@@ -139,6 +139,7 @@ __all__ = [
     "load_latest_premarket_brief",
     "market_session_label",
     "render_daily_supervisor_report",
+    "resolve_live_sleeve",
     "render_overnight_plan_markdown",
     "render_premarket_brief_markdown",
     "should_notify_supervisor",
@@ -154,6 +155,52 @@ UTC = datetime.timezone.utc
 CENTRAL = ZoneInfo("America/Chicago")
 LIVE_AGGRESSIVE_SLEEVE = "current-aggressive"
 DEFAULT_ALERT_THROTTLE_WINDOW = datetime.timedelta(hours=4)
+
+
+def resolve_live_sleeve(
+    live_strategy_selection: Mapping | None,
+    promotion_state: Mapping | None,
+) -> tuple[str, str]:
+    """Pick the sleeve identity stamped on live supervisor actions.
+
+    The paper-tournament selection becomes binding only when the selected
+    sleeve holds a live-enabled ``tiny_live_eligible`` promotion record.
+    Otherwise fall back to any live-enabled sleeve from promotion state, and
+    finally to the legacy default — which the unified live gate fails closed
+    on when it has no promotion record.
+    """
+    sleeves: Mapping = {}
+    if isinstance(promotion_state, Mapping):
+        raw = promotion_state.get("sleeves")
+        if isinstance(raw, Mapping):
+            sleeves = raw
+
+    def _live_enabled(sleeve_id: str) -> bool:
+        record = sleeves.get(sleeve_id)
+        return (
+            isinstance(record, Mapping)
+            and record.get("stage") == "tiny_live_eligible"
+            and record.get("live_enabled") is True
+        )
+
+    selected = None
+    if isinstance(live_strategy_selection, Mapping):
+        selected = live_strategy_selection.get("strategy_id")
+    if selected and _live_enabled(str(selected)):
+        return (
+            str(selected),
+            "tournament selection with live-enabled promotion record",
+        )
+    enabled = sorted(sleeve for sleeve in sleeves if _live_enabled(str(sleeve)))
+    if enabled:
+        return (
+            enabled[0],
+            "promotion-state live-enabled sleeve; tournament selection is not live-enabled",
+        )
+    return (
+        LIVE_AGGRESSIVE_SLEEVE,
+        "fail-closed default; no live-enabled sleeve in promotion state",
+    )
 
 _SYMBOL_RE = re.compile(r"\b[A-Z][A-Z0-9.]{0,5}\b")
 _NON_SYMBOL_WORDS = {
@@ -655,6 +702,7 @@ def build_hourly_decision(
     market_session: str = "regular",
     dynamic_live_cap: Decimal = BASE_LIVE_CAP,
     new_buys_suspended_reason: str | None = None,
+    live_sleeve: str | None = None,
 ) -> HourlySupervisorDecision:
     return _build_hourly_decision(
         live_positions=live_positions,
@@ -666,7 +714,7 @@ def build_hourly_decision(
         new_buys_suspended_reason=new_buys_suspended_reason,
         can_trade_session=can_trade_session,
         positive_decimal_or_none=_positive_decimal_or_none,
-        live_sleeve=LIVE_AGGRESSIVE_SLEEVE,
+        live_sleeve=live_sleeve or LIVE_AGGRESSIVE_SLEEVE,
     )
 
 

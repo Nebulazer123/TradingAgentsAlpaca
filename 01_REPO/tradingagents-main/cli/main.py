@@ -102,6 +102,7 @@ from tradingagents.brokers.alpaca_supervisor import (
     validate_hourly_supervisor_actions,
     validate_overnight_plan_against_candidates,
     validate_premarket_brief_against_candidates,
+    resolve_live_sleeve,
     validate_supervisor_live_submit_allowed,
     write_hourly_decision_packet,
     write_overnight_plan_packet,
@@ -110,6 +111,7 @@ from tradingagents.brokers.alpaca_supervisor import (
 from tradingagents.brokers.paper_tournament import (
     ALPHAINSIDER_PAPER_WATCH_ID,
     STRATEGY_IDS,
+    adapt_candidate_signals_for_live_strategy,
     build_alphainsider_paper_watch_plan,
     build_tournament_actions,
     build_tournament_order_payloads,
@@ -3808,6 +3810,79 @@ def policy_refresh_live_control(
         print(json.dumps(payload, indent=2))
     else:
         console.print(f"Live control refreshed until {payload['dead_man_expires_at']}")
+
+
+@policy_app.command("sync-promotion")
+def policy_sync_promotion(
+    report_path: Path = typer.Option(
+        Path("results/paper_strategy_tournament/latest.json"),
+        "--report-path",
+        help="Paper tournament report (or packet wrapping latest_report).",
+    ),
+    state_path: Path = typer.Option(
+        Path("results/policy/promotion_state.json"),
+        "--state-path",
+        help="Promotion state consumed by the unified live gate.",
+    ),
+    envelope_path: Path = typer.Option(
+        Path("config/risk_envelope.yaml"),
+        "--envelope-path",
+        help="Risk envelope providing the tiny-live tranche size.",
+    ),
+    arm_live: bool = typer.Option(
+        False,
+        "--arm-live/--no-arm-live",
+        help="Mark the promoted sleeve live-enabled when every gate passes.",
+    ),
+    ci_green: bool = typer.Option(
+        False,
+        "--ci-green/--no-ci-green",
+        help="Attest that the focused test suite passed for this working tree.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Sync live promotion state from paper-tournament evidence.
+
+    Promotes the tournament's live candidate through the deterministic gate
+    set and demotes any live-enabled sleeve whose own tournament evidence
+    turned negative. Never submits orders; live submission still requires
+    the unified go-live guard at submit time.
+    """
+    from tradingagents.policy.promotion_sync import sync_promotion_state_file
+
+    envelope, envelope_issues = load_risk_envelope(envelope_path)
+    if envelope is None:
+        raise typer.BadParameter(
+            f"risk envelope unusable at {envelope_path}: {'; '.join(envelope_issues)}"
+        )
+    tranche = envelope.tiny_live_tranche_usd
+    result = sync_promotion_state_file(
+        report_path,
+        state_path,
+        tiny_live_tranche_usd=tranche,
+        arm_live=arm_live,
+        ci_green=ci_green,
+    )
+    payload = {
+        "summary": result.summary,
+        "promoted": result.promoted,
+        "demoted": result.demoted,
+        "issues_by_sleeve": result.issues_by_sleeve,
+        "state_path": str(state_path),
+        "report_path": str(report_path),
+        "arm_live": arm_live,
+        "ci_green": ci_green,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "state": result.state,
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2))
+    else:
+        console.print(result.summary)
+        for sleeve, sleeve_issues in result.issues_by_sleeve.items():
+            for issue in sleeve_issues:
+                console.print(f"  {sleeve}: {issue}")
 
 
 @policy_app.command("preregister-sleeve")
@@ -10811,6 +10886,30 @@ def alpaca_supervise_hourly(
         held_symbols=held_symbols,
     )
     live_strategy_selection = load_live_strategy_selection(paper_tournament_log_dir)
+    promotion_state_for_sleeve = _read_json_packet(
+        Path(
+            os.environ.get(
+                "TRADINGAGENTS_PROMOTION_STATE_PATH",
+                "results/policy/promotion_state.json",
+            )
+        )
+    )
+    resolved_live_sleeve, live_sleeve_resolution = resolve_live_sleeve(
+        live_strategy_selection, promotion_state_for_sleeve
+    )
+    live_signals_adapted = False
+    if (
+        live_strategy_selection
+        and resolved_live_sleeve == live_strategy_selection.get("strategy_id")
+    ):
+        # The tournament selection is backed by a live-enabled promotion
+        # record, so reshape candidate signals to the winning sleeve's
+        # profile before the hourly decision.
+        candidate_signals = adapt_candidate_signals_for_live_strategy(
+            resolved_live_sleeve,
+            candidate_signals,
+        )
+        live_signals_adapted = True
     overnight_plan = load_latest_overnight_plan(overnight_log_dir)
     overnight_validation = validate_overnight_plan_against_candidates(
         overnight_plan,
@@ -10869,6 +10968,7 @@ def alpaca_supervise_hourly(
         market_session=market_session,
         dynamic_live_cap=dynamic_live_cap,
         new_buys_suspended_reason=new_buys_suspended_reason,
+        live_sleeve=resolved_live_sleeve,
     )
     issues = validate_hourly_supervisor_actions(
         decision.actions,
@@ -11154,14 +11254,24 @@ def alpaca_supervise_hourly(
         ),
     }
     if live_strategy_selection:
+        selection_is_binding = live_signals_adapted
         evidence["live_strategy_selection"] = {
             **live_strategy_selection,
-            "advisory_only": True,
+            "advisory_only": not selection_is_binding,
             "reason": (
                 f"{live_strategy_selection.get('reason', '')} "
-                "Selection is advisory until explicit promotion gates exist."
+                + (
+                    "Selection is binding: backed by a live-enabled promotion record."
+                    if selection_is_binding
+                    else "Selection is advisory until a live-enabled promotion record exists."
+                )
             ).strip(),
         }
+    evidence["live_sleeve_resolution"] = {
+        "live_sleeve": resolved_live_sleeve,
+        "reason": live_sleeve_resolution,
+        "signals_adapted": live_signals_adapted,
+    }
     if latest_packet_reconciliation is not None:
         evidence["latest_packet_reconciliation"] = latest_packet_reconciliation
     if preopen_validation_summary is not None:
