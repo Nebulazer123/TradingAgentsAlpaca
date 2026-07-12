@@ -1,4 +1,5 @@
 from langchain_core.messages import HumanMessage, RemoveMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 # Import tools from separate utility files
 from tradingagents.agents.utils.core_stock_tools import get_stock_data
@@ -71,25 +72,19 @@ def build_instrument_context(ticker: str, asset_type: str = "stock") -> str:
 def create_msg_delete():
     def delete_messages(state):
         """Clear messages and add placeholder for Anthropic compatibility"""
-        messages = state.get("messages") or []
-
-        # Remove each concrete message id at most once. Concurrent analyst
-        # fan-out can surface overlapping message state; duplicate or empty
-        # ids make LangGraph's message reducer fail before the graph reaches
-        # the fallback scorer.
-        seen_ids = set()
-        removal_operations = []
-        for message in messages:
-            message_id = getattr(message, "id", None)
-            if not message_id or message_id in seen_ids:
-                continue
-            seen_ids.add(message_id)
-            removal_operations.append(RemoveMessage(id=message_id))
+        # Under concurrent analyst fan-out each branch only sees its own
+        # ephemeral message state, so enumerating per-id RemoveMessage ops
+        # crashes the add_messages reducer at the merge when an id is not in
+        # the shared canonical channel ("Attempting to delete a message with
+        # an ID that doesn't exist"). The REMOVE_ALL_MESSAGES sentinel clears
+        # the channel without naming ids, which is safe in both the
+        # sequential and parallel paths.
+        removal = RemoveMessage(id=REMOVE_ALL_MESSAGES)
 
         # Add a minimal placeholder message
         placeholder = HumanMessage(content="Continue")
 
-        return {"messages": removal_operations + [placeholder]}
+        return {"messages": [removal, placeholder]}
 
     return delete_messages
 
