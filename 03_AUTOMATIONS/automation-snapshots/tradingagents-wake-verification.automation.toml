@@ -1,0 +1,14 @@
+version = 1
+id = "tradingagents-wake-verification"
+kind = "cron"
+name = "tradingagents-wake-verification"
+prompt = "Verify that the TradingAgents wake-controller ran after the morning controller window. Start in C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main. First check the local America/Chicago clock; if it is before 6:55 AM CT, stop with a quiet pre-wake status and do not change automation status. After 6:55 AM CT, run .\\.venv\\Scripts\\tradingagents.exe research controller-patrol --automation-id tradingagents-wake-verification --json-output so the check leaves an analysis-only evidence packet. Then check compact context first, inspect C:\\cm\\automations status for the market-day TradingAgents jobs, and confirm hourly-market-supervisor plus paper-strategy-tournament-runner are ACTIVE if today is a regular U.S. equities trading day, tradingagents-overnight-planning is PAUSED after overnight unless the next useful overnight research window requires it active again, and n8n runner/dashboard are still reachable. Do not submit orders, send email, refresh live-control, or change automation status unless the wake-controller clearly missed and the status correction is needed for market readiness; if changing status, use automation_update and report exact ids changed. Keep the result compact with the packet path, statuses checked, blockers, and any status changes."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=6;BYMINUTE=55;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.4-mini"
+reasoning_effort = "medium"
+execution_environment = "local"
+target = { type = "project", project_id = "C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main" }
+cwds = ["C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main"]
+created_at = 1781834479693
+updated_at = 1783808417435

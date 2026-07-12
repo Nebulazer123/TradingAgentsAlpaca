@@ -1,0 +1,9 @@
+# This repo is managed by pyproject.toml plus uv.lock.
+# Prefer:
+#   uv sync
+#   uv run --with pytest python -m pytest -q
+#   uv run --group static-analysis ruff check
+#   uv run --group static-analysis mypy tradingagents/brokers tradingagents/policy tradingagents/execution tradingagents/dataflows
+#
+# For legacy pip workflows that still consume requirements.txt:
+-e .

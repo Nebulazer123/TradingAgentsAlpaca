@@ -1,0 +1,4 @@
+# Optional crawler runtime for the research crawler lane.
+# Install into the repo Python 3.11 venv with:
+# uv pip install --python .\.venv\Scripts\python.exe -r requirements-crawler.txt
+crawlee[playwright]==1.7.1

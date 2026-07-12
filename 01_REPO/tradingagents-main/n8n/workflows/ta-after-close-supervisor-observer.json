@@ -1,0 +1,154 @@
+{
+  "name": "TA · After-Close Supervisor (observer)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Run observer",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        80,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"context_snapshot\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-0-context-snapshot",
+      "name": "context_snapshot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"agent_ledger_update\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-1-agent-ledger-update",
+      "name": "agent_ledger_update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"agent_ledger_summary\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-2-agent-ledger-summary",
+      "name": "agent_ledger_summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"outcome_labeling\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-3-outcome-labeling",
+      "name": "outcome_labeling",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Run observer": {
+      "main": [
+        [
+          {
+            "node": "context_snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "context_snapshot": {
+      "main": [
+        [
+          {
+            "node": "agent_ledger_update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "agent_ledger_update": {
+      "main": [
+        [
+          {
+            "node": "agent_ledger_summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "agent_ledger_summary": {
+      "main": [
+        [
+          {
+            "node": "outcome_labeling",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": [
+    {
+      "name": "tradingagents"
+    },
+    {
+      "name": "observer"
+    }
+  ]
+}

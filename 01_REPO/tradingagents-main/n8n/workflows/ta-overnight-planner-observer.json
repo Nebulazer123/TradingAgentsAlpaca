@@ -1,0 +1,185 @@
+{
+  "name": "TA · Overnight Planner (observer)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Run observer",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        80,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"context_snapshot\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-0-context-snapshot",
+      "name": "context_snapshot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"creator_workflow_status\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-1-creator-workflow-status",
+      "name": "creator_workflow_status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"source_quality_review\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-2-source-quality-review",
+      "name": "source_quality_review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"agent_ledger_update\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-3-agent-ledger-update",
+      "name": "agent_ledger_update",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"agent_ledger_summary\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-4-agent-ledger-summary",
+      "name": "agent_ledger_summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1280,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Run observer": {
+      "main": [
+        [
+          {
+            "node": "context_snapshot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "context_snapshot": {
+      "main": [
+        [
+          {
+            "node": "creator_workflow_status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "creator_workflow_status": {
+      "main": [
+        [
+          {
+            "node": "source_quality_review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "source_quality_review": {
+      "main": [
+        [
+          {
+            "node": "agent_ledger_update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "agent_ledger_update": {
+      "main": [
+        [
+          {
+            "node": "agent_ledger_summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": [
+    {
+      "name": "tradingagents"
+    },
+    {
+      "name": "observer"
+    }
+  ]
+}

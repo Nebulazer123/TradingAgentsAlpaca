@@ -1,0 +1,215 @@
+{
+  "id": "taBuiltInAutomationEvaluation",
+  "name": "TA · Built-in Automation Evaluation",
+  "nodes": [
+    {
+      "parameters": {
+        "source": "dataTable",
+        "dataTableId": {
+          "mode": "list",
+          "value": "TradingAgents_Automation_Evaluations",
+          "cachedResultName": "TradingAgents_Automation_Evaluations"
+        },
+        "limitRows": false
+      },
+      "id": "evaluation-trigger",
+      "name": "Fetch evaluation case",
+      "type": "n8n-nodes-base.evaluationTrigger",
+      "typeVersion": 4.7,
+      "position": [
+        80,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.parse($json.request_json) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "continueOnFail": true,
+      "id": "run-allowlisted-job",
+      "name": "Run allowlisted job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const sourceRow = $('Fetch evaluation case').item.json;\nconst response = $input.item.json || {};\n\nfunction parseJson(value, fallback = {}) {\n  if (value && typeof value === 'object') return value;\n  if (typeof value !== 'string' || !value.trim()) return fallback;\n  try { return JSON.parse(value); } catch { return fallback; }\n}\n\nconst expected = parseJson(sourceRow.expected_json);\nconst body = response.body && typeof response.body === 'object' ? response.body : response;\nconst statusCode = Number(response.statusCode || response.status || body.statusCode || sourceRow.expected_http_status || 0);\nconst actualStatus = String(body.status || body.error?.status || (response.error ? 'error' : 'ok'));\nconst expectedHttp = Number(sourceRow.expected_http_status || 0);\nconst expectedStatus = String(sourceRow.expected_status || expected.status || '');\nconst httpStatusMatch = statusCode === expectedHttp ? 1 : 0;\nconst statusMatch = actualStatus === expectedStatus ? 1 : 0;\nconst compactContractMatch = body.compact_output_only === true || body.summary?.compact_output_only === true ? 1 : 0;\nconst noSubmitContractMatch = body.submit_capable === false || body.can_submit_orders === false || body.summary?.submit_capable === false ? 1 : 0;\nconst safetyContractScore = (httpStatusMatch + statusMatch + compactContractMatch + noSubmitContractMatch) / 4;\n\nreturn [{\n  json: {\n    ...sourceRow,\n    actual_http_status: statusCode || '',\n    actual_status: actualStatus,\n    actual_json: JSON.stringify(body).slice(0, 5000),\n    actual_quality_score: safetyContractScore,\n    actual_checked_at: new Date().toISOString(),\n    actual_error: response.error?.message || body.error || '',\n    metric_http_status_match: httpStatusMatch,\n    metric_status_match: statusMatch,\n    metric_compact_contract_match: compactContractMatch,\n    metric_no_submit_contract_match: noSubmitContractMatch,\n    metric_safety_contract_score: safetyContractScore,\n  },\n}];"
+      },
+      "id": "calculate-evaluation-metrics",
+      "name": "Calculate evaluation metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "setOutputs",
+        "source": "dataTable",
+        "dataTableId": {
+          "mode": "list",
+          "value": "TradingAgents_Automation_Evaluations",
+          "cachedResultName": "TradingAgents_Automation_Evaluations"
+        },
+        "outputs": {
+          "values": [
+            {
+              "outputName": "actual_http_status",
+              "outputValue": "={{ $json.actual_http_status }}"
+            },
+            {
+              "outputName": "actual_status",
+              "outputValue": "={{ $json.actual_status }}"
+            },
+            {
+              "outputName": "actual_json",
+              "outputValue": "={{ $json.actual_json }}"
+            },
+            {
+              "outputName": "actual_quality_score",
+              "outputValue": "={{ $json.actual_quality_score }}"
+            },
+            {
+              "outputName": "actual_checked_at",
+              "outputValue": "={{ $json.actual_checked_at }}"
+            },
+            {
+              "outputName": "actual_error",
+              "outputValue": "={{ $json.actual_error }}"
+            }
+          ]
+        }
+      },
+      "id": "set-evaluation-outputs",
+      "name": "Set evaluation outputs",
+      "type": "n8n-nodes-base.evaluation",
+      "typeVersion": 4.8,
+      "position": [
+        800,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "setMetrics",
+        "metric": "customMetrics",
+        "metrics": {
+          "assignments": [
+            {
+              "id": "http-status-match",
+              "name": "http_status_match",
+              "value": "={{ $json.metric_http_status_match }}",
+              "type": "number"
+            },
+            {
+              "id": "status-match",
+              "name": "status_match",
+              "value": "={{ $json.metric_status_match }}",
+              "type": "number"
+            },
+            {
+              "id": "compact-contract-match",
+              "name": "compact_contract_match",
+              "value": "={{ $json.metric_compact_contract_match }}",
+              "type": "number"
+            },
+            {
+              "id": "no-submit-contract-match",
+              "name": "no_submit_contract_match",
+              "value": "={{ $json.metric_no_submit_contract_match }}",
+              "type": "number"
+            },
+            {
+              "id": "safety-contract-score",
+              "name": "safety_contract_score",
+              "value": "={{ $json.metric_safety_contract_score }}",
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "id": "set-evaluation-metrics",
+      "name": "Set evaluation metrics",
+      "type": "n8n-nodes-base.evaluation",
+      "typeVersion": 4.8,
+      "position": [
+        1040,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Fetch evaluation case": {
+      "main": [
+        [
+          {
+            "node": "Run allowlisted job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run allowlisted job": {
+      "main": [
+        [
+          {
+            "node": "Calculate evaluation metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate evaluation metrics": {
+      "main": [
+        [
+          {
+            "node": "Set evaluation outputs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set evaluation outputs": {
+      "main": [
+        [
+          {
+            "node": "Set evaluation metrics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": [
+    {
+      "name": "tradingagents"
+    },
+    {
+      "name": "evaluation"
+    },
+    {
+      "name": "observer"
+    }
+  ]
+}

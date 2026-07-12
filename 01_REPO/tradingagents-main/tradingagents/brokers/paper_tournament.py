@@ -1,0 +1,1224 @@
+"""Paper-account strategy tournament accounting and selection.
+
+Alpaca paper accounts aggregate positions by symbol, so this module keeps a
+local virtual ledger that attributes orders and performance to each strategy.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import time
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from decimal import ROUND_DOWN, Decimal
+from pathlib import Path
+
+from tradingagents.brokers.alpaca_supervisor import CandidateSignal
+
+UTC = datetime.timezone.utc
+LEDGER_FILE = "paper-tournament-ledger.json"
+COMPACT_LEDGER_FILE = "paper-tournament-ledger.compact.json"
+LIVE_SELECTION_FILE = "live-strategy-selection.json"
+STRATEGY_CURRENT_AGGRESSIVE = "current-aggressive"
+STRATEGY_PULLBACK_SUPPORT = "pullback-support"
+STRATEGY_CATALYST_ROTATION = "catalyst-relative-strength"
+ALPHAINSIDER_PAPER_WATCH_ID = "alphainsider-popular-paper"
+DEFAULT_TOURNAMENT_RESERVED_BUDGET = Decimal("30000")
+STRATEGY_IDS = (
+    STRATEGY_CURRENT_AGGRESSIVE,
+    STRATEGY_PULLBACK_SUPPORT,
+    STRATEGY_CATALYST_ROTATION,
+)
+
+STRATEGY_DEFINITIONS = {
+    STRATEGY_CURRENT_AGGRESSIVE: {
+        "name": "Current Aggressive TradingAgents",
+        "description": "Existing aggressive supervisor style: broad ranking, time-sensitive momentum, and rotations.",
+    },
+    STRATEGY_PULLBACK_SUPPORT: {
+        "name": "Pullback Support Buyer",
+        "description": "Buys strong liquid stocks on disciplined, non-thesis-breaking pullbacks.",
+    },
+    STRATEGY_CATALYST_ROTATION: {
+        "name": "Catalyst / Relative Strength Rotation",
+        "description": "Prioritizes fresh strength, volume, and catalyst-style momentum.",
+    },
+}
+
+ALPHAINSIDER_PAPER_WATCH_DEFINITION = {
+    "strategy_id": ALPHAINSIDER_PAPER_WATCH_ID,
+    "name": "AlphaInsider Popular Strategies Paper Watch",
+    "description": (
+        "Tracks popular AlphaInsider stock strategies with leftover paper buying power. "
+        "This is advisory/paper-only and cannot submit live orders."
+    ),
+}
+
+POPULAR_STRATEGY_SCORECARD_DEFINITIONS = {
+    STRATEGY_PULLBACK_SUPPORT: {
+        "name": "Pullback Support",
+        "setup_type": "buy_the_dip_support",
+        "status_when_missing": "planned_paper_sleeve",
+        "thesis": "Buy strong, liquid names on controlled dips that do not break the thesis.",
+        "pass_criteria": [
+            "positive paper total return",
+            "controlled drawdown versus other sleeves",
+            "evidence of rebound after entry",
+        ],
+        "fail_criteria": [
+            "dip keeps falling through support",
+            "drawdown dominates return",
+            "entries cluster in stale or low-liquidity names",
+        ],
+    },
+    "earnings-drift-estimate-revision": {
+        "name": "Earnings Drift / Estimate Revision",
+        "setup_type": "post_earnings_underreaction",
+        "status_when_missing": "planned_paper_sleeve",
+        "thesis": "Test whether positive estimate/guidance revisions keep drifting after the first reaction.",
+        "pass_criteria": [
+            "outperforms benchmark over stated horizon",
+            "revision evidence remains fresh",
+            "does not buy after an exhausted spike",
+        ],
+        "fail_criteria": [
+            "guidance was already priced in",
+            "revision reverses",
+            "price loses relative strength before entry",
+        ],
+    },
+    "event-underreaction": {
+        "name": "Event Underreaction",
+        "setup_type": "event_underreaction",
+        "status_when_missing": "planned_paper_sleeve",
+        "thesis": "Paper-test whether markets underreact to concrete catalysts with follow-through evidence.",
+        "pass_criteria": [
+            "event thesis resolves within the horizon",
+            "relative return beats sector or broad benchmark",
+            "source quality stays primary or corroborated",
+        ],
+        "fail_criteria": [
+            "event impact was already priced",
+            "follow-through volume fades",
+            "source quality is weak or stale",
+        ],
+    },
+    "pairs-comovement-residuals": {
+        "name": "Pairs / Co-Movement Residuals",
+        "setup_type": "pairs_residual_mean_reversion",
+        "status_when_missing": "planned_paper_sleeve",
+        "thesis": "Paper-test liquid relative-value spreads when one name diverges from a close peer basket.",
+        "pass_criteria": [
+            "spread closes without thesis break",
+            "both legs remain liquid and borrow-neutral",
+            "residual signal is not explained by new fundamentals",
+        ],
+        "fail_criteria": [
+            "divergence has a real fundamental cause",
+            "spread widens beyond invalidator",
+            "leg liquidity or correlation deteriorates",
+        ],
+    },
+    "news-sentiment-swing": {
+        "name": "News / Sentiment Swing",
+        "setup_type": "sentiment_overreaction_swing",
+        "status_when_missing": "planned_paper_sleeve",
+        "thesis": "Paper-test whether broad news/social sentiment overreacts before price mean-reverts.",
+        "pass_criteria": [
+            "sentiment shock fades",
+            "price stabilizes near support",
+            "source overlap confirms the story is not fake or stale",
+        ],
+        "fail_criteria": [
+            "negative news is fundamental",
+            "sentiment remains one-sided",
+            "price breaks support with abnormal volume",
+        ],
+    },
+    "macro-regime-overlay": {
+        "name": "Macro Regime Overlay",
+        "setup_type": "macro_regime_filter",
+        "status_when_missing": "planned_paper_sleeve",
+        "thesis": "Paper-test whether regime filters improve sleeve timing, cash thresholds, and sector selection.",
+        "pass_criteria": [
+            "reduces drawdown during risk-off tape",
+            "improves cash deployment timing",
+            "keeps sector exposure aligned with macro evidence",
+        ],
+        "fail_criteria": [
+            "filter overreacts to noisy macro releases",
+            "misses strong idiosyncratic setups",
+            "adds turnover without better return",
+        ],
+    },
+    ALPHAINSIDER_PAPER_WATCH_ID: {
+        "name": ALPHAINSIDER_PAPER_WATCH_DEFINITION["name"],
+        "setup_type": "popular_strategy_allocation_shadow",
+        "status_when_missing": "planned_paper_shadow",
+        "thesis": "Shadow popular third-party strategy allocations in paper only and compare outcomes.",
+        "pass_criteria": [
+            "shadow basket outperforms tournament reserve baseline",
+            "strategy metadata contains concrete tickers",
+            "weekly rotation improves paper evidence quality",
+        ],
+        "fail_criteria": [
+            "popular basket underperforms or churns",
+            "strategy metadata lacks actionable tickers",
+            "shadow allocation conflicts with live safety gates",
+        ],
+        "rotation_schedule": "RRULE:FREQ=WEEKLY;BYHOUR=2;BYMINUTE=30;BYDAY=SU,MO,TU,WE,TH,FR,SA",
+    },
+}
+
+_STRATEGY_CLIENT_PREFIX = {
+    STRATEGY_CURRENT_AGGRESSIVE: "current-aggressive",
+    STRATEGY_PULLBACK_SUPPORT: "pullback-support",
+    STRATEGY_CATALYST_ROTATION: "catalyst",
+}
+
+
+@dataclass(frozen=True)
+class TournamentAction:
+    strategy_id: str
+    action: str
+    symbol: str
+    side: str
+    notional: Decimal
+    limit_price: Decimal
+    reason: str
+    extended_hours: bool = False
+
+
+def _as_decimal(value: Decimal | int | float | str | None, default: str = "0") -> Decimal:
+    if value is None or value == "":
+        return Decimal(default)
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def _money(value: Decimal | int | float | str | None) -> str:
+    amount = _as_decimal(value).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if amount == 0:
+        amount = abs(amount)
+    return str(amount)
+
+
+def _price(value: Decimal | int | float | str | None) -> str:
+    return str(_as_decimal(value).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+
+def _iso(value: datetime.datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def _now() -> datetime.datetime:
+    return datetime.datetime.now(tz=UTC)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _unique_packet_path(output_path: Path, stem: str, suffix: str = ".json") -> Path:
+    candidate = output_path / f"{stem}{suffix}"
+    if not candidate.exists():
+        return candidate
+    for index in range(1, 1000):
+        candidate = output_path / f"{stem}-{index:03d}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"could not allocate unique paper tournament packet path for {stem}{suffix}")
+
+
+def _position_market_value(position: Mapping) -> Decimal:
+    market_value = _as_decimal(position.get("market_value"))
+    if market_value > 0:
+        return market_value
+    qty = _as_decimal(position.get("qty"))
+    current_price = _as_decimal(position.get("current_price") or position.get("avg_entry_price"))
+    return qty * current_price
+
+
+def _position_current_price(position: Mapping) -> Decimal:
+    current_price = _as_decimal(position.get("current_price"))
+    if current_price > 0:
+        return current_price
+    qty = _as_decimal(position.get("qty"))
+    market_value = _position_market_value(position)
+    if qty > 0 and market_value > 0:
+        return market_value / qty
+    return _as_decimal(position.get("avg_entry_price"), "0")
+
+
+def initialize_tournament(
+    *,
+    paper_account: Mapping,
+    paper_positions: Sequence[Mapping],
+    capital_per_strategy: Decimal,
+    now: datetime.datetime | None = None,
+    duration_days: int = 31,
+) -> dict:
+    now = now or _now()
+    started_at = _iso(now)
+    ends_at = _iso(now + datetime.timedelta(days=duration_days))
+    capital = _as_decimal(capital_per_strategy)
+    strategies = {}
+    for strategy_id in STRATEGY_IDS:
+        strategies[strategy_id] = {
+            "strategy_id": strategy_id,
+            "name": STRATEGY_DEFINITIONS[strategy_id]["name"],
+            "description": STRATEGY_DEFINITIONS[strategy_id]["description"],
+            "starting_capital": _money(capital),
+            "cash": _money(capital),
+            "baseline_imported_value": "0.00",
+            "positions": {},
+            "orders": [],
+            "realized_pl": "0.00",
+            "equity_history": [{"generated_at": started_at, "equity": _money(capital)}],
+        }
+
+    imported_value = Decimal("0")
+    current_strategy = strategies[STRATEGY_CURRENT_AGGRESSIVE]
+    for position in paper_positions:
+        symbol = str(position.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        qty = _as_decimal(position.get("qty"))
+        market_value = _position_market_value(position)
+        current_price = _position_current_price(position)
+        if qty <= 0 or market_value <= 0 or current_price <= 0:
+            continue
+        imported_value += market_value
+        current_strategy["positions"][symbol] = {
+            "symbol": symbol,
+            "qty": str(qty.normalize()),
+            "avg_entry_price": _price(current_price),
+            "cost_basis": _money(market_value),
+            "baseline_value": _money(market_value),
+            "baseline_unrealized_pl": "0.00",
+            "current_price": _price(current_price),
+            "source": "imported_current_paper_position",
+        }
+    imported_value = sum(
+        _as_decimal(position.get("cost_basis"))
+        for position in current_strategy["positions"].values()
+    )
+    current_strategy["baseline_imported_value"] = _money(imported_value)
+    current_strategy["cash"] = _money(max(Decimal("0"), capital - imported_value))
+
+    return {
+        "version": 1,
+        "tournament_id": f"paper-tournament-{now.strftime('%Y%m%d-%H%M%S')}",
+        "started_at": started_at,
+        "ends_at": ends_at,
+        "capital_per_strategy": _money(capital),
+        "paper_account_baseline": {
+            "status": paper_account.get("status"),
+            "equity": str(paper_account.get("equity", "")),
+            "buying_power": str(paper_account.get("buying_power", "")),
+            "portfolio_value": str(paper_account.get("portfolio_value", "")),
+        },
+        "strategies": strategies,
+        "live_strategy_selection": {
+            "status": "pending",
+            "strategy_id": None,
+            "reason": "not enough tournament evidence yet",
+        },
+    }
+
+
+def compact_tournament_ledger_payload(
+    ledger: Mapping,
+    *,
+    raw_packet_path: str | Path | None = None,
+) -> dict:
+    """Return the small scoreboard morning/n8n contexts need from the ledger."""
+
+    latest_report = ledger.get("latest_report") if isinstance(ledger.get("latest_report"), Mapping) else {}
+    rankings = latest_report.get("rankings") if isinstance(latest_report, Mapping) else []
+    if not isinstance(rankings, list):
+        rankings = []
+    candidate = latest_report.get("live_strategy_candidate") if isinstance(latest_report, Mapping) else {}
+    if not isinstance(candidate, Mapping):
+        candidate = ledger.get("live_strategy_selection") if isinstance(ledger.get("live_strategy_selection"), Mapping) else {}
+    selection = ledger.get("live_strategy_selection") if isinstance(ledger.get("live_strategy_selection"), Mapping) else {}
+    strategies = ledger.get("strategies") if isinstance(ledger.get("strategies"), Mapping) else {}
+    baseline = ledger.get("paper_account_baseline") if isinstance(ledger.get("paper_account_baseline"), Mapping) else {}
+    alphainsider = (
+        ledger.get("alphainsider_paper_watch_plan")
+        if isinstance(ledger.get("alphainsider_paper_watch_plan"), Mapping)
+        else {}
+    )
+
+    compact_rankings = []
+    for item in rankings[:5]:
+        if not isinstance(item, Mapping):
+            continue
+        compact_rankings.append(
+            {
+                "strategy_id": item.get("strategy_id"),
+                "name": item.get("name"),
+                "equity": item.get("equity"),
+                "total_return": item.get("total_return"),
+                "total_return_pct": item.get("total_return_pct"),
+                "max_drawdown_pct": item.get("max_drawdown_pct"),
+                "win_rate_pct": item.get("win_rate_pct"),
+                "tracked_days": item.get("tracked_days"),
+            }
+        )
+
+    compact: dict[str, object] = {
+        "schema": "compact_paper_tournament_ledger_v1",
+        "analysis_only": True,
+        "paper_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "raw_packet_path": str(raw_packet_path) if raw_packet_path is not None else None,
+        "generated_at": latest_report.get("generated_at") if isinstance(latest_report, Mapping) else None,
+        "tournament_id": ledger.get("tournament_id"),
+        "started_at": ledger.get("started_at"),
+        "ends_at": ledger.get("ends_at"),
+        "capital_per_strategy": ledger.get("capital_per_strategy"),
+        "strategy_count": len(strategies),
+        "paper_account_baseline": {
+            "status": baseline.get("status"),
+            "equity": baseline.get("equity"),
+            "buying_power": baseline.get("buying_power"),
+            "portfolio_value": baseline.get("portfolio_value"),
+        },
+        "latest_report": {
+            "generated_at": latest_report.get("generated_at") if isinstance(latest_report, Mapping) else None,
+            "rankings": compact_rankings,
+            "ranking_count": len(rankings),
+            "live_strategy_candidate": {
+                "status": candidate.get("status") if isinstance(candidate, Mapping) else None,
+                "strategy_id": candidate.get("strategy_id") if isinstance(candidate, Mapping) else None,
+                "reason": candidate.get("reason") if isinstance(candidate, Mapping) else None,
+            },
+        },
+        "live_strategy_selection": {
+            "status": selection.get("status"),
+            "strategy_id": selection.get("strategy_id"),
+            "reason": selection.get("reason"),
+        },
+        "alphainsider_paper_watch": {
+            "mode": alphainsider.get("paper_shadow_mode"),
+            "watch_item_count": len(alphainsider.get("watch_items") or [])
+            if isinstance(alphainsider.get("watch_items"), list)
+            else 0,
+            "shadow_order_count": alphainsider.get("shadow_order_count"),
+            "paper_shadow_spend_usd": alphainsider.get("paper_shadow_spend_usd"),
+            "execution_authority": alphainsider.get("execution_authority"),
+        },
+        "next_open": (
+            "Open the raw paper tournament ledger only when the candidate changes, "
+            "paper orders submit, a strategy leader changes, or AlphaInsider watch status changes."
+        ),
+    }
+    return compact
+
+
+def write_tournament_ledger(ledger: Mapping, output_dir: str | Path) -> Path:
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    ledger_path = path / LEDGER_FILE
+    ledger_text = json.dumps(ledger, indent=2)
+    _atomic_write_text(ledger_path, ledger_text)
+    _atomic_write_text(path / "latest.json", ledger_text)
+    compact = compact_tournament_ledger_payload(ledger, raw_packet_path=ledger_path)
+    compact_text = json.dumps(compact, indent=2)
+    _atomic_write_text(path / COMPACT_LEDGER_FILE, compact_text)
+    _atomic_write_text(path / "latest-compact.json", compact_text)
+    return ledger_path
+
+
+def load_tournament_ledger(log_dir: str | Path) -> dict:
+    ledger_path = Path(log_dir) / LEDGER_FILE
+    if not ledger_path.exists():
+        raise FileNotFoundError(f"paper tournament ledger not found: {ledger_path}")
+    return json.loads(ledger_path.read_text(encoding="utf-8"))
+
+
+def _current_price(symbol: str, position: Mapping, market_data: Mapping[str, Mapping]) -> Decimal:
+    data = market_data.get(symbol.upper()) or {}
+    price = _as_decimal(data.get("current_price") or data.get("price"))
+    if price > 0:
+        return price
+    return _as_decimal(position.get("current_price") or position.get("avg_entry_price"), "0")
+
+
+def strategy_position_value(strategy: Mapping, market_data: Mapping[str, Mapping]) -> Decimal:
+    value = Decimal("0")
+    for symbol, position in (strategy.get("positions") or {}).items():
+        if not market_data and position.get("source") == "imported_current_paper_position":
+            value += _as_decimal(position.get("cost_basis"))
+            continue
+        qty = _as_decimal(position.get("qty"))
+        price = _current_price(symbol, position, market_data)
+        value += qty * price
+    return value
+
+
+def strategy_open_order_reserve(strategy: Mapping) -> Decimal:
+    reserve = Decimal("0")
+    for order in strategy.get("orders") or []:
+        status = str(order.get("status", "")).lower()
+        side = str(order.get("side", "")).lower()
+        if side == "buy" and status not in {"filled", "canceled", "expired", "rejected"}:
+            reserve += _as_decimal(order.get("notional"))
+    return reserve
+
+
+def strategy_available_cash(strategy: Mapping) -> Decimal:
+    return max(Decimal("0"), _as_decimal(strategy.get("cash")) - strategy_open_order_reserve(strategy))
+
+
+def tournament_reserved_budget(
+    ledger: Mapping | None = None,
+    *,
+    fallback_reserved_budget: Decimal = DEFAULT_TOURNAMENT_RESERVED_BUDGET,
+) -> Decimal:
+    if not ledger:
+        return fallback_reserved_budget
+    total = Decimal("0")
+    strategies = ledger.get("strategies") or {}
+    for strategy_id in STRATEGY_IDS:
+        strategy = strategies.get(strategy_id) or {}
+        total += _as_decimal(strategy.get("starting_capital"))
+    return total if total > 0 else fallback_reserved_budget
+
+
+def remaining_paper_budget_after_tournament(
+    paper_account: Mapping,
+    *,
+    ledger: Mapping | None = None,
+    reserved_budget: Decimal | None = None,
+) -> Decimal:
+    reserve = _as_decimal(reserved_budget) if reserved_budget is not None else tournament_reserved_budget(ledger)
+    buying_power = _as_decimal(paper_account.get("buying_power") or paper_account.get("equity"))
+    return max(Decimal("0"), buying_power - reserve).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def _normalize_shadow_symbol(value: object) -> str | None:
+    raw = str(value or "").strip().upper().lstrip("$")
+    if not raw:
+        return None
+    symbol = "".join(ch for ch in raw if ch.isalnum() or ch in {".", "-"})
+    if not symbol or len(symbol) > 12:
+        return None
+    return symbol
+
+
+def _alphainsider_strategy_symbols(strategy: Mapping) -> list[str]:
+    symbols: list[str] = []
+
+    def add_symbol(value: object) -> None:
+        symbol = _normalize_shadow_symbol(value)
+        if symbol and symbol not in symbols:
+            symbols.append(symbol)
+
+    for key in (
+        "symbols",
+        "tickers",
+        "ticker_mentions",
+        "recommended_symbols",
+        "holdings",
+        "positions",
+        "allocations",
+    ):
+        value = strategy.get(key)
+        if isinstance(value, str):
+            for item in value.replace(";", ",").split(","):
+                add_symbol(item)
+        elif isinstance(value, Mapping):
+            add_symbol(value.get("symbol") or value.get("ticker"))
+            for item in value.values():
+                if isinstance(item, Mapping):
+                    add_symbol(item.get("symbol") or item.get("ticker"))
+        elif isinstance(value, Sequence):
+            for item in value:
+                if isinstance(item, Mapping):
+                    add_symbol(item.get("symbol") or item.get("ticker"))
+                else:
+                    add_symbol(item)
+    return symbols
+
+
+def build_alphainsider_paper_watch_plan(
+    *,
+    paper_account: Mapping,
+    recommended_strategies: Sequence[Mapping] | None = None,
+    ledger: Mapping | None = None,
+    reserved_budget: Decimal | None = None,
+    max_strategies: int = 5,
+    max_allocation_per_strategy: Decimal = Decimal("2000"),
+    fetch_status: str = "not_requested",
+    fetch_reason: str = "",
+    env_status: Mapping | None = None,
+    now: datetime.datetime | None = None,
+) -> dict:
+    now = now or _now()
+    reserve = _as_decimal(reserved_budget) if reserved_budget is not None else tournament_reserved_budget(ledger)
+    available = remaining_paper_budget_after_tournament(
+        paper_account,
+        ledger=ledger,
+        reserved_budget=reserve,
+    )
+    selected = list(recommended_strategies or [])[: max(0, int(max_strategies))]
+    allocation = Decimal("0")
+    if selected and available > 0:
+        allocation = min(
+            _as_decimal(max_allocation_per_strategy),
+            (available / Decimal(len(selected))).quantize(Decimal("0.01"), rounding=ROUND_DOWN),
+        )
+    watch_items = []
+    paper_shadow_orders = []
+    paper_shadow_spend = Decimal("0")
+    for index, strategy in enumerate(selected, start=1):
+        strategy_id = str(
+            strategy.get("strategy_id")
+            or strategy.get("id")
+            or strategy.get("_id")
+            or strategy.get("uuid")
+            or ""
+        )
+        symbols = _alphainsider_strategy_symbols(strategy)
+        if not strategy_id:
+            shadow_status = "missing_strategy_id"
+        elif allocation <= 0:
+            shadow_status = "no_shadow_budget"
+        elif not symbols:
+            shadow_status = "needs_strategy_tickers"
+        else:
+            shadow_status = "shadow_orders_ready"
+            per_symbol = (allocation / Decimal(len(symbols))).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+            if per_symbol > 0:
+                for symbol in symbols:
+                    paper_shadow_spend += per_symbol
+                    paper_shadow_orders.append(
+                        {
+                            "paper_watch_strategy_id": ALPHAINSIDER_PAPER_WATCH_ID,
+                            "alphainsider_strategy_id": strategy_id,
+                            "source_strategy_rank": index,
+                            "source_strategy_name": str(
+                                strategy.get("name") or strategy.get("title") or "unnamed strategy"
+                            )[:160],
+                            "symbol": symbol,
+                            "side": "buy",
+                            "type": "paper_shadow_allocation",
+                            "notional": _money(per_symbol),
+                            "status": "shadow_only",
+                            "execution_authority": "none",
+                            "broker_submission_ready": False,
+                            "reason": (
+                                "AlphaInsider popular-strategy paper emulation; "
+                                "comparison signal only, not trade truth."
+                            ),
+                        }
+                    )
+        watch_items.append(
+            {
+                "rank": index,
+                "strategy_id": strategy_id,
+                "name": str(strategy.get("name") or strategy.get("title") or "unnamed strategy")[:160],
+                "type": str(strategy.get("type") or strategy.get("strategy_type") or "unknown"),
+                "proposed_paper_allocation_usd": _money(allocation),
+                "action": "watch_only",
+                "status": "missing_strategy_id" if not strategy_id else "ready_for_paper_shadow",
+                "shadow_status": shadow_status,
+                "shadow_symbols": symbols,
+            }
+        )
+    return {
+        "kind": "alphainsider_paper_watch_plan",
+        "generated_at": _iso(now),
+        "strategy_id": ALPHAINSIDER_PAPER_WATCH_ID,
+        "name": ALPHAINSIDER_PAPER_WATCH_DEFINITION["name"],
+        "analysis_only": True,
+        "paper_only": True,
+        "execution_authority": "none",
+        "forbidden_effects": [
+            "submit_live_order",
+            "submit_alphainsider_order",
+            "submit_paper_order",
+            "start_bot",
+            "guess_strategy_id",
+            "guess_bot_id",
+            "waive_live_gate",
+        ],
+        "paper_account": {
+            "status": paper_account.get("status"),
+            "buying_power": str(paper_account.get("buying_power", "")),
+            "equity": str(paper_account.get("equity", "")),
+            "portfolio_value": str(paper_account.get("portfolio_value", "")),
+        },
+        "reserved_tournament_budget_usd": _money(reserve),
+        "available_shadow_budget_usd": _money(available),
+        "max_allocation_per_strategy_usd": _money(max_allocation_per_strategy),
+        "strategy_count": len(selected),
+        "watch_items": watch_items,
+        "paper_shadow_mode": "paper_strategy_emulation",
+        "paper_shadow_spend_usd": _money(paper_shadow_spend),
+        "shadow_order_count": len(paper_shadow_orders),
+        "paper_shadow_orders": paper_shadow_orders,
+        "fetch_status": fetch_status,
+        "fetch_reason": fetch_reason,
+        "alphainsider_env_status": dict(env_status or {}),
+        "notes": [
+            "Uses only paper buying power left after the existing tournament reserve.",
+            "AlphaInsider data is a comparison source, not trade truth.",
+            "Paper-shadow orders are fake emulation records until a separate paper-submit gate is built.",
+            "No AlphaInsider, Alpaca paper, or Alpaca live order is submitted by this plan.",
+        ],
+    }
+
+
+def strategy_equity(strategy: Mapping, market_data: Mapping[str, Mapping]) -> Decimal:
+    return _as_decimal(strategy.get("cash")) + strategy_position_value(strategy, market_data)
+
+
+def _max_drawdown(equity_history: Sequence[Mapping]) -> Decimal:
+    peak = Decimal("0")
+    worst = Decimal("0")
+    for item in equity_history:
+        equity = _as_decimal(item.get("equity"))
+        if equity > peak:
+            peak = equity
+        if peak > 0:
+            drawdown = (equity - peak) / peak
+            if drawdown < worst:
+                worst = drawdown
+    return worst
+
+
+def _position_win_rate_pct(strategy: Mapping, market_data: Mapping[str, Mapping]) -> str:
+    if _tracked_days(strategy) <= 1:
+        return "0.00"
+    positions = [
+        (symbol, position)
+        for symbol, position in (strategy.get("positions") or {}).items()
+        if _as_decimal(position.get("qty")) > 0
+    ]
+    if not positions:
+        return "0.00"
+    wins = 0
+    for symbol, position in positions:
+        current_value = (
+            _as_decimal(position.get("cost_basis"))
+            if not market_data and position.get("source") == "imported_current_paper_position"
+            else _as_decimal(position.get("qty")) * _current_price(symbol, position, market_data)
+        )
+        if current_value > _as_decimal(position.get("cost_basis")):
+            wins += 1
+    return str((Decimal(wins) / Decimal(len(positions)) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+
+def _strategy_turnover(strategy: Mapping) -> Decimal:
+    return sum(_as_decimal(order.get("notional")) for order in strategy.get("orders") or [])
+
+
+def _tracked_days(strategy: Mapping) -> int:
+    days = set()
+    for item in strategy.get("equity_history") or []:
+        try:
+            days.add(datetime.datetime.fromisoformat(str(item.get("generated_at"))).date())
+        except ValueError:
+            continue
+    return len(days)
+
+
+def record_equity_snapshot(
+    ledger: dict,
+    *,
+    market_data: Mapping[str, Mapping],
+    now: datetime.datetime | None = None,
+) -> None:
+    now = now or _now()
+    generated_at = _iso(now)
+    for strategy in ledger.get("strategies", {}).values():
+        equity = strategy_equity(strategy, market_data)
+        history = strategy.setdefault("equity_history", [])
+        if history and str(history[-1].get("generated_at")) == generated_at:
+            history[-1]["equity"] = _money(equity)
+        else:
+            history.append({"generated_at": generated_at, "equity": _money(equity)})
+
+
+def _scorecard_metrics_from_ranking(ranking: Mapping[str, object] | None) -> dict[str, object]:
+    if not ranking:
+        return {}
+    keys = (
+        "equity",
+        "total_return",
+        "total_return_pct",
+        "max_drawdown_pct",
+        "win_rate_pct",
+        "turnover",
+        "cash_usage_pct",
+        "tracked_days",
+    )
+    return {key: ranking.get(key) for key in keys if key in ranking}
+
+
+def build_popular_strategy_scorecards(ledger: Mapping, *, report: Mapping | None = None) -> list[dict]:
+    """Return paper-only scorecards for popular strategy families.
+
+    These scorecards make the experiments auditable. They do not submit orders or
+    grant live authority; live mirroring still depends on the deterministic
+    tournament promotion and Alpaca gates.
+    """
+    rankings = {
+        str(item.get("strategy_id")): item
+        for item in (report or {}).get("rankings", [])
+        if isinstance(item, Mapping)
+    }
+    strategies = ledger.get("strategies") or {}
+    live_candidate = (report or {}).get("live_strategy_candidate") or {}
+    alpha_plan = ledger.get("alphainsider_paper_watch_plan") or {}
+    scorecards: list[dict] = []
+    for strategy_id, definition in POPULAR_STRATEGY_SCORECARD_DEFINITIONS.items():
+        active_paper = strategy_id in strategies
+        is_alpha = strategy_id == ALPHAINSIDER_PAPER_WATCH_ID
+        if active_paper:
+            status = "active_paper_sleeve"
+            paper_metrics = _scorecard_metrics_from_ranking(rankings.get(strategy_id))
+        elif is_alpha and alpha_plan:
+            status = "paper_shadow_watch"
+            paper_metrics = {
+                "strategy_count": alpha_plan.get("strategy_count", 0),
+                "available_shadow_budget_usd": alpha_plan.get("available_shadow_budget_usd", "0.00"),
+                "paper_shadow_spend_usd": alpha_plan.get("paper_shadow_spend_usd", "0.00"),
+                "shadow_order_count": alpha_plan.get("shadow_order_count", 0),
+            }
+        else:
+            status = str(definition.get("status_when_missing", "planned_paper_sleeve"))
+            paper_metrics = {}
+
+        promoted_by_tournament = (
+            active_paper
+            and live_candidate.get("status") == "candidate"
+            and live_candidate.get("strategy_id") == strategy_id
+        )
+        scorecards.append(
+            {
+                "strategy_id": strategy_id,
+                "name": definition["name"],
+                "status": status,
+                "setup_type": definition["setup_type"],
+                "thesis": definition["thesis"],
+                "paper_only": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "forbidden_effects": [
+                    "submit_live_order",
+                    "submit_paper_order_without_tournament_gate",
+                    "promote_live_strategy_without_report_candidate",
+                    "waive_live_gate",
+                ],
+                "paper_metrics": paper_metrics,
+                "pass_criteria": list(definition["pass_criteria"]),
+                "fail_criteria": list(definition["fail_criteria"]),
+                "rotation_schedule": definition.get("rotation_schedule"),
+                "live_mirror_allowed": bool(promoted_by_tournament),
+                "live_mirror_policy": (
+                    "Only after this scorecard is the live_strategy_candidate and the deterministic Alpaca live gate passes."
+                ),
+            }
+        )
+    return scorecards
+
+
+def build_tournament_report(
+    ledger: Mapping,
+    *,
+    market_data: Mapping[str, Mapping],
+    now: datetime.datetime | None = None,
+    min_promotion_days: int = 5,
+) -> dict:
+    now = now or _now()
+    rankings = []
+    for strategy_id, strategy in ledger.get("strategies", {}).items():
+        equity = strategy_equity(strategy, market_data)
+        if not market_data and strategy.get("equity_history"):
+            equity = _as_decimal(strategy["equity_history"][-1].get("equity"))
+        start = _as_decimal(strategy.get("starting_capital"))
+        total_return = equity - start
+        total_return_pct = Decimal("0") if start <= 0 else total_return / start
+        rankings.append(
+            {
+                "strategy_id": strategy_id,
+                "name": strategy.get("name"),
+                "equity": _money(equity),
+                "cash": _money(strategy.get("cash")),
+                "position_value": _money(strategy_position_value(strategy, market_data)),
+                "open_order_reserve": _money(strategy_open_order_reserve(strategy)),
+                "realized_pl": _money(strategy.get("realized_pl")),
+                "total_return": _money(total_return),
+                "total_return_pct": str((total_return_pct * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+                "max_drawdown_pct": str((_max_drawdown(strategy.get("equity_history") or []) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)),
+                "win_rate_pct": _position_win_rate_pct(strategy, market_data),
+                "turnover": _money(_strategy_turnover(strategy)),
+                "cash_usage_pct": str(((Decimal("1") - (_as_decimal(strategy.get("cash")) / start)) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_DOWN) if start > 0 else Decimal("0.00")),
+                "tracked_days": _tracked_days(strategy),
+                "open_orders": [
+                    order for order in strategy.get("orders", [])
+                    if str(order.get("status", "")).lower() not in {"filled", "canceled", "expired", "rejected"}
+                ],
+            }
+        )
+    rankings.sort(
+        key=lambda item: (
+            _as_decimal(item["total_return"]),
+            _as_decimal(item["max_drawdown_pct"]),
+        ),
+        reverse=True,
+    )
+    top = rankings[0] if rankings else None
+    if top and top["tracked_days"] >= min_promotion_days and _as_decimal(top["total_return"]) > 0:
+        live_candidate = {
+            "status": "candidate",
+            "strategy_id": top["strategy_id"],
+            "reason": f"best positive paper strategy after {top['tracked_days']} tracked day(s)",
+        }
+    else:
+        live_candidate = {
+            "status": "pending",
+            "strategy_id": top["strategy_id"] if top else None,
+            "reason": f"need at least {min_promotion_days} tracked days and a positive winner",
+        }
+    report = {
+        "generated_at": _iso(now),
+        "tournament_id": ledger.get("tournament_id"),
+        "started_at": ledger.get("started_at"),
+        "ends_at": ledger.get("ends_at"),
+        "capital_per_strategy": ledger.get("capital_per_strategy"),
+        "rankings": rankings,
+        "live_strategy_candidate": live_candidate,
+    }
+    report["popular_strategy_scorecards"] = build_popular_strategy_scorecards(ledger, report=report)
+    return report
+
+
+def _symbols_held(strategy: Mapping) -> set[str]:
+    return {
+        symbol.upper()
+        for symbol, position in (strategy.get("positions") or {}).items()
+        if _as_decimal(position.get("qty")) > 0
+    }
+
+
+def _buy_limit(price: Decimal, *, extended_hours: bool) -> Decimal:
+    buffer = Decimal("1.003") if extended_hours else Decimal("1.002")
+    return (price * buffer).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def _action_notional(strategy: Mapping, preferred: Decimal) -> Decimal:
+    available = strategy_available_cash(strategy)
+    if available < Decimal("100"):
+        return Decimal("0")
+    return min(preferred, available).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def build_tournament_actions(
+    ledger: Mapping,
+    *,
+    candidate_signals: Sequence[CandidateSignal],
+    market_session: str,
+    strategy_ids: Sequence[str] | None = None,
+) -> list[TournamentAction]:
+    if market_session not in {"pre_open", "open_window", "regular", "pre_close"}:
+        return []
+    selected = list(strategy_ids or STRATEGY_IDS)
+    strategies = ledger.get("strategies", {})
+    actions: list[TournamentAction] = []
+    extended_hours = market_session == "pre_open"
+
+    if STRATEGY_CURRENT_AGGRESSIVE in selected:
+        strategy = strategies[STRATEGY_CURRENT_AGGRESSIVE]
+        held = _symbols_held(strategy)
+        best = next(
+            (
+                signal for signal in candidate_signals
+                if signal.symbol not in held and signal.score >= Decimal("0.70")
+            ),
+            None,
+        )
+        notional = _action_notional(strategy, Decimal("2000"))
+        if best and notional > 0:
+            actions.append(
+                TournamentAction(
+                    strategy_id=STRATEGY_CURRENT_AGGRESSIVE,
+                    action="buy",
+                    symbol=best.symbol,
+                    side="buy",
+                    notional=notional,
+                    limit_price=_buy_limit(best.current_price, extended_hours=extended_hours),
+                    reason=f"aggressive top ranked candidate: {best.reason}",
+                    extended_hours=extended_hours,
+                )
+            )
+
+    if STRATEGY_PULLBACK_SUPPORT in selected:
+        strategy = strategies[STRATEGY_PULLBACK_SUPPORT]
+        held = _symbols_held(strategy)
+        pullbacks = [
+            signal for signal in candidate_signals
+            if signal.symbol not in held
+            and Decimal("-0.025") <= signal.day_change_pct <= Decimal("-0.003")
+            and signal.volume_ratio <= Decimal("2.5")
+        ]
+        pullbacks.sort(key=lambda signal: (signal.volume_ratio, -abs(signal.day_change_pct)), reverse=True)
+        notional = _action_notional(strategy, Decimal("1500"))
+        if pullbacks and notional > 0:
+            best = pullbacks[0]
+            actions.append(
+                TournamentAction(
+                    strategy_id=STRATEGY_PULLBACK_SUPPORT,
+                    action="buy",
+                    symbol=best.symbol,
+                    side="buy",
+                    notional=notional,
+                    limit_price=_buy_limit(best.current_price, extended_hours=extended_hours),
+                    reason=f"disciplined pullback setup: {best.reason}",
+                    extended_hours=extended_hours,
+                )
+            )
+
+    if STRATEGY_CATALYST_ROTATION in selected:
+        strategy = strategies[STRATEGY_CATALYST_ROTATION]
+        held = _symbols_held(strategy)
+        catalysts = [
+            signal for signal in candidate_signals
+            if signal.symbol not in held and signal.time_sensitive and signal.score >= Decimal("0.65")
+        ]
+        notional = _action_notional(strategy, Decimal("2000"))
+        if catalysts and notional > 0:
+            best = catalysts[0]
+            actions.append(
+                TournamentAction(
+                    strategy_id=STRATEGY_CATALYST_ROTATION,
+                    action="buy",
+                    symbol=best.symbol,
+                    side="buy",
+                    notional=notional,
+                    limit_price=_buy_limit(best.current_price, extended_hours=extended_hours),
+                    reason=f"time-sensitive catalyst/relative-strength setup: {best.reason}",
+                    extended_hours=extended_hours,
+                )
+            )
+
+    return actions
+
+
+def _client_order_id(action: TournamentAction, *, now: datetime.datetime, index: int) -> str:
+    prefix = _STRATEGY_CLIENT_PREFIX[action.strategy_id]
+    raw = f"ta-paperbot-{prefix}-{now.strftime('%y%m%d%H%M')}-{index}-{action.symbol.lower()}"
+    return raw[:48]
+
+
+def build_tournament_order_payloads(
+    actions: Sequence[TournamentAction],
+    *,
+    now: datetime.datetime | None = None,
+) -> list[dict]:
+    now = now or _now()
+    payloads = []
+    for index, action in enumerate(actions, start=1):
+        payloads.append(
+            {
+                "strategy_id": action.strategy_id,
+                "symbol": action.symbol.upper(),
+                "side": action.side.lower(),
+                "type": "limit",
+                "time_in_force": "day",
+                "limit_price": _price(action.limit_price),
+                "notional": _money(action.notional),
+                "extended_hours": bool(action.extended_hours),
+                "client_order_id": _client_order_id(action, now=now, index=index),
+                "reason": action.reason,
+            }
+        )
+    return payloads
+
+
+def record_submitted_orders(ledger: dict, submitted_orders: Sequence[Mapping], *, now: datetime.datetime | None = None) -> None:
+    now = now or _now()
+    recorded_at = _iso(now)
+    strategies = ledger.get("strategies", {})
+    for order in submitted_orders:
+        strategy_id = str(order.get("strategy_id") or _strategy_from_client_order_id(order.get("client_order_id")))
+        if strategy_id not in strategies:
+            continue
+        strategies[strategy_id].setdefault("orders", []).append(
+            {
+                "client_order_id": str(order.get("client_order_id", "")),
+                "id": str(order.get("id", "")),
+                "symbol": str(order.get("symbol", "")).upper(),
+                "side": str(order.get("side", "")),
+                "type": str(order.get("type", "")),
+                "status": str(order.get("status", "submitted")),
+                "notional": _money(order.get("notional")),
+                "limit_price": _price(order.get("limit_price")),
+                "filled_qty": str(order.get("filled_qty", "0") or "0"),
+                "filled_avg_price": str(order.get("filled_avg_price", "") or ""),
+                "applied_filled_qty": "0",
+                "submitted_at": recorded_at,
+                "reason": str(order.get("reason", "")),
+            }
+        )
+
+
+def _strategy_from_client_order_id(client_order_id: object) -> str | None:
+    raw = str(client_order_id or "")
+    if raw.startswith("ta-paperbot-current-aggressive"):
+        return STRATEGY_CURRENT_AGGRESSIVE
+    if raw.startswith("ta-paperbot-pullback-support"):
+        return STRATEGY_PULLBACK_SUPPORT
+    if raw.startswith("ta-paperbot-catalyst"):
+        return STRATEGY_CATALYST_ROTATION
+    return None
+
+
+def reconcile_tournament_orders(
+    ledger: dict,
+    alpaca_orders: Iterable[Mapping],
+    *,
+    now: datetime.datetime | None = None,
+) -> None:
+    now = now or _now()
+    order_by_client_id = {
+        str(order.get("client_order_id", "")): order
+        for order in alpaca_orders
+        if str(order.get("client_order_id", "")).startswith("ta-paperbot-")
+    }
+    for strategy in ledger.get("strategies", {}).values():
+        for local_order in strategy.get("orders") or []:
+            client_order_id = local_order.get("client_order_id")
+            if client_order_id not in order_by_client_id:
+                continue
+            remote = order_by_client_id[client_order_id]
+            local_order["status"] = str(remote.get("status", local_order.get("status", "")))
+            local_order["id"] = str(remote.get("id", local_order.get("id", "")))
+            local_order["filled_qty"] = str(remote.get("filled_qty", local_order.get("filled_qty", "0")) or "0")
+            local_order["filled_avg_price"] = str(remote.get("filled_avg_price", local_order.get("filled_avg_price", "")) or "")
+            _apply_new_fill(strategy, local_order, now=now)
+
+
+def _apply_new_fill(strategy: dict, order: dict, *, now: datetime.datetime) -> None:
+    filled_qty = _as_decimal(order.get("filled_qty"))
+    applied_qty = _as_decimal(order.get("applied_filled_qty"))
+    delta_qty = filled_qty - applied_qty
+    if delta_qty <= 0:
+        return
+    price = _as_decimal(order.get("filled_avg_price") or order.get("limit_price"))
+    if price <= 0:
+        return
+    symbol = str(order.get("symbol", "")).upper()
+    side = str(order.get("side", "")).lower()
+    value = delta_qty * price
+    positions = strategy.setdefault("positions", {})
+    if side == "buy":
+        existing = positions.get(symbol, {})
+        existing_qty = _as_decimal(existing.get("qty"))
+        existing_cost = _as_decimal(existing.get("cost_basis"))
+        new_qty = existing_qty + delta_qty
+        new_cost = existing_cost + value
+        positions[symbol] = {
+            "symbol": symbol,
+            "qty": str(new_qty.normalize()),
+            "avg_entry_price": _price(new_cost / new_qty if new_qty > 0 else price),
+            "cost_basis": _money(new_cost),
+            "baseline_value": existing.get("baseline_value", "0.00"),
+            "baseline_unrealized_pl": existing.get("baseline_unrealized_pl", "0.00"),
+            "current_price": _price(price),
+            "source": existing.get("source", "tournament_order"),
+        }
+        strategy["cash"] = _money(_as_decimal(strategy.get("cash")) - value)
+    order["applied_filled_qty"] = str(filled_qty.normalize())
+    order["last_reconciled_at"] = _iso(now)
+
+
+def write_tournament_packet(packet: Mapping, output_dir: str | Path, *, prefix: str) -> Path:
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S-%f")
+    packet_path = _unique_packet_path(path, f"{prefix}-{timestamp}")
+    _atomic_write_text(packet_path, json.dumps(packet, indent=2))
+    return packet_path
+
+
+def maybe_write_live_strategy_selection(
+    report: Mapping,
+    output_dir: str | Path,
+    *,
+    now: datetime.datetime | None = None,
+) -> Path | None:
+    candidate = report.get("live_strategy_candidate") or {}
+    if candidate.get("status") != "candidate" or not candidate.get("strategy_id"):
+        return None
+    now = now or _now()
+    selection = {
+        "status": "active",
+        "strategy_id": candidate["strategy_id"],
+        "selected_at": _iso(now),
+        "reason": candidate.get("reason", ""),
+        "source_tournament_id": report.get("tournament_id"),
+        "source_report_generated_at": report.get("generated_at"),
+    }
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    selection_path = path / LIVE_SELECTION_FILE
+    selection_path.write_text(json.dumps(selection, indent=2), encoding="utf-8")
+    return selection_path
+
+
+def load_live_strategy_selection(log_dir: str | Path) -> dict | None:
+    selection_path = Path(log_dir) / LIVE_SELECTION_FILE
+    if not selection_path.exists():
+        return None
+    try:
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if selection.get("status") != "active" or selection.get("strategy_id") not in STRATEGY_IDS:
+        return None
+    return selection
+
+
+def adapt_candidate_signals_for_live_strategy(
+    strategy_id: str | None,
+    candidate_signals: Sequence[CandidateSignal],
+) -> list[CandidateSignal]:
+    if strategy_id == STRATEGY_PULLBACK_SUPPORT:
+        adjusted = []
+        for signal in candidate_signals:
+            if Decimal("-0.025") <= signal.day_change_pct <= Decimal("-0.003"):
+                adjusted.append(
+                    replace(
+                        signal,
+                        score=max(signal.score, Decimal("0.76")),
+                        time_sensitive=True,
+                        reason=f"live pullback winner profile: {signal.reason}",
+                    )
+                )
+        return sorted(adjusted, key=lambda signal: signal.score, reverse=True)
+    if strategy_id == STRATEGY_CATALYST_ROTATION:
+        adjusted = []
+        for signal in candidate_signals:
+            if signal.time_sensitive or signal.volume_ratio >= Decimal("1.5"):
+                adjusted.append(
+                    replace(
+                        signal,
+                        score=max(signal.score, Decimal("0.76")),
+                        time_sensitive=True,
+                        reason=f"live catalyst winner profile: {signal.reason}",
+                    )
+                )
+        return sorted(adjusted, key=lambda signal: signal.score, reverse=True)
+    return list(candidate_signals)

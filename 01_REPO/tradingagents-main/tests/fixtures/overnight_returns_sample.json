@@ -1,0 +1,16 @@
+{
+  "rows": [
+    {
+      "symbol": "NVDA",
+      "as_of": "2026-05-01",
+      "actual_return": "0.0400",
+      "benchmark_return": "0.0100"
+    },
+    {
+      "symbol": "MSFT",
+      "as_of": "2026-05-01",
+      "actual_return": "0.0010",
+      "benchmark_return": "0.0020"
+    }
+  ]
+}

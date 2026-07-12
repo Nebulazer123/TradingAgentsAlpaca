@@ -1,0 +1,89 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "commandWindows": "python .codex\\hooks\\token_context_hook.py",
+            "timeout": 30,
+            "statusMessage": "Refreshing TradingAgents compact context"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "commandWindows": "python .codex\\hooks\\token_context_hook.py",
+            "timeout": 30,
+            "statusMessage": "Preparing compact TradingAgents context for subagent"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "commandWindows": "python .codex\\hooks\\token_context_hook.py",
+            "timeout": 20,
+            "statusMessage": "Recording compact subagent finish event"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "commandWindows": "python .codex\\hooks\\token_context_hook.py",
+            "timeout": 15,
+            "statusMessage": "Checking TradingAgents compact-context guidance"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "commandWindows": "python .codex\\hooks\\token_context_hook.py",
+            "timeout": 20,
+            "statusMessage": "Writing compact TradingAgents handoff marker"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "commandWindows": "python .codex\\hooks\\token_context_hook.py",
+            "timeout": 30,
+            "statusMessage": "Rehydrating TradingAgents compact context"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "commandWindows": "python .codex\\hooks\\token_context_hook.py",
+            "timeout": 30,
+            "statusMessage": "Recording compact TradingAgents turn event"
+          }
+        ]
+      }
+    ]
+  }
+}

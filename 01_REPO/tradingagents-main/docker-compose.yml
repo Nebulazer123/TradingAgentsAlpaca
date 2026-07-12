@@ -1,0 +1,64 @@
+services:
+  tradingagents:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - tradingagents_data:/home/appuser/.tradingagents
+    tty: true
+    stdin_open: true
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    profiles:
+      - ollama
+
+  tradingagents-ollama:
+    build: .
+    env_file:
+      - .env
+    environment:
+      - TRADINGAGENTS_LLM_PROVIDER=ollama
+    volumes:
+      - tradingagents_data:/home/appuser/.tradingagents
+    depends_on:
+      - ollama
+    tty: true
+    stdin_open: true
+    profiles:
+      - ollama
+
+  # Self-hosted n8n as a READ-ONLY observer/control-plane wrapper for the
+  # TradingAgents automations. It can only call the allowlisted local runner
+  # bridge (see scripts/start-n8n-tradingagents-runner.ps1) over
+  # host.docker.internal:8765; it never gets Alpaca credentials and never runs
+  # submit-capable commands. Start with:
+  #   docker compose --profile n8n up -d n8n
+  # then open http://localhost:5678 and create your own local owner account.
+  n8n:
+    image: n8nio/n8n:latest
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_SECURE_COOKIE=false
+      - N8N_RUNNERS_ENABLED=true
+      - WEBHOOK_URL=http://localhost:5678/
+      - GENERIC_TIMEZONE=America/Chicago
+      - TZ=America/Chicago
+    volumes:
+      - n8n_data:/home/node/.n8n
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    profiles:
+      - n8n
+
+volumes:
+  tradingagents_data:
+  ollama_data:
+  n8n_data:

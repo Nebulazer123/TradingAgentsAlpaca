@@ -1,0 +1,14 @@
+version = 1
+id = "paper-strategy-tournament-runner"
+kind = "cron"
+name = "Paper Strategy Tournament Runner"
+prompt = "Run one paper-only TradingAgents strategy tournament tick.\n\nStart with compact context: run `python scripts/automation_context_snapshot.py --write`, then read `results/_context/latest-summary.json`, `results/_context/latest-flags.json`, and `results/_context/recent-deltas.md`. Open raw packets only when those files flag submitted paper actions, issues, blockers, changed tournament leader, changed live candidate, schema mismatch, or unexplained actions.\n\nUse the repo executable directly: `& \"C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main\\.venv\\Scripts\\tradingagents.exe\" ...`.\n\nRequired sequence:\n1. If the tournament ledger is missing, run `alpaca paper-tournament init --capital-per-strategy 10000 --json-output --log-dir results/paper_strategy_tournament`.\n2. Build the AlphaInsider popular-strategy paper watch with `alpaca paper-tournament alphainsider-watch --json-output --log-dir results/paper_strategy_tournament`. It uses only remaining Alpaca paper buying power after the reserved $30,000 tournament budget and must never call AlphaInsider trade, bot-start, bot-stop, or live broker endpoints.\n3. Run `alpaca paper-tournament run --all --json-output --log-dir results/paper_strategy_tournament`.\n4. Confirm the packet has `submitted_count`, `report.rankings`, `ledger_path`, and `packet_path`. Confirm AlphaInsider watch is `paper_only: true`, `analysis_only: true`, and `execution_authority: none`.\n5. Post in-thread only when paper orders submit, a blocker appears, the live strategy candidate changes, or AlphaInsider watch status/watchlist changes. Routine quiet checks just write packets.\n\nThis automation is paper-only and must never place live orders. It compares current-aggressive, pullback-support, and catalyst-relative-strength sleeves plus the AlphaInsider shadow watch. If something breaks, self-heal when safe. If a blocker must be posted, explain it simply: Plain English, What happened, Problem, Money today, Paper account, Need from you. Never ask for per-trade approval or code-level fixes."
+status = "PAUSED"
+rrule = "RRULE:FREQ=HOURLY;INTERVAL=1;BYMINUTE=5;BYDAY=SU,MO,TU,WE,TH,FR,SA"
+model = "gpt-5.4-mini"
+reasoning_effort = "medium"
+execution_environment = "local"
+target = { type = "project", project_id = "C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main" }
+cwds = ["C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main"]
+created_at = 1780214428387
+updated_at = 1783808416236

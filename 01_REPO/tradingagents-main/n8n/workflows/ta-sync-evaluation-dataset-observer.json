@@ -1,0 +1,61 @@
+{
+  "name": "TA · Sync Evaluation Dataset (observer)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Run observer",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        80,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"n8n_evaluation_dataset\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-0-n8n-evaluation-dataset",
+      "name": "n8n_evaluation_dataset",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Run observer": {
+      "main": [
+        [
+          {
+            "node": "n8n_evaluation_dataset",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": [
+    {
+      "name": "tradingagents"
+    },
+    {
+      "name": "observer"
+    }
+  ]
+}

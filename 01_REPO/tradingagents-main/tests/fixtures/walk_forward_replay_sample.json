@@ -1,0 +1,124 @@
+{
+  "rows": [
+    {
+      "symbol": "NVDA",
+      "as_of": "2026-05-01",
+      "baseline_action": "buy",
+      "baseline_probability": "0.70",
+      "actual_return": "0.0400",
+      "benchmark_return": "0.0100",
+      "overlays": {
+        "official_context_overlay": {"action": "buy", "probability": "0.68"},
+        "tradingagents_advisory_overlay": {"action": "hold", "probability": "0.55"}
+      }
+    },
+    {
+      "symbol": "MSFT",
+      "as_of": "2026-05-02",
+      "baseline_action": "buy",
+      "baseline_probability": "0.65",
+      "actual_return": "-0.0200",
+      "benchmark_return": "0.0050",
+      "overlays": {
+        "official_context_overlay": {"action": "hold", "probability": "0.54"},
+        "tradingagents_advisory_overlay": {"action": "sell", "probability": "0.61"}
+      }
+    },
+    {
+      "symbol": "AAPL",
+      "as_of": "2026-05-03",
+      "baseline_action": "sell",
+      "baseline_probability": "0.60",
+      "actual_return": "-0.0150",
+      "benchmark_return": "0.0100",
+      "overlays": {
+        "official_context_overlay": {"action": "sell", "probability": "0.62"},
+        "tradingagents_advisory_overlay": {"action": "sell", "probability": "0.64"}
+      }
+    },
+    {
+      "symbol": "AMZN",
+      "as_of": "2026-05-04",
+      "baseline_action": "hold",
+      "baseline_probability": "0.52",
+      "actual_return": "0.0020",
+      "benchmark_return": "0.0010",
+      "overlays": {
+        "official_context_overlay": {"action": "hold", "probability": "0.56"},
+        "tradingagents_advisory_overlay": {"action": "buy", "probability": "0.58"}
+      }
+    },
+    {
+      "symbol": "GOOGL",
+      "as_of": "2026-05-05",
+      "baseline_action": "buy",
+      "baseline_probability": "0.63",
+      "actual_return": "0.0180",
+      "benchmark_return": "0.0040",
+      "overlays": {
+        "official_context_overlay": {"action": "buy", "probability": "0.64"},
+        "tradingagents_advisory_overlay": {"action": "buy", "probability": "0.66"}
+      }
+    },
+    {
+      "symbol": "META",
+      "as_of": "2026-05-06",
+      "baseline_action": "buy",
+      "baseline_probability": "0.61",
+      "actual_return": "-0.0080",
+      "benchmark_return": "0.0060",
+      "overlays": {
+        "official_context_overlay": {"action": "hold", "probability": "0.57"},
+        "tradingagents_advisory_overlay": {"action": "sell", "probability": "0.59"}
+      }
+    },
+    {
+      "symbol": "TSLA",
+      "as_of": "2026-05-07",
+      "baseline_action": "sell",
+      "baseline_probability": "0.58",
+      "actual_return": "0.0300",
+      "benchmark_return": "0.0050",
+      "overlays": {
+        "official_context_overlay": {"action": "hold", "probability": "0.51"},
+        "tradingagents_advisory_overlay": {"action": "buy", "probability": "0.60"}
+      }
+    },
+    {
+      "symbol": "AMD",
+      "as_of": "2026-05-08",
+      "baseline_action": "buy",
+      "baseline_probability": "0.67",
+      "actual_return": "0.0250",
+      "benchmark_return": "0.0030",
+      "overlays": {
+        "official_context_overlay": {"action": "buy", "probability": "0.65"},
+        "tradingagents_advisory_overlay": {"action": "buy", "probability": "0.69"}
+      }
+    },
+    {
+      "symbol": "AVGO",
+      "as_of": "2026-05-09",
+      "baseline_action": "hold",
+      "baseline_probability": "0.53",
+      "actual_return": "-0.0010",
+      "benchmark_return": "0.0010",
+      "overlays": {
+        "official_context_overlay": {"action": "hold", "probability": "0.55"},
+        "tradingagents_advisory_overlay": {"action": "hold", "probability": "0.52"}
+      }
+    },
+    {
+      "symbol": "JPM",
+      "as_of": "2026-05-10",
+      "baseline_action": "sell",
+      "baseline_probability": "0.59",
+      "actual_return": "-0.0120",
+      "benchmark_return": "0.0020",
+      "overlays": {
+        "official_context_overlay": {"action": "sell", "probability": "0.60"},
+        "tradingagents_advisory_overlay": {"action": "sell", "probability": "0.57"}
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+FROM hf.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
+
+PARAMETER num_ctx 4096
+PARAMETER num_predict 350
+PARAMETER temperature 0.7
+PARAMETER top_p 0.8
+PARAMETER presence_penalty 1.5
+
+SYSTEM """You are the local TradingAgents reasoning model. Follow the requested schema exactly, keep outputs compact, and do not emit private reasoning."""

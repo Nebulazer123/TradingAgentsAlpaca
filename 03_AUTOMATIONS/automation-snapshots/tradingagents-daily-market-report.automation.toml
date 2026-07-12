@@ -1,0 +1,14 @@
+version = 1
+id = "tradingagents-daily-market-report"
+kind = "cron"
+name = "Email Daily Market Report"
+prompt = "Send the one daily TradingAgents market supervisor email report after the final after-close packet has had time to finish.\n\nStart with compact context: run `python scripts/automation_context_snapshot.py --write`, then read `results/_context/latest-summary.json`, `results/_context/latest-flags.json`, and `results/_context/recent-deltas.md`. Open raw packets only when those files flag submitted actions, issues, blockers, stale data, changed candidates, changed tournament leader, abnormal P/L, schema mismatch, or unexplained actions.\n\nUse the repo executable directly: `& \"C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main\\.venv\\Scripts\\tradingagents.exe\" ...`.\n\nRequired sequence:\n1. Refresh earned agent influence with `research agent-ledger-summary --json-output`. If the ledger has no due/resolved forecasts yet, keep going and say it is still building history.\n2. Run `alpaca supervisor-daily-report --json-output --log-dir results/hourly_supervisor --paper-tournament-log-dir results/paper_strategy_tournament --premarket-brief-log-dir results/premarket_briefs --email-to nebulazer2003@gmail.com`.\n3. Use the returned `subject` and `body` fields as the email. Do not rewrite the body into a longer format.\n4. Post the same concise report in-thread plus only compact extra paths: latest research orchestration packet, provider/source packet count, Agent Intelligence Ledger summary/influence weights, AlphaInsider paper-watch status, and current live gate/risk-envelope state if present.\n\nThis automation must never place trades. The Python report renderer owns the human-readable email. It should explain, like Corbin is 15, the important data using short sections such as Plain English, What happened, Problem, Money today, Live account, Paper account, Open orders, Submitted orders, Rejected/canceled orders when needed, and Need from you. Do not ask for per-trade approval, per-promotion approval, or code-level fixes. Read current live authority from `config/risk_envelope.yaml`, `results/policy/live_control.json`, broker buying power, and unified live-gate state; do not assume a no-cap mode or any stale fixed cap from memory."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=15;BYMINUTE=30;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.4-mini"
+reasoning_effort = "medium"
+execution_environment = "local"
+target = { type = "project", project_id = "C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main" }
+cwds = ["C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main"]
+created_at = 1780017852633
+updated_at = 1783808416733

@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "jobs": {
+    "context_snapshot": {
+      "description": "Refresh compact TradingAgents context only. Does not call broker submit paths.",
+      "commands": [
+        ["python", "scripts/automation_context_snapshot.py", "--write"]
+      ],
+      "timeout_seconds": 60,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "pre_open_context_refresh": {
+      "description": "Refresh external MiroFish handoff status first, then compact TradingAgents context for pre-open dashboards. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "mirofish-handoff-status", "--json-output"],
+        ["python", "scripts/automation_context_snapshot.py", "--write"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "daily_report_preview": {
+      "description": "Render the current daily supervisor report for dashboard/notification preview only. Does not send email or submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "alpaca", "supervisor-daily-report", "--json-output", "--compact-json-output", "--daily-report-log-dir", "results/daily_reports/n8n"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "overnight_plan_compact_preview": {
+      "description": "Refresh source-quality flags, then build a bounded compact overnight dashboard preview without writing latest pointers, appending ledger forecasts, running full graph models, or submitting orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "source-quality-review", "--json-output", "--compact-json-output"],
+        ["python", "-m", "cli.main", "alpaca", "plan-overnight", "--json-output", "--compact-json-output", "--full-graph-tickers", "0", "--time-budget-minutes", "0", "--source-quality-review-path", "results/source_quality/latest.json", "--source-quality-ordering", "--top-provider-bundle-count", "0", "--no-agent-ledger", "--no-write-latest", "--log-dir", "results/overnight_plans/n8n"]
+      ],
+      "timeout_seconds": 180,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "premarket_brief_compact_preview": {
+      "description": "Build a compact rolling premarket dashboard preview from local packets without updating latest pointers or submitting orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "alpaca", "premarket-brief", "--json-output", "--compact-json-output", "--no-write-latest", "--log-dir", "results/premarket_briefs/n8n", "--hourly-log-dir", "results/hourly_supervisor", "--overnight-log-dir", "results/overnight_plans", "--paper-tournament-log-dir", "results/paper_strategy_tournament"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "preopen_validation_preview": {
+      "description": "Read fresh Alpaca/context state into an analysis-only pre-open validation packet for dashboards. Does not submit orders or refresh live-control.",
+      "commands": [
+        ["python", "-m", "cli.main", "alpaca", "preopen-validation", "--json-output", "--compact-json-output", "--no-write-latest", "--log-dir", "results/preopen_validation/n8n", "--premarket-brief-log-dir", "results/premarket_briefs", "--overnight-log-dir", "results/overnight_plans"]
+      ],
+      "timeout_seconds": 120,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "hourly_supervisor_dry_run_preview": {
+      "description": "Run the hourly supervisor against live account/market data in dry-run compact preview mode under an n8n-only log directory. Does not submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "alpaca", "supervise-hourly", "--dry-run", "--json-output", "--compact-json-output", "--log-dir", "results/hourly_supervisor/n8n", "--overnight-log-dir", "results/overnight_plans", "--paper-tournament-log-dir", "results/paper_strategy_tournament", "--premarket-brief-log-dir", "results/premarket_briefs", "--execution-board-dir", "results/execution_board"]
+      ],
+      "timeout_seconds": 120,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "n8n_evaluation_dataset": {
+      "description": "Write a Data Table-ready n8n built-in evaluation dataset covering all allowlisted automation wrappers and edge cases. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "n8n-evaluation-dataset", "--json-output", "--compact-json-output"]
+      ],
+      "timeout_seconds": 60,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "overnight_calibration_guard": {
+      "description": "Build the analysis-only walk-forward calibration guard for overnight strategy influence. Cannot submit orders or promote sleeves.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "overnight-calibration-guard", "--json-output"]
+      ],
+      "timeout_seconds": 60,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "research_automation_orchestration_plan": {
+      "description": "Run the analysis-only model/source orchestration health plan for dashboards, including local helper route health. Cannot submit orders or promote sleeves.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "automation-orchestration-plan", "--candidate-symbols", "XOM,ADBE,CVX", "--no-research-context", "--json-output"]
+      ],
+      "timeout_seconds": 120,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "compact_output_audit": {
+      "description": "Measure compact-output byte reductions for high-traffic automation packets. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "alpaca", "compact-output-audit", "--json-output", "--daily-report-log-dir", "results/daily_reports/n8n"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "process_review": {
+      "description": "Run the Plugin Eval-style repo process review. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "process-review", "--json-output"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "automation_health_audit": {
+      "description": "Audit TradingAgents automation schedule evidence and run artifacts. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "automation-health-audit", "--json-output", "--compact-json-output"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "execution_board_review": {
+      "description": "Run the BOARD execution review after hourly activity. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "execution-board-review", "--json-output"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "outcome_labeling": {
+      "description": "Apply resolved Agent Intelligence outcome labels to advisory model and market-mirror reports. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "outcome-labeling", "--json-output"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "mirofish_handoff_status": {
+      "description": "Check whether the external MiroFish run has a final TradingAgents handoff yet. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "mirofish-handoff-status", "--json-output"]
+      ],
+      "timeout_seconds": 60,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "source_quality_review": {
+      "description": "Review research source freshness/quality for dashboard flags. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "source-quality-review", "--json-output", "--compact-json-output"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "loss_review_evidence": {
+      "description": "Build the analysis-only evidence packet for the latest hourly loss-review decision so BOARD can review losers without giving n8n submit authority.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "loss-review-evidence", "--json-output"]
+      ],
+      "timeout_seconds": 180,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "self_heal_handoff": {
+      "description": "Build a safe Codex self-heal handoff when compact context shows supervisor or control-plane errors. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "self-heal-handoff", "--json-output"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "self_heal_plan": {
+      "description": "Classify compact failure signals into audited safe-plane self-heal plans or escalations. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "self-heal-plan", "--json-output"]
+      ],
+      "timeout_seconds": 90,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "self_heal_execute_safe": {
+      "description": "Run only allowlisted safe-plane self-heal refresh/verification actions, then write the audited plan. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "self-heal-plan", "--execute-safe", "--json-output"]
+      ],
+      "timeout_seconds": 120,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "creator_workflow_status": {
+      "description": "Summarize preserved original TradingAgents workflow role artifacts. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "creator-workflow-status", "--json-output"]
+      ],
+      "timeout_seconds": 60,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "agent_ledger_summary": {
+      "description": "Summarize Agent Intelligence Ledger influence weights. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "agent-ledger-summary", "--json-output"]
+      ],
+      "timeout_seconds": 60,
+      "submit_capable": false,
+      "compact_output_only": true
+    },
+    "agent_ledger_update": {
+      "description": "Append latest overnight/MiroFish advisory forecasts, resolve due Agent Intelligence Ledger rows, and write the summary. Analysis-only and cannot submit orders.",
+      "commands": [
+        ["python", "-m", "cli.main", "research", "agent-ledger-update", "--json-output"]
+      ],
+      "timeout_seconds": 120,
+      "submit_capable": false,
+      "compact_output_only": true
+    }
+  }
+}

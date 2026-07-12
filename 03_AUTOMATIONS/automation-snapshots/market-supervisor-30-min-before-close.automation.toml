@@ -1,0 +1,14 @@
+version = 1
+id = "market-supervisor-30-min-before-close"
+kind = "cron"
+name = "Market Supervisor 30 Min Before Close"
+prompt = "Run the TradingAgents supervisor 30 minutes before the regular U.S. stock market close.\n\nStart with compact context: run `python scripts/automation_context_snapshot.py --write`, then read `results/_context/latest-summary.json`, `results/_context/latest-flags.json`, and `results/_context/recent-deltas.md`. Open raw packets only when those files flag submitted actions, issues, blockers, stale data, changed candidates, changed tournament leader, abnormal P/L, schema mismatch, or unexplained actions.\n\nUse the repo executable directly: `& \"C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main\\.venv\\Scripts\\tradingagents.exe\" ...`.\n\nRequired sequence:\n1. Run `alpaca check` through the repo executable.\n2. Run `alpaca supervise-hourly --dry-run --json-output --notification-policy urgent-exceptions --log-dir results/hourly_supervisor --overnight-log-dir results/overnight_plans --paper-tournament-log-dir results/paper_strategy_tournament --premarket-brief-log-dir results/premarket_briefs`.\n3. If the dry-run has valid actions and no issues, run the same supervisor command with `--submit-actions`. The unified live-submit guard is the only live authority.\n4. Refresh `alpaca premarket-brief --json-output` after the final supervisor packet.\n5. Email only for CRITICAL/NOTABLE structured alerts or legacy `notify: true`.\n\nFocus: close prep, hold/reduce/close risk, cancel stale orders, rotate into stronger evidence, paper-test, or hold cash. Prefer controlled dips with clean support/volume; avoid falling knives; do not chase sharp green spikes; sell/close spikes or risk-threshold breaks when the packet says so. Read the current live posture from `config/risk_envelope.yaml`, `results/policy/live_control.json`, broker buying power, and the unified live gate. Current handoff posture is fail-closed unless live-control and risk-envelope evidence prove otherwise; do not assume a no-cap mode or any fixed cap from memory.\n\nUrgent notes/emails must be short and human-readable with: Plain English, What happened, Problem, Money today, Live account, Paper account, Open orders, Submitted orders, Need from you. Never ask for per-trade approval or code-level fixes."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=14;BYMINUTE=30;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.5"
+reasoning_effort = "medium"
+execution_environment = "local"
+target = { type = "project", project_id = "C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main" }
+cwds = ["C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main"]
+created_at = 1780017841927
+updated_at = 1783808415927

@@ -1,0 +1,27 @@
+{
+  "packet_id": "overnight-fixture-sample",
+  "generated_at": "2026-05-01T02:30:00+00:00",
+  "ticker_results": [
+    {
+      "symbol": "NVDA",
+      "status": "ok",
+      "method": "full_graph",
+      "rating": "Buy",
+      "final_trade_decision": "Rating: Buy"
+    },
+    {
+      "symbol": "MSFT",
+      "status": "fallback",
+      "method": "market_snapshot_fallback",
+      "rating": "Hold",
+      "final_trade_decision": "Fallback rating: Hold"
+    },
+    {
+      "symbol": "AAPL",
+      "status": "ok",
+      "method": "full_graph",
+      "rating": "Sell",
+      "final_trade_decision": "Rating: Sell"
+    }
+  ]
+}

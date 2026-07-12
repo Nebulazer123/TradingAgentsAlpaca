@@ -1,0 +1,135 @@
+{
+  "policy": {
+    "analysis_only": true,
+    "official_sources_only": true,
+    "default_lookahead_days": 14,
+    "default_pre_window_hours": 36,
+    "default_post_window_hours": 6,
+    "execution_authority": "none",
+    "forbidden_effects": [
+      "create_trade_intent",
+      "size_position",
+      "submit_order",
+      "promote_sleeve",
+      "waive_live_gate"
+    ],
+    "planner_guidance": [
+      "Treat active high-impact release windows as context that requires fresh quotes, spreads, and post-release validation.",
+      "Use this as event-risk context only; it cannot approve trades or relax gates."
+    ]
+  },
+  "calendars": [
+    {
+      "source_name": "federal_reserve",
+      "label": "Federal Reserve monetary policy calendar",
+      "source_url": "https://www.federalreserve.gov/monetarypolicy.htm",
+      "quality": "high",
+      "watch_items": [
+        "FOMC Meeting",
+        "FOMC Minutes",
+        "Press Conference",
+        "Monetary Policy Report",
+        "Beige Book"
+      ]
+    },
+    {
+      "source_name": "bls",
+      "label": "BLS national release calendar",
+      "source_url": "https://www.bls.gov/schedule/news_release/bls.ics",
+      "quality": "high",
+      "watch_items": [
+        "Employment Situation",
+        "Consumer Price Index",
+        "Producer Price Index",
+        "Job Openings and Labor Turnover",
+        "Employment Cost Index"
+      ]
+    },
+    {
+      "source_name": "bea",
+      "label": "BEA release schedule",
+      "source_url": "https://www.bea.gov/index.php/news/schedule/full",
+      "quality": "high",
+      "watch_items": [
+        "Gross Domestic Product",
+        "Personal Income and Outlays",
+        "Corporate Profits",
+        "International Trade"
+      ]
+    },
+    {
+      "source_name": "eia",
+      "label": "EIA information releases",
+      "source_url": "https://ir.eia.gov/",
+      "quality": "high",
+      "watch_items": [
+        "Weekly Petroleum Status Report",
+        "Weekly Natural Gas Storage Report",
+        "Short-Term Energy Outlook"
+      ]
+    }
+  ],
+  "static_events": [
+    {
+      "event_id": "bls-employment-situation-2026-06-05",
+      "source_name": "bls",
+      "title": "Employment Situation, May 2026",
+      "event_type": "labor",
+      "starts_at": "2026-06-05T08:30:00-04:00",
+      "impact": "high",
+      "source_url": "https://www.bls.gov/schedule/news_release/empsit.htm",
+      "affected_themes": ["macro", "rates", "index_volatility", "labor"],
+      "why_it_matters": "Jobs data can move rate expectations, index futures, yields, and high-beta growth stocks."
+    },
+    {
+      "event_id": "fed-fomc-meeting-2026-06-16",
+      "source_name": "federal_reserve",
+      "title": "FOMC Meeting, June 16-17 2026",
+      "event_type": "monetary_policy",
+      "starts_at": "2026-06-16T14:00:00-04:00",
+      "impact": "high",
+      "source_url": "https://www.federalreserve.gov/monetarypolicy.htm",
+      "affected_themes": ["macro", "rates", "index_volatility", "dollar"],
+      "why_it_matters": "FOMC statements and press conferences can change rate expectations and market risk appetite."
+    },
+    {
+      "event_id": "fed-fomc-minutes-2026-07-08",
+      "source_name": "federal_reserve",
+      "title": "FOMC Minutes for June 16-17 meeting",
+      "event_type": "monetary_policy",
+      "starts_at": "2026-07-08T14:00:00-04:00",
+      "impact": "medium",
+      "source_url": "https://www.federalreserve.gov/monetarypolicy.htm",
+      "affected_themes": ["macro", "rates", "index_volatility"],
+      "why_it_matters": "Minutes can reprice market expectations if committee details are more hawkish or dovish than expected."
+    }
+  ],
+  "recurring_events": [
+    {
+      "event_id": "eia-weekly-petroleum-status-report",
+      "source_name": "eia",
+      "title": "Weekly Petroleum Status Report",
+      "event_type": "energy_inventory",
+      "day_of_week": "wednesday",
+      "time": "10:30",
+      "timezone": "America/New_York",
+      "impact": "medium",
+      "source_url": "https://ir.eia.gov/",
+      "affected_themes": ["energy", "oil", "inflation"],
+      "why_it_matters": "Petroleum inventories can move crude, energy equities, inflation expectations, and related ETFs."
+    },
+    {
+      "event_id": "eia-weekly-natural-gas-storage-report",
+      "source_name": "eia",
+      "title": "Weekly Natural Gas Storage Report",
+      "event_type": "energy_inventory",
+      "day_of_week": "thursday",
+      "time": "10:30",
+      "timezone": "America/New_York",
+      "impact": "medium",
+      "source_url": "https://ir.eia.gov/",
+      "affected_themes": ["energy", "natural_gas", "utilities"],
+      "why_it_matters": "Gas storage data can move natural gas futures, energy producers, utilities, and weather-sensitive trades."
+    }
+  ]
+}

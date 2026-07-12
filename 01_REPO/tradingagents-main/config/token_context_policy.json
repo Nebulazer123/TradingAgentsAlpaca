@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "compact_context_files": [
+    "results/_context/latest-summary.json",
+    "results/_context/latest-flags.json",
+    "results/_context/automation-index.json",
+    "results/_context/recent-deltas.md"
+  ],
+  "raw_packet_open_reasons": [
+    "actions",
+    "submitted",
+    "blocker",
+    "issues",
+    "stale",
+    "graph_failure",
+    "candidate_change",
+    "changed_candidates",
+    "changed_tournament_leader",
+    "schema",
+    "quality",
+    "model_telemetry",
+    "crawler",
+    "notify",
+    "abnormal_pl",
+    "unexplained_action"
+  ],
+  "max_hook_payload_chars": 5000,
+  "max_hook_stdout_lines": 20,
+  "authority": "context_only_no_trade"
+}

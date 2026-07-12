@@ -1,0 +1,83 @@
+# MiroFish PDT Pre-Start Packet Manifest
+
+Updated: 2026-06-03
+
+This packet is for reviewing the prepared MiroFish run before starting the real stage 03 simulation.
+
+Prepared real-run IDs:
+
+- Project: `proj_8ece728e49fe`
+- Graph: `mirofish_4a9df9ae8b184878`
+- Simulation: `sim_974459649906`
+- Stress copy: `sim_974459649906_stress2`
+
+Included planning files:
+
+- `MIRROR_FISH_PRE_START_APPROVAL_PACKET.md` - concise launch packet.
+- `MIRROR_FISH_TRADING_RUN_READINESS.md` - full readiness report and research/model notes.
+- `MIRROR_FISH_OPERATOR_RUNBOOK.md` - operator commands and launch sequence.
+- `MIRROR_FISH_PDT_SIMULATION_PROMPT.md` - standalone prompt used by stage 01/02.
+- `MIRROR_FISH_PDT_REALITY_SEED.md` - source-of-truth seed uploaded to MiroFish.
+- `MIRROR_FISH_PRE_RUN_ACCURACY_AUDIT.md` - current vs post-fix predictive-quality scorecard.
+- `MIRROR_FISH_EVENT_BEAT_MAP.md` - 30-round June 4-13 event-beat map.
+- `MIRROR_FISH_STATE_VARIABLES.md` - simulated state-variable contract.
+- `MIRROR_FISH_CAUSAL_ATTRIBUTION_PLAN.md` - final-report cause ledger contract.
+- `MIRROR_FISH_OPTIONS_MICROSTRUCTURE_BRIEF.md` - options/0DTE signal-separation brief.
+- `MIRROR_FISH_JUNE4_LIVE_CONTEXT_PATCH.md` - fresh public-context patch.
+- `MIRROR_FISH_STAGE05_INTERVIEW_PLAN.md` - telemetry-driven interview plan.
+
+Included helper/audit scripts:
+
+- `mirofish_preflight.py`
+- `mirofish_readiness_bundle.py`
+- `mirofish_completion_audit.py`
+- `mirofish_actor_population_audit.py`
+- `mirofish_workflow_audit.py`
+- `mirofish_cost_estimator.py`
+- `mirofish_active_coverage_estimator.py`
+- `mirofish_postrun_telemetry.py`
+- `mirofish_app_path_setup.py`
+- `mirofish_agent_expander.py`
+- `mirofish_env_gate.py`
+
+Current status:
+
+- Stage 01 graph construction is complete.
+- Stage 02 environment setup is complete.
+- Runnable population is expanded to 1,000 agents with retail, broker/platform, developer, media, policy/regulatory, institutional/liquidity, and tech-company/executive layers.
+- Actor-population audit passes against the prepared real-run config with non-retail quota `580`, actual non-retail entity count `565`, all required anchor desks/agencies/outlets/developer/exec actors present, and initial posts covering every major layer.
+- Predictive-quality pass is applied: 30 scheduled event beats, 7 forecast-ballot rounds, 14 state variables, 525 broker/account-segmented actors, and post-run telemetry extraction tooling.
+- Current patched 30-round estimate: dual-platform active-agent actions low `704`, mid `1257`, high `1786`; action-only Stage 03 cost mid `$1.0703`, worst `$3.1300`.
+- A capped two-round stage 03 stress copy completed with graph memory enabled and `failed=0`.
+- The real simulation is still gated until explicit user approval.
+- This is not the final TradingAgents handoff.
+
+Latest local deliverables:
+
+- Bundle folder: `C:\Users\Corbin\Documents\Coding projects\mirofish-main\deliverables\mirofish-prestart-20260603-003918-actor-audit`
+- Bundle zip: `C:\Users\Corbin\Documents\Coding projects\mirofish-main\deliverables\mirofish-prestart-20260603-003918-actor-audit.zip`
+- This supersedes the earlier `mirofish-prestart-20260602-231956` local packet because it adds the actor-population audit and refreshed readiness evidence.
+
+Temporary UI access:
+
+- Local: `http://localhost:3000`
+- Verified Tailscale/LAN route: `http://100.79.65.87:3000`
+- Verified through Tailscale/LAN: page returned HTTP 200; `/api/simulation/sim_974459649906/run-status` returned `runner_status=idle`.
+- Public `localtunnel` was tested but stopped because it became unstable with 502 responses. Use Tailscale/LAN unless a new public tunnel is explicitly needed.
+
+Google Drive review docs:
+
+Historical only. These were not refreshed in this local-only predictive-quality pass because the user explicitly said no email, no Google Docs/Drive, and no off-network localhost setup.
+
+- Approval packet: `https://docs.google.com/document/d/1BuRvF8qb2jSDd64S65SYWE3oe1EvcjyM4L3tjCMxO9s`
+- Manifest: `https://docs.google.com/document/d/1qzAM5idNLPS-SGQimJnwpqJX7sINuihilctX0WfarQo`
+- Final no-self-reference manifest: `https://docs.google.com/document/d/1z3sTlqd3RUXNAFdeUzpiFNt-PO9c2equwozDmqltW5k`
+- Operator runbook: `https://docs.google.com/document/d/1nduUi0iBBj-j6YZXSB6hU0iLgcUGXMunFelukDSFtBo`
+- Simulation prompt: `https://docs.google.com/document/d/1T0K1NJllQ6WdSEIr-HaiCR5YCtKY048SdOAnO2Juhhg`
+- Full readiness report: `https://docs.google.com/document/d/1XJqY-VYUNtbEEw-6OiemZS4U6AKyhWFIbKCTHFcoHSE`
+
+Gmail drafts:
+
+- Historical only: a prior ready email was sent to `nebulazer2003@gmail.com` with Drive links and the zip attached.
+- No email was sent or refreshed during the predictive-quality pass.
+- The exact Gmail message id is intentionally not embedded here so the zip does not become self-referential.

@@ -1,0 +1,10 @@
+version = 1
+id = "fetch-tradingagents-deep-research-report"
+kind = "heartbeat"
+name = "Fetch TradingAgents Deep Research report"
+prompt = "Return to the in-app Browser Deep Research conversation at https://chatgpt.com/c/6a1e954f-7a38-83ea-81f2-0d06210ae662. If the TradingAgents Deep Research Pro report is complete, save or copy/export its content into the repo under reports/research_merge, capture a screenshot, update reports/research_merge/CHATGPT_DEEP_RESEARCH_RUNS.md with the saved artifact path and status, then summarize the result in this thread. If it is still running, capture the visible status and keep the repo note accurate without interrupting the report."
+status = "PAUSED"
+rrule = "FREQ=DAILY;COUNT=1;BYHOUR=4;BYMINUTE=30"
+target_thread_id = "current"
+created_at = 1780389616094
+updated_at = 1783808413916

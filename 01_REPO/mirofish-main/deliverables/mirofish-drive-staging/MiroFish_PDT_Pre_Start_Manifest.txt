@@ -1,0 +1,40 @@
+# MiroFish PDT Pre-Start Packet Manifest
+
+Updated: 2026-06-03
+
+This packet is for reviewing the prepared MiroFish run before starting the real stage 03 simulation.
+
+Prepared real-run IDs:
+
+- Project: `proj_8ece728e49fe`
+- Graph: `mirofish_4a9df9ae8b184878`
+- Simulation: `sim_974459649906`
+- Stress copy: `sim_974459649906_stress2`
+
+Included planning files:
+
+- `MIRROR_FISH_PRE_START_APPROVAL_PACKET.md` - concise launch packet.
+- `MIRROR_FISH_TRADING_RUN_READINESS.md` - full readiness report and research/model notes.
+- `MIRROR_FISH_OPERATOR_RUNBOOK.md` - operator commands and launch sequence.
+- `MIRROR_FISH_PDT_SIMULATION_PROMPT.md` - standalone prompt used by stage 01/02.
+- `MIRROR_FISH_PDT_REALITY_SEED.md` - source-of-truth seed uploaded to MiroFish.
+
+Included helper/audit scripts:
+
+- `mirofish_preflight.py`
+- `mirofish_readiness_bundle.py`
+- `mirofish_completion_audit.py`
+- `mirofish_workflow_audit.py`
+- `mirofish_cost_estimator.py`
+- `mirofish_app_path_setup.py`
+- `mirofish_agent_expander.py`
+- `mirofish_env_gate.py`
+
+Current status:
+
+- Stage 01 graph construction is complete.
+- Stage 02 environment setup is complete.
+- Runnable population is expanded to 1,000 agents with retail, broker/platform, developer, media, policy/regulatory, institutional/liquidity, and tech-company/executive layers.
+- A capped two-round stage 03 stress copy completed with graph memory enabled and `failed=0`.
+- The real simulation is still gated until explicit user approval.
+- This is not the final TradingAgents handoff.

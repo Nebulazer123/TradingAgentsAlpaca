@@ -1,0 +1,1212 @@
+"""Ticker-level provider orchestration for analysis-only research packets."""
+
+from __future__ import annotations
+
+import datetime
+import json
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+from tradingagents.dataflows._official_common import (
+    OfficialDataError,
+    cached_safe_fetch_evidence,
+    evidence_packet,
+    official_cache_key,
+    request_hash,
+)
+from tradingagents.dataflows.alpaca_news import fetch_alpaca_news
+from tradingagents.dataflows.alpha_vantage_news import get_news as fetch_alpha_vantage_news_raw
+from tradingagents.dataflows.alpha_vantage_stock import get_stock as fetch_alpha_vantage_stock_raw
+from tradingagents.dataflows.eodhd import (
+    fetch_eodhd_fundamentals,
+    fetch_eodhd_news,
+    fetch_eodhd_sentiments,
+)
+from tradingagents.dataflows.finnhub import (
+    fetch_finnhub_company_news,
+    fetch_finnhub_profile2,
+    fetch_finnhub_quote,
+)
+from tradingagents.dataflows.fmp import (
+    fetch_fmp_company_profile,
+    fetch_fmp_latest_earning_call_transcript,
+    fetch_fmp_quote,
+    fetch_fmp_stock_news,
+)
+from tradingagents.dataflows.google_news import fetch_google_news_rss
+from tradingagents.dataflows.marketaux import fetch_marketaux_news
+from tradingagents.dataflows.massive import (
+    fetch_massive_previous_day_bar,
+    fetch_massive_ticker_overview,
+)
+from tradingagents.dataflows.newsapi import fetch_newsapi_everything
+from tradingagents.dataflows.reddit import fetch_reddit_posts
+from tradingagents.dataflows.sec import fetch_sec_company_tickers, fetch_sec_submissions
+from tradingagents.dataflows.tiingo import (
+    fetch_tiingo_daily_prices,
+    fetch_tiingo_news,
+    fetch_tiingo_ticker_metadata,
+)
+from tradingagents.dataflows.yfinance_options import fetch_yfinance_options_iv_flow
+from tradingagents.dataflows.yfinance_short_interest import fetch_yfinance_short_interest
+from tradingagents.research.crawler_policy import CrawlerPolicy
+from tradingagents.research.crawler_runner import run_crawlee_research_packet
+from tradingagents.research.provider_fallbacks import (
+    DEFAULT_PROVIDER_FALLBACK_PATH,
+    ProviderFallbackCandidate,
+    load_provider_fallback_config,
+    select_available_fallbacks,
+)
+from tradingagents.research.reddit_watchlists import build_reddit_watchlist_packet
+from tradingagents.research.source_quality import load_source_quality_strengths
+from tradingagents.research.twitter_mcp import fetch_twitter_recent_search_packet
+from tradingagents.research.youtube_transcript import fetch_youtube_earnings_transcript_packet
+from tradingagents.schemas.research import CrawlerRunPacket, SourceEvidencePacket
+
+DEFAULT_BROKER_SNAPSHOT_DIR = Path("results/hourly_supervisor")
+DEFAULT_SOURCE_QUALITY_REVIEW_PATH = Path("results/source_quality/latest.json")
+
+DEFAULT_TICKER_EVIDENCE_NEEDS = (
+    "market_news",
+    "quote_price_context",
+    "fundamentals_profile",
+    "earnings_transcripts",
+    "short_interest",
+    "options_iv_flow",
+    "crawler_research",
+)
+NO_STALE_CACHE_SOURCES = {"broker_snapshot", "crawlee", "twitter", "yfinance_short_interest"}
+
+RESEARCH_GAP_EVIDENCE_NEEDS = {
+    "earnings_transcripts": {
+        "why_it_matters": "Guidance tone and Q&A can validate event-underreaction theses.",
+        "suggested_routes": ["quartr_or_transcript_vendor", "company_ir_transcript_crawler"],
+    },
+    "short_interest": {
+        "why_it_matters": "Crowded-short and squeeze risk can change position timing and risk review.",
+        "suggested_routes": ["exchange_short_interest", "market_data_vendor_short_interest"],
+    },
+    "options_iv_flow": {
+        "why_it_matters": "0DTE/gamma/IV context can affect intraday dip-buy and spike-sell behavior.",
+        "suggested_routes": ["massive_options_or_polygon_options", "dedicated_options_vendor"],
+    },
+}
+
+
+@dataclass(frozen=True)
+class TickerProviderResearchResult:
+    symbol: str
+    packets: list[SourceEvidencePacket] = field(default_factory=list)
+    summary_packet: SourceEvidencePacket | None = None
+    route_attempts: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _symbol(value: str) -> str:
+    clean = value.strip().upper()
+    if not clean:
+        raise ValueError("ticker symbol is required")
+    return clean
+
+
+def _today(now: datetime.datetime | None = None) -> datetime.date:
+    current = now or datetime.datetime.now(tz=datetime.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=datetime.timezone.utc)
+    return current.astimezone(datetime.timezone.utc).date()
+
+
+def _news_dates(now: datetime.datetime | None = None, *, lookback_days: int = 3) -> tuple[str, str]:
+    end = _today(now)
+    start = end - datetime.timedelta(days=max(1, int(lookback_days)))
+    return start.isoformat(), end.isoformat()
+
+
+def _payload_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"raw_text": value, "format": "text"}
+        return parsed if isinstance(parsed, dict) else {"data": parsed}
+    return {"data": value}
+
+
+def _alpha_vantage_packet(
+    *,
+    symbol: str,
+    evidence_type: str,
+    payload: Any,
+    source_ref: str,
+) -> Any:
+    return evidence_packet(
+        source_name="alpha_vantage",
+        evidence_type=evidence_type,
+        subject=symbol,
+        symbol=symbol,
+        source_ref=source_ref,
+        payload=_payload_dict(payload),
+        quality="medium",
+        request_fingerprint=request_hash(
+            "GET",
+            source_ref,
+            {"symbol": symbol, "evidence_type": evidence_type},
+            None,
+        ),
+        tool_route="alpha_vantage_api",
+    )
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    try:
+        if hasattr(value, "item"):
+            return _json_safe(value.item())
+    except Exception:  # noqa: BLE001 - best-effort data normalization.
+        pass
+    return str(value)
+
+
+def _dataframe_records(frame: Any, *, max_rows: int = 20) -> list[dict[str, Any]]:
+    if frame is None or getattr(frame, "empty", False):
+        return []
+    limited = frame.tail(max(1, int(max_rows))).reset_index()
+    return [
+        {str(key): _json_safe(value) for key, value in row.items()}
+        for row in limited.to_dict(orient="records")
+    ]
+
+
+def _fetch_yfinance_quote_price_context(
+    symbol: str,
+    *,
+    now: datetime.datetime | None = None,
+) -> SourceEvidencePacket:
+    import yfinance as yf
+
+    ticker = yf.Ticker(symbol)
+    history = ticker.history(period="1mo", interval="1d", auto_adjust=False)
+    if history is None or history.empty:
+        raise OfficialDataError(f"yfinance returned no price history for {symbol}")
+    fast_info = getattr(ticker, "fast_info", None)
+    if fast_info is not None:
+        try:
+            fast_info_payload = dict(fast_info)
+        except Exception:  # noqa: BLE001 - yfinance lazy objects vary by version.
+            fast_info_payload = {"raw": str(fast_info)}
+    else:
+        fast_info_payload = {}
+    payload = {
+        "symbol": symbol,
+        "period": "1mo",
+        "interval": "1d",
+        "latest_bar": _dataframe_records(history, max_rows=1)[-1],
+        "recent_bars": _dataframe_records(history, max_rows=10),
+        "fast_info": {str(key): _json_safe(value) for key, value in fast_info_payload.items()},
+        "analysis_only": True,
+        "execution_authority": "none",
+    }
+    source_ref = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    return evidence_packet(
+        source_name="yfinance",
+        evidence_type="quote_price_context",
+        subject=f"yfinance quote and recent bars for {symbol}",
+        symbol=symbol,
+        source_ref=source_ref,
+        payload=payload,
+        quality="low",
+        request_fingerprint=request_hash(
+            "GET",
+            source_ref,
+            {"symbol": symbol, "period": "1mo", "interval": "1d"},
+            None,
+        ),
+        tool_route="dataflow:yfinance",
+        redaction_status="no_secrets_seen",
+        freshness_extra={"read_only": True},
+    )
+
+
+_ACCOUNT_SUMMARY_FIELDS = (
+    "status",
+    "buying_power",
+    "equity",
+    "portfolio_value",
+    "cash",
+    "exposure",
+    "dynamic_cap",
+    "unused_cap",
+    "unrealized_pl",
+)
+
+_POSITION_FIELDS = (
+    "symbol",
+    "qty",
+    "market_value",
+    "cost_basis",
+    "unrealized_pl",
+    "unrealized_plpc",
+    "unrealized_intraday_pl",
+    "unrealized_intraday_plpc",
+    "current_price",
+    "avg_entry_price",
+)
+
+_ORDER_FIELDS = (
+    "symbol",
+    "side",
+    "qty",
+    "notional",
+    "type",
+    "time_in_force",
+    "limit_price",
+    "stop_price",
+    "status",
+    "submitted_at",
+    "filled_at",
+    "filled_qty",
+    "filled_avg_price",
+    "account",
+    "execution_mode",
+    "action",
+)
+
+_CANDIDATE_FIELDS = (
+    "symbol",
+    "score",
+    "current_price",
+    "day_change_pct",
+    "volume_ratio",
+    "time_sensitive",
+    "source",
+    "reason",
+)
+
+
+def _json_object_from_file(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise OfficialDataError(f"broker supervisor packet could not be read: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise OfficialDataError("broker supervisor packet is not a JSON object")
+    return payload
+
+
+def _latest_broker_snapshot_path(snapshot_dir: str | Path) -> Path:
+    root = Path(snapshot_dir)
+    if root.is_file():
+        return root
+    if not root.exists():
+        raise OfficialDataError(f"no supervisor snapshot directory found at {root}")
+    latest = root / "latest.json"
+    if latest.exists():
+        return latest
+    candidates = [
+        path
+        for path in root.glob("hourly-supervisor-*.json")
+        if _is_raw_json_packet_path(path)
+    ]
+    if not candidates:
+        raise OfficialDataError(f"no supervisor snapshot packet found at {root}")
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _is_raw_json_packet_path(path: Path) -> bool:
+    if not path.is_file() or path.suffix.lower() != ".json":
+        return False
+    name = path.name.lower()
+    return not (name.endswith(".compact.json") or name == "latest-compact.json")
+
+
+def _dict_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        if all(isinstance(item, dict) for item in value.values()):
+            return [item for item in value.values() if isinstance(item, dict)]
+        return [value]
+    return []
+
+
+def _safe_subset(item: Any, fields: Sequence[str]) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    return {
+        field: _json_safe(item.get(field))
+        for field in fields
+        if field in item and item.get(field) is not None
+    }
+
+
+def _matching_symbol_items(value: Any, symbol: str) -> list[dict[str, Any]]:
+    target = symbol.upper()
+    return [
+        item
+        for item in _dict_items(value)
+        if str(item.get("symbol") or "").upper() == target
+    ]
+
+
+def _first_matching_symbol_item(value: Any, symbol: str) -> dict[str, Any] | None:
+    matches = _matching_symbol_items(value, symbol)
+    return matches[0] if matches else None
+
+
+def _account_summary(account: Any) -> dict[str, Any]:
+    if not isinstance(account, dict):
+        return {"position_count": 0, "open_order_count": 0, "position_symbols": []}
+    positions = _dict_items(account.get("positions"))
+    open_orders = _dict_items(account.get("open_orders"))
+    summary = _safe_subset(account, _ACCOUNT_SUMMARY_FIELDS)
+    summary.update(
+        {
+            "position_count": len(positions),
+            "open_order_count": len(open_orders),
+            "position_symbols": sorted(
+                {
+                    str(item.get("symbol") or "").upper()
+                    for item in positions
+                    if item.get("symbol")
+                }
+            ),
+        }
+    )
+    return summary
+
+
+def _sanitized_orders(value: Any, symbol: str) -> list[dict[str, Any]]:
+    return [_safe_subset(item, _ORDER_FIELDS) for item in _matching_symbol_items(value, symbol)]
+
+
+def _fetch_broker_snapshot_quote_price_context(
+    symbol: str,
+    *,
+    snapshot_dir: str | Path = DEFAULT_BROKER_SNAPSHOT_DIR,
+) -> SourceEvidencePacket:
+    snapshot_path = _latest_broker_snapshot_path(snapshot_dir)
+    snapshot = _json_object_from_file(snapshot_path)
+    portfolio = snapshot.get("portfolio") if isinstance(snapshot.get("portfolio"), dict) else {}
+    live_account = portfolio.get("live") if isinstance(portfolio, dict) else {}
+    paper_account = portfolio.get("paper") if isinstance(portfolio, dict) else {}
+    live_position = _first_matching_symbol_item(
+        live_account.get("positions") if isinstance(live_account, dict) else None,
+        symbol,
+    )
+    paper_position = _first_matching_symbol_item(
+        paper_account.get("positions") if isinstance(paper_account, dict) else None,
+        symbol,
+    )
+    ranked_candidate = _first_matching_symbol_item(
+        portfolio.get("ranked_candidates") if isinstance(portfolio, dict) else None,
+        symbol,
+    )
+    payload = {
+        "symbol": symbol,
+        "source_packet_path": str(snapshot_path),
+        "source_generated_at": snapshot.get("generated_at"),
+        "supervisor_decision": snapshot.get("decision"),
+        "market_session": portfolio.get("market_session") if isinstance(portfolio, dict) else None,
+        "live_exposure": _json_safe(snapshot.get("live_exposure")),
+        "live_account": _account_summary(live_account),
+        "paper_account": _account_summary(paper_account),
+        "portfolio_counts": {
+            "live_positions": len(_dict_items(live_account.get("positions") if isinstance(live_account, dict) else None)),
+            "paper_positions": len(_dict_items(paper_account.get("positions") if isinstance(paper_account, dict) else None)),
+            "live_open_orders": len(_dict_items(live_account.get("open_orders") if isinstance(live_account, dict) else None)),
+            "paper_open_orders": len(_dict_items(paper_account.get("open_orders") if isinstance(paper_account, dict) else None)),
+        },
+        "symbol_context": {
+            "live_position": _safe_subset(live_position, _POSITION_FIELDS) if live_position else None,
+            "paper_position": _safe_subset(paper_position, _POSITION_FIELDS) if paper_position else None,
+            "live_open_orders": _sanitized_orders(
+                live_account.get("open_orders") if isinstance(live_account, dict) else None,
+                symbol,
+            ),
+            "paper_open_orders": _sanitized_orders(
+                paper_account.get("open_orders") if isinstance(paper_account, dict) else None,
+                symbol,
+            ),
+            "ranked_candidate": _safe_subset(ranked_candidate, _CANDIDATE_FIELDS)
+            if ranked_candidate
+            else None,
+        },
+        "recent_submissions": _sanitized_orders(snapshot.get("submitted"), symbol),
+        "recent_reconciled_orders": _sanitized_orders(snapshot.get("reconciled_orders"), symbol),
+        "issue_count": len(_dict_items(snapshot.get("issues"))),
+        "submitted_order_count": len(_dict_items(snapshot.get("submitted"))),
+        "read_only": True,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "forbidden_effects": [
+            "create_trade_intent",
+            "size_position",
+            "submit_order",
+            "promote_sleeve",
+            "waive_live_gate",
+        ],
+    }
+    source_ref = f"local://{snapshot_path.as_posix()}#broker_snapshot/{symbol}"
+    return evidence_packet(
+        source_name="broker_snapshot",
+        evidence_type="quote_price_context",
+        subject=f"sanitized broker supervisor snapshot for {symbol}",
+        symbol=symbol,
+        source_ref=source_ref,
+        payload=payload,
+        quality="medium",
+        request_fingerprint=request_hash(
+            "READ",
+            source_ref,
+            {"symbol": symbol},
+            None,
+        ),
+        tool_route="local:hourly_supervisor_snapshot",
+        redaction_status="redacted",
+        freshness_extra={
+            "read_only": True,
+            "blocked": False,
+            "source_generated_at": snapshot.get("generated_at"),
+            "source_packet_path": str(snapshot_path),
+            "market_session": payload["market_session"],
+        },
+    )
+
+
+def _fetch_reddit_social_context(
+    symbol: str,
+    *,
+    evidence_need: str,
+    now: datetime.datetime | None = None,
+) -> SourceEvidencePacket:
+    start, end = _news_dates(now)
+    reddit_context = fetch_reddit_posts(symbol, start_date=start, end_date=end)
+    source_ref = f"https://www.reddit.com/search/?q={quote(symbol)}&sort=new&t=week"
+    payload = {
+        "symbol": symbol,
+        "evidence_need": evidence_need,
+        "window": {"start_date": start, "end_date": end},
+        "reddit_context": reddit_context,
+        "read_only": True,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "forbidden_effects": [
+            "post",
+            "comment",
+            "vote",
+            "message",
+            "create_trade_intent",
+            "size_position",
+            "submit_order",
+            "promote_sleeve",
+            "waive_live_gate",
+        ],
+    }
+    return evidence_packet(
+        source_name="reddit",
+        evidence_type=evidence_need,
+        subject=f"public Reddit social context for {symbol}",
+        symbol=symbol,
+        source_ref=source_ref,
+        payload=payload,
+        quality="low",
+        request_fingerprint=request_hash(
+            "GET",
+            source_ref,
+            {"symbol": symbol, "start_date": start, "end_date": end},
+            None,
+        ),
+        tool_route="dataflow:reddit_public",
+        redaction_status="redacted",
+        freshness_extra={"read_only": True, "route": "dataflow:reddit_public"},
+    )
+
+
+def _fetch_twitter_social_context(symbol: str, *, evidence_need: str) -> SourceEvidencePacket:
+    return fetch_twitter_recent_search_packet(
+        symbol,
+        evidence_need=evidence_need,
+    )
+
+
+def _fetch_research_gap_packet(symbol: str, *, evidence_need: str) -> SourceEvidencePacket:
+    gap = RESEARCH_GAP_EVIDENCE_NEEDS[evidence_need]
+    source_ref = f"local://{DEFAULT_PROVIDER_FALLBACK_PATH.as_posix()}#{evidence_need}/research_gap"
+    payload = {
+        "symbol": symbol,
+        "evidence_need": evidence_need,
+        "status": "connector_not_configured",
+        "gap_category": evidence_need,
+        "why_it_matters": gap["why_it_matters"],
+        "suggested_routes": gap["suggested_routes"],
+        "research_action": "downrank confidence and require independent confirmation until a real connector is configured",
+        "read_only": True,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "forbidden_effects": [
+            "create_trade_intent",
+            "size_position",
+            "submit_order",
+            "promote_sleeve",
+            "waive_live_gate",
+        ],
+    }
+    return evidence_packet(
+        source_name=f"{evidence_need}_gap",
+        evidence_type=evidence_need,
+        subject=f"{evidence_need} connector gap for {symbol}",
+        symbol=symbol,
+        source_ref=source_ref,
+        payload=payload,
+        quality="unknown",
+        request_fingerprint=request_hash(
+            "READ",
+            source_ref,
+            None,
+            {"symbol": symbol, "evidence_need": evidence_need, "status": "connector_not_configured"},
+        ),
+        tool_route="local:research_gap",
+        redaction_status="no_secrets_seen",
+        freshness_extra={
+            "read_only": True,
+            "blocked": True,
+            "gap_category": evidence_need,
+            "connector_status": "not_configured",
+            "downrank_evidence": True,
+        },
+    )
+
+
+def _cik_for_symbol(company_tickers_payload: dict[str, Any], symbol: str) -> str:
+    target = symbol.upper()
+    for item in company_tickers_payload.values():
+        if not isinstance(item, dict):
+            continue
+        ticker = str(item.get("ticker") or "").upper()
+        if ticker == target:
+            cik = item.get("cik_str")
+            if cik is not None:
+                return str(cik)
+    raise OfficialDataError(f"SEC CIK not found for ticker {target}")
+
+
+def _fetch_sec_submissions_by_symbol(symbol: str) -> SourceEvidencePacket:
+    company_tickers = fetch_sec_company_tickers()
+    cik = _cik_for_symbol(company_tickers.payload, symbol)
+    return fetch_sec_submissions(cik, symbol=symbol)
+
+
+@dataclass(frozen=True)
+class TickerCrawlerTarget:
+    target: str
+    allowed_domains: tuple[str, ...]
+    max_pages: int
+    quality: str
+    purpose: str
+
+
+def _crawler_target_for_symbol(symbol: str, evidence_need: str) -> TickerCrawlerTarget | None:
+    encoded = quote(symbol.upper(), safe="")
+    if evidence_need == "market_news":
+        return TickerCrawlerTarget(
+            target=f"https://finance.yahoo.com/quote/{encoded}/news/",
+            allowed_domains=("finance.yahoo.com",),
+            max_pages=2,
+            quality="low",
+            purpose="ticker_news_page",
+        )
+    if evidence_need in {"crawler_research", "fundamentals_profile"}:
+        return TickerCrawlerTarget(
+            target=(
+                "https://www.sec.gov/cgi-bin/browse-edgar"
+                f"?CIK={encoded}&owner=exclude&action=getcompany"
+            ),
+            allowed_domains=("sec.gov",),
+            max_pages=2,
+            quality="medium",
+            purpose="official_company_filings_page",
+        )
+    return None
+
+
+def _crawler_source_packet(
+    crawler_packet: CrawlerRunPacket,
+    *,
+    symbol: str,
+    evidence_need: str,
+    target: TickerCrawlerTarget,
+) -> SourceEvidencePacket:
+    blocked = crawler_packet.status in {"blocked", "failed"}
+    payload = {
+        "symbol": symbol,
+        "evidence_need": evidence_need,
+        "crawler_packet_id": crawler_packet.packet_id,
+        "crawler_status": crawler_packet.status,
+        "target": crawler_packet.target,
+        "target_purpose": target.purpose,
+        "fetched_urls": crawler_packet.fetched_urls[:10],
+        "blocked_urls": crawler_packet.blocked_urls[:10],
+        "max_pages": crawler_packet.max_pages,
+        "robots_policy": crawler_packet.robots_policy,
+        "target_policy": crawler_packet.freshness.get("target_policy"),
+        "runtime": crawler_packet.freshness.get("runtime"),
+        "metrics": crawler_packet.freshness.get("metrics"),
+        "page_titles": crawler_packet.freshness.get("page_titles", {}),
+        "blocked_reason": crawler_packet.freshness.get("blocked_reason"),
+        "error_summary": crawler_packet.freshness.get("error_summary"),
+        "read_only": True,
+        "analysis_only": True,
+        "execution_authority": "none",
+    }
+    return evidence_packet(
+        source_name="crawlee",
+        evidence_type=evidence_need,
+        subject=f"allowlisted crawler research for {symbol}",
+        symbol=symbol,
+        source_ref=crawler_packet.target,
+        payload=payload,
+        quality=target.quality if not blocked else "unknown",
+        request_fingerprint=request_hash(
+            "CRAWL",
+            crawler_packet.target,
+            {"symbol": symbol, "evidence_need": evidence_need},
+            None,
+        ),
+        tool_route="crawler:crawlee_playwright",
+        redaction_status="redacted",
+        freshness_extra={
+            "read_only": True,
+            "blocked": blocked,
+            "crawler_status": crawler_packet.status,
+            "crawler_packet_id": crawler_packet.packet_id,
+            "target_policy": crawler_packet.freshness.get("target_policy"),
+        },
+    )
+
+
+def _fetch_crawlee_ticker_research(symbol: str, evidence_need: str) -> SourceEvidencePacket:
+    target = _crawler_target_for_symbol(symbol, evidence_need)
+    if target is None:
+        raise OfficialDataError(f"no crawler target policy for {symbol} {evidence_need}")
+    crawler_packet = run_crawlee_research_packet(
+        run_id=f"ticker-provider-{symbol.lower()}-{evidence_need}",
+        target=target.target,
+        policy=CrawlerPolicy(
+            allowed_domains=target.allowed_domains,
+            max_pages=target.max_pages,
+            max_bytes=1_000_000,
+            rate_limit_per_minute=12,
+        ),
+    )
+    return _crawler_source_packet(
+        crawler_packet,
+        symbol=symbol,
+        evidence_need=evidence_need,
+        target=target,
+    )
+
+
+def _cache_file_for_source(
+    cache_dir: str | Path,
+    *,
+    symbol: str,
+    evidence_need: str,
+    source_name: str,
+) -> Path:
+    cache_key = _provider_cache_key(
+        symbol=symbol,
+        evidence_need=evidence_need,
+        source_name=source_name,
+    )
+    return Path(cache_dir) / f"{cache_key}.json"
+
+
+def _provider_cache_key(*, symbol: str, evidence_need: str, source_name: str) -> str:
+    parts: list[Any] = [
+        "ticker_provider_orchestrator",
+        symbol,
+        evidence_need,
+        source_name,
+    ]
+    if source_name == "crawlee":
+        target = _crawler_target_for_symbol(symbol, evidence_need)
+        if target is not None:
+            parts.extend([target.target, target.purpose])
+    if source_name == "yfinance_short_interest":
+        parts.append("requires_short_interest_fields_v2")
+    return official_cache_key(*parts)
+
+
+def _read_source_cache_packet(
+    cache_dir: str | Path,
+    *,
+    symbol: str,
+    evidence_need: str,
+    candidate_sources: Sequence[str],
+) -> SourceEvidencePacket:
+    for source_name in candidate_sources:
+        if source_name == "official_cache":
+            continue
+        path = _cache_file_for_source(
+            cache_dir,
+            symbol=symbol,
+            evidence_need=evidence_need,
+            source_name=source_name,
+        )
+        if not path.exists():
+            continue
+        try:
+            cached = SourceEvidencePacket.model_validate_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if cached.tool_route == "local:research_gap" or cached.freshness.get("gap_category"):
+            continue
+        source_ref = f"local://{path.as_posix()}"
+        return evidence_packet(
+            source_name="official_cache",
+            evidence_type=evidence_need,
+            subject=f"cached {evidence_need} evidence for {symbol}",
+            symbol=symbol,
+            source_ref=source_ref,
+            payload={
+                "symbol": symbol,
+                "evidence_need": evidence_need,
+                "cached_source_name": cached.source_name,
+                "cached_packet_id": cached.packet_id,
+                "cached_quality": cached.quality,
+                "cached_as_of": cached.as_of or cached.generated_at,
+                "cached_source_refs": cached.source_refs[:5],
+                "read_only": True,
+                "execution_authority": "none",
+            },
+            quality=cached.quality,
+            request_fingerprint=request_hash(
+                "READ",
+                source_ref,
+                None,
+                {
+                    "symbol": symbol,
+                    "evidence_need": evidence_need,
+                    "cached_source_name": cached.source_name,
+                    "cached_packet_id": cached.packet_id,
+                },
+            ),
+            tool_route="local:official_cache",
+            redaction_status="no_secrets_seen",
+            freshness_extra={"read_only": True, "cache": {"state": "hit", "source": cached.source_name}},
+        )
+    raise OfficialDataError(f"no cached {evidence_need} evidence for {symbol}")
+
+
+def _unsupported_attempt(candidate: ProviderFallbackCandidate, *, evidence_need: str) -> dict[str, Any]:
+    return {
+        "evidence_need": evidence_need,
+        "source_name": candidate.source_name,
+        "route": candidate.route,
+        "cost_tier": candidate.cost_tier,
+        "source_quality_score": candidate.source_quality_score,
+        "source_quality_reason": candidate.source_quality_reason,
+        "status": "unsupported_in_local_orchestrator",
+    }
+
+
+def _cache_miss_attempt(
+    candidate: ProviderFallbackCandidate,
+    *,
+    evidence_need: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "evidence_need": evidence_need,
+        "source_name": candidate.source_name,
+        "route": candidate.route,
+        "cost_tier": candidate.cost_tier,
+        "source_quality_score": candidate.source_quality_score,
+        "source_quality_reason": candidate.source_quality_reason,
+        "status": "cache_miss",
+        "reason": str(reason)[:300],
+    }
+
+
+def _cache_ttl_seconds(evidence_need: str) -> int:
+    if evidence_need == "quote_price_context":
+        return 5 * 60
+    if evidence_need in {"market_news", "social_sentiment"}:
+        return 30 * 60
+    return 24 * 60 * 60
+
+
+def _fetcher_for_candidate(
+    candidate: ProviderFallbackCandidate,
+    *,
+    evidence_need: str,
+    symbol: str,
+    now: datetime.datetime | None,
+    cache_dir: str | Path,
+    candidate_sources: Sequence[str],
+    broker_snapshot_dir: str | Path,
+):
+    source = candidate.source_name
+    if source == "google_news_rss" and evidence_need == "market_news":
+        return lambda: fetch_google_news_rss(query=f"{symbol} stock", limit=25)
+    if source == "alpaca_news" and evidence_need == "market_news":
+        start, end = _news_dates(now)
+        return lambda: fetch_alpaca_news(symbols=[symbol], start=start, end=end, limit=50)
+    if source == "reddit_watchlist" and evidence_need in {"market_news", "social_sentiment"}:
+        return lambda: build_reddit_watchlist_packet()
+    if source == "reddit" and evidence_need == "social_sentiment":
+        return lambda: _fetch_reddit_social_context(
+            symbol,
+            evidence_need=evidence_need,
+            now=now,
+        )
+    if source == "twitter" and evidence_need == "social_sentiment":
+        return lambda: _fetch_twitter_social_context(symbol, evidence_need=evidence_need)
+    if source == "youtube_transcript" and evidence_need == "earnings_transcripts":
+        return lambda: fetch_youtube_earnings_transcript_packet(symbol, now=now)
+    if candidate.route == "local:research_gap" and evidence_need in RESEARCH_GAP_EVIDENCE_NEEDS:
+        return lambda: _fetch_research_gap_packet(symbol, evidence_need=evidence_need)
+    if source == "broker_snapshot" and evidence_need == "quote_price_context":
+        return lambda: _fetch_broker_snapshot_quote_price_context(
+            symbol,
+            snapshot_dir=broker_snapshot_dir,
+        )
+    if source == "yfinance" and evidence_need == "quote_price_context":
+        return lambda: _fetch_yfinance_quote_price_context(symbol, now=now)
+    if source == "yfinance_options" and evidence_need == "options_iv_flow":
+        return lambda: fetch_yfinance_options_iv_flow(symbol)
+    if source == "yfinance_short_interest" and evidence_need == "short_interest":
+        return lambda: fetch_yfinance_short_interest(symbol)
+    if source == "sec_edgar" and evidence_need == "fundamentals_profile":
+        return lambda: _fetch_sec_submissions_by_symbol(symbol)
+    if source == "crawlee" and evidence_need in {
+        "crawler_research",
+        "market_news",
+        "fundamentals_profile",
+    }:
+        return lambda: _fetch_crawlee_ticker_research(symbol, evidence_need)
+    if source == "newsapi" and evidence_need == "market_news":
+        start, end = _news_dates(now)
+        return lambda: fetch_newsapi_everything(
+            f"{symbol} stock",
+            from_date=start,
+            to_date=end,
+            page_size=50,
+            symbol=symbol,
+        )
+    if source == "tiingo":
+        if evidence_need == "market_news":
+            start, end = _news_dates(now)
+            return lambda: fetch_tiingo_news(tickers=[symbol], start_date=start, end_date=end, limit=50)
+        if evidence_need == "quote_price_context":
+            start, end = _news_dates(now, lookback_days=30)
+            return lambda: fetch_tiingo_daily_prices(symbol, start_date=start, end_date=end)
+        if evidence_need == "fundamentals_profile":
+            return lambda: fetch_tiingo_ticker_metadata(symbol)
+    if source == "marketaux" and evidence_need == "market_news":
+        start, end = _news_dates(now)
+        return lambda: fetch_marketaux_news(
+            symbols=[symbol],
+            search=f"{symbol} stock",
+            published_after=start,
+            published_before=end,
+            limit=50,
+        )
+    if source == "eodhd":
+        if evidence_need == "market_news":
+            start, end = _news_dates(now)
+            return lambda: fetch_eodhd_news(symbol=symbol, from_date=start, to_date=end, limit=50)
+        if evidence_need == "fundamentals_profile":
+            return lambda: fetch_eodhd_fundamentals(symbol)
+        if evidence_need == "social_sentiment":
+            start, end = _news_dates(now)
+            return lambda: fetch_eodhd_sentiments([symbol], from_date=start, to_date=end)
+    if source == "massive":
+        if evidence_need == "quote_price_context":
+            return lambda: fetch_massive_previous_day_bar(symbol)
+        if evidence_need == "fundamentals_profile":
+            return lambda: fetch_massive_ticker_overview(symbol)
+    if source == "alpha_vantage":
+        if evidence_need == "quote_price_context":
+            start, end = _news_dates(now, lookback_days=30)
+            return lambda: _alpha_vantage_packet(
+                symbol=symbol,
+                evidence_type="daily_adjusted",
+                payload=fetch_alpha_vantage_stock_raw(symbol, start, end),
+                source_ref=(
+                    "https://www.alphavantage.co/query?"
+                    f"function=TIME_SERIES_DAILY_ADJUSTED&symbol={symbol}"
+                ),
+            )
+        if evidence_need == "market_news":
+            start, end = _news_dates(now)
+            return lambda: _alpha_vantage_packet(
+                symbol=symbol,
+                evidence_type="news_sentiment",
+                payload=fetch_alpha_vantage_news_raw(symbol, start, end),
+                source_ref=(
+                    "https://www.alphavantage.co/query?"
+                    f"function=NEWS_SENTIMENT&tickers={symbol}"
+                ),
+            )
+    if source == "finnhub":
+        if evidence_need == "quote_price_context":
+            return lambda: fetch_finnhub_quote(symbol)
+        if evidence_need == "market_news":
+            start, end = _news_dates(now)
+            return lambda: fetch_finnhub_company_news(symbol, from_date=start, to_date=end)
+        if evidence_need == "fundamentals_profile":
+            return lambda: fetch_finnhub_profile2(symbol)
+    if source == "fmp":
+        if evidence_need == "quote_price_context":
+            return lambda: fetch_fmp_quote(symbol)
+        if evidence_need == "market_news":
+            start, end = _news_dates(now)
+            return lambda: fetch_fmp_stock_news([symbol], from_date=start, to_date=end, limit=25)
+        if evidence_need == "fundamentals_profile":
+            return lambda: fetch_fmp_company_profile(symbol)
+        if evidence_need == "earnings_transcripts":
+            return lambda: fetch_fmp_latest_earning_call_transcript(symbol)
+    return None
+
+
+def _packet_attempt(
+    packet: SourceEvidencePacket,
+    candidate: ProviderFallbackCandidate,
+    *,
+    evidence_need: str,
+) -> dict[str, Any]:
+    cache = packet.freshness.get("cache") if isinstance(packet.freshness, dict) else None
+    return {
+        "evidence_need": evidence_need,
+        "source_name": candidate.source_name,
+        "route": candidate.route,
+        "cost_tier": candidate.cost_tier,
+        "source_quality_score": candidate.source_quality_score,
+        "source_quality_reason": candidate.source_quality_reason,
+        "status": "packet_written",
+        "packet_id": packet.packet_id,
+        "quality": packet.quality,
+        "blocked": bool(packet.freshness.get("blocked")) if isinstance(packet.freshness, dict) else False,
+        "cache_state": cache.get("state") if isinstance(cache, dict) else None,
+    }
+
+
+def _blocked_packet_counts_as_evidence(
+    packet: SourceEvidencePacket,
+    candidate: ProviderFallbackCandidate,
+) -> bool:
+    if not packet.freshness.get("blocked"):
+        return True
+    return candidate.route == "local:research_gap" or candidate.cost_tier == "connected_mcp_read"
+
+
+def _packet_is_gap(packet: SourceEvidencePacket) -> bool:
+    return (
+        packet.tool_route == "local:research_gap"
+        or str(packet.source_name).endswith("_gap")
+        or bool(packet.freshness.get("gap_category"))
+    )
+
+
+def _route_status_counts(attempts: Sequence[dict[str, Any]]) -> dict[str, int]:
+    statuses = sorted({str(attempt.get("status") or "unknown") for attempt in attempts})
+    return {
+        status: sum(1 for attempt in attempts if str(attempt.get("status") or "unknown") == status)
+        for status in statuses
+    }
+
+
+def build_ticker_provider_research_packets(
+    symbol: str,
+    *,
+    evidence_needs: Sequence[str] = DEFAULT_TICKER_EVIDENCE_NEEDS,
+    provider_config_path: str | Path = DEFAULT_PROVIDER_FALLBACK_PATH,
+    depleted_sources: set[str] | None = None,
+    disabled_sources: set[str] | None = None,
+    max_packets_per_need: int = 1,
+    cache_dir: str | Path = "results/research_provider_cache",
+    broker_snapshot_dir: str | Path = DEFAULT_BROKER_SNAPSHOT_DIR,
+    source_quality_review_path: str | Path | None = None,
+    now: datetime.datetime | None = None,
+) -> TickerProviderResearchResult:
+    ticker = _symbol(symbol)
+    config = load_provider_fallback_config(provider_config_path)
+    source_quality_strengths = (
+        load_source_quality_strengths(source_quality_review_path)
+        if source_quality_review_path is not None
+        else {}
+    )
+    packets: list[SourceEvidencePacket] = []
+    attempts: list[dict[str, Any]] = []
+    requested_needs = [need.strip() for need in evidence_needs if need and need.strip()]
+    for evidence_need in requested_needs:
+        written_for_need = 0
+        candidates = select_available_fallbacks(
+            evidence_need,
+            config=config,
+            depleted_sources=depleted_sources,
+            disabled_sources=disabled_sources,
+            source_quality_strengths=(
+                source_quality_strengths if source_quality_review_path is not None else None
+            ),
+        )
+        candidate_sources = [candidate.source_name for candidate in candidates]
+        for candidate in candidates:
+            if candidate.source_name == "official_cache":
+                try:
+                    packet = _read_source_cache_packet(
+                        cache_dir,
+                        symbol=ticker,
+                        evidence_need=evidence_need,
+                        candidate_sources=candidate_sources,
+                    )
+                except OfficialDataError as exc:
+                    attempts.append(
+                        _cache_miss_attempt(candidate, evidence_need=evidence_need, reason=str(exc))
+                    )
+                    continue
+                packets.append(packet)
+                attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
+                written_for_need += 1
+                if written_for_need >= max(1, int(max_packets_per_need)):
+                    break
+                continue
+            fetcher = _fetcher_for_candidate(
+                candidate,
+                evidence_need=evidence_need,
+                symbol=ticker,
+                now=now,
+                cache_dir=cache_dir,
+                candidate_sources=candidate_sources,
+                broker_snapshot_dir=broker_snapshot_dir,
+            )
+            if fetcher is None:
+                attempts.append(_unsupported_attempt(candidate, evidence_need=evidence_need))
+                continue
+            cache_key = _provider_cache_key(
+                symbol=ticker,
+                evidence_need=evidence_need,
+                source_name=candidate.source_name,
+            )
+            packet = cached_safe_fetch_evidence(
+                fetcher,
+                cache_key=cache_key,
+                ttl_seconds=0
+                if candidate.source_name in NO_STALE_CACHE_SOURCES
+                else _cache_ttl_seconds(evidence_need),
+                source_name=candidate.source_name,
+                evidence_type=evidence_need,
+                subject=ticker,
+                symbol=ticker,
+                source_ref=f"{candidate.route}:{ticker}",
+                cache_dir=cache_dir,
+                now=now,
+                allow_stale_on_error=candidate.source_name not in NO_STALE_CACHE_SOURCES,
+            )
+            if not _blocked_packet_counts_as_evidence(packet, candidate):
+                attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
+                continue
+            packets.append(packet)
+            attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
+            written_for_need += 1
+            if written_for_need >= max(1, int(max_packets_per_need)):
+                break
+    source_ref = f"local://{Path(provider_config_path).as_posix()}#ticker_provider_orchestrator/{ticker}"
+    cost_tier_by_source = {
+        str(attempt.get("source_name")): str(attempt.get("cost_tier"))
+        for attempt in attempts
+        if attempt.get("source_name") and attempt.get("cost_tier")
+    }
+    gap_packets = [packet for packet in packets if _packet_is_gap(packet)]
+    non_gap_evidence_needs = {
+        packet.evidence_type
+        for packet in packets
+        if not _packet_is_gap(packet) and not packet.freshness.get("blocked")
+    }
+    gap_evidence_needs = {packet.evidence_type for packet in gap_packets}
+    summary_packet = evidence_packet(
+        source_name="ticker_provider_orchestrator",
+        evidence_type="ticker_research_provider_bundle",
+        subject=ticker,
+        symbol=ticker,
+        source_ref=source_ref,
+        payload={
+            "symbol": ticker,
+            "evidence_needs": requested_needs,
+            "depleted_sources": sorted(depleted_sources or set()),
+            "disabled_sources": sorted(disabled_sources or set()),
+            "max_packets_per_need": max_packets_per_need,
+            "source_quality_ordering": {
+                "enabled": source_quality_review_path is not None,
+                "review_path": str(source_quality_review_path) if source_quality_review_path else None,
+                "scored_source_count": len(source_quality_strengths),
+            },
+            "source_packet_ids": [packet.packet_id for packet in packets],
+            "route_attempts": attempts,
+            "packet_counts_by_source": {
+                source_name: sum(1 for packet in packets if packet.source_name == source_name)
+                for source_name in sorted({packet.source_name for packet in packets})
+            },
+            "route_status_counts": _route_status_counts(attempts),
+            "unsupported_route_count": sum(
+                1
+                for attempt in attempts
+                if attempt.get("status") == "unsupported_in_local_orchestrator"
+            ),
+            "blocked_packet_attempt_count": sum(
+                1
+                for attempt in attempts
+                if attempt.get("status") == "packet_written" and attempt.get("blocked") is True
+            ),
+            "gap_packet_count": len(gap_packets),
+            "evidence_needs_with_gap_packets": sorted(gap_evidence_needs),
+            "evidence_needs_without_non_gap_packets": sorted(
+                set(requested_needs) - non_gap_evidence_needs
+            ),
+            "limited_source_packet_count": sum(
+                1
+                for packet in packets
+                if cost_tier_by_source.get(packet.source_name) in {"free_limited", "paid_limited"}
+            ),
+            "analysis_only": True,
+            "execution_authority": "none",
+            "forbidden_effects": config.get("policy", {}).get("forbidden_effects", []),
+        },
+        quality="medium" if packets else "unknown",
+        request_fingerprint=request_hash(
+            "LOCAL",
+            source_ref,
+            None,
+            {
+                "symbol": ticker,
+                "evidence_needs": requested_needs,
+                "depleted_sources": sorted(depleted_sources or set()),
+                "disabled_sources": sorted(disabled_sources or set()),
+            },
+        ),
+        tool_route="local_ticker_provider_orchestrator",
+        redaction_status="no_secrets_seen",
+        freshness_extra={
+            "packet_count": len(packets),
+            "attempt_count": len(attempts),
+            "read_only": True,
+        },
+    )
+    return TickerProviderResearchResult(
+        symbol=ticker,
+        packets=packets,
+        summary_packet=summary_packet,
+        route_attempts=attempts,
+    )
+
+
+def packet_ids(packets: Iterable[SourceEvidencePacket]) -> list[str]:
+    return [packet.packet_id for packet in packets]

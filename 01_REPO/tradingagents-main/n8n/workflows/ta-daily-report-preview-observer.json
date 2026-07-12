@@ -1,0 +1,61 @@
+{
+  "name": "TA · Daily Report Preview (observer)",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Run observer",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        80,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8765/run",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"job\":\"daily_report_preview\"}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "job-0-daily-report-preview",
+      "name": "daily_report_preview",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        320,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Run observer": {
+      "main": [
+        [
+          {
+            "node": "daily_report_preview",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": [
+    {
+      "name": "tradingagents"
+    },
+    {
+      "name": "observer"
+    }
+  ]
+}

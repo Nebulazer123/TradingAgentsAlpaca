@@ -1,0 +1,25 @@
+{
+  "rows": [
+    {
+      "symbol": "NVDA",
+      "start_date": "2026-05-01",
+      "end_date": "2026-05-06",
+      "start_price": "100",
+      "end_price": "110"
+    },
+    {
+      "symbol": "MSFT",
+      "start_date": "2026-05-01",
+      "end_date": "2026-05-06",
+      "start_price": "200",
+      "end_price": "198"
+    },
+    {
+      "symbol": "SPY",
+      "start_date": "2026-05-01",
+      "end_date": "2026-05-06",
+      "start_price": "500",
+      "end_price": "505"
+    }
+  ]
+}

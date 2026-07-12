@@ -1,0 +1,14 @@
+version = 1
+id = "tradingagents-self-heal-monitor"
+kind = "cron"
+name = "TradingAgents self-heal monitor"
+prompt = "Run the TradingAgents self-heal monitor as a fresh standalone Codex repair job.\n\nStart from compact context only:\n1. Run `.\\.venv\\Scripts\\python.exe scripts\\automation_context_snapshot.py --write`.\n2. Run `.\\.venv\\Scripts\\python.exe -m cli.main research self-heal-handoff --json-output`.\n3. Read `results/self_heal/latest.json` and `results/self_heal/latest-prompt.txt`.\n4. Run `.\\.venv\\Scripts\\python.exe -m cli.main research self-heal-plan --execute-safe --json-output` so safe non-order remediation plans are created promptly when an actionable handoff exists.\n5. Run `.\\.venv\\Scripts\\python.exe -m cli.main research automation-health-audit --json-output` and inspect `results/automation_health/latest.json` to verify self-heal follow-up timing and automation health after this monitor pass.\n\nIf `should_start_new_chat` is false and the self-heal plan/audit are clean, do not inspect raw packets and do not edit files. Post one short status line with trigger count, max severity, self-heal packet path, plan packet path, audit packet path, and remaining late/missing counts.\n\nIf `should_start_new_chat` is true, treat this automation run as the fresh self-heal chat. Follow `latest-prompt.txt`: inspect only the exact trigger paths first, diagnose root cause, patch repo files only when evidence proves a repo bug, and run the smallest focused tests plus `.\\.venv\\Scripts\\python.exe scripts\\automation_context_snapshot.py --write` after edits. After any patch, rerun `research self-heal-plan --execute-safe --json-output` and `research automation-health-audit --json-output` through `.\\.venv\\Scripts\\python.exe -m cli.main` to verify the repair loop is orderly and timely.\n\nHard boundaries: do not submit live or paper orders, do not cancel or replace orders, do not refresh the live dead-man, do not send email, do not change automation statuses unless the trigger proves a controller config bug, do not read secrets, and do not ask for per-trade approval. If the trigger is stale external data or timing rather than a repo bug, document that and leave code unchanged.\n\nFinal note must be short: self-heal packet path, self-heal plan packet path, automation-health audit path, root cause, files changed, tests run, and remaining blocker if any."
+status = "PAUSED"
+rrule = "RRULE:FREQ=HOURLY;INTERVAL=1;BYMINUTE=15;BYDAY=SU,MO,TU,WE,TH,FR,SA"
+model = "gpt-5.4-mini"
+reasoning_effort = "high"
+execution_environment = "local"
+target = { type = "project", project_id = "C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main" }
+cwds = ["C:\\Users\\Corbin\\Documents\\Coding projects\\TradingAgents-main"]
+created_at = 1780474503135
+updated_at = 1783808417250

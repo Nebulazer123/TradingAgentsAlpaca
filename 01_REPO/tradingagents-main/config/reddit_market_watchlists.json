@@ -1,0 +1,193 @@
+{
+  "policy": {
+    "read_only": true,
+    "source_role": "social/context feed, not trade truth",
+    "default_recent_only": true,
+    "default_listing_rule": "Use subreddit /new pages and search links with sort=new&t=day unless explicitly running historical analysis.",
+    "full_thread_rule": "Open raw threads only for open positions, overnight top candidates, paper tournament candidates, major macro events, major ticker spikes, or unusually high engagement.",
+    "raw_comment_threads_by_default": false,
+    "allowed_context_flags": [
+      "retail_panic",
+      "retail_euphoria",
+      "buy_the_dip_chatter",
+      "squeeze_hype",
+      "macro_fear",
+      "earnings_reaction",
+      "no_signal"
+    ],
+    "forbidden_effects": [
+      "post",
+      "comment",
+      "vote",
+      "message",
+      "trade",
+      "create_trade_intent",
+      "size_position",
+      "submit_order",
+      "promote_sleeve",
+      "waive_live_gate"
+    ]
+  },
+  "polling_cadence": {
+    "overnight_research": "1 pass nightly across all buckets, capped by top-N candidates and cache freshness",
+    "premarket_brief": "1 quick refresh of core_market_pulse, macro_fear_context, ai_semiconductor_theme, and dynamic_ticker_pages for active candidates",
+    "hourly_supervisor": "only check Reddit summaries when an open position, paper candidate, major ticker spike, or macro-event flag is active",
+    "high_noise_buckets": "retail_speculative_heat no more than every 2 hours unless a ticker spike or open-position trigger is active"
+  },
+  "compact_output_schema": {
+    "source_url": "string",
+    "subreddit": "string",
+    "post_time": "string",
+    "post_title": "string",
+    "post_url": "string",
+    "ticker_mentions": ["NVDA", "SPY"],
+    "theme": "macro_fear | ticker_hype | earnings_reaction | buy_the_dip | short_squeeze | bearish_warning | no_signal",
+    "sentiment": "panic | bearish | neutral | bullish | euphoric",
+    "confidence": 0.0,
+    "engagement": {
+      "upvotes": null,
+      "comments": null
+    },
+    "why_it_matters": "one sentence",
+    "open_raw_thread": false
+  },
+  "reddit_watchlists": {
+    "core_market_pulse": [
+      "https://www.reddit.com/r/stocks/new/",
+      "https://www.reddit.com/r/investing/new/",
+      "https://www.reddit.com/r/StockMarket/new/",
+      "https://www.reddit.com/r/SecurityAnalysis/new/",
+      "https://www.reddit.com/r/ValueInvesting/new/",
+      "https://www.reddit.com/r/wallstreetbets/new/",
+      "https://www.reddit.com/r/options/new/",
+      "https://www.reddit.com/r/thetagang/new/",
+      "https://www.reddit.com/r/swingtrading/new/",
+      "https://www.reddit.com/r/Daytrading/new/",
+      "https://www.reddit.com/r/pennystocks/new/",
+      "https://www.reddit.com/r/smallstreetbets/new/"
+    ],
+    "retail_speculative_heat": [
+      "https://www.reddit.com/r/wallstreetbets/new/",
+      "https://www.reddit.com/r/smallstreetbets/new/",
+      "https://www.reddit.com/r/pennystocks/new/",
+      "https://www.reddit.com/r/Shortsqueeze/new/",
+      "https://www.reddit.com/r/SqueezePlays/new/",
+      "https://www.reddit.com/r/Superstonk/new/",
+      "https://www.reddit.com/r/GME/new/",
+      "https://www.reddit.com/r/amcstock/new/",
+      "https://www.reddit.com/r/roaringkitty/new/"
+    ],
+    "macro_fear_context": [
+      "https://www.reddit.com/r/Economics/new/",
+      "https://www.reddit.com/r/economy/new/",
+      "https://www.reddit.com/r/finance/new/",
+      "https://www.reddit.com/r/business/new/",
+      "https://www.reddit.com/r/news/new/",
+      "https://www.reddit.com/r/worldnews/new/",
+      "https://www.reddit.com/r/geopolitics/new/",
+      "https://www.reddit.com/r/inflation/new/",
+      "https://www.reddit.com/r/REBubble/new/",
+      "https://www.reddit.com/r/RealEstate/new/"
+    ],
+    "ai_semiconductor_theme": [
+      "https://www.reddit.com/r/artificial/new/",
+      "https://www.reddit.com/r/MachineLearning/new/",
+      "https://www.reddit.com/r/singularity/new/",
+      "https://www.reddit.com/r/technology/new/",
+      "https://www.reddit.com/r/hardware/new/",
+      "https://www.reddit.com/r/buildapc/new/",
+      "https://www.reddit.com/r/nvidia/new/",
+      "https://www.reddit.com/r/NVDA_Stock/new/",
+      "https://www.reddit.com/r/AMD/new/",
+      "https://www.reddit.com/r/AMD_Stock/new/",
+      "https://www.reddit.com/r/intel/new/"
+    ],
+    "dynamic_ticker_pages": [
+      "https://www.reddit.com/r/NVDA_Stock/new/",
+      "https://www.reddit.com/r/nvidia/new/",
+      "https://www.reddit.com/r/AMD_Stock/new/",
+      "https://www.reddit.com/r/AMD/new/",
+      "https://www.reddit.com/r/teslainvestorsclub/new/",
+      "https://www.reddit.com/r/TSLA/new/",
+      "https://www.reddit.com/r/apple/new/",
+      "https://www.reddit.com/r/AAPL/new/",
+      "https://www.reddit.com/r/Microsoft/new/",
+      "https://www.reddit.com/r/PLTR/new/",
+      "https://www.reddit.com/r/SoFiStock/new/",
+      "https://www.reddit.com/r/ASTSpaceMobile/new/",
+      "https://www.reddit.com/r/RKLB/new/",
+      "https://www.reddit.com/r/SpaceXLounge/new/",
+      "https://www.reddit.com/r/Rivian/new/",
+      "https://www.reddit.com/r/lucidmotors/new/",
+      "https://www.reddit.com/r/HOOD/new/",
+      "https://www.reddit.com/r/coinbase/new/"
+    ],
+    "reddit_search_queries": [
+      "https://www.reddit.com/search/?q=stock%20market&sort=new&t=day",
+      "https://www.reddit.com/search/?q=SPY%20OR%20QQQ%20OR%20Nasdaq&sort=new&t=day",
+      "https://www.reddit.com/search/?q=market%20crash%20OR%20recession%20OR%20panic&sort=new&t=day",
+      "https://www.reddit.com/search/?q=CPI%20OR%20FOMC%20OR%20Powell%20OR%20rate%20cuts%20OR%20yields&sort=new&t=day",
+      "https://www.reddit.com/search/?q=earnings%20guidance%20upgrade%20downgrade&sort=new&t=day",
+      "https://www.reddit.com/search/?q=NVDA%20OR%20Nvidia%20earnings%20guidance&sort=new&t=day",
+      "https://www.reddit.com/search/?q=AMD%20OR%20Nvidia%20OR%20semiconductor&sort=new&t=day",
+      "https://www.reddit.com/search/?q=AI%20stocks%20OR%20datacenter%20OR%20GPU&sort=new&t=day",
+      "https://www.reddit.com/search/?q=Microsoft%20OpenAI%20AI%20stock&sort=new&t=day",
+      "https://www.reddit.com/search/?q=short%20squeeze%20stock&sort=new&t=day",
+      "https://www.reddit.com/search/?q=GME%20OR%20AMC%20OR%20Roaring%20Kitty&sort=new&t=day",
+      "https://www.reddit.com/search/?q=YOLO%20stock%20calls%20puts&sort=new&t=day",
+      "https://www.reddit.com/search/?q=buy%20the%20dip%20stock&sort=new&t=day",
+      "https://www.reddit.com/search/?q=oversold%20stock%20rebound&sort=new&t=day",
+      "https://www.reddit.com/search/?q=selloff%20overreaction%20stock&sort=new&t=day",
+      "https://www.reddit.com/search/?q=inflation%20stocks%20market&sort=new&t=day",
+      "https://www.reddit.com/search/?q=jobs%20report%20stocks%20market&sort=new&t=day",
+      "https://www.reddit.com/search/?q=Fed%20Powell%20stocks%20market&sort=new&t=day",
+      "https://www.reddit.com/search/?q=treasury%20yields%20stocks&sort=new&t=day",
+      "https://www.reddit.com/r/stocks/search/?q=NVDA&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/stocks/search/?q=earnings&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/stocks/search/?q=buy%20the%20dip&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/investing/search/?q=recession&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/investing/search/?q=Fed&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/wallstreetbets/search/?q=NVDA&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/wallstreetbets/search/?q=YOLO&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/options/search/?q=SPY&restrict_sr=1&sort=new&t=day",
+      "https://www.reddit.com/r/options/search/?q=NVDA&restrict_sr=1&sort=new&t=day"
+    ]
+  },
+  "low_quality_or_historical_only": {
+    "subreddit_hot_pages": {
+      "reason": "Useful only for broad mood or historical analysis; default recent checks should prefer /new.",
+      "urls": [
+        "https://www.reddit.com/r/stocks/hot/",
+        "https://www.reddit.com/r/investing/hot/",
+        "https://www.reddit.com/r/StockMarket/hot/",
+        "https://www.reddit.com/r/wallstreetbets/hot/",
+        "https://www.reddit.com/r/options/hot/"
+      ]
+    },
+    "sector_theme_expansion_queue": {
+      "reason": "Good optional expansion after core buckets; do not poll every cycle by default.",
+      "urls": [
+        "https://www.reddit.com/r/energy/new/",
+        "https://www.reddit.com/r/oilandgas/new/",
+        "https://www.reddit.com/r/NuclearPower/new/",
+        "https://www.reddit.com/r/UraniumSqueeze/new/",
+        "https://www.reddit.com/r/RenewableEnergy/new/",
+        "https://www.reddit.com/r/biotech/new/",
+        "https://www.reddit.com/r/Biotechplays/new/",
+        "https://www.reddit.com/r/pharmaindustry/new/",
+        "https://www.reddit.com/r/medicine/new/",
+        "https://www.reddit.com/r/CryptoCurrency/new/",
+        "https://www.reddit.com/r/Bitcoin/new/",
+        "https://www.reddit.com/r/ethfinance/new/",
+        "https://www.reddit.com/r/MSTR/new/",
+        "https://www.reddit.com/r/Costco/new/",
+        "https://www.reddit.com/r/walmart/new/",
+        "https://www.reddit.com/r/Target/new/",
+        "https://www.reddit.com/r/starbucks/new/",
+        "https://www.reddit.com/r/Nike/new/",
+        "https://www.reddit.com/r/disney/new/",
+        "https://www.reddit.com/r/netflix/new/"
+      ]
+    }
+  }
+}

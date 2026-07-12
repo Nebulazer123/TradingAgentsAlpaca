@@ -1,0 +1,140 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradingagents"
+version = "0.2.5"
+description = "TradingAgents: Multi-Agents LLM Financial Trading Framework"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-core>=0.3.81",
+    "langchain-anthropic>=0.3.15",
+    "langchain-experimental>=0.3.4",
+    "langchain-google-genai>=4.0.0",
+    "langchain-openai>=0.3.23",
+    "langgraph>=0.4.8",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    "pandas>=2.3.0",
+    "parsel>=1.10.0",
+    "python-dotenv>=1.0.1",
+    "pytz>=2025.2",
+    "questionary>=2.1.0",
+    "redis>=6.2.0",
+    "requests>=2.32.4",
+    "rich>=14.0.0",
+    "typer>=0.21.0",
+    "setuptools>=80.9.0",
+    "stockstats>=0.6.5",
+    "tomli>=2.0.1; python_version < '3.11'",
+    "tqdm>=4.67.1",
+    "typing-extensions>=4.14.0",
+    "yfinance>=0.2.63",
+]
+
+[dependency-groups]
+static-analysis = [
+    "mypy>=1.19.0",
+    "pandas-stubs>=2.3.0.250703",
+    "ruff>=0.14.0",
+    "types-python-dateutil>=2.9.0.20250822",
+    "types-requests>=2.32.4.20250913",
+]
+
+[project.scripts]
+tradingagents = "cli.main:app"
+
+[tool.setuptools.packages.find]
+include = ["tradingagents*", "cli*"]
+
+[tool.setuptools.package-data]
+cli = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "unit: fast isolated unit tests",
+    "integration: tests requiring external services",
+    "smoke: quick sanity-check tests",
+    "allow_network: tests that intentionally use external network access",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 320
+target-version = "py310"
+extend-exclude = [
+    ".venv",
+    "data",
+    "eval_results",
+    "results",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"cli/main.py" = ["B008", "F403", "F405"]
+"scripts/ollama/stress_eval_local_model.py" = ["E402"]
+"tradingagents/graph/setup.py" = ["F403", "F405"]
+"tradingagents/graph/trading_graph.py" = ["E402", "F403", "F405"]
+
+[tool.mypy]
+python_version = "3.10"
+namespace_packages = true
+show_error_codes = true
+pretty = true
+exclude = [
+    "^\\.venv/",
+    "^data/",
+    "^eval_results/",
+    "^results/",
+    "^tests/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "langchain_anthropic.*",
+    "langchain_core.*",
+    "langchain_google_genai.*",
+    "langchain_openai.*",
+    "langgraph.*",
+    "parsel.*",
+    "questionary.*",
+    "rich.*",
+    "stockstats.*",
+    "tomli",
+    "tomllib",
+    "typer.*",
+    "yfinance.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "cli.stats_handler",
+    "tradingagents.dataflows.integration_registry",
+    "tradingagents.execution.clock",
+    "tradingagents.execution.lock",
+    "tradingagents.policy.io",
+    "tradingagents.policy.live_control",
+    "tradingagents.policy.packets",
+    "tradingagents.policy.risk_posture",
+    "tradingagents.default_config",
+    "tradingagents.research.crawler_policy",
+]
+strict = true
+
+[[tool.mypy.overrides]]
+module = [
+    "tradingagents.brokers.*",
+    "tradingagents.dataflows.*",
+    "tradingagents.execution.*",
+    "tradingagents.policy.*",
+]
+ignore_errors = true

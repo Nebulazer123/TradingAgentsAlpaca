@@ -1,0 +1,66 @@
+# MiroFish PDT Pre-Start Packet Manifest
+
+Updated: 2026-06-03
+
+This packet is for reviewing the prepared MiroFish run before starting the real stage 03 simulation.
+
+Prepared real-run IDs:
+
+- Project: `proj_8ece728e49fe`
+- Graph: `mirofish_4a9df9ae8b184878`
+- Simulation: `sim_974459649906`
+- Stress copy: `sim_974459649906_stress2`
+
+Included planning files:
+
+- `MIRROR_FISH_PRE_START_APPROVAL_PACKET.md` - concise launch packet.
+- `MIRROR_FISH_TRADING_RUN_READINESS.md` - full readiness report and research/model notes.
+- `MIRROR_FISH_OPERATOR_RUNBOOK.md` - operator commands and launch sequence.
+- `MIRROR_FISH_PDT_SIMULATION_PROMPT.md` - standalone prompt used by stage 01/02.
+- `MIRROR_FISH_PDT_REALITY_SEED.md` - source-of-truth seed uploaded to MiroFish.
+
+Included helper/audit scripts:
+
+- `mirofish_preflight.py`
+- `mirofish_readiness_bundle.py`
+- `mirofish_completion_audit.py`
+- `mirofish_workflow_audit.py`
+- `mirofish_cost_estimator.py`
+- `mirofish_app_path_setup.py`
+- `mirofish_agent_expander.py`
+- `mirofish_env_gate.py`
+
+Current status:
+
+- Stage 01 graph construction is complete.
+- Stage 02 environment setup is complete.
+- Runnable population is expanded to 1,000 agents with retail, broker/platform, developer, media, policy/regulatory, institutional/liquidity, and tech-company/executive layers.
+- A capped two-round stage 03 stress copy completed with graph memory enabled and `failed=0`.
+- The real simulation is still gated until explicit user approval.
+- This is not the final TradingAgents handoff.
+
+Local deliverables:
+
+- Bundle folder: `C:\Users\Corbin\Documents\Coding projects\mirofish-main\deliverables\mirofish-prestart-20260602-231956`
+- Bundle zip: `C:\Users\Corbin\Documents\Coding projects\mirofish-main\deliverables\mirofish-prestart-20260602-231956.zip`
+
+Temporary UI access:
+
+- Local: `http://localhost:3000`
+- Verified Tailscale/LAN route: `http://100.79.65.87:3000`
+- Verified through Tailscale/LAN: page returned HTTP 200; `/api/simulation/sim_974459649906/run-status` returned `runner_status=idle`.
+- Public `localtunnel` was tested but stopped because it became unstable with 502 responses. Use Tailscale/LAN unless a new public tunnel is explicitly needed.
+
+Google Drive review docs:
+
+- Approval packet: `https://docs.google.com/document/d/1BuRvF8qb2jSDd64S65SYWE3oe1EvcjyM4L3tjCMxO9s`
+- Manifest: `https://docs.google.com/document/d/1qzAM5idNLPS-SGQimJnwpqJX7sINuihilctX0WfarQo`
+- Final stable manifest: `https://docs.google.com/document/d/1XFVMNvoMKYvd_8UDG_o-yNEP-r9MmzxC9c7qqQ59bzk`
+- Operator runbook: `https://docs.google.com/document/d/1nduUi0iBBj-j6YZXSB6hU0iLgcUGXMunFelukDSFtBo`
+- Simulation prompt: `https://docs.google.com/document/d/1T0K1NJllQ6WdSEIr-HaiCR5YCtKY048SdOAnO2Juhhg`
+- Full readiness report: `https://docs.google.com/document/d/1XJqY-VYUNtbEEw-6OiemZS4U6AKyhWFIbKCTHFcoHSE`
+
+Gmail drafts:
+
+- A ready email was sent to `nebulazer2003@gmail.com` with Drive links and the zip attached.
+- The exact Gmail message id is intentionally not embedded here so the zip does not become self-referential.

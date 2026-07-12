@@ -1,0 +1,114 @@
+{
+  "policy": {
+    "prefer_unmetered_first": true,
+    "limited_api_behavior": "optional_enrichment_only",
+    "depletion_behavior": "mark source depleted, use fallback routes, continue with lower confidence",
+    "cache_behavior": "use fresh cache first; stale cache is allowed only as a clearly marked fallback",
+    "execution_authority": "none",
+    "forbidden_effects": [
+      "create_trade_intent",
+      "size_position",
+      "submit_order",
+      "promote_sleeve",
+      "waive_live_gate"
+    ]
+  },
+  "cost_tier_order": [
+    "cache",
+    "local_unlimited",
+    "connected_mcp_read",
+    "free_unmetered",
+    "free_limited",
+    "paid_limited"
+  ],
+  "fallbacks": {
+    "market_news": [
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 10},
+      {"source_name": "google_news_rss", "route": "dataflow:google_news_rss", "cost_tier": "free_unmetered", "priority": 20},
+      {"source_name": "alpaca_news", "route": "dataflow:alpaca_news", "cost_tier": "connected_mcp_read", "priority": 25},
+      {"source_name": "reddit_watchlist", "route": "local:reddit_watchlist", "cost_tier": "local_unlimited", "priority": 30},
+      {"source_name": "reddit", "route": "dataflow:reddit_public", "cost_tier": "free_unmetered", "priority": 40},
+      {"source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free_limited", "priority": 70},
+      {"source_name": "newsapi", "route": "dataflow:newsapi", "cost_tier": "free_limited", "priority": 75},
+      {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 80},
+      {"source_name": "tiingo", "route": "dataflow:tiingo", "cost_tier": "free_limited", "priority": 85},
+      {"source_name": "eodhd", "route": "dataflow:eodhd", "cost_tier": "paid_limited", "priority": 90},
+      {"source_name": "marketaux", "route": "dataflow:marketaux", "cost_tier": "paid_limited", "priority": 100},
+      {"source_name": "scrapingbee", "route": "dataflow:scrapingbee", "cost_tier": "paid_limited", "priority": 110}
+    ],
+    "quote_price_context": [
+      {"source_name": "broker_snapshot", "route": "alpaca:read_only_snapshot", "cost_tier": "connected_mcp_read", "priority": 10},
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 20},
+      {"source_name": "massive", "route": "dataflow:massive", "cost_tier": "paid_limited", "priority": 30},
+      {"source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free_limited", "priority": 40},
+      {"source_name": "tiingo", "route": "dataflow:tiingo", "cost_tier": "free_limited", "priority": 45},
+      {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 50},
+      {"source_name": "alpha_vantage", "route": "dataflow:alpha_vantage", "cost_tier": "free_limited", "priority": 60},
+      {"source_name": "yfinance", "route": "dataflow:yfinance", "cost_tier": "free_unmetered", "priority": 90}
+    ],
+    "fundamentals_profile": [
+      {"source_name": "sec_edgar", "route": "dataflow:sec_edgar", "cost_tier": "free_unmetered", "priority": 10},
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 20},
+      {"source_name": "tiingo", "route": "dataflow:tiingo", "cost_tier": "free_limited", "priority": 25},
+      {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 30},
+      {"source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free_limited", "priority": 40},
+      {"source_name": "eodhd", "route": "dataflow:eodhd", "cost_tier": "paid_limited", "priority": 50}
+    ],
+    "macro_official": [
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 10},
+      {"source_name": "fred", "route": "dataflow:fred", "cost_tier": "free_limited", "priority": 20},
+      {"source_name": "bls", "route": "dataflow:bls", "cost_tier": "free_limited", "priority": 30},
+      {"source_name": "bea", "route": "dataflow:bea", "cost_tier": "free_limited", "priority": 40},
+      {"source_name": "eia", "route": "dataflow:eia", "cost_tier": "free_limited", "priority": 50},
+      {"source_name": "treasury_fiscal", "route": "dataflow:treasury_fiscal", "cost_tier": "free_unmetered", "priority": 60},
+      {"source_name": "google_news_rss", "route": "dataflow:google_news_rss", "cost_tier": "free_unmetered", "priority": 90}
+    ],
+    "social_sentiment": [
+      {"source_name": "reddit_watchlist", "route": "local:reddit_watchlist", "cost_tier": "local_unlimited", "priority": 10},
+      {"source_name": "social_watchlist", "route": "local:social_watchlist", "cost_tier": "local_unlimited", "priority": 20},
+      {"source_name": "reddit", "route": "dataflow:reddit_public", "cost_tier": "free_unmetered", "priority": 30},
+      {"source_name": "twitter", "route": "docker:twitter-research", "cost_tier": "connected_mcp_read", "priority": 40},
+      {"source_name": "facebook", "route": "composio:facebook", "cost_tier": "connected_mcp_read", "priority": 50},
+      {"source_name": "instagram", "route": "composio:instagram", "cost_tier": "connected_mcp_read", "priority": 60},
+      {"source_name": "linkedin", "route": "composio:linkedin", "cost_tier": "connected_mcp_read", "priority": 70},
+      {"source_name": "google_news_rss", "route": "dataflow:google_news_rss", "cost_tier": "free_unmetered", "priority": 90}
+    ],
+    "crawler_research": [
+      {"source_name": "crawlee", "route": "crawler:crawlee_playwright", "cost_tier": "local_unlimited", "priority": 10},
+      {"source_name": "firecrawl", "route": "composio:firecrawl", "cost_tier": "connected_mcp_read", "priority": 30},
+      {"source_name": "docker_fetch", "route": "docker:fetch", "cost_tier": "local_unlimited", "priority": 40},
+      {"source_name": "scrapingbee", "route": "dataflow:scrapingbee", "cost_tier": "paid_limited", "priority": 90}
+    ],
+    "earnings_transcripts": [
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 10},
+      {"source_name": "youtube_transcript", "route": "docker:youtube_transcript", "cost_tier": "local_unlimited", "priority": 20},
+      {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 30},
+      {"source_name": "benzinga", "route": "composio:benzinga", "cost_tier": "connected_mcp_read", "priority": 40},
+      {"source_name": "earnings_transcripts_gap", "route": "local:research_gap", "cost_tier": "local_unlimited", "priority": 999}
+    ],
+    "short_interest": [
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 10},
+      {"source_name": "yfinance_short_interest", "route": "dataflow:yfinance_short_interest", "cost_tier": "free_unmetered", "priority": 20},
+      {"source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free_limited", "priority": 40},
+      {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 50},
+      {"source_name": "short_interest_gap", "route": "local:research_gap", "cost_tier": "local_unlimited", "priority": 999}
+    ],
+    "options_iv_flow": [
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 10},
+      {"source_name": "yfinance_options", "route": "dataflow:yfinance_options", "cost_tier": "free_unmetered", "priority": 20},
+      {"source_name": "massive_options", "route": "dataflow:massive_options", "cost_tier": "paid_limited", "priority": 40},
+      {"source_name": "options_iv_flow_gap", "route": "local:research_gap", "cost_tier": "local_unlimited", "priority": 999}
+    ],
+    "earnings_calendar": [
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 10},
+      {"source_name": "yfinance_earnings_calendar", "route": "dataflow:yfinance_earnings_calendar", "cost_tier": "free_unmetered", "priority": 20},
+      {"source_name": "release_calendar_watchlist", "route": "config:release_calendar_watchlist", "cost_tier": "local_unlimited", "priority": 40},
+      {"source_name": "earnings_calendar_gap", "route": "local:research_gap", "cost_tier": "local_unlimited", "priority": 999}
+    ],
+    "macro_release_calendar": [
+      {"source_name": "official_release_calendar", "route": "config:release_calendar_watchlist", "cost_tier": "local_unlimited", "priority": 10},
+      {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 20},
+      {"source_name": "macro_release_calendar_gap", "route": "local:research_gap", "cost_tier": "local_unlimited", "priority": 999}
+    ]
+  }
+}

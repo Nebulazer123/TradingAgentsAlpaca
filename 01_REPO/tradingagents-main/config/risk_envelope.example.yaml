@@ -1,0 +1,30 @@
+# Copy to config/risk_envelope.yaml only when tiny-live is intentionally armed.
+#
+# Current canonical live posture:
+# - fixed_tranche: every live buy stays at or below tiny_live_tranche_usd.
+# - autonomous_with_caps: bots may size above tiny_live_tranche_usd, but only
+#   inside per_name_cap_usd, account_max_capital_at_risk_usd, sector, beta,
+#   broker buying-power, live-control, rate-limit, and pre-submit checks.
+# - autonomous_uncapped is retired and rejected by the loader.
+live_budget_mode: autonomous_with_caps
+account_max_capital_at_risk_usd: 250.00
+per_name_cap_usd: 50.00
+per_sector_cap_pct: 0.20
+aggregate_beta_cap: 1.25
+daily_loss_halt_usd: 25.00
+max_drawdown_halt_pct: 0.05
+tiny_live_tranche_usd: 25.00
+tiny_live_max_loss_usd: 5.00
+new_sleeve_auto_promote: false
+alert_email: ops@example.com
+# --- Optional submit-path hardening (all default-inert; omit to keep unchanged) ---
+# account_hard_ceiling_usd: a hard cap on (current live exposure + new buys).
+# This is separate from account_max_capital_at_risk_usd so the live account can
+# have an absolute emergency exposure ceiling in addition to the normal capped
+# mode. Uncomment + set to arm it (e.g. match account_max_capital_at_risk_usd).
+# account_hard_ceiling_usd: 250.00
+#
+# Rolling-window live-order rate limit. BOTH fields must be set to enforce. Counts
+# actual live submissions recorded in results/policy/live_order_rate_state.json.
+# max_live_orders_per_window: 6
+# live_order_window_minutes: 60
