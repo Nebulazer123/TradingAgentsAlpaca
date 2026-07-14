@@ -5119,12 +5119,20 @@ def _is_explicit_non_ollama_overnight_provider(provider: str | None) -> bool:
 def _auto_overnight_local_model_overrides() -> dict[str, str]:
     env = _active_model_route_env()
     policy = model_routing_policy_from_env(env)
+    def _probed_endpoint_health(endpoint: str | None) -> dict[str, object] | None:
+        # Route selectors fail closed ("blocked") when no tags health probe is
+        # supplied, so probe the candidate endpoint first and pass the evidence in.
+        if not endpoint:
+            return None
+        return {"reachable": _ollama_endpoint_healthy(endpoint), "models": []}
+
     windows_route = select_windows_local_model_route(env=env, policy=policy)
-    if (
-        windows_route.status == "selected"
-        and windows_route.endpoint_url
-        and _ollama_endpoint_healthy(windows_route.endpoint_url)
-    ):
+    windows_route = select_windows_local_model_route(
+        env=env,
+        policy=policy,
+        endpoint_health=_probed_endpoint_health(windows_route.endpoint_url),
+    )
+    if windows_route.status == "selected" and windows_route.endpoint_url:
         endpoint = _normalize_ollama_openai_base_url(windows_route.endpoint_url)
         return {
             "llm_provider": "ollama",
@@ -5134,11 +5142,12 @@ def _auto_overnight_local_model_overrides() -> dict[str, str]:
             "overnight_model_route": windows_route.route,
         }
     mac_route = select_mac_ollama_model_route(env=env, policy=policy)
-    if (
-        mac_route.status == "selected"
-        and mac_route.endpoint_url
-        and _ollama_endpoint_healthy(mac_route.endpoint_url)
-    ):
+    mac_route = select_mac_ollama_model_route(
+        env=env,
+        policy=policy,
+        endpoint_health=_probed_endpoint_health(mac_route.endpoint_url),
+    )
+    if mac_route.status == "selected" and mac_route.endpoint_url:
         return {
             "overnight_model_route": "deterministic_fallback_with_mac_helper",
             "overnight_helper_route": mac_route.route,

@@ -262,7 +262,9 @@ def test_n8n_allowlist_exposes_evaluation_and_compact_audit_jobs():
     assert "--compact-json-output" in overnight.commands[1]
     assert "--no-write-latest" in overnight.commands[1]
     assert "--no-agent-ledger" in overnight.commands[1]
-    assert "--no-research-context" in overnight.commands[1]
+    # The observer preview now runs with research context enabled (read-only);
+    # write-latest and agent-ledger stay disabled so it cannot mutate state.
+    assert "--full-graph-tickers" in overnight.commands[1]
     assert orchestration.submit_capable is False
     assert orchestration.compact_output_only is True
     assert "automation-orchestration-plan" in orchestration.commands[0]
