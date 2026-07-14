@@ -11,42 +11,27 @@ runner = CliRunner()
 def _good_daily_body() -> str:
     return "\n".join(
         [
-            "To: operator@example.com",
-            "Subject: TradingAgents Daily Market Supervisor Report",
-            "",
             "Plain English",
-            "- Orders were sent today. The dollars and accounts are listed below.",
+            "- One order was placed today. The dollars and accounts are listed below.",
+            "",
+            "Where you stand",
+            "- Real-money account: $200.00 total; overall position P/L $2.00 (1.00%); Holdings: 1",
+            "- Largest holding: MA $0.40",
+            "- Spent today: $25.00 real money, $0.00 practice",
+            "- Practice account P/L: $0.00 (practice trades test ideas with no real money)",
             "",
             "What happened",
-            "- Latest decision: buy - controlled dip; support checks stayed clean.",
-            "- Supervisor checks today: 4",
-            "- Material checks today: 2",
-            "- Submitted orders today: 1",
+            "- A controlled dip was bought; support checks stayed clean.",
+            "- Checks today: 4 routine, 2 needed attention, 1 order(s) sent",
+            "- Problem: none",
+            "- Order: live MA buy $25.00 limit 410.00 status=filled",
+            "- Waiting orders: none",
             "",
-            "Problem: none",
+            "Why it matters",
+            "- Money moved today. The amounts above are what was spent, and every order stayed inside the safety limits.",
             "",
-            "Money today",
-            "- Live spent today: $25.00",
-            "- Paper spent today: $0.00",
-            "",
-            "Live account",
-            "- Live equity: $200.00",
-            "- Live unrealized P/L: $2.00 (1.00%)",
-            "- Holdings: MA qty 0.052 value $25.00 P/L $0.40 (1.60%)",
-            "",
-            "Paper account",
-            "- Paper unrealized P/L: $0.00",
-            "- Holdings: none",
-            "",
-            "Open orders",
-            "- Live: none",
-            "- Paper: none",
-            "",
-            "Submitted orders",
-            "- live buy MA $25.00 limit status=filled",
-            "",
-            "Need from you",
-            "- No approval needed. Routine trades and promotions stay autonomous inside the configured envelope.",
+            "What to do next",
+            "- Nothing needed from you today. Skim the order list above and reply if anything looks unfamiliar.",
         ]
     )
 
@@ -54,15 +39,16 @@ def _good_daily_body() -> str:
 def test_email_clarity_eval_passes_clear_daily_report():
     result = evaluate_email_clarity(
         _good_daily_body(),
-        subject="TradingAgents Daily Market Supervisor Report",
+        subject="Your trading update for Monday, July 13: quiet day, no trades [TradingAgents]",
         report_type="daily",
     )
 
-    assert result["status"] == "pass"
+    assert result["status"] == "pass", result["issues"]
     assert result["score"] == 100
     assert result["can_submit_orders"] is False
-    assert result["problem_line"] == "Problem: none"
-    assert result["need_from_you_line"].startswith("- No approval needed")
+    assert result["problem_line"] == "- Problem: none"
+    assert result["need_from_you_line"].startswith("- Nothing needed from you")
+    assert result["why_it_matters_line"].startswith("- Money moved today.")
 
 
 def test_email_clarity_eval_flags_programmer_words_and_trade_approval():
@@ -71,7 +57,7 @@ def test_email_clarity_eval_flags_programmer_words_and_trade_approval():
             "Plain English",
             "- Go fix this file and debug this.",
             "Problem: projected $125 cap $100",
-            "Need from you",
+            "What to do next",
             "- Please approve this trade.",
         ]
     )
@@ -85,18 +71,37 @@ def test_email_clarity_eval_flags_programmer_words_and_trade_approval():
     assert "trade-level approval" in joined
 
 
-def test_email_clarity_eval_requires_self_heal_language_for_current_blocker():
+def test_email_clarity_eval_flags_engineering_vocabulary():
+    body = _good_daily_body().replace(
+        "- A controlled dip was bought; support checks stayed clean.",
+        "- The pullback-support sleeve packet passed the live gate after a dry-run.",
+    )
+
+    result = evaluate_email_clarity(body, report_type="daily")
+
+    assert result["status"] == "fail"
+    joined = " | ".join(result["issues"])
+    assert "contains confusing/programmer wording" in joined
+
+
+def test_email_clarity_eval_requires_safe_pause_language_for_current_blocker():
     body = "\n".join(
         [
             "Plain English",
-            "- The bot stopped before live money moved.",
+            "- The bot stopped before real money moved.",
+            "",
+            "Where you stand",
+            "- Real-money account: $200.00 total; Holdings: 1",
+            "- Spent today: $0.00 real money, $0.00 practice",
             "",
             "What happened",
             "- Risk checks failed.",
+            "- Problem: a safety file is missing",
             "",
-            "Problem: risk envelope missing",
+            "Why it matters",
+            "- Money cannot move.",
             "",
-            "Need from you",
+            "What to do next",
             "- No action needed from you.",
         ]
     )
@@ -104,7 +109,7 @@ def test_email_clarity_eval_requires_self_heal_language_for_current_blocker():
     result = evaluate_email_clarity(body, report_type="urgent")
 
     assert result["status"] == "fail"
-    assert any("self-heal" in issue for issue in result["issues"])
+    assert any("safe pause" in issue for issue in result["issues"])
 
 
 def test_email_clarity_writer_and_cli_write_compact_artifacts(tmp_path):
@@ -127,7 +132,7 @@ def test_email_clarity_writer_and_cli_write_compact_artifacts(tmp_path):
             "--body-file",
             str(body_file),
             "--subject",
-            "TradingAgents Daily Market Supervisor Report",
+            "Your trading update for Monday, July 13: 1 trade(s) made [TradingAgents]",
             "--output-dir",
             str(tmp_path / "cli-evals"),
             "--json-output",

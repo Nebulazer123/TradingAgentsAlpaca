@@ -694,12 +694,12 @@ def test_daily_report_includes_paper_tournament_leader(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert "Paper tournament leader: catalyst-relative-strength" in payload["body"]
-    assert "Premarket brief: 2026-06-01T10:00:00+00:00, top ORCL" in payload["body"]
-    assert "Model telemetry: Model routes are safe but not fully ready" in payload["body"]
-    assert "BOARD review: new buys are paused for review" in payload["body"]
-    assert "sells still work independently" in payload["body"]
-    assert "wait for cleaner dip/support evidence" in payload["body"]
+    assert "Practice-strategy race: the momentum strategy is leading" in payload["body"]
+    assert "Tomorrow's top stock to watch: ORCL." in payload["body"]
+    assert "Model telemetry" not in payload["body"]
+    assert "BOARD review" not in payload["body"]
+    assert "sleeve" not in payload["body"].lower()
+    assert "Practice-strategy race:" in payload["body"]
     assert payload["paper_tournament"]["live_strategy_candidate"]["strategy_id"] == "catalyst-relative-strength"
     assert payload["premarket_brief"]["premarket_instructions"]["top_symbol"] == "ORCL"
     assert payload["model_telemetry_report"]["resolved_model_run_count"] == 1

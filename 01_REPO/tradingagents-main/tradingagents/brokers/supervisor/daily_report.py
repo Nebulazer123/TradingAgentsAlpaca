@@ -12,7 +12,11 @@ from collections.abc import Mapping, Sequence
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 
-from tradingagents.brokers.supervisor.formatting import email_reason_text as _email_reason_text
+from tradingagents.brokers.supervisor.formatting import (
+    email_reason_text as _email_reason_text,
+    plain_language_reason,
+    strategy_display_name,
+)
 from tradingagents.brokers.supervisor.session import UTC
 from tradingagents.policy.io import atomic_write_text, unique_packet_path
 
@@ -131,15 +135,15 @@ def _human_problem_reason(reason: str, *, cleared: bool = False) -> str:
     ):
         if cleared:
             return (
-                "Earlier live buy was blocked by the old dollar-cap guard. "
-                "Later clean packets cleared it."
+                "An earlier real-money buy was stopped by a spending limit. "
+                "Later checks came back clean."
             )
         return (
-            "This looks like an old dollar-cap style blocker. "
-            "Current uncapped mode ignores repo dollar caps, so Codex should rerun "
-            "the supervisor and only stop if broker buying power or the live gate still blocks it."
+            "A real-money buy was stopped by a spending limit. The system "
+            "will retry on its own and only stays stopped if the broker or "
+            "a safety check still says no."
         )
-    return reason
+    return plain_language_reason(reason, default=_email_reason_text(reason))
 
 
 def _daily_packet_sort_key(packet: Mapping) -> datetime.datetime:
@@ -237,143 +241,122 @@ def render_daily_supervisor_report(
         plain_english = "Orders were sent today. The dollars and accounts are listed below."
     else:
         plain_english = "Nothing urgent happened. The bot kept watching and stayed inside the rules."
-    live_budget_mode = ""
-    for packet in reversed(ordered_packets):
-        evidence = packet.get("evidence") if isinstance(packet, Mapping) else None
-        if not isinstance(evidence, Mapping):
-            continue
-        live_budget = evidence.get("live_budget")
-        if isinstance(live_budget, Mapping) and live_budget.get("mode"):
-            live_budget_mode = str(live_budget.get("mode"))
-            break
-    live_sizing_lines = [
-        (
-            "- Live sizing mode: configured limit; "
-            f"Live reference limit: ${_display_money(live.get('dynamic_cap'))}; "
-            f"Unused live reference: ${_display_money(live.get('unused_cap'))}"
-        ),
-    ]
-    if live_budget_mode == "autonomous_uncapped":
-        live_sizing_lines = [
-            (
-                "- Live sizing mode: autonomous uncapped; Live buying power available: "
-                f"${_display_money(live.get('buying_power'))}"
-            ),
-        ]
+    # --- Why it matters / next action -------------------------------------
+    if current_problem_packet is not None:
+        why_it_matters = (
+            "- While a safety problem is open, the system stops buying and "
+            "keeps your money where it is. Nothing is lost by the block "
+            "itself, but no new opportunities are taken until it clears."
+        )
+        next_action = (
+            "- Reply to this email or open the app and approve the safe "
+            "auto-repair. If the problem needs an owner decision (renewing "
+            "the real-money safety timer, or a freeze/unfreeze call), it "
+            "will be asked as one question. Trading stays paused until then."
+        )
+    elif submitted:
+        why_it_matters = (
+            "- Money moved today. The amounts above are what was spent, and "
+            "every order stayed inside the safety limits."
+        )
+        next_action = (
+            "- Nothing needed from you today. Skim the order list above and "
+            "reply if anything looks unfamiliar."
+        )
+    else:
+        why_it_matters = (
+            "- A quiet day means the rules did not find anything worth "
+            "buying or selling, so your money stayed where it was."
+        )
+        next_action = "- Nothing needed from you today."
+
+    positions = live.get("positions") or []
+    best = max(positions, key=lambda p: float(p.get("unrealized_pl") or 0), default=None)
+    worst = min(positions, key=lambda p: float(p.get("unrealized_pl") or 0), default=None)
 
     lines = [
         "Plain English",
         f"- {plain_english}",
         "",
-        "What happened",
+        "Where you stand",
         (
-            "- "
-            f"Latest decision: {latest_material.get('decision', 'none')} - "
-            f"{_email_reason_text(latest_material.get('reason'))}"
+            "- Real-money account: "
+            f"${_display_money(live.get('equity'))} total; "
+            f"overall position P/L ${_display_money(live.get('unrealized_pl'))} "
+            f"({_portfolio_unrealized_plpc(live)}%); Holdings: {len(positions)}"
         ),
-        (
-            "- Checks today: "
-            f"{len(ordered_packets)} supervisor, "
-            f"{len(material_packets)} material, "
-            f"{len(submitted)} submitted order(s)"
-        ),
-        "",
-        f"Problem: {problem_reason}",
-        "",
-        "Money today",
-        f"- Live spent today: ${_display_money(spend['live'])}",
-        f"- Paper spent today: ${_display_money(spend['paper'])}",
-        "",
-        "Live account",
-        (
-            f"- Live equity: ${_display_money(live.get('equity'))}; "
-            f"Live unrealized P/L: ${_display_money(live.get('unrealized_pl'))} "
-            f"({_portfolio_unrealized_plpc(live)}%)"
-        ),
-        *live_sizing_lines,
     ]
-    lines.extend(_position_lines(live.get("positions") or [], limit=5))
+    if best is not None and worst is not None and best is not worst:
+        lines.append(
+            f"- Best holding: {best.get('symbol')} "
+            f"${_display_money(best.get('unrealized_pl'))}; worst: "
+            f"{worst.get('symbol')} ${_display_money(worst.get('unrealized_pl'))}"
+        )
+    elif best is not None:
+        lines.append(
+            f"- Largest holding: {best.get('symbol')} "
+            f"${_display_money(best.get('unrealized_pl'))}"
+        )
     lines.extend(
         [
+            f"- Spent today: ${_display_money(spend['live'])} real money, "
+            f"${_display_money(spend['paper'])} practice",
+            (
+                "- Practice account P/L: "
+                f"${_display_money(paper.get('unrealized_pl'))} "
+                f"(practice trades test ideas with no real money)"
+            ),
             "",
-            "Paper account",
-            f"- Paper unrealized P/L: ${_display_money(paper.get('unrealized_pl'))}",
+            "What happened",
+            f"- {plain_language_reason(latest_material.get('reason'), default='Routine checks ran on schedule.')}",
+            (
+                "- Checks today: "
+                f"{len(ordered_packets)} routine, "
+                f"{len(material_packets)} needed attention, "
+                f"{len(submitted)} order(s) sent"
+            ),
+            f"- Problem: {problem_reason}",
         ]
     )
-    lines.extend(_position_lines(paper.get("positions") or [], limit=4))
-    lines.extend(["", "Open orders"])
-    lines.extend(_open_order_lines("Live", live.get("open_orders") or []))
-    lines.extend(_open_order_lines("Paper", paper.get("open_orders") or []))
-    lines.extend(["", "Submitted orders"])
     if spend["orders"]:
-        shown_orders = spend["orders"][:5]
-        for order in shown_orders:
-            lines.append(f"- {_submitted_order_line(order)}")
-        remaining_orders = len(spend["orders"]) - len(shown_orders)
+        for order in spend["orders"][:4]:
+            lines.append(f"- Order: {_submitted_order_line(order)}")
+        remaining_orders = len(spend["orders"]) - min(len(spend["orders"]), 4)
         if remaining_orders > 0:
-            lines.append(f"- {remaining_orders} more submitted order(s) not shown in this short email.")
-    else:
-        lines.append("- none")
+            lines.append(f"- {remaining_orders} more order(s) not shown in this short email")
     if spend["excluded_orders"]:
-        lines.extend(["", "Rejected/canceled orders"])
-        for order in spend["excluded_orders"]:
-            lines.append(f"- {_submitted_order_line(order)}")
-    if cleared_problem_packets and current_problem_packet is None:
-        cleared_reason = _human_problem_reason(
-            _packet_problem_reason(cleared_problem_packets[-1]),
-            cleared=True,
+        lines.append(
+            f"- {len(spend['excluded_orders'])} order(s) were rejected or "
+            "canceled before any money moved"
         )
-        lines.extend(["", f"Earlier issue cleared: {cleared_reason}"])
-    overnight_items = [
-        packet.get("evidence", {}).get("overnight_plan")
-        for packet in ordered_packets
-        if isinstance(packet.get("evidence"), Mapping)
-        and packet.get("evidence", {}).get("overnight_plan")
-    ]
-    if overnight_items:
-        latest_overnight = overnight_items[-1]
-        lines.extend(
-            [
-                "",
-                (
-                    "Overnight validation: "
-                    f"{latest_overnight.get('status', 'unknown')} "
-                    f"(overnight top {latest_overnight.get('overnight_top_symbol', 'none')}, "
-                    f"current top {latest_overnight.get('current_top_symbol', 'none')})"
-                ),
-            ]
+    open_order_count = len(live.get("open_orders") or []) + len(paper.get("open_orders") or [])
+    lines.append(
+        f"- Waiting orders: {open_order_count if open_order_count else 'none'}"
+    )
+    if cleared_problem_packets and current_problem_packet is None:
+        lines.append(
+            "- An earlier issue cleared on its own: "
+            f"{_human_problem_reason(_packet_problem_reason(cleared_problem_packets[-1]), cleared=True)}"
         )
     candidates = portfolio.get("ranked_candidates") or []
     if candidates:
         candidate_bits = [
-            f"{candidate.get('symbol')} {candidate.get('day_change_pct')}%"
+            f"{candidate.get('symbol')} ({candidate.get('day_change_pct')}% today)"
             for candidate in candidates[:3]
         ]
-        lines.extend(["", f"Top dip candidates: {', '.join(candidate_bits)}"])
-    if len(material_packets) > 1 and not submitted:
-        lines.append("")
-        lines.append("Material decisions")
-        for packet in material_packets[-2:]:
-            lines.append(
-                "- "
-                f"{packet.get('generated_at', 'unknown')}: "
-                f"{packet.get('decision', 'unknown')} - "
-                f"{packet.get('reason', '')}"
-            )
-        if len(material_packets) > 2:
-            lines.append(f"- {len(material_packets) - 2} earlier material decisions not shown")
+        lines.append(
+            f"- Stocks being watched for a possible dip buy: {', '.join(candidate_bits)}"
+        )
     lines.extend(
         [
             "",
-            "Need from you",
+            "Why it matters",
+            why_it_matters,
+            "",
+            "What to do next",
+            next_action,
         ]
     )
-    if current_problem_packet is not None:
-        lines.append(
-            "- Please approve Codex to self-heal the blocker if it can do that safely. If this needs a credential, risk-envelope arming, or kill/freeze decision, the bot will ask that one owner-level question and keep trading blocked until answered."
-        )
-    else:
-        lines.append("- No approval needed. Routine trades and promotions stay autonomous inside the configured envelope.")
     return "\n".join(lines)
 
 
@@ -460,35 +443,43 @@ def build_supervisor_daily_report_payload(
     daily_context_lines: list[str] = []
     if paper_tournament_report and paper_tournament_report.get("rankings"):
         leader = paper_tournament_report["rankings"][0]
-        candidate = paper_tournament_report.get("live_strategy_candidate") or {}
         daily_context_lines.append(
-            f"Paper tournament leader: {leader.get('strategy_id')} "
-            f"return ${leader.get('total_return')} / {leader.get('total_return_pct')}%; "
-            f"candidate {candidate.get('status', 'unknown')} "
-            f"{candidate.get('strategy_id') or 'none'}."
+            "Practice-strategy race: "
+            f"{strategy_display_name(leader.get('strategy_id'))} is leading "
+            f"with a {leader.get('total_return_pct')}% return."
         )
     if premarket_brief:
         instructions = premarket_brief.get("premarket_instructions") or {}
-        daily_context_lines.append(
-            "Premarket brief: "
-            f"{premarket_brief.get('generated_at', 'unknown')}, "
-            f"top {instructions.get('top_symbol') or 'none'}, "
-            f"status {premarket_brief_validation.get('status') if premarket_brief_validation else None}, "
-            f"sources {len(premarket_brief.get('source_packets') or [])}, "
-            f"path {premarket_brief_path_text or 'unknown'}"
-        )
-    model_telemetry = daily_model_telemetry_line(model_telemetry_report)
-    if model_telemetry:
-        daily_context_lines.append(model_telemetry)
-    execution_board = daily_execution_board_line(execution_board_review)
-    if execution_board:
-        daily_context_lines.append(execution_board)
+        top_symbol = instructions.get("top_symbol")
+        if top_symbol:
+            daily_context_lines.append(
+                f"Tomorrow's top stock to watch: {top_symbol}."
+            )
     if daily_context_lines:
         body = "\n".join([body, "", *daily_context_lines])
 
+    has_problem = any(
+        packet.get("issues") or packet.get("decision") == "blocked"
+        for packet in packets
+        if isinstance(packet, Mapping)
+    )
+    submitted_count = sum(
+        len(packet.get("submitted") or []) for packet in packets if isinstance(packet, Mapping)
+    )
+    if has_problem:
+        status_phrase = "a safety check needs attention"
+    elif submitted_count:
+        status_phrase = f"{submitted_count} trade(s) made"
+    else:
+        status_phrase = "quiet day, no trades"
+    today = datetime.datetime.now(tz=UTC)
+    subject = (
+        f"Your trading update for {today:%A, %B %-d}: {status_phrase} [TradingAgents]"
+    )
+
     return {
         "email_to": email_to,
-        "subject": "TradingAgents Daily Market Supervisor Report",
+        "subject": subject,
         "body": body,
         "portfolio": portfolio,
         "paper_tournament": paper_tournament_report,

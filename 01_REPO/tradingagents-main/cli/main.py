@@ -11357,6 +11357,17 @@ def alpaca_supervise_hourly(
     )
     payload["notification_policy_notify"] = policy_notify
     payload["notify"] = bool(payload.get("alert", {}).get("notify", policy_notify))
+    if payload["notify"]:
+        alert_email = payload.get("alert_email")
+        if isinstance(alert_email, Mapping) and alert_email.get("body"):
+            from tradingagents.notifications.outbox import write_outbox_message
+
+            outbox_path = write_outbox_message(
+                {**alert_email, "email_to": ""},
+                report_type="urgent",
+                severity=str(payload.get("alert", {}).get("severity") or "NOTABLE"),
+            )
+            payload["outbox_path"] = str(outbox_path)
     payload["account"] = {
         "live": {
             "status": live_account.get("status"),
@@ -11489,6 +11500,11 @@ def alpaca_supervisor_daily_report(
         premarket_brief_path=premarket_brief_path,
         model_telemetry_report=model_telemetry_report,
         execution_board_review=execution_board_review,
+    )
+    from tradingagents.notifications.outbox import write_outbox_message
+
+    payload["outbox_path"] = str(
+        write_outbox_message(payload, report_type="daily", severity="ROUTINE")
     )
     if json_output:
         if compact_json_output:

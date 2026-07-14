@@ -1816,8 +1816,8 @@ def test_alert_classifier_separates_routine_notable_and_critical():
     alert = classify_supervisor_alert(critical)
     assert alert.severity == "CRITICAL"
     assert alert.notify is True
-    assert "approve Codex" in alert.approval_prompt
-    assert "bot stays blocked" in alert.approval_prompt
+    assert "repair its own setup" in alert.approval_prompt
+    assert "stays stopped" in alert.approval_prompt
     assert "fix configuration" not in alert.approval_prompt
 
 
@@ -1874,20 +1874,19 @@ def test_critical_alert_serializes_clear_exception_email():
         }
     ]
     assert payload["issue_category_counts"] == {"policy": 1}
-    assert payload["alert_email"]["subject"].startswith("TradingAgents CRITICAL")
+    assert payload["alert_email"]["subject"].startswith("Action may be needed:")
     assert "Plain English" in body
     assert "The bot stopped before live money moved." in body
     assert "Trading stays blocked" in body
-    assert "Money today" in body
-    assert "This alert submitted live $0.00 and paper $0.00." in body
-    assert "Live account" in body
-    assert "Live: holdings GOOGL; open orders 0; exposure $114.99." in body
-    assert "Paper account" in body
-    assert "Paper: holdings none; open orders 0; equity $100,000.00." in body
+    assert "Where you stand" in body
+    assert "Spent today: $0.00 real money, $0.00 practice" in body
+    assert "Real-money account: holdings GOOGL; waiting orders 0; money in the market $114.99." in body
+    assert "Practice account: holdings none; waiting orders 0; total value $100,000.00." in body
     assert "Problem: risk envelope missing" in body
     assert "(policy | live-submit-guard)" in body
-    assert "Need from you" in body
-    assert "approve Codex" in body
+    assert "Why it matters" in body
+    assert "What to do next" in body
+    assert "repair its own setup" in body
     assert "What the bot did or refused to do" not in body
     assert "fix configuration" not in body
     assert "live_exposure_limit" not in body
@@ -1951,8 +1950,8 @@ def test_clean_material_alert_email_does_not_claim_self_heal_is_needed():
 
     assert "Problem: none" in body
     assert "No approval needed" in body
-    assert "No repair needed" in body
-    assert "self-heal safe setup problems" not in body
+    assert "re-verify" in body
+    assert "repair its own setup" not in body
     assert "trading stays blocked" not in body.lower()
 
 
@@ -1992,13 +1991,13 @@ def test_loss_review_email_requests_board_review_without_claiming_repair_needed(
     body = serialize_hourly_decision(decision)["alert_email"]["body"]
     clarity = evaluate_email_clarity(body, report_type="urgent")
 
-    assert "Problem: MA hit loss review." in body
-    assert "No live loss sell was submitted" in body
-    assert "BOARD/Codex must review the packet before any loss exit" in body
-    assert "Safety check said: MA hit loss review. The bot held and did not sell at a loss." in body
+    assert "Problem: MA is down enough to trigger a loss review." in body
+    assert "Nothing was sold" in body
+    assert "A review must finish before any sale at a loss" in body
+    assert "review before" in body
     assert "allowed loss-exit reason is missing" not in body
-    assert "Next step: HOLD/loss-review is default" in body
-    assert "New live buys are paused while paper exploration continues." in body
+    assert "held, not sold" in body
+    assert "practice" in body.lower()
     assert "No repair needed" not in body
     assert "self-heal safe setup problems" not in body
     assert clarity["status"] == "pass"
@@ -2042,7 +2041,7 @@ def test_loss_review_email_uses_refreshed_board_evidence_counts():
 
     assert "5 evidence item(s) still open after refresh" in body
     assert "13 evidence item(s) still missing" not in body
-    assert "HOLD remains default" in body
+    assert "held, not sold" in body
     assert len(body.splitlines()) <= 32
     assert clarity["status"] == "pass"
     assert clarity["max_line_length"] <= 180
@@ -2207,30 +2206,21 @@ def test_portfolio_snapshot_and_daily_digest_formats_key_balances_and_gains():
     )
 
     assert portfolio["live"]["unrealized_pl"] == "0.57"
-    assert "Live equity: $1,201.34" in body
-    assert "Live sizing mode: configured limit" in body
-    assert "Live reference limit: $100.00" in body
-    assert "Unused live reference: $55.00" in body
-    assert "Live unrealized P/L: $0.57 (1.26%)" in body
+    assert "Real-money account: $1,201.34 total" in body
+    assert "position P/L $0.57 (1.26%)" in body
     assert "Live buying power:" not in body
     assert "Live exposure:" not in body
     assert "Paper equity:" not in body
-    assert "Overnight validation: confirmed" in body
-    assert "ORCL" in body
     assert "GOOGL" in body
-    assert "ta-test" in body
     assert "Plain English" in body
+    assert "Where you stand" in body
     assert "What happened" in body
     assert "Problem: none" in body
-    assert "What the bot did or refused to do" not in body
-    assert "Live account" in body
-    assert "Paper account" in body
-    assert "Money today" in body
-    assert "Open orders" in body
-    assert "Paper spent today: $100.00" in body
-    assert "Live spent today: $0.00" in body
-    assert "Need from you" in body
-    assert "No approval needed" in body
+    assert "Why it matters" in body
+    assert "What to do next" in body
+    assert "Spent today: $0.00 real money, $100.00 practice" in body
+    assert "What to do next" in body
+    assert "Nothing needed from you today" in body
     assert len(body.splitlines()) <= 45
 
 
@@ -2296,14 +2286,15 @@ def test_daily_report_payload_builder_collects_context_lines():
         },
     )
 
-    assert payload["subject"] == "TradingAgents Daily Market Supervisor Report"
+    assert payload["subject"].startswith("Your trading update for ")
+    assert payload["subject"].endswith("[TradingAgents]")
     assert payload["packet_count"] == 1
     assert payload["material_count"] == 0
     assert Path(payload["premarket_brief_path"]).as_posix() == "results/premarket_briefs/latest.json"
-    assert "Paper tournament leader: buy_the_dip" in payload["body"]
-    assert "Premarket brief: 2026-06-07T12:30:00+00:00, top XOM, status pass" in payload["body"]
-    assert "Model telemetry: Mac helper reachable; Codex remains judge." in payload["body"]
-    assert "BOARD review: new buys are paused for review; sells still work independently." in payload["body"]
+    assert "Practice-strategy race:" in payload["body"]
+    assert "Tomorrow's top stock to watch: XOM." in payload["body"]
+    assert "path results" not in payload["body"]
+    assert "Model telemetry" not in payload["body"]
 
 
 def test_daily_digest_excludes_rejected_orders_from_spent_today():
@@ -2356,10 +2347,9 @@ def test_daily_digest_excludes_rejected_orders_from_spent_today():
         email_to="nebulazer2003@gmail.com",
     )
 
-    assert "Paper spent today: $100.00" in body
-    assert "Live spent today: $0.00" in body
-    assert "Rejected/canceled orders" in body
-    assert "live MSFT buy $75.00 limit 410.00 status=rejected" in body
+    assert "Spent today: $0.00 real money, $100.00 practice" in body
+    assert "Spent today: $0.00 real money" in body
+    assert "rejected or canceled before any money moved" in body
     assert "Failed, rejected, or canceled order details" not in body
 
 
@@ -2385,8 +2375,7 @@ def test_daily_digest_explains_uncapped_live_budget_without_cap_room():
         email_to="nebulazer2003@gmail.com",
     )
 
-    assert "Live sizing mode: autonomous uncapped" in body
-    assert "Live buying power available: $126.16" in body
+    assert "Real-money account:" in body
     assert "Live sizing room:" not in body
     assert "Unused live sizing room:" not in body
 
@@ -2418,10 +2407,10 @@ def test_daily_digest_uses_self_heal_proposal_for_blockers():
         email_to="nebulazer2003@gmail.com",
     )
 
-    assert "Problem: risk envelope missing" in body
-    assert "Need from you" in body
-    assert "approve Codex to self-heal" in body
-    assert "keep trading blocked" in body
+    assert "Problem:" in body
+    assert "What to do next" in body
+    assert "approve the safe" in body.lower()
+    assert "paused" in body.lower()
     assert "fix configuration" not in body
     assert "Ops only question" not in body
 
@@ -2475,10 +2464,10 @@ def test_daily_digest_clears_historical_blocker_after_later_clean_packet():
 
     assert "Problem: none" in body
     assert "The bot found a safety problem and kept live trading blocked." not in body
-    assert "Please approve Codex to self-heal" not in body
+    assert "approve the safe auto-repair" not in body.lower()
     assert (
-        "Earlier issue cleared: Earlier live buy was blocked by the old dollar-cap guard. "
-        "Later clean packets cleared it."
+        "An earlier issue cleared on its own: An earlier real-money buy was "
+        "stopped by a spending limit. Later checks came back clean."
     ) in body
     assert "projected $131.83, cap $100.00" not in body
 
@@ -2514,7 +2503,7 @@ def test_daily_digest_formats_sell_to_close_as_quantity_not_zero_spend():
         email_to="nebulazer2003@gmail.com",
     )
 
-    assert "Live spent today: $0.00" in body
+    assert "Spent today: $0.00 real money" in body
     assert "live AVGO sell qty 0.05579062 limit 472.76 status=filled" in body
     assert "live AVGO sell $0.00" not in body
 
