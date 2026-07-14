@@ -593,7 +593,7 @@ def test_overnight_summary_carries_structured_mirofish_attention_priors(monkeypa
                     {
                         "status": "final_advisory_no_execution_authority",
                         "execution_authority": "none",
-                        "report_id": "report_9c77ca2557ae",
+                        "report_id": "report_1e3059f732b1",
                         "staleness": {
                             "valid_window": "2026-06-04 through 2026-06-13",
                             "expires_after": "2026-06-13 market close unless refreshed",
@@ -773,7 +773,15 @@ def test_intraday_margin_market_structure_packet_removes_old_pdt_gates():
     assert "submit_order" in packet.payload["policy"]["forbidden_effects"]
 
 
-def test_overnight_research_context_includes_market_structure_transition(tmp_path):
+def test_overnight_research_context_includes_market_structure_transition(tmp_path, monkeypatch):
+    # Pin the clock inside the June 2026 transition window; after 2026-07-03
+    # the packet correctly reports the transition flags as False.
+    import datetime as _dt
+
+    monkeypatch.setattr(
+        "tradingagents.research.market_structure._as_utc",
+        lambda now: _dt.datetime(2026, 6, 10, tzinfo=_dt.timezone.utc),
+    )
     result = write_overnight_research_context(output_dir=tmp_path)
 
     market_structure = result.summary["watchlists"]["market_structure"]

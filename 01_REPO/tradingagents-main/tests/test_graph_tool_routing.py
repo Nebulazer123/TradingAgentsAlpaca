@@ -131,10 +131,18 @@ def test_graph_setup_uses_batched_analyst_fanout_when_concurrency_enabled(monkey
     start_route = next(path for source, path, _path_map in graph.conditional_edges if source == START)
     fanout = start_route({"messages": [HumanMessage(content="shared seed", id="seed-1")]})
     assert [item.node for item in fanout] == ["Market Analyst", "Sentiment Analyst"]
-    assert all(item.arg["messages"] == [] for item in fanout)
+    # Each branch receives its own seed message with a deterministic
+    # branch-scoped id so parallel branches never share message ids.
+    assert all(len(item.arg["messages"]) == 1 for item in fanout)
+    assert {item.arg["messages"][0].id for item in fanout} == {
+        "Market Analyst-seed",
+        "Sentiment Analyst-seed",
+    }
 
 
-def test_message_cleanup_skips_duplicate_and_empty_ids():
+def test_message_cleanup_uses_remove_all_sentinel():
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
     from tradingagents.agents.utils.agent_utils import create_msg_delete
 
     cleanup = create_msg_delete()
@@ -149,7 +157,7 @@ def test_message_cleanup_skips_duplicate_and_empty_ids():
     )
 
     removals = [message for message in result["messages"] if isinstance(message, RemoveMessage)]
-    assert [message.id for message in removals] == ["shared"]
+    assert [message.id for message in removals] == [REMOVE_ALL_MESSAGES]
     assert result["messages"][-1].content == "Continue"
 
 

@@ -26,18 +26,30 @@ FORBIDDEN_EFFECTS = [
     "promote_sleeve",
     "waive_live_gate",
 ]
+# The MiroFish checkout normally sits next to this repo (…/01_REPO/mirofish-main
+# on the Mac workspace); the Windows paths are kept for provenance with packets
+# generated before the 2026-07 transfer.
+_MIROFISH_SIBLING_ROOT = Path(__file__).resolve().parents[3] / "mirofish-main"
 DEFAULT_FINAL_HANDOFF_PATHS = (
     "reports/mirofish/MIROFISH_FINAL_TRADINGAGENTS_HANDOFF.md",
     "reports/mirofish/MIROFISH_TRADINGAGENTS_HANDOFF.md",
     "reports/mirofish/MIROFISH_FINAL_HANDOFF.md",
+    str(_MIROFISH_SIBLING_ROOT / "docs/mirror_fish/MIROFISH_FINAL_TRADINGAGENTS_HANDOFF.md"),
+    str(_MIROFISH_SIBLING_ROOT / "docs/mirror_fish/MIRROR_FISH_TRADINGAGENTS_HANDOFF.md"),
     r"C:\Users\Corbin\Documents\Coding projects\mirofish-main\docs\mirror_fish\MIROFISH_FINAL_TRADINGAGENTS_HANDOFF.md",
     r"C:\Users\Corbin\Documents\Coding projects\mirofish-main\docs\mirror_fish\MIRROR_FISH_TRADINGAGENTS_HANDOFF.md",
 )
 DEFAULT_REVIEW_ARTIFACT_PATHS = (
+    str(_MIROFISH_SIBLING_ROOT / "docs/mirror_fish/MIRROR_FISH_FINAL_ACCEPTANCE_DECISION.md"),
+    str(
+        _MIROFISH_SIBLING_ROOT
+        / "backend/uploads/reports/report_1e3059f732b1/review_packet_report_1e3059f732b1.zip"
+    ),
     r"C:\Users\Corbin\Documents\Coding projects\mirofish-main\docs\mirror_fish\MIRROR_FISH_FINAL_ACCEPTANCE_DECISION.md",
     r"C:\Users\Corbin\Documents\Coding projects\mirofish-main\backend\uploads\reports\report_1e3059f732b1\review_packet_report_1e3059f732b1.zip",
 )
 DEFAULT_FULL_REPORT_PATHS = (
+    str(_MIROFISH_SIBLING_ROOT / "backend/uploads/reports/report_1e3059f732b1/full_report.md"),
     r"C:\Users\Corbin\Documents\Coding projects\mirofish-main\backend\uploads\reports\report_1e3059f732b1\full_report.md",
     r"C:\Users\Corbin\Downloads\full_report.md",
 )
@@ -463,19 +475,22 @@ def _existing_artifact_path(value: str | Path | None) -> str | None:
     return str(path) if path.exists() else str(path)
 
 
+def _artifact_basename(value: str | Path) -> str:
+    """Basename that tolerates Windows-style paths on POSIX hosts."""
+    return str(value).replace("\\", "/").rsplit("/", 1)[-1]
+
+
 def _augment_source_artifacts(source_artifacts: dict[str, Any]) -> dict[str, Any]:
     augmented = dict(source_artifacts)
     if "acceptance_decision" not in augmented:
         for path in DEFAULT_REVIEW_ARTIFACT_PATHS:
-            candidate = Path(path)
-            if candidate.name.upper() == "MIRROR_FISH_FINAL_ACCEPTANCE_DECISION.MD":
-                augmented["acceptance_decision"] = str(candidate)
+            if _artifact_basename(path).upper() == "MIRROR_FISH_FINAL_ACCEPTANCE_DECISION.MD":
+                augmented["acceptance_decision"] = str(path)
                 break
     if "review_packet_zip" not in augmented:
         for path in DEFAULT_REVIEW_ARTIFACT_PATHS:
-            candidate = Path(path)
-            if candidate.suffix.lower() == ".zip":
-                augmented["review_packet_zip"] = str(candidate)
+            if _artifact_basename(path).lower().endswith(".zip"):
+                augmented["review_packet_zip"] = str(path)
                 break
     if "downloaded_full_report" not in augmented:
         downloaded_candidate: Path | None = None

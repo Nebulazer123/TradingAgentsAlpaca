@@ -694,13 +694,99 @@ def test_daily_report_includes_paper_tournament_leader(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert "Paper tournament leader: catalyst-relative-strength" in payload["body"]
-    assert "Premarket brief: 2026-06-01T10:00:00+00:00, top ORCL" in payload["body"]
-    assert "Model telemetry: Model routes are safe but not fully ready" in payload["body"]
-    assert "BOARD review: new buys are paused for review" in payload["body"]
-    assert "sells still work independently" in payload["body"]
-    assert "wait for cleaner dip/support evidence" in payload["body"]
+    assert "Practice-strategy race: the momentum strategy is leading" in payload["body"]
+    assert "Tomorrow's top stock to watch: ORCL." in payload["body"]
+    assert "Model telemetry" not in payload["body"]
+    assert "BOARD review" not in payload["body"]
+    assert "sleeve" not in payload["body"].lower()
+    assert "Practice-strategy race:" in payload["body"]
     assert payload["paper_tournament"]["live_strategy_candidate"]["strategy_id"] == "catalyst-relative-strength"
     assert payload["premarket_brief"]["premarket_instructions"]["top_symbol"] == "ORCL"
     assert payload["model_telemetry_report"]["resolved_model_run_count"] == 1
     assert payload["execution_board_review"]["recommendation"] == "pause_new_buys_and_review"
+
+
+def test_supervisor_binds_selection_with_live_enabled_promotion_record(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    live_client = _FakePaperClient()
+    live_client.paper = False
+    live_client.positions = []
+    tournament_dir = tmp_path / "tournament"
+    tournament_dir.mkdir()
+    (tournament_dir / "live-strategy-selection.json").write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "strategy_id": "pullback-support",
+                "selected_at": "2026-06-05T20:10:00+00:00",
+                "reason": "best positive paper strategy after 11 tracked day(s)",
+            }
+        ),
+        encoding="utf-8",
+    )
+    promotion_path = tmp_path / "promotion_state.json"
+    promotion_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.1.0",
+                "sleeves": {
+                    "pullback-support": {
+                        "stage": "tiny_live_eligible",
+                        "live_enabled": True,
+                        "preregistered": True,
+                        "ci_green": True,
+                        "shadow_confirmed": True,
+                        "benchmark_gate_passed": True,
+                        "cost_gate_passed": True,
+                        "recent_alpha_gate_passed": True,
+                        "capacity_gate_passed": True,
+                        "validation_report_ref": "results/paper_strategy_tournament/latest.json",
+                        "risk_envelope_ref": "config/risk_envelope.yaml",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TRADINGAGENTS_PROMOTION_STATE_PATH", str(promotion_path))
+    monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
+    monkeypatch.setattr(cli_main, "market_session_label", lambda: "regular")
+    monkeypatch.setattr(
+        cli_main,
+        "_fetch_aggressive_candidate_market_data",
+        lambda: {
+            "MSFT": {
+                "current_price": "490",
+                "previous_close": "495",
+                "volume_ratio": "1.0",
+                "tradable": True,
+            }
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "supervise-hourly",
+            "--dry-run",
+            "--json-output",
+            "--log-dir",
+            str(tmp_path / "hourly"),
+            "--paper-tournament-log-dir",
+            str(tournament_dir),
+            "--execution-board-dir",
+            str(tmp_path / "execution_board"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    resolution = payload["evidence"]["live_sleeve_resolution"]
+    assert resolution["live_sleeve"] == "pullback-support"
+    assert resolution["signals_adapted"] is True
+    assert payload["evidence"]["live_strategy_selection"]["advisory_only"] is False
+    assert "binding" in payload["evidence"]["live_strategy_selection"]["reason"]
+    for action in payload["actions"]:
+        if action.get("account") == "live" and action.get("action") == "buy":
+            assert action["sleeve"] == "pullback-support"

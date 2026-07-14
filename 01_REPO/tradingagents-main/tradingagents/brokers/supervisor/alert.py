@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
-from tradingagents.brokers.supervisor.formatting import email_reason_text
+from tradingagents.brokers.supervisor.formatting import (
+    email_reason_text,
+    plain_language_reason,
+)
 from tradingagents.brokers.supervisor.session import UTC
 
 DEFAULT_ALERT_THROTTLE_WINDOW = datetime.timedelta(hours=4)
@@ -150,10 +153,10 @@ def classify_supervisor_alert(decision: Any) -> SupervisorAlert:
             severity="CRITICAL",
             notify=True,
             reason=decision.reason,
-            problem="A guardrail, broker, or live-submit control blocked the run.",
+            problem="A safety control or the broker stopped this run before money moved.",
             approval_prompt=(
-                "Question: approve Codex to repair or refresh the missing ops setup if it can be done safely? "
-                "Until then, the bot stays blocked and will not spend live money."
+                "Question: OK to let the system repair its own setup if it can do so safely? "
+                "Until then it stays stopped and will not spend real money."
             ),
         )
     if decision.decision == "loss-review":
@@ -165,8 +168,8 @@ def classify_supervisor_alert(decision: Any) -> SupervisorAlert:
             notify=True,
             reason=decision.reason,
             problem=(
-                f"{symbol} hit loss review. No live loss sell was submitted. "
-                f"{missing_clause}. BOARD/Codex must review the packet before any loss exit."
+                f"{symbol} is down enough to trigger a loss review. Nothing was sold. "
+                f"{missing_clause}. A review must finish before any sale at a loss."
             ),
             approval_prompt=context["approval_prompt"],
         )
@@ -355,59 +358,94 @@ def render_supervisor_alert_email(decision: Any) -> dict[str, str]:
         else "- Submitted orders: none."
     )
     if alert.severity == "CRITICAL" or decision.issues:
+        why_it_matters = (
+            "- Real-money trading is paused until this clears, so no new "
+            "opportunities are taken but no money is at new risk either."
+        )
         next_step = (
-            "Codex next step: self-heal safe setup problems, then rerun checks. "
-            "If it cannot do that safely, trading stays blocked."
+            "- Approve the safe auto-repair if asked. Trading stays paused "
+            "until then."
         )
     elif decision.submitted:
+        why_it_matters = (
+            "- Money moved. The amounts above are what was spent, and the "
+            "order stayed inside the safety limits."
+        )
         next_step = (
-            "Next step: reconcile the submitted order, then re-check positions "
-            "before any new action."
+            "- Nothing needed from you. The system will confirm the order "
+            "filled and re-check prices before doing anything else."
         )
     elif decision.decision == "loss-review":
+        why_it_matters = (
+            "- Selling now locks in the loss; holding risks it growing. "
+            "New buying is paused until a review weighs both with fresh facts."
+        )
         next_step = (
-            "Next step: HOLD/loss-review is default. New live buys are paused while paper "
-            "exploration continues. BOARD/manual review is required before any loss exit can be "
-            "submitted."
+            "- Nothing needed this minute: the position is held, not sold. "
+            "A follow-up will carry the review's recommendation."
         )
     else:
+        why_it_matters = (
+            "- Something important was recorded, but no money moved and no "
+            "safety limit was touched."
+        )
         next_step = (
-            "Next step: No repair needed. The next supervisor run will re-check "
-            "prices, positions, and guardrails before doing anything else."
+            "- Nothing needed from you. The next check will re-verify "
+            "prices, positions, and safety limits before acting."
         )
     body_lines = [
         "Plain English",
         f"- {plain}",
         "",
-        "What happened",
-        f"- Last decision: {decision.decision}.",
-        f"- Safety check said: {safety_reason}",
-        *action_lines,
-        submitted_line,
-        "",
-        f"Problem: {issue_reason}",
-        "",
-        "Money today",
+        "Where you stand",
+        _account_snapshot("Real-money account", live),
+        _account_snapshot("Practice account", paper),
         (
-            f"- This alert submitted live ${_display_money(submitted_live)} "
-            f"and paper ${_display_money(submitted_paper)}."
+            f"- Spent today: ${_display_money(submitted_live)} real money, "
+            f"${_display_money(submitted_paper)} practice"
         ),
         "",
-        "Live account",
-        _account_snapshot("Live", live),
+        "What happened",
+        f"- {plain_language_reason(decision.reason, default=safety_reason)}",
+        *action_lines,
+        submitted_line,
+        f"- Problem: {issue_reason}",
         "",
-        "Paper account",
-        _account_snapshot("Paper", paper),
+        "Why it matters",
+        why_it_matters,
         "",
-        "Need from you",
-        f"- {need}",
-        "",
+        "What to do next",
+        f"- {need}" if need != "No action needed from you." else "- Nothing needed from you today.",
         next_step,
     ]
+    if alert.severity == "CRITICAL":
+        subject = f"Action may be needed: {_plain_decision_phrase(decision.decision)} [TradingAgents]"
+    else:
+        subject = f"Heads up: {_plain_decision_phrase(decision.decision)} [TradingAgents]"
     return {
-        "subject": f"TradingAgents {alert.severity}: {decision.decision}",
+        "subject": subject,
         "body": "\n".join(body_lines),
     }
+
+
+_DECISION_PHRASES = {
+    "blocked": "a safety check paused trading",
+    "loss-review": "one stock is under loss review",
+    "buy": "a buy order was placed",
+    "close": "a position was closed",
+    "reduce": "a position was reduced",
+    "rotate": "money was rotated between stocks",
+    "profit-take": "profits were taken on a winner",
+    "paper-first": "a new idea is being tested with practice money",
+    "review-open-orders": "waiting orders need a look",
+}
+
+
+def _plain_decision_phrase(decision_name: object) -> str:
+    return _DECISION_PHRASES.get(
+        str(decision_name or "").strip().lower(),
+        "the trading system flagged something",
+    )
 
 
 def _loss_review_alert_context(evidence: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -452,12 +490,12 @@ def _loss_review_alert_context(evidence: Mapping[str, Any] | None) -> dict[str, 
         if refreshed_resolved_count:
             missing_clause += f"; {refreshed_resolved_count} resolved"
         approval_prompt = (
-            "No action needed right now. HOLD remains default until BOARD/Codex can prove "
+            "No action needed right now. The stock is held, not sold, until the review can prove "
             "the thesis is broken and selling is better than holding."
         )
         if refreshed_review_allowed is True:
             approval_prompt = (
-                "No action needed right now. BOARD/Codex has refreshed evidence; live loss "
+                "No action needed right now. The review has fresh evidence; a sale at a loss "
                 "exit still requires the normal market/session and submit gates."
             )
     else:
@@ -467,7 +505,7 @@ def _loss_review_alert_context(evidence: Mapping[str, Any] | None) -> dict[str, 
             else "loss-exit evidence still needs review"
         )
         approval_prompt = (
-            "No action needed right now. BOARD/Codex should refresh thesis, market, "
+            "No action needed right now. The review will refresh the original buy reasons, market, "
             "news, and earnings evidence before any live loss exit."
         )
     return {
@@ -540,10 +578,11 @@ def _account_snapshot(label: str, account: Mapping[str, Any]) -> str:
     holding_text = ", ".join(symbols[:4]) if symbols else "none"
     if len(symbols) > 4:
         holding_text += f", +{len(symbols) - 4} more"
-    exposure = account.get("exposure") if label == "Live" else account.get("equity")
-    exposure_label = "exposure" if label == "Live" else "equity"
+    is_live = "live" in label.lower() or "real" in label.lower()
+    exposure = account.get("exposure") if is_live else account.get("equity")
+    exposure_label = "money in the market" if is_live else "total value"
     return (
-        f"- {label}: holdings {holding_text}; open orders {len(open_orders or [])}; "
+        f"- {label}: holdings {holding_text}; waiting orders {len(open_orders or [])}; "
         f"{exposure_label} ${_display_money(exposure)}."
     )
 

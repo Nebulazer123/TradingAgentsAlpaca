@@ -11,19 +11,18 @@ UTC = datetime.timezone.utc
 
 DAILY_REQUIRED_HEADINGS = (
     "Plain English",
+    "Where you stand",
     "What happened",
-    "Money today",
-    "Live account",
-    "Paper account",
-    "Open orders",
-    "Submitted orders",
-    "Need from you",
+    "Why it matters",
+    "What to do next",
 )
 
 URGENT_REQUIRED_HEADINGS = (
     "Plain English",
+    "Where you stand",
     "What happened",
-    "Need from you",
+    "Why it matters",
+    "What to do next",
 )
 
 FORBIDDEN_PHRASES = (
@@ -44,6 +43,20 @@ FORBIDDEN_PHRASES = (
     "approve this trade",
     "approve trade",
     "per-trade approval",
+    # engineering vocabulary that must never reach the owner
+    "packet",
+    "sleeve",
+    "dry-run",
+    "board/codex",
+    "codex",
+    "telemetry",
+    "results/",
+    "latest.json",
+    ".yaml",
+    "live gate",
+    "current-aggressive",
+    "pullback-support",
+    "catalyst-relative-strength",
 )
 
 
@@ -104,7 +117,9 @@ def evaluate_email_clarity(
     if missing_headings:
         issues.append("missing required section(s): " + ", ".join(missing_headings))
 
-    problem_line = _first_line_with_prefix(lines, "Problem:")
+    problem_line = _first_line_with_prefix(lines, "Problem:") or _first_line_with_prefix(
+        lines, "- Problem:"
+    )
     if problem_line is None:
         issues.append("missing plain Problem line")
 
@@ -112,17 +127,20 @@ def evaluate_email_clarity(
     if not plain_line:
         issues.append("Plain English section has no summary line")
 
-    need_line = _line_after(lines, "Need from you")
+    need_line = _line_after(lines, "What to do next")
     if not need_line:
-        issues.append("Need from you section has no operator ask")
+        issues.append("What to do next section has no owner action")
     elif any(phrase in need_line.lower() for phrase in ("approve trade", "approve this trade")):
-        issues.append("Need from you asks for trade-level approval instead of ops-level approval")
+        issues.append("What to do next asks for trade-level approval instead of ops-level approval")
 
+    why_line = _line_after(lines, "Why it matters")
+    if not why_line:
+        issues.append("Why it matters section has no consequence line")
+
+    if not any("spent today" in line.lower() for line in lines):
+        issues.append("missing spent-today money line")
     if normalized_report_type != "urgent":
-        for prefix in ("- Live spent today:", "- Paper spent today:"):
-            if _first_line_with_prefix(lines, prefix) is None:
-                issues.append(f"missing money line: {prefix}")
-        if not any(line.startswith("- Holdings:") for line in lines):
+        if not any("holdings" in line.lower() for line in lines):
             issues.append("missing holdings summary line")
 
     forbidden_found = [phrase for phrase in FORBIDDEN_PHRASES if phrase in lowered]
@@ -136,14 +154,20 @@ def evaluate_email_clarity(
     if max_line_length > 260:
         warnings.append(f"very long line found: {max_line_length} characters")
 
-    current_problem = problem_line is not None and problem_line.strip().lower() not in {
+    normalized_problem = (
+        problem_line.strip().lstrip("- ").lower() if problem_line is not None else ""
+    )
+    current_problem = problem_line is not None and normalized_problem not in {
         "problem: none",
         "problem: no current blocker",
     }
     if current_problem and not any(
-        phrase in lowered for phrase in ("self-heal", "stay blocked", "board/codex")
+        phrase in lowered
+        for phrase in ("repair", "paused", "stays stopped", "held, not sold", "review")
     ):
-        issues.append("current blocker email does not explain Codex self-heal, BOARD/Codex review, or safe block behavior")
+        issues.append(
+            "current blocker email does not explain the safe pause or the repair path"
+        )
 
     score = 100
     score -= 20 * len(issues)
@@ -167,6 +191,7 @@ def evaluate_email_clarity(
         "problem_line": problem_line,
         "plain_english_line": plain_line,
         "need_from_you_line": need_line,
+        "why_it_matters_line": why_line,
         "issues": issues,
         "warnings": warnings,
         "can_submit_orders": False,

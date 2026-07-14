@@ -1701,8 +1701,8 @@ def test_alpaca_supervise_hourly_suppresses_duplicate_alert_email(monkeypatch, t
             "notify": True,
             "base_notify": True,
             "reason": "hourly supervisor live submit failed guard validation",
-            "problem": "A guardrail, broker, or live-submit control blocked the run.",
-            "approval_prompt": "Question: approve Codex to repair or refresh the missing ops setup if it can be done safely? Until then, the bot stays blocked and will not spend live money.",
+            "problem": "A safety control or the broker stopped this run before money moved.",
+            "approval_prompt": "Question: OK to let the system repair its own setup if it can do so safely? Until then it stays stopped and will not spend real money.",
             "email_suppressed": False,
         },
     }
@@ -1856,10 +1856,10 @@ def test_alpaca_supervisor_daily_report_includes_balances_and_positions(monkeypa
 
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
-    assert payload["subject"] == "TradingAgents Daily Market Supervisor Report"
-    assert "Live equity: $1,200.00" in payload["body"]
-    assert "Live unrealized P/L: $0.30 (0.66%)" in payload["body"]
-    assert "Paper unrealized P/L: $1,000.30" in payload["body"]
+    assert payload["subject"].startswith("Your trading update for ")
+    assert "Real-money account: $1,200.00 total" in payload["body"]
+    assert "position P/L $0.30 (0.66%)" in payload["body"]
+    assert "Practice account P/L: $1,000.30" in payload["body"]
     assert "Live buying power:" not in payload["body"]
     assert "Live exposure:" not in payload["body"]
     assert "Paper equity:" not in payload["body"]
@@ -1906,14 +1906,14 @@ def test_alpaca_supervisor_daily_report_compact_json_writes_raw_packet(monkeypat
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["schema"] == "compact_supervisor_daily_report_v1"
-    assert payload["subject"] == "TradingAgents Daily Market Supervisor Report"
+    assert payload["subject"].startswith("Your trading update for ")
     assert payload["counts"]["hourly_packets"] == 1
     assert payload["portfolio_summary"]["live"]["equity"] == "1200.00"
     assert payload["body_summary"]["char_count"] > 0
     assert Path(payload["raw_packet_path"]).exists()
     assert (report_dir / "latest.json").exists()
     raw_packet = json.loads(Path(payload["raw_packet_path"]).read_text(encoding="utf-8"))
-    assert "Live equity: $1,200.00" in raw_packet["body"]
+    assert "Real-money account: $1,200.00 total" in raw_packet["body"]
     assert raw_packet["packet_path"] == payload["raw_packet_path"]
     assert "body" not in payload
     assert "portfolio" not in payload
@@ -1972,7 +1972,7 @@ def test_daily_report_includes_latest_premarket_brief(monkeypatch, tmp_path):
     assert result.exit_code == 0
     payload = json.loads(result.stdout)
     assert payload["premarket_brief"]["premarket_instructions"]["top_symbol"] == "ORCL"
-    assert "Premarket brief: 2026-06-01T10:00:00+00:00, top ORCL" in payload["body"]
+    assert "Tomorrow's top stock to watch: ORCL." in payload["body"]
 
 
 def test_plan_overnight_writes_analysis_packet_without_submitting(monkeypatch, tmp_path):

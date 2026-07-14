@@ -66,6 +66,7 @@ def list_jobs(
         "status": "ok",
         "allowlist_path": str(Path(allowlist_path) if allowlist_path else DEFAULT_ALLOWLIST_PATH),
         "job_count": len(jobs),
+        "submit_capable_count": sum(1 for job in jobs.values() if job.submit_capable),
         "jobs": [
             _job_payload(job, include_commands=include_commands)
             for job in sorted(jobs.values(), key=lambda item: item.name)
