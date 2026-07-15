@@ -2,17 +2,31 @@
 # Install (or reinstall) the TradingAgents launchd agents on this Mac.
 #
 # Recreates the paused Windows Codex automation cadence with local launchd
-# jobs that call the deterministic repo CLI via ta_job.sh. All times are
-# local (America/Chicago on this machine; regular market hours 8:30-15:00).
+# jobs that call the deterministic repo CLI via ta_job.sh.
 #
-#   com.tradingagents.hourly      hourly 08:00-15:00 + 14:30 + 15:15 ticks
-#   com.tradingagents.preopen     08:15 weekdays-equivalent (daily; market
-#                                 closed days produce quiet packets)
-#   com.tradingagents.tournament  hourly at :05, 08:05-15:05
-#   com.tradingagents.overnight   daily 03:00
-#   com.tradingagents.daily-report weekdays 15:30 pattern (daily; quiet on
-#                                 closed days)
-#   com.tradingagents.deliver-outbox daily 15:40
+# IMPORTANT: launchd's StartCalendarInterval Hour/Minute fields are the
+# system's local time zone (verify with `readlink /etc/localtime`), but
+# tradingagents.brokers.supervisor.session.market_session_label() classifies
+# market sessions in hardcoded America/Chicago time (NYSE 9:30-16:00 ET is
+# defined there as 8:30-15:00 CT). On a Mac set to America/New_York (the
+# common case), every schedule below must be entered in Eastern = Chicago+1
+# so the two clocks agree; entering raw Central hours here silently shifts
+# every tick an hour early relative to actual market session boundaries
+# (e.g. a tick meant for market open lands in the pre-open/closed window
+# instead). Times below are ALREADY converted to Eastern for an
+# America/New_York system. If this Mac's system time zone is ever changed,
+# recompute these hours (Eastern = Chicago + 1; re-derive from Chicago-time
+# intent if the system zone changes to something else).
+#
+#   com.tradingagents.hourly      hourly 09:00-16:00 ET + 15:30 + 16:15 ticks
+#                                 (= CT 08:00-15:00 + 14:30 + 15:15)
+#   com.tradingagents.preopen     09:15 ET (= CT 08:15) daily; market-closed
+#                                 days produce quiet packets
+#   com.tradingagents.tournament  hourly at :05, 09:05-16:05 ET (= CT 08:05-15:05)
+#   com.tradingagents.overnight   daily 04:00 ET (= CT 03:00)
+#   com.tradingagents.daily-report weekdays 16:30 ET pattern (= CT 15:30);
+#                                 daily, quiet on closed days
+#   com.tradingagents.deliver-outbox daily 16:40 ET (= CT 15:40)
 #
 # Usage: install_launchd.sh [--uninstall]
 
@@ -88,14 +102,14 @@ EOF
 
 mkdir -p "$TA_REPO/results/mac_automation/logs"
 
-write_plist com.tradingagents.hourly hourly "$(calendar_entries 0 8 9 10 11 12 13 14 15)
-$(calendar_entries 30 14)
-$(calendar_entries 15 15)"
-write_plist com.tradingagents.preopen preopen "$(calendar_entries 15 8)"
-write_plist com.tradingagents.tournament tournament "$(calendar_entries 5 8 9 10 11 12 13 14 15)"
-write_plist com.tradingagents.overnight overnight "$(calendar_entries 0 3)"
-write_plist com.tradingagents.daily-report daily-report "$(calendar_entries 30 15)"
-write_plist com.tradingagents.deliver-outbox deliver-outbox "$(calendar_entries 40 15)"
+write_plist com.tradingagents.hourly hourly "$(calendar_entries 0 9 10 11 12 13 14 15 16)
+$(calendar_entries 30 15)
+$(calendar_entries 15 16)"
+write_plist com.tradingagents.preopen preopen "$(calendar_entries 15 9)"
+write_plist com.tradingagents.tournament tournament "$(calendar_entries 5 9 10 11 12 13 14 15 16)"
+write_plist com.tradingagents.overnight overnight "$(calendar_entries 0 4)"
+write_plist com.tradingagents.daily-report daily-report "$(calendar_entries 30 16)"
+write_plist com.tradingagents.deliver-outbox deliver-outbox "$(calendar_entries 40 16)"
 
 for label in "${LABELS[@]}"; do
   launchctl bootout "$UID_TARGET/$label" 2>/dev/null || true
