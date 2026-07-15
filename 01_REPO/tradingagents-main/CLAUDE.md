@@ -221,3 +221,41 @@ guardrail validation → go-live guard → (only then) limit orders.
 | 10 | NFLX stop before earnings / TSM watch | NFLX armed and scheduled; TSM below trigger | Low arch / high P&L relevance | Low |
 | 11 | MiroFish refresh run (cheap-lane funded, pre-catalyst) | OPTIONAL | Medium — fresh advisory priors | Medium (never runs 100% clean) |
 | 12 | Zep → stay local (+codebase-memory MCP) | DECIDED (no action) | Low | None |
+
+## 10. Survivability / opsec / edge layer (branch `fable`, 2026-07-15)
+
+Added on `fable` (flag-gated, dry-run/warn defaults — **no armed-path behavior change
+until the owner flips a flag**). Spec: `docs/superpowers/specs/2026-07-15-resilience-opsec-edge-design.md`.
+Never weakens the go-live guard; only ever adds fail-closed gates. Full suite green.
+
+**Survivability**
+- **fsync durability** (`policy/io.py`): control-plane writes fsync data + parent dir
+  (F_FULLFSYNC on macOS) — no more zero-length safety file after power loss.
+- **Tamper-evident state** (`policy/integrity.py`): sha256+seq sidecars + a hash-chained
+  `results/policy/state_audit.jsonl` on `live_control.json`/`promotion_state.json`.
+  Verified on read via `TA_STATE_INTEGRITY=off|warn|enforce` (**default warn = log-only**;
+  flip to `enforce` after ~1 week to make integrity failures fail-closed).
+- **`policy health-check`**: plain-language heartbeat (dead-man, freeze/promotion,
+  integrity, last tick, outbox backlog, disk, `.env` hygiene). Read-only; exit 0/1/2.
+- **`policy panic-flatten`**: owner kill switch. Cancels open live orders, sells every
+  position that passes the FULL guard, freezes after. **Dry-run by default**; real
+  submit needs `--confirm FLATTEN` AND `TA_LIVE_SUBMIT=1`. Loss gate not bypassed.
+- **`policy snapshot-state` / `restore-state`**: checksummed backups of safety files;
+  restore is dry-run unless `--confirm`, refuses on checksum mismatch.
+- **`policy reconcile-live`**: read-only post-restart broker-vs-packet reconcile.
+
+**Opsec**
+- **`policy scan-leaks`** (`evals/secret_leakage.py`): scans results/logs/outbox for
+  leaked credential values (fingerprints only, never raw). Key hygiene (distinct
+  live/paper) wired into `health-check`.
+- **`policy key-fingerprints [--record]`** + `docs/runbooks/key_rotation.md`.
+
+**Edge / optional inert gates** (in `config/risk_envelope.yaml`; absent = no change):
+- `promotion_max_age_days` — stale promotion evidence blocks live orders.
+- `min_promotion_tracked_days` — raises the anti-overfit tracked-days floor.
+
+**Owner decisions (flip when ready):** `TA_STATE_INTEGRITY=enforce` after burn-in;
+`promotion_max_age_days` (≈30); `min_promotion_tracked_days` (≈20); arm the order
+rate-limit config after the earnings window. **Deferred** (recommended follow-ups):
+Tournament v2 realized-PnL scoring (item 9 above; substantial, touches core scoring),
+earnings-proximity entry guard, execution-quality telemetry.
