@@ -12,7 +12,7 @@ from typing import Any
 
 from tradingagents.brokers.alpaca import OrderIssue
 from tradingagents.policy.integrity import verify_state_integrity
-from tradingagents.policy.live_control import load_live_control_state
+from tradingagents.policy.live_control import load_live_control_state, parse_control_time
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
 
@@ -97,7 +97,13 @@ def _read_promotion_state(path: Path) -> tuple[dict[str, Any], list[str]]:
     return parsed, integrity_issues
 
 
-def _promotion_issues(action: Any, promotion_state: dict[str, Any]) -> list[str]:
+def _promotion_issues(
+    action: Any,
+    promotion_state: dict[str, Any],
+    *,
+    max_age_days: int | None = None,
+    now: datetime.datetime | None = None,
+) -> list[str]:
     sleeve = str(_action_value(action, "sleeve", "")).strip()
     if not sleeve:
         return ["live action has no sleeve identity for promotion gate"]
@@ -109,6 +115,25 @@ def _promotion_issues(action: Any, promotion_state: dict[str, Any]) -> list[str]
         return [f"sleeve {sleeve} has no promotion record"]
 
     issues: list[str] = []
+    # Optional staleness gate (inert unless promotion_max_age_days is configured).
+    if max_age_days is not None:
+        current = now or datetime.datetime.now(tz=datetime.timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=datetime.timezone.utc)
+        raw_ts = state.get("promoted_at") or promotion_state.get("generated_at")
+        promoted_at = parse_control_time(str(raw_ts or ""))
+        if promoted_at is None:
+            issues.append(
+                f"sleeve {sleeve} promotion evidence has no usable timestamp for the "
+                f"{max_age_days}-day freshness gate"
+            )
+        else:
+            age_days = (current.astimezone(datetime.timezone.utc) - promoted_at).days
+            if age_days > max_age_days:
+                issues.append(
+                    f"sleeve {sleeve} promotion evidence is stale: {age_days} days old "
+                    f"exceeds promotion_max_age_days {max_age_days} (re-sync required)"
+                )
     if state.get("stage") != "tiny_live_eligible":
         issues.append(f"sleeve {sleeve} is not tiny_live_eligible")
     if state.get("live_enabled") is not True:
@@ -515,7 +540,12 @@ def evaluate_go_live_guard(
             total_buy_notional = projected_buy_notional
 
         if promotion_state:
-            action_promotion_issues = _promotion_issues(action, promotion_state)
+            action_promotion_issues = _promotion_issues(
+                action,
+                promotion_state,
+                max_age_days=(envelope.promotion_max_age_days if envelope is not None else None),
+                now=now,
+            )
             if action_promotion_issues:
                 checks["promotion"] = False
                 issues.extend(OrderIssue(_action_symbol(action), issue) for issue in action_promotion_issues)

@@ -27,6 +27,10 @@ class RiskEnvelope:
     # Absent (None) -> inert / no behavior change.
     max_live_orders_per_window: int | None = None
     live_order_window_minutes: int | None = None
+    # Optional max age (days) of the live promotion evidence. When set, a promotion
+    # record older than this blocks live orders (stale evidence must be re-synced).
+    # Absent (None) -> inert / no behavior change.
+    promotion_max_age_days: int | None = None
 
 
 _DECIMAL_FIELDS = {
@@ -44,7 +48,11 @@ _STRING_FIELDS = {"alert_email"}
 _REQUIRED_FIELDS = _DECIMAL_FIELDS | _BOOL_FIELDS | _STRING_FIELDS
 _OPTIONAL_STRING_FIELDS = {"live_budget_mode"}
 _OPTIONAL_DECIMAL_FIELDS = {"account_hard_ceiling_usd"}
-_OPTIONAL_INT_FIELDS = {"max_live_orders_per_window", "live_order_window_minutes"}
+_OPTIONAL_INT_FIELDS = {
+    "max_live_orders_per_window",
+    "live_order_window_minutes",
+    "promotion_max_age_days",
+}
 _LIVE_BUDGET_MODES = {"fixed_tranche", "autonomous_with_caps", "autonomous_uncapped"}
 
 
@@ -158,4 +166,5 @@ def load_risk_envelope(path: str | Path) -> tuple[RiskEnvelope | None, list[str]
         account_hard_ceiling_usd=parsed.get("account_hard_ceiling_usd"),
         max_live_orders_per_window=parsed.get("max_live_orders_per_window"),
         live_order_window_minutes=parsed.get("live_order_window_minutes"),
+        promotion_max_age_days=parsed.get("promotion_max_age_days"),
     ), []
