@@ -450,6 +450,7 @@ def _plain_decision_phrase(decision_name: object) -> str:
 
 def _loss_review_alert_context(evidence: Mapping[str, Any] | None) -> dict[str, Any]:
     symbol = "A live position"
+    current_review_symbol = ""
     missing_count = 0
     refreshed_missing_count: int | None = None
     refreshed_resolved_count: int | None = None
@@ -459,6 +460,7 @@ def _loss_review_alert_context(evidence: Mapping[str, Any] | None) -> dict[str, 
         if isinstance(review, Mapping):
             raw_symbol = str(review.get("symbol") or "").strip().upper()
             if raw_symbol:
+                current_review_symbol = raw_symbol
                 symbol = raw_symbol
             missing_count = len(
                 [item for item in review.get("blockers", []) if str(item).strip()]
@@ -468,21 +470,25 @@ def _loss_review_alert_context(evidence: Mapping[str, Any] | None) -> dict[str, 
             loss_evidence = board.get("loss_review_evidence")
             if isinstance(loss_evidence, Mapping):
                 raw_symbol = str(loss_evidence.get("symbol") or "").strip().upper()
-                if raw_symbol:
+                matches_current_review = not current_review_symbol or (
+                    raw_symbol == current_review_symbol
+                )
+                if matches_current_review and raw_symbol:
                     symbol = raw_symbol
-                try:
-                    refreshed_missing_count = int(
-                        loss_evidence.get("remaining_blocker_count")
-                    )
-                except (TypeError, ValueError):
-                    refreshed_missing_count = None
-                try:
-                    refreshed_resolved_count = int(
-                        loss_evidence.get("resolved_blocker_count")
-                    )
-                except (TypeError, ValueError):
-                    refreshed_resolved_count = None
-                refreshed_review_allowed = loss_evidence.get("review_allowed")
+                if matches_current_review:
+                    try:
+                        refreshed_missing_count = int(
+                            loss_evidence.get("remaining_blocker_count")
+                        )
+                    except (TypeError, ValueError):
+                        refreshed_missing_count = None
+                    try:
+                        refreshed_resolved_count = int(
+                            loss_evidence.get("resolved_blocker_count")
+                        )
+                    except (TypeError, ValueError):
+                        refreshed_resolved_count = None
+                    refreshed_review_allowed = loss_evidence.get("review_allowed")
     if refreshed_missing_count is not None:
         missing_clause = (
             f"{refreshed_missing_count} evidence item(s) still open after refresh"
