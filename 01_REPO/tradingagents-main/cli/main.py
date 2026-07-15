@@ -3812,6 +3812,51 @@ def policy_refresh_live_control(
         console.print(f"Live control refreshed until {payload['dead_man_expires_at']}")
 
 
+@policy_app.command("health-check")
+def policy_health_check(
+    control_path: Path = typer.Option(
+        Path("results/policy/live_control.json"), "--control-path"
+    ),
+    promotion_path: Path = typer.Option(
+        Path("results/policy/promotion_state.json"), "--promotion-path"
+    ),
+    tick_dir: Path = typer.Option(
+        Path("results/hourly_supervisor"), "--tick-dir",
+        help="Directory whose newest packet marks the last automation activity.",
+    ),
+    outbox_dir: Path = typer.Option(Path("results/outbox"), "--outbox-dir"),
+    env_path: Path = typer.Option(Path(".env"), "--env-path"),
+    email_on_critical: bool = typer.Option(
+        False, "--email-on-critical/--no-email",
+        help="Queue a plain-language owner email when overall status is critical.",
+    ),
+    email_to: str = typer.Option("", "--email-to"),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Read-only heartbeat of the tiny-live control plane.
+
+    Reports the dead-man timer, freeze/promotion state, safety-file integrity, last
+    automation activity, email backlog, disk space, and credentials-file hygiene.
+    Never submits orders. Exit code: 0 ok, 1 warn, 2 critical (for schedulers).
+    """
+    from tradingagents.policy.health import health_json, run_health_check
+
+    report = run_health_check(
+        control_path=control_path,
+        promotion_path=promotion_path,
+        tick_dir=tick_dir,
+        env_path=env_path,
+        outbox_dir=outbox_dir,
+        email_on_critical=email_on_critical,
+        email_to=email_to,
+    )
+    if json_output:
+        print(health_json(report))
+    else:
+        console.print(report.render_plain())
+    raise typer.Exit(code={"ok": 0, "warn": 1, "critical": 2}[report.overall])
+
+
 @policy_app.command("sync-promotion")
 def policy_sync_promotion(
     report_path: Path = typer.Option(
