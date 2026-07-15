@@ -130,12 +130,23 @@ guardrail validation → go-live guard → (only then) limit orders.
 ## 6. Unresolved risks
 
 1. ~~TCC grant~~ RESOLVED 2026-07-14: all six launchd jobs heartbeat ok.
-2. **Dead-man expired 2026-06-04 + TA_LIVE_SUBMIT=0** → live submits blocked. The
-   exit policy therefore PLANS exits and emails, but cannot execute them until the
-   owner re-arms. Live buying power $86 — sizing warnings expected.
-3. **NFLX is at −11.6%, past the −8% stop; earnings 2026-07-16.** The policy will
-   emit a close action on the first in-session tick; it executes only once live is
-   re-armed. TSM also under review; TSM reports 2026-07-16.
+2. ~~Dead-man expired / TA_LIVE_SUBMIT=0~~ RESOLVED 2026-07-15 00:58 UTC: owner
+   confirmed and live trading was re-armed (dead-man refreshed to 2026-07-17T12:58Z,
+   TA_LIVE_SUBMIT=1). Also found + fixed while arming: launchd Hour/Minute fields
+   are the Mac's system-local time (`America/New_York`, verified via
+   `readlink /etc/localtime`), but `market_session_label()` classifies sessions in
+   hardcoded America/Chicago — every tick had been firing an hour early relative to
+   real market boundaries. `scripts/mac/install_launchd.sh` now carries the
+   Eastern-converted hours with the mismatch documented in its header; re-derive if
+   the system time zone ever changes.
+3. **NFLX is at −11.5%, past the −8% hard-stop; earnings 2026-07-16.** With live now
+   armed, the exit-policy close action fires on the first tradeable-session hourly
+   tick (09:00 ET pre-open queues a regular day-limit order at 0.3% below market;
+   Alpaca queues fractional-qty non-extended-hours orders to execute at the 9:30 ET
+   open — no special handling needed). Verified via `--submit-actions` dry run with
+   the market closed: every gate (dead-man, promotion, buying power) passed clean,
+   only "market session is not tradeable" blocked, as expected. TSM (−5.4%, below
+   the −8% stop) also reports 2026-07-16 but is not yet at a rule trigger.
 4. **Tournament metrics are mark-to-market** (no sell rules in tournament sleeves;
    win rate = open positions only). Direction of evidence is right; magnitude is
    soft. Next iteration: realized-PnL tournament with exits.
@@ -153,11 +164,11 @@ guardrail validation → go-live guard → (only then) limit orders.
 ## 7. Future priorities (ranked)
 
 1. ~~TCC grant~~ done. 2. ~~OpenRouter key~~ done (validated full-graph run).
-3. Owner: re-arm live so the exit policy can actually exit — refresh dead-man
-   (`.venv/bin/python -m cli.main policy refresh-live-control --reason "arm exits" --ttl-hours 24`)
-   and set `TA_LIVE_SUBMIT=1` in `~/Library/LaunchAgents/com.tradingagents.*.plist`
-   (or rerun `TA_LIVE_SUBMIT=1 scripts/mac/install_launchd.sh`). Until then exits
-   are planned + emailed, not executed. NFLX/TSM earnings 2026-07-16.
+3. ~~Re-arm live~~ done 2026-07-15. Watch the first two live ticks tomorrow morning
+   (09:00 and 10:00 ET) for the NFLX close order — check `results/hourly_supervisor/`
+   and the outbox/inbox for confirmation, and re-freeze
+   (`policy freeze-live... ` or set `TA_LIVE_SUBMIT=0` + reinstall) if anything looks
+   wrong before Thursday's earnings.
 5. Tournament v2: realized-PnL scoring + exit rules + restart window (current one
    ended 2026-07-01; it keeps running but start a fresh 31-day window).
 6. SMTP app password → outbox actually emails (or wire a Claude scheduled task to
@@ -186,8 +197,9 @@ guardrail validation → go-live guard → (only then) limit orders.
 | 4 | Mac launchd automation layer (dry-run default) | DONE (needs TCC grant) | High — restores autonomy post-migration | Low-med (TCC, laptop sleep) |
 | 5 | 8 legacy test failures + Windows-path portability | DONE | Medium — trustworthy CI signal on Mac | Very low |
 | 6 | Strategy demotion of current-aggressive | DONE | High — stops worst sleeve from being live default | Low (live was blocked anyway) |
-| 7 | Re-arm live trading (dead-man + TA_LIVE_SUBMIT) | RECOMMENDED (owner; now also gates the NFLX stop-loss exit) | Medium — turns paper edge into (tiny) real P&L | Medium (real money; caps are small) |
-| 7b | Mechanical exit policy (−8%/−12%/time stop) | DONE | High — ends HOLD deadlocks; caps losses by rule | Low (pre-registered, fully tested, still guard-gated) |
+| 7 | Re-arm live trading (dead-man + TA_LIVE_SUBMIT) | DONE 2026-07-15 | Medium — turns paper edge into (tiny) real P&L | Medium (real money; caps are small) |
+| 7b | Mechanical exit policy (−8%/−12%/time stop) | DONE, now live-armed | High — ends HOLD deadlocks; caps losses by rule | Low (pre-registered, fully tested, still guard-gated) |
+| 7c | launchd Eastern/Chicago timezone fix | DONE 2026-07-15 | High — every scheduled tick was firing 1hr early vs. intended session | Low (schedule-only change) |
 | 8 | OpenRouter key + cheap overnight graph lanes | RECOMMENDED | High — real multi-agent research resumes at ~$0.1–0.3/M | Low (spend-capped) |
 | 9 | Tournament v2 (realized PnL, exits, fresh window) | RECOMMENDED | High — evidence quality for promotions | Medium (touches core scoring) |
 | 10 | NFLX/TSM loss-review decision pre-earnings | RECOMMENDED (urgent) | Low arch / high P&L relevance | Low |
