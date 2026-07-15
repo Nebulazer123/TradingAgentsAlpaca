@@ -183,7 +183,8 @@ guardrail validation → go-live guard → (only then) limit orders.
 
 ## 8. Validation evidence (this audit)
 
-- Full test suite: `1078 passed, 1 skipped` (from 8 failed / 1066 passed).
+- Full test suite: `1091 passed, 1 skipped` (from 8 failed / 1066 passed at
+  audit start).
 - Live-market dry-run (open session, real data): loss-review decision, 0 orders,
   binding sleeve resolution `pullback-support`, alert queued + clarity pass.
 - Pre-open validation on month-stale context: **fails closed** (2 fail, 1 warn).
@@ -196,6 +197,10 @@ guardrail validation → go-live guard → (only then) limit orders.
   fill-friendly 73.55 limit and only the closed market blocking submission.
 - n8n pickup proof: Docker container healthy, runner and n8n health endpoints OK,
   24 allowlisted jobs, zero submit-capable jobs.
+- Notification isolation proof: two consecutive full pytest runs left the
+  production outbox file count unchanged. The 76-item pre-scheduler backlog was
+  quarantined (mostly test-generated batches), leaving zero active undelivered
+  messages before the first Codex market run.
 
 ## 9. Executive matrix — completed & recommended (impact × risk)
 
