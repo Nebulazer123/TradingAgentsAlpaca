@@ -3857,6 +3857,53 @@ def policy_health_check(
     raise typer.Exit(code={"ok": 0, "warn": 1, "critical": 2}[report.overall])
 
 
+@policy_app.command("panic-flatten")
+def policy_panic_flatten(
+    confirm: str = typer.Option(
+        "", "--confirm",
+        help="Type FLATTEN to arm a real submit. Anything else = dry-run preview.",
+    ),
+    control_path: Path = typer.Option(
+        Path("results/policy/live_control.json"), "--control-path"
+    ),
+    promotion_path: Path = typer.Option(
+        Path("results/policy/promotion_state.json"), "--promotion-path"
+    ),
+    envelope_path: Path = typer.Option(
+        Path("config/risk_envelope.yaml"), "--envelope-path"
+    ),
+    email: bool = typer.Option(True, "--email/--no-email"),
+    email_to: str = typer.Option("", "--email-to"),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Owner kill switch: stand down all live positions.
+
+    Cancels open live orders, sells every position that passes the FULL go-live
+    guard (losers still need a valid loss-exit review — the guard is NOT bypassed),
+    then freezes live trading and emails you. DRY-RUN by default; a real submit
+    requires BOTH '--confirm FLATTEN' AND environment TA_LIVE_SUBMIT=1. Positions
+    the guard blocks are reported, never force-sold.
+    """
+    from tradingagents.policy.panic_flatten import run_panic_flatten
+
+    submit_enabled = os.environ.get("TA_LIVE_SUBMIT", "0").strip() == "1"
+    live_client = _alpaca_live_client()
+    result = run_panic_flatten(
+        live_client=live_client,
+        confirm=confirm,
+        submit_enabled=submit_enabled,
+        risk_envelope_path=envelope_path,
+        promotion_state_path=promotion_path,
+        control_state_path=control_path,
+        email=email,
+        email_to=email_to,
+    )
+    if json_output:
+        print(json.dumps(result.to_dict(), indent=2))
+    else:
+        console.print(result.render_plain())
+
+
 @policy_app.command("sync-promotion")
 def policy_sync_promotion(
     report_path: Path = typer.Option(
