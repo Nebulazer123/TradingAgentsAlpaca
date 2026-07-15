@@ -17,9 +17,11 @@
 > trigger. A fresh submit-capable closed-market run identified NFLX at −11.51%,
 > applied the mechanical hard stop and 73.55 limit, and stopped solely because
 > the market was closed. Codex also fixed a notification bug where stale TSM
-> BOARD evidence could overwrite the active NFLX alert; full verification is
-> 1090 passed, 1 skipped. n8n and its localhost runner are healthy with 24
-> allowlisted and zero submit-capable jobs.
+> BOARD evidence could overwrite the active NFLX alert, then fixed pytest CLI
+> runs writing into the production SMTP outbox. Seventy-six stale/test-generated
+> messages were quarantined without sending; the active outbox now has zero
+> pending items. Full verification is 1091 passed, 1 skipped. n8n and its
+> localhost runner are healthy with 24 allowlisted and zero submit-capable jobs.
 
 ---
 
@@ -112,8 +114,8 @@ Dev work happened in a git worktree at `../tradingagents-fable` (branch
 `fable`), merged into `master` after each validated slice. That worktree
 still exists and is safe to reuse or remove.
 
-Test suite: **1089 passed, 1 skipped** (was 8 failed / 1066 passed at
-session start). Run with `.venv/bin/python -m pytest tests/ -q`.
+Test suite at Codex pickup: **1091 passed, 1 skipped** (was 8 failed / 1066
+passed at session start). Run with `.venv/bin/python -m pytest tests/ -q`.
 
 ---
 
