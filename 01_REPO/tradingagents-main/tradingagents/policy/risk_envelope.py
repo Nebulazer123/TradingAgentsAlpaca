@@ -31,6 +31,9 @@ class RiskEnvelope:
     # record older than this blocks live orders (stale evidence must be re-synced).
     # Absent (None) -> inert / no behavior change.
     promotion_max_age_days: int | None = None
+    # Optional anti-overfit floor: minimum tournament tracked-days before a sleeve may
+    # be promoted. Only ever RAISES the built-in floor. Absent (None) -> inert.
+    min_promotion_tracked_days: int | None = None
 
 
 _DECIMAL_FIELDS = {
@@ -52,6 +55,7 @@ _OPTIONAL_INT_FIELDS = {
     "max_live_orders_per_window",
     "live_order_window_minutes",
     "promotion_max_age_days",
+    "min_promotion_tracked_days",
 }
 _LIVE_BUDGET_MODES = {"fixed_tranche", "autonomous_with_caps", "autonomous_uncapped"}
 
@@ -167,4 +171,5 @@ def load_risk_envelope(path: str | Path) -> tuple[RiskEnvelope | None, list[str]
         max_live_orders_per_window=parsed.get("max_live_orders_per_window"),
         live_order_window_minutes=parsed.get("live_order_window_minutes"),
         promotion_max_age_days=parsed.get("promotion_max_age_days"),
+        min_promotion_tracked_days=parsed.get("min_promotion_tracked_days"),
     ), []

@@ -4077,6 +4077,7 @@ def policy_sync_promotion(
         tiny_live_tranche_usd=tranche,
         arm_live=arm_live,
         ci_green=ci_green,
+        min_promotion_tracked_days=envelope.min_promotion_tracked_days,
     )
     payload = {
         "summary": result.summary,

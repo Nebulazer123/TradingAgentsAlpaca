@@ -84,12 +84,14 @@ def _ranking_for(report: Mapping, sleeve_id: str) -> Mapping | None:
     return None
 
 
-def _quality_gate_issues(ranking: Mapping) -> list[str]:
+def _quality_gate_issues(ranking: Mapping, *, min_tracked_days: int | None = None) -> list[str]:
     issues: list[str] = []
     tracked_days = int(ranking.get("tracked_days") or 0)
-    if tracked_days < MIN_TRACKED_DAYS:
+    # The configured floor can only RAISE the built-in one (stricter = safer).
+    effective_floor = max(MIN_TRACKED_DAYS, int(min_tracked_days or 0))
+    if tracked_days < effective_floor:
         issues.append(
-            f"tracked_days {tracked_days} is below the {MIN_TRACKED_DAYS}-day floor"
+            f"tracked_days {tracked_days} is below the {effective_floor}-day floor"
         )
     drawdown = _as_decimal(ranking.get("max_drawdown_pct"))
     if drawdown < MAX_DRAWDOWN_FLOOR_PCT:
@@ -179,6 +181,7 @@ def sync_promotion_state_from_tournament(
     ci_green: bool = False,
     validation_report_ref: str = DEFAULT_VALIDATION_REPORT_REF,
     risk_envelope_ref: str = DEFAULT_RISK_ENVELOPE_REF,
+    min_promotion_tracked_days: int | None = None,
     now: datetime.datetime | None = None,
 ) -> PromotionSyncResult:
     now_iso = _now_iso(now)
@@ -235,7 +238,9 @@ def sync_promotion_state_from_tournament(
     # 2. Evaluate the tournament candidate for promotion.
     if candidate_id:
         ranking = _ranking_for(report, candidate_id)
-        quality_issues = _quality_gate_issues(ranking or {})
+        quality_issues = _quality_gate_issues(
+            ranking or {}, min_tracked_days=min_promotion_tracked_days
+        )
         evidence = build_tournament_promotion_evidence(
             report,
             candidate_id,
@@ -321,6 +326,7 @@ def sync_promotion_state_file(
     tiny_live_tranche_usd: Decimal,
     arm_live: bool = False,
     ci_green: bool = False,
+    min_promotion_tracked_days: int | None = None,
     now: datetime.datetime | None = None,
 ) -> PromotionSyncResult:
     report = json.loads(Path(report_path).read_text(encoding="utf-8"))
@@ -341,6 +347,7 @@ def sync_promotion_state_file(
         tiny_live_tranche_usd=tiny_live_tranche_usd,
         arm_live=arm_live,
         ci_green=ci_green,
+        min_promotion_tracked_days=min_promotion_tracked_days,
         now=now,
     )
     write_state_with_integrity(
