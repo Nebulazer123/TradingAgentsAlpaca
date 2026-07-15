@@ -131,3 +131,18 @@ def mock_llm_client():
         return_value=client,
     ):
         yield client
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_promotion_state(monkeypatch, tmp_path):
+    """Point the supervisor's promotion-state lookup at a nonexistent file.
+
+    The repo's real results/policy/promotion_state.json (present on operator
+    machines) would otherwise leak into tests and make the tournament
+    selection binding. Tests that exercise the binding path set the env var
+    themselves, which overrides this default.
+    """
+    monkeypatch.setenv(
+        "TRADINGAGENTS_PROMOTION_STATE_PATH",
+        str(tmp_path / "promotion-state-absent.json"),
+    )
