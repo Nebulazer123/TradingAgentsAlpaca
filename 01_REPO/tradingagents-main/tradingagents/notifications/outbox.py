@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from tradingagents.policy.io import atomic_write_text
 
@@ -27,13 +29,14 @@ def _now_iso() -> str:
 
 def write_outbox_message(
     payload: Mapping[str, Any],
-    outbox_dir: str | Path = DEFAULT_OUTBOX_DIR,
+    outbox_dir: str | Path | None = None,
     *,
     report_type: str = "daily",
     severity: str = "ROUTINE",
 ) -> Path:
     """Queue one rendered notification; returns the message path."""
-    outbox = Path(outbox_dir)
+    configured_outbox = os.environ.get("TRADINGAGENTS_OUTBOX_DIR", "").strip()
+    outbox = Path(outbox_dir or configured_outbox or DEFAULT_OUTBOX_DIR)
     outbox.mkdir(parents=True, exist_ok=True)
     message_id = f"{datetime.datetime.now(tz=UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
     message = {

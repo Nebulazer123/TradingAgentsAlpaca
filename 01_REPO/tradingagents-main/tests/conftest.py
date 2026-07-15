@@ -146,3 +146,12 @@ def _hermetic_promotion_state(monkeypatch, tmp_path):
         "TRADINGAGENTS_PROMOTION_STATE_PATH",
         str(tmp_path / "promotion-state-absent.json"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_notification_outbox(monkeypatch, tmp_path):
+    """Keep CLI notification tests out of the production SMTP outbox."""
+    monkeypatch.setenv(
+        "TRADINGAGENTS_OUTBOX_DIR",
+        str(tmp_path / "notification-outbox"),
+    )

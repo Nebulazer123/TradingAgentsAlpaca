@@ -32,6 +32,18 @@ def test_outbox_roundtrip(tmp_path):
     assert stored["delivered_at"]
 
 
+def test_outbox_uses_environment_override_when_directory_omitted(
+    monkeypatch, tmp_path
+):
+    isolated_outbox = tmp_path / "isolated-outbox"
+    monkeypatch.setenv("TRADINGAGENTS_OUTBOX_DIR", str(isolated_outbox))
+
+    path = write_outbox_message({"subject": "Test", "body": "Body"})
+
+    assert path.parent == isolated_outbox
+    assert path.exists()
+
+
 def test_mark_delivered_missing_id(tmp_path):
     assert mark_delivered("nope", tmp_path) is False
 
