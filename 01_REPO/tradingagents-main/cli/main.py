@@ -3899,6 +3899,42 @@ def policy_reconcile_live(
     raise typer.Exit(code=0 if result.matched else 1)
 
 
+@policy_app.command("key-fingerprints")
+def policy_key_fingerprints(
+    record: bool = typer.Option(
+        False, "--record", help="Save the current fingerprints as the baseline.",
+    ),
+    path: Path = typer.Option(
+        Path("results/policy/key_fingerprints.json"), "--path",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Record or compare key fingerprints (one-way codes) to verify a rotation.
+
+    Never prints or stores raw key values. With --record it saves a baseline;
+    without, it reports which keys changed since the baseline.
+    """
+    from tradingagents.evals.secret_leakage import (
+        compare_key_fingerprints,
+        record_key_fingerprints,
+    )
+
+    if record:
+        payload = record_key_fingerprints(path)
+        if json_output:
+            print(json.dumps(payload, indent=2))
+        else:
+            console.print(f"Recorded {len(payload['fingerprints'])} key fingerprint(s) to {path}")
+        return
+    diff = compare_key_fingerprints(path)
+    if json_output:
+        print(json.dumps(diff, indent=2))
+    elif diff["changed"]:
+        console.print("Changed since baseline: " + ", ".join(diff["changed"]))
+    else:
+        console.print("No monitored keys changed since the baseline.")
+
+
 @policy_app.command("scan-leaks")
 def policy_scan_leaks(
     scan_dir: list[Path] = typer.Option(

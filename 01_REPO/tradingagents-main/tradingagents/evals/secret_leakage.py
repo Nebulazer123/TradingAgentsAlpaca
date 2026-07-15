@@ -147,6 +147,49 @@ def check_key_hygiene(env: Mapping[str, str] | None = None) -> list[str]:
     return issues
 
 
+def key_fingerprints(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """B4: fingerprint (never value) of each loaded monitored key."""
+
+    environ = env if env is not None else os.environ
+    return {name: fingerprint(value) for name, value in _loaded_key_values(environ)}
+
+
+def record_key_fingerprints(
+    path: str | Path, *, env: Mapping[str, str] | None = None, now_iso: str | None = None
+) -> dict:
+    """Write current key fingerprints to disk so rotations are later verifiable."""
+
+    import json
+
+    from tradingagents.policy.io import atomic_write_text
+
+    payload = {"recorded_at": now_iso or "", "fingerprints": key_fingerprints(env)}
+    atomic_write_text(Path(path), json.dumps(payload, indent=2))
+    return payload
+
+
+def compare_key_fingerprints(
+    path: str | Path, *, env: Mapping[str, str] | None = None
+) -> dict:
+    """Compare current key fingerprints to a recorded baseline. Values never exposed."""
+
+    import json
+
+    recorded: dict[str, str] = {}
+    recorded_path = Path(path)
+    if recorded_path.exists():
+        try:
+            recorded = dict(json.loads(recorded_path.read_text(encoding="utf-8")).get("fingerprints") or {})
+        except (json.JSONDecodeError, OSError, AttributeError):
+            recorded = {}
+    current = key_fingerprints(env)
+    changed = sorted(n for n in current if n in recorded and current[n] != recorded[n])
+    added = sorted(n for n in current if n not in recorded)
+    removed = sorted(n for n in recorded if n not in current)
+    unchanged = sorted(n for n in current if n in recorded and current[n] == recorded[n])
+    return {"changed": changed, "added": added, "removed": removed, "unchanged": unchanged}
+
+
 def leaks_summary(leaks: Iterable[Leak]) -> dict:
     leak_list = list(leaks)
     return {

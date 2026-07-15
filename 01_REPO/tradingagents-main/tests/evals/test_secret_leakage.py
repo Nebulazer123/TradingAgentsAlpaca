@@ -62,3 +62,16 @@ def test_key_hygiene_clean_when_distinct() -> None:
 def test_email_body_secret_check() -> None:
     assert sl.email_contains_secret("api_key=sk_abcdefghijklmnop1234567890") is True
     assert sl.email_contains_secret("You are up 2% on MSFT. owner@example.com") is False
+
+
+def test_key_fingerprints_record_and_compare(tmp_path):
+    path = tmp_path / "fp.json"
+    env1 = {"ALPACA_LIVE_API_KEY": "OLDKEY123456", "OPENROUTER_API_KEY": "ORKEY1234567"}
+    sl.record_key_fingerprints(path, env=env1)
+    # nothing changed against the same env
+    assert sl.compare_key_fingerprints(path, env=env1)["changed"] == []
+    # rotate the live key -> detected as changed, value never exposed
+    env2 = {"ALPACA_LIVE_API_KEY": "NEWKEY789012", "OPENROUTER_API_KEY": "ORKEY1234567"}
+    diff = sl.compare_key_fingerprints(path, env=env2)
+    assert diff["changed"] == ["ALPACA_LIVE_API_KEY"]
+    assert "NEWKEY789012" not in path.read_text()
