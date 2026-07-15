@@ -1,7 +1,8 @@
 # CLAUDE.md — TradingAgents System Map & Operating Model
 
-Last full audit: **2026-07-14** (Claude Fable 5; follow-up same day: OpenRouter lanes live,
-launchd verified post-TCC, mechanical exit policy added, SMTP delivery working).
+Last full audit: **2026-07-14** (Claude Fable 5; Codex pickup 2026-07-15:
+Codex scheduling active, NFLX exit path re-verified, notification-symbol bug fixed,
+n8n observer stack healthy).
 Read this before `AGENTS.md`/`CONTEXT_ROUTER.md` — those predate the Mac migration.
 
 ## 1. What this system is
@@ -75,21 +76,19 @@ guardrail validation → go-live guard → (only then) limit orders.
 - Repo: `/Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main`
   (branch `master`; dev worktree `../tradingagents-fable`, branch `fable`).
 - Python: `.venv` (3.13, uv-managed). Tests: `.venv/bin/python -m pytest tests/ -q`.
-- Credentials: `.env` (owner-only, gitignored) — Alpaca paper+live. The package
-  auto-loads it from CWD. No GOOGLE/OPENAI keys on this machine yet.
-- launchd agents (local time = America/Chicago; market 08:30–15:00):
-  `hourly` (:00, 8–15 + 14:30 + 15:15) · `preopen` (08:15) · `tournament` (:05)
-  · `overnight` (03:00) · `daily-report` (15:30) · `deliver-outbox` (15:40).
-  Manage via `scripts/mac/install_launchd.sh [--uninstall]`.
-  **Fail-closed default: `TA_LIVE_SUBMIT=0`** (dry-run only). To re-arm live:
-  set `TA_LIVE_SUBMIT=1` in the plists AND refresh the dead-man
-  (`policy refresh-live-control --reason ... --ttl-hours N`).
-- **BLOCKER (owner action):** macOS TCC denies launchd access to `~/Documents`.
-  Grant Full Disk Access to `/bin/zsh` (System Settings → Privacy & Security →
-  Full Disk Access → “+” → ⌘⇧G → `/bin/zsh`), then
-  `launchctl kickstart gui/$UID/com.tradingagents.daily-report` and check
-  `results/mac_automation/logs/heartbeat.log`. Alternative: move the workspace
-  out of `~/Documents`.
+- Credentials: `.env` (owner-only, gitignored) — Alpaca paper+live and OpenRouter.
+  The package auto-loads it from CWD. Google/OpenAI keys are not required for the
+  active OpenRouter route.
+- **Codex owns scheduling.** The six temporary Claude-installed launchd jobs are
+  intentionally absent. Five Codex app automations now run against the production
+  repo in system-local Eastern time: overnight research 04:00 weekdays, pre-open
+  validation 09:15, paper tournament 10:05, market supervisor hourly at :35 from
+  09:35 through 15:35, and daily report/outbox delivery 16:30. The market job is
+  the only submit-capable trigger; it calls the lock-protected `ta_job.sh hourly`
+  wrapper with `TA_LIVE_SUBMIT=1`, while every other job is dry-run, paper-only,
+  or analysis-only. All live submissions still require the unexpired dead-man and
+  unified go-live guard. `scripts/mac/install_launchd.sh` remains reference code
+  only; do not install it alongside the Codex schedule.
 - Alpaca MCP (paper) is configured for Claude sessions; live keys exist but the
   MCP is paper-only by design.
 
@@ -129,10 +128,14 @@ guardrail validation → go-live guard → (only then) limit orders.
 
 ## 6. Unresolved risks
 
-1. ~~TCC grant~~ RESOLVED 2026-07-14: all six launchd jobs heartbeat ok.
+1. ~~Scheduler handoff~~ RESOLVED 2026-07-15: Claude's launchd jobs were removed
+   as instructed and replaced by five non-overlapping Codex automations. The
+   market supervisor is scheduled inside the regular session and uses the repo's
+   per-job lock to avoid duplicate order paths.
 2. ~~Dead-man expired / TA_LIVE_SUBMIT=0~~ RESOLVED 2026-07-15 00:58 UTC: owner
    confirmed and live trading was re-armed (dead-man refreshed to 2026-07-17T12:58Z,
-   TA_LIVE_SUBMIT=1). Also found + fixed while arming: launchd Hour/Minute fields
+   the Codex market automation supplies `TA_LIVE_SUBMIT=1`). Also found + fixed
+   while arming: launchd Hour/Minute fields
    are the Mac's system-local time (`America/New_York`, verified via
    `readlink /etc/localtime`), but `market_session_label()` classifies sessions in
    hardcoded America/Chicago — every tick had been firing an hour early relative to
@@ -153,22 +156,24 @@ guardrail validation → go-live guard → (only then) limit orders.
 5. **Paper portfolio is heavy AI-beta** (NVDA/AMD/AVGO/TSM/MSFT/ORCL/CRM…) in an
    AI-financing-stress regime; ORCL −41% and CRM −21% are the drag. The demoted
    aggressive sleeve imported these; pullback-support inherits watch-only.
-6. **No LLM key on Mac** → overnight research is deterministic-only until
-   OPENROUTER/GOOGLE key lands.
-7. **n8n-runner launchd service exists but last exited via SIGTERM** — user
-   installed n8n+Docker recently; the observer workflows haven't been re-verified
-   on Mac.
+6. ~~No LLM key on Mac~~ RESOLVED 2026-07-14: OpenRouter is configured and a
+   full-graph run completed successfully. Google/OpenAI keys remain optional.
+7. ~~n8n observer stack not re-verified~~ RESOLVED 2026-07-15: Docker n8n and
+   both localhost health endpoints are healthy; the runner exposes 24 allowlisted
+   jobs and zero submit-capable jobs. Its `env -i` wrapper strips unrelated shell
+   credentials before Python starts.
 8. **Session-limit fragility:** heavy multi-agent Claude work can hit plan limits
    mid-task; prefer inline work + durable commits.
 
 ## 7. Future priorities (ranked)
 
 1. ~~TCC grant~~ done. 2. ~~OpenRouter key~~ done (validated full-graph run).
-3. ~~Re-arm live~~ done 2026-07-15. Watch the first two live ticks tomorrow morning
-   (09:00 and 10:00 ET) for the NFLX close order — check `results/hourly_supervisor/`
+3. ~~Re-arm live and restore a trigger~~ done 2026-07-15. Watch the 09:35 ET
+   Codex market-supervisor run for the NFLX close order — check `results/hourly_supervisor/`
    and the outbox/inbox for confirmation, and re-freeze
-   (`policy freeze-live... ` or set `TA_LIVE_SUBMIT=0` + reinstall) if anything looks
-   wrong before Thursday's earnings.
+   (`policy freeze-live --reason "pause and review"`) if anything looks wrong
+   before Thursday's earnings. The Codex automation can keep running safely after
+   a freeze because the unified guard fails closed.
 5. Tournament v2: realized-PnL scoring + exit rules + restart window (current one
    ended 2026-07-01; it keeps running but start a fresh 31-day window).
 6. SMTP app password → outbox actually emails (or wire a Claude scheduled task to
@@ -186,6 +191,11 @@ guardrail validation → go-live guard → (only then) limit orders.
 - Daily report from real accounts: clarity 100/100, no jargon, correct money.
 - Promotion state file: written by `policy sync-promotion --arm-live --ci-green`
   from tournament report `paper-tournament-20260531-080741`.
+- Codex pickup proof (2026-07-15 01:12 UTC): current live account ACTIVE, zero
+  open live orders, NFLX −11.51%; mechanical hard stop recognized with a
+  fill-friendly 73.55 limit and only the closed market blocking submission.
+- n8n pickup proof: Docker container healthy, runner and n8n health endpoints OK,
+  24 allowlisted jobs, zero submit-capable jobs.
 
 ## 9. Executive matrix — completed & recommended (impact × risk)
 
@@ -194,14 +204,15 @@ guardrail validation → go-live guard → (only then) limit orders.
 | 1 | Promotion bridge: evidence → live sleeve (was disconnected) | DONE | **Very high** — closes the core feedback loop | Low (fail-closed, gated, tested) |
 | 2 | Overnight graph concurrency fix | DONE | **High** — restores the system's research engine | Very low (sentinel + regression tests) |
 | 3 | Plain-language notifications + outbox transport | DONE | High — makes autonomy owner-legible; adds missing delivery layer | Low |
-| 4 | Mac launchd automation layer (dry-run default) | DONE (needs TCC grant) | High — restores autonomy post-migration | Low-med (TCC, laptop sleep) |
+| 4 | Mac launchd automation layer | RETIRED by owner; scripts retained as reference | Medium — proved the cadence and wrappers | None while uninstalled |
 | 5 | 8 legacy test failures + Windows-path portability | DONE | Medium — trustworthy CI signal on Mac | Very low |
 | 6 | Strategy demotion of current-aggressive | DONE | High — stops worst sleeve from being live default | Low (live was blocked anyway) |
 | 7 | Re-arm live trading (dead-man + TA_LIVE_SUBMIT) | DONE 2026-07-15 | Medium — turns paper edge into (tiny) real P&L | Medium (real money; caps are small) |
 | 7b | Mechanical exit policy (−8%/−12%/time stop) | DONE, now live-armed | High — ends HOLD deadlocks; caps losses by rule | Low (pre-registered, fully tested, still guard-gated) |
 | 7c | launchd Eastern/Chicago timezone fix | DONE 2026-07-15 | High — every scheduled tick was firing 1hr early vs. intended session | Low (schedule-only change) |
-| 8 | OpenRouter key + cheap overnight graph lanes | RECOMMENDED | High — real multi-agent research resumes at ~$0.1–0.3/M | Low (spend-capped) |
+| 7d | Codex-owned production schedule | DONE 2026-07-15 | High — restores autonomous routines without duplicate launchd triggers | Low-med (local app must remain available) |
+| 8 | OpenRouter key + cheap overnight graph lanes | DONE 2026-07-14 | High — real multi-agent research resumes at ~$0.1–0.3/M | Low (spend-capped) |
 | 9 | Tournament v2 (realized PnL, exits, fresh window) | RECOMMENDED | High — evidence quality for promotions | Medium (touches core scoring) |
-| 10 | NFLX/TSM loss-review decision pre-earnings | RECOMMENDED (urgent) | Low arch / high P&L relevance | Low |
+| 10 | NFLX stop before earnings / TSM watch | NFLX armed and scheduled; TSM below trigger | Low arch / high P&L relevance | Low |
 | 11 | MiroFish refresh run (cheap-lane funded, pre-catalyst) | OPTIONAL | Medium — fresh advisory priors | Medium (never runs 100% clean) |
 | 12 | Zep → stay local (+codebase-memory MCP) | DECIDED (no action) | Low | None |

@@ -9,15 +9,30 @@
 > **Codex now owns scheduling.** Claude/Fable is not going to run anything on
 > a timer on this machine going forward — see §5.
 
+> **Codex pickup addendum — 2026-07-15 01:12 UTC:** the scheduler gap below is
+> resolved. Five Codex app automations are active: overnight research (04:00 ET),
+> pre-open validation (09:15), paper tournament (10:05), market supervisor
+> (hourly at :35 from 09:35 through 15:35), and daily report/outbox (16:30).
+> Claude's launchd jobs remain uninstalled, so there is still only one order
+> trigger. A fresh submit-capable closed-market run identified NFLX at −11.51%,
+> applied the mechanical hard stop and 73.55 limit, and stopped solely because
+> the market was closed. Codex also fixed a notification bug where stale TSM
+> BOARD evidence could overwrite the active NFLX alert; full verification is
+> 1090 passed, 1 skipped. n8n and its localhost runner are healthy with 24
+> allowlisted and zero submit-capable jobs.
+
 ---
 
 ## 0. Read this first — time-sensitive
 
-**Live trading is armed but nothing will trigger it.** I built and then, per
+**Historical state at handoff:** live trading was armed but nothing would trigger it. I built and then, per
 owner instruction, tore down a set of macOS `launchd` jobs that would have
 executed the NFLX stop-loss exit automatically tomorrow morning. The
 underlying safety state (dead-man timer, promotion record) is still armed and
 correct — there is simply no scheduler pointed at it anymore.
+
+The Codex pickup addendum above supersedes that last sentence: the active market
+automation now satisfies option 1 below while preserving the same guard chain.
 
 **NFLX is at ~−11.5%, past its −8% hard-stop rule, in a real (tiny, ~$24)
 live position. NFLX and TSM both report earnings 2026-07-16.** If a stop-loss
@@ -220,10 +235,10 @@ root-caused individually — see commit `1c96956`.
 | Dead-man control | armed, expires **2026-07-17T12:58:45Z** |
 | Risk envelope | unchanged: $250 max at risk, $50/name, $25 tranche, $25 daily-loss halt, 5% drawdown halt |
 | Exit policy thresholds | −8% hard stop / −12% catastrophic / 15-day time stop (config/risk_envelope.yaml overridable) |
-| Scheduler | **none** — all Claude-installed launchd jobs removed 2026-07-15 |
+| Scheduler | Five active Codex automations; market supervisor is the only submit-capable trigger; Claude launchd jobs remain removed |
 | OpenRouter | configured, `.env`: quick lane `qwen/qwen3-30b-a3b-instruct-2507`, deep lane `deepseek/deepseek-v4-flash` |
 | SMTP outbox | configured and verified delivering to `corbin.inboxhub@gmail.com` |
-| n8n-runner | pre-existing launchd service (`com.tradingagents.n8n-runner`), not touched this session, not re-verified |
+| n8n-runner | healthy 2026-07-15; 24 allowlisted jobs, zero submit-capable jobs, localhost-only `env -i` wrapper |
 | Test suite | 1089 passed, 1 skipped |
 
 ---
@@ -296,8 +311,8 @@ that.
    by design (has an explicit `advisory_expires_after`).
 5. `TA_LIVE_SUBMIT` and the dead-man TTL are both time-boxed for a reason —
    don't set a long-lived unattended dead-man without deliberately deciding
-   to do that; the fail-closed default (dead-man expiring, no scheduler
-   running) is the safe resting state of this system.
+   to do that. The safe resting state is the dead-man expired or live control
+   frozen; the Codex schedule may still run, but the unified guard fails closed.
 
 ---
 
