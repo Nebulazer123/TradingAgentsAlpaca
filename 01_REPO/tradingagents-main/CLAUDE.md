@@ -1,6 +1,7 @@
 # CLAUDE.md — TradingAgents System Map & Operating Model
 
-Last full audit: **2026-07-14** (Claude Fable 5 session; market open during final validation).
+Last full audit: **2026-07-14** (Claude Fable 5; follow-up same day: OpenRouter lanes live,
+launchd verified post-TCC, mechanical exit policy added, SMTP delivery working).
 Read this before `AGENTS.md`/`CONTEXT_ROUTER.md` — those predate the Mac migration.
 
 ## 1. What this system is
@@ -27,7 +28,8 @@ guardrail validation → go-live guard → (only then) limit orders.
 | Paper tournament | `tradingagents/brokers/paper_tournament.py` | races 3 sleeves, writes live-selection |
 | Promotion bridge | `tradingagents/policy/promotion_sync.py` + `policy sync-promotion` | tournament evidence → `results/policy/promotion_state.json` (NEW 2026-07) |
 | Overnight research | `cli plan-overnight`, `tradingagents/graph/` | analysis-only LangGraph multi-agent research |
-| Notifications | `brokers/supervisor/daily_report.py`, `alert.py`, `notifications/outbox.py` | plain-language emails → `results/outbox/` queue |
+| Notifications | `brokers/supervisor/daily_report.py`, `alert.py`, `notifications/outbox.py` | plain-language emails → `results/outbox/` → SMTP to corbin.inboxhub@gmail.com (verified delivering) |
+| Exit policy | `tradingagents/policy/exit_policy.py` | pre-registered mechanical loss exits: −8% hard stop, −12% catastrophic, 15-day time stop; overrides in `config/risk_envelope.yaml` |
 | Mac automation | `scripts/mac/` + `~/Library/LaunchAgents/com.tradingagents.*` | replaces the 14 paused Windows Codex automations |
 | MiroFish | `../mirofish-main` | external society-simulation; advisory-only handoffs, no execution authority |
 | n8n | `config/n8n_tradingagents_allowlist.json`, `orchestration/n8n_*` | observer workflows only; allowlisted read-only jobs |
@@ -93,9 +95,11 @@ guardrail validation → go-live guard → (only then) limit orders.
 
 ## 4. Model strategy (2026-07 reality)
 
-- **No LLM is currently wired on the Mac** — overnight runs use the deterministic
-  fallback scorer (validated: ranks 40, submits 0). The graph bug fix is ready for
-  when a provider returns.
+- **OpenRouter is live** (`TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER=openrouter` in `.env`):
+  quick lane `qwen/qwen3-30b-a3b-instruct-2507` ($0.048/$0.193 per 1M), deep lane
+  `deepseek/deepseek-v4-flash` ($0.09/$0.18, 1M ctx). Validated 2026-07-14: first
+  clean full-graph run since June (1/1 success). A missing optional vendor key now
+  degrades the dataflows chain instead of crashing the graph (OfficialDataError).
 - **OpenRouter** (user has a management key): cheap lanes as of July 2026 —
   DeepSeek V3.2 ≈ $0.14/$0.28 per 1M tokens; Gemini 2.5 Flash-class similar; free
   tier (DeepSeek R1, Llama 3.3 70B) at 20 req/min for non-urgent lanes. Route
@@ -125,12 +129,13 @@ guardrail validation → go-live guard → (only then) limit orders.
 
 ## 6. Unresolved risks
 
-1. **TCC grant missing** → launchd jobs can't run yet (owner one-click; §3).
-2. **Dead-man expired 2026-06-04** → live submits blocked (intentional until owner
-   re-arms). Live account also has only $86 buying power — sizing warnings expected.
-3. **NFLX loss-review is open with earnings 2026-07-16** — binary event in 2 days;
-   the loss-review evidence refresh resolved 12/13 blockers. Decide hold-vs-exit
-   before earnings or accept event risk. TSM also under review; TSM reports 2026-07-16.
+1. ~~TCC grant~~ RESOLVED 2026-07-14: all six launchd jobs heartbeat ok.
+2. **Dead-man expired 2026-06-04 + TA_LIVE_SUBMIT=0** → live submits blocked. The
+   exit policy therefore PLANS exits and emails, but cannot execute them until the
+   owner re-arms. Live buying power $86 — sizing warnings expected.
+3. **NFLX is at −11.6%, past the −8% stop; earnings 2026-07-16.** The policy will
+   emit a close action on the first in-session tick; it executes only once live is
+   re-armed. TSM also under review; TSM reports 2026-07-16.
 4. **Tournament metrics are mark-to-market** (no sell rules in tournament sleeves;
    win rate = open positions only). Direction of evidence is right; magnitude is
    soft. Next iteration: realized-PnL tournament with exits.
@@ -147,11 +152,12 @@ guardrail validation → go-live guard → (only then) limit orders.
 
 ## 7. Future priorities (ranked)
 
-1. Owner: TCC grant + verify heartbeat (unblocks everything autonomous).
-2. Owner: add `OPENROUTER_API_KEY`; then set overnight profile to a cheap
-   DeepSeek/Flash lane and re-run `plan-overnight` with `--full-graph-tickers 3`.
-3. Decide NFLX/TSM loss-reviews before 2026-07-16 earnings.
-4. Re-arm live (dead-man + `TA_LIVE_SUBMIT=1`) once 1–2 clean dry-run days pass.
+1. ~~TCC grant~~ done. 2. ~~OpenRouter key~~ done (validated full-graph run).
+3. Owner: re-arm live so the exit policy can actually exit — refresh dead-man
+   (`.venv/bin/python -m cli.main policy refresh-live-control --reason "arm exits" --ttl-hours 24`)
+   and set `TA_LIVE_SUBMIT=1` in `~/Library/LaunchAgents/com.tradingagents.*.plist`
+   (or rerun `TA_LIVE_SUBMIT=1 scripts/mac/install_launchd.sh`). Until then exits
+   are planned + emailed, not executed. NFLX/TSM earnings 2026-07-16.
 5. Tournament v2: realized-PnL scoring + exit rules + restart window (current one
    ended 2026-07-01; it keeps running but start a fresh 31-day window).
 6. SMTP app password → outbox actually emails (or wire a Claude scheduled task to
@@ -180,7 +186,8 @@ guardrail validation → go-live guard → (only then) limit orders.
 | 4 | Mac launchd automation layer (dry-run default) | DONE (needs TCC grant) | High — restores autonomy post-migration | Low-med (TCC, laptop sleep) |
 | 5 | 8 legacy test failures + Windows-path portability | DONE | Medium — trustworthy CI signal on Mac | Very low |
 | 6 | Strategy demotion of current-aggressive | DONE | High — stops worst sleeve from being live default | Low (live was blocked anyway) |
-| 7 | Re-arm live trading (dead-man + TA_LIVE_SUBMIT) | RECOMMENDED (owner) | Medium — turns paper edge into (tiny) real P&L | Medium (real money; caps are small) |
+| 7 | Re-arm live trading (dead-man + TA_LIVE_SUBMIT) | RECOMMENDED (owner; now also gates the NFLX stop-loss exit) | Medium — turns paper edge into (tiny) real P&L | Medium (real money; caps are small) |
+| 7b | Mechanical exit policy (−8%/−12%/time stop) | DONE | High — ends HOLD deadlocks; caps losses by rule | Low (pre-registered, fully tested, still guard-gated) |
 | 8 | OpenRouter key + cheap overnight graph lanes | RECOMMENDED | High — real multi-agent research resumes at ~$0.1–0.3/M | Low (spend-capped) |
 | 9 | Tournament v2 (realized PnL, exits, fresh window) | RECOMMENDED | High — evidence quality for promotions | Medium (touches core scoring) |
 | 10 | NFLX/TSM loss-review decision pre-earnings | RECOMMENDED (urgent) | Low arch / high P&L relevance | Low |
