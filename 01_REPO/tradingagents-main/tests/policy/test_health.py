@@ -128,6 +128,13 @@ def test_gather_reads_real_files(tmp_path, monkeypatch) -> None:
     from tradingagents.policy.integrity import write_state_with_integrity
     from tradingagents.policy.live_control import write_live_control_state
 
+    # Distinct live/paper keys so the (real-env) key-hygiene check is deterministic;
+    # the shared conftest sets both to the same placeholder.
+    monkeypatch.setenv("ALPACA_LIVE_API_KEY", "LIVEKEY_distinct")
+    monkeypatch.setenv("ALPACA_PAPER_API_KEY", "PAPERKEY_distinct")
+    monkeypatch.setenv("ALPACA_LIVE_SECRET_KEY", "LIVESECRET_distinct")
+    monkeypatch.setenv("ALPACA_PAPER_SECRET_KEY", "PAPERSECRET_distinct")
+
     control = tmp_path / "policy" / "live_control.json"
     promo = tmp_path / "policy" / "promotion_state.json"
     ticks = tmp_path / "hourly_supervisor"

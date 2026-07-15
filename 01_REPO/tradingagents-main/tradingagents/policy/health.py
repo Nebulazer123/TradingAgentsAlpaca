@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from tradingagents.evals.secret_leakage import check_key_hygiene
 from tradingagents.notifications.outbox import list_undelivered, write_outbox_message
 from tradingagents.policy import integrity
 from tradingagents.policy.live_control import load_live_control_state, parse_control_time
@@ -185,6 +186,11 @@ def collect_health(inputs: dict[str, Any]) -> HealthReport:
             checks.append(HealthCheck("env_permissions", OK,
                                       "Your secrets file (.env) is owner-only."))
 
+    # Credential hygiene (distinct live vs paper keys).
+    hygiene_issues = inputs.get("key_hygiene_issues") or []
+    if hygiene_issues:
+        checks.append(HealthCheck("key_hygiene", WARN, "; ".join(hygiene_issues)))
+
     # Broker reachability — only present when explicitly checked.
     reachable = inputs.get("broker_reachable")
     if reachable is not None:
@@ -298,6 +304,7 @@ def gather_health_inputs(
         "env_present": env_path.exists(),
         "env_mode_octal": _env_mode_octal(env_path) if env_path.exists() else None,
         "env_git_tracked": _env_git_tracked(env_path) if env_path.exists() else None,
+        "key_hygiene_issues": check_key_hygiene(),
         "broker_reachable": None,
     }
 

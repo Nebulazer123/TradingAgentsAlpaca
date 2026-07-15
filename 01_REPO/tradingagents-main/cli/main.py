@@ -3812,6 +3812,42 @@ def policy_refresh_live_control(
         console.print(f"Live control refreshed until {payload['dead_man_expires_at']}")
 
 
+@policy_app.command("scan-leaks")
+def policy_scan_leaks(
+    scan_dir: list[Path] = typer.Option(
+        [Path("results"), Path("logs")], "--scan-dir",
+        help="Directories to scan for leaked secrets (repeatable).",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Scan output for leaked credentials + check key hygiene. Reports fingerprints only.
+
+    Analysis-only; never trades and never prints raw secret values. Exit 0 clean, 1 if
+    any leak or hygiene issue is found.
+    """
+    from tradingagents.evals.secret_leakage import (
+        check_key_hygiene,
+        find_secret_leaks,
+        leaks_summary,
+    )
+
+    leaks = find_secret_leaks(scan_dir)
+    hygiene = check_key_hygiene()
+    summary = leaks_summary(leaks)
+    summary["key_hygiene_issues"] = hygiene
+    if json_output:
+        print(json.dumps(summary, indent=2))
+    else:
+        if not leaks and not hygiene:
+            console.print("No secret leaks found; credential hygiene OK.")
+        else:
+            for leak in leaks:
+                console.print(f"LEAK: {leak.detail} ({leak.file})")
+            for issue in hygiene:
+                console.print(f"HYGIENE: {issue}")
+    raise typer.Exit(code=0 if not leaks and not hygiene else 1)
+
+
 @policy_app.command("health-check")
 def policy_health_check(
     control_path: Path = typer.Option(
