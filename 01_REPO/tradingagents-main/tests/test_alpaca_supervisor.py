@@ -2047,6 +2047,43 @@ def test_loss_review_email_uses_refreshed_board_evidence_counts():
     assert clarity["max_line_length"] <= 180
 
 
+def test_loss_review_email_ignores_board_evidence_for_another_symbol():
+    decision = build_hourly_decision(
+        live_positions=[
+            {
+                "symbol": "NFLX",
+                "unrealized_plpc": "-0.1151",
+                "market_value": "23.67",
+                "cost_basis": "26.76",
+                "qty": "0.320946047",
+                "current_price": "73.78",
+            }
+        ],
+        live_open_orders=[],
+        config=HourlySupervisorConfig(),
+        market_session="closed",
+    )
+    evidence = {
+        **decision.evidence,
+        "execution_board_review": {
+            "recommendation": "review_underperformers_before_new_buys",
+            "loss_review_evidence": {
+                "symbol": "TSM",
+                "review_allowed": False,
+                "remaining_blocker_count": 5,
+                "resolved_blocker_count": 8,
+            },
+        },
+    }
+    decision = decision.__class__(**{**decision.__dict__, "evidence": evidence})
+
+    body = serialize_hourly_decision(decision)["alert_email"]["body"]
+
+    assert "Problem: NFLX is down enough to trigger a loss review." in body
+    assert "TSM is down enough" not in body
+    assert "5 evidence item(s) still open after refresh" not in body
+
+
 def test_same_cause_alert_throttle_suppresses_duplicate_email_only():
     issue = type("Issue", (), {"ticket_id": "live-submit-guard", "reason": "risk envelope missing"})()
     first = build_hourly_decision(
