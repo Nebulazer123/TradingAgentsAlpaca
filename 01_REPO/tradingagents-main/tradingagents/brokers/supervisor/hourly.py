@@ -27,6 +27,7 @@ from tradingagents.brokers.supervisor.candidates import (
     is_buy_entry_candidate,
 )
 from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.brokers.supervisor.types import (
     HourlySupervisorAction,
     HourlySupervisorConfig,
@@ -115,6 +116,12 @@ def build_loss_review_decision(
     ):
         return None
 
+    # Mechanical stop-floor / time-stop lane: enrich the position with
+    # pre-registered exit-policy evidence before the review, so rule-based
+    # exits stop deadlocking in HOLD when no narrative evidence exists.
+    worst_position = apply_exit_policy_to_position(
+        worst_position, generated_at=generated_at
+    )
     symbol = str(worst_position.get("symbol", "")).upper()
     loss_decision_id = f"loss-exit-{symbol}-{generated_at:%Y%m%d%H%M%S}"
     loss_exit_review = loss_exit_review_packet(
@@ -122,7 +129,10 @@ def build_loss_review_decision(
         generated_at=generated_at,
         decision_id=loss_decision_id,
         side="sell",
-        proposed_limit_price=worst_position.get("current_price"),
+        proposed_limit_price=(
+            worst_position.get("exit_policy_limit_price")
+            or worst_position.get("current_price")
+        ),
     )
     loss_exit_reason = str(loss_exit_review.get("allowed_exit_reason") or "")
     tradeable_session = can_trade_session(market_session)
@@ -188,13 +198,18 @@ def build_loss_review_decision(
 
     notional = _as_decimal(worst_position.get("market_value") or worst_position.get("cost_basis"))
     qty_raw = worst_position.get("qty")
+    # Price rule-based exits slightly below market so the limit-only sell
+    # realistically fills instead of resting above the bid.
+    policy_limit = positive_decimal_or_none(
+        worst_position.get("exit_policy_limit_price")
+    )
     action = HourlySupervisorAction(
         action="close",
         symbol=symbol,
         side="sell",
         qty=_as_decimal(qty_raw) if qty_raw else None,
         notional=notional,
-        limit_price=current_price,
+        limit_price=policy_limit or current_price,
         reason=f"Exit approved loss: {symbol} crossed loss review; {loss_exit_reason}",
         execution_mode="tiny_live",
         sleeve=live_sleeve,

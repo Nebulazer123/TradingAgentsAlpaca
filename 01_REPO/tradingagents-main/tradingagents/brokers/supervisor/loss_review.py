@@ -20,6 +20,11 @@ ALLOWED_LOSS_EXIT_REASONS = frozenset(
         "hard_stop_defined_before_entry",
         "portfolio_exposure_limit",
         "user_manual_override",
+        # Deterministic lane from tradingagents/policy/exit_policy.py: the
+        # pre-registered stop-floor / time-stop rules are their own
+        # documented justification (owner-approved 2026-07).
+        "policy_stop_floor",
+        "policy_time_stop",
     }
 )
 
@@ -28,8 +33,15 @@ RECENT_LOSS_EXIT_ALLOWED_REASONS = frozenset(
         "thesis_invalidated",
         "hard_stop_defined_before_entry",
         "user_manual_override",
+        "policy_stop_floor",
     }
 )
+
+#: Reasons backed by a pre-registered mechanical rule. These carry their own
+#: justification, so the subjective narrative-evidence blockers (thesis text,
+#: news check, why-hold-is-worse, confidence, source packet ids) do not apply.
+#: Objective blockers (price evidence, position actually below entry) still do.
+POLICY_RULE_REASONS = frozenset({"policy_stop_floor", "policy_time_stop"})
 
 LOSS_EXIT_REASON_ALIASES = {
     "thesis_broken": "thesis_invalidated",
@@ -109,6 +121,8 @@ def loss_exit_review_packet(
     blockers: list[str] = []
     review_decision_id = decision_id or f"loss-exit-{symbol}-{generated_at:%Y%m%d%H%M%S}"
 
+    policy_rule_exit = allowed_reason in POLICY_RULE_REASONS
+
     if current_price <= 0:
         blockers.append("current price evidence is missing")
     if avg_entry_price <= 0:
@@ -119,30 +133,35 @@ def loss_exit_review_packet(
         blockers.append("allowed loss-exit reason is missing")
     if not allowed_reason_source:
         blockers.append("allowed loss-exit reason source is missing")
-    if holding_days is None:
+    if holding_days is None and not policy_rule_exit:
         blockers.append("holding period evidence is missing")
-    elif holding_days < 3 and allowed_reason not in RECENT_LOSS_EXIT_ALLOWED_REASONS:
+    elif (
+        holding_days is not None
+        and holding_days < 3
+        and allowed_reason not in RECENT_LOSS_EXIT_ALLOWED_REASONS
+    ):
         blockers.append("recent-position churn guard blocks opposite-side sell")
-    if not original_buy_thesis:
-        blockers.append("original buy thesis is missing")
-    if not current_thesis_status:
-        blockers.append("current thesis status is missing")
-    if not _market_context_has_required_benchmarks(position):
-        blockers.append("SPY/QQQ/sector context is missing")
-    if _market_context_is_broad_weakness(position):
-        blockers.append("broad-market weakness is insufficient")
-    if not company_news:
-        blockers.append("company-specific news check is missing")
-    if not earnings_check:
-        blockers.append("earnings/guidance/filing check is missing")
-    if not why_hold_worse:
-        blockers.append("why HOLD is worse than SELL is missing")
-    if not anti_noise:
-        blockers.append("why this is not broad-market red-day noise is missing")
-    if confidence <= 0:
-        blockers.append("loss-exit confidence is missing")
-    if not source_ids:
-        blockers.append("source packet ids are missing")
+    if not policy_rule_exit:
+        if not original_buy_thesis:
+            blockers.append("original buy thesis is missing")
+        if not current_thesis_status:
+            blockers.append("current thesis status is missing")
+        if not _market_context_has_required_benchmarks(position):
+            blockers.append("SPY/QQQ/sector context is missing")
+        if _market_context_is_broad_weakness(position):
+            blockers.append("broad-market weakness is insufficient")
+        if not company_news:
+            blockers.append("company-specific news check is missing")
+        if not earnings_check:
+            blockers.append("earnings/guidance/filing check is missing")
+        if not why_hold_worse:
+            blockers.append("why HOLD is worse than SELL is missing")
+        if not anti_noise:
+            blockers.append("why this is not broad-market red-day noise is missing")
+        if confidence <= 0:
+            blockers.append("loss-exit confidence is missing")
+        if not source_ids:
+            blockers.append("source packet ids are missing")
     market_context = dict(_market_context_mapping(position))
 
     return {
@@ -184,6 +203,9 @@ def loss_exit_review_packet(
         "confidence": str(confidence),
         "evidence_generated_at": generated_at.isoformat(timespec="seconds"),
         "source_packet_ids": source_ids,
+        "policy_rule_exit": policy_rule_exit,
+        "exit_policy_rule": position.get("exit_policy_rule"),
+        "exit_policy_rationale": position.get("exit_policy_rationale"),
         "allowed": not blockers,
         "blocked_reasons": blockers,
         "blockers": blockers,

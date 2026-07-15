@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import zoneinfo
 from collections.abc import Mapping, Sequence
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -472,7 +473,9 @@ def build_supervisor_daily_report_payload(
         status_phrase = f"{submitted_count} trade(s) made"
     else:
         status_phrase = "quiet day, no trades"
-    today = datetime.datetime.now(tz=UTC)
+    # Owner-local date (America/Chicago), not UTC — a 3:30pm report must not
+    # carry tomorrow's date.
+    today = datetime.datetime.now(tz=zoneinfo.ZoneInfo("America/Chicago"))
     subject = (
         f"Your trading update for {today:%A, %B %-d}: {status_phrase} [TradingAgents]"
     )

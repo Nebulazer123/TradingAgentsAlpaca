@@ -23,6 +23,11 @@ def strategy_display_name(strategy_id: object) -> str:
 #: sentences a non-technical owner can act on. First match wins.
 _PLAIN_REASON_RULES: tuple[tuple[str, str], ...] = (
     (
+        "exit approved loss",
+        "A losing stock hit its pre-set safety stop, so it was sold to cap "
+        "the damage. The freed cash stays in cash until a clean setup appears.",
+    ),
+    (
         "loss review",
         "One stock is down enough that the rules require a review before "
         "selling at a loss. It is being held while the facts are gathered.",
