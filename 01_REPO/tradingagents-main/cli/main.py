@@ -3812,6 +3812,93 @@ def policy_refresh_live_control(
         console.print(f"Live control refreshed until {payload['dead_man_expires_at']}")
 
 
+@policy_app.command("snapshot-state")
+def policy_snapshot_state(
+    dest_root: Path = typer.Option(
+        Path("results/policy/snapshots"), "--dest-root",
+        help="Where timestamped, checksummed snapshots are written.",
+    ),
+    label: str = typer.Option("", "--label", help="Optional suffix for the snapshot folder."),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Save a checksummed snapshot of the safety-state files. Read-only of production."""
+    from tradingagents.policy.snapshots import snapshot_state
+
+    dest = snapshot_state(dest_root=dest_root, label=label or None)
+    if json_output:
+        print(json.dumps({"snapshot_dir": str(dest)}, indent=2))
+    else:
+        console.print(f"Snapshot written to {dest}")
+
+
+@policy_app.command("restore-state")
+def policy_restore_state(
+    snapshot_dir: Path = typer.Argument(..., help="Snapshot folder to restore from."),
+    confirm: bool = typer.Option(
+        False, "--confirm", help="Actually overwrite the live files (default = dry-run preview).",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Restore safety state from a snapshot. Dry-run unless --confirm; refuses on checksum mismatch."""
+    from tradingagents.policy.snapshots import restore_state
+
+    report = restore_state(snapshot_dir, dry_run=not confirm, confirm=confirm)
+    payload = {
+        "dry_run": report.dry_run, "verified": report.verified,
+        "issues": report.issues, "restored": report.restored,
+    }
+    if json_output:
+        print(json.dumps(payload, indent=2))
+    elif not report.verified:
+        console.print("Restore refused — snapshot failed verification:")
+        for issue in report.issues:
+            console.print(f"  {issue}")
+    elif report.dry_run:
+        console.print("Would restore (dry-run): " + ", ".join(report.restored))
+    else:
+        console.print("Restored: " + ", ".join(report.restored))
+    raise typer.Exit(code=0 if report.verified else 1)
+
+
+@policy_app.command("reconcile-live")
+def policy_reconcile_live(
+    tick_dir: Path = typer.Option(
+        Path("results/hourly_supervisor"), "--tick-dir",
+        help="Directory of hourly packets; the newest is reconciled against the broker.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Read-only reconcile of the newest hourly packet's live orders against the broker.
+
+    Run after a restart / before the first tick to confirm local state matches the
+    broker. Never submits or cancels anything. Exit 0 clean, 1 on mismatch.
+    """
+    from tradingagents.brokers.alpaca import find_order_by_client_order_id
+    from tradingagents.execution.reconcile import reconcile_latest_packet_live_orders
+
+    packets = sorted(Path(tick_dir).glob("hourly-supervisor-*.json"), reverse=True)
+    packets = [p for p in packets if not p.name.endswith(".compact.json")]
+    if not packets:
+        console.print("No hourly packets found to reconcile.")
+        raise typer.Exit(code=0)
+    packet = json.loads(packets[0].read_text(encoding="utf-8"))
+    live_client = _alpaca_live_client()
+    result = reconcile_latest_packet_live_orders(
+        packet,
+        order_lookup=lambda coid: find_order_by_client_order_id(live_client, coid),
+    )
+    payload = {"packet": packets[0].name, "matched": result.matched, "issues": result.issues}
+    if json_output:
+        print(json.dumps(payload, indent=2))
+    elif result.matched:
+        console.print(f"Live state reconciles with the broker ({packets[0].name}).")
+    else:
+        console.print("Reconciliation found issues:")
+        for issue in result.issues:
+            console.print(f"  {issue}")
+    raise typer.Exit(code=0 if result.matched else 1)
+
+
 @policy_app.command("scan-leaks")
 def policy_scan_leaks(
     scan_dir: list[Path] = typer.Option(
