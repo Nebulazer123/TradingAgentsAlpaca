@@ -63,6 +63,9 @@ case "$JOB" in
       run "$PY" -m cli.main alpaca preopen-validation --json-output
     fi
     run "$PY" scripts/automation_context_snapshot.py --write
+    # Urgent alerts queue in the outbox as they happen; drain it every tick
+    # so a CRITICAL/NOTABLE email is not stuck until the 15:40 daily drain.
+    run "$PY" scripts/mac/deliver_outbox.py
     ;;
   tournament)
     run "$PY" -m cli.main alpaca paper-tournament run --all --json-output
