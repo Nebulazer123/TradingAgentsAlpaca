@@ -30,7 +30,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping
 
-from tradingagents.policy.io import atomic_write_text
+from tradingagents.policy.integrity import write_state_with_integrity
 from tradingagents.policy.promotion import (
     SleevePromotionEvidence,
     evaluate_sleeve_promotion,
@@ -343,5 +343,7 @@ def sync_promotion_state_file(
         ci_green=ci_green,
         now=now,
     )
-    atomic_write_text(state_file, json.dumps(result.state, indent=2))
+    write_state_with_integrity(
+        state_file, json.dumps(result.state, indent=2), actor="promotion_sync"
+    )
     return result

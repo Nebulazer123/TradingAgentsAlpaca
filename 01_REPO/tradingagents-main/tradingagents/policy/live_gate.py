@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.brokers.alpaca import OrderIssue
+from tradingagents.policy.integrity import verify_state_integrity
 from tradingagents.policy.live_control import load_live_control_state
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
@@ -85,13 +86,15 @@ def _is_live_order_action(action: Any) -> bool:
 def _read_promotion_state(path: Path) -> tuple[dict[str, Any], list[str]]:
     if not path.exists():
         return {}, [f"promotion state missing at {path}"]
+    raw_text = path.read_text(encoding="utf-8")
     try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
+        parsed = json.loads(raw_text)
     except json.JSONDecodeError as exc:
         return {}, [f"promotion state is invalid JSON: {exc}"]
     if not isinstance(parsed, dict):
         return {}, ["promotion state must be a JSON object"]
-    return parsed, []
+    integrity_issues = verify_state_integrity(path, raw_text)
+    return parsed, integrity_issues
 
 
 def _promotion_issues(action: Any, promotion_state: dict[str, Any]) -> list[str]:
