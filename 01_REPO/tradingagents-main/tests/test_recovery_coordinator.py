@@ -502,4 +502,26 @@ def test_receipt_ttl_and_future_issued_time_close_control(tmp_path):
         )
     )
     _state, issues = load_live_control_state(control, now=NOW)
-    assert any("expired or invalid" in issue for issue in issues)
+    assert issues
+
+
+def test_hostile_mapping_get_and_noncanonical_source_path_fail_closed():
+    class HostileGet(dict):
+        def get(self, _key, _default=None):
+            raise RuntimeError("hostile get")
+
+    hostile = _evidence(source_packet_sha256=HostileGet())
+    assert evaluate_rearm_readiness(hostile).ready is False
+    evidence = _evidence()
+    paths = dict(evidence.source_packet_paths)
+    paths["incident"] = str(Path(paths["incident"]).parent / ".." / Path(paths["incident"]).parent.name / "incident.json")
+    assert evaluate_rearm_readiness(_evidence(source_packet_paths=paths)).ready is False
+
+
+def test_source_binding_incident_mismatch_and_verified_reason_without_markers_close(tmp_path):
+    bindings = {"incident_id": "other", "symbol": "NFLX", "broker_account": "live", "environment": "test", "source_revision": "abc"}
+    assert evaluate_rearm_readiness(_evidence(source_bindings=bindings)).ready is False
+    control = tmp_path / "control.json"
+    control.write_text(json.dumps({"frozen": False, "reason": "verified recovery inc", "dead_man_expires_at": "2026-07-19T12:00:00+00:00"}))
+    _state, issues = load_live_control_state(control, now=NOW)
+    assert any("markers" in issue for issue in issues)

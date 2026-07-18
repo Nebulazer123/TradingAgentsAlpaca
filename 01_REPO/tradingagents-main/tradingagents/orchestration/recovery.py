@@ -135,12 +135,18 @@ def evaluate_rearm_readiness(evidence: RecoveryEvidence) -> RecoveryVerdict:
         issues.append("source packet path and hash proof is incomplete")
     else:
         for key in packet_keys:
-            digest = evidence.source_packet_sha256.get(key)
-            path = evidence.source_packet_paths.get(key)
+            try:
+                digest = evidence.source_packet_sha256.get(key)
+                path = evidence.source_packet_paths.get(key)
+            except Exception:
+                issues.append(f"source packet proof is unreadable for {key}")
+                continue
             if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
                 issues.append(f"source packet hash is invalid for {key}")
-            if not isinstance(path, str) or not Path(path).is_absolute():
+            if not isinstance(path, str) or not Path(path).is_absolute() or str(Path(path).resolve()) != path:
                 issues.append(f"source packet path is not absolute for {key}")
+    if bindings_valid and evidence.source_bindings.get("incident_id") != evidence.incident_id:
+        issues.append("source binding incident_id must match recovery evidence")
     if not isinstance(evidence.recovery_manifest_path, str) or not evidence.recovery_manifest_path or not Path(evidence.recovery_manifest_path).is_absolute() or str(Path(evidence.recovery_manifest_path).resolve()) != evidence.recovery_manifest_path:
         issues.append("recovery manifest path must be absolute")
     if not isinstance(evidence.recovery_manifest_sha256, str) or len(evidence.recovery_manifest_sha256) != 64 or any(char not in "0123456789abcdef" for char in evidence.recovery_manifest_sha256):
