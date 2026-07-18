@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.orchestration.incidents import is_safe_incident_id
 from tradingagents.orchestration.recovery import (
     load_recovery_evidence,
@@ -65,9 +66,28 @@ RECOVERY_EFFECTS = (
     "sync_promotion_state_from_evidence",
     "read_only_broker_reconciliation",
     "run_focused_tests",
-    "independent_verification",
+    "integrity_verification",
     "refresh_live_control_after_ready",
 )
+
+
+def _required_authority_owner(
+    action: ActionClass,
+    *,
+    expected_owner: str,
+) -> str:
+    verdict = authority_for(action)
+    if (
+        verdict.allowed is not True
+        or verdict.human_required is not False
+        or verdict.owner_role != expected_owner
+    ):
+        raise ValueError(
+            f"{action.value} authority contract is not available"
+        )
+    return verdict.owner_role
+
+
 RECOVERY_RECIPE_NAME = "resolve_policy_sync_reconcile_verify_rearm"
 RECOVERY_PHASES = (
     "resolve_authority",
@@ -440,8 +460,7 @@ def _valid_persisted_recovery_state(value: Mapping[str, Any]) -> bool:
             value.get("next_retry_at") is not None
             and _parse_aware_recovery_time(value.get("next_retry_at")) is None
         )
-        or not isinstance(value.get("owner_role"), str)
-        or not is_safe_incident_id(value.get("owner_role"))
+        or value.get("owner_role") != "reliability_controller"
         or not isinstance(value.get("idempotency_keys"), list)
         or not isinstance(value.get("incident_history"), list)
         or not all(isinstance(item, Mapping) for item in value["incident_history"])
@@ -1974,11 +1993,10 @@ def _valid_phase_packet(
             and packet.get("focused_tests_passed") is True
             and packet.get("passing_tests") == list(RECOVERY_FOCUSED_TESTS)
             and is_safe_incident_id(packet.get("verifier_run_id"))
-            and is_safe_incident_id(packet.get("verifier_role_id"))
+            and packet.get("verifier_role_id") == "integrity_verifier"
+            and packet.get("owner_role") == "reliability_controller"
             and packet.get("verifier_run_id").casefold()
             != packet.get("owner_run_id").casefold()
-            and packet.get("verifier_role_id").casefold()
-            != packet.get("owner_role").casefold()
         )
     if phase == "ready_incident":
         expected_phases = RECOVERY_PHASES[:5]
@@ -1995,7 +2013,9 @@ def _valid_phase_packet(
             and packet.get("evidence_refs")
             == [outputs[name]["path"] for name in expected_phases]
             and packet.get("repairer_run_id") == packet.get("owner_run_id")
-            and packet.get("repairer_role_id") == packet.get("owner_role")
+            and packet.get("repairer_role_id")
+            == "reliability_controller"
+            and packet.get("owner_role") == "reliability_controller"
             and packet.get("root_cause_resolved") is True
             and packet.get("external_blockers") == []
         )
@@ -3023,6 +3043,10 @@ def build_production_recovery_request(
             return unavailable("focused_verify", _redact_recovery_detail(error))
         if int(getattr(result, "returncode", 1)) != 0:
             return unavailable("focused_verify", "fixed focused verification failed")
+        verifier_role_id = _required_authority_owner(
+            ActionClass.VERIFY,
+            expected_owner="integrity_verifier",
+        )
         return {
             "packet": {
                 "kind": "recovery_focused_proof",
@@ -3030,7 +3054,7 @@ def build_production_recovery_request(
                 "focused_tests_passed": True,
                 "passing_tests": list(RECOVERY_FOCUSED_TESTS),
                 "verifier_run_id": f"self-heal-verifier-{secrets.token_hex(8)}",
-                "verifier_role_id": "independent_verifier",
+                "verifier_role_id": verifier_role_id,
             }
         }
 
@@ -3255,6 +3279,19 @@ def coordinate_verified_recovery(
             idempotency_key=idempotency_key,
         )
 
+    try:
+        rearm_request_owner = _required_authority_owner(
+            ActionClass.REARM_REQUEST,
+            expected_owner="reliability_controller",
+        )
+        rearm_issue_owner = _required_authority_owner(
+            ActionClass.REARM_ISSUE,
+            expected_owner="integrity_verifier",
+        )
+    except ValueError:
+        fail_closed("rearm authority contract is unavailable")
+        raise
+
     required_bindings = {"incident_id", "symbol", "broker_account", "environment", "source_revision"}
     try:
         canonical_bindings = dict(bindings)
@@ -3278,6 +3315,9 @@ def coordinate_verified_recovery(
     ):
         fail_closed("unsafe recovery identifier")
         return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe recovery identifier")}
+    if owner_role != rearm_request_owner:
+        fail_closed("recovery owner lacks rearm request authority")
+        raise ValueError("recovery owner authority is invalid")
     if idempotency_key is not None and (not isinstance(idempotency_key, str) or not is_safe_incident_id(idempotency_key)):
         fail_closed("unsafe idempotency key")
         return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe idempotency key")}
@@ -3783,7 +3823,7 @@ def coordinate_verified_recovery(
                             for name in RECOVERY_PHASES[:5]
                         ],
                         "repairer_run_id": owner_run_id,
-                        "repairer_role_id": owner_role,
+                        "repairer_role_id": rearm_request_owner,
                         "root_cause_resolved": True,
                         "external_blockers": [],
                     }
@@ -3873,9 +3913,12 @@ def coordinate_verified_recovery(
                         or not is_safe_incident_id(repairer_run_id)
                         or not is_safe_incident_id(repairer_role_id)
                         or verifier_run_id.casefold() == repairer_run_id.casefold()
-                        or verifier_role_id.casefold() == repairer_role_id.casefold()
+                        or verifier_role_id != rearm_issue_owner
+                        or repairer_role_id != rearm_request_owner
                     ):
-                        raise ValueError("focused verifier identity must be distinct")
+                        raise ValueError(
+                            "recovery roles do not match rearm authority"
+                        )
                     state["verifier_run_id"] = verifier_run_id
                     evidence, evidence_issues = load_recovery_evidence(
                         incident_path=paths["incident"],

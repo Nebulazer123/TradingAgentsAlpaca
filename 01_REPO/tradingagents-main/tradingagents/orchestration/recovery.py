@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.live_control import (
     _write_live_control_state_locked,
@@ -55,6 +56,26 @@ class RecoveryVerdict:
     issues: tuple[str, ...]
 
 
+def _rearm_authority_binding() -> dict[str, str]:
+    request = authority_for(ActionClass.REARM_REQUEST)
+    issue = authority_for(ActionClass.REARM_ISSUE)
+    if (
+        request.allowed is not True
+        or request.human_required is not False
+        or request.owner_role != "reliability_controller"
+        or issue.allowed is not True
+        or issue.human_required is not False
+        or issue.owner_role != "integrity_verifier"
+    ):
+        raise ValueError("rearm authority contract is not available")
+    return {
+        "request_action": request.action.value,
+        "request_owner_role": request.owner_role,
+        "issue_action": issue.action.value,
+        "issue_owner_role": issue.owner_role,
+    }
+
+
 def _normalized_string(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -75,9 +96,14 @@ def _string_items(value: object) -> tuple[str, ...] | None:
     return tuple(item for item in values if item is not None)
 
 
-def evaluate_rearm_readiness(evidence: RecoveryEvidence) -> RecoveryVerdict:
-    """Return all independently checkable reasons a recovery cannot re-arm."""
-    issues: list[str] = []
+def _evaluate_rearm_readiness(
+    evidence: RecoveryEvidence,
+    *,
+    authority_binding: Mapping[str, str],
+    initial_issues: tuple[str, ...] = (),
+) -> RecoveryVerdict:
+    """Evaluate evidence against an already resolved authority binding."""
+    issues = list(initial_issues)
     if _normalized_string(evidence.incident_id) is None:
         issues.append("incident_id must be a nonblank string")
     repairer_run = _normalized_string(evidence.repairer_run_id)
@@ -88,14 +114,20 @@ def evaluate_rearm_readiness(evidence: RecoveryEvidence) -> RecoveryVerdict:
         issues.append("verifier_run_id must be a nonblank string")
     if repairer_run is not None and verifier_run is not None and repairer_run.casefold() == verifier_run.casefold():
         issues.append("repairer and verifier run IDs must differ")
-    repairer_role = _normalized_string(evidence.repairer_role_id)
-    verifier_role = _normalized_string(evidence.verifier_role_id)
-    if repairer_role is None:
-        issues.append("repairer_role_id must be a nonblank string")
-    if verifier_role is None:
-        issues.append("verifier_role_id must be a nonblank string")
-    if repairer_role is not None and verifier_role is not None and repairer_role.casefold() == verifier_role.casefold():
-        issues.append("repairer and verifier role IDs must differ")
+    if (
+        evidence.repairer_role_id
+        != authority_binding.get("request_owner_role")
+    ):
+        issues.append(
+            "repairer_role_id must exactly match rearm request authority"
+        )
+    if (
+        evidence.verifier_role_id
+        != authority_binding.get("issue_owner_role")
+    ):
+        issues.append(
+            "verifier_role_id must exactly match rearm issue authority"
+        )
 
     for field_name in (
         "root_cause_resolved",
@@ -155,6 +187,24 @@ def evaluate_rearm_readiness(evidence: RecoveryEvidence) -> RecoveryVerdict:
     if not isinstance(evidence.recovery_manifest_sha256, str) or len(evidence.recovery_manifest_sha256) != 64 or any(char not in "0123456789abcdef" for char in evidence.recovery_manifest_sha256):
         issues.append("recovery manifest hash is invalid")
     return RecoveryVerdict(ready=not issues, issues=tuple(issues))
+
+
+def evaluate_rearm_readiness(
+    evidence: RecoveryEvidence,
+) -> RecoveryVerdict:
+    """Return all checkable reasons a recovery cannot re-arm."""
+    try:
+        authority_binding = _rearm_authority_binding()
+    except (TypeError, ValueError):
+        return _evaluate_rearm_readiness(
+            evidence,
+            authority_binding={},
+            initial_issues=("rearm authority contract is unavailable",),
+        )
+    return _evaluate_rearm_readiness(
+        evidence,
+        authority_binding=authority_binding,
+    )
 
 
 def _as_utc(now: dt.datetime | None) -> dt.datetime:
@@ -417,12 +467,16 @@ def rearm_after_verified_recovery(
     ttl_minutes: int = MAX_REARM_TTL_MINUTES,
     now: dt.datetime | None = None,
 ) -> dict[str, Any]:
-    """Re-arm only a currently frozen control after durable independent evidence."""
+    """Re-arm a frozen control after authority-bound integrity evidence."""
     if _sha256_reference(expected_control_preimage_sha256) is None:
         raise ValueError(
             "rearm blocked: expected frozen control preimage is required"
         )
-    verdict = evaluate_rearm_readiness(evidence)
+    authority_binding = _rearm_authority_binding()
+    verdict = _evaluate_rearm_readiness(
+        evidence,
+        authority_binding=authority_binding,
+    )
     if not verdict.ready:
         raise ValueError("rearm blocked: " + "; ".join(verdict.issues))
     ttl = _strict_ttl(ttl_minutes)
@@ -573,13 +627,14 @@ def rearm_after_verified_recovery(
             )
             reason = f"verified recovery {evidence.incident_id.strip()}"
             receipt = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "verified_rearm_receipt",
                 "incident_id": evidence.incident_id.strip(),
                 "repairer_run_id": evidence.repairer_run_id.strip(),
                 "verifier_run_id": evidence.verifier_run_id.strip(),
-                "repairer_role_id": evidence.repairer_role_id.strip(),
-                "verifier_role_id": evidence.verifier_role_id.strip(),
+                "repairer_role_id": evidence.repairer_role_id,
+                "verifier_role_id": evidence.verifier_role_id,
+                "authority": authority_binding,
                 "issued_at": current.isoformat(timespec="seconds"),
                 "expires_at": normalized_expiry,
                 "ttl_minutes": ttl,
@@ -1239,8 +1294,16 @@ def load_recovery_evidence(
     writes = reconciliation.get("broker_write_calls")
     if type(writes) is not int or writes != 0:
         issues.append("reconciliation broker_write_calls must equal zero")
-    repairer_role = _normalized_string(incident.get("repairer_role_id") or incident.get("owner_role"))
-    verifier_role = _normalized_string(focused.get("verifier_role_id"))
+    repairer_role = incident.get("repairer_role_id")
+    verifier_role = focused.get("verifier_role_id")
+    if repairer_role != "reliability_controller":
+        issues.append(
+            "incident repairer_role_id must be exactly reliability_controller"
+        )
+    if verifier_role != "integrity_verifier":
+        issues.append(
+            "focused verifier_role_id must be exactly integrity_verifier"
+        )
     if issues:
         return None, tuple(issues)
     evidence = RecoveryEvidence(

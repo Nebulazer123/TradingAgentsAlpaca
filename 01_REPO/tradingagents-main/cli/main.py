@@ -213,6 +213,7 @@ from tradingagents.graph.analyst_execution import (
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.model_catalog import get_model_context_window_tokens
+from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.orchestration.control_plane_patrol import write_control_plane_patrol_packet
 from tradingagents.orchestration.n8n_api_sync import N8NApiSyncError, sync_n8n_evaluation_data_table
 from tradingagents.orchestration.n8n_evaluation_run_probe import (
@@ -3879,7 +3880,7 @@ def policy_recover_incident(
     receipt_dir: Path = typer.Option(Path("results/control_plane/rearm"), "--receipt-dir"),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Re-arm a frozen live-control lease from independently verified packets."""
+    """Re-arm a frozen live-control lease from integrity-verified packets."""
     control_absolute = control_path.resolve()
     accepted_control_preimage_sha256: str | None = None
     control_acceptance_issues: list[str] = []
@@ -3951,6 +3952,23 @@ def policy_recover_incident(
                 }
             else:
                 try:
+                    request_authority = authority_for(
+                        ActionClass.REARM_REQUEST
+                    )
+                    issue_authority = authority_for(ActionClass.REARM_ISSUE)
+                    if (
+                        request_authority.allowed is not True
+                        or request_authority.human_required is not False
+                        or request_authority.owner_role
+                        != "reliability_controller"
+                        or issue_authority.allowed is not True
+                        or issue_authority.human_required is not False
+                        or issue_authority.owner_role
+                        != "integrity_verifier"
+                    ):
+                        raise ValueError(
+                            "rearm authority contract is unavailable"
+                        )
                     receipt = rearm_after_verified_recovery(
                         evidence=evidence,
                         control_path=control_path,

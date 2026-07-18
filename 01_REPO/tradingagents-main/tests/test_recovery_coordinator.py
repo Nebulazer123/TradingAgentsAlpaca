@@ -12,6 +12,8 @@ from typer.testing import CliRunner
 import cli.main as cli_main
 from cli.main import app
 from tradingagents.orchestration import recovery as recovery_module
+from tradingagents.orchestration.authority import ActionClass
+from tradingagents.orchestration.authority import authority_for as real_authority_for
 from tradingagents.orchestration.incidents import Incident, IncidentStage, transition_incident
 from tradingagents.orchestration.recovery import (
     evaluate_rearm_readiness,
@@ -46,7 +48,7 @@ def test_clean_independent_evidence_is_ready():
     "overrides",
     [
         {"verifier_run_id": "repair-1"},
-        {"verifier_role_id": "repair"},
+        {"verifier_role_id": "reliability_controller"},
         {"root_cause_resolved": False},
         {"focused_tests_passed": False},
         {"promotion_evidence_fresh": False},
@@ -59,6 +61,36 @@ def test_clean_independent_evidence_is_ready():
 )
 def test_any_unresolved_integrity_condition_blocks_rearm(overrides):
     assert evaluate_rearm_readiness(_evidence(**overrides)).ready is False
+
+
+@pytest.mark.parametrize(
+    ("repairer_role_id", "verifier_role_id"),
+    [
+        ("repair_team", "audit_team"),
+        ("reliability_controller", "audit_team"),
+        ("repair_team", "integrity_verifier"),
+        ("integrity_verifier", "reliability_controller"),
+        (" reliability_controller", "integrity_verifier"),
+        ("reliability_controller ", "integrity_verifier"),
+        ("RELIABILITY_CONTROLLER", "integrity_verifier"),
+        ("reliability_controller", " integrity_verifier"),
+        ("reliability_controller", "integrity_verifier "),
+        ("reliability_controller", "Integrity_Verifier"),
+    ],
+)
+def test_arbitrary_distinct_roles_cannot_request_or_issue_rearm(
+    repairer_role_id,
+    verifier_role_id,
+):
+    verdict = evaluate_rearm_readiness(
+        _evidence(
+            repairer_role_id=repairer_role_id,
+            verifier_role_id=verifier_role_id,
+        )
+    )
+
+    assert verdict.ready is False
+    assert any("role" in issue for issue in verdict.issues)
 
 
 def test_verified_recovery_writes_receipt_before_bounded_live_control(tmp_path):
@@ -86,8 +118,196 @@ def test_verified_recovery_writes_receipt_before_bounded_live_control(tmp_path):
     assert state["recovery_receipt_path"] == result["receipt_path"]
     assert state["recovery_receipt_sha256"] == result["receipt_sha256"]
     receipt = json.loads((receipt_dir / Path(result["receipt_path"]).name).read_text())
+    assert receipt["schema_version"] == 2
+    assert receipt["authority"] == {
+        "request_action": "rearm_request",
+        "request_owner_role": "reliability_controller",
+        "issue_action": "rearm_issue",
+        "issue_owner_role": "integrity_verifier",
+    }
     assert receipt["can_submit_orders"] is False
     assert receipt["broker_write_calls"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("request_action", "repair"),
+        ("request_owner_role", "repair_team"),
+        ("issue_action", "verify"),
+        ("issue_owner_role", "independent_verifier"),
+    ],
+)
+def test_live_control_rejects_noncanonical_rearm_receipt_authority(
+    tmp_path,
+    field,
+    value,
+):
+    control_path = tmp_path / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=NOW + dt.timedelta(days=1),
+    )
+    result = rearm_after_verified_recovery(
+        evidence=_evidence(),
+        control_path=control_path,
+        receipt_dir=tmp_path / "rearm",
+        now=NOW,
+        expected_control_preimage_sha256=_control_sha256(control_path),
+    )
+    receipt_path = Path(result["receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    expected_authority = {
+        "request_action": "rearm_request",
+        "request_owner_role": "reliability_controller",
+        "issue_action": "rearm_issue",
+        "issue_owner_role": "integrity_verifier",
+    }
+    assert receipt.get("authority") == expected_authority
+    receipt["authority"][field] = value
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    control["recovery_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    control_path.write_text(json.dumps(control), encoding="utf-8")
+
+    _state, issues = load_live_control_state(control_path, now=NOW)
+
+    assert any("authority" in issue for issue in issues)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_issue"),
+    [
+        (lambda receipt: receipt.pop("authority"), "authority"),
+        (lambda receipt: receipt.update({"authority": []}), "authority"),
+        (
+            lambda receipt: receipt["authority"].update({"unexpected": "owner"}),
+            "authority",
+        ),
+        (lambda receipt: receipt.update({"schema_version": 1}), "schema"),
+    ],
+)
+def test_live_control_rejects_malformed_or_wrong_schema_authority(
+    tmp_path,
+    mutation,
+    expected_issue,
+):
+    control_path = tmp_path / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=NOW + dt.timedelta(days=1),
+    )
+    result = rearm_after_verified_recovery(
+        evidence=_evidence(),
+        control_path=control_path,
+        receipt_dir=tmp_path / "rearm",
+        now=NOW,
+        expected_control_preimage_sha256=_control_sha256(control_path),
+    )
+    receipt_path = Path(result["receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["schema_version"] == 2
+    assert isinstance(receipt["authority"], dict)
+    mutation(receipt)
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    control["recovery_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    control_path.write_text(json.dumps(control), encoding="utf-8")
+
+    _state, issues = load_live_control_state(control_path, now=NOW)
+
+    assert any(expected_issue in issue for issue in issues)
+
+
+def test_legacy_v1_independent_verifier_receipt_stays_fail_closed(tmp_path):
+    control_path = tmp_path / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=NOW + dt.timedelta(days=1),
+    )
+    result = rearm_after_verified_recovery(
+        evidence=_evidence(),
+        control_path=control_path,
+        receipt_dir=tmp_path / "rearm",
+        now=NOW,
+        expected_control_preimage_sha256=_control_sha256(control_path),
+    )
+    receipt_path = Path(result["receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["schema_version"] = 1
+    receipt.pop("authority")
+    receipt["verifier_role_id"] = "independent_verifier"
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    control["recovery_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    control_path.write_text(json.dumps(control), encoding="utf-8")
+    control_before = control_path.read_bytes()
+    receipt_before = receipt_path.read_bytes()
+
+    _state, issues = load_live_control_state(control_path, now=NOW)
+
+    assert any("schema" in issue or "authority" in issue for issue in issues)
+    assert control_path.read_bytes() == control_before
+    assert receipt_path.read_bytes() == receipt_before
+
+
+def test_rearm_authority_lookup_denial_preserves_frozen_control(
+    monkeypatch,
+    tmp_path,
+):
+    control_path = tmp_path / "live_control.json"
+    receipt_dir = tmp_path / "rearm"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=NOW + dt.timedelta(days=1),
+    )
+    control_before = control_path.read_bytes()
+    calls: list[ActionClass] = []
+
+    def deny_issue(action):
+        verdict = real_authority_for(action)
+        calls.append(verdict.action)
+        if verdict.action is ActionClass.REARM_ISSUE:
+            return replace(verdict, allowed=False)
+        return verdict
+
+    monkeypatch.setattr(recovery_module, "authority_for", deny_issue, raising=False)
+
+    with pytest.raises(ValueError, match="authority"):
+        rearm_after_verified_recovery(
+            evidence=_evidence(),
+            control_path=control_path,
+            receipt_dir=receipt_dir,
+            now=NOW,
+            expected_control_preimage_sha256=_control_sha256(control_path),
+        )
+
+    assert calls == [ActionClass.REARM_REQUEST, ActionClass.REARM_ISSUE]
+    assert control_path.read_bytes() == control_before
+    assert not receipt_dir.exists()
 
 
 @pytest.mark.parametrize("ttl", [True, 0, 91, 1.5, "15"])
@@ -243,14 +463,14 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
             "history": [{"to_stage": "ready"}],
             "evidence_refs": ["proof"],
             "repairer_run_id": "repair-1",
-            "repairer_role_id": "repair",
+            "repairer_role_id": "reliability_controller",
             "generated_at": now.isoformat(),
         },
         "focused": {
             "focused_tests_passed": True,
             "passing_tests": ["tests/test_x.py::test_ok"],
             "verifier_run_id": "verify-1",
-            "verifier_role_id": "verify",
+            "verifier_role_id": "integrity_verifier",
             "source_revision": "abc123",
             "generated_at": now.isoformat(),
         },
@@ -298,7 +518,7 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
             paths["focused"].read_bytes()
         ).hexdigest(),
         "verifier_run_id": "verify-1",
-        "verifier_role_id": "verify",
+        "verifier_role_id": "integrity_verifier",
         "reconciliation_path": str(paths["reconciliation"].resolve()),
         "reconciliation_sha256": hashlib.sha256(
             paths["reconciliation"].read_bytes()
@@ -481,6 +701,81 @@ def _loaded_bundle_evidence(bundle, *, now):
     assert issues == ()
     assert evidence is not None
     return evidence
+
+
+@pytest.mark.parametrize(
+    "role_id",
+    [
+        " reliability_controller",
+        "reliability_controller ",
+        "RELIABILITY_CONTROLLER",
+    ],
+)
+def test_evidence_loader_rejects_nonexact_repairer_role_strings(
+    tmp_path,
+    role_id,
+):
+    bundle = _write_cli_recovery_bundle(tmp_path, now=NOW)
+    incident_path = bundle["paths"]["incident"]
+    incident = json.loads(incident_path.read_text(encoding="utf-8"))
+    incident["repairer_role_id"] = role_id
+    incident_path.write_text(json.dumps(incident), encoding="utf-8")
+    manifest_path = bundle["manifest_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packet_sha256"]["incident"] = hashlib.sha256(
+        incident_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    evidence, issues = load_recovery_evidence(
+        incident_path=incident_path,
+        reconciliation_path=bundle["paths"]["reconciliation"],
+        promotion_sync_path=bundle["paths"]["promotion"],
+        focused_proof_path=bundle["paths"]["focused"],
+        recovery_manifest_path=manifest_path,
+        repairer_run_id="repair-1",
+        verifier_run_id="verify-1",
+        now=NOW,
+    )
+
+    assert evidence is None
+    assert any("repairer_role_id" in issue for issue in issues)
+
+
+@pytest.mark.parametrize("explicit_role", [None, ""])
+def test_evidence_loader_requires_explicit_repairer_role_without_owner_fallback(
+    tmp_path,
+    explicit_role,
+):
+    bundle = _write_cli_recovery_bundle(tmp_path, now=NOW)
+    incident_path = bundle["paths"]["incident"]
+    incident = json.loads(incident_path.read_text(encoding="utf-8"))
+    incident["owner_role"] = "reliability_controller"
+    if explicit_role is None:
+        incident.pop("repairer_role_id")
+    else:
+        incident["repairer_role_id"] = explicit_role
+    incident_path.write_text(json.dumps(incident), encoding="utf-8")
+    manifest_path = bundle["manifest_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["packet_sha256"]["incident"] = hashlib.sha256(
+        incident_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    evidence, issues = load_recovery_evidence(
+        incident_path=incident_path,
+        reconciliation_path=bundle["paths"]["reconciliation"],
+        promotion_sync_path=bundle["paths"]["promotion"],
+        focused_proof_path=bundle["paths"]["focused"],
+        recovery_manifest_path=manifest_path,
+        repairer_run_id="repair-1",
+        verifier_run_id="verify-1",
+        now=NOW,
+    )
+
+    assert evidence is None
+    assert any("repairer_role_id" in issue for issue in issues)
 
 
 def _invoke_cli_recovery(bundle, tmp_path):

@@ -11,9 +11,33 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
+
+
+def _expected_rearm_authority() -> dict[str, str] | None:
+    try:
+        request = authority_for(ActionClass.REARM_REQUEST)
+        issue = authority_for(ActionClass.REARM_ISSUE)
+    except (TypeError, ValueError):
+        return None
+    if (
+        request.allowed is not True
+        or request.human_required is not False
+        or request.owner_role != "reliability_controller"
+        or issue.allowed is not True
+        or issue.human_required is not False
+        or issue.owner_role != "integrity_verifier"
+    ):
+        return None
+    return {
+        "request_action": request.action.value,
+        "request_owner_role": request.owner_role,
+        "issue_action": issue.action.value,
+        "issue_owner_role": issue.owner_role,
+    }
 
 
 class LiveControlPreimageMismatch(ValueError):
@@ -223,20 +247,28 @@ def load_live_control_state(
             except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                 issues.append("verified recovery receipt is missing or corrupt")
             else:
+                expected_authority = _expected_rearm_authority()
                 if actual_digest != receipt_digest:
                     issues.append("verified recovery receipt digest mismatch")
                 if not isinstance(receipt, dict):
                     issues.append("verified recovery receipt must be a JSON object")
-                elif receipt.get("schema_version") != 1:
+                elif receipt.get("schema_version") != 2:
                     issues.append("verified recovery receipt has wrong schema")
                 elif receipt.get("kind") != "verified_rearm_receipt":
                     issues.append("verified recovery receipt has wrong kind")
                 elif receipt.get("incident_id") != state.get("recovery_incident_id"):
                     issues.append("verified recovery receipt incident binding mismatch")
+                elif (
+                    expected_authority is None
+                    or receipt.get("authority") != expected_authority
+                ):
+                    issues.append(
+                        "verified recovery receipt has invalid authority binding"
+                    )
                 elif any(
                     not isinstance(receipt.get(key), str) or not receipt[key].strip()
                     for key in ("repairer_run_id", "verifier_run_id", "repairer_role_id", "verifier_role_id")
-                ) or receipt["repairer_run_id"].strip().casefold() == receipt["verifier_run_id"].strip().casefold() or receipt["repairer_role_id"].strip().casefold() == receipt["verifier_role_id"].strip().casefold():
+                ) or receipt["repairer_run_id"].strip().casefold() == receipt["verifier_run_id"].strip().casefold() or receipt.get("repairer_role_id") != "reliability_controller" or receipt.get("verifier_role_id") != "integrity_verifier":
                     issues.append("verified recovery receipt identities are unsafe")
                 elif receipt.get("effective_only_when_control_matches_receipt_digest") is not True:
                     issues.append("verified recovery receipt lacks effective binding")

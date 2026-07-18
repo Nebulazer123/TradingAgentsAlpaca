@@ -12,6 +12,12 @@ import pytest
 from tradingagents.brokers import alpaca_reconciliation
 from tradingagents.orchestration import recovery as recovery_module
 from tradingagents.orchestration import self_heal as self_heal_module
+from tradingagents.orchestration.authority import (
+    ActionClass,
+)
+from tradingagents.orchestration.authority import (
+    authority_for as real_authority_for,
+)
 from tradingagents.orchestration.recovery import rearm_after_verified_recovery
 from tradingagents.orchestration.self_heal import (
     RECOVERY_FOCUSED_TESTS,
@@ -317,7 +323,7 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
             "focused_tests_passed": True,
             "passing_tests": list(RECOVERY_FOCUSED_TESTS),
             "verifier_run_id": "verify-nflx-1",
-            "verifier_role_id": "independent_verifier",
+            "verifier_role_id": "integrity_verifier",
         },
     }
 
@@ -867,6 +873,30 @@ def test_production_promotion_adapter_requires_prior_focused_proof(tmp_path):
     assert not any("sync-promotion" in argv for argv in invocations)
 
 
+def test_production_focused_adapter_uses_the_canonical_integrity_owner(
+    tmp_path,
+    monkeypatch,
+):
+    request, _state_path, _invocations, _broker_spy = (
+        _production_recovery_harness(tmp_path)
+    )
+    calls: list[ActionClass] = []
+
+    def record(action):
+        verdict = real_authority_for(action)
+        calls.append(verdict.action)
+        return verdict
+
+    monkeypatch.setattr(self_heal_module, "authority_for", record, raising=False)
+
+    result = request["adapters"]["focused_verify"](
+        {"phase": "focused_verify"}
+    )
+
+    assert result["packet"]["verifier_role_id"] == "integrity_verifier"
+    assert calls == [ActionClass.VERIFY]
+
+
 def test_promotion_validation_requires_hash_bound_focused_proof(tmp_path):
     calls: list[str] = []
     result = _run(tmp_path, calls, idempotency_key="delivery-1")
@@ -933,6 +963,108 @@ def test_promotion_validation_requires_hash_bound_focused_proof(tmp_path):
             **validation_kwargs,
         ), field
     focused_path.write_text(original_focused, encoding="utf-8")
+
+
+def test_focused_phase_rejects_a_distinct_but_noncanonical_verifier_role(
+    tmp_path,
+):
+    calls: list[str] = []
+    assert _run(tmp_path, calls, idempotency_key="delivery-1")["status"] == "monitoring"
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    focused_path = Path(state["phase_outputs"]["focused_verify"]["path"])
+    focused = json.loads(focused_path.read_text(encoding="utf-8"))
+    focused["verifier_role_id"] = "audit_team"
+    focused_path.write_text(json.dumps(focused), encoding="utf-8")
+
+    assert not _valid_phase_packet(
+        focused_path,
+        "focused_verify",
+        BINDINGS,
+        state=state,
+        phase_outputs=state["phase_outputs"],
+        control_path=tmp_path / "live_control.json",
+        now=NOW,
+        idempotency_key="delivery-1",
+    )
+
+
+def test_ready_incident_rejects_a_distinct_but_noncanonical_repairer_role(
+    tmp_path,
+):
+    calls: list[str] = []
+    assert _run(tmp_path, calls, idempotency_key="delivery-1")["status"] == "monitoring"
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    ready_path = Path(state["phase_outputs"]["ready_incident"]["path"])
+    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+    ready["repairer_role_id"] = "repair_team"
+    ready["owner_role"] = "repair_team"
+    ready_path.write_text(json.dumps(ready), encoding="utf-8")
+
+    assert not _valid_phase_packet(
+        ready_path,
+        "ready_incident",
+        BINDINGS,
+        state=state,
+        phase_outputs=state["phase_outputs"],
+        control_path=tmp_path / "live_control.json",
+        now=NOW,
+        idempotency_key="delivery-1",
+    )
+
+
+def test_coordinator_authority_denial_preserves_frozen_control_and_no_receipt(
+    tmp_path,
+    monkeypatch,
+):
+    control_path = _control(tmp_path)
+    control_before = control_path.read_bytes()
+    authority_calls: list[ActionClass] = []
+
+    def deny_issue(action):
+        verdict = real_authority_for(action)
+        authority_calls.append(verdict.action)
+        if verdict.action is ActionClass.REARM_ISSUE:
+            return type(verdict)(
+                action=verdict.action,
+                allowed=False,
+                human_required=verdict.human_required,
+                owner_role=verdict.owner_role,
+                reason="test denial",
+            )
+        return verdict
+
+    monkeypatch.setattr(
+        self_heal_module,
+        "authority_for",
+        deny_issue,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="authority"):
+        _run(tmp_path, [])
+
+    assert authority_calls == [
+        ActionClass.REARM_REQUEST,
+        ActionClass.REARM_ISSUE,
+    ]
+    assert control_path.read_bytes() == control_before
+    assert not (tmp_path / "receipts").exists()
 
 
 @pytest.mark.parametrize("fail_phase", ["reconcile", "focused_verify"])
@@ -1816,8 +1948,9 @@ def test_full_recipe_writes_strict_manifest_uses_distinct_verifier_and_only_rear
     ready = json.loads((run_root / "packets" / "ready_incident.json").read_text())
     focused = json.loads((run_root / "packets" / "focused_verify.json").read_text())
     assert ready["repairer_run_id"] == "repair-nflx-1"
+    assert ready["repairer_role_id"] == "reliability_controller"
     assert focused["verifier_run_id"] != ready["repairer_run_id"]
-    assert focused["verifier_role_id"] != ready["repairer_role_id"]
+    assert focused["verifier_role_id"] == "integrity_verifier"
     state, issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
     assert issues == []
     assert state["frozen"] is False
@@ -3339,6 +3472,7 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     "mutate",
     [
         lambda state: state["bindings"].update({"extra": "not-canonical"}),
+        lambda state: state.update({"owner_role": "repair_team"}),
         lambda state: state.update({"follow_on_count": True}),
         lambda state: state.update(
             {

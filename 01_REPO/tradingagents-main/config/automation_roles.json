@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "roles": {
+    "strategy_learning": {
+      "display_name": "Research & Strategy Council",
+      "kind": "business",
+      "allowed_actions": [
+        "strategy_change",
+        "promotion_change"
+      ],
+      "forbidden_effects": [
+        "trade_decision",
+        "risk_change",
+        "freeze",
+        "repair",
+        "verify",
+        "rearm_request",
+        "rearm_issue",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order"
+      ],
+      "command_family": [
+        "alpaca plan-overnight --json-output",
+        "alpaca paper-tournament run --all --dry-run --json-output",
+        "policy sync-promotion"
+      ]
+    },
+    "portfolio_executive": {
+      "display_name": "Portfolio Executive",
+      "kind": "business",
+      "allowed_actions": [
+        "trade_decision",
+        "risk_change"
+      ],
+      "forbidden_effects": [
+        "strategy_change",
+        "promotion_change",
+        "freeze",
+        "repair",
+        "verify",
+        "rearm_request",
+        "rearm_issue",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order"
+      ],
+      "command_family": [
+        "research execution-board-review --json-output"
+      ]
+    },
+    "reliability_controller": {
+      "display_name": "Reliability Controller",
+      "kind": "business",
+      "allowed_actions": [
+        "repair",
+        "rearm_request"
+      ],
+      "forbidden_effects": [
+        "trade_decision",
+        "strategy_change",
+        "risk_change",
+        "promotion_change",
+        "freeze",
+        "verify",
+        "rearm_issue",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order"
+      ],
+      "command_family": [
+        "research self-heal-handoff --json-output",
+        "research self-heal-plan --execute-safe --json-output"
+      ]
+    },
+    "integrity_verifier": {
+      "display_name": "Integrity Verifier",
+      "kind": "business",
+      "allowed_actions": [
+        "freeze",
+        "verify",
+        "rearm_issue"
+      ],
+      "forbidden_effects": [
+        "trade_decision",
+        "strategy_change",
+        "risk_change",
+        "promotion_change",
+        "repair",
+        "rearm_request",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order"
+      ],
+      "command_family": [
+        "alpaca check",
+        "alpaca reconcile-symbol-incident",
+        "policy freeze-live",
+        "policy recover-incident"
+      ]
+    },
+    "execution_operator": {
+      "display_name": "Execution Operator",
+      "kind": "business",
+      "allowed_actions": [
+        "order_submit"
+      ],
+      "forbidden_effects": [
+        "trade_decision",
+        "strategy_change",
+        "risk_change",
+        "promotion_change",
+        "freeze",
+        "repair",
+        "verify",
+        "rearm_request",
+        "rearm_issue",
+        "recovery_order_submit"
+      ],
+      "required_inputs": [
+        "authorized_normal_trade_intent"
+      ],
+      "command_family": [
+        "scripts/mac/ta_job.sh hourly"
+      ]
+    },
+    "schedule_controller": {
+      "display_name": "Schedule Controller",
+      "kind": "utility",
+      "allowed_actions": [],
+      "forbidden_effects": [
+        "trade_decision",
+        "strategy_change",
+        "risk_change",
+        "promotion_change",
+        "freeze",
+        "repair",
+        "verify",
+        "rearm_request",
+        "rearm_issue",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order"
+      ],
+      "command_family": [
+        "automation status",
+        "research controller-patrol --json-output"
+      ]
+    },
+    "reporting_utility": {
+      "display_name": "Reporting Utility",
+      "kind": "utility",
+      "allowed_actions": [],
+      "forbidden_effects": [
+        "trade_decision",
+        "strategy_change",
+        "risk_change",
+        "promotion_change",
+        "freeze",
+        "repair",
+        "verify",
+        "rearm_request",
+        "rearm_issue",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order"
+      ],
+      "command_family": [
+        "scripts/mac/ta_job.sh daily-report",
+        "scripts/mac/ta_job.sh deliver-outbox"
+      ]
+    }
+  },
+  "automations": {
+    "tradingagents-automation-sleep-controller": "schedule_controller",
+    "tradingagents-automation-wake-controller": "schedule_controller",
+    "tradingagents-autonomous-execution-board": "portfolio_executive",
+    "tradingagents-autonomous-safety-sentinel": "integrity_verifier",
+    "tradingagents-autonomous-self-healer": "reliability_controller",
+    "tradingagents-daily-report": "reporting_utility",
+    "tradingagents-market-supervisor": "execution_operator",
+    "tradingagents-overnight-research": "strategy_learning",
+    "tradingagents-paper-tournament": "strategy_learning",
+    "tradingagents-preopen-validation": "integrity_verifier"
+  }
+}

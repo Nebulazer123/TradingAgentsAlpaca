@@ -12,7 +12,8 @@ class ActionClass(str, Enum):
     FREEZE = "freeze"
     REPAIR = "repair"
     VERIFY = "verify"
-    REARM = "rearm"
+    REARM_REQUEST = "rearm_request"
+    REARM_ISSUE = "rearm_issue"
     ORDER_SUBMIT = "order_submit"
     CAPITAL_CHANGE = "capital_change"
     ACCOUNT_IDENTITY_CHANGE = "account_identity_change"
@@ -34,10 +35,11 @@ _MACHINE_OWNERS = {
     ActionClass.STRATEGY_CHANGE: "strategy_learning",
     ActionClass.RISK_CHANGE: "portfolio_executive",
     ActionClass.PROMOTION_CHANGE: "strategy_learning",
-    ActionClass.FREEZE: "integrity_controller",
+    ActionClass.FREEZE: "integrity_verifier",
     ActionClass.REPAIR: "reliability_controller",
     ActionClass.VERIFY: "integrity_verifier",
-    ActionClass.REARM: "reliability_controller",
+    ActionClass.REARM_REQUEST: "reliability_controller",
+    ActionClass.REARM_ISSUE: "integrity_verifier",
     ActionClass.ORDER_SUBMIT: "execution_operator",
 }
 _HUMAN_ACTIONS = {
