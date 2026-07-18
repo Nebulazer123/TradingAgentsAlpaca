@@ -7,6 +7,7 @@ import pytest
 
 from tradingagents.orchestration.self_heal import (
     RECOVERY_PHASES,
+    _classify_self_heal_signal,
     _valid_phase_packet,
     build_production_recovery_request,
     classify_recovery_signal,
@@ -23,6 +24,158 @@ BINDINGS = {
     "environment": "test",
     "source_revision": "59ea344",
 }
+
+
+def _loss_review_source_packet(
+    *,
+    symbol: str = "NFLX",
+    account: str = "paper",
+    packet_path: str = "/tmp/loss-review-evidence.json",
+    hourly_packet_path: str = "/tmp/hourly-supervisor.json",
+) -> dict:
+    supervisor = {
+        "symbol": symbol,
+        "decision_id": f"loss-exit-{symbol}-20260718",
+        "allowed": True,
+        "policy_rule_exit": True,
+        "allowed_exit_reason": "policy_stop_floor",
+        "allowed_exit_reason_source": "pre-registered exit policy rule",
+        "exit_policy_rule": "catastrophic_stop",
+        "exit_policy_rationale": "The pre-registered rule fired.",
+        "blockers": [],
+        "blocked_reasons": [],
+        "source_packet_ids": [f"supervisor-{symbol.lower()}"],
+    }
+    advisory = {
+        "symbol": symbol,
+        "requires_board_decision": False,
+        "decision_owner": "execution_operator",
+    }
+    source_ref = f"local://{hourly_packet_path}"
+    return {
+        "schema_version": "1.0.0",
+        "packet_id": f"source-evidence-{symbol.lower()}-loss-review",
+        "generated_at": NOW.isoformat(),
+        "analysis_only": True,
+        "sources": [
+            {
+                "schema_version": "1.0.0",
+                "source": "loss_review_evidence",
+                "as_of": NOW.isoformat(),
+                "path": source_ref,
+                "quality": "high",
+            }
+        ],
+        "source_refs": [source_ref],
+        "input_hashes": {"request": "a" * 64},
+        "freshness": {
+            "as_of": NOW.isoformat(),
+            "stale": False,
+            "read_only": True,
+            "can_submit_orders": False,
+            "source_packet_count": 2,
+        },
+        "tool_route": "local_loss_review_evidence",
+        "redaction_status": "no_secrets_seen",
+        "source_name": "loss_review_evidence",
+        "evidence_type": "loss_review_evidence",
+        "subject": symbol,
+        "symbol": symbol,
+        "payload": {
+            "symbol": symbol,
+            "hourly_packet_path": hourly_packet_path,
+            "hourly_decision": "loss-review",
+            "review_allowed": True,
+            "supervisor_review_authority": supervisor,
+            "entry_context": {"symbol": symbol, "account": account},
+            "entry_context_found": True,
+            "advisory_analysis": advisory,
+            "analysis_only": True,
+            "execution_authority": "none",
+            "forbidden_effects": [
+                "create_trade_intent",
+                "size_position",
+                "submit_order",
+                "promote_sleeve",
+                "waive_live_gate",
+                "mark_loss_exit_allowed",
+            ],
+        },
+        "quality": "medium",
+        "packet_path": packet_path,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "hourly_packet_path": hourly_packet_path,
+        "hourly_decision": "loss-review",
+        "review_allowed": True,
+        "entry_context_found": True,
+        "entry_context": {"symbol": symbol, "account": account},
+        "evidence_needs": ["company_specific_news"],
+        "evidence_coverage_by_need": {"company_specific_news": True},
+        "remaining_blockers_before_refresh_count": 1,
+        "resolved_blockers_by_refresh": ["company-specific news check"],
+        "remaining_blocker_count": 0,
+        "resolved_blocker_count": 1,
+        "next_action": "pre_registered_policy_approval_preserved",
+        "source_packet_count": 1,
+        "source_packet_paths": {
+            f"provider-{symbol.lower()}": f"/tmp/provider-{symbol.lower()}.json"
+        },
+        "summary_packet_path": f"/tmp/provider-{symbol.lower()}-summary.json",
+    }
+
+
+def _promotion_source_packet(*, symbol: str = "NFLX") -> dict:
+    return {
+        "summary": "promotion state synchronized",
+        "promoted": [],
+        "demoted": [],
+        "issues_by_sleeve": {"default": []},
+        "state_path": "/tmp/promotion-state.json",
+        "report_path": "/tmp/paper-tournament.json",
+        "arm_live": False,
+        "ci_green": False,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "state": {
+            "schema_version": "1.1.0",
+            "generated_at": NOW.isoformat(),
+            "source": {
+                "kind": "paper_tournament_sync",
+                "tournament_id": "tournament-20260718",
+                "report_generated_at": NOW.isoformat(),
+                "arm_live": False,
+                "ci_green": False,
+            },
+            "sleeves": {"default": {"symbol": symbol, "live_enabled": False}},
+        },
+    }
+
+
+def _reconciliation_source_packet(*, symbol: str = "NFLX") -> dict:
+    return {
+        "schema_version": 1,
+        "kind": "symbol_broker_reconciliation",
+        "generated_at": NOW.isoformat(),
+        "read_only": True,
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "symbol": symbol,
+        "matched": True,
+        "position": {
+            "symbol": symbol,
+            "qty": "0",
+            "notional": "0",
+            "market_value": "0",
+            "avg_entry_price": "0",
+        },
+        "open_orders": [],
+        "recent_fills": [],
+        "checked_client_order_ids": [],
+        "issues": [],
+        "broker_write_calls": 0,
+    }
 
 
 def _control(tmp_path: Path) -> Path:
@@ -48,27 +201,15 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
             "decision_owner": "execution_operator",
         },
         "regenerate_evidence": {
-            "analysis_only": True,
-            "can_submit_orders": False,
-            "execution_authority": "none",
-            "packet_path": "/tmp/loss-review-evidence.json",
-            "hourly_packet_path": "/tmp/hourly-supervisor.json",
+            **_loss_review_source_packet(),
         },
         "sync_promotion": {
+            **_promotion_source_packet(),
             "promotion_evidence_fresh": True,
             "issues": [],
-            "arm_live": False,
-            "ci_green": False,
-            "can_submit_orders": False,
-            "execution_authority": "none",
         },
         "reconcile": {
-            "read_only": True,
-            "execution_authority": "none",
-            "can_submit_orders": False,
-            "matched": True,
-            "issues": [],
-            "broker_write_calls": 0,
+            **_reconciliation_source_packet(),
         },
         "focused_verify": {
             "focused_tests_passed": True,
@@ -88,7 +229,17 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     "failure_type": fail.get("failure_type", "permanent"),
                     "detail": fail.get("detail", "injected failure"),
                 }
-            return {"packet": packets[phase]}
+            packet = json.loads(json.dumps(packets[phase]))
+            generated_at = arguments.get("generated_at", NOW.isoformat())
+            packet["generated_at"] = generated_at
+            if phase == "regenerate_evidence":
+                packet["freshness"]["as_of"] = generated_at
+                for source in packet["sources"]:
+                    source["as_of"] = generated_at
+            elif phase == "sync_promotion":
+                packet["state"]["generated_at"] = generated_at
+                packet["state"]["source"]["report_generated_at"] = generated_at
+            return {"packet": packet}
 
         return run
 
@@ -118,6 +269,42 @@ def test_policy_conflict_is_recoverable_not_manual_escalation():
     assert signal["classification"] == "recoverable_integrity"
     assert signal["owner_role"] == "reliability_controller"
     assert signal["recipe"] == "resolve_policy_sync_reconcile_verify_rearm"
+
+
+def test_only_exact_hourly_board_review_is_owned_recovery():
+    exact = {
+        "label": "hourly",
+        "reason": "board_review",
+        "path": "results/hourly_supervisor/latest-compact.json",
+    }
+
+    classified = classify_recovery_signal(exact)
+
+    assert classified["classification"] == "recoverable_integrity"
+    assert classified["status"] == "owned_recovery_ready"
+    assert classified["may_rearm"] is True
+
+    other_order_adjacent = _classify_self_heal_signal(
+        {
+            "label": "execution_board_review",
+            "reason": "board_review",
+            "path": "results/execution_board/latest.json",
+        },
+        prior_signatures=set(),
+    )
+    malformed_label = _classify_self_heal_signal(
+        {
+            "label": "hourly-review",
+            "reason": "board_review",
+            "path": "results/hourly_supervisor/latest-compact.json",
+        },
+        prior_signatures=set(),
+    )
+
+    assert other_order_adjacent["classification"] == "escalate_order_adjacent"
+    assert other_order_adjacent["status"] == "escalated"
+    assert malformed_label["classification"] == "observe_only"
+    assert malformed_label["status"] == "observed"
 
 
 def test_unknown_broker_order_is_external_blocked():
@@ -610,6 +797,236 @@ def test_each_valid_phase_packet_passes_then_one_invariant_mutation_fails(tmp_pa
         phase_path.write_text(original, encoding="utf-8")
 
 
+def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_path):
+    calls: list[str] = []
+    assert _run(tmp_path, calls, idempotency_key="delivery-1")["status"] == "monitoring"
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    mutations = [
+        (
+            "regenerate_evidence",
+            "canonical kind",
+            lambda packet: packet.update({"kind": "self_attested_evidence"}),
+        ),
+        (
+            "regenerate_evidence",
+            "source schema",
+            lambda packet: packet.update({"source_schema_version": 1}),
+        ),
+        (
+            "regenerate_evidence",
+            "packet identity",
+            lambda packet: packet.update({"packet_id": ""}),
+        ),
+        (
+            "regenerate_evidence",
+            "source name",
+            lambda packet: packet.update({"source_name": "other"}),
+        ),
+        (
+            "regenerate_evidence",
+            "evidence type",
+            lambda packet: packet.update({"evidence_type": "other"}),
+        ),
+        (
+            "regenerate_evidence",
+            "subject binding",
+            lambda packet: packet.update({"subject": "TSLA"}),
+        ),
+        (
+            "regenerate_evidence",
+            "tool route",
+            lambda packet: packet.update({"tool_route": "self_attested"}),
+        ),
+        (
+            "regenerate_evidence",
+            "source refs",
+            lambda packet: packet.update({"source_refs": []}),
+        ),
+        (
+            "regenerate_evidence",
+            "provenance sources",
+            lambda packet: packet.update({"sources": []}),
+        ),
+        (
+            "regenerate_evidence",
+            "provenance source path",
+            lambda packet: packet["sources"][0].update(
+                {"path": "local://other-hourly.json"}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "input hashes",
+            lambda packet: packet.update({"input_hashes": []}),
+        ),
+        (
+            "regenerate_evidence",
+            "request digest",
+            lambda packet: packet.update({"input_hashes": {"request": "not-a-digest"}}),
+        ),
+        (
+            "regenerate_evidence",
+            "freshness authority",
+            lambda packet: packet["freshness"].update({"read_only": False}),
+        ),
+        (
+            "regenerate_evidence",
+            "freshness source count",
+            lambda packet: packet["freshness"].update({"source_packet_count": 1}),
+        ),
+        (
+            "regenerate_evidence",
+            "source packet paths",
+            lambda packet: packet.update({"source_packet_paths": []}),
+        ),
+        (
+            "regenerate_evidence",
+            "canonical payload envelope",
+            lambda packet: packet.update({"payload": {}}),
+        ),
+        (
+            "regenerate_evidence",
+            "forbidden effect rails",
+            lambda packet: packet["payload"].update({"forbidden_effects": []}),
+        ),
+        (
+            "regenerate_evidence",
+            "entry account binding",
+            lambda packet: packet["payload"]["entry_context"].update(
+                {"account": "live"}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "canonical kind",
+            lambda packet: packet.update({"kind": "self_attested_promotion"}),
+        ),
+        (
+            "sync_promotion",
+            "source identity",
+            lambda packet: packet.update({"source_identity": "other"}),
+        ),
+        (
+            "sync_promotion",
+            "issues mapping",
+            lambda packet: packet.update({"issues_by_sleeve": []}),
+        ),
+        (
+            "sync_promotion",
+            "nonempty sleeve issues",
+            lambda packet: packet.update(
+                {"issues_by_sleeve": {"default": ["not synchronized"]}}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "state source kind",
+            lambda packet: packet["state"]["source"].update({"kind": "other"}),
+        ),
+        (
+            "sync_promotion",
+            "source state path",
+            lambda packet: packet.update({"state_path": ""}),
+        ),
+        (
+            "reconcile",
+            "canonical kind",
+            lambda packet: packet.update({"kind": "self_attested_reconciliation"}),
+        ),
+        (
+            "reconcile",
+            "source identity",
+            lambda packet: packet.update({"source_identity": "other"}),
+        ),
+        (
+            "reconcile",
+            "analysis only",
+            lambda packet: packet.update({"analysis_only": False}),
+        ),
+        (
+            "reconcile",
+            "position shape",
+            lambda packet: packet.update({"position": []}),
+        ),
+        (
+            "reconcile",
+            "position symbol",
+            lambda packet: packet["position"].update({"symbol": "TSLA"}),
+        ),
+        (
+            "reconcile",
+            "open orders shape",
+            lambda packet: packet.update({"open_orders": {}}),
+        ),
+        (
+            "reconcile",
+            "open order identity",
+            lambda packet: packet.update(
+                {"open_orders": [{"symbol": "NFLX", "status": "open"}]}
+            ),
+        ),
+        (
+            "reconcile",
+            "recent fill identity",
+            lambda packet: packet.update(
+                {
+                    "recent_fills": [
+                        {
+                            "symbol": "NFLX",
+                            "client_order_id": "unknown-fill",
+                            "status": "filled",
+                        }
+                    ]
+                }
+            ),
+        ),
+        (
+            "reconcile",
+            "checked client ids",
+            lambda packet: packet.update({"checked_client_order_ids": [True]}),
+        ),
+    ]
+
+    for phase, invariant, mutate in mutations:
+        phase_path = Path(state["phase_outputs"][phase]["path"])
+        original = phase_path.read_text(encoding="utf-8")
+        assert _valid_phase_packet(
+            phase_path,
+            phase,
+            BINDINGS,
+            state=state,
+            phase_outputs=state["phase_outputs"],
+            control_path=tmp_path / "live_control.json",
+            now=NOW,
+            idempotency_key="delivery-1",
+        ), (phase, invariant, "valid baseline")
+        packet = json.loads(original)
+        mutate(packet)
+        phase_path.write_text(json.dumps(packet), encoding="utf-8")
+        assert (
+            _valid_phase_packet(
+                phase_path,
+                phase,
+                BINDINGS,
+                state=state,
+                phase_outputs=state["phase_outputs"],
+                control_path=tmp_path / "live_control.json",
+                now=NOW,
+                idempotency_key="delivery-1",
+            )
+            is False
+        ), (phase, invariant)
+        phase_path.write_text(original, encoding="utf-8")
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -925,6 +1342,10 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
     evidence_path.write_text(
         json.dumps(
             {
+                "schema_version": "1.0.0",
+                "source_name": "loss_review_evidence",
+                "evidence_type": "loss_review_evidence",
+                "subject": "NFLX",
                 "symbol": "NFLX",
                 "payload": {
                     "symbol": "NFLX",
@@ -1075,3 +1496,142 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
         command_runner=runner,
     )
     assert paper_signal["ready"] is False
+
+
+def test_hourly_board_review_without_symbol_uses_canonical_evidence_and_completes(
+    tmp_path,
+):
+    hourly_path = (
+        tmp_path
+        / "results"
+        / "hourly_supervisor"
+        / "hourly-supervisor-nflx.json"
+    )
+    hourly_path.parent.mkdir(parents=True)
+    source_packet = _loss_review_source_packet(
+        account="live",
+        packet_path=str(
+            tmp_path / "results" / "loss_review_evidence" / "latest.json"
+        ),
+        hourly_packet_path=str(hourly_path.relative_to(tmp_path)),
+    )
+    supervisor = source_packet["payload"]["supervisor_review_authority"]
+    hourly_path.write_text(
+        json.dumps(
+            {
+                "generated_at": NOW.isoformat(),
+                "decision": "loss-review",
+                "evidence": {"loss_exit_review": supervisor},
+            }
+        ),
+        encoding="utf-8",
+    )
+    compact_path = (
+        tmp_path / "results" / "hourly_supervisor" / "latest-compact.json"
+    )
+    compact_path.write_text(
+        json.dumps(
+            {
+                "label": "hourly",
+                "reason": "board_review",
+                "path": str(compact_path.relative_to(tmp_path)),
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence_path = tmp_path / "results" / "loss_review_evidence" / "latest.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(json.dumps(source_packet), encoding="utf-8")
+    for path, content in (
+        (
+            tmp_path / "results" / "paper_strategy_tournament" / "latest.json",
+            "{}",
+        ),
+        (
+            tmp_path / "results" / "policy" / "promotion_state.json",
+            "{}",
+        ),
+        (tmp_path / "config" / "risk_envelope.yaml", "tiny_live_tranche_usd: 25\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    invocations: list[list[str]] = []
+
+    class Result:
+        def __init__(self, *, stdout="", stderr="", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def runner(argv, **_kwargs):
+        invocations.append(list(argv))
+        if argv[:3] == ["git", "rev-parse", "HEAD"]:
+            return Result(stdout="source-revision\n")
+        if "loss-review-evidence" in argv:
+            return Result(stdout=json.dumps(source_packet))
+        if "sync-promotion" in argv:
+            return Result(stdout=json.dumps(_promotion_source_packet()))
+        if "reconcile-symbol-incident" in argv:
+            return Result(stdout=json.dumps(_reconciliation_source_packet()))
+        if "pytest" in argv:
+            return Result(stdout="passed")
+        raise AssertionError(argv)
+
+    exact_signal = {
+        "label": "hourly",
+        "reason": "board_review",
+        "path": "results/hourly_supervisor/latest-compact.json",
+    }
+    assert (
+        classify_recovery_signal(exact_signal)["classification"]
+        == "recoverable_integrity"
+    )
+    request = build_production_recovery_request(
+        exact_signal,
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+
+    assert request["ready"] is True
+    assert request["bindings"]["symbol"] == "NFLX"
+    assert request["bindings"]["broker_account"] == "live"
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path / "production-control"),
+        receipt_dir=tmp_path / "production-receipts",
+        recovery_root=tmp_path / "production-recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "monitoring"
+    state_path = (
+        tmp_path
+        / "production-recovery"
+        / request["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    expected_source_schemas = {
+        "regenerate_evidence": "1.0.0",
+        "sync_promotion": "1.1.0",
+        "reconcile": 1,
+    }
+    for phase, source_schema in expected_source_schemas.items():
+        packet = json.loads(
+            Path(state["phase_outputs"][phase]["path"]).read_text(encoding="utf-8")
+        )
+        assert packet["schema_version"] == "tradingagents.recovery_phase.v1"
+        assert packet["source_schema_version"] == source_schema
+    assert any("loss-review-evidence" in argv for argv in invocations)
+    assert any("reconcile-symbol-incident" in argv for argv in invocations)
+    assert sum("pytest" in argv for argv in invocations) == 1
+
+    conflict = build_production_recovery_request(
+        {**exact_signal, "symbol": "TSLA"},
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+    assert conflict["ready"] is False

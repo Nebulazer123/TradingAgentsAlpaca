@@ -280,7 +280,12 @@ def classify_recovery_signal(trigger: Mapping[str, Any]) -> dict[str, Any]:
         "policy_conflict",
         "reconciliation_mismatch",
     }
-    if label in recoverable_labels or reason in recoverable_reasons:
+    exact_hourly_board_review = label == "hourly" and reason == "board_review"
+    if (
+        label in recoverable_labels
+        or reason in recoverable_reasons
+        or exact_hourly_board_review
+    ):
         return {
             **base,
             "classification": "recoverable_integrity",
@@ -837,6 +842,202 @@ def _freeze_recovery_control(control_path: str | Path, *, reason: str) -> None:
     )
 
 
+def _nonempty_recovery_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _valid_loss_review_phase_packet(
+    packet: Mapping[str, Any], bindings: Mapping[str, str]
+) -> bool:
+    symbol = bindings["symbol"]
+    payload = packet.get("payload")
+    entry_context = payload.get("entry_context") if isinstance(payload, Mapping) else None
+    supervisor = (
+        payload.get("supervisor_review_authority")
+        if isinstance(payload, Mapping)
+        else None
+    )
+    advisory = (
+        payload.get("advisory_analysis") if isinstance(payload, Mapping) else None
+    )
+    freshness = packet.get("freshness")
+    sources = packet.get("sources")
+    input_hashes = packet.get("input_hashes")
+    source_packet_paths = packet.get("source_packet_paths")
+    source_refs = packet.get("source_refs")
+    summary_packet_path = packet.get("summary_packet_path")
+    return (
+        packet.get("schema_version") == "tradingagents.recovery_phase.v1"
+        and packet.get("source_schema_version") == "1.0.0"
+        and packet.get("kind") == "loss_review_evidence"
+        and packet.get("source_identity") == "loss_review_evidence"
+        and packet.get("source_name") == "loss_review_evidence"
+        and packet.get("evidence_type") == "loss_review_evidence"
+        and packet.get("subject") == symbol
+        and packet.get("symbol") == symbol
+        and _nonempty_recovery_string(packet.get("packet_id"))
+        and packet.get("tool_route") == "local_loss_review_evidence"
+        and packet.get("redaction_status") == "no_secrets_seen"
+        and packet.get("analysis_only") is True
+        and packet.get("can_submit_orders") is False
+        and packet.get("execution_authority") == "none"
+        and _nonempty_recovery_string(packet.get("packet_path"))
+        and _nonempty_recovery_string(packet.get("hourly_packet_path"))
+        and _packet_string_list(source_refs, nonempty=True)
+        and len(source_refs) == 1
+        and isinstance(sources, list)
+        and len(sources) == 1
+        and all(
+            isinstance(source, Mapping)
+            and source.get("schema_version") == "1.0.0"
+            and source.get("source") == "loss_review_evidence"
+            and _parse_aware_recovery_time(source.get("as_of")) is not None
+            and _nonempty_recovery_string(source.get("path"))
+            and source.get("path") in source_refs
+            and source.get("quality") in {"high", "medium", "low", "unknown"}
+            for source in sources
+        )
+        and isinstance(input_hashes, Mapping)
+        and set(input_hashes) == {"request"}
+        and _valid_recovery_digest(input_hashes.get("request"))
+        and isinstance(freshness, Mapping)
+        and _parse_aware_recovery_time(freshness.get("as_of")) is not None
+        and freshness.get("stale") is False
+        and freshness.get("read_only") is True
+        and freshness.get("can_submit_orders") is False
+        and type(freshness.get("source_packet_count")) is int
+        and freshness.get("source_packet_count") >= 0
+        and isinstance(source_packet_paths, Mapping)
+        and all(
+            _nonempty_recovery_string(key)
+            and _nonempty_recovery_string(value)
+            for key, value in source_packet_paths.items()
+        )
+        and type(packet.get("source_packet_count")) is int
+        and packet.get("source_packet_count") == len(source_packet_paths)
+        and freshness.get("source_packet_count")
+        == packet.get("source_packet_count")
+        + (1 if _nonempty_recovery_string(summary_packet_path) else 0)
+        and (
+            summary_packet_path is None
+            or _nonempty_recovery_string(summary_packet_path)
+        )
+        and isinstance(payload, Mapping)
+        and payload.get("symbol") == symbol
+        and payload.get("analysis_only") is True
+        and payload.get("execution_authority") == "none"
+        and payload.get("forbidden_effects")
+        == [
+            "create_trade_intent",
+            "size_position",
+            "submit_order",
+            "promote_sleeve",
+            "waive_live_gate",
+            "mark_loss_exit_allowed",
+        ]
+        and payload.get("hourly_packet_path") == packet.get("hourly_packet_path")
+        and isinstance(entry_context, Mapping)
+        and entry_context.get("symbol") == symbol
+        and entry_context.get("account") == bindings["broker_account"]
+        and isinstance(supervisor, Mapping)
+        and supervisor.get("symbol") == symbol
+        and isinstance(advisory, Mapping)
+        and advisory.get("symbol") == symbol
+        and packet.get("entry_context") == entry_context
+    )
+
+
+def _valid_promotion_phase_packet(
+    packet: Mapping[str, Any], bindings: Mapping[str, str]
+) -> bool:
+    issues_by_sleeve = packet.get("issues_by_sleeve")
+    state = packet.get("state")
+    source = state.get("source") if isinstance(state, Mapping) else None
+    return (
+        packet.get("schema_version") == "tradingagents.recovery_phase.v1"
+        and packet.get("source_schema_version") == "1.1.0"
+        and packet.get("kind") == "promotion_state_sync"
+        and packet.get("source_identity") == "paper_tournament_sync"
+        and packet.get("symbol") == bindings["symbol"]
+        and packet.get("promotion_evidence_fresh") is True
+        and packet.get("issues") == []
+        and isinstance(issues_by_sleeve, Mapping)
+        and all(
+            isinstance(issues, list) and not issues
+            for issues in issues_by_sleeve.values()
+        )
+        and isinstance(packet.get("promoted"), list)
+        and isinstance(packet.get("demoted"), list)
+        and _nonempty_recovery_string(packet.get("state_path"))
+        and _nonempty_recovery_string(packet.get("report_path"))
+        and packet.get("arm_live") is False
+        and packet.get("ci_green") is False
+        and packet.get("can_submit_orders") is False
+        and packet.get("execution_authority") == "none"
+        and isinstance(state, Mapping)
+        and state.get("schema_version") == packet.get("source_schema_version")
+        and isinstance(state.get("sleeves"), Mapping)
+        and isinstance(source, Mapping)
+        and source.get("kind") == "paper_tournament_sync"
+        and source.get("arm_live") is False
+        and source.get("ci_green") is False
+        and _nonempty_recovery_string(source.get("tournament_id"))
+        and _parse_aware_recovery_time(source.get("report_generated_at")) is not None
+    )
+
+
+def _valid_reconciliation_collection(
+    value: object, *, symbol: str, checked_client_order_ids: set[str]
+) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, Mapping)
+        and item.get("symbol") == symbol
+        and _nonempty_recovery_string(item.get("client_order_id"))
+        and item.get("client_order_id") in checked_client_order_ids
+        for item in value
+    )
+
+
+def _valid_reconciliation_phase_packet(
+    packet: Mapping[str, Any], bindings: Mapping[str, str]
+) -> bool:
+    symbol = bindings["symbol"]
+    position = packet.get("position")
+    checked = packet.get("checked_client_order_ids")
+    if not _packet_string_list(checked):
+        return False
+    checked_ids = set(checked)
+    return (
+        packet.get("schema_version") == "tradingagents.recovery_phase.v1"
+        and packet.get("source_schema_version") == 1
+        and packet.get("kind") == "symbol_broker_reconciliation"
+        and packet.get("source_identity")
+        == "alpaca_symbol_incident_reconciliation"
+        and packet.get("symbol") == symbol
+        and packet.get("read_only") is True
+        and packet.get("analysis_only") is True
+        and packet.get("execution_authority") == "none"
+        and packet.get("can_submit_orders") is False
+        and packet.get("matched") is True
+        and packet.get("issues") == []
+        and type(packet.get("broker_write_calls")) is int
+        and packet.get("broker_write_calls") == 0
+        and isinstance(position, Mapping)
+        and position.get("symbol") == symbol
+        and _nonempty_recovery_string(position.get("qty"))
+        and _valid_reconciliation_collection(
+            packet.get("open_orders"),
+            symbol=symbol,
+            checked_client_order_ids=checked_ids,
+        )
+        and _valid_reconciliation_collection(
+            packet.get("recent_fills"),
+            symbol=symbol,
+            checked_client_order_ids=checked_ids,
+        )
+    )
+
+
 def _valid_phase_packet(
     path: Path,
     phase: str,
@@ -886,37 +1087,11 @@ def _valid_phase_packet(
             and bool(packet["decision_owner"].strip())
         )
     if phase == "regenerate_evidence":
-        return (
-            packet.get("schema_version") == "tradingagents.recovery_phase.v1"
-            and packet.get("analysis_only") is True
-            and packet.get("can_submit_orders") is False
-            and packet.get("execution_authority") == "none"
-            and isinstance(packet.get("packet_path"), str)
-            and bool(packet["packet_path"].strip())
-            and isinstance(packet.get("hourly_packet_path"), str)
-            and bool(packet["hourly_packet_path"].strip())
-        )
+        return _valid_loss_review_phase_packet(packet, bindings)
     if phase == "sync_promotion":
-        return (
-            packet.get("schema_version") == "tradingagents.recovery_phase.v1"
-            and packet.get("promotion_evidence_fresh") is True
-            and packet.get("issues") == []
-            and packet.get("arm_live") is False
-            and packet.get("ci_green") is False
-            and packet.get("can_submit_orders") is False
-            and packet.get("execution_authority") == "none"
-        )
+        return _valid_promotion_phase_packet(packet, bindings)
     if phase == "reconcile":
-        return (
-            packet.get("schema_version") == "tradingagents.recovery_phase.v1"
-            and packet.get("read_only") is True
-            and packet.get("execution_authority") == "none"
-            and packet.get("can_submit_orders") is False
-            and packet.get("matched") is True
-            and packet.get("issues") == []
-            and type(packet.get("broker_write_calls")) is int
-            and packet.get("broker_write_calls") == 0
-        )
+        return _valid_reconciliation_phase_packet(packet, bindings)
     if phase == "focused_verify":
         return (
             packet.get("schema_version") == "tradingagents.recovery_phase.v1"
@@ -1035,7 +1210,49 @@ def _write_phase_packet(path: Path, packet: Mapping[str, Any]) -> dict[str, str]
     return _phase_record(path)
 
 
-def _adapter_packet(result: object) -> Mapping[str, Any]:
+def _normalize_adapter_phase_packet(
+    packet: Mapping[str, Any], *, phase: str
+) -> dict[str, Any]:
+    payload = dict(packet)
+    raw_schema_version = payload.get("schema_version")
+    if phase == "sync_promotion" and raw_schema_version is None:
+        state = payload.get("state")
+        if isinstance(state, Mapping):
+            raw_schema_version = state.get("schema_version")
+    if raw_schema_version is not None:
+        existing_source_schema = payload.get("source_schema_version")
+        if (
+            existing_source_schema is not None
+            and existing_source_schema != raw_schema_version
+        ):
+            raise ValueError("adapter source schema identity is inconsistent")
+        payload["source_schema_version"] = raw_schema_version
+    canonical_metadata = {
+        "resolve_authority": ("recovery_authority", "recovery_authority"),
+        "regenerate_evidence": (
+            "loss_review_evidence",
+            "loss_review_evidence",
+        ),
+        "sync_promotion": ("promotion_state_sync", "paper_tournament_sync"),
+        "reconcile": (
+            "symbol_broker_reconciliation",
+            "alpaca_symbol_incident_reconciliation",
+        ),
+        "focused_verify": (
+            "recovery_focused_proof",
+            "recovery_focused_proof",
+        ),
+    }
+    expected = canonical_metadata.get(phase)
+    if expected is None:
+        raise ValueError(f"unsupported adapter recovery phase: {phase}")
+    payload.setdefault("kind", expected[0])
+    payload.setdefault("source_identity", expected[1])
+    payload["schema_version"] = "tradingagents.recovery_phase.v1"
+    return payload
+
+
+def _adapter_packet(result: object, *, phase: str) -> Mapping[str, Any]:
     if not isinstance(result, Mapping):
         raise ValueError("adapter result must be a packet record")
     if result.get("outcome", "success") != "success":
@@ -1048,7 +1265,7 @@ def _adapter_packet(result: object) -> Mapping[str, Any]:
     forbidden = set(_trigger_effects(packet)).intersection(FORBIDDEN_EFFECTS)
     if forbidden:
         raise PermissionError("forbidden recovery effects: " + ", ".join(sorted(forbidden)))
-    return packet
+    return _normalize_adapter_phase_packet(packet, phase=phase)
 
 
 def _failure_from_exception(error: Exception) -> dict[str, Any]:
@@ -1124,8 +1341,7 @@ def build_production_recovery_request(
     signal_symbol = str(signal.get("symbol") or "").strip().upper()
     if (
         not symbol
-        or not signal_symbol
-        or symbol != signal_symbol
+        or bool(signal_symbol and symbol != signal_symbol)
         or any(
             not isinstance(context.get(key), str)
             or not str(context[key]).strip()
@@ -1277,101 +1493,120 @@ def derive_production_recovery_context(
             if flagged_path.is_absolute()
             else (root / flagged_path).resolve(),
         )
-    evidence_path = next(
-        (
-            path.resolve()
-            for path in candidates
-            if _path_under(path, root) and path.is_file()
-        ),
-        None,
-    )
-    if evidence_path is None:
-        return None
-    envelope = _read_json(evidence_path)
-    payload = (
-        envelope.get("payload")
-        if isinstance(envelope.get("payload"), Mapping)
-        else envelope
-    )
-    if not isinstance(payload, Mapping):
-        return None
-    supervisor = payload.get("supervisor_review_authority")
-    advisory = payload.get("advisory_analysis")
-    entry_context = payload.get("entry_context")
-    hourly_ref = payload.get("hourly_packet_path")
-    if (
-        not isinstance(supervisor, Mapping)
-        or not isinstance(advisory, Mapping)
-        or not isinstance(entry_context, Mapping)
-        or not isinstance(hourly_ref, str)
-        or not hourly_ref
-    ):
-        return None
-    hourly_candidate = Path(hourly_ref)
-    hourly_packet = (
-        hourly_candidate.resolve()
-        if hourly_candidate.is_absolute()
-        else (root / hourly_candidate).resolve()
-    )
-    if not _path_under(hourly_packet, root) or not hourly_packet.is_file():
-        return None
-    hourly = _read_json(hourly_packet)
-    hourly_evidence = (
-        hourly.get("evidence") if isinstance(hourly.get("evidence"), Mapping) else {}
-    )
-    hourly_review = (
-        hourly_evidence.get("loss_exit_review")
-        if isinstance(hourly_evidence.get("loss_exit_review"), Mapping)
-        else {}
-    )
-    symbol_values = {
-        "signal": signal.get("symbol"),
-        "envelope": envelope.get("symbol"),
-        "payload": payload.get("symbol"),
-        "supervisor": supervisor.get("symbol"),
-        "advisory": advisory.get("symbol"),
-        "hourly": hourly_review.get("symbol"),
-    }
-    normalized_symbols = {
-        name: str(value or "").strip().upper()
-        for name, value in symbol_values.items()
-    }
-    if any(not value for value in normalized_symbols.values()) or len(
-        set(normalized_symbols.values())
-    ) != 1:
-        return None
-    symbol = normalized_symbols["signal"]
-    entry_symbol = str(entry_context.get("symbol") or "").strip().upper()
-    if entry_symbol and entry_symbol != symbol:
-        return None
-
+    signal_symbol = str(signal.get("symbol") or "").strip().upper()
     signal_account = str(
         signal.get("broker_account") or signal.get("account") or ""
     ).strip()
-    expected_account = "live"
-    account_values = [
-        str(entry_context.get("account") or "").strip(),
-        *[
-            str(value).strip()
-            for value in (
-                envelope.get("broker_account"),
-                envelope.get("account"),
-                payload.get("broker_account"),
-                payload.get("account"),
-            )
-            if value is not None and str(value).strip()
-        ],
-    ]
-    if (
-        signal_account
-        and signal_account != expected_account
-        or not account_values[0]
-        or any(
-        account != expected_account for account in account_values
+    selected: dict[str, Any] | None = None
+    seen_candidates: set[Path] = set()
+    for candidate in candidates:
+        evidence_path = candidate.resolve()
+        if (
+            evidence_path in seen_candidates
+            or not _path_under(evidence_path, root)
+            or not evidence_path.is_file()
+        ):
+            continue
+        seen_candidates.add(evidence_path)
+        envelope = _read_json(evidence_path)
+        payload = envelope.get("payload")
+        if (
+            envelope.get("schema_version") != "1.0.0"
+            or envelope.get("source_name") != "loss_review_evidence"
+            or envelope.get("evidence_type") != "loss_review_evidence"
+            or not isinstance(payload, Mapping)
+        ):
+            continue
+        supervisor = payload.get("supervisor_review_authority")
+        advisory = payload.get("advisory_analysis")
+        entry_context = payload.get("entry_context")
+        hourly_ref = payload.get("hourly_packet_path")
+        if (
+            not isinstance(supervisor, Mapping)
+            or not isinstance(advisory, Mapping)
+            or not isinstance(entry_context, Mapping)
+            or not _nonempty_recovery_string(hourly_ref)
+        ):
+            continue
+        hourly_candidate = Path(hourly_ref)
+        hourly_packet = (
+            hourly_candidate.resolve()
+            if hourly_candidate.is_absolute()
+            else (root / hourly_candidate).resolve()
         )
-    ):
+        if not _path_under(hourly_packet, root) or not hourly_packet.is_file():
+            continue
+        hourly = _read_json(hourly_packet)
+        hourly_evidence = (
+            hourly.get("evidence")
+            if isinstance(hourly.get("evidence"), Mapping)
+            else {}
+        )
+        hourly_review = (
+            hourly_evidence.get("loss_exit_review")
+            if isinstance(hourly_evidence.get("loss_exit_review"), Mapping)
+            else {}
+        )
+        evidence_symbols = [
+            envelope.get("subject"),
+            envelope.get("symbol"),
+            payload.get("symbol"),
+            supervisor.get("symbol"),
+            advisory.get("symbol"),
+            hourly_review.get("symbol"),
+        ]
+        normalized_symbols = [
+            str(value or "").strip().upper() for value in evidence_symbols
+        ]
+        if any(not value for value in normalized_symbols) or len(
+            set(normalized_symbols)
+        ) != 1:
+            continue
+        symbol = normalized_symbols[0]
+        if signal_symbol and signal_symbol != symbol:
+            return None
+        entry_symbol = str(entry_context.get("symbol") or "").strip().upper()
+        if entry_symbol and entry_symbol != symbol:
+            continue
+        expected_account = "live"
+        account_values = [
+            str(entry_context.get("account") or "").strip(),
+            *[
+                str(value).strip()
+                for value in (
+                    envelope.get("broker_account"),
+                    envelope.get("account"),
+                    payload.get("broker_account"),
+                    payload.get("account"),
+                )
+                if value is not None and str(value).strip()
+            ],
+        ]
+        if signal_account and signal_account != expected_account:
+            return None
+        if not account_values[0] or any(
+            account != expected_account for account in account_values
+        ):
+            continue
+        selected = {
+            "evidence_path": evidence_path,
+            "envelope": envelope,
+            "payload": payload,
+            "supervisor": supervisor,
+            "advisory": advisory,
+            "hourly_packet": hourly_packet,
+            "symbol": symbol,
+            "account": expected_account,
+        }
+        break
+    if selected is None:
         return None
-    account = expected_account
+    evidence_path = selected["evidence_path"]
+    supervisor = selected["supervisor"]
+    advisory = selected["advisory"]
+    hourly_packet = selected["hourly_packet"]
+    symbol = selected["symbol"]
+    account = selected["account"]
 
     required_paths = {
         "hourly_dir": hourly_packet.parent,
@@ -1745,7 +1980,21 @@ def coordinate_verified_recovery(
                     adapter = adapters.get(phase)
                     if not callable(adapter):
                         raise ValueError(f"missing recovery adapter for {phase}")
-                    packet = _adapter_packet(adapter({"incident_id": incident_id, "bindings": dict(canonical_bindings), "owner_run_id": owner_run_id, "owner_role": owner_role, "recovery_run_id": recovery_run_id, "phase": phase, "phase_outputs": dict(state["phase_outputs"])}))
+                    packet = _adapter_packet(
+                        adapter(
+                            {
+                                "incident_id": incident_id,
+                                "bindings": dict(canonical_bindings),
+                                "owner_run_id": owner_run_id,
+                                "owner_role": owner_role,
+                                "recovery_run_id": recovery_run_id,
+                                "phase": phase,
+                                "phase_outputs": dict(state["phase_outputs"]),
+                                "generated_at": current.isoformat(),
+                            }
+                        ),
+                        phase=phase,
+                    )
                 packet = _canonical_packet(packet, canonical_bindings, current)
                 packet.update(
                     {
