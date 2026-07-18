@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.brokers.alpaca import OrderIssue
+from tradingagents.policy.decision_authority import (
+    POLICY_EXIT_RULE_IDS,
+    resolve_exit_authority,
+)
 from tradingagents.policy.live_control import load_live_control_state
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
@@ -49,6 +53,24 @@ LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
     "confidence",
     "evidence_generated_at",
     "source_packet_ids",
+    "allowed",
+    "blocked_reasons",
+)
+
+POLICY_LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
+    "symbol",
+    "side",
+    "decision_id",
+    "current_price",
+    "average_entry_price",
+    "estimated_realized_loss",
+    "unrealized_pnl_percent",
+    "allowed_exit_reason",
+    "allowed_exit_reason_source",
+    "policy_rule_exit",
+    "exit_policy_rule",
+    "exit_policy_rationale",
+    "evidence_generated_at",
     "allowed",
     "blocked_reasons",
 )
@@ -196,6 +218,92 @@ def _missing_review_fields(review: Mapping[str, Any]) -> list[str]:
     return missing
 
 
+def _is_policy_exit_claim(review: Mapping[str, Any]) -> bool:
+    return (
+        review.get("allowed_exit_reason") in POLICY_EXIT_RULE_IDS
+        or (
+            "policy_rule_exit" in review
+            and review.get("policy_rule_exit") is not False
+        )
+    )
+
+
+def _missing_policy_review_fields(review: Mapping[str, Any]) -> list[str]:
+    missing = []
+    for review_field in POLICY_LOSS_EXIT_REVIEW_REQUIRED_FIELDS:
+        value = review.get(review_field)
+        if review_field == "blocked_reasons":
+            if value is None:
+                missing.append(review_field)
+            continue
+        if value in (None, "", []):
+            missing.append(review_field)
+    return missing
+
+
+def _review_binding_and_freshness_issues(
+    action: Any,
+    review: Mapping[str, Any],
+    *,
+    now: datetime.datetime | None,
+) -> list[str]:
+    issues: list[str] = []
+    action_decision_id, action_client_order_id, action_symbol = _current_action_identity(action)
+    review_decision_id = str(review.get("decision_id") or "")
+    if action_decision_id and review_decision_id != action_decision_id:
+        issues.append("decision_id does not match current action")
+    if action_symbol and str(review.get("symbol") or "").upper() != action_symbol:
+        issues.append("symbol does not match current action")
+    action_side = "sell" if _is_sell_action(action) else str(_action_value(action, "side", "")).lower()
+    if action_side and str(review.get("side") or "").lower() != action_side:
+        issues.append("side does not match current action")
+    if action_client_order_id:
+        review_order_id = str(review.get("client_order_id") or review.get("proposed_order_id") or "")
+        if review_order_id and review_order_id != action_client_order_id:
+            issues.append("client_order_id/proposed_order_id does not match current action")
+
+    generated_at = review.get("evidence_generated_at")
+    if now is not None and generated_at:
+        try:
+            parsed = datetime.datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            issues.append("evidence_generated_at is not an ISO timestamp")
+        else:
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            age = now.astimezone(datetime.timezone.utc) - parsed.astimezone(
+                datetime.timezone.utc
+            )
+            if age < datetime.timedelta(0) or age > datetime.timedelta(hours=6):
+                issues.append("loss_exit_review is stale for current submit")
+    return issues
+
+
+def _policy_loss_exit_review_issues(
+    action: Any,
+    review: Mapping[str, Any],
+    *,
+    now: datetime.datetime | None,
+) -> list[str]:
+    issues = _missing_policy_review_fields(review)
+    policy_review = dict(review)
+    # The live contract makes blockers optional, but the shared authority
+    # resolver validates it when present. Normalize absence to its only safe
+    # value so the final gate can still require the resolver's verdict.
+    policy_review.setdefault("blockers", [])
+    verdict = resolve_exit_authority(
+        supervisor_review=policy_review,
+        advisory_analysis=None,
+    )
+    if not (
+        verdict.allowed is True
+        and verdict.authority_source == "pre_registered_policy_rule"
+    ):
+        issues.append(f"policy exit authority denied: {verdict.reason}")
+    issues.extend(_review_binding_and_freshness_issues(action, review, now=now))
+    return sorted(set(issues))
+
+
 def _current_action_identity(action: Any) -> tuple[str, str, str]:
     return (
         str(_action_value(action, "decision_id", "") or ""),
@@ -216,6 +324,8 @@ def _loss_exit_review_issues(
 ) -> list[str]:
     if review is None:
         return ["loss_exit_review is missing"]
+    if _is_policy_exit_claim(review):
+        return _policy_loss_exit_review_issues(action, review, now=now)
     issues = _missing_review_fields(review)
     if review.get("allowed") is not True:
         issues.append("loss_exit_review.allowed is not true")
@@ -226,34 +336,7 @@ def _loss_exit_review_issues(
             + ", ".join(sorted(STRICT_ALLOWED_LOSS_EXIT_REASONS))
         )
 
-    action_decision_id, action_client_order_id, action_symbol = _current_action_identity(action)
-    review_decision_id = str(review.get("decision_id") or "")
-    if action_decision_id and review_decision_id != action_decision_id:
-        issues.append("decision_id does not match current action")
-    if action_symbol and str(review.get("symbol") or "").upper() != action_symbol:
-        issues.append("symbol does not match current action")
-    action_side = "sell" if _is_sell_action(action) else str(_action_value(action, "side", "")).lower()
-    if action_side and str(review.get("side") or "").lower() != action_side:
-        issues.append("side does not match current action")
-    if action_client_order_id:
-        review_order_id = str(review.get("client_order_id") or review.get("proposed_order_id") or "")
-        if review_order_id and review_order_id != action_client_order_id:
-            issues.append("client_order_id/proposed_order_id does not match current action")
-
-    generated_at = review.get("evidence_generated_at")
-    if now is not None and generated_at:
-        try:
-            parsed = datetime.datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
-        except ValueError:
-            issues.append("evidence_generated_at is not an ISO timestamp")
-        else:
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-            age = now.astimezone(datetime.timezone.utc) - parsed.astimezone(
-                datetime.timezone.utc
-            )
-            if age < datetime.timedelta(0) or age > datetime.timedelta(hours=6):
-                issues.append("loss_exit_review is stale for current submit")
+    issues.extend(_review_binding_and_freshness_issues(action, review, now=now))
     return sorted(set(issues))
 
 

@@ -2,6 +2,8 @@ import datetime
 import json
 from decimal import Decimal
 
+import pytest
+
 from tradingagents.brokers.alpaca_supervisor import (
     HourlySupervisorAction,
     validate_supervisor_live_submit_allowed,
@@ -736,6 +738,250 @@ def test_live_gate_allows_strict_current_approved_loss_exit_review(tmp_path):
     )
 
     assert result.allowed is True
+
+
+def test_live_gate_allows_current_pre_registered_policy_stop_review(tmp_path):
+    envelope_path = tmp_path / "risk_envelope.yaml"
+    promotion_path = tmp_path / "promotion.json"
+    control_path = tmp_path / "live_control.json"
+    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
+    promotion_path.write_text(
+        json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
+        encoding="utf-8",
+    )
+    review = {
+        "symbol": "NFLX",
+        "side": "sell",
+        "decision_id": "decision-current",
+        "current_price": "69.28",
+        "proposed_limit_price": "69.07",
+        "average_entry_price": "83.37",
+        "estimated_realized_loss": "-4.52",
+        "unrealized_pnl_percent": "-16.90",
+        "allowed_exit_reason": "policy_stop_floor",
+        "allowed_exit_reason_source": (
+            "pre-registered exit policy rule 'catastrophic_stop'"
+        ),
+        "policy_rule_exit": True,
+        "exit_policy_rule": "catastrophic_stop",
+        "exit_policy_rationale": (
+            "Position is beyond the pre-registered catastrophic floor."
+        ),
+        "evidence_generated_at": "2026-06-03T15:00:00+00:00",
+        "allowed": True,
+        "blocked_reasons": [],
+    }
+
+    result = evaluate_go_live_guard(
+        actions=[
+            _tiny_live_action(
+                action="close",
+                side="sell",
+                symbol="NFLX",
+                notional=Decimal("22.23"),
+                limit_price=Decimal("69.07"),
+                decision_id="decision-current",
+            )
+        ],
+        live_positions=[_loss_position(
+            symbol="NFLX",
+            avg_entry_price="83.37",
+            current_price="69.28",
+            market_value="22.23",
+            cost_basis="26.76",
+            unrealized_pl="-4.52",
+            unrealized_plpc="-0.1690",
+        )],
+        decision_evidence={"loss_exit_review": review},
+        risk_envelope_path=envelope_path,
+        promotion_state_path=promotion_path,
+        control_state_path=control_path,
+        now=datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    assert result.allowed is True
+
+
+def _policy_exit_review(**overrides):
+    review = {
+        "symbol": "NFLX",
+        "side": "sell",
+        "decision_id": "decision-current",
+        "current_price": "69.28",
+        "average_entry_price": "83.37",
+        "estimated_realized_loss": "-4.52",
+        "unrealized_pnl_percent": "-16.90",
+        "allowed_exit_reason": "policy_stop_floor",
+        "allowed_exit_reason_source": "pre-registered exit policy rule",
+        "policy_rule_exit": True,
+        "exit_policy_rule": "catastrophic_stop",
+        "exit_policy_rationale": "Position is beyond the pre-registered floor.",
+        "evidence_generated_at": "2026-06-03T15:00:00+00:00",
+        "allowed": True,
+        "blockers": [],
+        "blocked_reasons": [],
+    }
+    review.update(overrides)
+    return review
+
+
+def _policy_exit_gate_result(
+    tmp_path,
+    review,
+    *,
+    action_overrides=None,
+    now=datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc),
+):
+    envelope_path = tmp_path / "risk_envelope.yaml"
+    promotion_path = tmp_path / "promotion.json"
+    control_path = tmp_path / "live_control.json"
+    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
+    promotion_path.write_text(
+        json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
+        encoding="utf-8",
+    )
+    action_values = {
+        "action": "close",
+        "side": "sell",
+        "symbol": "NFLX",
+        "notional": Decimal("22.23"),
+        "limit_price": Decimal("69.07"),
+        "decision_id": "decision-current",
+    }
+    action_values.update(action_overrides or {})
+    action = _tiny_live_action(**action_values)
+    return evaluate_go_live_guard(
+        actions=[action],
+        live_positions=[_loss_position(
+            symbol=action.symbol,
+            avg_entry_price="83.37",
+            current_price="69.28",
+            market_value="22.23",
+            cost_basis="26.76",
+            unrealized_pl="-4.52",
+            unrealized_plpc="-0.1690",
+        )],
+        decision_evidence={"loss_exit_review": review},
+        risk_envelope_path=envelope_path,
+        promotion_state_path=promotion_path,
+        control_state_path=control_path,
+        now=now,
+    )
+
+
+def test_live_gate_allows_current_pre_registered_policy_time_stop_review(tmp_path):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(
+            allowed_exit_reason="policy_time_stop",
+            exit_policy_rule="time_stop",
+        ),
+    )
+
+    assert result.allowed is True
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("allowed", "true"),
+        ("allowed", "false"),
+        ("policy_rule_exit", "true"),
+        ("policy_rule_exit", "false"),
+    ],
+)
+def test_live_gate_rejects_string_policy_booleans(tmp_path, field, value):
+    result = _policy_exit_gate_result(tmp_path, _policy_exit_review(**{field: value}))
+
+    assert result.allowed is False
+    assert any("final_submit_loss_gate_blocked" in issue.reason for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "symbol",
+        "decision_id",
+        "allowed_exit_reason_source",
+        "exit_policy_rule",
+        "exit_policy_rationale",
+    ],
+)
+def test_live_gate_rejects_policy_review_missing_required_field(tmp_path, field):
+    review = _policy_exit_review()
+    review.pop(field)
+
+    result = _policy_exit_gate_result(tmp_path, review)
+
+    assert result.allowed is False
+    assert any("final_submit_loss_gate_blocked" in issue.reason for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("blockers", ["blocked"]),
+        ("blocked_reasons", ["blocked"]),
+        ("blockers", "blocked"),
+        ("blocked_reasons", "blocked"),
+    ],
+)
+def test_live_gate_rejects_policy_review_with_blockers(tmp_path, field, value):
+    result = _policy_exit_gate_result(tmp_path, _policy_exit_review(**{field: value}))
+
+    assert result.allowed is False
+    assert any("final_submit_loss_gate_blocked" in issue.reason for issue in result.issues)
+
+
+def test_live_gate_fails_closed_without_raising_for_malformed_policy_review(tmp_path):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        {"policy_rule_exit": True},
+    )
+
+    assert result.allowed is False
+    assert any("final_submit_loss_gate_blocked" in issue.reason for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "review,action_overrides",
+    [
+        (_policy_exit_review(allowed_exit_reason="unknown_policy_reason"), {}),
+        (_policy_exit_review(exit_policy_rule="unknown_policy_rule"), {}),
+        (_policy_exit_review(symbol="TSM"), {}),
+        (_policy_exit_review(decision_id="other-decision"), {}),
+        (_policy_exit_review(side="buy"), {}),
+        (_policy_exit_review(), {"symbol": "TSM"}),
+        (_policy_exit_review(), {"decision_id": "other-decision"}),
+    ],
+)
+def test_live_gate_rejects_policy_review_with_conflicting_authority_or_identity(
+    tmp_path, review, action_overrides
+):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        review,
+        action_overrides=action_overrides,
+    )
+
+    assert result.allowed is False
+    assert any("final_submit_loss_gate_blocked" in issue.reason for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    ["2026-06-03T08:59:59+00:00", "2026-06-03T15:00:01+00:00"],
+)
+def test_live_gate_rejects_stale_or_future_policy_review(tmp_path, timestamp):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(evidence_generated_at=timestamp),
+    )
+
+    assert result.allowed is False
+    assert any("stale for current submit" in issue.reason for issue in result.issues)
 
 
 def test_live_gate_does_not_require_loss_review_for_profit_taking_sell(tmp_path):
