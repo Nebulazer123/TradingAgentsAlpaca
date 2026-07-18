@@ -224,6 +224,11 @@ from tradingagents.orchestration.n8n_evaluations import (
 from tradingagents.orchestration.n8n_runner import list_jobs as list_n8n_runner_jobs
 from tradingagents.orchestration.n8n_workflow_sync import sync_n8n_workflows
 from tradingagents.orchestration.night_shift_patrol import write_night_shift_patrol_packet
+from tradingagents.orchestration.recovery import (
+    evaluate_rearm_readiness,
+    load_recovery_evidence,
+    rearm_after_verified_recovery,
+)
 from tradingagents.orchestration.self_heal import (
     build_self_heal_handoff,
     build_self_heal_plan,
@@ -3794,6 +3799,19 @@ def policy_refresh_live_control(
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Refresh the tiny-live dead-man control state without submitting orders."""
+    existing, existing_issues = load_live_control_state(control_path)
+    if existing is None or existing_issues or existing.get("frozen") is True:
+        payload = {
+            "refreshed": False,
+            "frozen": existing.get("frozen") if isinstance(existing, dict) else True,
+            "reason": "live control refresh blocked; verified recovery is required to unfreeze",
+            "control_path": str(control_path),
+        }
+        if json_output:
+            print(json.dumps(payload, indent=2))
+        else:
+            console.print(payload["reason"])
+        return
     expires_at = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(
         hours=ttl_hours
     )
@@ -3804,6 +3822,7 @@ def policy_refresh_live_control(
         dead_man_expires_at=expires_at,
     )
     payload = {
+        "refreshed": True,
         "frozen": False,
         "reason": reason,
         "dead_man_expires_at": expires_at.isoformat(timespec="seconds"),
@@ -3813,6 +3832,56 @@ def policy_refresh_live_control(
         print(json.dumps(payload, indent=2))
     else:
         console.print(f"Live control refreshed until {payload['dead_man_expires_at']}")
+
+
+@policy_app.command("recover-incident")
+def policy_recover_incident(
+    incident_path: Path = typer.Option(..., "--incident-path"),
+    reconciliation_path: Path = typer.Option(..., "--reconciliation-path"),
+    promotion_sync_path: Path = typer.Option(..., "--promotion-sync-path"),
+    focused_proof_path: Path = typer.Option(..., "--focused-proof-path"),
+    recovery_manifest_path: Path | None = typer.Option(None, "--recovery-manifest-path"),
+    repairer_run_id: str = typer.Option(..., "--repairer-run-id"),
+    verifier_run_id: str = typer.Option(..., "--verifier-run-id"),
+    ttl_minutes: int = typer.Option(90, "--ttl-minutes"),
+    control_path: Path = typer.Option(Path("results/policy/live_control.json"), "--control-path"),
+    receipt_dir: Path = typer.Option(Path("results/control_plane/rearm"), "--receipt-dir"),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Re-arm a frozen live-control lease from independently verified packets."""
+    evidence, parse_issues = load_recovery_evidence(
+        incident_path=incident_path,
+        reconciliation_path=reconciliation_path,
+        promotion_sync_path=promotion_sync_path,
+        focused_proof_path=focused_proof_path,
+        recovery_manifest_path=recovery_manifest_path,
+        repairer_run_id=repairer_run_id,
+        verifier_run_id=verifier_run_id,
+    )
+    if evidence is None:
+        payload: dict[str, Any] = {"ready": False, "issues": list(parse_issues), "can_submit_orders": False}
+    else:
+        verdict = evaluate_rearm_readiness(evidence)
+        if not verdict.ready:
+            payload = {"ready": False, "issues": list(verdict.issues), "can_submit_orders": False}
+        else:
+            try:
+                receipt = rearm_after_verified_recovery(
+                    evidence=evidence,
+                    control_path=control_path,
+                    receipt_dir=receipt_dir,
+                    ttl_minutes=ttl_minutes,
+                )
+            except (OSError, ValueError) as exc:
+                payload = {"ready": False, "issues": [str(exc)], "can_submit_orders": False}
+            else:
+                payload = {"ready": True, "receipt": receipt, "can_submit_orders": False}
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    elif payload["ready"]:
+        console.print(f"Verified recovery receipt: {payload['receipt']['receipt_path']}")
+    else:
+        console.print("Recovery re-arm blocked: " + "; ".join(payload["issues"]))
 
 
 @policy_app.command("sync-promotion")

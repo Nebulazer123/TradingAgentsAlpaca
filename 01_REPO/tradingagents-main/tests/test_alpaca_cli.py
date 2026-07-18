@@ -5830,6 +5830,13 @@ def test_policy_freeze_live_writes_control_state(tmp_path):
 
 def test_policy_refresh_live_control_writes_dead_man(tmp_path):
     control_path = tmp_path / "live_control.json"
+    cli_main.write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="existing healthy lease",
+        dead_man_expires_at=datetime.datetime.now(tz=datetime.timezone.utc)
+        + datetime.timedelta(hours=1),
+    )
 
     result = runner.invoke(
         app,
