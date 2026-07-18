@@ -10,6 +10,12 @@ import datetime
 from collections.abc import Mapping, Sequence
 from decimal import ROUND_DOWN, Decimal
 
+from tradingagents.policy.decision_authority import (
+    POLICY_EXIT_REASONS,
+    resolve_exit_authority,
+)
+from tradingagents.policy.exit_policy import POLICY_STOP_FLOOR
+
 UTC = datetime.timezone.utc
 
 ALLOWED_LOSS_EXIT_REASONS = frozenset(
@@ -20,28 +26,16 @@ ALLOWED_LOSS_EXIT_REASONS = frozenset(
         "hard_stop_defined_before_entry",
         "portfolio_exposure_limit",
         "user_manual_override",
-        # Deterministic lane from tradingagents/policy/exit_policy.py: the
-        # pre-registered stop-floor / time-stop rules are their own
-        # documented justification (owner-approved 2026-07).
-        "policy_stop_floor",
-        "policy_time_stop",
     }
-)
+) | POLICY_EXIT_REASONS
 
 RECENT_LOSS_EXIT_ALLOWED_REASONS = frozenset(
     {
         "thesis_invalidated",
         "hard_stop_defined_before_entry",
         "user_manual_override",
-        "policy_stop_floor",
     }
-)
-
-#: Reasons backed by a pre-registered mechanical rule. These carry their own
-#: justification, so the subjective narrative-evidence blockers (thesis text,
-#: news check, why-hold-is-worse, confidence, source packet ids) do not apply.
-#: Objective blockers (price evidence, position actually below entry) still do.
-POLICY_RULE_REASONS = frozenset({"policy_stop_floor", "policy_time_stop"})
+) | frozenset({POLICY_STOP_FLOOR})
 
 LOSS_EXIT_REASON_ALIASES = {
     "thesis_broken": "thesis_invalidated",
@@ -121,7 +115,7 @@ def loss_exit_review_packet(
     blockers: list[str] = []
     review_decision_id = decision_id or f"loss-exit-{symbol}-{generated_at:%Y%m%d%H%M%S}"
 
-    policy_rule_exit = allowed_reason in POLICY_RULE_REASONS
+    policy_rule_exit = allowed_reason in POLICY_EXIT_REASONS
 
     if current_price <= 0:
         blockers.append("current price evidence is missing")
@@ -164,7 +158,7 @@ def loss_exit_review_packet(
             blockers.append("source packet ids are missing")
     market_context = dict(_market_context_mapping(position))
 
-    return {
+    review = {
         "symbol": symbol,
         "side": side,
         "decision_id": review_decision_id,
@@ -209,6 +203,17 @@ def loss_exit_review_packet(
         "allowed": not blockers,
         "blocked_reasons": blockers,
         "blockers": blockers,
+    }
+    authority = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+    )
+    return {
+        **review,
+        "allowed": authority.allowed,
+        "authority_source": authority.authority_source,
+        "requires_additional_decision": authority.requires_additional_decision,
+        "decision_owner": authority.decision_owner,
     }
 
 

@@ -9,6 +9,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from tradingagents.policy.decision_authority import resolve_exit_authority
+
 UTC = datetime.timezone.utc
 
 CHASING_TERMS = ("green spike", "do not chase", "breakout chase", "after the move")
@@ -179,13 +181,20 @@ def _latest_loss_review_evidence_summary(
     loss_exit_candidate = advisory_summary.get("loss_exit_candidate")
     if not isinstance(loss_exit_candidate, Mapping):
         loss_exit_candidate = {}
+    supervisor_review = payload.get("supervisor_review_authority")
+    if not isinstance(supervisor_review, Mapping):
+        supervisor_review = {"allowed": payload.get("review_allowed") is True}
+    authority = resolve_exit_authority(
+        supervisor_review=supervisor_review,
+        advisory_analysis=advisory_summary,
+    )
     summary = {
         "evidence_path": str(evidence_path),
         "raw_packet_path": str(packet.get("raw_packet_path") or evidence_path),
         "hourly_packet_path": hourly_packet_path,
         "matches_review_window": _normalized_packet_ref(hourly_packet_path) in packet_paths,
         "symbol": str(payload.get("symbol") or "").upper(),
-        "review_allowed": payload.get("review_allowed"),
+        "review_allowed": authority.allowed,
         "next_action": payload.get("next_action"),
         "remaining_blocker_count": len(remaining_blockers),
         "remaining_blockers": remaining_blockers[:8],

@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.dataflows._official_common import evidence_packet, request_hash
+from tradingagents.policy.decision_authority import (
+    ExitAuthorityVerdict,
+    resolve_exit_authority,
+)
 from tradingagents.research.provider_orchestrator import TickerProviderResearchResult
 from tradingagents.schemas.research import SourceEvidencePacket
 
@@ -444,6 +448,26 @@ def _infer_loss_exit_candidate(
     }
 
 
+def _pre_registered_policy_candidate(
+    review: Mapping[str, Any],
+    authority: ExitAuthorityVerdict,
+) -> dict[str, Any] | None:
+    if authority.authority_source != "pre_registered_policy_rule":
+        return None
+    return {
+        "allowed_exit_reason_candidate": review.get("allowed_exit_reason"),
+        "allowed_exit_reason_source": review.get("allowed_exit_reason_source"),
+        "confidence": None,
+        "confidence_tier": "pre_registered_policy",
+        "reason_summary": review.get("exit_policy_rationale"),
+        "drivers": [authority.reason],
+        "approval_effect": "preserves_pre_registered_policy_approval",
+        "requires_board_decision": False,
+        "requires_tradeable_session": True,
+        "can_submit_orders": False,
+    }
+
+
 def _build_advisory_analysis(
     *,
     symbol: str,
@@ -509,7 +533,7 @@ def _build_advisory_analysis(
         source_refs=source_refs,
     )
 
-    return {
+    advisory_analysis = {
         "purpose": (
             "advisory context for BOARD/manual loss review; not a loss-exit approval"
         ),
@@ -553,6 +577,18 @@ def _build_advisory_analysis(
         "review_allowed_after_refresh": False,
         "forbidden_effects": list(LOSS_REVIEW_FORBIDDEN_EFFECTS),
     }
+    authority = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=advisory_analysis,
+    )
+    policy_candidate = _pre_registered_policy_candidate(review, authority)
+    if policy_candidate is not None:
+        advisory_analysis["loss_exit_candidate"] = policy_candidate
+    advisory_analysis["review_allowed_after_refresh"] = authority.allowed
+    advisory_analysis["authority_source"] = authority.authority_source
+    advisory_analysis["requires_board_decision"] = authority.requires_additional_decision
+    advisory_analysis["decision_owner"] = authority.decision_owner
+    return advisory_analysis
 
 
 def _refresh_resolved_blockers(
@@ -681,6 +717,10 @@ def build_loss_review_evidence_packet(
         "hourly_decision": hourly_packet.get("decision"),
         "submitted_order_count": len(hourly_packet.get("submitted") or []),
         "review_allowed": review.get("allowed") is True,
+        "supervisor_review_authority": {
+            key: review.get(key)
+            for key in ("allowed", "policy_rule_exit", "allowed_exit_reason")
+        },
         "supervisor_review_source_packet_ids": _strings(review.get("source_packet_ids")),
         "source_packet_ids": source_ids,
         "provider_summary_packet_id": (
@@ -705,9 +745,13 @@ def build_loss_review_evidence_packet(
             "market_session": review.get("market_session"),
         },
         "next_action": (
-            "manual_board_review_with_refreshed_evidence_required"
-            if resolved_blockers
-            else "manual_board_review_required"
+            "pre_registered_policy_approval_preserved"
+            if advisory_analysis.get("review_allowed_after_refresh") is True
+            else (
+                "manual_board_review_with_refreshed_evidence_required"
+                if resolved_blockers
+                else "manual_board_review_required"
+            )
         ),
         "analysis_only": True,
         "execution_authority": "none",
