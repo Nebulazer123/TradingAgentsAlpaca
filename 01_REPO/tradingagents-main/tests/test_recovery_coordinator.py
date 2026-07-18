@@ -48,13 +48,15 @@ def _evidence(**overrides):
         source_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     manifest_path = source_dir / "manifest.json"
     manifest_path.write_text("{}", encoding="utf-8")
-    values.update({
-        "source_bindings": {"incident_id": "inc-nflx-rule-conflict", "symbol": "NFLX", "broker_account": "live", "environment": "test", "source_revision": "abc"},
-        "source_packet_paths": source_paths,
-        "source_packet_sha256": source_hashes,
-        "recovery_manifest_path": str(manifest_path.resolve()),
-        "recovery_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-    })
+    values.update(
+        {
+            "source_bindings": {"incident_id": "inc-nflx-rule-conflict", "symbol": "NFLX", "broker_account": "live", "environment": "test", "source_revision": "abc"},
+            "source_packet_paths": source_paths,
+            "source_packet_sha256": source_hashes,
+            "recovery_manifest_path": str(manifest_path.resolve()),
+            "recovery_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        }
+    )
     values.update(overrides)
     return RecoveryEvidence(**values)
 
@@ -384,3 +386,120 @@ def test_actual_incident_lifecycle_ready_shape_establishes_resolution():
     assert payload["stage"] == "ready"
     assert any(event["to_stage"] == "ready" for event in payload["history"])
     assert payload["subject"] == "NFLX"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"recovery_manifest_path": None},
+        {"source_bindings": {"incident_id": "", "symbol": "NFLX", "broker_account": "live", "environment": "test", "source_revision": "abc"}},
+        {"source_packet_sha256": {"incident": "bad", "reconciliation": "bad", "promotion": "bad", "focused": "bad"}},
+        {"source_packet_paths": {"incident": "relative", "reconciliation": "relative", "promotion": "relative", "focused": "relative"}},
+    ],
+)
+def test_evidence_requires_manifest_and_complete_canonical_source_proof(overrides):
+    assert evaluate_rearm_readiness(_evidence(**overrides)).ready is False
+
+
+def test_hostile_mapping_evaluation_returns_blocked_verdict():
+    class HostileMapping(dict):
+        def __iter__(self):
+            raise RuntimeError("hostile")
+
+    verdict = evaluate_rearm_readiness(_evidence(source_bindings=HostileMapping()))
+    assert verdict.ready is False
+
+
+def test_explicit_root_cause_true_cannot_bypass_canonical_lifecycle(tmp_path):
+    from tradingagents.orchestration.recovery import load_recovery_evidence
+
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    files = {name: tmp_path / f"{name}.json" for name in ("incident", "reconciliation", "promotion", "focused")}
+    files["incident"].write_text(json.dumps({"schema_version": "tradingagents.incident.v1", "stage": "ready", "root_cause_resolved": True, "repairer_run_id": "r", "repairer_role_id": "repair", "generated_at": now.isoformat()}))
+    files["focused"].write_text(json.dumps({"focused_tests_passed": True, "passing_tests": ["x"], "verifier_run_id": "v", "verifier_role_id": "verify", "source_revision": "rev", "generated_at": now.isoformat()}))
+    files["promotion"].write_text(json.dumps({"promotion_evidence_fresh": True, "issues": [], "generated_at": now.isoformat()}))
+    files["reconciliation"].write_text(json.dumps({"read_only": True, "execution_authority": "none", "can_submit_orders": False, "matched": True, "issues": [], "broker_write_calls": 0, "generated_at": now.isoformat()}))
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": "tradingagents.recovery_manifest.v1",
+                "kind": "verified_recovery_manifest",
+                "generated_at": now.isoformat(),
+                "incident_id": "i",
+                "symbol": "NFLX",
+                "broker_account": "live",
+                "environment": "prod",
+                "source_revision": "rev",
+                "packet_sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in files.items()},
+            }
+        )
+    )
+    evidence, issues = load_recovery_evidence(incident_path=files["incident"], reconciliation_path=files["reconciliation"], promotion_sync_path=files["promotion"], focused_proof_path=files["focused"], recovery_manifest_path=manifest, repairer_run_id="r", verifier_run_id="v")
+    assert evidence is None
+    assert any("lifecycle" in issue for issue in issues)
+
+
+def test_rearm_rejects_control_receipt_latest_collision_without_mutating_frozen_file(tmp_path):
+    control_path = tmp_path / "rearm" / "latest.json"
+    control_path.parent.mkdir()
+    original = '{"frozen": true, "reason": "incident", "dead_man_expires_at": "2026-07-19T12:00:00+00:00"}'
+    control_path.write_text(original)
+    with pytest.raises(ValueError, match="collides"):
+        rearm_after_verified_recovery(evidence=_evidence(), control_path=control_path, receipt_dir=control_path.parent, now=NOW)
+    assert control_path.read_text() == original
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"frozen": False, "recovery_mode": "verified_recovery"},
+        {"frozen": "false", "reason": "legacy", "dead_man_expires_at": "2026-07-19T12:00:00+00:00"},
+        {"frozen": True, "recovery_mode": "verified_recovery", "recovery_incident_id": "i", "recovery_receipt_path": "/tmp/nope", "recovery_receipt_sha256": "a" * 64},
+    ],
+)
+def test_partial_or_unsafe_recovery_markers_close_active_control(tmp_path, state):
+    state.setdefault("reason", "verified recovery i")
+    state.setdefault("dead_man_expires_at", "2026-07-19T12:00:00+00:00")
+    control_path = tmp_path / "control.json"
+    control_path.write_text(json.dumps(state))
+    _state, issues = load_live_control_state(control_path, now=NOW)
+    assert issues
+
+
+def test_receipt_ttl_and_future_issued_time_close_control(tmp_path):
+    receipt = tmp_path / "receipt.json"
+    control = tmp_path / "control.json"
+    receipt.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "verified_rearm_receipt",
+                "effective_only_when_control_matches_receipt_digest": True,
+                "can_submit_orders": False,
+                "broker_write_calls": 0,
+                "source_bindings": {"incident_id": "i", "symbol": "NFLX", "broker_account": "live", "environment": "prod", "source_revision": "r"},
+                "source_packet_sha256": {key: "a" * 64 for key in ("incident", "reconciliation", "promotion", "focused")},
+                "source_packet_paths": {key: str((tmp_path / f"{key}.json").resolve()) for key in ("incident", "reconciliation", "promotion", "focused")},
+                "issued_at": (NOW + dt.timedelta(minutes=1)).isoformat(),
+                "expires_at": (NOW + dt.timedelta(minutes=92)).isoformat(),
+                "ttl_minutes": 91,
+                "control_binding": {"control_path": str(control.resolve()), "incident_id": "i", "reason": "verified recovery i", "dead_man_expires_at": (NOW + dt.timedelta(minutes=92)).isoformat(timespec="seconds"), "frozen": False, "mode": "verified_recovery", "receipt_path": str(receipt.resolve())},
+            }
+        )
+    )
+    control.write_text(
+        json.dumps(
+            {
+                "frozen": False,
+                "reason": "verified recovery i",
+                "dead_man_expires_at": (NOW + dt.timedelta(minutes=92)).isoformat(timespec="seconds"),
+                "recovery_mode": "verified_recovery",
+                "recovery_incident_id": "i",
+                "recovery_receipt_path": str(receipt.resolve()),
+                "recovery_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            }
+        )
+    )
+    _state, issues = load_live_control_state(control, now=NOW)
+    assert any("expired or invalid" in issue for issue in issues)

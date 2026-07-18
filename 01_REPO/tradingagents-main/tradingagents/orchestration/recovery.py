@@ -122,7 +122,7 @@ def evaluate_rearm_readiness(evidence: RecoveryEvidence) -> RecoveryVerdict:
     required_bindings = {"incident_id", "symbol", "broker_account", "environment", "source_revision"}
     try:
         bindings_valid = isinstance(evidence.source_bindings, Mapping) and set(evidence.source_bindings) == required_bindings and all(_normalized_string(evidence.source_bindings.get(key)) is not None for key in required_bindings)
-    except (AttributeError, KeyError, TypeError, ValueError):
+    except Exception:
         bindings_valid = False
     if not bindings_valid:
         issues.append("source bindings must contain canonical incident, symbol, account, environment, and source revision")

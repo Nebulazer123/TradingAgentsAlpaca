@@ -127,6 +127,8 @@ def load_live_control_state(
                         or receipt_expires_at is None
                         or receipt_issued_at is None
                         or type(ttl_minutes) is not int
+                        or not 1 <= ttl_minutes <= 90
+                        or receipt_issued_at > current
                         or receipt_issued_at + datetime.timedelta(minutes=ttl_minutes) != receipt_expires_at
                         or receipt_expires_at <= current
                     ):
