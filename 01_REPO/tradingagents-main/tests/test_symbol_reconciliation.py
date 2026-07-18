@@ -416,6 +416,38 @@ def test_reconcile_symbol_incident_deduplicates_repeated_ids_and_reports_conflic
     assert spy.write_calls == []
 
 
+def test_reconcile_symbol_incident_deduplicates_identical_ids_before_broker_lookup(tmp_path):
+    first = _packet(tmp_path / "first.json", client_order_id="nflx-1")
+    second = _packet(tmp_path / "second.json", client_order_id="nflx-1")
+
+    class _OneShotLookupClient(ReadOnlyBrokerSpy):
+        def __init__(self):
+            super().__init__(
+                positions=[{"symbol": "NFLX", "qty": "1"}],
+                orders=[_order("NFLX", "nflx-1")],
+            )
+            self.lookup_count = 0
+
+        def get_order_by_client_order_id(self, client_order_id):
+            self.lookup_count += 1
+            if self.lookup_count > 1:
+                return None
+            return super().get_order_by_client_order_id(client_order_id)
+
+    spy = _OneShotLookupClient()
+    result = _reconcile_symbol_incident(
+        symbol="NFLX",
+        packet_paths=[first, second],
+        live_client=spy,
+        expected_qty="1",
+    )
+
+    assert result.matched is True
+    assert result.checked_client_order_ids == ["nflx-1"]
+    assert spy.lookup_count == 1
+    assert spy.write_calls == []
+
+
 def test_reconcile_symbol_incident_rejects_explicit_broker_account_conflict(tmp_path):
     packet_path = _packet(tmp_path / "nflx.json")
     spy = ReadOnlyBrokerSpy(

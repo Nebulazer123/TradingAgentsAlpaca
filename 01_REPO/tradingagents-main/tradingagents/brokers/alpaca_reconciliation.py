@@ -153,8 +153,8 @@ def reconcile_symbol_incident(
     resolved_paths = [Path(path) for path in packet_paths]
     issues: list[str] = []
     checked_client_order_ids: list[str] = []
-    seen_client_order_ids: set[str] = set()
     packet_evidence: dict[str, dict] = {}
+    combined_packet = {"actions": [], "submitted": [], "reconciled_orders": []}
 
     for packet_path in resolved_paths:
         packet, packet_issue = _read_packet_with_issue(packet_path)
@@ -168,15 +168,16 @@ def reconcile_symbol_incident(
             packet_evidence,
             symbol_packet,
         )
-        packet_result = reconcile_latest_packet_live_orders(
-            symbol_packet,
-            order_lookup=lambda client_order_id: _lookup_live_order(live_client, client_order_id),
-        )
-        issues.extend(packet_result.issues)
-        for client_order_id in packet_result.checked_client_order_ids:
-            if client_order_id not in seen_client_order_ids:
-                seen_client_order_ids.add(client_order_id)
-                checked_client_order_ids.append(client_order_id)
+        _append_target_submission_count_issues(issues, symbol_packet)
+        for key in combined_packet:
+            combined_packet[key].extend(symbol_packet[key])
+
+    packet_result = reconcile_latest_packet_live_orders(
+        combined_packet,
+        order_lookup=lambda client_order_id: _lookup_live_order(live_client, client_order_id),
+    )
+    issues.extend(packet_result.issues)
+    checked_client_order_ids.extend(packet_result.checked_client_order_ids)
 
     positions, position_issue = _read_broker_collection(
         live_client,
@@ -368,6 +369,22 @@ def _packet_record_client_order_id(entry: Mapping) -> str:
         fallback_keys=("live_response", "live_order", "live", "order", "intent"),
     )
     return _stringify(entry.get("client_order_id") or payload.get("client_order_id"))
+
+
+def _append_target_submission_count_issues(issues: list[str], packet: Mapping) -> None:
+    count = _packet_explicit_submission_count(packet)
+    if count is None:
+        return
+    live_ids = {
+        record["client_order_id"]
+        for record in _packet_evidence_records(packet)
+        if record.get("account") != "paper"
+    }
+    if count > len(live_ids):
+        issues.append(
+            "previous packet recorded live submission evidence without client_order_id; "
+            "manual reconciliation required"
+        )
 
 
 def _validate_expected_qty(value: Decimal | str | None) -> tuple[Decimal | None, str | None]:

@@ -8903,12 +8903,29 @@ def _write_reconciliation_packet(
     packet: dict,
 ) -> tuple[Path, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = _unique_packet_path(output_dir, stem)
+    output_path = _reserve_reconciliation_packet_path(output_dir, stem)
     packet["json_path"] = str(output_path)
     json_text = json.dumps(packet, indent=2, sort_keys=True) + "\n"
-    _atomic_write_text(output_path, json_text)
+    try:
+        _atomic_write_text(output_path, json_text)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
     _atomic_write_text(output_dir / "latest.json", json_text)
     return output_path, json_text
+
+
+def _reserve_reconciliation_packet_path(output_dir: Path, stem: str) -> Path:
+    candidate = _unique_packet_path(output_dir, stem)
+    for index in range(1000):
+        try:
+            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            candidate = output_dir / f"{stem}-{index + 1:03d}.json"
+            continue
+        os.close(descriptor)
+        return candidate
+    raise RuntimeError(f"could not reserve immutable reconciliation packet for {stem}")
 
 
 @alpaca_app.command("reconcile-orcl-incident")

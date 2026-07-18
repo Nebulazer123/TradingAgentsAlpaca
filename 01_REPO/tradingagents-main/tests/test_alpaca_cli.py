@@ -2,6 +2,7 @@ import datetime
 import inspect
 import json
 import sys
+import threading
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -728,6 +729,47 @@ def test_reconciliation_packet_target_write_failure_leaves_no_truncated_packet(m
 
     assert list(output_dir.glob("symbol-reconciliation-target-failure*.json")) == []
     assert latest_path.read_text(encoding="utf-8") == '{"previous": true}\n'
+
+
+def test_reconciliation_packet_concurrent_same_stem_preserves_two_immutable_packets(
+    monkeypatch, tmp_path
+):
+    output_dir = tmp_path / "reconciliation"
+    barrier = threading.Barrier(2)
+    errors = []
+    paths = []
+
+    def force_same_initial_candidate(output_dir_arg, stem, suffix=".json"):
+        barrier.wait(timeout=3)
+        return Path(output_dir_arg) / f"{stem}{suffix}"
+
+    monkeypatch.setattr(cli_main, "_unique_packet_path", force_same_initial_candidate)
+
+    def write_packet(run_id):
+        try:
+            path, _text = cli_main._write_reconciliation_packet(
+                output_dir,
+                stem="race",
+                packet={"kind": "symbol_broker_reconciliation", "run_id": run_id},
+            )
+            paths.append(path)
+        except Exception as exc:  # pragma: no cover - asserted below.
+            errors.append(exc)
+
+    writers = [threading.Thread(target=write_packet, args=(run_id,)) for run_id in ("a", "b")]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=5)
+
+    assert errors == []
+    assert len(paths) == 2
+    assert paths[0] != paths[1]
+    immutable_packets = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    assert {packet["run_id"] for packet in immutable_packets} == {"a", "b"}
+    assert all(path.read_text(encoding="utf-8").endswith("\n") for path in paths)
+    latest = json.loads((output_dir / "latest.json").read_text(encoding="utf-8"))
+    assert latest["run_id"] in {"a", "b"}
 
 
 def test_alpaca_reconcile_orcl_incident_discovers_symbol_sell_packet(monkeypatch, tmp_path):
