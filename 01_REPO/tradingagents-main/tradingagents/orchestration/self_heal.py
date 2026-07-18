@@ -3555,6 +3555,78 @@ def coordinate_verified_recovery(
                 idempotency_key=idempotency_key,
             )
 
+        def adopt_active_task5_rearm(phase_path: Path) -> dict[str, str]:
+            control_state, control_issues = load_live_control_state(
+                control_path,
+                now=current,
+            )
+            if (
+                control_state is None
+                or control_issues
+                or not active_task5_rearm()
+            ):
+                raise ValueError(
+                    "rearm exception has no exact active Task 5 receipt"
+                )
+            receipt_ref = {
+                "receipt_path": control_state["recovery_receipt_path"],
+                "receipt_sha256": control_state["recovery_receipt_sha256"],
+            }
+            publish_rearm_receipt(
+                receipt_ref,
+                receipt_dir,
+                now=current,
+            )
+            if phase_path.exists():
+                record = _phase_record(phase_path)
+            else:
+                recovered_packet = _canonical_packet(
+                    {
+                        "kind": "verified_rearm_result",
+                        **receipt_ref,
+                        "can_submit_orders": False,
+                        "recovered_after_exception": True,
+                    },
+                    canonical_bindings,
+                    current,
+                )
+                recovered_packet.update(
+                    {
+                        "phase": "rearm",
+                        "recovery_run_id": state["recovery_run_id"],
+                        "owner_run_id": state["owner_run_id"],
+                        "owner_role": state["owner_role"],
+                        "schema_version": (
+                            "tradingagents.recovery_phase.v1"
+                        ),
+                    }
+                )
+                record = _write_phase_packet(
+                    phase_path,
+                    recovered_packet,
+                )
+            candidate_outputs = {
+                **state["phase_outputs"],
+                "rearm": record,
+            }
+            if (
+                not _valid_phase_record(record)
+                or not _valid_phase_packet(
+                    phase_path,
+                    "rearm",
+                    canonical_bindings,
+                    state=state,
+                    phase_outputs=candidate_outputs,
+                    control_path=control_path,
+                    now=current,
+                    idempotency_key=idempotency_key,
+                )
+            ):
+                raise ValueError(
+                    "exact active rearm result packet is invalid"
+                )
+            return record
+
         def require_recovery_freeze() -> None:
             if not active_task5_rearm():
                 _assert_recovery_control_frozen(
@@ -3586,12 +3658,37 @@ def coordinate_verified_recovery(
             return {"status": "retry_scheduled", "incident_id": incident_id, "phase": state.get("phase"), "next_retry_at": state["next_retry_at"]}
         prior_failure = state.get("last_failure") or {}
         if prior_failure.get("kind") in {"permanent_integrity", "forbidden_effect", "external_blocked", "transient_exhausted"}:
-            return {
-                "status": "external_blocked" if prior_failure.get("kind") == "external_blocked" else "frozen",
-                "incident_id": incident_id,
-                "phase": state.get("phase"),
-                "failure": state.get("last_failure"),
-            }
+            if state.get("phase") == "rearm" and active_task5_rearm():
+                state["last_failure"] = None
+                state["next_retry_at"] = None
+                state["external_blockers"] = []
+                state["incident_history"].append(
+                    {
+                        "event": (
+                            "terminal_failure_cleared_for_exact_rearm"
+                        ),
+                        "phase": "rearm",
+                        "at": current.isoformat(),
+                    }
+                )
+                _append_recovery_event(
+                    incident_root,
+                    {
+                        "event": (
+                            "terminal_failure_cleared_for_exact_rearm"
+                        ),
+                        "incident_id": incident_id,
+                        "phase": "rearm",
+                        "at": current.isoformat(),
+                    },
+                )
+            else:
+                return {
+                    "status": "external_blocked" if prior_failure.get("kind") == "external_blocked" else "frozen",
+                    "incident_id": incident_id,
+                    "phase": state.get("phase"),
+                    "failure": state.get("last_failure"),
+                }
         state["attempt"] = int(state.get("attempt", 0)) + 1
         state["next_retry_at"] = None
         _append_recovery_event(incident_root, {"event": "attempt_started", "incident_id": incident_id, "attempt": state["attempt"], "phase": state.get("phase"), "at": current.isoformat()})
@@ -3936,7 +4033,32 @@ def coordinate_verified_recovery(
                 if callable(fault_hook):
                     fault_hook({"boundary": "after_phase_fsync", "phase": phase, "path": str(phase_path)})
             except Exception as error:
-                failure = _failure_from_exception(error)
+                failure_error = error
+                if phase == "rearm":
+                    try:
+                        record = adopt_active_task5_rearm(phase_path)
+                    except Exception as adoption_error:
+                        fail_closed(
+                            "rearm phase failed without an exact active receipt"
+                        )
+                        failure_error = adoption_error
+                    else:
+                        state["phase_outputs"][phase] = record
+                        state["last_artifact"] = record
+                        state["phase"] = "monitoring"
+                        state["last_failure"] = None
+                        state["next_retry_at"] = None
+                        state["external_blockers"] = []
+                        state["incident_history"].append(
+                            {
+                                "event": "active_rearm_adopted",
+                                "phase": phase,
+                                "at": current.isoformat(),
+                                **record,
+                            }
+                        )
+                        continue
+                failure = _failure_from_exception(failure_error)
                 state["last_failure"] = failure
                 state["incident_history"].append({"event": "phase_failed", "phase": phase, "failure": failure, "at": current.isoformat()})
                 if failure["external"]:

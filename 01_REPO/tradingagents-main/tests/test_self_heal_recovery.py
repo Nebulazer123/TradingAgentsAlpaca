@@ -2451,6 +2451,179 @@ def test_rearm_return_crash_recovers_active_task5_control_without_second_rearm(t
     assert latest_path.exists()
 
 
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        "after_rearm_runtime",
+        "rearm_packet_before_write",
+        "rearm_packet_after_write",
+    ],
+)
+def test_exact_active_rearm_exception_is_adopted_truthfully_without_second_rearm(
+    tmp_path,
+    monkeypatch,
+    failure_mode,
+):
+    calls: list[str] = []
+    rearm_calls: list[dict] = []
+    original_rearm = recovery_module.rearm_after_verified_recovery
+    original_packet_writer = self_heal_module._write_phase_packet
+    injected = False
+
+    def counted_rearm(**kwargs):
+        rearm_calls.append(kwargs)
+        return original_rearm(**kwargs)
+
+    def fault_hook(boundary):
+        if (
+            failure_mode == "after_rearm_runtime"
+            and boundary["boundary"] == "after_rearm_return"
+        ):
+            raise RuntimeError("ordinary failure after Task5 return")
+
+    def one_shot_rearm_packet_failure(path, packet):
+        nonlocal injected
+        if path.name == "rearm.json" and not injected:
+            injected = True
+            if failure_mode == "rearm_packet_before_write":
+                raise RuntimeError("rearm packet failed before write")
+            if failure_mode == "rearm_packet_after_write":
+                original_packet_writer(path, packet)
+                raise RuntimeError("rearm packet write completed then failed")
+        return original_packet_writer(path, packet)
+
+    if failure_mode != "after_rearm_runtime":
+        monkeypatch.setattr(
+            self_heal_module,
+            "_write_phase_packet",
+            one_shot_rearm_packet_failure,
+        )
+
+    first = _run(
+        tmp_path,
+        calls,
+        idempotency_key="delivery-1",
+        rearm=counted_rearm,
+        fault_hook=fault_hook,
+    )
+    second = _run(
+        tmp_path,
+        calls,
+        idempotency_key="delivery-1",
+        rearm=counted_rearm,
+    )
+
+    assert first["status"] == "monitoring"
+    assert second["status"] == "duplicate"
+    assert len(rearm_calls) == 1
+    assert calls.count("sync_promotion") == 1
+    control, issues = load_live_control_state(
+        tmp_path / "live_control.json",
+        now=NOW,
+    )
+    assert issues == []
+    assert control["frozen"] is False
+    state = json.loads(
+        (
+            tmp_path
+            / "results"
+            / "control_plane"
+            / "recovery"
+            / BINDINGS["incident_id"]
+            / "state.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert state["phase"] == "monitoring"
+    assert state["last_failure"] is None
+    assert "rearm" in state["phase_outputs"]
+    assert (tmp_path / "receipts" / "latest.json").exists()
+
+
+def test_persisted_terminal_failure_with_exact_active_receipt_is_adopted(
+    tmp_path,
+):
+    calls: list[str] = []
+    rearm_calls: list[dict] = []
+    original_rearm = recovery_module.rearm_after_verified_recovery
+
+    def counted_rearm(**kwargs):
+        rearm_calls.append(kwargs)
+        return original_rearm(**kwargs)
+
+    def crash_after_return(boundary):
+        if boundary["boundary"] == "after_rearm_return":
+            raise SystemExit("leave exact active receipt before state commit")
+
+    with pytest.raises(SystemExit, match="leave exact active receipt"):
+        _run(
+            tmp_path,
+            calls,
+            idempotency_key="delivery-1",
+            rearm=counted_rearm,
+            fault_hook=crash_after_return,
+        )
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["last_failure"] = {
+        "kind": "permanent_integrity",
+        "detail": "old coordinator persisted a false terminal failure",
+        "external": False,
+    }
+    state["incident_stage"] = "repairing"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    resumed = _run(
+        tmp_path,
+        calls,
+        idempotency_key="delivery-1",
+        rearm=counted_rearm,
+    )
+
+    assert resumed["status"] == "monitoring"
+    assert len(rearm_calls) == 1
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["last_failure"] is None
+    assert persisted["phase"] == "monitoring"
+
+
+def test_rearm_exception_with_invalid_active_receipt_forces_control_frozen(
+    tmp_path,
+):
+    calls: list[str] = []
+
+    def tamper_receipt_then_fail(boundary):
+        if boundary["boundary"] != "after_rearm_return":
+            return
+        control = json.loads(
+            (tmp_path / "live_control.json").read_text(encoding="utf-8")
+        )
+        Path(control["recovery_receipt_path"]).write_text(
+            '{"tampered":true}',
+            encoding="utf-8",
+        )
+        raise RuntimeError("receipt became invalid after Task5 return")
+
+    result = _run(
+        tmp_path,
+        calls,
+        fault_hook=tamper_receipt_then_fail,
+    )
+
+    assert result["status"] == "frozen"
+    control, _issues = load_live_control_state(
+        tmp_path / "live_control.json",
+        now=NOW,
+    )
+    assert control["frozen"] is True
+
+
 def test_all_phase_packet_validators_reject_metadata_complete_false_greens(tmp_path):
     common = {
         **BINDINGS,
