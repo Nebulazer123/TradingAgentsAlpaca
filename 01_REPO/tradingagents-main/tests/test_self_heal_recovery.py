@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from tradingagents.brokers import alpaca_reconciliation
+from tradingagents.orchestration import recovery as recovery_module
+from tradingagents.orchestration.recovery import rearm_after_verified_recovery
 from tradingagents.orchestration.self_heal import (
     RECOVERY_FOCUSED_TESTS,
     RECOVERY_PHASES,
@@ -417,11 +419,12 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     ).hexdigest(),
                 }
                 packet["state"]["source"].update(
-                    {
-                        "canonical_input_sha256": before_sha256,
-                        "recovery_commit": recovery_commit,
-                    }
+                    {"canonical_input_sha256": before_sha256}
                 )
+                raw_stage_sha256 = hashlib.sha256(
+                    json.dumps(packet["state"], indent=2).encode("utf-8")
+                ).hexdigest()
+                packet["state"]["source"]["recovery_commit"] = recovery_commit
                 stage_path = staging_dir / "promotion_state.json"
                 stage_path.parent.mkdir(parents=True, exist_ok=True)
                 stage_text = json.dumps(packet["state"], indent=2, sort_keys=True)
@@ -434,6 +437,11 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     "kind": "promotion_commit_prepare",
                     "recovery_commit": recovery_commit,
                     "stage_path": str(stage_path.resolve()),
+                    "generated_at": generated_at,
+                    "arm_live": True,
+                    "ci_green": True,
+                    "expected_raw_stage_sha256": raw_stage_sha256,
+                    "expected_stage_sha256": staged_sha256,
                     "can_submit_orders": False,
                     "execution_authority": "none",
                 }
@@ -460,6 +468,28 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     "canonical_path": str(canonical_path.resolve()),
                     "canonical_before_sha256": before_sha256,
                 }
+                stage_request = {
+                    "commit_id": recovery_commit["commit_id"],
+                    "prepare_path": prepare_record["path"],
+                    "prepare_sha256": prepare_record["sha256"],
+                    "stage_path": str(stage_path.resolve()),
+                    "expected_raw_stage_sha256": raw_stage_sha256,
+                    "expected_stage_sha256": staged_sha256,
+                    "generated_at": generated_at,
+                    "canonical_path": str(canonical_path.resolve()),
+                    "canonical_before_sha256": before_sha256,
+                    "report_sha256": recovery_commit["report_sha256"],
+                    "envelope_sha256": recovery_commit["envelope_sha256"],
+                    "focused_sha256": recovery_commit["focused_sha256"],
+                    "reconciliation_sha256": recovery_commit[
+                        "reconciliation_sha256"
+                    ],
+                    "arm_live": True,
+                    "ci_green": True,
+                }
+                arguments["_persist_promotion_stage_request"](
+                    stage_request
+                )
                 arguments["_persist_promotion_commit_intent"](intent)
                 receipt_path = packet_dir / "promotion_commit.json"
                 receipt = {
@@ -502,6 +532,7 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                         "promotion_prepare": prepare_record,
                         "promotion_commit": receipt_record,
                         "promotion_commit_intent": intent,
+                        "promotion_stage_request": stage_request,
                     }
                 )
             return {"packet": packet}
@@ -732,6 +763,13 @@ def _production_recovery_harness(
         if "sync-promotion" in command:
             arm_live = "--arm-live" in command and "--no-arm-live" not in command
             ci_green = "--ci-green" in command and "--no-ci-green" not in command
+            promotion_now = (
+                dt.datetime.fromisoformat(
+                    command[command.index("--generated-at") + 1]
+                )
+                if "--generated-at" in command
+                else NOW
+            )
             canonical_input_path = command[command.index("--state-path") + 1]
             output_state_path = (
                 command[command.index("--output-state-path") + 1]
@@ -742,10 +780,10 @@ def _production_recovery_harness(
                 command[command.index("--report-path") + 1],
                 canonical_input_path,
                 output_state_path=output_state_path,
-                tiny_live_tranche_usd=Decimal("25"),
+                tiny_live_tranche_usd=Decimal("25.00"),
                 arm_live=arm_live,
                 ci_green=ci_green,
-                now=NOW,
+                now=promotion_now,
             )
             if fail_phase == "promotion_after_stage_write":
                 raise SystemExit("promotion state written before adapter return")
@@ -978,6 +1016,100 @@ def test_production_recovery_promotes_only_after_focused_proof(tmp_path):
     assert broker_spy.write_calls == []
 
 
+def test_task5_revalidates_canonical_after_injected_pre_rearm_mutation(
+    tmp_path,
+):
+    request, canonical_path, invocations, broker_spy = (
+        _production_recovery_harness(tmp_path)
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    def mutate_then_rearm(**kwargs):
+        canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
+        canonical["sleeves"]["pullback-support"]["metrics"][
+            "benchmark_excess_return"
+        ] = "888888.00"
+        canonical_path.write_text(
+            json.dumps(canonical, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return rearm_after_verified_recovery(**kwargs)
+
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+        rearm=mutate_then_rearm,
+    )
+
+    assert result["status"] == "frozen"
+    assert result["phase"] == "rearm"
+    control, _issues = load_live_control_state(
+        tmp_path / "live_control.json",
+        now=NOW,
+    )
+    assert control["frozen"] is True
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
+    assert broker_spy.write_calls == []
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+
+
+def test_coordinator_task5_cas_preserves_newer_safety_freeze(
+    tmp_path,
+    monkeypatch,
+):
+    request, _canonical_path, invocations, broker_spy = (
+        _production_recovery_harness(tmp_path)
+    )
+    control_path = _control(tmp_path)
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+    original_write_receipt = recovery_module.write_rearm_receipt
+
+    def receipt_then_newer_freeze(*args, **kwargs):
+        receipt_ref = original_write_receipt(*args, **kwargs)
+        control_path.write_text(
+            json.dumps(
+                {
+                    "frozen": True,
+                    "reason": "newer independent safety freeze",
+                    "dead_man_expires_at": (
+                        NOW + dt.timedelta(days=1)
+                    ).isoformat(timespec="seconds"),
+                    "updated_at": NOW.isoformat(timespec="seconds"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return receipt_ref
+
+    monkeypatch.setattr(
+        recovery_module,
+        "write_rearm_receipt",
+        receipt_then_newer_freeze,
+    )
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=control_path,
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "frozen"
+    assert result["phase"] == "rearm"
+    control, _issues = load_live_control_state(control_path, now=NOW)
+    assert control["frozen"] is True
+    assert control["reason"] == "newer independent safety freeze"
+    assert "recovery_receipt_path" not in control
+    assert not (tmp_path / "receipts" / "latest.json").exists()
+    assert broker_spy.write_calls == []
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+
+
 def test_post_promotion_manifest_fault_stays_frozen_until_receipt(tmp_path):
     request, state_path, invocations, broker_spy = _production_recovery_harness(
         tmp_path
@@ -1087,10 +1219,197 @@ def test_stage_write_crash_resumes_without_reinvoking_promotion(tmp_path):
     assert committed["sleeves"]["pullback-support"]["live_enabled"] is True
 
 
+def test_stage_orphan_rejects_semantically_valid_metric_tamper(tmp_path):
+    request, canonical_path, invocations, broker_spy = (
+        _production_recovery_harness(
+            tmp_path,
+            fail_phase="promotion_after_stage_write",
+        )
+    )
+    original_canonical = canonical_path.read_bytes()
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    with pytest.raises(
+        SystemExit,
+        match="promotion state written before adapter return",
+    ):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+        )
+
+    stage_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / request["incident_id"]
+        / request["recovery_run_id"]
+        / "staging"
+        / "promotion_state.json"
+    )
+    staged = json.loads(stage_path.read_text(encoding="utf-8"))
+    staged["sleeves"]["pullback-support"]["metrics"][
+        "benchmark_excess_return"
+    ] = "999999.00"
+    stage_path.write_text(
+        json.dumps(staged, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    resumed = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert resumed["status"] == "frozen"
+    assert resumed["phase"] == "sync_promotion"
+    assert resumed["failure"]["kind"] == "permanent_integrity"
+    assert canonical_path.read_bytes() == original_canonical
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert broker_spy.write_calls == []
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
+
+
+@pytest.mark.parametrize("mutation", ["extra_field", "raw_hash"])
+def test_stage_orphan_rejects_arbitrary_content_or_hash_mutation(
+    tmp_path,
+    mutation,
+):
+    request, canonical_path, invocations, broker_spy = (
+        _production_recovery_harness(
+            tmp_path,
+            fail_phase="promotion_after_stage_write",
+        )
+    )
+    original_canonical = canonical_path.read_bytes()
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    with pytest.raises(
+        SystemExit,
+        match="promotion state written before adapter return",
+    ):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+        )
+
+    stage_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / request["incident_id"]
+        / request["recovery_run_id"]
+        / "staging"
+        / "promotion_state.json"
+    )
+    if mutation == "extra_field":
+        staged = json.loads(stage_path.read_text(encoding="utf-8"))
+        staged["authenticated_extension"] = {"forged": True}
+        stage_path.write_text(
+            json.dumps(staged, indent=2),
+            encoding="utf-8",
+        )
+    else:
+        stage_path.write_bytes(stage_path.read_bytes() + b"\n")
+
+    resumed = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert resumed["status"] == "frozen"
+    assert resumed["phase"] == "sync_promotion"
+    assert canonical_path.read_bytes() == original_canonical
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert broker_spy.write_calls == []
+
+
+def test_recovery_freezes_initially_open_control_before_promotion_replace(
+    tmp_path,
+):
+    request, promotion_path, invocations, broker_spy = (
+        _production_recovery_harness(tmp_path)
+    )
+    control_path = _control(tmp_path)
+    write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="healthy before recovery",
+        dead_man_expires_at=NOW + dt.timedelta(minutes=30),
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    def crash(event):
+        if event["boundary"] == "after_promotion_canonical_replace":
+            raise SystemExit("canonical replaced while recovery is open")
+
+    with pytest.raises(
+        SystemExit,
+        match="canonical replaced while recovery is open",
+    ):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=control_path,
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+            fault_hook=crash,
+        )
+
+    promotion = json.loads(promotion_path.read_text(encoding="utf-8"))
+    assert promotion["sleeves"]["pullback-support"]["live_enabled"] is True
+    control, _issues = load_live_control_state(control_path, now=NOW)
+    assert control["frozen"] is True
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
+    assert broker_spy.write_calls == []
+    gate = evaluate_go_live_guard(
+        [
+            {
+                "action": "buy",
+                "symbol": "NFLX",
+                "notional": Decimal("20"),
+                "limit_price": Decimal("100"),
+                "side": "buy",
+                "order_type": "limit",
+                "account": "live",
+                "execution_mode": "tiny_live",
+                "asset_class": "stock",
+                "sleeve": "pullback-support",
+            }
+        ],
+        risk_envelope_path=tmp_path / "config" / "risk_envelope.yaml",
+        promotion_state_path=promotion_path,
+        control_state_path=control_path,
+        live_buying_power=Decimal("1000"),
+        now=NOW,
+    )
+    assert gate.allowed is False
+    assert gate.checks["live_not_frozen"] is False
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+
+
 @pytest.mark.parametrize(
     "boundary",
     [
         "before_promotion_adapter",
+        "after_promotion_stage_request_fsync",
         "after_promotion_prepare_fsync",
         "after_promotion_intent_fsync",
         "after_promotion_canonical_replace",
@@ -1129,6 +1448,7 @@ def test_promotion_transaction_faults_resume_exactly_once(tmp_path, boundary):
     assert broker_spy.write_calls == []
     if boundary in {
         "before_promotion_adapter",
+        "after_promotion_stage_request_fsync",
         "after_promotion_prepare_fsync",
         "after_promotion_intent_fsync",
     }:
@@ -1298,8 +1618,17 @@ def test_promotion_transaction_tamper_stays_frozen(
     assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
 
 
+@pytest.mark.parametrize(
+    ("prepare_boundary", "stale_sync_calls"),
+    [
+        ("after_promotion_stage_request_fsync", 0),
+        ("after_promotion_prepare_fsync", 1),
+    ],
+)
 def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_on(
     tmp_path,
+    prepare_boundary,
+    stale_sync_calls,
 ):
     request, canonical_path, invocations, broker_spy = (
         _production_recovery_harness(tmp_path)
@@ -1308,7 +1637,7 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
     coordinator_args.pop("ready")
 
     def crash(event):
-        if event["boundary"] == "after_promotion_prepare_fsync":
+        if event["boundary"] == prepare_boundary:
             raise SystemExit("prepared before foreign writer")
 
     with pytest.raises(SystemExit, match="prepared before foreign writer"):
@@ -1345,7 +1674,10 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
         NOW + dt.timedelta(seconds=120)
     ).isoformat()
     assert canonical_path.read_bytes() == foreign_bytes
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert (
+        sum("sync-promotion" in argv for argv in invocations)
+        == stale_sync_calls
+    )
 
     exhausted = coordinate_verified_recovery(
         **coordinator_args,
@@ -1368,7 +1700,10 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
 
     assert recovered["status"] == "monitoring"
     assert recovered["recovery_run_id"].endswith("-follow-1")
-    assert sum("sync-promotion" in argv for argv in invocations) == 2
+    assert (
+        sum("sync-promotion" in argv for argv in invocations)
+        == stale_sync_calls + 1
+    )
     follow_on_prepare = json.loads(
         (
             tmp_path
@@ -1742,11 +2077,23 @@ def test_existing_corrupt_state_fails_closed_without_reinitializing(tmp_path):
     state_path = recovery_root / BINDINGS["incident_id"] / "state.json"
     state_path.parent.mkdir(parents=True)
     state_path.write_text("{bad", encoding="utf-8")
+    write_live_control_state(
+        tmp_path / "live_control.json",
+        frozen=False,
+        reason="unsafe open control before corrupt recovery state",
+        dead_man_expires_at=NOW + dt.timedelta(hours=1),
+        now=NOW,
+    )
 
     result = _run(tmp_path, [])
 
     assert result["status"] == "corrupt_state"
     assert state_path.read_text(encoding="utf-8") == "{bad"
+    control, _issues = load_live_control_state(
+        tmp_path / "live_control.json",
+        now=NOW,
+    )
+    assert control["frozen"] is True
 
 
 def test_malformed_orphan_packet_is_not_recovered_as_completed(tmp_path):
@@ -2391,11 +2738,14 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     empty_promotion["state"]["sleeves"] = {}
     staged_path = Path(empty_promotion["staged_state_path"])
     canonical_path = Path(empty_promotion["state_path"])
+    prepare_path = Path(empty_promotion["promotion_prepare"]["path"])
     receipt_path = Path(empty_promotion["promotion_commit"]["path"])
     staged_original = staged_path.read_bytes()
     canonical_original = canonical_path.read_bytes()
+    prepare_original = prepare_path.read_bytes()
     receipt_original = receipt_path.read_bytes()
     intent_original = state["promotion_commit_intent"]
+    stage_request_original = state["promotion_stage_request"]
     empty_state_bytes = json.dumps(
         empty_promotion["state"],
         indent=2,
@@ -2409,10 +2759,37 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     empty_promotion["promotion_commit_intent"]["staged_sha256"] = (
         empty_sha256
     )
+    prepare = json.loads(prepare_original)
+    prepare["expected_stage_sha256"] = empty_sha256
+    prepare_path.write_text(
+        json.dumps(
+            prepare,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    prepare_sha256 = hashlib.sha256(prepare_path.read_bytes()).hexdigest()
+    empty_promotion["promotion_prepare"]["sha256"] = prepare_sha256
+    empty_promotion["promotion_commit_intent"]["prepare_sha256"] = (
+        prepare_sha256
+    )
+    empty_promotion["promotion_stage_request"].update(
+        {
+            "prepare_sha256": prepare_sha256,
+            "expected_stage_sha256": empty_sha256,
+        }
+    )
     state["promotion_commit_intent"] = dict(
         empty_promotion["promotion_commit_intent"]
     )
+    state["promotion_stage_request"] = dict(
+        empty_promotion["promotion_stage_request"]
+    )
     receipt = json.loads(receipt_original)
+    receipt["prepare_sha256"] = prepare_sha256
     receipt["staged_sha256"] = empty_sha256
     receipt["canonical_after_sha256"] = empty_sha256
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
@@ -2433,8 +2810,10 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     promotion_path.write_text(promotion_original, encoding="utf-8")
     staged_path.write_bytes(staged_original)
     canonical_path.write_bytes(canonical_original)
+    prepare_path.write_bytes(prepare_original)
     receipt_path.write_bytes(receipt_original)
     state["promotion_commit_intent"] = intent_original
+    state["promotion_stage_request"] = stage_request_original
 
     reconciliation_path = Path(state["phase_outputs"]["reconcile"]["path"])
     reconciliation_original = reconciliation_path.read_text(encoding="utf-8")
@@ -3089,7 +3468,23 @@ def test_hourly_board_review_without_symbol_uses_canonical_evidence_and_complete
             tmp_path / "results" / "policy" / "promotion_state.json",
             json.dumps({"schema_version": "1.0.0", "sleeves": {}}),
         ),
-        (tmp_path / "config" / "risk_envelope.yaml", "tiny_live_tranche_usd: 25\n"),
+            (
+                tmp_path / "config" / "risk_envelope.yaml",
+                "\n".join(
+                    (
+                        "account_max_capital_at_risk_usd: 250.00",
+                        "per_name_cap_usd: 50.00",
+                        "per_sector_cap_pct: 0.20",
+                        "aggregate_beta_cap: 1.25",
+                        "daily_loss_halt_usd: 25.00",
+                        "max_drawdown_halt_pct: 0.05",
+                        "tiny_live_tranche_usd: 25.00",
+                        "tiny_live_max_loss_usd: 5.00",
+                        "new_sleeve_auto_promote: false",
+                        "alert_email: ops@example.com",
+                    )
+                ),
+            ),
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
@@ -3115,7 +3510,7 @@ def test_hourly_board_review_without_symbol_uses_canonical_evidence_and_complete
                 argv[argv.index("--report-path") + 1],
                 canonical_path,
                 output_state_path=stage_path,
-                tiny_live_tranche_usd=Decimal("25"),
+                    tiny_live_tranche_usd=Decimal("25.00"),
                 arm_live="--arm-live" in argv,
                 ci_green="--ci-green" in argv,
                 now=NOW,

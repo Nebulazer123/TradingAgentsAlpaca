@@ -10,6 +10,7 @@ import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
+from tradingagents.orchestration import recovery as recovery_module
 from tradingagents.orchestration.incidents import Incident, IncidentStage, transition_incident
 from tradingagents.orchestration.recovery import (
     RecoveryEvidence,
@@ -324,16 +325,22 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
             ).encode("utf-8")
         ).hexdigest(),
     }
-    canonical_state = {
+    raw_canonical_state = {
         "schema_version": "1.1.0",
         "generated_at": now.isoformat(),
         "source": {
             "kind": "paper_tournament_sync",
             "canonical_input_sha256": canonical_before_sha256,
-            "recovery_commit": recovery_commit,
+            "arm_live": True,
+            "ci_green": True,
         },
         "sleeves": {},
     }
+    raw_stage_sha256 = hashlib.sha256(
+        json.dumps(raw_canonical_state, indent=2).encode("utf-8")
+    ).hexdigest()
+    canonical_state = json.loads(json.dumps(raw_canonical_state))
+    canonical_state["source"]["recovery_commit"] = recovery_commit
     canonical_bytes = json.dumps(
         canonical_state,
         indent=2,
@@ -351,6 +358,11 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
         "kind": "promotion_commit_prepare",
         "recovery_commit": recovery_commit,
         "stage_path": str(staged_path.resolve()),
+        "generated_at": now.isoformat(),
+        "arm_live": True,
+        "ci_green": True,
+        "expected_raw_stage_sha256": raw_stage_sha256,
+        "expected_stage_sha256": canonical_after_sha256,
         "can_submit_orders": False,
         "execution_authority": "none",
     }
@@ -384,6 +396,25 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
         "promotion_commit": {
             "path": str(commit_path.resolve()),
             "sha256": hashlib.sha256(commit_path.read_bytes()).hexdigest(),
+        },
+        "promotion_stage_request": {
+            "commit_id": recovery_commit["commit_id"],
+            "prepare_path": str(prepare_path.resolve()),
+            "prepare_sha256": prepare_sha256,
+            "stage_path": str(staged_path.resolve()),
+            "expected_raw_stage_sha256": raw_stage_sha256,
+            "expected_stage_sha256": canonical_after_sha256,
+            "generated_at": now.isoformat(),
+            "canonical_path": str(canonical_path.resolve()),
+            "canonical_before_sha256": canonical_before_sha256,
+            "report_sha256": recovery_commit["report_sha256"],
+            "envelope_sha256": recovery_commit["envelope_sha256"],
+            "focused_sha256": recovery_commit["focused_sha256"],
+            "reconciliation_sha256": recovery_commit[
+                "reconciliation_sha256"
+            ],
+            "arm_live": True,
+            "ci_green": True,
         },
         "staged_state_path": str(staged_path.resolve()),
         "staged_state_sha256": canonical_after_sha256,
@@ -461,6 +492,47 @@ def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["ready"] is True
+
+
+def test_recovery_cli_task5_cas_preserves_newer_safety_freeze(
+    tmp_path,
+    monkeypatch,
+):
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    bundle = _write_cli_recovery_bundle(tmp_path, now=now)
+    control_path = bundle["control_path"]
+    original_write_receipt = recovery_module.write_rearm_receipt
+
+    def receipt_then_newer_freeze(*args, **kwargs):
+        receipt_ref = original_write_receipt(*args, **kwargs)
+        control_path.write_text(
+            json.dumps(
+                {
+                    "frozen": True,
+                    "reason": "newer independent safety freeze",
+                    "dead_man_expires_at": (
+                        now + dt.timedelta(days=1)
+                    ).isoformat(timespec="seconds"),
+                    "updated_at": now.isoformat(timespec="seconds"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return receipt_ref
+
+    monkeypatch.setattr(
+        recovery_module,
+        "write_rearm_receipt",
+        receipt_then_newer_freeze,
+    )
+    result = _invoke_cli_recovery(bundle, tmp_path)
+
+    assert result.exit_code == 1
+    control, _issues = load_live_control_state(control_path, now=now)
+    assert control["frozen"] is True
+    assert control["reason"] == "newer independent safety freeze"
+    assert "recovery_receipt_path" not in control
+    assert not (tmp_path / "rearm" / "latest.json").exists()
 
 
 def test_recovery_cli_rejects_coherently_rehashed_thin_promotion_receipt(

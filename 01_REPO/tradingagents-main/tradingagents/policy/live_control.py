@@ -3,14 +3,41 @@
 from __future__ import annotations
 
 import datetime
+import fcntl
 import hashlib
 import json
+import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
+
+
+class LiveControlPreimageMismatch(ValueError):
+    """The live-control file changed after a caller accepted its preimage."""
+
+
+def live_control_lock_path(state_path: str | Path) -> Path:
+    state_file = Path(state_path).resolve()
+    return state_file.with_name(f".{state_file.name}.control.lock")
+
+
+@contextmanager
+def live_control_lock(state_path: str | Path):
+    """Serialize every cooperating live-control writer."""
+
+    lock_path = live_control_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield lock_path
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def parse_control_time(value: str) -> datetime.datetime | None:
@@ -175,7 +202,7 @@ def load_live_control_state(
     return state, issues
 
 
-def write_live_control_state(
+def _write_live_control_state_locked(
     path: str | Path,
     *,
     frozen: bool,
@@ -185,17 +212,46 @@ def write_live_control_state(
     recovery_receipt_sha256: str | None = None,
     recovery_incident_id: str | None = None,
     recovery_mode: str | None = None,
+    expected_preimage_sha256: str | None = None,
+    now: datetime.datetime | None = None,
 ) -> Path:
+    """Replace live control while its interprocess lock is already held."""
+
     control_path = Path(path)
     control_path.parent.mkdir(parents=True, exist_ok=True)
-    expires_at = dead_man_expires_at or (datetime.datetime.now(tz=UTC) + datetime.timedelta(hours=6))
+    if expected_preimage_sha256 is not None:
+        if (
+            len(expected_preimage_sha256) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in expected_preimage_sha256
+            )
+        ):
+            raise ValueError("expected_preimage_sha256 must be a SHA-256 digest")
+        try:
+            actual_preimage = hashlib.sha256(control_path.read_bytes()).hexdigest()
+        except OSError:
+            raise LiveControlPreimageMismatch(
+                "live control preimage is unavailable"
+            ) from None
+        if actual_preimage != expected_preimage_sha256:
+            raise LiveControlPreimageMismatch(
+                "live control changed after its safety preimage was accepted"
+            )
+    updated_at = now or datetime.datetime.now(tz=UTC)
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    updated_at = updated_at.astimezone(UTC)
+    expires_at = dead_man_expires_at or (
+        updated_at + datetime.timedelta(hours=6)
+    )
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
     payload = {
         "frozen": bool(frozen),
         "reason": reason,
         "dead_man_expires_at": expires_at.astimezone(UTC).isoformat(timespec="seconds"),
-        "updated_at": datetime.datetime.now(tz=UTC).isoformat(timespec="seconds"),
+        "updated_at": updated_at.isoformat(timespec="seconds"),
     }
     if recovery_receipt_path is not None or recovery_receipt_sha256 is not None:
         if not isinstance(recovery_receipt_path, str) or not recovery_receipt_path.strip():
@@ -210,3 +266,33 @@ def write_live_control_state(
         payload["recovery_mode"] = recovery_mode
     atomic_write_text(control_path, json.dumps(payload, indent=2))
     return control_path
+
+
+def write_live_control_state(
+    path: str | Path,
+    *,
+    frozen: bool,
+    reason: str,
+    dead_man_expires_at: datetime.datetime | None = None,
+    recovery_receipt_path: str | None = None,
+    recovery_receipt_sha256: str | None = None,
+    recovery_incident_id: str | None = None,
+    recovery_mode: str | None = None,
+    expected_preimage_sha256: str | None = None,
+    now: datetime.datetime | None = None,
+) -> Path:
+    """Atomically update live control under its shared writer lock."""
+
+    with live_control_lock(path):
+        return _write_live_control_state_locked(
+            path,
+            frozen=frozen,
+            reason=reason,
+            dead_man_expires_at=dead_man_expires_at,
+            recovery_receipt_path=recovery_receipt_path,
+            recovery_receipt_sha256=recovery_receipt_sha256,
+            recovery_incident_id=recovery_incident_id,
+            recovery_mode=recovery_mode,
+            expected_preimage_sha256=expected_preimage_sha256,
+            now=now,
+        )

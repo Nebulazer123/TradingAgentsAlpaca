@@ -5862,6 +5862,65 @@ def test_policy_refresh_live_control_writes_dead_man(tmp_path):
     assert state["dead_man_expires_at"]
 
 
+def test_policy_refresh_live_control_cas_preserves_newer_freeze(
+    tmp_path,
+    monkeypatch,
+):
+    control_path = tmp_path / "live_control.json"
+    cli_main.write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="existing healthy lease",
+        dead_man_expires_at=datetime.datetime.now(tz=datetime.timezone.utc)
+        + datetime.timedelta(hours=1),
+    )
+    original_write = cli_main._write_live_control_state_locked
+
+    def newer_freeze_before_refresh(*args, **kwargs):
+        control_path.write_text(
+            json.dumps(
+                {
+                    "frozen": True,
+                    "reason": "newer independent safety freeze",
+                    "dead_man_expires_at": (
+                        datetime.datetime.now(tz=datetime.timezone.utc)
+                        + datetime.timedelta(days=1)
+                    ).isoformat(timespec="seconds"),
+                    "updated_at": datetime.datetime.now(
+                        tz=datetime.timezone.utc
+                    ).isoformat(timespec="seconds"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cli_main,
+        "_write_live_control_state_locked",
+        newer_freeze_before_refresh,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "policy",
+            "refresh-live-control",
+            "--reason",
+            "ops window active",
+            "--ttl-hours",
+            "2",
+            "--control-path",
+            str(control_path),
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 1
+    state = json.loads(control_path.read_text(encoding="utf-8"))
+    assert state["frozen"] is True
+    assert state["reason"] == "newer independent safety freeze"
+
+
 def test_research_crawl_target_writes_blocked_packet(tmp_path):
     result = runner.invoke(
         app,

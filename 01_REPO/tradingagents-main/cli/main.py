@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import multiprocessing
 import os
@@ -242,7 +243,12 @@ from tradingagents.policy.io import (
 from tradingagents.policy.io import (
     unique_packet_path as _unique_packet_path,
 )
-from tradingagents.policy.live_control import load_live_control_state, write_live_control_state
+from tradingagents.policy.live_control import (
+    _write_live_control_state_locked,
+    live_control_lock,
+    load_live_control_state,
+    write_live_control_state,
+)
 from tradingagents.policy.order_rate_limit import record_live_order_submission
 from tradingagents.policy.packets import write_research_packet, write_shadow_run_packet
 from tradingagents.policy.preregistration import (
@@ -3806,33 +3812,45 @@ def policy_refresh_live_control(
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Refresh the tiny-live dead-man control state without submitting orders."""
-    existing, existing_issues = load_live_control_state(control_path)
-    if (
-        existing is None
-        or existing_issues
-        or existing.get("frozen") is True
-        or existing.get("recovery_mode") == "verified_recovery"
-    ):
-        payload = {
-            "refreshed": False,
-            "frozen": existing.get("frozen") if isinstance(existing, dict) else True,
-            "reason": "live control refresh blocked; verified recovery is required to unfreeze",
-            "control_path": str(control_path),
-        }
-        if json_output:
-            print(json.dumps(payload, indent=2))
-        else:
-            console.print(payload["reason"])
-        raise typer.Exit(1)
-    expires_at = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(
-        hours=ttl_hours
-    )
-    written = write_live_control_state(
-        control_path,
-        frozen=False,
-        reason=reason,
-        dead_man_expires_at=expires_at,
-    )
+    with live_control_lock(control_path):
+        existing, existing_issues = load_live_control_state(control_path)
+        if (
+            existing is None
+            or existing_issues
+            or existing.get("frozen") is True
+            or existing.get("recovery_mode") == "verified_recovery"
+        ):
+            payload = {
+                "refreshed": False,
+                "frozen": (
+                    existing.get("frozen")
+                    if isinstance(existing, dict)
+                    else True
+                ),
+                "reason": (
+                    "live control refresh blocked; verified recovery is "
+                    "required to unfreeze"
+                ),
+                "control_path": str(control_path),
+            }
+            if json_output:
+                print(json.dumps(payload, indent=2))
+            else:
+                console.print(payload["reason"])
+            raise typer.Exit(1)
+        accepted_preimage_sha256 = hashlib.sha256(
+            control_path.read_bytes()
+        ).hexdigest()
+        expires_at = datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ) + datetime.timedelta(hours=ttl_hours)
+        written = _write_live_control_state_locked(
+            control_path,
+            frozen=False,
+            reason=reason,
+            dead_man_expires_at=expires_at,
+            expected_preimage_sha256=accepted_preimage_sha256,
+        )
     payload = {
         "refreshed": True,
         "frozen": False,
@@ -3930,6 +3948,11 @@ def policy_sync_promotion(
         "--ci-green/--no-ci-green",
         help="Attest that the focused test suite passed for this working tree.",
     ),
+    generated_at: str | None = typer.Option(
+        None,
+        "--generated-at",
+        help="Optional timezone-aware deterministic generation time.",
+    ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Sync live promotion state from paper-tournament evidence.
@@ -3946,6 +3969,21 @@ def policy_sync_promotion(
         raise typer.BadParameter(
             f"risk envelope unusable at {envelope_path}: {'; '.join(envelope_issues)}"
         )
+    promotion_now = None
+    if generated_at is not None:
+        try:
+            promotion_now = datetime.datetime.fromisoformat(
+                generated_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            raise typer.BadParameter(
+                "--generated-at must be a timezone-aware ISO timestamp"
+            ) from None
+        if promotion_now.tzinfo is None:
+            raise typer.BadParameter(
+                "--generated-at must be a timezone-aware ISO timestamp"
+            )
+        promotion_now = promotion_now.astimezone(datetime.timezone.utc)
     tranche = envelope.tiny_live_tranche_usd
     result = sync_promotion_state_file(
         report_path,
@@ -3954,6 +3992,7 @@ def policy_sync_promotion(
         tiny_live_tranche_usd=tranche,
         arm_live=arm_live,
         ci_green=ci_green,
+        now=promotion_now,
     )
     written_state_path = output_state_path or state_path
     payload = {

@@ -8,16 +8,19 @@ import json
 import os
 import secrets
 from collections.abc import Mapping
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.live_control import (
+    _write_live_control_state_locked,
+    live_control_lock,
     load_live_control_state,
     parse_control_time,
-    write_live_control_state,
 )
+from tradingagents.policy.promotion_sync import promotion_state_lock
 
 UTC = dt.timezone.utc
 MAX_REARM_TTL_MINUTES = 90
@@ -183,6 +186,7 @@ def write_rearm_receipt(
     *,
     now: dt.datetime | None = None,
     prepared_path: Path | None = None,
+    publish_latest: bool = True,
 ) -> dict[str, str]:
     """Durably create an immutable receipt, then update its non-authoritative pointer."""
     current = _as_utc(now)
@@ -205,16 +209,52 @@ def write_rearm_receipt(
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        latest = {
-            "kind": "verified_rearm_latest",
+        receipt_ref = {
             "receipt_path": str(path.resolve()),
             "receipt_sha256": digest,
-            "updated_at": current.isoformat(),
-            "can_submit_orders": False,
         }
-        atomic_write_text(target_dir / "latest.json", json.dumps(latest, indent=2, sort_keys=True))
-        return {"receipt_path": str(path.resolve()), "receipt_sha256": digest}
+        if publish_latest:
+            publish_rearm_receipt(
+                receipt_ref,
+                target_dir,
+                now=current,
+            )
+        return receipt_ref
     raise OSError("could not allocate a unique recovery receipt path")
+
+
+def publish_rearm_receipt(
+    receipt_ref: Mapping[str, str],
+    receipt_dir: str | Path,
+    *,
+    now: dt.datetime | None = None,
+) -> Path:
+    """Publish the non-authoritative pointer after control accepts the receipt."""
+
+    current = _as_utc(now)
+    receipt_path = receipt_ref.get("receipt_path")
+    receipt_sha256 = receipt_ref.get("receipt_sha256")
+    if (
+        not isinstance(receipt_path, str)
+        or not Path(receipt_path).is_absolute()
+        or str(Path(receipt_path).resolve()) != receipt_path
+        or not isinstance(receipt_sha256, str)
+        or len(receipt_sha256) != 64
+        or any(char not in "0123456789abcdef" for char in receipt_sha256)
+    ):
+        raise ValueError("rearm receipt reference is invalid")
+    latest = {
+        "kind": "verified_rearm_latest",
+        "receipt_path": receipt_path,
+        "receipt_sha256": receipt_sha256,
+        "updated_at": current.isoformat(),
+        "can_submit_orders": False,
+    }
+    latest_path = Path(receipt_dir) / "latest.json"
+    return atomic_write_text(
+        latest_path,
+        json.dumps(latest, indent=2, sort_keys=True),
+    )
 
 
 def rearm_after_verified_recovery(
@@ -224,6 +264,7 @@ def rearm_after_verified_recovery(
     receipt_dir: str | Path,
     ttl_minutes: int = MAX_REARM_TTL_MINUTES,
     now: dt.datetime | None = None,
+    expected_control_preimage_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Re-arm only a currently frozen control after durable independent evidence."""
     verdict = evaluate_rearm_readiness(evidence)
@@ -242,65 +283,209 @@ def rearm_after_verified_recovery(
         raise ValueError("rearm blocked: proof paths collide with control authority")
     if evidence.recovery_manifest_path and Path(evidence.recovery_manifest_path).resolve() in proof_paths | {control_absolute_path, receipt_root / "latest.json"}:
         raise ValueError("rearm blocked: manifest path collides with control authority")
-    state, _control_issues = load_live_control_state(control_path, now=current)
-    if state is None or _normalized_string(state.get("reason")) is None or parse_control_time(str(state.get("dead_man_expires_at", ""))) is None:
-        raise ValueError("rearm blocked: existing live control is not valid")
-    if state.get("frozen") is not True:
-        raise ValueError("rearm blocked: existing live control must be currently frozen")
-    for key, expected in evidence.source_packet_sha256.items():
-        try:
-            actual = hashlib.sha256(Path(evidence.source_packet_paths[key]).read_bytes()).hexdigest()
-        except (OSError, TypeError):
-            raise ValueError(f"rearm blocked: source packet unavailable for {key}") from None
-        if actual != expected:
-            raise ValueError(f"rearm blocked: source packet hash changed for {key}")
-    if evidence.recovery_manifest_path is not None:
-        try:
-            manifest_actual = hashlib.sha256(Path(evidence.recovery_manifest_path).read_bytes()).hexdigest()
-        except OSError:
-            raise ValueError("rearm blocked: recovery manifest unavailable") from None
-        if manifest_actual != evidence.recovery_manifest_sha256:
-            raise ValueError("rearm blocked: recovery manifest hash changed")
-    expires_at = current + dt.timedelta(minutes=ttl)
-    normalized_expiry = expires_at.astimezone(UTC).isoformat(timespec="seconds")
-    control_absolute = str(control_absolute_path)
-    prepared_receipt_path = str(_receipt_path(Path(receipt_dir), current).resolve())
-    if Path(prepared_receipt_path) == control_absolute_path:
-        raise ValueError("rearm blocked: control path collides with receipt path")
-    reason = f"verified recovery {evidence.incident_id.strip()}"
-    receipt = {
-        "schema_version": 1,
-        "kind": "verified_rearm_receipt",
-        "incident_id": evidence.incident_id.strip(),
-        "repairer_run_id": evidence.repairer_run_id.strip(),
-        "verifier_run_id": evidence.verifier_run_id.strip(),
-        "repairer_role_id": evidence.repairer_role_id.strip(),
-        "verifier_role_id": evidence.verifier_role_id.strip(),
-        "issued_at": current.isoformat(timespec="seconds"),
-        "expires_at": normalized_expiry,
-        "ttl_minutes": ttl,
-        "broker_write_calls": 0,
-        "can_submit_orders": False,
-        "effective_only_when_control_matches_receipt_digest": True,
-        "source_bindings": dict(evidence.source_bindings),
-        "source_packet_sha256": dict(evidence.source_packet_sha256),
-        "source_packet_paths": dict(evidence.source_packet_paths),
-        "recovery_manifest_path": evidence.recovery_manifest_path,
-        "recovery_manifest_sha256": evidence.recovery_manifest_sha256,
-        "control_binding": {"control_path": control_absolute, "incident_id": evidence.incident_id.strip(), "reason": reason, "dead_man_expires_at": normalized_expiry, "frozen": False, "mode": "verified_recovery", "receipt_path": prepared_receipt_path},
-    }
-    receipt_ref = write_rearm_receipt(receipt, receipt_dir, now=current, prepared_path=Path(prepared_receipt_path))
-    written = write_live_control_state(
-        control_path,
-        frozen=False,
-        reason=reason,
-        dead_man_expires_at=expires_at,
-        recovery_receipt_path=receipt_ref["receipt_path"],
-        recovery_receipt_sha256=receipt_ref["receipt_sha256"],
-        recovery_incident_id=evidence.incident_id.strip(),
-        recovery_mode="verified_recovery",
+    promotion_packet_path = evidence.source_packet_paths.get("promotion")
+    promotion_canonical_path: Path | None = None
+    try:
+        promotion_packet = json.loads(
+            Path(str(promotion_packet_path)).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        promotion_packet = None
+    if isinstance(promotion_packet, Mapping) and "state_path" in promotion_packet:
+        candidate = _canonical_reference(promotion_packet.get("state_path"))
+        if candidate is None:
+            raise ValueError(
+                "rearm blocked: promotion canonical path is invalid"
+            )
+        promotion_canonical_path = candidate
+
+    promotion_guard = (
+        promotion_state_lock(promotion_canonical_path)
+        if promotion_canonical_path is not None
+        else nullcontext()
     )
-    return {**receipt_ref, "control_path": str(written), "expires_at": expires_at.isoformat(), "can_submit_orders": False}
+    with promotion_guard:
+        if promotion_canonical_path is not None:
+            refreshed, refresh_issues = load_recovery_evidence(
+                incident_path=evidence.source_packet_paths["incident"],
+                reconciliation_path=evidence.source_packet_paths[
+                    "reconciliation"
+                ],
+                promotion_sync_path=evidence.source_packet_paths["promotion"],
+                focused_proof_path=evidence.source_packet_paths["focused"],
+                recovery_manifest_path=evidence.recovery_manifest_path,
+                repairer_run_id=evidence.repairer_run_id,
+                verifier_run_id=evidence.verifier_run_id,
+                now=current,
+            )
+            if (
+                refreshed is None
+                or refresh_issues
+                or refreshed != evidence
+            ):
+                detail = (
+                    "; ".join(refresh_issues)
+                    if refresh_issues
+                    else "recovery evidence changed before re-arm"
+                )
+                raise ValueError("rearm blocked: " + detail)
+
+        for key, expected in evidence.source_packet_sha256.items():
+            try:
+                actual = hashlib.sha256(
+                    Path(evidence.source_packet_paths[key]).read_bytes()
+                ).hexdigest()
+            except (OSError, TypeError):
+                raise ValueError(
+                    f"rearm blocked: source packet unavailable for {key}"
+                ) from None
+            if actual != expected:
+                raise ValueError(
+                    f"rearm blocked: source packet hash changed for {key}"
+                )
+        if evidence.recovery_manifest_path is not None:
+            try:
+                manifest_actual = hashlib.sha256(
+                    Path(evidence.recovery_manifest_path).read_bytes()
+                ).hexdigest()
+            except OSError:
+                raise ValueError(
+                    "rearm blocked: recovery manifest unavailable"
+                ) from None
+            if manifest_actual != evidence.recovery_manifest_sha256:
+                raise ValueError(
+                    "rearm blocked: recovery manifest hash changed"
+                )
+
+        with live_control_lock(control_absolute_path):
+            try:
+                control_preimage = control_absolute_path.read_bytes()
+            except OSError:
+                raise ValueError(
+                    "rearm blocked: existing live control is not valid"
+                ) from None
+            accepted_preimage_sha256 = hashlib.sha256(
+                control_preimage
+            ).hexdigest()
+            if (
+                expected_control_preimage_sha256 is not None
+                and accepted_preimage_sha256
+                != expected_control_preimage_sha256
+            ):
+                raise ValueError(
+                    "rearm blocked: live control no longer matches the "
+                    "recovery-owned freeze"
+                )
+            state, _control_issues = load_live_control_state(
+                control_absolute_path,
+                now=current,
+            )
+            if (
+                state is None
+                or _normalized_string(state.get("reason")) is None
+                or parse_control_time(
+                    str(state.get("dead_man_expires_at", ""))
+                )
+                is None
+            ):
+                raise ValueError(
+                    "rearm blocked: existing live control is not valid"
+                )
+            if state.get("frozen") is not True:
+                raise ValueError(
+                    "rearm blocked: existing live control must be currently frozen"
+                )
+
+            expires_at = current + dt.timedelta(minutes=ttl)
+            normalized_expiry = expires_at.astimezone(UTC).isoformat(
+                timespec="seconds"
+            )
+            control_absolute = str(control_absolute_path)
+            prepared_receipt_path = str(
+                _receipt_path(Path(receipt_dir), current).resolve()
+            )
+            if Path(prepared_receipt_path) == control_absolute_path:
+                raise ValueError(
+                    "rearm blocked: control path collides with receipt path"
+                )
+            reason = f"verified recovery {evidence.incident_id.strip()}"
+            receipt = {
+                "schema_version": 1,
+                "kind": "verified_rearm_receipt",
+                "incident_id": evidence.incident_id.strip(),
+                "repairer_run_id": evidence.repairer_run_id.strip(),
+                "verifier_run_id": evidence.verifier_run_id.strip(),
+                "repairer_role_id": evidence.repairer_role_id.strip(),
+                "verifier_role_id": evidence.verifier_role_id.strip(),
+                "issued_at": current.isoformat(timespec="seconds"),
+                "expires_at": normalized_expiry,
+                "ttl_minutes": ttl,
+                "broker_write_calls": 0,
+                "can_submit_orders": False,
+                "effective_only_when_control_matches_receipt_digest": True,
+                "control_preimage_sha256": accepted_preimage_sha256,
+                "source_bindings": dict(evidence.source_bindings),
+                "source_packet_sha256": dict(
+                    evidence.source_packet_sha256
+                ),
+                "source_packet_paths": dict(evidence.source_packet_paths),
+                "recovery_manifest_path": evidence.recovery_manifest_path,
+                "recovery_manifest_sha256": evidence.recovery_manifest_sha256,
+                "control_binding": {
+                    "control_path": control_absolute,
+                    "incident_id": evidence.incident_id.strip(),
+                    "reason": reason,
+                    "dead_man_expires_at": normalized_expiry,
+                    "frozen": False,
+                    "mode": "verified_recovery",
+                    "receipt_path": prepared_receipt_path,
+                },
+            }
+            receipt_ref = write_rearm_receipt(
+                receipt,
+                receipt_dir,
+                now=current,
+                prepared_path=Path(prepared_receipt_path),
+                publish_latest=False,
+            )
+            latest_path = Path(receipt_dir) / "latest.json"
+            prior_latest = (
+                latest_path.read_bytes() if latest_path.exists() else None
+            )
+            publish_rearm_receipt(
+                receipt_ref,
+                receipt_dir,
+                now=current,
+            )
+            try:
+                written = _write_live_control_state_locked(
+                    control_absolute_path,
+                    frozen=False,
+                    reason=reason,
+                    dead_man_expires_at=expires_at,
+                    recovery_receipt_path=receipt_ref["receipt_path"],
+                    recovery_receipt_sha256=receipt_ref["receipt_sha256"],
+                    recovery_incident_id=evidence.incident_id.strip(),
+                    recovery_mode="verified_recovery",
+                    expected_preimage_sha256=accepted_preimage_sha256,
+                    now=current,
+                )
+            except Exception:
+                if prior_latest is None:
+                    with suppress(FileNotFoundError):
+                        latest_path.unlink()
+                else:
+                    atomic_write_text(
+                        latest_path,
+                        prior_latest.decode("utf-8"),
+                    )
+                raise
+            return {
+                **receipt_ref,
+                "control_path": str(written),
+                "expires_at": expires_at.isoformat(),
+                "can_submit_orders": False,
+            }
 
 
 def _parse_time(value: object, *, field: str, now: dt.datetime) -> tuple[dt.datetime | None, str | None]:
@@ -384,6 +569,7 @@ def _promotion_transaction_issues(
     expected_commit_path = phase_path.with_name("promotion_commit.json")
     prepare_ref = promotion.get("promotion_prepare")
     commit_ref = promotion.get("promotion_commit")
+    stage_request = promotion.get("promotion_stage_request")
     state_path = _canonical_reference(promotion.get("state_path"))
     staged_path = _canonical_reference(
         promotion.get("staged_state_path")
@@ -590,8 +776,38 @@ def _promotion_transaction_issues(
         "kind": "promotion_commit_prepare",
         "recovery_commit": dict(recovery_commit),
         "stage_path": str(staged_path),
+        "generated_at": canonical_state.get("generated_at"),
+        "arm_live": True,
+        "ci_green": True,
+        "expected_raw_stage_sha256": prepare.get(
+            "expected_raw_stage_sha256"
+        ),
+        "expected_stage_sha256": staged_sha256,
         "can_submit_orders": False,
         "execution_authority": "none",
+    }
+    expected_stage_request = {
+        "commit_id": recovery_commit.get("commit_id"),
+        "prepare_path": str(expected_prepare_path),
+        "prepare_sha256": prepare_ref["sha256"],
+        "stage_path": str(staged_path),
+        "expected_raw_stage_sha256": prepare.get(
+            "expected_raw_stage_sha256"
+        ),
+        "expected_stage_sha256": staged_sha256,
+        "generated_at": canonical_state.get("generated_at"),
+        "canonical_path": str(state_path),
+        "canonical_before_sha256": recovery_commit.get(
+            "canonical_before_sha256"
+        ),
+        "report_sha256": recovery_commit.get("report_sha256"),
+        "envelope_sha256": recovery_commit.get("envelope_sha256"),
+        "focused_sha256": recovery_commit.get("focused_sha256"),
+        "reconciliation_sha256": recovery_commit.get(
+            "reconciliation_sha256"
+        ),
+        "arm_live": True,
+        "ci_green": True,
     }
     expected_receipt = {
         "schema_version": "tradingagents.promotion_commit.v1",
@@ -609,8 +825,13 @@ def _promotion_transaction_issues(
         "can_submit_orders": False,
         "execution_authority": "none",
     }
-    if prepare != expected_prepare:
+    if (
+        _sha256_reference(prepare.get("expected_raw_stage_sha256")) is None
+        or prepare != expected_prepare
+    ):
         issues.append("promotion prepare receipt binding is invalid")
+    if stage_request != expected_stage_request:
+        issues.append("promotion stage request binding is invalid")
     if receipt != expected_receipt:
         issues.append("promotion commit receipt binding is invalid")
     source = (
