@@ -324,16 +324,11 @@ def test_production_recovery_request_uses_fixed_structured_adapters(tmp_path):
         repo_root=tmp_path,
     )
 
-    assert request["incident_id"].startswith("self-heal-")
-    assert request["bindings"]["symbol"] == "NFLX"
-    assert set(request["adapters"]) == {
-        "resolve_authority",
-        "regenerate_evidence",
-        "sync_promotion",
-        "reconcile",
-        "focused_verify",
+    assert request == {
+        "ready": False,
+        "outcome": "transient",
+        "detail": "canonical recovery context is incomplete",
     }
-    assert request["adapters"]["resolve_authority"]({"phase": "resolve_authority"})["outcome"] == "failed"
 
 
 def test_production_request_preserves_msft_and_rejects_preassembled_packets(tmp_path):

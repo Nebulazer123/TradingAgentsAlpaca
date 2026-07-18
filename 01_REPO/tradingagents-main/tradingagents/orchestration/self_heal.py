@@ -11,6 +11,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -357,6 +358,17 @@ def _read_recovery_state(path: Path) -> tuple[dict[str, Any] | None, str | None]
         return None, "corrupt_state"
     if not set(value["phase_outputs"]).issubset(RECOVERY_PHASES) or not all(isinstance(item, Mapping) and isinstance(item.get("path"), str) and isinstance(item.get("sha256"), str) and len(item["sha256"]) == 64 for item in value["phase_outputs"].values()):
         return None, "corrupt_state"
+    intent = value.get("rearm_intent")
+    if intent is not None and (
+        not isinstance(intent, Mapping)
+        or not all(
+            isinstance(intent.get(key), str) and intent[key]
+            for key in ("incident_id", "manifest_path", "manifest_sha256", "control_path", "repairer_run_id", "verifier_run_id")
+        )
+        or not isinstance(intent.get("source_packet_paths"), Mapping)
+        or not isinstance(intent.get("source_packet_sha256"), Mapping)
+    ):
+        return None, "corrupt_state"
     return value, None
 
 
@@ -420,7 +432,12 @@ def _release_recovery_lock(path: Path, descriptor: int, token: str | None) -> No
 
 
 def _recovery_failure(kind: str, detail: str, *, external: bool = False) -> dict[str, Any]:
-    return {"kind": kind, "detail": detail[:500], "external": external}
+    return {"kind": kind, "detail": _redact_recovery_detail(detail)[:500], "external": external}
+
+
+def _redact_recovery_detail(value: object) -> str:
+    text = str(value)
+    return re.sub(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", text)
 
 
 def _phase_path(run_root: Path, phase: str) -> Path:
@@ -584,14 +601,16 @@ def build_production_recovery_request(
     context = signal.get("recovery_context")
     required = {"symbol", "broker_account", "environment", "source_revision", "supervisor_path", "advisory_path", "hourly_dir", "report_path", "envelope_path", "promotion_state_path", "reconciliation_packet_paths"}
     if not isinstance(context, Mapping) or not required.issubset(context):
-        context = {}
-    symbol = str(context.get("symbol") or signal.get("symbol") or "missing_symbol").upper()
+        return {"ready": False, "outcome": "transient", "detail": "canonical recovery context is incomplete"}
+    symbol = str(context.get("symbol") or signal.get("symbol") or "").upper()
+    if not symbol or any(not isinstance(context.get(key), str) or not str(context[key]).strip() for key in ("broker_account", "environment", "source_revision")):
+        return {"ready": False, "outcome": "transient", "detail": "canonical recovery bindings are incomplete"}
     bindings = {
         "incident_id": incident_id,
         "symbol": symbol,
-        "broker_account": str(context.get("broker_account") or "missing_account"),
-        "environment": str(context.get("environment") or "missing_environment"),
-        "source_revision": str(context.get("source_revision") or "missing_revision"),
+        "broker_account": str(context["broker_account"]),
+        "environment": str(context["environment"]),
+        "source_revision": str(context["source_revision"]),
     }
 
     def unavailable(phase: str, detail: str) -> dict[str, Any]:
@@ -606,9 +625,12 @@ def build_production_recovery_request(
         return path if _path_under(path, root) else None
 
     def run_json(phase: str, argv: list[str]) -> dict[str, Any]:
-        result = command_runner(argv, cwd=str(root), capture_output=True, text=True, timeout=120)
+        try:
+            result = command_runner(argv, cwd=str(root), capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return unavailable(phase, _redact_recovery_detail(error))
         if int(getattr(result, "returncode", 1)) != 0:
-            return unavailable(phase, _compact_text(getattr(result, "stderr", "command failed")))
+            return unavailable(phase, _redact_recovery_detail(_compact_text(getattr(result, "stderr", "command failed"))))
         try:
             payload = json.loads(str(getattr(result, "stdout", "")))
         except json.JSONDecodeError:
@@ -668,10 +690,16 @@ def build_production_recovery_request(
         return path if _path_under(path, root) else None
 
     def focused(_arguments: Mapping[str, Any]) -> dict[str, Any]:
-        revision = command_runner(["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, timeout=30)
+        try:
+            revision = command_runner(["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return unavailable("focused_verify", _redact_recovery_detail(error))
         if int(getattr(revision, "returncode", 1)) != 0 or str(getattr(revision, "stdout", "")).strip() != bindings["source_revision"]:
             return unavailable("focused_verify", "checkout source revision does not match recovery binding")
-        result = command_runner([sys.executable, "-m", "pytest", "tests/test_recovery_coordinator.py", "tests/test_self_heal_recovery.py", "-q"], cwd=str(root), capture_output=True, text=True, timeout=120)
+        try:
+            result = command_runner([sys.executable, "-m", "pytest", "tests/test_recovery_coordinator.py", "tests/test_self_heal_recovery.py", "-q"], cwd=str(root), capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return unavailable("focused_verify", _redact_recovery_detail(error))
         if int(getattr(result, "returncode", 1)) != 0:
             return unavailable("focused_verify", "fixed focused verification failed")
         return {
@@ -680,12 +708,13 @@ def build_production_recovery_request(
                 "schema_version": "tradingagents.recovery_phase.v1",
                 "focused_tests_passed": True,
                 "passing_tests": ["tests/test_recovery_coordinator.py", "tests/test_self_heal_recovery.py"],
-                "verifier_run_id": f"self-heal-verifier-{hashlib.sha256(signature.encode()).hexdigest()[:16]}",
+                "verifier_run_id": f"self-heal-verifier-{secrets.token_hex(8)}",
                 "verifier_role_id": "independent_verifier",
             }
         }
 
     return {
+        "ready": True,
         "incident_id": incident_id,
         "bindings": bindings,
         "owner_run_id": f"self-heal-owner-{hashlib.sha256((signature + ':owner').encode()).hexdigest()[:16]}",
@@ -887,6 +916,16 @@ def coordinate_verified_recovery(
                     if isinstance(prior_intent, Mapping):
                         control_state, control_issues = load_live_control_state(control_path, now=current)
                         if control_state is not None and not control_issues and control_state.get("frozen") is False and control_state.get("recovery_incident_id") == incident_id and control_state.get("recovery_receipt_path"):
+                            receipt = _read_json(Path(control_state["recovery_receipt_path"]))
+                            required_intent = {"incident_id": incident_id, "manifest_path": state["phase_outputs"]["manifest"]["path"], "manifest_sha256": state["phase_outputs"]["manifest"]["sha256"], "control_path": str(Path(control_path).resolve())}
+                            if (
+                                any(prior_intent.get(key) != value for key, value in required_intent.items())
+                                or receipt.get("recovery_manifest_path") != required_intent["manifest_path"]
+                                or receipt.get("recovery_manifest_sha256") != required_intent["manifest_sha256"]
+                                or receipt.get("source_packet_sha256") != prior_intent.get("source_packet_sha256")
+                                or receipt.get("source_packet_paths") != prior_intent.get("source_packet_paths")
+                            ):
+                                raise ValueError("rearm intent does not match active receipt")
                             packet = {"kind": "verified_rearm_result", "receipt_path": control_state["recovery_receipt_path"], "receipt_sha256": control_state["recovery_receipt_sha256"], "can_submit_orders": False, "recovered_after_crash": True}
                             packet = _canonical_packet(packet, canonical_bindings, current)
                             packet.update({"phase": phase, "recovery_run_id": state["recovery_run_id"], "owner_run_id": state["owner_run_id"], "owner_role": state["owner_role"], "schema_version": "tradingagents.recovery_phase.v1"})
@@ -922,6 +961,10 @@ def coordinate_verified_recovery(
                         "manifest_sha256": state["phase_outputs"]["manifest"]["sha256"],
                         "control_path": str(Path(control_path).resolve()),
                         "idempotency_key": idempotency_key,
+                        "source_packet_paths": dict(evidence.source_packet_paths),
+                        "source_packet_sha256": dict(evidence.source_packet_sha256),
+                        "repairer_run_id": evidence.repairer_run_id,
+                        "verifier_run_id": evidence.verifier_run_id,
                     }
                     _write_recovery_state(state_path, state)
                     if callable(fault_hook):
@@ -1881,12 +1924,16 @@ def execute_self_heal_plan(
             continue
         if signal.get("classification") == "recoverable_integrity" and signal.get("status") == "owned_recovery_ready":
             request = build_production_recovery_request(signal, repo_root=root)
-            recovery = coordinate_verified_recovery(
-                **request,
-                control_path=root / "results" / "policy" / "live_control.json",
-                receipt_dir=root / "results" / "control_plane" / "rearm_receipts",
-                recovery_root=root / "results" / "control_plane" / "recovery",
-            )
+            if request.get("ready") is not True:
+                recovery = {"status": "transient_context_unavailable", "detail": request.get("detail")}
+            else:
+                request.pop("ready", None)
+                recovery = coordinate_verified_recovery(
+                    **request,
+                    control_path=root / "results" / "policy" / "live_control.json",
+                    receipt_dir=root / "results" / "control_plane" / "rearm_receipts",
+                    recovery_root=root / "results" / "control_plane" / "recovery",
+                )
             signal["recovery_result"] = recovery
             signal["status"] = "owned_recovery_dispatched"
             signal["recovery_status"] = recovery.get("status")
