@@ -8,6 +8,7 @@ itself.
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -388,6 +389,17 @@ def _recovery_lock(
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             try:
+                probe = os.open(path, os.O_RDONLY)
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(probe)
+                    return None, "owner_busy", None
+                fcntl.flock(probe, fcntl.LOCK_UN)
+                os.close(probe)
+            except OSError:
+                return None, "owner_busy", None
+            try:
                 existing = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 return None, "corrupt_lock", None
@@ -408,6 +420,7 @@ def _recovery_lock(
             continue
         encoded = _recovery_json(metadata)
         try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if os.write(descriptor, encoded) != len(encoded):
                 raise OSError("incomplete recovery lock write")
             os.fsync(descriptor)
@@ -421,6 +434,8 @@ def _recovery_lock(
 
 
 def _release_recovery_lock(path: Path, descriptor: int, token: str | None) -> None:
+    with suppress(OSError):
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
     os.close(descriptor)
     try:
         current = json.loads(path.read_text(encoding="utf-8"))
@@ -437,7 +452,12 @@ def _recovery_failure(kind: str, detail: str, *, external: bool = False) -> dict
 
 def _redact_recovery_detail(value: object) -> str:
     text = str(value)
-    return re.sub(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", text)
+    text = re.sub(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+", r"\1=[REDACTED]", text)
+    text = re.sub(r"(?i)authorization:\s*bearer\s+[^\s,;]+", "Authorization: Bearer [REDACTED]", text)
+    text = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]+", "sk-[REDACTED]", text)
+    text = re.sub(r"(?i)(https?://[^\s/@:]+:)[^@\s]+@", r"\1[REDACTED]@", text)
+    return re.sub(r"(?i)([?&](?:api[_-]?key|token|password|secret)=)[^&\s]+", r"\1[REDACTED]", text)
 
 
 def _phase_path(run_root: Path, phase: str) -> Path:
@@ -599,6 +619,8 @@ def build_production_recovery_request(
     signature = _trigger_signature(signal)
     incident_id = f"self-heal-{hashlib.sha256(signature.encode()).hexdigest()[:20]}"
     context = signal.get("recovery_context")
+    if not isinstance(context, Mapping):
+        context = derive_production_recovery_context(signal, repo_root=root, command_runner=command_runner)
     required = {"symbol", "broker_account", "environment", "source_revision", "supervisor_path", "advisory_path", "hourly_dir", "report_path", "envelope_path", "promotion_state_path", "reconciliation_packet_paths"}
     if not isinstance(context, Mapping) or not required.issubset(context):
         return {"ready": False, "outcome": "transient", "detail": "canonical recovery context is incomplete"}
@@ -639,7 +661,8 @@ def build_production_recovery_request(
 
     def authority(_arguments: Mapping[str, Any]) -> dict[str, Any]:
         supervisor_path, advisory_path = context_path("supervisor_path"), context_path("advisory_path")
-        supervisor, advisory = _read_json(supervisor_path) if supervisor_path else {}, _read_json(advisory_path) if advisory_path else {}
+        supervisor = context.get("supervisor_record") if isinstance(context.get("supervisor_record"), Mapping) else (_read_json(supervisor_path) if supervisor_path else {})
+        advisory = context.get("advisory_record") if isinstance(context.get("advisory_record"), Mapping) else (_read_json(advisory_path) if advisory_path else {})
         if not supervisor_path or not advisory_path or not supervisor or not advisory:
             return unavailable("resolve_authority", "canonical supervisor/advisory packets are unavailable")
         verdict = resolve_exit_authority(supervisor_review=supervisor, advisory_analysis=advisory)
@@ -721,6 +744,60 @@ def build_production_recovery_request(
         "recovery_run_id": f"self-heal-run-{hashlib.sha256((signature + ':run').encode()).hexdigest()[:16]}",
         "idempotency_key": f"self-heal-delivery-{hashlib.sha256(signature.encode()).hexdigest()[:16]}",
         "adapters": {"resolve_authority": authority, "regenerate_evidence": regenerate, "sync_promotion": promotion, "reconcile": reconcile, "focused_verify": focused},
+    }
+
+
+def derive_production_recovery_context(
+    signal: Mapping[str, Any], *, repo_root: str | Path, command_runner: Any = subprocess.run
+) -> dict[str, Any] | None:
+    """Resolve only canonical, repo-contained recovery evidence for a signal."""
+    root = Path(repo_root).resolve()
+    flagged = signal.get("path")
+    candidates = [root / "results" / "loss_review_evidence" / "latest.json"]
+    if isinstance(flagged, str) and not Path(flagged).is_absolute():
+        candidates.insert(0, (root / flagged).resolve())
+    evidence_path = next((path.resolve() for path in candidates if _path_under(path, root) and path.exists()), None)
+    if evidence_path is None:
+        return None
+    envelope = _read_json(evidence_path)
+    payload = envelope.get("payload") if isinstance(envelope.get("payload"), Mapping) else envelope
+    supervisor = payload.get("supervisor_review_authority")
+    advisory = payload.get("advisory_analysis")
+    hourly_ref = payload.get("hourly_packet_path")
+    symbol = str(payload.get("symbol") or envelope.get("symbol") or signal.get("symbol") or "").upper()
+    account = str(payload.get("broker_account") or payload.get("account") or envelope.get("broker_account") or "")
+    if not symbol or not account or not isinstance(supervisor, Mapping) or not isinstance(advisory, Mapping) or not isinstance(hourly_ref, str):
+        return None
+    hourly_packet = (root / hourly_ref).resolve() if not Path(hourly_ref).is_absolute() else Path(hourly_ref).resolve()
+    required_paths = {
+        "hourly_dir": hourly_packet.parent,
+        "report_path": root / "results" / "paper_strategy_tournament" / "latest.json",
+        "envelope_path": root / "config" / "risk_envelope.yaml",
+        "promotion_state_path": root / "results" / "policy" / "promotion_state.json",
+    }
+    if not _path_under(hourly_packet, root) or not all(_path_under(path, root) and path.exists() for path in required_paths.values()):
+        return None
+    try:
+        revision = command_runner(["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    source_revision = str(getattr(revision, "stdout", "")).strip()
+    if int(getattr(revision, "returncode", 1)) != 0 or not source_revision:
+        return None
+    return {
+        "symbol": symbol,
+        "broker_account": account,
+        "environment": "production",
+        "source_revision": source_revision,
+        "supervisor_path": str(evidence_path),
+        "advisory_path": str(evidence_path),
+        "supervisor_record": dict(supervisor),
+        "advisory_record": dict(advisory),
+        "hourly_dir": str(required_paths["hourly_dir"]),
+        "report_path": str(required_paths["report_path"]),
+        "envelope_path": str(required_paths["envelope_path"]),
+        "promotion_state_path": str(required_paths["promotion_state_path"]),
+        "reconciliation_packet_paths": [str(hourly_packet)],
     }
 
 
