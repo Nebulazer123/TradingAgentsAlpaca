@@ -38,7 +38,7 @@ def load_live_control_state(
         return None, [f"live control state missing at {control_path}"]
     try:
         state = json.loads(control_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         return None, [f"live control state is invalid JSON: {exc}"]
     if not isinstance(state, dict):
         return None, ["live control state must be a JSON object"]
@@ -63,12 +63,12 @@ def load_live_control_state(
     if receipt_path is not None or receipt_digest is not None:
         if not isinstance(receipt_path, str) or not receipt_path.strip():
             issues.append("verified recovery control missing receipt path")
-        elif not isinstance(receipt_digest, str) or len(receipt_digest) != 64:
+        elif not isinstance(receipt_digest, str) or len(receipt_digest) != 64 or any(char not in "0123456789abcdef" for char in receipt_digest):
             issues.append("verified recovery control missing receipt digest")
+        elif not Path(receipt_path).is_absolute():
+            issues.append("verified recovery receipt path must be absolute")
         else:
             candidate = Path(receipt_path)
-            if not candidate.is_absolute():
-                candidate = control_path.parent / candidate
             try:
                 raw_receipt = candidate.read_bytes()
                 actual_digest = hashlib.sha256(raw_receipt).hexdigest()
@@ -80,22 +80,52 @@ def load_live_control_state(
                     issues.append("verified recovery receipt digest mismatch")
                 if not isinstance(receipt, dict):
                     issues.append("verified recovery receipt must be a JSON object")
+                elif receipt.get("schema_version") != 1:
+                    issues.append("verified recovery receipt has wrong schema")
                 elif receipt.get("kind") != "verified_rearm_receipt":
                     issues.append("verified recovery receipt has wrong kind")
                 elif receipt.get("effective_only_when_control_matches_receipt_digest") is not True:
                     issues.append("verified recovery receipt lacks effective binding")
-                elif receipt.get("can_submit_orders") is not False or receipt.get("broker_write_calls") != 0:
+                elif receipt.get("can_submit_orders") is not False or type(receipt.get("broker_write_calls")) is not int or receipt.get("broker_write_calls") != 0:
                     issues.append("verified recovery receipt has unsafe authority fields")
+                elif (
+                    not isinstance(receipt.get("source_bindings"), dict)
+                    or set(receipt["source_bindings"]) != {"incident_id", "symbol", "broker_account", "environment", "source_revision"}
+                    or not isinstance(receipt.get("source_packet_sha256"), dict)
+                    or not isinstance(receipt.get("source_packet_paths"), dict)
+                    or set(receipt["source_packet_sha256"]) != {"incident", "reconciliation", "promotion", "focused"}
+                    or set(receipt["source_packet_paths"]) != {"incident", "reconciliation", "promotion", "focused"}
+                ):
+                    issues.append("verified recovery receipt lacks source proof")
                 else:
                     receipt_expires_raw = receipt.get("expires_at")
+                    receipt_issued_raw = receipt.get("issued_at")
                     receipt_expires_at = parse_control_time(str(receipt_expires_raw or ""))
+                    receipt_issued_at = parse_control_time(str(receipt_issued_raw or ""))
+                    ttl_minutes = receipt.get("ttl_minutes")
                     if (
                         not isinstance(receipt_expires_raw, str)
+                        or not isinstance(receipt_issued_raw, str)
                         or not (receipt_expires_raw.endswith("Z") or "+" in receipt_expires_raw[10:])
+                        or not (receipt_issued_raw.endswith("Z") or "+" in receipt_issued_raw[10:])
                         or receipt_expires_at is None
+                        or receipt_issued_at is None
+                        or type(ttl_minutes) is not int
+                        or receipt_issued_at + datetime.timedelta(minutes=ttl_minutes) != receipt_expires_at
                         or receipt_expires_at <= current
                     ):
                         issues.append("verified recovery receipt is expired or invalid")
+                    binding = receipt.get("control_binding")
+                    if not isinstance(binding, dict) or binding != {
+                        "control_path": str(control_path.resolve()),
+                        "incident_id": state.get("recovery_incident_id"),
+                        "reason": state.get("reason"),
+                        "dead_man_expires_at": state.get("dead_man_expires_at"),
+                        "frozen": False,
+                        "mode": state.get("recovery_mode"),
+                        "receipt_path": receipt_path,
+                    }:
+                        issues.append("verified recovery receipt control binding mismatch")
 
     return state, issues
 
@@ -108,6 +138,8 @@ def write_live_control_state(
     dead_man_expires_at: datetime.datetime | None = None,
     recovery_receipt_path: str | None = None,
     recovery_receipt_sha256: str | None = None,
+    recovery_incident_id: str | None = None,
+    recovery_mode: str | None = None,
 ) -> Path:
     control_path = Path(path)
     control_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,5 +159,9 @@ def write_live_control_state(
             raise ValueError("recovery_receipt_sha256 must be a SHA-256 digest")
         payload["recovery_receipt_path"] = recovery_receipt_path
         payload["recovery_receipt_sha256"] = recovery_receipt_sha256
+        if not isinstance(recovery_incident_id, str) or not recovery_incident_id.strip() or recovery_mode != "verified_recovery":
+            raise ValueError("verified recovery control requires incident and mode")
+        payload["recovery_incident_id"] = recovery_incident_id.strip()
+        payload["recovery_mode"] = recovery_mode
     atomic_write_text(control_path, json.dumps(payload, indent=2))
     return control_path

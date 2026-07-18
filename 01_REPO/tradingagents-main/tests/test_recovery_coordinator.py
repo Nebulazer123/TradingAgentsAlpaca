@@ -1,13 +1,16 @@
 import datetime as dt
 import hashlib
 import json
+import tempfile
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
+from tradingagents.orchestration.incidents import Incident, IncidentStage, transition_incident
 from tradingagents.orchestration.recovery import (
     RecoveryEvidence,
     evaluate_rearm_readiness,
@@ -35,6 +38,19 @@ def _evidence(**overrides):
         "broker_write_calls": 0,
         "external_blockers": (),
     }
+    source_dir = Path(tempfile.mkdtemp())
+    source_paths = {}
+    source_hashes = {}
+    for name in ("incident", "reconciliation", "promotion", "focused"):
+        path = source_dir / f"{name}.json"
+        path.write_text("{}", encoding="utf-8")
+        source_paths[name] = str(path.resolve())
+        source_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    values.update({
+        "source_bindings": {"incident_id": "inc-nflx-rule-conflict", "symbol": "NFLX", "broker_account": "live", "environment": "test", "source_revision": "abc"},
+        "source_packet_paths": source_paths,
+        "source_packet_sha256": source_hashes,
+    })
     values.update(overrides)
     return RecoveryEvidence(**values)
 
@@ -197,7 +213,7 @@ def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
     bindings = {"incident_id": "inc-1", "symbol": "NFLX", "broker_account": "live", "environment": "production", "source_revision": "abc123"}
     packets = {
         "incident": {**bindings, "stage": "ready", "root_cause_resolved": True, "repairer_role_id": "repair", "generated_at": now.isoformat()},
-        "focused": {"focused_tests_passed": True, "passing_tests": ["tests/test_x.py::test_ok"], "verifier_role_id": "verify", "generated_at": now.isoformat()},
+        "focused": {"focused_tests_passed": True, "passing_tests": ["tests/test_x.py::test_ok"], "verifier_role_id": "verify", "source_revision": "abc123", "generated_at": now.isoformat()},
         "promotion": {"promotion_evidence_fresh": True, "issues": [], "generated_at": now.isoformat()},
         "reconciliation": {"read_only": True, "execution_authority": "none", "can_submit_orders": False, "matched": True, "issues": [], "broker_write_calls": 0, "generated_at": now.isoformat()},
     }
@@ -206,7 +222,7 @@ def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
         path = tmp_path / f"{name}.json"
         path.write_text(json.dumps(packet), encoding="utf-8")
         paths[name] = path
-    manifest = {**bindings, "packet_sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}}
+    manifest = {**bindings, "schema_version": "tradingagents.recovery_manifest.v1", "kind": "verified_recovery_manifest", "generated_at": now.isoformat(), "packet_sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}}
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     control_path = tmp_path / "control.json"
@@ -322,3 +338,45 @@ def test_recovery_module_has_no_broker_or_order_imports():
     source = Path(__import__("tradingagents.orchestration.recovery", fromlist=["recovery"]).__file__).read_text(encoding="utf-8")
     assert "tradingagents.brokers" not in source
     assert "submit_order(" not in source
+
+
+def test_direct_evidence_cannot_bypass_source_packet_proof(tmp_path):
+    control_path = tmp_path / "control.json"
+    write_live_control_state(control_path, frozen=True, reason="incident", dead_man_expires_at=NOW + dt.timedelta(days=1))
+
+    evidence = _evidence(source_bindings={}, source_packet_paths={}, source_packet_sha256={})
+    with pytest.raises(ValueError, match="source"):
+        rearm_after_verified_recovery(evidence=evidence, control_path=control_path, receipt_dir=tmp_path / "rearm", now=NOW)
+
+
+def test_relative_receipt_and_boolean_write_count_close_control(tmp_path):
+    control_path = tmp_path / "control.json"
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text(json.dumps({"schema_version": 1, "kind": "verified_rearm_receipt", "effective_only_when_control_matches_receipt_digest": True, "can_submit_orders": False, "broker_write_calls": False, "issued_at": NOW.isoformat(), "expires_at": (NOW + dt.timedelta(minutes=1)).isoformat()}), encoding="utf-8")
+    control_path.write_text(json.dumps({"frozen": False, "reason": "verified recovery inc", "dead_man_expires_at": (NOW + dt.timedelta(minutes=1)).isoformat(), "recovery_receipt_path": "receipt.json", "recovery_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest()}), encoding="utf-8")
+
+    _state, issues = load_live_control_state(control_path, now=NOW)
+
+    assert any("receipt" in issue for issue in issues)
+
+
+def test_expired_frozen_control_can_recover_with_current_evidence(tmp_path):
+    control_path = tmp_path / "control.json"
+    write_live_control_state(control_path, frozen=True, reason="safe expired freeze", dead_man_expires_at=NOW - dt.timedelta(days=1))
+
+    result = rearm_after_verified_recovery(evidence=_evidence(), control_path=control_path, receipt_dir=tmp_path / "rearm", now=NOW)
+
+    assert result["can_submit_orders"] is False
+
+
+def test_actual_incident_lifecycle_ready_shape_establishes_resolution():
+    incident = Incident.open(incident_id="inc-actual", kind="rule", subject="NFLX", owner_role="repair", now=NOW)
+    incident = transition_incident(incident, IncidentStage.DIAGNOSING, now=NOW)
+    incident = transition_incident(incident, IncidentStage.VERIFYING, now=NOW)
+    incident = transition_incident(incident, IncidentStage.READY, now=NOW)
+    incident = replace(incident, evidence_refs=("evidence.json",))
+    payload = incident.to_dict()
+
+    assert payload["stage"] == "ready"
+    assert any(event["to_stage"] == "ready" for event in payload["history"])
+    assert payload["subject"] == "NFLX"

@@ -3800,7 +3800,12 @@ def policy_refresh_live_control(
 ):
     """Refresh the tiny-live dead-man control state without submitting orders."""
     existing, existing_issues = load_live_control_state(control_path)
-    if existing is None or existing_issues or existing.get("frozen") is True:
+    if (
+        existing is None
+        or existing_issues
+        or existing.get("frozen") is True
+        or existing.get("recovery_mode") == "verified_recovery"
+    ):
         payload = {
             "refreshed": False,
             "frozen": existing.get("frozen") if isinstance(existing, dict) else True,
