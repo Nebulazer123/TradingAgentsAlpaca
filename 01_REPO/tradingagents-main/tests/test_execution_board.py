@@ -9,6 +9,7 @@ from tradingagents.evals.execution_board import (
     load_hourly_packets,
     write_execution_board_review,
 )
+from tradingagents.policy.decision_authority import bounded_exit_authority_record
 
 runner = CliRunner()
 
@@ -222,6 +223,19 @@ def test_execution_board_accepts_approved_loss_exit_review_evidence(tmp_path):
 def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
     hourly = tmp_path / "hourly"
     evidence_dir = tmp_path / "loss_review_evidence"
+    loss_exit_review = {
+        "symbol": "TSM",
+        "decision_id": "loss-exit-TSM-20260606210521",
+        "allowed": False,
+        "policy_rule_exit": False,
+        "allowed_exit_reason": "",
+        "allowed_exit_reason_source": "",
+        "exit_policy_rule": "",
+        "exit_policy_rationale": "",
+        "blockers": ["allowed loss-exit reason is missing"],
+        "blocked_reasons": ["allowed loss-exit reason is missing"],
+        "source_packet_ids": [],
+    }
     hourly_packet = _write_packet(
         hourly,
         "hourly-supervisor-20260606-210521-309775.json",
@@ -230,6 +244,7 @@ def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
             "decision": "loss-review",
             "actions": [],
             "submitted": [],
+            "evidence": {"loss_exit_review": loss_exit_review},
             "portfolio": {"live": {"unrealized_pl": "-1.88"}},
         },
     )
@@ -243,6 +258,9 @@ def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
                 "symbol": "TSM",
                 "hourly_packet_path": str(hourly_packet),
                 "review_allowed": False,
+                "supervisor_review_authority": bounded_exit_authority_record(
+                    loss_exit_review
+                ),
                 "next_action": "manual_board_review_with_refreshed_evidence_required",
                 "remaining_blockers": [
                     "allowed loss-exit reason is missing",
@@ -268,6 +286,7 @@ def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
         "raw_packet_path": str(evidence_dir / "source-evidence-tsm.json"),
         "hourly_packet_path": str(hourly_packet),
         "matches_review_window": True,
+        "source_binding": {"matched": True, "issue": None},
         "symbol": "TSM",
         "review_allowed": False,
         "next_action": "manual_board_review_with_refreshed_evidence_required",
@@ -290,6 +309,19 @@ def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
 def test_execution_board_names_tradeable_session_when_loss_exit_candidate_ready(tmp_path):
     hourly = tmp_path / "hourly"
     evidence_dir = tmp_path / "loss_review_evidence"
+    loss_exit_review = {
+        "symbol": "TSM",
+        "decision_id": "loss-exit-TSM-20260607065131",
+        "allowed": False,
+        "policy_rule_exit": False,
+        "allowed_exit_reason": "",
+        "allowed_exit_reason_source": "",
+        "exit_policy_rule": "",
+        "exit_policy_rationale": "",
+        "blockers": ["market session is not tradeable for a live loss exit"],
+        "blocked_reasons": ["market session is not tradeable for a live loss exit"],
+        "source_packet_ids": [],
+    }
     hourly_packet = _write_packet(
         hourly,
         "hourly-supervisor-20260607-065131-399090.json",
@@ -298,6 +330,7 @@ def test_execution_board_names_tradeable_session_when_loss_exit_candidate_ready(
             "decision": "loss-review",
             "actions": [],
             "submitted": [],
+            "evidence": {"loss_exit_review": loss_exit_review},
             "portfolio": {"live": {"unrealized_pl": "-1.88"}},
         },
     )
@@ -311,6 +344,9 @@ def test_execution_board_names_tradeable_session_when_loss_exit_candidate_ready(
                 "symbol": "TSM",
                 "hourly_packet_path": str(hourly_packet),
                 "review_allowed": False,
+                "supervisor_review_authority": bounded_exit_authority_record(
+                    loss_exit_review
+                ),
                 "next_action": "manual_board_review_with_refreshed_evidence_required",
                 "remaining_blockers": [
                     "market session is not tradeable for a live loss exit",

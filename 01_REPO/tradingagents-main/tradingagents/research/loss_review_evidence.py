@@ -11,6 +11,7 @@ from typing import Any
 from tradingagents.dataflows._official_common import evidence_packet, request_hash
 from tradingagents.policy.decision_authority import (
     ExitAuthorityVerdict,
+    bounded_exit_authority_record,
     resolve_exit_authority,
 )
 from tradingagents.research.provider_orchestrator import TickerProviderResearchResult
@@ -717,10 +718,7 @@ def build_loss_review_evidence_packet(
         "hourly_decision": hourly_packet.get("decision"),
         "submitted_order_count": len(hourly_packet.get("submitted") or []),
         "review_allowed": review.get("allowed") is True,
-        "supervisor_review_authority": {
-            key: review.get(key)
-            for key in ("allowed", "policy_rule_exit", "allowed_exit_reason")
-        },
+        "supervisor_review_authority": bounded_exit_authority_record(review),
         "supervisor_review_source_packet_ids": _strings(review.get("source_packet_ids")),
         "source_packet_ids": source_ids,
         "provider_summary_packet_id": (
@@ -746,7 +744,8 @@ def build_loss_review_evidence_packet(
         },
         "next_action": (
             "pre_registered_policy_approval_preserved"
-            if advisory_analysis.get("review_allowed_after_refresh") is True
+            if advisory_analysis.get("authority_source")
+            == "pre_registered_policy_rule"
             else (
                 "manual_board_review_with_refreshed_evidence_required"
                 if resolved_blockers
