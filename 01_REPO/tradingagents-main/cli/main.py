@@ -8896,6 +8896,21 @@ def alpaca_check():
     console.print(table)
 
 
+def _write_reconciliation_packet(
+    output_dir: Path,
+    *,
+    stem: str,
+    packet: dict,
+) -> tuple[Path, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = _unique_packet_path(output_dir, stem)
+    packet["json_path"] = str(output_path)
+    json_text = json.dumps(packet, indent=2, sort_keys=True) + "\n"
+    _atomic_write_text(output_path, json_text)
+    _atomic_write_text(output_dir / "latest.json", json_text)
+    return output_path, json_text
+
+
 @alpaca_app.command("reconcile-orcl-incident")
 def alpaca_reconcile_orcl_incident(
     order_packet_paths: list[Path] = typer.Argument(None),
@@ -8942,12 +8957,11 @@ def alpaca_reconcile_orcl_incident(
         "packet_discovery_issues": discovery_issues,
         **payload,
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"orcl-reconciliation-{generated_at:%Y%m%d-%H%M%S}.json"
-    packet["json_path"] = str(output_path)
-    json_text = json.dumps(packet, indent=2, sort_keys=True)
-    output_path.write_text(json_text, encoding="utf-8")
-    (output_dir / "latest.json").write_text(json_text, encoding="utf-8")
+    output_path, json_text = _write_reconciliation_packet(
+        output_dir,
+        stem=f"orcl-reconciliation-{generated_at:%Y%m%d-%H%M%S}",
+        packet=packet,
+    )
     if json_output:
         typer.echo(json_text)
         return
@@ -8995,12 +9009,11 @@ def alpaca_reconcile_symbol_incident(
         "execution_authority": "none",
         **asdict(reconciliation),
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"symbol-reconciliation-{generated_at:%Y%m%d-%H%M%S}.json"
-    packet["json_path"] = str(output_path)
-    json_text = json.dumps(packet, indent=2, sort_keys=True)
-    output_path.write_text(json_text, encoding="utf-8")
-    (output_dir / "latest.json").write_text(json_text, encoding="utf-8")
+    output_path, json_text = _write_reconciliation_packet(
+        output_dir,
+        stem=f"symbol-reconciliation-{generated_at:%Y%m%d-%H%M%S}",
+        packet=packet,
+    )
     if json_output:
         typer.echo(json_text)
         return

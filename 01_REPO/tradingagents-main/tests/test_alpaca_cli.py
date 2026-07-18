@@ -57,6 +57,18 @@ PREMARKET_FRESH_VALIDATION_ITEMS = [
 ]
 
 
+def _order_for_reconciliation(symbol: str, client_order_id: str) -> dict:
+    return {
+        "client_order_id": client_order_id,
+        "symbol": symbol,
+        "side": "buy",
+        "type": "limit",
+        "qty": "1",
+        "limit_price": "10.00",
+        "status": "accepted",
+    }
+
+
 def _premarket_instructions(symbol: str = "ORCL") -> dict:
     return {
         "summary": "Validate fresh state before any live action.",
@@ -556,6 +568,166 @@ def test_alpaca_reconcile_symbol_incident_writes_generic_zero_write_packet(monke
     assert payload["matched"] is True
     assert live_client.write_calls == []
     assert (tmp_path / "reconciliation" / "latest.json").exists()
+
+
+def test_alpaca_reconcile_symbol_incident_invalid_expected_quantity_writes_fail_closed_packet(
+    monkeypatch, tmp_path
+):
+    class _NoReadClient:
+        def __init__(self):
+            self.read_calls = []
+            self.write_calls = []
+
+        def list_positions(self):
+            self.read_calls.append("list_positions")
+            raise AssertionError("invalid expected quantity must prevent broker reads")
+
+        def submit_order(self, *args, **kwargs):
+            self.write_calls.append(("submit", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+        def cancel_order(self, *args, **kwargs):
+            self.write_calls.append(("cancel", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+        def replace_order(self, *args, **kwargs):
+            self.write_calls.append(("replace", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+        def close_position(self, *args, **kwargs):
+            self.write_calls.append(("close", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+    live_client = _NoReadClient()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: live_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "reconcile-symbol-incident",
+            "--symbol",
+            "NFLX",
+            "--expected-qty",
+            "NaN",
+            "--output-dir",
+            str(tmp_path / "reconciliation"),
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["matched"] is False
+    assert payload["issues"] == ["invalid expected quantity: NaN"]
+    assert payload["broker_write_calls"] == 0
+    assert live_client.read_calls == []
+    assert live_client.write_calls == []
+
+
+def test_alpaca_reconcile_symbol_incident_uses_unique_atomic_packet_paths(monkeypatch, tmp_path):
+    packet_path = tmp_path / "nflx.json"
+    packet_path.write_text(
+        json.dumps(
+            {
+                "actions": [{"symbol": "NFLX", "account": "live", "idempotency_key": "nflx-1"}],
+                "submitted": [_order_for_reconciliation("NFLX", "nflx-1")],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _Client:
+        def list_positions(self):
+            return [{"symbol": "NFLX", "qty": "1"}]
+
+        def list_orders(self, status="all"):
+            return [_order_for_reconciliation("NFLX", "nflx-1")]
+
+        def get_order_by_client_order_id(self, _client_order_id):
+            return _order_for_reconciliation("NFLX", "nflx-1")
+
+    class _FixedDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 1, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", _Client)
+    monkeypatch.setattr(cli_main.datetime, "datetime", _FixedDateTime)
+    output_dir = tmp_path / "reconciliation"
+    args = [
+        "alpaca",
+        "reconcile-symbol-incident",
+        "--symbol",
+        "NFLX",
+        "--packet-path",
+        str(packet_path),
+        "--expected-qty",
+        "1",
+        "--output-dir",
+        str(output_dir),
+        "--json-output",
+    ]
+
+    first = runner.invoke(app, args)
+    second = runner.invoke(app, args)
+
+    assert first.exit_code == second.exit_code == 0
+    first_payload = json.loads(first.stdout)
+    second_payload = json.loads(second.stdout)
+    assert first_payload["json_path"] != second_payload["json_path"]
+    assert Path(first_payload["json_path"]).read_text(encoding="utf-8").endswith("\n")
+    assert json.loads((output_dir / "latest.json").read_text(encoding="utf-8")) == second_payload
+
+
+def test_reconciliation_packet_atomic_write_failure_leaves_complete_files(monkeypatch, tmp_path):
+    output_dir = tmp_path / "reconciliation"
+    output_dir.mkdir()
+    latest_path = output_dir / "latest.json"
+    latest_path.write_text('{"previous": true}\n', encoding="utf-8")
+    original_writer = cli_main._atomic_write_text
+
+    def fail_latest(path, text, **kwargs):
+        if Path(path) == latest_path:
+            raise OSError("injected latest write failure")
+        return original_writer(path, text, **kwargs)
+
+    monkeypatch.setattr(cli_main, "_atomic_write_text", fail_latest)
+    with pytest.raises(OSError, match="injected latest write failure"):
+        cli_main._write_reconciliation_packet(
+            output_dir,
+            stem="symbol-reconciliation-test",
+            packet={"kind": "symbol_broker_reconciliation"},
+        )
+
+    immutable_paths = list(output_dir.glob("symbol-reconciliation-test*.json"))
+    assert len(immutable_paths) == 1
+    assert immutable_paths[0].read_text(encoding="utf-8").endswith("\n")
+    assert json.loads(immutable_paths[0].read_text(encoding="utf-8"))["kind"] == (
+        "symbol_broker_reconciliation"
+    )
+    assert latest_path.read_text(encoding="utf-8") == '{"previous": true}\n'
+
+
+def test_reconciliation_packet_target_write_failure_leaves_no_truncated_packet(monkeypatch, tmp_path):
+    output_dir = tmp_path / "reconciliation"
+    output_dir.mkdir()
+    latest_path = output_dir / "latest.json"
+    latest_path.write_text('{"previous": true}\n', encoding="utf-8")
+
+    def fail_target(path, text, **kwargs):
+        raise OSError("injected target write failure")
+
+    monkeypatch.setattr(cli_main, "_atomic_write_text", fail_target)
+    with pytest.raises(OSError, match="injected target write failure"):
+        cli_main._write_reconciliation_packet(
+            output_dir,
+            stem="symbol-reconciliation-target-failure",
+            packet={"kind": "symbol_broker_reconciliation"},
+        )
+
+    assert list(output_dir.glob("symbol-reconciliation-target-failure*.json")) == []
+    assert latest_path.read_text(encoding="utf-8") == '{"previous": true}\n'
 
 
 def test_alpaca_reconcile_orcl_incident_discovers_symbol_sell_packet(monkeypatch, tmp_path):

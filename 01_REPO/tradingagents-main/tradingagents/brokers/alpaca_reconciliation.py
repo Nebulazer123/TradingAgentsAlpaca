@@ -1,4 +1,4 @@
-"""Read-only reconciliation helpers for ORCL incident evidence."""
+"""Read-only symbol reconciliation with ORCL incident compatibility helpers."""
 
 from __future__ import annotations
 
@@ -138,39 +138,89 @@ def reconcile_symbol_incident(
     """Reconcile one symbol's packet evidence with live broker reads only."""
 
     target_symbol = _require_symbol(symbol)
+    normalized_expected_qty, expected_issue = _validate_expected_qty(expected_qty)
+    if expected_issue:
+        return SymbolReconciliationResult(
+            symbol=target_symbol,
+            matched=False,
+            position=_empty_position(target_symbol),
+            open_orders=[],
+            recent_fills=[],
+            checked_client_order_ids=[],
+            issues=[expected_issue],
+        )
+
     resolved_paths = [Path(path) for path in packet_paths]
     issues: list[str] = []
     checked_client_order_ids: list[str] = []
+    seen_client_order_ids: set[str] = set()
+    packet_evidence: dict[str, dict] = {}
 
     for packet_path in resolved_paths:
         packet, packet_issue = _read_packet_with_issue(packet_path)
         if packet_issue:
             issues.append(f"packet read issue for {packet_path}: {packet_issue}")
             continue
+        symbol_packet, packet_count_issues = _symbol_packet_for_idempotency(packet, target_symbol)
+        issues.extend(packet_count_issues)
+        _append_packet_evidence_conflicts(
+            issues,
+            packet_evidence,
+            symbol_packet,
+        )
         packet_result = reconcile_latest_packet_live_orders(
-            _symbol_packet_for_idempotency(packet, target_symbol),
-            order_lookup=lambda client_order_id: find_order_by_client_order_id(
-                live_client,
-                client_order_id,
-            ),
+            symbol_packet,
+            order_lookup=lambda client_order_id: _lookup_live_order(live_client, client_order_id),
         )
         issues.extend(packet_result.issues)
-        checked_client_order_ids.extend(packet_result.checked_client_order_ids)
+        for client_order_id in packet_result.checked_client_order_ids:
+            if client_order_id not in seen_client_order_ids:
+                seen_client_order_ids.add(client_order_id)
+                checked_client_order_ids.append(client_order_id)
 
-    positions = _safe_list_positions(live_client)
-    raw_position = _extract_position(positions, target_symbol)
-    open_orders = _filter_symbol_orders(_safe_list_orders(live_client, "open"), target_symbol)
-    all_orders = _safe_list_orders(live_client, "all")
-    recent_fills = _recent_fills(all_orders, symbol=target_symbol)
+    positions, position_issue = _read_broker_collection(
+        live_client,
+        method_name="list_positions",
+        label="broker positions",
+    )
+    open_order_rows, open_orders_issue = _read_broker_collection(
+        live_client,
+        method_name="list_orders",
+        label="broker open orders",
+        status="open",
+    )
+    all_order_rows, all_orders_issue = _read_broker_collection(
+        live_client,
+        method_name="list_orders",
+        label="broker all orders",
+        status="all",
+    )
+    issues.extend(
+        issue
+        for issue in (position_issue, open_orders_issue, all_orders_issue)
+        if issue is not None
+    )
+
+    matching_positions = _matching_positions(positions, target_symbol)
+    raw_position = _extract_position(matching_positions, target_symbol)
+    if len(matching_positions) > 1:
+        raw_position["duplicate_count"] = len(matching_positions)
+        issues.append(f"duplicate broker positions for {target_symbol}: {len(matching_positions)}")
+    target_open_orders = _matching_orders(open_order_rows, target_symbol)
+    target_all_orders = _matching_orders(all_order_rows, target_symbol)
+    open_orders = [compact_alpaca_order(order) for order in target_open_orders]
+    recent_fills = _recent_fills(target_all_orders, symbol=target_symbol)
 
     _append_position_issues(
         issues,
         position=raw_position,
         symbol=target_symbol,
-        expected_qty=expected_qty,
+        expected_qty=normalized_expected_qty,
     )
     _append_unknown_order_issues(issues, open_orders, checked_client_order_ids)
     _append_unknown_fill_issues(issues, recent_fills, checked_client_order_ids)
+    _append_order_quantity_issues(issues, target_open_orders, kind="open order")
+    _append_order_quantity_issues(issues, target_all_orders, kind="order")
 
     return SymbolReconciliationResult(
         symbol=target_symbol,
@@ -250,19 +300,11 @@ def _extract_order_payload(order: Mapping, *, fallback_keys: tuple[str, ...]) ->
     return order
 
 
-def _symbol_packet_for_idempotency(packet: Mapping, symbol: str) -> dict:
+def _symbol_packet_for_idempotency(packet: Mapping, symbol: str) -> tuple[dict, list[str]]:
     """Keep only the requested symbol before reusing generic idempotency checks."""
 
-    result = {
-        key: packet.get(key)
-        for key in (
-            "submitted_order_count",
-            "submitted_count",
-            "live_submitted_order_count",
-            "metrics",
-        )
-        if key in packet
-    }
+    issues: list[str] = []
+    result: dict = {}
     result["actions"] = [
         action
         for action in packet.get("actions") or []
@@ -292,7 +334,189 @@ def _symbol_packet_for_idempotency(packet: Mapping, symbol: str) -> dict:
         )
         == symbol
     ]
-    return result
+    all_records = [
+        entry
+        for key in ("submitted", "reconciled_orders")
+        for entry in packet.get(key) or []
+        if isinstance(entry, Mapping)
+        and _packet_record_client_order_id(entry)
+    ]
+    all_symbols = {
+        _normalize_symbol(
+            _extract_order_payload(
+                entry,
+                fallback_keys=("live_response", "live_order", "live", "order", "intent"),
+            ).get("symbol")
+        )
+        for entry in all_records
+    }
+    explicit_count = _packet_explicit_submission_count(packet)
+    if explicit_count is not None:
+        if all_symbols <= {symbol}:
+            result["submitted_order_count"] = explicit_count
+        elif explicit_count != len({_packet_record_client_order_id(entry) for entry in all_records}):
+            issues.append(
+                "ambiguous cross-symbol packet submission count cannot be allocated to "
+                f"{symbol}"
+            )
+    return result, issues
+
+
+def _packet_record_client_order_id(entry: Mapping) -> str:
+    payload = _extract_order_payload(
+        entry,
+        fallback_keys=("live_response", "live_order", "live", "order", "intent"),
+    )
+    return _stringify(entry.get("client_order_id") or payload.get("client_order_id"))
+
+
+def _validate_expected_qty(value: Decimal | str | None) -> tuple[Decimal | None, str | None]:
+    if value is None:
+        return None, None
+    quantity = _nonnegative_decimal(value)
+    if quantity is None:
+        return None, f"invalid expected quantity: {value}"
+    return quantity, None
+
+
+def _read_broker_collection(
+    client,
+    *,
+    method_name: str,
+    label: str,
+    status: str | None = None,
+) -> tuple[list[dict], str | None]:
+    method = getattr(client, method_name, None)
+    if not callable(method):
+        return [], f"{label} read unavailable"
+    try:
+        rows = method() if status is None else method(status=status)
+    except TypeError:
+        if status is None:
+            return [], f"{label} read failed: TypeError"
+        try:
+            rows = method()
+        except Exception as exc:
+            return [], f"{label} read failed: {type(exc).__name__}"
+    except Exception as exc:
+        return [], f"{label} read failed: {type(exc).__name__}"
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        return [], f"{label} read returned non-sequence"
+    if any(not isinstance(row, Mapping) for row in rows):
+        return [], f"{label} read returned malformed rows"
+    return [dict(row) for row in rows], None
+
+
+def _lookup_live_order(client, client_order_id: str) -> Mapping | None:
+    lookup = getattr(client, "get_order_by_client_order_id", None)
+    if callable(lookup):
+        order = lookup(client_order_id)
+        return dict(order) if isinstance(order, Mapping) else None
+    return find_order_by_client_order_id(client, client_order_id)
+
+
+def _matching_positions(positions: Sequence[Mapping], symbol: str) -> list[dict]:
+    return [
+        dict(position)
+        for position in positions
+        if _normalize_symbol(position.get("symbol")) == symbol
+    ]
+
+
+def _matching_orders(orders: Sequence[Mapping], symbol: str) -> list[dict]:
+    return [
+        dict(order)
+        for order in orders
+        if _normalize_symbol(order.get("symbol")) == symbol
+    ]
+
+
+def _packet_explicit_submission_count(packet: Mapping) -> int | None:
+    values = [
+        packet.get(key)
+        for key in ("submitted_order_count", "submitted_count", "live_submitted_order_count")
+        if key in packet
+    ]
+    metrics = packet.get("metrics")
+    if isinstance(metrics, Mapping):
+        values.extend(
+            metrics.get(key)
+            for key in ("submitted_order_count", "submitted_count", "live_submitted_order_count")
+            if key in metrics
+        )
+    counts = [_positive_int(value) for value in values]
+    return max(counts) if counts else None
+
+
+def _append_packet_evidence_conflicts(
+    issues: list[str],
+    known_evidence: dict[str, dict],
+    packet: Mapping,
+) -> None:
+    for record in _packet_evidence_records(packet):
+        client_order_id = record["client_order_id"]
+        previous = known_evidence.get(client_order_id)
+        if previous is None:
+            known_evidence[client_order_id] = record
+            continue
+        if _packet_evidence_conflicts(previous, record):
+            issues.append(f"conflicting packet evidence for {client_order_id}")
+
+
+def _packet_evidence_records(packet: Mapping) -> Iterable[dict]:
+    action_accounts = {
+        _stringify(action.get("idempotency_key")): _normalize_status(action.get("account"))
+        for action in packet.get("actions") or []
+        if isinstance(action, Mapping)
+    }
+    for collection_key in ("submitted", "reconciled_orders"):
+        for entry in packet.get(collection_key) or []:
+            if not isinstance(entry, Mapping):
+                continue
+            payload = _extract_order_payload(
+                entry,
+                fallback_keys=("live_response", "live_order", "live", "order", "intent"),
+            )
+            client_order_id = _stringify(
+                entry.get("client_order_id") or payload.get("client_order_id")
+            )
+            if not client_order_id:
+                continue
+            yield {
+                "client_order_id": client_order_id,
+                "symbol": _normalize_symbol(payload.get("symbol")),
+                "side": _normalize_status(payload.get("side")),
+                "type": _normalize_status(payload.get("type")),
+                "account": _normalize_status(
+                    entry.get("account") or action_accounts.get(client_order_id)
+                ),
+                "qty": _stringify(payload.get("qty")),
+                "notional": _stringify(payload.get("notional")),
+                "limit_price": _stringify(payload.get("limit_price")),
+            }
+
+
+def _packet_evidence_conflicts(left: Mapping, right: Mapping) -> bool:
+    return any(
+        left.get(key) and right.get(key) and left.get(key) != right.get(key)
+        for key in ("symbol", "side", "type", "account", "qty", "notional", "limit_price")
+    )
+
+
+def _append_order_quantity_issues(
+    issues: list[str],
+    orders: Sequence[Mapping],
+    *,
+    kind: str,
+) -> None:
+    for order in orders:
+        client_order_id = _stringify(order.get("client_order_id")) or "missing client_order_id"
+        for field_name in ("qty", "filled_qty"):
+            value = order.get(field_name)
+            if value in (None, ""):
+                continue
+            if _nonnegative_decimal(value) is None:
+                issues.append(f"invalid broker {kind} {field_name} for {client_order_id}")
 
 
 def _append_position_issues(
@@ -302,20 +526,17 @@ def _append_position_issues(
     symbol: str,
     expected_qty: Decimal | str | None,
 ) -> None:
-    actual_qty = _strict_decimal(position.get("qty"))
+    actual_qty = _nonnegative_decimal(position.get("qty"))
     if actual_qty is None:
-        issues.append(f"malformed broker position quantity for {symbol}")
+        issues.append(f"invalid broker position quantity for {symbol}")
         return
     if expected_qty is None:
         if actual_qty != 0:
             issues.append(f"unexpected live position for {symbol}: {actual_qty}")
         return
-    expected_decimal = _strict_decimal(expected_qty)
-    if expected_decimal is None:
-        raise ValueError("expected_qty must be a decimal value")
-    if abs(actual_qty - expected_decimal) > Decimal("0.000001"):
+    if abs(actual_qty - expected_qty) > Decimal("0.000001"):
         issues.append(
-            f"position mismatch for {symbol}: expected {expected_decimal} got {actual_qty}"
+            f"position mismatch for {symbol}: expected {expected_qty} got {actual_qty}"
         )
 
 
@@ -429,8 +650,12 @@ def _extract_position(positions: Sequence[Mapping], symbol: str) -> dict:
             "avg_entry_price_hint": _stringify(position.get("average_entry_price", "")),
         }
 
+    return _empty_position(target_symbol)
+
+
+def _empty_position(symbol: str) -> dict:
     return {
-        "symbol": target_symbol,
+        "symbol": symbol,
         "qty": "0",
         "notional": "0",
         "market_value": "0",
@@ -625,11 +850,25 @@ def _to_decimal(value: object) -> Decimal:
         return Decimal("0")
 
 
+def _nonnegative_decimal(value: object) -> Decimal | None:
+    parsed = _strict_decimal(value)
+    if parsed is None or not parsed.is_finite() or parsed < 0:
+        return None
+    return parsed
+
+
 def _strict_decimal(value: object) -> Decimal | None:
     try:
         return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
+
+
+def _positive_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _require_symbol(value: object) -> str:

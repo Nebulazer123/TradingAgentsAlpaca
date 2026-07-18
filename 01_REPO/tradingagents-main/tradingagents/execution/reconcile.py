@@ -145,6 +145,7 @@ def _latest_packet_live_order_records(packet: Mapping) -> list[dict]:
                     "source": "submitted.live_response",
                     "client_order_id": str(nested_live.get("client_order_id")),
                     "intent": nested_live,
+                    "expected_account": _packet_order_account(packet, nested_live),
                     "prior_intent_match": True,
                 }
             )
@@ -157,6 +158,7 @@ def _latest_packet_live_order_records(packet: Mapping) -> list[dict]:
                 "source": "submitted",
                 "client_order_id": client_order_id,
                 "intent": submitted,
+                "expected_account": "live",
                 "prior_intent_match": True,
             }
         )
@@ -178,11 +180,46 @@ def _latest_packet_live_order_records(packet: Mapping) -> list[dict]:
                 "source": "reconciled_orders",
                 "client_order_id": client_order_id,
                 "intent": order,
+                "expected_account": "live",
                 "prior_intent_match": bool(reconciled.get("intent_match", True)),
                 "prior_comparison_issues": list(reconciled.get("comparison_issues") or []),
             }
         )
     return records
+
+
+def _dedupe_live_order_records(records: Sequence[Mapping]) -> tuple[list[dict], list[str]]:
+    unique: dict[str, dict] = {}
+    issues: list[str] = []
+    for record in records:
+        client_order_id = str(record.get("client_order_id") or "")
+        if not client_order_id:
+            continue
+        normalized = dict(record)
+        existing = unique.get(client_order_id)
+        if existing is None:
+            unique[client_order_id] = normalized
+            continue
+        if _live_order_records_conflict(existing, normalized):
+            issues.append(f"conflicting packet evidence for {client_order_id}")
+    return list(unique.values()), issues
+
+
+def _live_order_records_conflict(left: Mapping, right: Mapping) -> bool:
+    left_intent = left.get("intent") if isinstance(left.get("intent"), Mapping) else {}
+    right_intent = right.get("intent") if isinstance(right.get("intent"), Mapping) else {}
+    if (
+        left.get("expected_account")
+        and right.get("expected_account")
+        and left.get("expected_account") != right.get("expected_account")
+    ):
+        return True
+    return any(
+        left_intent.get(field)
+        and right_intent.get(field)
+        and str(left_intent.get(field)) != str(right_intent.get(field))
+        for field in ("symbol", "side", "type", "qty", "notional", "limit_price")
+    )
 
 
 def reconcile_latest_packet_live_orders(
@@ -192,7 +229,8 @@ def reconcile_latest_packet_live_orders(
 ) -> ReconciliationResult:
     issues: list[str] = []
     checked: list[str] = []
-    records = _latest_packet_live_order_records(packet)
+    records, record_issues = _dedupe_live_order_records(_latest_packet_live_order_records(packet))
+    issues.extend(record_issues)
     evidence_count = _packet_submission_evidence_count(packet)
     if evidence_count > len(records):
         issues.append(
@@ -226,6 +264,13 @@ def reconcile_latest_packet_live_orders(
             f"previous live order mismatch for {client_order_id}: {issue}"
             for issue in comparison_issues
         )
+        expected_account = str(record.get("expected_account") or "").lower()
+        broker_account = str(broker_order.get("account") or "").lower()
+        if expected_account and broker_account and expected_account != broker_account:
+            issues.append(
+                f"previous live order account mismatch for {client_order_id}: "
+                f"expected {expected_account} got {broker_account}"
+            )
     return ReconciliationResult(
         matched=not issues,
         issues=issues,
