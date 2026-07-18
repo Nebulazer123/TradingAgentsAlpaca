@@ -1,3 +1,5 @@
+import pytest
+
 from tradingagents.policy.decision_authority import resolve_exit_authority
 
 
@@ -115,3 +117,60 @@ def test_nested_discretionary_candidate_requires_internal_board_decision():
     assert verdict.allowed is False
     assert verdict.requires_additional_decision is True
     assert verdict.decision_owner == "portfolio_executive"
+
+
+def test_policy_claim_requires_both_blocker_keys():
+    review = _valid_policy_review()
+    review.pop("blockers")
+    review.pop("blocked_reasons")
+
+    verdict = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+    )
+
+    assert verdict.allowed is False
+    assert "blockers" in verdict.reason
+
+
+@pytest.mark.parametrize("missing_key", ["blockers", "blocked_reasons"])
+def test_policy_claim_fails_closed_when_one_blocker_key_is_missing(missing_key):
+    review = _valid_policy_review()
+    review.pop(missing_key)
+
+    verdict = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+    )
+
+    assert verdict.allowed is False
+    assert missing_key in verdict.reason
+
+
+@pytest.mark.parametrize("field", ["blockers", "blocked_reasons"])
+@pytest.mark.parametrize("value", [None, "blocked", 1, {"blocked": True}, ["blocked"]])
+def test_policy_claim_rejects_malformed_or_nonempty_blocker_fields(field, value):
+    review = _valid_policy_review()
+    review[field] = value
+
+    verdict = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+    )
+
+    assert verdict.allowed is False
+    assert field in verdict.reason
+
+
+@pytest.mark.parametrize("value", [1, "supervisor-nflx", {"id": "supervisor-nflx"}])
+def test_policy_claim_rejects_malformed_present_source_packet_ids(value):
+    review = _valid_policy_review()
+    review["source_packet_ids"] = value
+
+    verdict = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+    )
+
+    assert verdict.allowed is False
+    assert "source_packet_ids" in verdict.reason

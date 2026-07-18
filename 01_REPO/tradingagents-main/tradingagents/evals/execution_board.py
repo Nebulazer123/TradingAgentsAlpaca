@@ -279,7 +279,7 @@ def _source_binding(
             "issue": "compact authority record does not match current hourly review: "
             + ", ".join(mismatches),
         }, current_record
-    return True, {"matched": True, "issue": None}, current_record
+    return True, {"matched": True, "issue": None}, current_review
 
 
 def _summarize_roles(

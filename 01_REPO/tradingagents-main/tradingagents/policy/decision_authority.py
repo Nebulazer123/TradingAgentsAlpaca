@@ -77,13 +77,22 @@ def bounded_exit_authority_record(review: Mapping[str, Any] | Any) -> dict[str, 
 
 def _policy_blockers(review: Mapping[str, Any]) -> str | None:
     for key in ("blockers", "blocked_reasons"):
+        if key not in review:
+            return f"pre-registered policy exit is missing required {key}"
         value = review.get(key)
-        if value is None:
-            continue
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
             return f"pre-registered policy exit has malformed {key}"
         if any(str(item).strip() for item in value):
             return f"pre-registered policy exit has {key}"
+    return None
+
+
+def _source_packet_ids_issue(review: Mapping[str, Any]) -> str | None:
+    if "source_packet_ids" not in review:
+        return None
+    value = review.get("source_packet_ids")
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return "pre-registered policy exit has malformed source_packet_ids"
     return None
 
 
@@ -140,6 +149,9 @@ def resolve_exit_authority(
         blocker_issue = _policy_blockers(review)
         if blocker_issue is not None:
             return _invalid_policy_verdict(blocker_issue)
+        source_packet_ids_issue = _source_packet_ids_issue(review)
+        if source_packet_ids_issue is not None:
+            return _invalid_policy_verdict(source_packet_ids_issue)
         rule = _text(review.get("exit_policy_rule"))
         if rule not in POLICY_EXIT_RULE_IDS[reason]:
             return _invalid_policy_verdict(

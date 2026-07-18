@@ -132,3 +132,52 @@ def test_board_fails_closed_without_raising_on_malformed_compact_authority(tmp_p
     assert evidence["matches_review_window"] is False
     assert evidence["review_allowed"] is False
     assert evidence["source_binding"]["issue"] == "missing compact authority record"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("blockers", None),
+        ("blocked_reasons", None),
+        ("blockers", "blocked"),
+        ("blocked_reasons", 1),
+        ("blockers", {"blocked": True}),
+        ("blocked_reasons", ["blocked"]),
+        ("source_packet_ids", "supervisor-nflx"),
+        ("source_packet_ids", 1),
+        ("source_packet_ids", {"id": "supervisor-nflx"}),
+    ],
+)
+def test_board_uses_raw_hourly_authority_for_malformed_fields(tmp_path, field, value):
+    review = _review()
+    review[field] = value
+    hourly_dir, evidence_dir = _write_valid_evidence(tmp_path, review)
+
+    board = build_execution_board_review(hourly_dir, loss_review_evidence_dir=evidence_dir)
+
+    evidence = board["loss_review_evidence"]
+    assert evidence["source_binding"]["matched"] is True
+    assert evidence["review_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    "missing_fields",
+    [
+        ("blockers", "blocked_reasons"),
+        ("blockers",),
+        ("blocked_reasons",),
+    ],
+)
+def test_board_uses_raw_hourly_authority_for_missing_blocker_fields(
+    tmp_path, missing_fields
+):
+    review = _review()
+    for field in missing_fields:
+        review.pop(field)
+    hourly_dir, evidence_dir = _write_valid_evidence(tmp_path, review)
+
+    board = build_execution_board_review(hourly_dir, loss_review_evidence_dir=evidence_dir)
+
+    evidence = board["loss_review_evidence"]
+    assert evidence["source_binding"]["matched"] is True
+    assert evidence["review_allowed"] is False
