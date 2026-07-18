@@ -24,11 +24,16 @@ limit-only checks) at submit time.
 from __future__ import annotations
 
 import datetime
+import fcntl
+import hashlib
 import json
+import os
+from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.promotion import (
@@ -63,6 +68,26 @@ class PromotionSyncResult:
     unchanged: list[str]
     issues_by_sleeve: dict[str, list[str]] = field(default_factory=dict)
     summary: str = ""
+
+
+def promotion_state_lock_path(state_path: str | Path) -> Path:
+    state_file = Path(state_path).resolve()
+    return state_file.with_name(f".{state_file.name}.recovery.lock")
+
+
+@contextmanager
+def promotion_state_lock(state_path: str | Path):
+    """Serialize every canonical promotion-state read/replace."""
+
+    lock_path = promotion_state_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield lock_path
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _now_iso(now: datetime.datetime | None = None) -> str:
@@ -276,6 +301,11 @@ def sync_promotion_state_from_tournament(
                 if candidate_id in unchanged:
                     unchanged.remove(candidate_id)
 
+    issues_by_sleeve = {
+        sleeve_id: list(record["issues"])
+        for sleeve_id, record in new_sleeves.items()
+        if isinstance(record.get("issues"), list)
+    }
     live_enabled_now = [
         sleeve
         for sleeve, record in new_sleeves.items()
@@ -318,30 +348,45 @@ def sync_promotion_state_file(
     report_path: str | Path,
     state_path: str | Path,
     *,
+    output_state_path: str | Path | None = None,
     tiny_live_tranche_usd: Decimal,
     arm_live: bool = False,
     ci_green: bool = False,
     now: datetime.datetime | None = None,
 ) -> PromotionSyncResult:
-    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    # The tournament dir stores the full report under "latest_report" inside
-    # compact packets; accept either a bare report or a wrapper.
-    if "rankings" not in report and isinstance(report.get("latest_report"), dict):
-        report = report["latest_report"]
-    current_state: Mapping | None = None
     state_file = Path(state_path)
-    if state_file.exists():
-        try:
-            current_state = json.loads(state_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            current_state = None
-    result = sync_promotion_state_from_tournament(
-        report,
-        current_state,
-        tiny_live_tranche_usd=tiny_live_tranche_usd,
-        arm_live=arm_live,
-        ci_green=ci_green,
-        now=now,
+    output_file = (
+        Path(output_state_path) if output_state_path is not None else state_file
     )
-    atomic_write_text(state_file, json.dumps(result.state, indent=2))
-    return result
+
+    def evaluate_and_write() -> PromotionSyncResult:
+        report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        # The tournament dir stores the full report under "latest_report" inside
+        # compact packets; accept either a bare report or a wrapper.
+        if "rankings" not in report and isinstance(
+            report.get("latest_report"), dict
+        ):
+            report = report["latest_report"]
+        current_state: Mapping | None = None
+        if state_file.exists():
+            try:
+                current_state = json.loads(state_file.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                current_state = None
+        result = sync_promotion_state_from_tournament(
+            report,
+            current_state,
+            tiny_live_tranche_usd=tiny_live_tranche_usd,
+            arm_live=arm_live,
+            ci_green=ci_green,
+            now=now,
+        )
+        input_bytes = state_file.read_bytes() if state_file.exists() else b""
+        result.state["source"]["canonical_input_sha256"] = hashlib.sha256(
+            input_bytes
+        ).hexdigest()
+        atomic_write_text(output_file, json.dumps(result.state, indent=2))
+        return result
+
+    with promotion_state_lock(state_file):
+        return evaluate_and_write()

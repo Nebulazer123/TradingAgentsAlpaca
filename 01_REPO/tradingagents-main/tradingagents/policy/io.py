@@ -27,10 +27,26 @@ def atomic_write_text(
     output.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output.with_name(f".{output.name}.{os.getpid()}.{time.time_ns()}.tmp")
     try:
-        tmp_path.write_text(text, encoding=encoding)
+        payload = text.encode(encoding)
+        descriptor = os.open(tmp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("incomplete atomic write")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
         for delay in (*_ATOMIC_REPLACE_RETRY_DELAYS_SECONDS, None):
             try:
                 os.replace(tmp_path, output)
+                directory = os.open(output.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
                 return output
             except PermissionError:
                 if delay is None:

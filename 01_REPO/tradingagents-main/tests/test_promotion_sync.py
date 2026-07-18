@@ -6,8 +6,8 @@ from tradingagents.brokers.alpaca_supervisor import (
     resolve_live_sleeve,
 )
 from tradingagents.policy.promotion_sync import (
-    sync_promotion_state_from_tournament,
     sync_promotion_state_file,
+    sync_promotion_state_from_tournament,
 )
 
 
@@ -174,6 +174,52 @@ def test_sync_promotion_state_file_roundtrip(tmp_path):
     assert written["sleeves"]["pullback-support"]["live_enabled"] is True
     assert written["sleeves"]["current-aggressive"]["live_enabled"] is False
     assert written["source"]["kind"] == "paper_tournament_sync"
+
+
+def test_sync_promotion_state_file_can_stage_without_mutating_canonical(tmp_path):
+    report_path = tmp_path / "latest.json"
+    report_path.write_text(json.dumps(_report()), encoding="utf-8")
+    canonical_path = tmp_path / "promotion_state.json"
+    canonical_path.write_text(json.dumps(_incumbent_state()), encoding="utf-8")
+    before = canonical_path.read_bytes()
+    staged_path = tmp_path / "staging" / "promotion_state.json"
+
+    result = sync_promotion_state_file(
+        report_path,
+        canonical_path,
+        output_state_path=staged_path,
+        tiny_live_tranche_usd=Decimal("25"),
+        arm_live=True,
+        ci_green=True,
+    )
+
+    assert result.promoted == ["pullback-support"]
+    assert canonical_path.read_bytes() == before
+    staged = json.loads(staged_path.read_text(encoding="utf-8"))
+    assert staged["sleeves"]["pullback-support"]["live_enabled"] is True
+
+
+def test_sync_result_preserves_issues_for_every_sleeve():
+    current = _incumbent_state()
+    current["sleeves"]["current-aggressive"]["issues"] = [
+        "incumbent evidence requires review"
+    ]
+
+    result = sync_promotion_state_from_tournament(
+        _report(),
+        current,
+        tiny_live_tranche_usd=Decimal("25"),
+        arm_live=True,
+        ci_green=True,
+    )
+
+    assert result.issues_by_sleeve == {
+        "current-aggressive": ["incumbent evidence requires review"],
+        "pullback-support": [],
+    }
+    assert result.state["sleeves"]["current-aggressive"]["issues"] == [
+        "incumbent evidence requires review"
+    ]
 
 
 def test_resolve_live_sleeve_prefers_backed_selection():

@@ -214,27 +214,218 @@ def test_refresh_live_control_cannot_unfreeze_frozen_state(tmp_path):
     assert control_path.read_text(encoding="utf-8") == original
 
 
-def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
-    now = dt.datetime.now(tz=dt.timezone.utc)
-    bindings = {"incident_id": "inc-1", "symbol": "NFLX", "broker_account": "live", "environment": "production", "source_revision": "abc123"}
+def _write_cli_recovery_bundle(tmp_path, *, now):
+    bindings = {
+        "incident_id": "inc-1",
+        "symbol": "NFLX",
+        "broker_account": "live",
+        "environment": "production",
+        "source_revision": "abc123",
+    }
     packets = {
-        "incident": {**bindings, "schema_version": "tradingagents.incident.v1", "stage": "ready", "history": [{"to_stage": "ready"}], "evidence_refs": ["proof"], "repairer_run_id": "repair-1", "repairer_role_id": "repair", "generated_at": now.isoformat()},
-        "focused": {"focused_tests_passed": True, "passing_tests": ["tests/test_x.py::test_ok"], "verifier_run_id": "verify-1", "verifier_role_id": "verify", "source_revision": "abc123", "generated_at": now.isoformat()},
-        "promotion": {"promotion_evidence_fresh": True, "issues": [], "generated_at": now.isoformat()},
-        "reconciliation": {"read_only": True, "execution_authority": "none", "can_submit_orders": False, "matched": True, "issues": [], "broker_write_calls": 0, "generated_at": now.isoformat()},
+        "incident": {
+            **bindings,
+            "schema_version": "tradingagents.incident.v1",
+            "stage": "ready",
+            "history": [{"to_stage": "ready"}],
+            "evidence_refs": ["proof"],
+            "repairer_run_id": "repair-1",
+            "repairer_role_id": "repair",
+            "generated_at": now.isoformat(),
+        },
+        "focused": {
+            "focused_tests_passed": True,
+            "passing_tests": ["tests/test_x.py::test_ok"],
+            "verifier_run_id": "verify-1",
+            "verifier_role_id": "verify",
+            "source_revision": "abc123",
+            "generated_at": now.isoformat(),
+        },
+        "reconciliation": {
+            "read_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "matched": True,
+            "issues": [],
+            "broker_write_calls": 0,
+            "generated_at": now.isoformat(),
+        },
     }
     paths = {}
     for name, packet in packets.items():
         path = tmp_path / f"{name}.json"
         path.write_text(json.dumps(packet), encoding="utf-8")
         paths[name] = path
-    manifest = {**bindings, "schema_version": "tradingagents.recovery_manifest.v1", "kind": "verified_recovery_manifest", "generated_at": now.isoformat(), "packet_sha256": {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in paths.items()}}
+
+    report_path = tmp_path / "paper_tournament.json"
+    candidate = {
+        "status": "candidate",
+        "strategy_id": "pullback-support",
+    }
+    report_path.write_text(
+        json.dumps({"live_strategy_candidate": candidate}),
+        encoding="utf-8",
+    )
+    envelope_path = tmp_path / "risk_envelope.yaml"
+    envelope_path.write_text(
+        "tiny_live_tranche_usd: 25\n",
+        encoding="utf-8",
+    )
+    canonical_path = tmp_path / "promotion_state.json"
+    canonical_before_sha256 = hashlib.sha256(
+        b'{"schema_version":"1.0.0","sleeves":{}}'
+    ).hexdigest()
+    commit_seed = {
+        "schema_version": "tradingagents.promotion_recovery_commit.v1",
+        "incident_id": bindings["incident_id"],
+        "recovery_run_id": "recovery-1",
+        "source_revision": bindings["source_revision"],
+        "focused_path": str(paths["focused"].resolve()),
+        "focused_sha256": hashlib.sha256(
+            paths["focused"].read_bytes()
+        ).hexdigest(),
+        "verifier_run_id": "verify-1",
+        "verifier_role_id": "verify",
+        "reconciliation_path": str(paths["reconciliation"].resolve()),
+        "reconciliation_sha256": hashlib.sha256(
+            paths["reconciliation"].read_bytes()
+        ).hexdigest(),
+        "report_path": str(report_path.resolve()),
+        "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        "envelope_path": str(envelope_path.resolve()),
+        "envelope_sha256": hashlib.sha256(
+            envelope_path.read_bytes()
+        ).hexdigest(),
+        "canonical_path": str(canonical_path.resolve()),
+        "canonical_before_sha256": canonical_before_sha256,
+        "candidate_payload_sha256": hashlib.sha256(
+            (
+                json.dumps(
+                    candidate,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    recovery_commit = {
+        **commit_seed,
+        "commit_id": hashlib.sha256(
+            (
+                json.dumps(
+                    commit_seed,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                )
+                + "\n"
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    canonical_state = {
+        "schema_version": "1.1.0",
+        "generated_at": now.isoformat(),
+        "source": {
+            "kind": "paper_tournament_sync",
+            "canonical_input_sha256": canonical_before_sha256,
+            "recovery_commit": recovery_commit,
+        },
+        "sleeves": {},
+    }
+    canonical_bytes = json.dumps(
+        canonical_state,
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+    staged_path = tmp_path / "staging" / "promotion_state.json"
+    staged_path.parent.mkdir()
+    staged_path.write_bytes(canonical_bytes)
+    canonical_path.write_bytes(canonical_bytes)
+    canonical_after_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+
+    prepare_path = tmp_path / "promotion_prepare.json"
+    prepare = {
+        "schema_version": "tradingagents.promotion_prepare.v1",
+        "kind": "promotion_commit_prepare",
+        "recovery_commit": recovery_commit,
+        "stage_path": str(staged_path.resolve()),
+        "can_submit_orders": False,
+        "execution_authority": "none",
+    }
+    prepare_path.write_text(json.dumps(prepare), encoding="utf-8")
+    prepare_sha256 = hashlib.sha256(prepare_path.read_bytes()).hexdigest()
+    commit_path = tmp_path / "promotion_commit.json"
+    commit = {
+        "schema_version": "tradingagents.promotion_commit.v1",
+        "kind": "verified_promotion_commit",
+        "recovery_commit": recovery_commit,
+        "prepare_path": str(prepare_path.resolve()),
+        "prepare_sha256": prepare_sha256,
+        "staged_path": str(staged_path.resolve()),
+        "staged_sha256": canonical_after_sha256,
+        "canonical_path": str(canonical_path.resolve()),
+        "canonical_before_sha256": canonical_before_sha256,
+        "canonical_after_sha256": canonical_after_sha256,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+    }
+    commit_path.write_text(json.dumps(commit), encoding="utf-8")
+    packets["promotion"] = {
+        "promotion_evidence_fresh": True,
+        "issues": [],
+        "generated_at": now.isoformat(),
+        "recovery_commit": recovery_commit,
+        "promotion_prepare": {
+            "path": str(prepare_path.resolve()),
+            "sha256": prepare_sha256,
+        },
+        "promotion_commit": {
+            "path": str(commit_path.resolve()),
+            "sha256": hashlib.sha256(commit_path.read_bytes()).hexdigest(),
+        },
+        "staged_state_path": str(staged_path.resolve()),
+        "staged_state_sha256": canonical_after_sha256,
+        "state_path": str(canonical_path.resolve()),
+        "canonical_after_sha256": canonical_after_sha256,
+        "state": canonical_state,
+    }
+    paths["promotion"] = tmp_path / "promotion.json"
+    paths["promotion"].write_text(
+        json.dumps(packets["promotion"]),
+        encoding="utf-8",
+    )
+    manifest = {
+        **bindings,
+        "schema_version": "tradingagents.recovery_manifest.v1",
+        "kind": "verified_recovery_manifest",
+        "generated_at": now.isoformat(),
+        "packet_sha256": {
+            name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for name, path in paths.items()
+        },
+    }
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     control_path = tmp_path / "control.json"
-    write_live_control_state(control_path, frozen=True, reason="incident", dead_man_expires_at=now + dt.timedelta(days=1))
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=now + dt.timedelta(days=1),
+    )
+    return {
+        "paths": paths,
+        "manifest_path": manifest_path,
+        "control_path": control_path,
+        "commit_path": commit_path,
+    }
 
-    result = CliRunner().invoke(
+
+def _invoke_cli_recovery(bundle, tmp_path):
+    paths = bundle["paths"]
+    return CliRunner().invoke(
         app,
         [
             "policy",
@@ -248,21 +439,60 @@ def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
             "--focused-proof-path",
             str(paths["focused"]),
             "--recovery-manifest-path",
-            str(manifest_path),
+            str(bundle["manifest_path"]),
             "--repairer-run-id",
             "repair-1",
             "--verifier-run-id",
             "verify-1",
             "--control-path",
-            str(control_path),
+            str(bundle["control_path"]),
             "--receipt-dir",
             str(tmp_path / "rearm"),
             "--json-output",
         ],
     )
 
+
+def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    bundle = _write_cli_recovery_bundle(tmp_path, now=now)
+
+    result = _invoke_cli_recovery(bundle, tmp_path)
+
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["ready"] is True
+
+
+def test_recovery_cli_rejects_coherently_rehashed_thin_promotion_receipt(
+    tmp_path,
+):
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    bundle = _write_cli_recovery_bundle(tmp_path, now=now)
+    commit_path = bundle["commit_path"]
+    commit = json.loads(commit_path.read_text(encoding="utf-8"))
+    commit.pop("staged_sha256")
+    commit_path.write_text(json.dumps(commit), encoding="utf-8")
+    promotion_path = bundle["paths"]["promotion"]
+    promotion = json.loads(promotion_path.read_text(encoding="utf-8"))
+    promotion["promotion_commit"]["sha256"] = hashlib.sha256(
+        commit_path.read_bytes()
+    ).hexdigest()
+    promotion_path.write_text(json.dumps(promotion), encoding="utf-8")
+    manifest = json.loads(
+        bundle["manifest_path"].read_text(encoding="utf-8")
+    )
+    manifest["packet_sha256"]["promotion"] = hashlib.sha256(
+        promotion_path.read_bytes()
+    ).hexdigest()
+    bundle["manifest_path"].write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    result = _invoke_cli_recovery(bundle, tmp_path)
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["ready"] is False
 
 
 def test_recovery_manifest_packet_swap_blocks_without_changing_frozen_control(tmp_path):

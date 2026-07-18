@@ -34,6 +34,17 @@ def test_atomic_append_line_preserves_lines_and_cleans_temp_files(tmp_path):
     assert list(tmp_path.glob(".preregistrations.jsonl.*.tmp")) == []
 
 
+def test_atomic_write_text_fsyncs_file_and_parent_directory(tmp_path, monkeypatch):
+    target = tmp_path / "promotion_state.json"
+    fsync_calls: list[int] = []
+    monkeypatch.setattr(policy_io.os, "fsync", fsync_calls.append)
+
+    policy_io.atomic_write_text(target, "durable-state")
+
+    assert target.read_text(encoding="utf-8") == "durable-state"
+    assert len(fsync_calls) == 2
+
+
 def test_unique_packet_path_allocates_suffix_without_creating_file(tmp_path):
     existing = tmp_path / "packet.json"
     existing.write_text("{}", encoding="utf-8")

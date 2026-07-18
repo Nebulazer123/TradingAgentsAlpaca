@@ -348,6 +348,288 @@ def _binding(packet: Mapping[str, Any], key: str) -> str | None:
     return None
 
 
+def _canonical_reference(value: object) -> Path | None:
+    normalized = _normalized_string(value)
+    if normalized is None:
+        return None
+    path = Path(normalized)
+    if not path.is_absolute() or str(path.resolve()) != normalized:
+        return None
+    return path
+
+
+def _sha256_reference(value: object) -> str | None:
+    normalized = _normalized_string(value)
+    if (
+        normalized is None
+        or len(normalized) != 64
+        or any(char not in "0123456789abcdef" for char in normalized)
+    ):
+        return None
+    return normalized
+
+
+def _promotion_transaction_issues(
+    *,
+    promotion: Mapping[str, Any],
+    promotion_sync_path: str | Path,
+    focused_proof_path: str | Path,
+    reconciliation_path: str | Path,
+    focused: Mapping[str, Any],
+    bindings: Mapping[str, str],
+) -> list[str]:
+    issues: list[str] = []
+    phase_path = Path(promotion_sync_path).resolve()
+    expected_prepare_path = phase_path.with_name("promotion_prepare.json")
+    expected_commit_path = phase_path.with_name("promotion_commit.json")
+    prepare_ref = promotion.get("promotion_prepare")
+    commit_ref = promotion.get("promotion_commit")
+    state_path = _canonical_reference(promotion.get("state_path"))
+    staged_path = _canonical_reference(
+        promotion.get("staged_state_path")
+    )
+    after_sha256 = _sha256_reference(
+        promotion.get("canonical_after_sha256")
+    )
+    staged_sha256 = _sha256_reference(
+        promotion.get("staged_state_sha256")
+    )
+    recovery_commit = promotion.get("recovery_commit")
+    if (
+        not isinstance(prepare_ref, Mapping)
+        or set(prepare_ref) != {"path", "sha256"}
+        or _canonical_reference(prepare_ref.get("path"))
+        != expected_prepare_path
+        or _sha256_reference(prepare_ref.get("sha256")) is None
+    ):
+        issues.append("promotion prepare receipt reference is invalid")
+    if (
+        not isinstance(commit_ref, Mapping)
+        or set(commit_ref) != {"path", "sha256"}
+        or _canonical_reference(commit_ref.get("path"))
+        != expected_commit_path
+        or _sha256_reference(commit_ref.get("sha256")) is None
+    ):
+        issues.append("promotion commit receipt reference is invalid")
+    if state_path is None or staged_path is None:
+        issues.append("promotion state references must be canonical absolute paths")
+    if (
+        after_sha256 is None
+        or staged_sha256 is None
+        or after_sha256 != staged_sha256
+    ):
+        issues.append("promotion staged and canonical digests are invalid")
+    recovery_commit_keys = {
+        "schema_version",
+        "commit_id",
+        "incident_id",
+        "recovery_run_id",
+        "source_revision",
+        "focused_path",
+        "focused_sha256",
+        "verifier_run_id",
+        "verifier_role_id",
+        "reconciliation_path",
+        "reconciliation_sha256",
+        "report_path",
+        "report_sha256",
+        "envelope_path",
+        "envelope_sha256",
+        "canonical_path",
+        "canonical_before_sha256",
+        "candidate_payload_sha256",
+    }
+    if (
+        not isinstance(recovery_commit, Mapping)
+        or set(recovery_commit) != recovery_commit_keys
+    ):
+        issues.append("promotion recovery commit schema is invalid")
+        return issues
+    digest_fields = {
+        "commit_id",
+        "focused_sha256",
+        "reconciliation_sha256",
+        "report_sha256",
+        "envelope_sha256",
+        "canonical_before_sha256",
+        "candidate_payload_sha256",
+    }
+    if any(
+        _sha256_reference(recovery_commit.get(field)) is None
+        for field in digest_fields
+    ):
+        issues.append("promotion recovery commit digest is invalid")
+    commit_seed = dict(recovery_commit)
+    commit_id = commit_seed.pop("commit_id")
+    expected_commit_id = hashlib.sha256(
+        _canonical_json(commit_seed) + b"\n"
+    ).hexdigest()
+    if commit_id != expected_commit_id:
+        issues.append("promotion recovery commit identity is invalid")
+    focused_path = Path(focused_proof_path).resolve()
+    reconciliation_absolute = Path(reconciliation_path).resolve()
+    if (
+        recovery_commit.get("schema_version")
+        != "tradingagents.promotion_recovery_commit.v1"
+        or recovery_commit.get("incident_id") != bindings.get("incident_id")
+        or recovery_commit.get("source_revision")
+        != bindings.get("source_revision")
+        or recovery_commit.get("focused_path") != str(focused_path)
+        or recovery_commit.get("reconciliation_path")
+        != str(reconciliation_absolute)
+        or recovery_commit.get("verifier_run_id")
+        != focused.get("verifier_run_id")
+        or recovery_commit.get("verifier_role_id")
+        != focused.get("verifier_role_id")
+        or (
+            state_path is not None
+            and recovery_commit.get("canonical_path")
+            != str(state_path)
+        )
+    ):
+        issues.append("promotion recovery commit binding is invalid")
+    try:
+        if (
+            hashlib.sha256(focused_path.read_bytes()).hexdigest()
+            != recovery_commit.get("focused_sha256")
+            or hashlib.sha256(
+                reconciliation_absolute.read_bytes()
+            ).hexdigest()
+            != recovery_commit.get("reconciliation_sha256")
+        ):
+            issues.append("promotion proof digest binding is invalid")
+    except OSError:
+        issues.append("promotion proof binding is unreadable")
+
+    report_path = _canonical_reference(recovery_commit.get("report_path"))
+    envelope_path = _canonical_reference(
+        recovery_commit.get("envelope_path")
+    )
+    if report_path is None or envelope_path is None:
+        issues.append("promotion input references are not canonical")
+    else:
+        try:
+            report_raw = report_path.read_bytes()
+            envelope_raw = envelope_path.read_bytes()
+            report = json.loads(report_raw)
+        except (OSError, json.JSONDecodeError):
+            issues.append("promotion input binding is unreadable")
+        else:
+            if (
+                hashlib.sha256(report_raw).hexdigest()
+                != recovery_commit.get("report_sha256")
+                or hashlib.sha256(envelope_raw).hexdigest()
+                != recovery_commit.get("envelope_sha256")
+            ):
+                issues.append("promotion input digest binding is invalid")
+            report_payload = (
+                report.get("latest_report")
+                if isinstance(report, Mapping)
+                and isinstance(report.get("latest_report"), Mapping)
+                else report
+            )
+            candidate = (
+                report_payload.get("live_strategy_candidate")
+                if isinstance(report_payload, Mapping)
+                and isinstance(
+                    report_payload.get("live_strategy_candidate"),
+                    Mapping,
+                )
+                else {}
+            )
+            candidate_sha256 = hashlib.sha256(
+                _canonical_json(dict(candidate)) + b"\n"
+            ).hexdigest()
+            if (
+                candidate_sha256
+                != recovery_commit.get("candidate_payload_sha256")
+            ):
+                issues.append("promotion candidate digest binding is invalid")
+
+    if (
+        not isinstance(prepare_ref, Mapping)
+        or set(prepare_ref) != {"path", "sha256"}
+        or _canonical_reference(prepare_ref.get("path"))
+        != expected_prepare_path
+        or _sha256_reference(prepare_ref.get("sha256")) is None
+        or not isinstance(commit_ref, Mapping)
+        or set(commit_ref) != {"path", "sha256"}
+        or _canonical_reference(commit_ref.get("path"))
+        != expected_commit_path
+        or _sha256_reference(commit_ref.get("sha256")) is None
+        or state_path is None
+        or staged_path is None
+        or after_sha256 is None
+        or staged_sha256 is None
+    ):
+        return issues
+    try:
+        prepare_raw = expected_prepare_path.read_bytes()
+        commit_raw = expected_commit_path.read_bytes()
+        staged_raw = staged_path.read_bytes()
+        canonical_raw = state_path.read_bytes()
+        prepare = json.loads(prepare_raw)
+        receipt = json.loads(commit_raw)
+        staged_state = json.loads(staged_raw)
+        canonical_state = json.loads(canonical_raw)
+    except (OSError, json.JSONDecodeError):
+        issues.append("promotion transaction artifact is unreadable")
+        return issues
+    if (
+        hashlib.sha256(prepare_raw).hexdigest()
+        != prepare_ref.get("sha256")
+        or hashlib.sha256(commit_raw).hexdigest()
+        != commit_ref.get("sha256")
+        or hashlib.sha256(staged_raw).hexdigest() != staged_sha256
+        or hashlib.sha256(canonical_raw).hexdigest() != after_sha256
+        or staged_raw != canonical_raw
+    ):
+        issues.append("promotion transaction artifact digest is invalid")
+    expected_prepare = {
+        "schema_version": "tradingagents.promotion_prepare.v1",
+        "kind": "promotion_commit_prepare",
+        "recovery_commit": dict(recovery_commit),
+        "stage_path": str(staged_path),
+        "can_submit_orders": False,
+        "execution_authority": "none",
+    }
+    expected_receipt = {
+        "schema_version": "tradingagents.promotion_commit.v1",
+        "kind": "verified_promotion_commit",
+        "recovery_commit": dict(recovery_commit),
+        "prepare_path": str(expected_prepare_path),
+        "prepare_sha256": prepare_ref["sha256"],
+        "staged_path": str(staged_path),
+        "staged_sha256": staged_sha256,
+        "canonical_path": str(state_path),
+        "canonical_before_sha256": recovery_commit.get(
+            "canonical_before_sha256"
+        ),
+        "canonical_after_sha256": after_sha256,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+    }
+    if prepare != expected_prepare:
+        issues.append("promotion prepare receipt binding is invalid")
+    if receipt != expected_receipt:
+        issues.append("promotion commit receipt binding is invalid")
+    source = (
+        canonical_state.get("source")
+        if isinstance(canonical_state, Mapping)
+        else None
+    )
+    if (
+        staged_state != canonical_state
+        or promotion.get("state") != canonical_state
+        or not isinstance(source, Mapping)
+        or source.get("recovery_commit") != recovery_commit
+        or source.get("canonical_input_sha256")
+        != recovery_commit.get("canonical_before_sha256")
+    ):
+        issues.append("promotion canonical state binding is invalid")
+    return issues
+
+
 def load_recovery_evidence(
     *,
     incident_path: str | Path,
@@ -463,6 +745,16 @@ def load_recovery_evidence(
     promotion_fresh = promotion.get("promotion_evidence_fresh", promotion.get("fresh"))
     promotion_issues = _string_items(promotion.get("issues"))
     reconciliation_issues = _string_items(reconciliation.get("issues"))
+    issues.extend(
+        _promotion_transaction_issues(
+            promotion=promotion,
+            promotion_sync_path=promotion_sync_path,
+            focused_proof_path=focused_proof_path,
+            reconciliation_path=reconciliation_path,
+            focused=focused,
+            bindings=bindings,
+        )
+    )
     for field_name, value in (("root_cause_resolved", root_cause), ("focused_tests_passed", focused_passed), ("promotion_evidence_fresh", promotion_fresh), ("read_only", reconciliation.get("read_only")), ("can_submit_orders", reconciliation.get("can_submit_orders")), ("matched", reconciliation.get("matched"))):
         if not _literal_bool(value):
             issues.append(f"{field_name} must be a literal boolean")

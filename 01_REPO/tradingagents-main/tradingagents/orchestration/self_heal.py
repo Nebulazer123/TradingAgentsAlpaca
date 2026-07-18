@@ -33,6 +33,7 @@ from tradingagents.policy.live_control import (
     load_live_control_state,
     write_live_control_state,
 )
+from tradingagents.policy.promotion_sync import promotion_state_lock
 
 UTC = dt.timezone.utc
 DEFAULT_CONTEXT_DIR = Path("results/_context")
@@ -64,16 +65,28 @@ RECOVERY_RECIPE_NAME = "resolve_policy_sync_reconcile_verify_rearm"
 RECOVERY_PHASES = (
     "resolve_authority",
     "regenerate_evidence",
-    "sync_promotion",
     "reconcile",
     "focused_verify",
+    "sync_promotion",
     "ready_incident",
     "manifest",
     "rearm",
 )
+RECOVERY_FOCUSED_TESTS = (
+    "tests/test_recovery_coordinator.py",
+    "tests/test_self_heal_recovery.py",
+    "tests/test_promotion_sync.py",
+    "tests/test_promotion_policy.py",
+    "tests/test_live_gate.py",
+    "tests/test_symbol_reconciliation.py",
+)
 RECOVERY_MAX_ATTEMPTS = 3
 RECOVERY_BACKOFF_SECONDS = (0, 30, 120)
 RECOVERY_LEASE_MINUTES = 30
+
+
+class _PromotionStalePreimage(RuntimeError):
+    """A concurrent canonical promotion writer won the compare-and-swap."""
 
 HIGH_REASONS = {"blocker", "issues", "schema", "graph_failure", "abnormal_pl", "unexplained_action"}
 MEDIUM_REASONS = {"model_telemetry", "crawler", "quality", "automation_health"}
@@ -401,7 +414,7 @@ def _valid_persisted_recovery_state(value: Mapping[str, Any]) -> bool:
         "source_revision",
     }
     if (
-        value.get("schema_version") != "tradingagents.self_heal_recovery.v1"
+        value.get("schema_version") != "tradingagents.self_heal_recovery.v2"
         or not required.issubset(value)
         or not isinstance(value.get("bindings"), Mapping)
         or set(value["bindings"]) != canonical_binding_keys
@@ -517,6 +530,60 @@ def _valid_persisted_recovery_state(value: Mapping[str, Any]) -> bool:
     if parent_run is not None and "follow_on_count" not in value:
         return False
 
+    legacy_path = value.get("legacy_v1_state_path")
+    legacy_digest = value.get("legacy_v1_state_sha256")
+    if (legacy_path is None) != (legacy_digest is None):
+        return False
+    if legacy_path is not None:
+        canonical_legacy_path = _canonical_absolute_path(legacy_path)
+        if (
+            canonical_legacy_path is None
+            or not _valid_recovery_digest(legacy_digest)
+            or Path(canonical_legacy_path).name
+            != f"state-v1-{legacy_digest}.json"
+            or Path(canonical_legacy_path).parent.name
+            != value.get("incident_id")
+            or parent_run is None
+            or follow_on_count < 1
+            or not any(
+                event.get("event") == "legacy_v1_migrated"
+                and event.get("legacy_v1_state_path") == canonical_legacy_path
+                and event.get("legacy_v1_state_sha256") == legacy_digest
+                for event in value["incident_history"]
+            )
+        ):
+            return False
+        try:
+            if _recovery_digest(Path(canonical_legacy_path)) != legacy_digest:
+                return False
+        except OSError:
+            return False
+
+    promotion_intent = value.get("promotion_commit_intent")
+    if promotion_intent is not None and (
+        not isinstance(promotion_intent, Mapping)
+        or set(promotion_intent)
+        != {
+            "commit_id",
+            "prepare_path",
+            "prepare_sha256",
+            "staged_path",
+            "staged_sha256",
+            "canonical_path",
+            "canonical_before_sha256",
+        }
+        or not _valid_recovery_digest(promotion_intent.get("commit_id"))
+        or _canonical_absolute_path(promotion_intent.get("prepare_path")) is None
+        or not _valid_recovery_digest(promotion_intent.get("prepare_sha256"))
+        or _canonical_absolute_path(promotion_intent.get("staged_path")) is None
+        or not _valid_recovery_digest(promotion_intent.get("staged_sha256"))
+        or _canonical_absolute_path(promotion_intent.get("canonical_path")) is None
+        or not _valid_recovery_digest(
+            promotion_intent.get("canonical_before_sha256")
+        )
+    ):
+        return False
+
     intent = value.get("rearm_intent")
     if intent is None:
         return True
@@ -593,6 +660,11 @@ def _read_recovery_state(path: Path) -> tuple[dict[str, Any] | None, str | None]
         return None, "corrupt_state"
     if not isinstance(value, dict):
         return None, "corrupt_state"
+    if (
+        value.get("schema_version")
+        == "tradingagents.self_heal_recovery.v1"
+    ):
+        return value, "legacy_v1"
     try:
         valid = _valid_persisted_recovery_state(value)
     except Exception:
@@ -604,6 +676,37 @@ def _read_recovery_state(path: Path) -> tuple[dict[str, Any] | None, str | None]
 
 def _write_recovery_state(path: Path, state: Mapping[str, Any]) -> None:
     atomic_write_text(path, json.dumps(state, indent=2, sort_keys=True))
+
+
+def _write_immutable_recovery_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(
+            path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+    except FileExistsError:
+        if path.read_bytes() != payload:
+            raise ValueError(
+                "immutable legacy recovery archive already differs"
+            ) from None
+        return
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("incomplete legacy recovery archive write")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    parent_descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
 
 
 def _recovery_lock(
@@ -1046,14 +1149,149 @@ def _valid_loss_review_phase_packet(
 
 
 def _valid_promotion_phase_packet(
-    packet: Mapping[str, Any], bindings: Mapping[str, str]
+    path: Path,
+    packet: Mapping[str, Any],
+    bindings: Mapping[str, str],
+    *,
+    state: Mapping[str, Any],
+    phase_outputs: Mapping[str, object],
 ) -> bool:
     issues_by_sleeve = packet.get("issues_by_sleeve")
-    state = packet.get("state")
-    source = state.get("source") if isinstance(state, Mapping) else None
-    sleeves = state.get("sleeves") if isinstance(state, Mapping) else None
+    promotion_state = packet.get("state")
+    source = (
+        promotion_state.get("source")
+        if isinstance(promotion_state, Mapping)
+        else None
+    )
+    sleeves = (
+        promotion_state.get("sleeves")
+        if isinstance(promotion_state, Mapping)
+        else None
+    )
     promoted = packet.get("promoted")
     demoted = packet.get("demoted")
+    focused_record = phase_outputs.get("focused_verify")
+    reconciliation_record = phase_outputs.get("reconcile")
+    prepare_record = packet.get("promotion_prepare")
+    receipt_record = packet.get("promotion_commit")
+    recovery_commit = packet.get("recovery_commit")
+    intent = packet.get("promotion_commit_intent")
+    recovery_commit_keys = {
+        "schema_version",
+        "commit_id",
+        "incident_id",
+        "recovery_run_id",
+        "source_revision",
+        "focused_path",
+        "focused_sha256",
+        "verifier_run_id",
+        "verifier_role_id",
+        "reconciliation_path",
+        "reconciliation_sha256",
+        "report_path",
+        "report_sha256",
+        "envelope_path",
+        "envelope_sha256",
+        "canonical_path",
+        "canonical_before_sha256",
+        "candidate_payload_sha256",
+    }
+    if (
+        not isinstance(recovery_commit, Mapping)
+        or set(recovery_commit) != recovery_commit_keys
+    ):
+        return False
+    try:
+        if not all(
+            _valid_phase_record(record)
+            for record in (
+                focused_record,
+                reconciliation_record,
+                prepare_record,
+                receipt_record,
+            )
+        ):
+            return False
+        focused_path = Path(str(focused_record["path"])).resolve()
+        reconciliation_path = Path(str(reconciliation_record["path"])).resolve()
+        prepare_path = Path(str(prepare_record["path"])).resolve()
+        receipt_path = Path(str(receipt_record["path"])).resolve()
+        staged_path = Path(str(packet.get("staged_state_path"))).resolve()
+        canonical_path = Path(str(packet.get("state_path"))).resolve()
+        if (
+            prepare_path != path.parent / "promotion_prepare.json"
+            or receipt_path != path.parent / "promotion_commit.json"
+            or staged_path != path.parent.parent / "staging" / "promotion_state.json"
+            or any(
+                _recovery_digest(record_path) != record["sha256"]
+                for record_path, record in (
+                    (focused_path, focused_record),
+                    (reconciliation_path, reconciliation_record),
+                    (prepare_path, prepare_record),
+                    (receipt_path, receipt_record),
+                )
+            )
+            or _recovery_digest(staged_path) != packet.get("staged_state_sha256")
+            or _recovery_digest(canonical_path)
+            != packet.get("canonical_after_sha256")
+            or staged_path.read_bytes() != canonical_path.read_bytes()
+        ):
+            return False
+        focused = json.loads(focused_path.read_text(encoding="utf-8"))
+        reconciliation = json.loads(
+            reconciliation_path.read_text(encoding="utf-8")
+        )
+        staged_state = json.loads(staged_path.read_text(encoding="utf-8"))
+        prepare = json.loads(prepare_path.read_text(encoding="utf-8"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        report_path = Path(str(recovery_commit.get("report_path"))).resolve()
+        envelope_path = Path(str(recovery_commit.get("envelope_path"))).resolve()
+        report_sha256 = _recovery_digest(report_path)
+        envelope_sha256 = _recovery_digest(envelope_path)
+        report_packet = json.loads(report_path.read_text(encoding="utf-8"))
+        report_payload = (
+            report_packet.get("latest_report")
+            if isinstance(report_packet.get("latest_report"), Mapping)
+            else report_packet
+        )
+        candidate = (
+            report_payload.get("live_strategy_candidate")
+            if isinstance(report_payload, Mapping)
+            else {}
+        )
+        if not isinstance(candidate, Mapping):
+            candidate = {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    commit_seed = dict(recovery_commit)
+    commit_id = commit_seed.pop("commit_id")
+    expected_intent = {
+        "commit_id": commit_id,
+        "prepare_path": prepare_record["path"],
+        "prepare_sha256": prepare_record["sha256"],
+        "staged_path": str(staged_path),
+        "staged_sha256": packet.get("staged_state_sha256"),
+        "canonical_path": str(canonical_path),
+        "canonical_before_sha256": recovery_commit.get(
+            "canonical_before_sha256"
+        ),
+    }
+    receipt_expected = {
+        "schema_version": "tradingagents.promotion_commit.v1",
+        "kind": "verified_promotion_commit",
+        "recovery_commit": dict(recovery_commit),
+        "prepare_path": prepare_record["path"],
+        "prepare_sha256": prepare_record["sha256"],
+        "staged_path": str(staged_path),
+        "staged_sha256": packet.get("staged_state_sha256"),
+        "canonical_path": str(canonical_path),
+        "canonical_before_sha256": recovery_commit.get(
+            "canonical_before_sha256"
+        ),
+        "canonical_after_sha256": packet.get("canonical_after_sha256"),
+        "can_submit_orders": False,
+        "execution_authority": "none",
+    }
     return (
         packet.get("schema_version") == "tradingagents.recovery_phase.v1"
         and packet.get("source_schema_version") == "1.1.0"
@@ -1074,13 +1312,17 @@ def _valid_promotion_phase_packet(
         and not set(promoted).intersection(demoted)
         and _nonempty_recovery_string(packet.get("state_path"))
         and _nonempty_recovery_string(packet.get("report_path"))
-        and packet.get("arm_live") is False
-        and packet.get("ci_green") is False
+        and packet.get("canonical_state_path") == packet.get("state_path")
+        and packet.get("arm_live") is True
+        and packet.get("ci_green") is True
         and packet.get("can_submit_orders") is False
         and packet.get("execution_authority") == "none"
-        and isinstance(state, Mapping)
-        and state.get("schema_version") == packet.get("source_schema_version")
-        and _parse_aware_recovery_time(state.get("generated_at")) is not None
+        and isinstance(promotion_state, Mapping)
+        and promotion_state == staged_state
+        and promotion_state.get("schema_version")
+        == packet.get("source_schema_version")
+        and _parse_aware_recovery_time(promotion_state.get("generated_at"))
+        is not None
         and isinstance(sleeves, Mapping)
         and all(
             _nonempty_recovery_string(sleeve_id)
@@ -1096,6 +1338,7 @@ def _valid_promotion_phase_packet(
         and set(issues_by_sleeve).issubset(sleeves)
         and all(
             sleeves[sleeve_id].get("stage") == "tiny_live_eligible"
+            and sleeves[sleeve_id].get("live_enabled") is True
             for sleeve_id in promoted
         )
         and all(
@@ -1105,10 +1348,65 @@ def _valid_promotion_phase_packet(
         )
         and isinstance(source, Mapping)
         and source.get("kind") == "paper_tournament_sync"
-        and source.get("arm_live") is False
-        and source.get("ci_green") is False
+        and source.get("arm_live") is True
+        and source.get("ci_green") is True
+        and source.get("canonical_input_sha256")
+        == recovery_commit.get("canonical_before_sha256")
+        and source.get("recovery_commit") == recovery_commit
         and _nonempty_recovery_string(source.get("tournament_id"))
         and _parse_aware_recovery_time(source.get("report_generated_at")) is not None
+        and commit_id == hashlib.sha256(_recovery_json(commit_seed)).hexdigest()
+        and recovery_commit.get("schema_version")
+        == "tradingagents.promotion_recovery_commit.v1"
+        and recovery_commit.get("incident_id") == bindings["incident_id"]
+        and recovery_commit.get("recovery_run_id") == state.get("recovery_run_id")
+        and recovery_commit.get("source_revision") == bindings["source_revision"]
+        and recovery_commit.get("focused_path") == str(focused_path)
+        and recovery_commit.get("focused_sha256") == focused_record["sha256"]
+        and _valid_phase_packet(
+            focused_path,
+            "focused_verify",
+            bindings,
+            state=state,
+            phase_outputs=phase_outputs,
+        )
+        and recovery_commit.get("verifier_run_id")
+        == focused.get("verifier_run_id")
+        and recovery_commit.get("verifier_role_id")
+        == focused.get("verifier_role_id")
+        and focused.get("passing_tests") == list(RECOVERY_FOCUSED_TESTS)
+        and recovery_commit.get("reconciliation_path")
+        == str(reconciliation_path)
+        and recovery_commit.get("reconciliation_sha256")
+        == reconciliation_record["sha256"]
+        and _valid_phase_packet(
+            reconciliation_path,
+            "reconcile",
+            bindings,
+            state=state,
+            phase_outputs=phase_outputs,
+        )
+        and reconciliation.get("read_only") is True
+        and reconciliation.get("broker_write_calls") == 0
+        and recovery_commit.get("report_sha256")
+        == report_sha256
+        and recovery_commit.get("envelope_sha256")
+        == envelope_sha256
+        and recovery_commit.get("canonical_path") == str(canonical_path)
+        and recovery_commit.get("candidate_payload_sha256")
+        == hashlib.sha256(_recovery_json(dict(candidate))).hexdigest()
+        and prepare
+        == {
+            "schema_version": "tradingagents.promotion_prepare.v1",
+            "kind": "promotion_commit_prepare",
+            "recovery_commit": dict(recovery_commit),
+            "stage_path": str(staged_path),
+            "can_submit_orders": False,
+            "execution_authority": "none",
+        }
+        and receipt == receipt_expected
+        and intent == expected_intent
+        and state.get("promotion_commit_intent") == expected_intent
     )
 
 
@@ -1326,6 +1624,7 @@ def _valid_reconciliation_phase_packet(
         )
         and (
             "avg_entry_price_hint" not in position
+            or position.get("avg_entry_price_hint") in {None, ""}
             or _finite_recovery_decimal(position.get("avg_entry_price_hint"))
             is not None
         )
@@ -1395,14 +1694,20 @@ def _valid_phase_packet(
     if phase == "regenerate_evidence":
         return _valid_loss_review_phase_packet(packet, bindings)
     if phase == "sync_promotion":
-        return _valid_promotion_phase_packet(packet, bindings)
+        return _valid_promotion_phase_packet(
+            path,
+            packet,
+            bindings,
+            state=state,
+            phase_outputs=outputs,
+        )
     if phase == "reconcile":
         return _valid_reconciliation_phase_packet(packet, bindings)
     if phase == "focused_verify":
         return (
             packet.get("schema_version") == "tradingagents.recovery_phase.v1"
             and packet.get("focused_tests_passed") is True
-            and _packet_string_list(packet.get("passing_tests"), nonempty=True)
+            and packet.get("passing_tests") == list(RECOVERY_FOCUSED_TESTS)
             and is_safe_incident_id(packet.get("verifier_run_id"))
             and is_safe_incident_id(packet.get("verifier_role_id"))
             and packet.get("verifier_run_id").casefold()
@@ -1513,6 +1818,11 @@ def _write_phase_packet(path: Path, packet: Mapping[str, Any]) -> dict[str, str]
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
     return _phase_record(path)
 
 
@@ -1713,17 +2023,434 @@ def build_production_recovery_request(
             return unavailable("regenerate_evidence", "hourly evidence directory is unavailable")
         return run_json("regenerate_evidence", [sys.executable, "-m", "cli.main", "research", "loss-review-evidence", "--hourly-dir", str(hourly_dir), "--json-output"])
 
-    def promotion(_arguments: Mapping[str, Any]) -> dict[str, Any]:
+    def promotion(arguments: Mapping[str, Any]) -> dict[str, Any]:
         paths = [context_path(name) for name in ("report_path", "envelope_path", "promotion_state_path")]
         if any(path is None for path in paths):
             return unavailable("sync_promotion", "named promotion inputs are unavailable")
-        report, envelope, state = paths
-        result = run_json("sync_promotion", [sys.executable, "-m", "cli.main", "policy", "sync-promotion", "--report-path", str(report), "--envelope-path", str(envelope), "--state-path", str(state), "--no-arm-live", "--no-ci-green", "--json-output"])
-        packet = result.get("packet") if isinstance(result, Mapping) else None
-        if not isinstance(packet, dict) or not isinstance(packet.get("issues_by_sleeve"), Mapping):
-            return unavailable("sync_promotion", "canonical promotion result is incomplete")
-        issues = [str(issue) for values in packet["issues_by_sleeve"].values() if isinstance(values, list) for issue in values]
-        return {"packet": {**packet, "promotion_evidence_fresh": not issues, "issues": issues}}
+        report, envelope, canonical_state = paths
+        phase_outputs = arguments.get("phase_outputs")
+        run_root_raw = arguments.get("run_root")
+        staging_dir_raw = arguments.get("staging_dir")
+        if (
+            not isinstance(phase_outputs, Mapping)
+            or not isinstance(run_root_raw, str)
+            or not isinstance(staging_dir_raw, str)
+        ):
+            return unavailable(
+                "sync_promotion", "focused proof and deterministic staging are required"
+            )
+        run_root = Path(run_root_raw).resolve()
+        staging_dir = Path(staging_dir_raw).resolve()
+        if staging_dir != run_root / "staging":
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": "sync_promotion: staging path is not canonical",
+            }
+        packet_dir = run_root / "packets"
+        prepare_path = packet_dir / "promotion_prepare.json"
+        receipt_path = packet_dir / "promotion_commit.json"
+        stage_path = staging_dir / "promotion_state.json"
+        if not all(
+            _path_under(path, run_root)
+            for path in (staging_dir, prepare_path, receipt_path, stage_path)
+        ):
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": "sync_promotion: transaction path escapes recovery run",
+            }
+
+        proof_state = {
+            "recovery_run_id": arguments.get("recovery_run_id"),
+            "owner_run_id": arguments.get("owner_run_id"),
+            "owner_role": arguments.get("owner_role"),
+            "phase_outputs": phase_outputs,
+        }
+
+        def bound_phase_packet(name: str) -> tuple[Mapping[str, Any], Mapping[str, str]]:
+            record = phase_outputs.get(name)
+            if not _valid_phase_record(record):
+                raise ValueError(f"missing hash-bound {name} proof")
+            record_path = Path(str(record["path"])).resolve()
+            if (
+                not _path_under(record_path, run_root)
+                or _recovery_digest(record_path) != record["sha256"]
+                or not _valid_phase_packet(
+                    record_path,
+                    name,
+                    bindings,
+                    state=proof_state,
+                    phase_outputs=phase_outputs,
+                )
+            ):
+                raise ValueError(f"invalid hash-bound {name} proof")
+            packet = json.loads(record_path.read_text(encoding="utf-8"))
+            return packet, record
+
+        try:
+            focused_packet, focused_record = bound_phase_packet("focused_verify")
+            _reconciliation_packet, reconciliation_record = bound_phase_packet(
+                "reconcile"
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": f"sync_promotion: {_redact_recovery_detail(error)}",
+            }
+        if focused_packet.get("passing_tests") != list(RECOVERY_FOCUSED_TESTS):
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": "sync_promotion: focused proof does not cover fixed policy suites",
+            }
+        if not all(path.exists() and path.is_file() for path in (report, envelope, canonical_state)):
+            return unavailable("sync_promotion", "promotion input file is unavailable")
+        try:
+            report_packet = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return unavailable("sync_promotion", "tournament report is invalid")
+        report_payload = (
+            report_packet.get("latest_report")
+            if isinstance(report_packet.get("latest_report"), Mapping)
+            else report_packet
+        )
+        candidate_payload = (
+            report_payload.get("live_strategy_candidate")
+            if isinstance(report_payload, Mapping)
+            else {}
+        )
+        if not isinstance(candidate_payload, Mapping):
+            candidate_payload = {}
+        report_sha256 = _recovery_digest(report)
+        envelope_sha256 = _recovery_digest(envelope)
+        fault = arguments.get("_transaction_fault_hook")
+        persist_intent = arguments.get("_persist_promotion_commit_intent")
+        if not callable(persist_intent):
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": "sync_promotion: durable coordinator intent callback is required",
+            }
+
+        def emit_fault(boundary: str) -> None:
+            if callable(fault):
+                fault({"boundary": boundary, "phase": "sync_promotion"})
+
+        def commit_seed(before_sha256: str) -> dict[str, Any]:
+            return {
+                "schema_version": "tradingagents.promotion_recovery_commit.v1",
+                "incident_id": bindings["incident_id"],
+                "recovery_run_id": str(arguments["recovery_run_id"]),
+                "source_revision": bindings["source_revision"],
+                "focused_path": str(Path(str(focused_record["path"])).resolve()),
+                "focused_sha256": focused_record["sha256"],
+                "verifier_run_id": focused_packet["verifier_run_id"],
+                "verifier_role_id": focused_packet["verifier_role_id"],
+                "reconciliation_path": str(
+                    Path(str(reconciliation_record["path"])).resolve()
+                ),
+                "reconciliation_sha256": reconciliation_record["sha256"],
+                "report_path": str(report),
+                "report_sha256": report_sha256,
+                "envelope_path": str(envelope),
+                "envelope_sha256": envelope_sha256,
+                "canonical_path": str(canonical_state),
+                "canonical_before_sha256": before_sha256,
+                "candidate_payload_sha256": hashlib.sha256(
+                    _recovery_json(dict(candidate_payload))
+                ).hexdigest(),
+            }
+
+        def read_prepare() -> tuple[dict[str, Any], dict[str, str]]:
+            if prepare_path.exists():
+                prepare = json.loads(prepare_path.read_text(encoding="utf-8"))
+                record = _phase_record(prepare_path)
+                recovery_commit = prepare.get("recovery_commit")
+                if (
+                    prepare.get("schema_version")
+                    != "tradingagents.promotion_prepare.v1"
+                    or prepare.get("kind") != "promotion_commit_prepare"
+                    or prepare.get("stage_path") != str(stage_path)
+                    or not isinstance(recovery_commit, Mapping)
+                ):
+                    raise ValueError("promotion prepare packet is malformed")
+                seed = dict(recovery_commit)
+                commit_id = seed.pop("commit_id", None)
+                expected_seed = commit_seed(
+                    str(recovery_commit.get("canonical_before_sha256") or "")
+                )
+                expected_commit_id = hashlib.sha256(
+                    _recovery_json(expected_seed)
+                ).hexdigest()
+                if (
+                    seed != expected_seed
+                    or commit_id != expected_commit_id
+                    or _recovery_digest(prepare_path) != record["sha256"]
+                ):
+                    raise ValueError("promotion prepare packet binding mismatch")
+                return prepare, record
+            before_sha256 = _recovery_digest(canonical_state)
+            seed = commit_seed(before_sha256)
+            recovery_commit = {
+                **seed,
+                "commit_id": hashlib.sha256(_recovery_json(seed)).hexdigest(),
+            }
+            prepare = {
+                "schema_version": "tradingagents.promotion_prepare.v1",
+                "kind": "promotion_commit_prepare",
+                "recovery_commit": recovery_commit,
+                "stage_path": str(stage_path),
+                "can_submit_orders": False,
+                "execution_authority": "none",
+            }
+            record = _write_phase_packet(prepare_path, prepare)
+            emit_fault("after_promotion_prepare_fsync")
+            return prepare, record
+
+        def reconstruct_packet(
+            staged_state: Mapping[str, Any],
+            recovery_commit: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            sleeves = staged_state.get("sleeves")
+            candidate_id = (
+                str(candidate_payload.get("strategy_id"))
+                if candidate_payload.get("status") == "candidate"
+                and candidate_payload.get("strategy_id")
+                else None
+            )
+            candidate_record = (
+                sleeves.get(candidate_id)
+                if isinstance(sleeves, Mapping) and candidate_id
+                else None
+            )
+            candidate_issues = (
+                list(candidate_record.get("issues") or [])
+                if isinstance(candidate_record, Mapping)
+                else []
+            )
+            promoted = (
+                [candidate_id]
+                if isinstance(candidate_record, Mapping)
+                and candidate_record.get("stage") == "tiny_live_eligible"
+                and candidate_record.get("live_enabled") is True
+                else []
+            )
+            demoted = [
+                str(sleeve_id)
+                for sleeve_id, record in (sleeves.items() if isinstance(sleeves, Mapping) else ())
+                if isinstance(record, Mapping)
+                and record.get("stage") == "paper_only"
+                and record.get("live_enabled") is False
+                and _nonempty_recovery_string(record.get("demotion_reason"))
+            ]
+            issues_by_sleeve = {
+                str(sleeve_id): list(record.get("issues") or [])
+                for sleeve_id, record in (
+                    sleeves.items() if isinstance(sleeves, Mapping) else ()
+                )
+                if isinstance(record, Mapping) and "issues" in record
+            }
+            if candidate_id and candidate_id not in issues_by_sleeve:
+                issues_by_sleeve[candidate_id] = candidate_issues
+            issues = [
+                str(issue)
+                for values in issues_by_sleeve.values()
+                for issue in values
+            ]
+            return {
+                "summary": "promotion state synchronized by verified recovery",
+                "promoted": promoted,
+                "demoted": demoted,
+                "issues_by_sleeve": issues_by_sleeve,
+                "state_path": str(canonical_state),
+                "canonical_state_path": str(canonical_state),
+                "report_path": str(report),
+                "arm_live": True,
+                "ci_green": True,
+                "can_submit_orders": False,
+                "execution_authority": "none",
+                "state": dict(staged_state),
+                "promotion_evidence_fresh": not issues,
+                "issues": issues,
+                "recovery_commit": dict(recovery_commit),
+            }
+
+        try:
+            prepare, prepare_record = read_prepare()
+            recovery_commit = dict(prepare["recovery_commit"])
+            if stage_path.exists():
+                staged_state = json.loads(stage_path.read_text(encoding="utf-8"))
+            else:
+                result = run_json(
+                    "sync_promotion",
+                    [
+                        sys.executable,
+                        "-m",
+                        "cli.main",
+                        "policy",
+                        "sync-promotion",
+                        "--report-path",
+                        str(report),
+                        "--envelope-path",
+                        str(envelope),
+                        "--state-path",
+                        str(canonical_state),
+                        "--output-state-path",
+                        str(stage_path),
+                        "--arm-live",
+                        "--ci-green",
+                        "--json-output",
+                    ],
+                )
+                raw_packet = (
+                    result.get("packet") if isinstance(result, Mapping) else None
+                )
+                if not isinstance(raw_packet, Mapping) or not stage_path.exists():
+                    return unavailable(
+                        "sync_promotion", "canonical promotion staging failed"
+                    )
+                staged_state = json.loads(stage_path.read_text(encoding="utf-8"))
+            if not isinstance(staged_state, Mapping):
+                raise ValueError("staged promotion state is malformed")
+            source = staged_state.get("source")
+            if not isinstance(source, Mapping):
+                raise ValueError("staged promotion source is malformed")
+            if (
+                source.get("canonical_input_sha256")
+                != recovery_commit["canonical_before_sha256"]
+            ):
+                raise _PromotionStalePreimage(
+                    "promotion canonical changed during staging"
+                )
+            staged_state = dict(staged_state)
+            staged_state["source"] = {
+                **dict(source),
+                "recovery_commit": recovery_commit,
+            }
+            atomic_write_text(
+                stage_path,
+                json.dumps(staged_state, indent=2, sort_keys=True),
+            )
+            staged_sha256 = _recovery_digest(stage_path)
+            packet = reconstruct_packet(staged_state, recovery_commit)
+            staged_source = staged_state.get("source")
+            staged_sleeves = staged_state.get("sleeves")
+            if (
+                staged_state.get("schema_version") != "1.1.0"
+                or _parse_aware_recovery_time(staged_state.get("generated_at"))
+                is None
+                or not isinstance(staged_source, Mapping)
+                or staged_source.get("kind") != "paper_tournament_sync"
+                or staged_source.get("arm_live") is not True
+                or staged_source.get("ci_green") is not True
+                or staged_source.get("canonical_input_sha256")
+                != recovery_commit["canonical_before_sha256"]
+                or staged_source.get("recovery_commit") != recovery_commit
+                or not isinstance(staged_sleeves, Mapping)
+                or not all(
+                    _nonempty_recovery_string(sleeve_id)
+                    and isinstance(record, Mapping)
+                    and _valid_promotion_sleeve_record(
+                        record,
+                        symbol=bindings["symbol"],
+                    )
+                    for sleeve_id, record in staged_sleeves.items()
+                )
+                or packet.get("issues") != []
+                or any(packet.get("issues_by_sleeve", {}).values())
+                or any(
+                    staged_sleeves[sleeve_id].get("stage")
+                    != "tiny_live_eligible"
+                    or staged_sleeves[sleeve_id].get("live_enabled") is not True
+                    for sleeve_id in packet.get("promoted", [])
+                )
+            ):
+                raise ValueError(
+                    "staged promotion transaction failed semantic validation"
+                )
+            intent = {
+                "commit_id": recovery_commit["commit_id"],
+                "prepare_path": prepare_record["path"],
+                "prepare_sha256": prepare_record["sha256"],
+                "staged_path": str(stage_path),
+                "staged_sha256": staged_sha256,
+                "canonical_path": str(canonical_state),
+                "canonical_before_sha256": recovery_commit[
+                    "canonical_before_sha256"
+                ],
+            }
+            with promotion_state_lock(canonical_state):
+                current_sha256 = _recovery_digest(canonical_state)
+                if callable(persist_intent):
+                    persist_intent(intent)
+                emit_fault("after_promotion_intent_fsync")
+                if current_sha256 == recovery_commit["canonical_before_sha256"]:
+                    atomic_write_text(
+                        canonical_state,
+                        stage_path.read_text(encoding="utf-8"),
+                    )
+                    current_sha256 = _recovery_digest(canonical_state)
+                    if current_sha256 != staged_sha256:
+                        raise ValueError("promotion canonical replace digest mismatch")
+                    emit_fault("after_promotion_canonical_replace")
+                elif current_sha256 == staged_sha256:
+                    canonical = json.loads(
+                        canonical_state.read_text(encoding="utf-8")
+                    )
+                    canonical_commit = (
+                        canonical.get("source", {}).get("recovery_commit")
+                        if isinstance(canonical, Mapping)
+                        else None
+                    )
+                    if canonical_commit != recovery_commit:
+                        raise ValueError("committed promotion identity mismatch")
+                else:
+                    raise _PromotionStalePreimage(
+                        "promotion canonical state changed after prepare"
+                    )
+                receipt = {
+                    "schema_version": "tradingagents.promotion_commit.v1",
+                    "kind": "verified_promotion_commit",
+                    "recovery_commit": recovery_commit,
+                    "prepare_path": prepare_record["path"],
+                    "prepare_sha256": prepare_record["sha256"],
+                    "staged_path": str(stage_path),
+                    "staged_sha256": staged_sha256,
+                    "canonical_path": str(canonical_state),
+                    "canonical_before_sha256": recovery_commit[
+                        "canonical_before_sha256"
+                    ],
+                    "canonical_after_sha256": staged_sha256,
+                    "can_submit_orders": False,
+                    "execution_authority": "none",
+                }
+                receipt_record = _write_phase_packet(receipt_path, receipt)
+                emit_fault("after_promotion_commit_receipt_fsync")
+            packet.update(
+                {
+                    "staged_state_path": str(stage_path),
+                    "staged_state_sha256": staged_sha256,
+                    "canonical_after_sha256": staged_sha256,
+                    "promotion_prepare": prepare_record,
+                    "promotion_commit": receipt_record,
+                    "promotion_commit_intent": intent,
+                }
+            )
+            return {"packet": packet}
+        except _PromotionStalePreimage as error:
+            return {
+                "outcome": "failed",
+                "failure_type": "transient",
+                "detail": f"sync_promotion: {_redact_recovery_detail(error)}",
+            }
+        except (OSError, ValueError, json.JSONDecodeError, KeyError) as error:
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": f"sync_promotion: {_redact_recovery_detail(error)}",
+            }
 
     def reconcile(_arguments: Mapping[str, Any]) -> dict[str, Any]:
         raw_paths = context.get("reconciliation_packet_paths")
@@ -1757,7 +2484,7 @@ def build_production_recovery_request(
         if int(getattr(revision, "returncode", 1)) != 0 or str(getattr(revision, "stdout", "")).strip() != bindings["source_revision"]:
             return unavailable("focused_verify", "checkout source revision does not match recovery binding")
         try:
-            result = command_runner([sys.executable, "-m", "pytest", "tests/test_recovery_coordinator.py", "tests/test_self_heal_recovery.py", "-q"], cwd=str(root), capture_output=True, text=True, timeout=120)
+            result = command_runner([sys.executable, "-m", "pytest", *RECOVERY_FOCUSED_TESTS, "-q"], cwd=str(root), capture_output=True, text=True, timeout=120)
         except (OSError, subprocess.TimeoutExpired) as error:
             return unavailable("focused_verify", _redact_recovery_detail(error))
         if int(getattr(result, "returncode", 1)) != 0:
@@ -1767,7 +2494,7 @@ def build_production_recovery_request(
                 "kind": "recovery_focused_proof",
                 "schema_version": "tradingagents.recovery_phase.v1",
                 "focused_tests_passed": True,
-                "passing_tests": ["tests/test_recovery_coordinator.py", "tests/test_self_heal_recovery.py"],
+                "passing_tests": list(RECOVERY_FOCUSED_TESTS),
                 "verifier_run_id": f"self-heal-verifier-{secrets.token_hex(8)}",
                 "verifier_role_id": "independent_verifier",
             }
@@ -2006,12 +2733,101 @@ def coordinate_verified_recovery(
         return {"status": "owner_busy", "incident_id": incident_id, "phase": None}
     try:
         state, state_error = _read_recovery_state(state_path)
-        if state_error is not None:
+        if state_error == "legacy_v1":
+            assert isinstance(state, dict)
+            if (
+                state.get("incident_id") != incident_id
+                or state.get("bindings") != canonical_bindings
+                or state.get("recovery_run_id") != recovery_run_id
+            ):
+                _append_recovery_event(
+                    incident_root,
+                    {
+                        "event": "corrupt_state",
+                        "incident_id": incident_id,
+                        "at": current.isoformat(),
+                    },
+                )
+                return {
+                    "status": "corrupt_state",
+                    "incident_id": incident_id,
+                    "phase": None,
+                    "failure": _recovery_failure(
+                        "permanent_integrity",
+                        "legacy v1 recovery identity is malformed",
+                    ),
+                }
+            legacy_bytes = state_path.read_bytes()
+            legacy_sha256 = hashlib.sha256(legacy_bytes).hexdigest()
+            legacy_path = (
+                incident_root / f"state-v1-{legacy_sha256}.json"
+            )
+            _write_immutable_recovery_bytes(legacy_path, legacy_bytes)
+            next_run = f"{recovery_run_id}-v2-follow-1"
+            if not is_safe_incident_id(next_run):
+                return {
+                    "status": "corrupt_state",
+                    "incident_id": incident_id,
+                    "phase": None,
+                    "failure": _recovery_failure(
+                        "permanent_integrity",
+                        "unsafe v2 recovery follow-on identifier",
+                    ),
+                }
+            migration_event = {
+                "event": "legacy_v1_migrated",
+                "at": current.isoformat(),
+                "legacy_v1_state_path": str(legacy_path.resolve()),
+                "legacy_v1_state_sha256": legacy_sha256,
+                "recovery_run_id": next_run,
+            }
+            _freeze_recovery_control(
+                control_path,
+                reason="legacy v1 recovery state requires v2 follow-on",
+            )
+            state = {
+                "schema_version": "tradingagents.self_heal_recovery.v2",
+                "incident_id": incident_id,
+                "bindings": canonical_bindings,
+                "recovery_run_id": next_run,
+                "parent_recovery_run_id": recovery_run_id,
+                "follow_on_count": 1,
+                "follow_on_required": False,
+                "owner_role": owner_role,
+                "owner_run_id": owner_run_id,
+                "attempt": 0,
+                "phase": RECOVERY_PHASES[0],
+                "phase_outputs": {},
+                "lease_expires_at": (
+                    current
+                    + dt.timedelta(minutes=RECOVERY_LEASE_MINUTES)
+                ).isoformat(),
+                "next_retry_at": None,
+                "last_failure": None,
+                "last_artifact": None,
+                "external_blockers": [],
+                "incident_stage": "repairing",
+                "incident_history": [migration_event],
+                "idempotency_keys": [],
+                "created_at": current.isoformat(),
+                "legacy_v1_state_path": str(legacy_path.resolve()),
+                "legacy_v1_state_sha256": legacy_sha256,
+            }
+            run_root = incident_root / next_run
+            _write_recovery_state(state_path, state)
+            _append_recovery_event(
+                incident_root,
+                {
+                    **migration_event,
+                    "incident_id": incident_id,
+                },
+            )
+        elif state_error is not None:
             _append_recovery_event(incident_root, {"event": "corrupt_state", "incident_id": incident_id, "at": current.isoformat()})
             return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "persisted recovery state is malformed")}
         if state is None:
             state = {
-                "schema_version": "tradingagents.self_heal_recovery.v1",
+                "schema_version": "tradingagents.self_heal_recovery.v2",
                 "incident_id": incident_id,
                 "bindings": canonical_bindings,
                 "recovery_run_id": recovery_run_id,
@@ -2036,6 +2852,17 @@ def coordinate_verified_recovery(
             _append_recovery_event(incident_root, {"event": "lock_stale_takeover", "incident_id": incident_id, "owner_run_id": owner_run_id, "at": current.isoformat()})
         if state.get("bindings") != canonical_bindings or (state.get("recovery_run_id") != recovery_run_id and state.get("parent_recovery_run_id") != recovery_run_id):
             return {"status": "identity_mismatch_frozen", "incident_id": incident_id, "phase": state.get("phase")}
+        run_root = incident_root / str(state["recovery_run_id"])
+        if not _path_under(run_root, root):
+            return {
+                "status": "corrupt_state",
+                "incident_id": incident_id,
+                "phase": None,
+                "failure": _recovery_failure(
+                    "permanent_integrity",
+                    "persisted recovery run path escapes root",
+                ),
+            }
         prior_failure = state.get("last_failure") or {}
         if prior_failure.get("kind") == "transient_exhausted" and state.get("follow_on_required") is True:
             not_before = _parse_datetime(state.get("follow_on_not_before"))
@@ -2063,6 +2890,7 @@ def coordinate_verified_recovery(
             )
             state.pop("rearm_intent", None)
             state.pop("verifier_run_id", None)
+            state.pop("promotion_commit_intent", None)
             run_root = incident_root / next_run
             state["incident_history"].append({"event": "follow_on_opened", "at": current.isoformat(), "recovery_run_id": next_run})
             _append_recovery_event(incident_root, {"event": "follow_on_opened", "incident_id": incident_id, "recovery_run_id": next_run, "at": current.isoformat()})
@@ -2286,21 +3114,59 @@ def coordinate_verified_recovery(
                     adapter = adapters.get(phase)
                     if not callable(adapter):
                         raise ValueError(f"missing recovery adapter for {phase}")
-                    packet = _adapter_packet(
-                        adapter(
+                    adapter_arguments: dict[str, Any] = {
+                        "incident_id": incident_id,
+                        "bindings": dict(canonical_bindings),
+                        "owner_run_id": owner_run_id,
+                        "owner_role": owner_role,
+                        "recovery_run_id": state["recovery_run_id"],
+                        "phase": phase,
+                        "phase_outputs": dict(state["phase_outputs"]),
+                        "generated_at": current.isoformat(),
+                    }
+                    if phase == "sync_promotion":
+                        staging_dir = run_root / "staging"
+
+                        def persist_promotion_commit_intent(
+                            intent: Mapping[str, Any],
+                        ) -> None:
+                            existing_intent = state.get("promotion_commit_intent")
+                            if (
+                                existing_intent is not None
+                                and existing_intent != intent
+                            ):
+                                raise ValueError(
+                                    "persisted promotion commit intent mismatch"
+                                )
+                            state["promotion_commit_intent"] = dict(intent)
+                            _write_recovery_state(state_path, state)
+
+                        adapter_arguments.update(
                             {
-                                "incident_id": incident_id,
-                                "bindings": dict(canonical_bindings),
-                                "owner_run_id": owner_run_id,
-                                "owner_role": owner_role,
-                                "recovery_run_id": recovery_run_id,
-                                "phase": phase,
-                                "phase_outputs": dict(state["phase_outputs"]),
-                                "generated_at": current.isoformat(),
+                                "run_root": str(run_root),
+                                "staging_dir": str(staging_dir),
+                                "_persist_promotion_commit_intent": persist_promotion_commit_intent,
+                                "_transaction_fault_hook": fault_hook,
                             }
-                        ),
+                        )
+                        if callable(fault_hook):
+                            fault_hook(
+                                {
+                                    "boundary": "before_promotion_adapter",
+                                    "phase": phase,
+                                }
+                            )
+                    packet = _adapter_packet(
+                        adapter(adapter_arguments),
                         phase=phase,
                     )
+                    if phase == "sync_promotion" and callable(fault_hook):
+                        fault_hook(
+                            {
+                                "boundary": "after_promotion_adapter_return",
+                                "phase": phase,
+                            }
+                        )
                 packet = _canonical_packet(packet, canonical_bindings, current)
                 packet.update(
                     {

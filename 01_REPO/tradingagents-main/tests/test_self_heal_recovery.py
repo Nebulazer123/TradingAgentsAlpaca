@@ -1,11 +1,15 @@
 import datetime as dt
 import hashlib
 import json
+from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
+from tradingagents.brokers import alpaca_reconciliation
 from tradingagents.orchestration.self_heal import (
+    RECOVERY_FOCUSED_TESTS,
     RECOVERY_PHASES,
     _classify_self_heal_signal,
     _valid_phase_packet,
@@ -15,6 +19,8 @@ from tradingagents.orchestration.self_heal import (
     recovery_recipe,
 )
 from tradingagents.policy.live_control import load_live_control_state, write_live_control_state
+from tradingagents.policy.live_gate import evaluate_go_live_guard
+from tradingagents.policy.promotion_sync import sync_promotion_state_file
 
 NOW = dt.datetime(2026, 7, 18, 12, 0, tzinfo=dt.timezone.utc)
 BINDINGS = {
@@ -154,13 +160,13 @@ def _loss_review_source_packet(
 def _promotion_source_packet(*, symbol: str = "NFLX") -> dict:
     return {
         "summary": "promotion state synchronized",
-        "promoted": [],
+        "promoted": ["pullback-support"],
         "demoted": [],
         "issues_by_sleeve": {"pullback-support": []},
         "state_path": "/tmp/promotion-state.json",
         "report_path": "/tmp/paper-tournament.json",
-        "arm_live": False,
-        "ci_green": False,
+        "arm_live": True,
+        "ci_green": True,
         "can_submit_orders": False,
         "execution_authority": "none",
         "state": {
@@ -170,13 +176,13 @@ def _promotion_source_packet(*, symbol: str = "NFLX") -> dict:
                 "kind": "paper_tournament_sync",
                 "tournament_id": "tournament-20260718",
                 "report_generated_at": NOW.isoformat(),
-                "arm_live": False,
-                "ci_green": False,
+                "arm_live": True,
+                "ci_green": True,
             },
             "sleeves": {
                 "pullback-support": {
                     "stage": "tiny_live_eligible",
-                    "live_enabled": False,
+                    "live_enabled": True,
                     "ci_green": True,
                     "shadow_confirmed": True,
                     "preregistered": True,
@@ -304,7 +310,7 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
         },
         "focused_verify": {
             "focused_tests_passed": True,
-            "passing_tests": ["tests/test_policy.py::test_nflx"],
+            "passing_tests": list(RECOVERY_FOCUSED_TESTS),
             "verifier_run_id": "verify-nflx-1",
             "verifier_role_id": "independent_verifier",
         },
@@ -330,6 +336,174 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
             elif phase == "sync_promotion":
                 packet["state"]["generated_at"] = generated_at
                 packet["state"]["source"]["report_generated_at"] = generated_at
+                run_root = Path(arguments["run_root"])
+                staging_dir = Path(arguments["staging_dir"])
+                packet_dir = run_root / "packets"
+                input_dir = run_root / "test-promotion-inputs"
+                input_dir.mkdir(parents=True, exist_ok=True)
+                report_path = input_dir / "paper-tournament.json"
+                envelope_path = input_dir / "risk-envelope.yaml"
+                canonical_path = input_dir / "promotion-state.json"
+                report_path.write_text(
+                    json.dumps(_current_like_tournament_report()),
+                    encoding="utf-8",
+                )
+                envelope_path.write_text(
+                    "tiny_live_tranche_usd: 25\n", encoding="utf-8"
+                )
+                if not canonical_path.exists():
+                    canonical_path.write_text(
+                        json.dumps({"schema_version": "1.0.0", "sleeves": {}}),
+                        encoding="utf-8",
+                    )
+                focused_record = arguments["phase_outputs"]["focused_verify"]
+                reconciliation_record = arguments["phase_outputs"]["reconcile"]
+                focused = json.loads(
+                    Path(focused_record["path"]).read_text(encoding="utf-8")
+                )
+                before_sha256 = hashlib.sha256(
+                    canonical_path.read_bytes()
+                ).hexdigest()
+                candidate = _current_like_tournament_report()[
+                    "live_strategy_candidate"
+                ]
+                commit_seed = {
+                    "schema_version": "tradingagents.promotion_recovery_commit.v1",
+                    "incident_id": arguments["bindings"]["incident_id"],
+                    "recovery_run_id": arguments["recovery_run_id"],
+                    "source_revision": arguments["bindings"]["source_revision"],
+                    "focused_path": str(Path(focused_record["path"]).resolve()),
+                    "focused_sha256": focused_record["sha256"],
+                    "verifier_run_id": focused["verifier_run_id"],
+                    "verifier_role_id": focused["verifier_role_id"],
+                    "reconciliation_path": str(
+                        Path(reconciliation_record["path"]).resolve()
+                    ),
+                    "reconciliation_sha256": reconciliation_record["sha256"],
+                    "report_path": str(report_path.resolve()),
+                    "report_sha256": hashlib.sha256(
+                        report_path.read_bytes()
+                    ).hexdigest(),
+                    "envelope_path": str(envelope_path.resolve()),
+                    "envelope_sha256": hashlib.sha256(
+                        envelope_path.read_bytes()
+                    ).hexdigest(),
+                    "canonical_path": str(canonical_path.resolve()),
+                    "canonical_before_sha256": before_sha256,
+                    "candidate_payload_sha256": hashlib.sha256(
+                        (
+                            json.dumps(
+                                candidate,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=True,
+                            )
+                            + "\n"
+                        ).encode()
+                    ).hexdigest(),
+                }
+                recovery_commit = {
+                    **commit_seed,
+                    "commit_id": hashlib.sha256(
+                        (
+                            json.dumps(
+                                commit_seed,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=True,
+                            )
+                            + "\n"
+                        ).encode()
+                    ).hexdigest(),
+                }
+                packet["state"]["source"].update(
+                    {
+                        "canonical_input_sha256": before_sha256,
+                        "recovery_commit": recovery_commit,
+                    }
+                )
+                stage_path = staging_dir / "promotion_state.json"
+                stage_path.parent.mkdir(parents=True, exist_ok=True)
+                stage_text = json.dumps(packet["state"], indent=2, sort_keys=True)
+                stage_path.write_text(stage_text, encoding="utf-8")
+                canonical_path.write_text(stage_text, encoding="utf-8")
+                staged_sha256 = hashlib.sha256(stage_path.read_bytes()).hexdigest()
+                prepare_path = packet_dir / "promotion_prepare.json"
+                prepare = {
+                    "schema_version": "tradingagents.promotion_prepare.v1",
+                    "kind": "promotion_commit_prepare",
+                    "recovery_commit": recovery_commit,
+                    "stage_path": str(stage_path.resolve()),
+                    "can_submit_orders": False,
+                    "execution_authority": "none",
+                }
+                prepare_path.write_text(
+                    json.dumps(
+                        prepare,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                prepare_record = {
+                    "path": str(prepare_path.resolve()),
+                    "sha256": hashlib.sha256(prepare_path.read_bytes()).hexdigest(),
+                }
+                intent = {
+                    "commit_id": recovery_commit["commit_id"],
+                    "prepare_path": prepare_record["path"],
+                    "prepare_sha256": prepare_record["sha256"],
+                    "staged_path": str(stage_path.resolve()),
+                    "staged_sha256": staged_sha256,
+                    "canonical_path": str(canonical_path.resolve()),
+                    "canonical_before_sha256": before_sha256,
+                }
+                arguments["_persist_promotion_commit_intent"](intent)
+                receipt_path = packet_dir / "promotion_commit.json"
+                receipt = {
+                    "schema_version": "tradingagents.promotion_commit.v1",
+                    "kind": "verified_promotion_commit",
+                    "recovery_commit": recovery_commit,
+                    "prepare_path": prepare_record["path"],
+                    "prepare_sha256": prepare_record["sha256"],
+                    "staged_path": str(stage_path.resolve()),
+                    "staged_sha256": staged_sha256,
+                    "canonical_path": str(canonical_path.resolve()),
+                    "canonical_before_sha256": before_sha256,
+                    "canonical_after_sha256": staged_sha256,
+                    "can_submit_orders": False,
+                    "execution_authority": "none",
+                }
+                receipt_path.write_text(
+                    json.dumps(
+                        receipt,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                receipt_record = {
+                    "path": str(receipt_path.resolve()),
+                    "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                }
+                packet.update(
+                    {
+                        "state_path": str(canonical_path.resolve()),
+                        "canonical_state_path": str(canonical_path.resolve()),
+                        "report_path": str(report_path.resolve()),
+                        "staged_state_path": str(stage_path.resolve()),
+                        "staged_state_sha256": staged_sha256,
+                        "canonical_after_sha256": staged_sha256,
+                        "recovery_commit": recovery_commit,
+                        "promotion_prepare": prepare_record,
+                        "promotion_commit": receipt_record,
+                        "promotion_commit_intent": intent,
+                    }
+                )
             return {"packet": packet}
 
         return run
@@ -350,6 +524,868 @@ def _run(tmp_path: Path, calls: list[str], **overrides):
         now=overrides.pop("now", NOW),
         **overrides,
     )
+
+
+def _current_like_tournament_report() -> dict:
+    return {
+        "generated_at": NOW.isoformat(),
+        "tournament_id": "tournament-20260718",
+        "rankings": [
+            {
+                "strategy_id": "pullback-support",
+                "name": "pullback-support",
+                "equity": "10353.62",
+                "total_return": "353.62",
+                "total_return_pct": "3.53",
+                "max_drawdown_pct": "-1.91",
+                "win_rate_pct": "71.42",
+                "tracked_days": 14,
+            }
+        ],
+        "live_strategy_candidate": {
+            "status": "candidate",
+            "strategy_id": "pullback-support",
+            "reason": "best positive paper strategy after 14 tracked day(s)",
+        },
+    }
+
+
+def _production_recovery_harness(
+    tmp_path: Path, *, fail_phase: str | None = None
+) -> tuple[dict, Path, list[list[str]], object]:
+    evidence = _loss_review_source_packet(
+        account="paper",
+        packet_path=str(tmp_path / "results" / "loss_review_evidence" / "latest.json"),
+        hourly_packet_path="results/hourly_supervisor/hourly-supervisor-nflx.json",
+    )
+    supervisor_path = tmp_path / "results" / "hourly_supervisor" / "supervisor.json"
+    advisory_path = tmp_path / "results" / "hourly_supervisor" / "advisory.json"
+    hourly_dir = tmp_path / "results" / "hourly_supervisor"
+    report_path = tmp_path / "results" / "paper_strategy_tournament" / "latest.json"
+    state_path = tmp_path / "results" / "policy" / "promotion_state.json"
+    envelope_path = tmp_path / "config" / "risk_envelope.yaml"
+    reconciliation_path = tmp_path / "results" / "alpaca_reconciliation" / "latest.json"
+    for path, content in (
+        (
+            supervisor_path,
+            json.dumps(evidence["payload"]["supervisor_review_authority"]),
+        ),
+        (advisory_path, json.dumps(evidence["payload"]["advisory_analysis"])),
+        (report_path, json.dumps(_current_like_tournament_report())),
+        (state_path, json.dumps(_promotion_source_packet()["state"], indent=2)),
+        (
+            envelope_path,
+            "\n".join(
+                (
+                    "account_max_capital_at_risk_usd: 250.00",
+                    "per_name_cap_usd: 50.00",
+                    "per_sector_cap_pct: 0.20",
+                    "aggregate_beta_cap: 1.25",
+                    "daily_loss_halt_usd: 25.00",
+                    "max_drawdown_halt_pct: 0.05",
+                    "tiny_live_tranche_usd: 25.00",
+                    "tiny_live_max_loss_usd: 5.00",
+                    "new_sleeve_auto_promote: false",
+                    "alert_email: ops@example.com",
+                )
+            ),
+        ),
+        (
+            reconciliation_path,
+            json.dumps(
+                {
+                    "actions": [
+                        {
+                            "symbol": "NFLX",
+                            "side": "buy",
+                            "account": "live",
+                            "idempotency_key": "open-nflx-1",
+                        }
+                    ],
+                    "submitted": [
+                        {
+                            "client_order_id": "open-nflx-1",
+                            "symbol": "NFLX",
+                            "side": "buy",
+                            "type": "limit",
+                            "qty": "1",
+                            "limit_price": "100",
+                            "status": "accepted",
+                        }
+                    ],
+                }
+            ),
+        ),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    invocations: list[list[str]] = []
+
+    class BrokerSpy:
+        def __init__(self):
+            self.write_calls: list[tuple] = []
+            self.read_calls: list[tuple] = []
+            self.positions = [
+                {
+                    "symbol": "NFLX",
+                    "qty": "1",
+                    "notional": "100",
+                    "market_value": "100",
+                    "avg_entry_price": "100",
+                }
+            ]
+            self.orders = [
+                {
+                    "id": "broker-open-nflx-1",
+                    "client_order_id": "open-nflx-1",
+                    "symbol": "NFLX",
+                    "side": "buy",
+                    "type": "limit",
+                    "time_in_force": "day",
+                    "qty": "1",
+                    "limit_price": "100",
+                    "status": "accepted",
+                    "filled_qty": "0",
+                    "submitted_at": NOW.isoformat(),
+                    "updated_at": NOW.isoformat(),
+                }
+            ]
+
+        def list_positions(self):
+            self.read_calls.append(("list_positions",))
+            return self.positions
+
+        def list_orders(self, status="all"):
+            self.read_calls.append(("list_orders", status))
+            return self.orders
+
+        def get_order_by_client_order_id(self, client_order_id):
+            self.read_calls.append(("get_order_by_client_order_id", client_order_id))
+            return next(
+                (
+                    order
+                    for order in self.orders
+                    if order["client_order_id"] == client_order_id
+                ),
+                None,
+            )
+
+        def _reject_write(self, name, args, kwargs):
+            self.write_calls.append((name, args, kwargs))
+            raise AssertionError("recovery reconciliation attempted a broker write")
+
+        def submit_order(self, *args, **kwargs):
+            return self._reject_write("submit", args, kwargs)
+
+        def cancel_order(self, *args, **kwargs):
+            return self._reject_write("cancel", args, kwargs)
+
+        def replace_order(self, *args, **kwargs):
+            return self._reject_write("replace", args, kwargs)
+
+        def close_position(self, *args, **kwargs):
+            return self._reject_write("close_position", args, kwargs)
+
+    broker_spy = BrokerSpy()
+
+    class Result:
+        def __init__(self, *, stdout: str = "", stderr: str = "", returncode: int = 0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def runner(argv, **_kwargs):
+        command = list(argv)
+        invocations.append(command)
+        if command[:3] == ["git", "rev-parse", "HEAD"]:
+            return Result(stdout="source-revision\n")
+        if "loss-review-evidence" in command:
+            return Result(stdout=json.dumps(evidence))
+        if "reconcile-symbol-incident" in command:
+            if fail_phase == "reconcile":
+                return Result(stderr="read-only reconciliation failed", returncode=1)
+            reconciliation = alpaca_reconciliation.reconcile_symbol_incident(
+                symbol="NFLX",
+                packet_paths=[reconciliation_path],
+                live_client=broker_spy,
+                expected_qty=Decimal("1"),
+            )
+            return Result(
+                stdout=json.dumps(
+                    {
+                        "schema_version": 1,
+                        "kind": "symbol_broker_reconciliation",
+                        "generated_at": NOW.isoformat(),
+                        "read_only": True,
+                        "analysis_only": True,
+                        "can_submit_orders": False,
+                        "execution_authority": "none",
+                        **asdict(reconciliation),
+                    }
+                )
+            )
+        if "pytest" in command:
+            if fail_phase == "focused_verify":
+                return Result(stderr="focused verification failed", returncode=1)
+            return Result(stdout="passed")
+        if "sync-promotion" in command:
+            arm_live = "--arm-live" in command and "--no-arm-live" not in command
+            ci_green = "--ci-green" in command and "--no-ci-green" not in command
+            canonical_input_path = command[command.index("--state-path") + 1]
+            output_state_path = (
+                command[command.index("--output-state-path") + 1]
+                if "--output-state-path" in command
+                else canonical_input_path
+            )
+            result = sync_promotion_state_file(
+                command[command.index("--report-path") + 1],
+                canonical_input_path,
+                output_state_path=output_state_path,
+                tiny_live_tranche_usd=Decimal("25"),
+                arm_live=arm_live,
+                ci_green=ci_green,
+                now=NOW,
+            )
+            if fail_phase == "promotion_after_stage_write":
+                raise SystemExit("promotion state written before adapter return")
+            return Result(
+                stdout=json.dumps(
+                    {
+                        "summary": result.summary,
+                        "promoted": result.promoted,
+                        "demoted": result.demoted,
+                        "issues_by_sleeve": result.issues_by_sleeve,
+                        "state_path": output_state_path,
+                        "canonical_state_path": canonical_input_path,
+                        "report_path": command[command.index("--report-path") + 1],
+                        "arm_live": arm_live,
+                        "ci_green": ci_green,
+                        "can_submit_orders": False,
+                        "execution_authority": "none",
+                        "state": result.state,
+                    }
+                )
+            )
+        raise AssertionError(command)
+
+    context = {
+        "symbol": "NFLX",
+        "broker_account": "paper",
+        "environment": "test",
+        "source_revision": "source-revision",
+        "supervisor_path": str(supervisor_path),
+        "advisory_path": str(advisory_path),
+        "hourly_dir": str(hourly_dir),
+        "report_path": str(report_path),
+        "envelope_path": str(envelope_path),
+        "promotion_state_path": str(state_path),
+        "reconciliation_packet_paths": [str(reconciliation_path)],
+        "supervisor_record": evidence["payload"]["supervisor_review_authority"],
+        "advisory_record": evidence["payload"]["advisory_analysis"],
+    }
+    request = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "symbol": "NFLX",
+            "recovery_context": context,
+        },
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+    assert request["ready"] is True
+    return request, state_path, invocations, broker_spy
+
+
+def test_recovery_phase_order_proves_before_mutating_promotion():
+    assert RECOVERY_PHASES == (
+        "resolve_authority",
+        "regenerate_evidence",
+        "reconcile",
+        "focused_verify",
+        "sync_promotion",
+        "ready_incident",
+        "manifest",
+        "rearm",
+    )
+
+
+def test_production_promotion_adapter_requires_prior_focused_proof(tmp_path):
+    request, state_path, invocations, _broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    original = state_path.read_bytes()
+
+    result = request["adapters"]["sync_promotion"](
+        {"phase": "sync_promotion", "phase_outputs": {}}
+    )
+
+    assert result["outcome"] == "failed"
+    assert state_path.read_bytes() == original
+    assert not any("sync-promotion" in argv for argv in invocations)
+
+
+def test_promotion_validation_requires_hash_bound_focused_proof(tmp_path):
+    calls: list[str] = []
+    result = _run(tmp_path, calls, idempotency_key="delivery-1")
+    assert result["status"] == "monitoring"
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    promotion_path = Path(state["phase_outputs"]["sync_promotion"]["path"])
+    validation_kwargs = {
+        "state": state,
+        "control_path": tmp_path / "live_control.json",
+        "now": NOW,
+        "idempotency_key": "delivery-1",
+    }
+    assert _valid_phase_packet(
+        promotion_path,
+        "sync_promotion",
+        BINDINGS,
+        phase_outputs=state["phase_outputs"],
+        **validation_kwargs,
+    )
+
+    missing = dict(state["phase_outputs"])
+    missing.pop("focused_verify")
+    assert not _valid_phase_packet(
+        promotion_path,
+        "sync_promotion",
+        BINDINGS,
+        phase_outputs=missing,
+        **validation_kwargs,
+    )
+
+    bad_digest = json.loads(json.dumps(state["phase_outputs"]))
+    bad_digest["focused_verify"]["sha256"] = "0" * 64
+    assert not _valid_phase_packet(
+        promotion_path,
+        "sync_promotion",
+        BINDINGS,
+        phase_outputs=bad_digest,
+        **validation_kwargs,
+    )
+
+    focused_path = Path(state["phase_outputs"]["focused_verify"]["path"])
+    original_focused = focused_path.read_text(encoding="utf-8")
+    for field, value in (
+        ("recovery_run_id", "other-recovery"),
+        ("source_revision", "other-revision"),
+        ("verifier_run_id", "repair-nflx-1"),
+    ):
+        focused = json.loads(original_focused)
+        focused[field] = value
+        focused_path.write_text(json.dumps(focused), encoding="utf-8")
+        assert not _valid_phase_packet(
+            promotion_path,
+            "sync_promotion",
+            BINDINGS,
+            phase_outputs=state["phase_outputs"],
+            **validation_kwargs,
+        ), field
+    focused_path.write_text(original_focused, encoding="utf-8")
+
+
+@pytest.mark.parametrize("fail_phase", ["reconcile", "focused_verify"])
+def test_failed_immutable_proof_leaves_promotion_state_byte_identical(
+    tmp_path, fail_phase
+):
+    request, state_path, invocations, broker_spy = _production_recovery_harness(
+        tmp_path, fail_phase=fail_phase
+    )
+    original = state_path.read_bytes()
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "frozen"
+    assert result["phase"] == fail_phase
+    assert state_path.read_bytes() == original
+    assert not any("sync-promotion" in argv for argv in invocations)
+    assert broker_spy.write_calls == []
+    control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
+    assert control["frozen"] is True
+
+
+def test_production_recovery_promotes_only_after_focused_proof(tmp_path):
+    request, state_path, invocations, broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "monitoring"
+    reconcile_index = next(
+        index
+        for index, argv in enumerate(invocations)
+        if "reconcile-symbol-incident" in argv
+    )
+    focused_index = next(
+        index for index, argv in enumerate(invocations) if "pytest" in argv
+    )
+    promotion_indexes = [
+        index for index, argv in enumerate(invocations) if "sync-promotion" in argv
+    ]
+    assert reconcile_index < focused_index < promotion_indexes[0]
+    assert len(promotion_indexes) == 1
+    promotion_argv = invocations[promotion_indexes[0]]
+    assert "--arm-live" in promotion_argv
+    assert "--ci-green" in promotion_argv
+    assert "--no-arm-live" not in promotion_argv
+    assert "--no-ci-green" not in promotion_argv
+    assert set(RECOVERY_FOCUSED_TESTS).issubset(invocations[focused_index])
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["source"]["arm_live"] is True
+    assert state["source"]["ci_green"] is True
+    assert state["sleeves"]["pullback-support"]["live_enabled"] is True
+    reconciliation_packet = json.loads(
+        (
+            tmp_path
+            / "results"
+            / "control_plane"
+            / "recovery"
+            / request["incident_id"]
+            / request["recovery_run_id"]
+            / "packets"
+            / "reconcile.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert reconciliation_packet["broker_write_calls"] == 0
+    assert reconciliation_packet["can_submit_orders"] is False
+    assert broker_spy.write_calls == []
+
+
+def test_post_promotion_manifest_fault_stays_frozen_until_receipt(tmp_path):
+    request, state_path, invocations, broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    def crash(boundary):
+        if (
+            boundary["boundary"] == "after_phase_fsync"
+            and boundary["phase"] == "manifest"
+        ):
+            raise SystemExit("post-promotion manifest fault")
+
+    with pytest.raises(SystemExit, match="post-promotion manifest fault"):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+            fault_hook=crash,
+        )
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["sleeves"]["pullback-support"]["live_enabled"] is True
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
+    assert control["frozen"] is True
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
+    reconciliation_packet = json.loads(
+        (
+            tmp_path
+            / "results"
+            / "control_plane"
+            / "recovery"
+            / request["incident_id"]
+            / request["recovery_run_id"]
+            / "packets"
+            / "reconcile.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert reconciliation_packet["broker_write_calls"] == 0
+    assert reconciliation_packet["can_submit_orders"] is False
+    assert broker_spy.write_calls == []
+    live_gate = evaluate_go_live_guard(
+        [
+            {
+                "action": "buy",
+                "symbol": "NFLX",
+                "notional": Decimal("20"),
+                "limit_price": Decimal("100"),
+                "side": "buy",
+                "order_type": "limit",
+                "account": "live",
+                "execution_mode": "tiny_live",
+                "asset_class": "stock",
+                "sleeve": "pullback-support",
+            }
+        ],
+        risk_envelope_path=tmp_path / "config" / "risk_envelope.yaml",
+        promotion_state_path=state_path,
+        control_state_path=tmp_path / "live_control.json",
+        live_buying_power=Decimal("1000"),
+        now=NOW,
+    )
+    assert live_gate.allowed is False
+    assert live_gate.checks["live_not_frozen"] is False
+
+
+def test_stage_write_crash_resumes_without_reinvoking_promotion(tmp_path):
+    request, state_path, invocations, broker_spy = _production_recovery_harness(
+        tmp_path, fail_phase="promotion_after_stage_write"
+    )
+    original = state_path.read_bytes()
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    with pytest.raises(
+        SystemExit, match="promotion state written before adapter return"
+    ):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+        )
+
+    assert state_path.read_bytes() == original
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
+    assert control["frozen"] is True
+    assert broker_spy.write_calls == []
+
+    resumed = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert resumed["status"] == "monitoring"
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    committed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert committed["sleeves"]["pullback-support"]["live_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "before_promotion_adapter",
+        "after_promotion_prepare_fsync",
+        "after_promotion_intent_fsync",
+        "after_promotion_canonical_replace",
+        "after_promotion_commit_receipt_fsync",
+        "after_promotion_adapter_return",
+    ],
+)
+def test_promotion_transaction_faults_resume_exactly_once(tmp_path, boundary):
+    request, state_path, invocations, broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    original = state_path.read_bytes()
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+    fired = False
+
+    def crash(event):
+        nonlocal fired
+        if event["boundary"] == boundary and not fired:
+            fired = True
+            raise SystemExit(boundary)
+
+    with pytest.raises(SystemExit, match=boundary):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+            fault_hook=crash,
+        )
+
+    control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
+    assert control["frozen"] is True
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
+    assert broker_spy.write_calls == []
+    if boundary in {
+        "before_promotion_adapter",
+        "after_promotion_prepare_fsync",
+        "after_promotion_intent_fsync",
+    }:
+        assert state_path.read_bytes() == original
+
+    resumed = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert resumed["status"] == "monitoring"
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    commit_receipts = list(
+        (
+            tmp_path
+            / "results"
+            / "control_plane"
+            / "recovery"
+            / request["incident_id"]
+            / request["recovery_run_id"]
+            / "packets"
+        ).glob("promotion_commit.json")
+    )
+    assert len(commit_receipts) == 1
+    committed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert committed["sleeves"]["pullback-support"]["live_enabled"] is True
+
+
+def test_promotion_phase_packet_orphan_resumes_without_reinvoking_sync(tmp_path):
+    request, state_path, invocations, broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    def crash(event):
+        if (
+            event["boundary"] == "after_phase_fsync"
+            and event["phase"] == "sync_promotion"
+        ):
+            raise SystemExit("promotion phase packet fsynced")
+
+    with pytest.raises(SystemExit, match="promotion phase packet fsynced"):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+            fault_hook=crash,
+        )
+
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert broker_spy.write_calls == []
+    control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
+    assert control["frozen"] is True
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
+
+    resumed = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert resumed["status"] == "monitoring"
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert json.loads(state_path.read_text(encoding="utf-8"))["sleeves"][
+        "pullback-support"
+    ]["live_enabled"] is True
+
+
+@pytest.mark.parametrize(
+    ("target", "boundary", "expected_sync_calls"),
+    [
+        ("intent", "after_promotion_intent_fsync", 1),
+        ("stage", "promotion_after_stage_write", 1),
+        ("prepare", "after_promotion_prepare_fsync", 0),
+        ("receipt", "after_promotion_commit_receipt_fsync", 1),
+    ],
+)
+def test_promotion_transaction_tamper_stays_frozen(
+    tmp_path,
+    target,
+    boundary,
+    expected_sync_calls,
+):
+    fail_phase = boundary if target == "stage" else None
+    request, canonical_path, invocations, broker_spy = (
+        _production_recovery_harness(tmp_path, fail_phase=fail_phase)
+    )
+    original_canonical = canonical_path.read_bytes()
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+    run_root = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / request["incident_id"]
+        / request["recovery_run_id"]
+    )
+
+    def crash(event):
+        if target != "stage" and event["boundary"] == boundary:
+            raise SystemExit(boundary)
+
+    expected_crash = (
+        "promotion state written before adapter return"
+        if target == "stage"
+        else boundary
+    )
+    with pytest.raises(SystemExit, match=expected_crash):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+            fault_hook=crash,
+        )
+
+    if target == "intent":
+        artifact_path = run_root.parent / "state.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["promotion_commit_intent"]["commit_id"] = "0" * 64
+    elif target == "stage":
+        artifact_path = run_root / "staging" / "promotion_state.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["source"]["arm_live"] = False
+    elif target == "prepare":
+        artifact_path = run_root / "packets" / "promotion_prepare.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["kind"] = "tampered_prepare"
+    else:
+        artifact_path = run_root / "packets" / "promotion_commit.json"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["kind"] = "tampered_commit"
+    artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "frozen"
+    assert result["phase"] == "sync_promotion"
+    assert result["failure"]["kind"] == "permanent_integrity"
+    assert (
+        sum("sync-promotion" in argv for argv in invocations)
+        == expected_sync_calls
+    )
+    if target != "receipt":
+        assert canonical_path.read_bytes() == original_canonical
+    control, _issues = load_live_control_state(
+        tmp_path / "live_control.json", now=NOW
+    )
+    assert control["frozen"] is True
+    assert broker_spy.write_calls == []
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
+
+
+def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_on(
+    tmp_path,
+):
+    request, canonical_path, invocations, broker_spy = (
+        _production_recovery_harness(tmp_path)
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    def crash(event):
+        if event["boundary"] == "after_promotion_prepare_fsync":
+            raise SystemExit("prepared before foreign writer")
+
+    with pytest.raises(SystemExit, match="prepared before foreign writer"):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+            fault_hook=crash,
+        )
+
+    foreign_state = {
+        "schema_version": "1.1.0",
+        "generated_at": NOW.isoformat(),
+        "source": {"kind": "foreign_canonical_writer"},
+        "sleeves": {},
+    }
+    foreign_bytes = json.dumps(foreign_state, sort_keys=True).encode("utf-8")
+    canonical_path.write_bytes(foreign_bytes)
+    foreign_sha256 = hashlib.sha256(foreign_bytes).hexdigest()
+
+    stale = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert stale["status"] == "frozen"
+    assert stale["failure"]["kind"] == "transient"
+    assert stale["next_retry_at"] == (
+        NOW + dt.timedelta(seconds=120)
+    ).isoformat()
+    assert canonical_path.read_bytes() == foreign_bytes
+    assert sum("sync-promotion" in argv for argv in invocations) == 1
+
+    exhausted = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW + dt.timedelta(seconds=120),
+    )
+
+    assert exhausted["failure"]["kind"] == "transient_exhausted"
+    assert canonical_path.read_bytes() == foreign_bytes
+
+    recovered = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW + dt.timedelta(seconds=240),
+    )
+
+    assert recovered["status"] == "monitoring"
+    assert recovered["recovery_run_id"].endswith("-follow-1")
+    assert sum("sync-promotion" in argv for argv in invocations) == 2
+    follow_on_prepare = json.loads(
+        (
+            tmp_path
+            / "results"
+            / "control_plane"
+            / "recovery"
+            / request["incident_id"]
+            / recovered["recovery_run_id"]
+            / "packets"
+            / "promotion_prepare.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert (
+        follow_on_prepare["recovery_commit"]["canonical_before_sha256"]
+        == foreign_sha256
+    )
+    assert broker_spy.write_calls == []
 
 
 def test_policy_conflict_is_recoverable_not_manual_escalation():
@@ -424,9 +1460,9 @@ def test_full_recipe_writes_strict_manifest_uses_distinct_verifier_and_only_rear
     assert calls == [
         "resolve_authority",
         "regenerate_evidence",
-        "sync_promotion",
         "reconcile",
         "focused_verify",
+        "sync_promotion",
     ]
     run_root = tmp_path / "results" / "control_plane" / "recovery" / BINDINGS["incident_id"] / "recovery-nflx-1"
     manifest_path = run_root / "packets" / "manifest.json"
@@ -497,7 +1533,13 @@ def test_permanent_and_forbidden_failures_stop_frozen_without_rearm(tmp_path):
 
     assert failed["status"] == "frozen"
     assert failed["failure"]["kind"] == "permanent_integrity"
-    assert calls == ["resolve_authority", "regenerate_evidence", "sync_promotion"]
+    assert calls == [
+        "resolve_authority",
+        "regenerate_evidence",
+        "reconcile",
+        "focused_verify",
+        "sync_promotion",
+    ]
     state, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
     assert state["frozen"] is True
 
@@ -846,7 +1888,7 @@ def test_each_valid_phase_packet_passes_then_one_invariant_mutation_fails(tmp_pa
         "regenerate_evidence": lambda packet: packet.update(
             {"analysis_only": False}
         ),
-        "sync_promotion": lambda packet: packet.update({"arm_live": True}),
+        "sync_promotion": lambda packet: packet.update({"arm_live": False}),
         "reconcile": lambda packet: packet.update({"matched": False}),
         "focused_verify": lambda packet: packet.update(
             {"verifier_run_id": packet["owner_run_id"]}
@@ -1089,8 +2131,28 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
         ),
         (
             "sync_promotion",
+            "live arming attestation",
+            lambda packet: packet.update({"arm_live": False}),
+        ),
+        (
+            "sync_promotion",
+            "focused CI attestation",
+            lambda packet: packet.update({"ci_green": False}),
+        ),
+        (
+            "sync_promotion",
             "state source kind",
             lambda packet: packet["state"]["source"].update({"kind": "other"}),
+        ),
+        (
+            "sync_promotion",
+            "state live arming attestation",
+            lambda packet: packet["state"]["source"].update({"arm_live": False}),
+        ),
+        (
+            "sync_promotion",
+            "state focused CI attestation",
+            lambda packet: packet["state"]["source"].update({"ci_green": False}),
         ),
         (
             "sync_promotion",
@@ -1128,6 +2190,13 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
             "sleeve live flag",
             lambda packet: packet["state"]["sleeves"]["pullback-support"].update(
                 {"live_enabled": "false"}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "promoted sleeve is live enabled",
+            lambda packet: packet["state"]["sleeves"]["pullback-support"].update(
+                {"live_enabled": False}
             ),
         ),
         (
@@ -1320,6 +2389,36 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     empty_promotion["demoted"] = []
     empty_promotion["issues_by_sleeve"] = {}
     empty_promotion["state"]["sleeves"] = {}
+    staged_path = Path(empty_promotion["staged_state_path"])
+    canonical_path = Path(empty_promotion["state_path"])
+    receipt_path = Path(empty_promotion["promotion_commit"]["path"])
+    staged_original = staged_path.read_bytes()
+    canonical_original = canonical_path.read_bytes()
+    receipt_original = receipt_path.read_bytes()
+    intent_original = state["promotion_commit_intent"]
+    empty_state_bytes = json.dumps(
+        empty_promotion["state"],
+        indent=2,
+        sort_keys=True,
+    ).encode("utf-8")
+    staged_path.write_bytes(empty_state_bytes)
+    canonical_path.write_bytes(empty_state_bytes)
+    empty_sha256 = hashlib.sha256(empty_state_bytes).hexdigest()
+    empty_promotion["staged_state_sha256"] = empty_sha256
+    empty_promotion["canonical_after_sha256"] = empty_sha256
+    empty_promotion["promotion_commit_intent"]["staged_sha256"] = (
+        empty_sha256
+    )
+    state["promotion_commit_intent"] = dict(
+        empty_promotion["promotion_commit_intent"]
+    )
+    receipt = json.loads(receipt_original)
+    receipt["staged_sha256"] = empty_sha256
+    receipt["canonical_after_sha256"] = empty_sha256
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    empty_promotion["promotion_commit"]["sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
     promotion_path.write_text(json.dumps(empty_promotion), encoding="utf-8")
     assert _valid_phase_packet(
         promotion_path,
@@ -1332,6 +2431,10 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
         idempotency_key="delivery-1",
     )
     promotion_path.write_text(promotion_original, encoding="utf-8")
+    staged_path.write_bytes(staged_original)
+    canonical_path.write_bytes(canonical_original)
+    receipt_path.write_bytes(receipt_original)
+    state["promotion_commit_intent"] = intent_original
 
     reconciliation_path = Path(state["phase_outputs"]["reconcile"]["path"])
     reconciliation_original = reconciliation_path.read_text(encoding="utf-8")
@@ -1423,6 +2526,93 @@ def test_malformed_persisted_state_schema_is_corrupt_and_never_raises(
     assert result["status"] == "corrupt_state"
     control, _issues = load_live_control_state(_control(tmp_path), now=NOW)
     assert control["frozen"] is True
+
+
+def test_legacy_v1_state_is_archived_and_restarted_as_frozen_v2_follow_on(
+    tmp_path,
+):
+    initial_calls: list[str] = []
+    assert _run(tmp_path, initial_calls)["status"] == "monitoring"
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    completed = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy = dict(completed)
+    legacy["schema_version"] = "tradingagents.self_heal_recovery.v1"
+    legacy["phase_outputs"] = {
+        name: completed["phase_outputs"][name]
+        for name in (
+            "resolve_authority",
+            "regenerate_evidence",
+            "sync_promotion",
+        )
+    }
+    legacy["phase"] = "reconcile"
+    legacy["last_artifact"] = legacy["phase_outputs"]["sync_promotion"]
+    legacy["incident_stage"] = "repairing"
+    legacy["idempotency_keys"] = []
+    for key in (
+        "rearm_intent",
+        "promotion_commit_intent",
+        "verifier_run_id",
+        "parent_recovery_run_id",
+        "follow_on_count",
+        "follow_on_required",
+        "follow_on_not_before",
+    ):
+        legacy.pop(key, None)
+    legacy_bytes = json.dumps(legacy, sort_keys=True).encode("utf-8")
+    state_path.write_bytes(legacy_bytes)
+    legacy_sha256 = hashlib.sha256(legacy_bytes).hexdigest()
+
+    migration_calls: list[str] = []
+    adapters = _adapters(migration_calls)
+
+    def stop_at_phase_zero(arguments):
+        migration_calls.append(arguments["phase"])
+        raise SystemExit("inspect migrated phase zero")
+
+    adapters["resolve_authority"] = stop_at_phase_zero
+    with pytest.raises(SystemExit, match="inspect migrated phase zero"):
+        _run(
+            tmp_path,
+            migration_calls,
+            adapters=adapters,
+            now=NOW + dt.timedelta(seconds=1),
+        )
+
+    migrated = json.loads(state_path.read_text(encoding="utf-8"))
+    assert migrated["schema_version"] == "tradingagents.self_heal_recovery.v2"
+    assert migrated["parent_recovery_run_id"] == "recovery-nflx-1"
+    assert migrated["recovery_run_id"] == "recovery-nflx-1-v2-follow-1"
+    assert migrated["phase"] == "resolve_authority"
+    assert migrated["phase_outputs"] == {}
+    assert migrated["legacy_v1_state_sha256"] == legacy_sha256
+    archive_path = Path(migrated["legacy_v1_state_path"])
+    assert archive_path.read_bytes() == legacy_bytes
+    assert migration_calls == ["resolve_authority"]
+    frozen, _issues = load_live_control_state(
+        tmp_path / "live_control.json",
+        now=NOW + dt.timedelta(seconds=1),
+    )
+    assert frozen["frozen"] is True
+
+    resumed_calls: list[str] = []
+    resumed = _run(
+        tmp_path,
+        resumed_calls,
+        adapters=_adapters(resumed_calls),
+        now=NOW + dt.timedelta(seconds=2),
+    )
+
+    assert resumed["status"] == "monitoring"
+    assert resumed["recovery_run_id"] == "recovery-nflx-1-v2-follow-1"
+    assert resumed_calls == list(RECOVERY_PHASES[:5])
 
 
 def test_crash_resume_rejects_changed_receipt_identity_and_idempotency(tmp_path):
@@ -1786,13 +2976,17 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
     assert authority["packet"]["authority_source"] == "pre_registered_policy_rule"
     for phase in (
         "regenerate_evidence",
-        "sync_promotion",
         "reconcile",
         "focused_verify",
     ):
         assert request["adapters"][phase]({"phase": phase}).get("packet")
+    promotion_without_proof = request["adapters"]["sync_promotion"](
+        {"phase": "sync_promotion"}
+    )
+    assert promotion_without_proof["outcome"] == "failed"
+    assert promotion_without_proof["failure_type"] == "transient"
     assert all(isinstance(argv, list) for argv in invocations)
-    assert any("--no-arm-live" in argv and "--no-ci-green" in argv for argv in invocations)
+    assert not any("sync-promotion" in argv for argv in invocations)
     assert any("reconcile-symbol-incident" in argv for argv in invocations)
 
     conflicting = json.loads(evidence_path.read_text(encoding="utf-8"))
@@ -1889,11 +3083,11 @@ def test_hourly_board_review_without_symbol_uses_canonical_evidence_and_complete
     for path, content in (
         (
             tmp_path / "results" / "paper_strategy_tournament" / "latest.json",
-            "{}",
+            json.dumps(_current_like_tournament_report()),
         ),
         (
             tmp_path / "results" / "policy" / "promotion_state.json",
-            "{}",
+            json.dumps({"schema_version": "1.0.0", "sleeves": {}}),
         ),
         (tmp_path / "config" / "risk_envelope.yaml", "tiny_live_tranche_usd: 25\n"),
     ):
@@ -1915,7 +3109,27 @@ def test_hourly_board_review_without_symbol_uses_canonical_evidence_and_complete
         if "loss-review-evidence" in argv:
             return Result(stdout=json.dumps(source_packet))
         if "sync-promotion" in argv:
-            return Result(stdout=json.dumps(_promotion_source_packet()))
+            canonical_path = argv[argv.index("--state-path") + 1]
+            stage_path = argv[argv.index("--output-state-path") + 1]
+            result = sync_promotion_state_file(
+                argv[argv.index("--report-path") + 1],
+                canonical_path,
+                output_state_path=stage_path,
+                tiny_live_tranche_usd=Decimal("25"),
+                arm_live="--arm-live" in argv,
+                ci_green="--ci-green" in argv,
+                now=NOW,
+            )
+            return Result(
+                stdout=json.dumps(
+                    {
+                        "promoted": result.promoted,
+                        "demoted": result.demoted,
+                        "issues_by_sleeve": result.issues_by_sleeve,
+                        "state": result.state,
+                    }
+                )
+            )
         if "reconcile-symbol-incident" in argv:
             return Result(stdout=json.dumps(_reconciliation_source_packet()))
         if "pytest" in argv:

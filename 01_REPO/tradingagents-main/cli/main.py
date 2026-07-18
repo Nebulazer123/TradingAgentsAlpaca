@@ -3910,6 +3910,11 @@ def policy_sync_promotion(
         "--state-path",
         help="Promotion state consumed by the unified live gate.",
     ),
+    output_state_path: Path | None = typer.Option(
+        None,
+        "--output-state-path",
+        help="Optional staged output; reads --state-path without replacing it.",
+    ),
     envelope_path: Path = typer.Option(
         Path("config/risk_envelope.yaml"),
         "--envelope-path",
@@ -3945,16 +3950,19 @@ def policy_sync_promotion(
     result = sync_promotion_state_file(
         report_path,
         state_path,
+        output_state_path=output_state_path,
         tiny_live_tranche_usd=tranche,
         arm_live=arm_live,
         ci_green=ci_green,
     )
+    written_state_path = output_state_path or state_path
     payload = {
         "summary": result.summary,
         "promoted": result.promoted,
         "demoted": result.demoted,
         "issues_by_sleeve": result.issues_by_sleeve,
-        "state_path": str(state_path),
+        "state_path": str(written_state_path),
+        "canonical_state_path": str(state_path),
         "report_path": str(report_path),
         "arm_live": arm_live,
         "ci_green": ci_green,
