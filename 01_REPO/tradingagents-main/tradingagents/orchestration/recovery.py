@@ -120,12 +120,18 @@ def evaluate_rearm_readiness(evidence: RecoveryEvidence) -> RecoveryVerdict:
     elif evidence.broker_write_calls != 0:
         issues.append("broker_write_calls must equal zero")
     required_bindings = {"incident_id", "symbol", "broker_account", "environment", "source_revision"}
-    if set(evidence.source_bindings) != required_bindings or any(
-        _normalized_string(evidence.source_bindings.get(key)) is None for key in required_bindings
-    ):
+    try:
+        bindings_valid = isinstance(evidence.source_bindings, Mapping) and set(evidence.source_bindings) == required_bindings and all(_normalized_string(evidence.source_bindings.get(key)) is not None for key in required_bindings)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        bindings_valid = False
+    if not bindings_valid:
         issues.append("source bindings must contain canonical incident, symbol, account, environment, and source revision")
     packet_keys = {"incident", "reconciliation", "promotion", "focused"}
-    if set(evidence.source_packet_sha256) != packet_keys or set(evidence.source_packet_paths) != packet_keys:
+    try:
+        packet_proof_complete = isinstance(evidence.source_packet_sha256, Mapping) and isinstance(evidence.source_packet_paths, Mapping) and set(evidence.source_packet_sha256) == packet_keys and set(evidence.source_packet_paths) == packet_keys
+    except Exception:
+        packet_proof_complete = False
+    if not packet_proof_complete:
         issues.append("source packet path and hash proof is incomplete")
     else:
         for key in packet_keys:
@@ -135,13 +141,10 @@ def evaluate_rearm_readiness(evidence: RecoveryEvidence) -> RecoveryVerdict:
                 issues.append(f"source packet hash is invalid for {key}")
             if not isinstance(path, str) or not Path(path).is_absolute():
                 issues.append(f"source packet path is not absolute for {key}")
-    if (evidence.recovery_manifest_path is None) != (evidence.recovery_manifest_sha256 is None):
-        issues.append("recovery manifest path and hash must be supplied together")
-    if evidence.recovery_manifest_path is not None:
-        if not isinstance(evidence.recovery_manifest_path, str) or not Path(evidence.recovery_manifest_path).is_absolute():
-            issues.append("recovery manifest path must be absolute")
-        if not isinstance(evidence.recovery_manifest_sha256, str) or len(evidence.recovery_manifest_sha256) != 64 or any(char not in "0123456789abcdef" for char in evidence.recovery_manifest_sha256):
-            issues.append("recovery manifest hash is invalid")
+    if not isinstance(evidence.recovery_manifest_path, str) or not evidence.recovery_manifest_path or not Path(evidence.recovery_manifest_path).is_absolute() or str(Path(evidence.recovery_manifest_path).resolve()) != evidence.recovery_manifest_path:
+        issues.append("recovery manifest path must be absolute")
+    if not isinstance(evidence.recovery_manifest_sha256, str) or len(evidence.recovery_manifest_sha256) != 64 or any(char not in "0123456789abcdef" for char in evidence.recovery_manifest_sha256):
+        issues.append("recovery manifest hash is invalid")
     return RecoveryVerdict(ready=not issues, issues=tuple(issues))
 
 
@@ -222,6 +225,17 @@ def rearm_after_verified_recovery(
         raise ValueError("rearm blocked: " + "; ".join(verdict.issues))
     ttl = _strict_ttl(ttl_minutes)
     current = _as_utc(now)
+    control_absolute_path = Path(control_path).resolve()
+    receipt_root = Path(receipt_dir).resolve()
+    if receipt_root.exists() and not receipt_root.is_dir():
+        raise ValueError("rearm blocked: receipt_dir is not a directory")
+    if control_absolute_path == receipt_root or control_absolute_path == receipt_root / "latest.json":
+        raise ValueError("rearm blocked: control path collides with receipt path")
+    proof_paths = {Path(path).resolve() for path in evidence.source_packet_paths.values()}
+    if len(proof_paths) != len(evidence.source_packet_paths) or control_absolute_path in proof_paths or receipt_root / "latest.json" in proof_paths:
+        raise ValueError("rearm blocked: proof paths collide with control authority")
+    if evidence.recovery_manifest_path and Path(evidence.recovery_manifest_path).resolve() in proof_paths | {control_absolute_path, receipt_root / "latest.json"}:
+        raise ValueError("rearm blocked: manifest path collides with control authority")
     state, _control_issues = load_live_control_state(control_path, now=current)
     if state is None or _normalized_string(state.get("reason")) is None or parse_control_time(str(state.get("dead_man_expires_at", ""))) is None:
         raise ValueError("rearm blocked: existing live control is not valid")
@@ -243,8 +257,10 @@ def rearm_after_verified_recovery(
             raise ValueError("rearm blocked: recovery manifest hash changed")
     expires_at = current + dt.timedelta(minutes=ttl)
     normalized_expiry = expires_at.astimezone(UTC).isoformat(timespec="seconds")
-    control_absolute = str(Path(control_path).resolve())
+    control_absolute = str(control_absolute_path)
     prepared_receipt_path = str(_receipt_path(Path(receipt_dir), current).resolve())
+    if Path(prepared_receipt_path) == control_absolute_path:
+        raise ValueError("rearm blocked: control path collides with receipt path")
     reason = f"verified recovery {evidence.incident_id.strip()}"
     receipt = {
         "schema_version": 1,
@@ -263,6 +279,8 @@ def rearm_after_verified_recovery(
         "source_bindings": dict(evidence.source_bindings),
         "source_packet_sha256": dict(evidence.source_packet_sha256),
         "source_packet_paths": dict(evidence.source_packet_paths),
+        "recovery_manifest_path": evidence.recovery_manifest_path,
+        "recovery_manifest_sha256": evidence.recovery_manifest_sha256,
         "control_binding": {"control_path": control_absolute, "incident_id": evidence.incident_id.strip(), "reason": reason, "dead_man_expires_at": normalized_expiry, "frozen": False, "mode": "verified_recovery", "receipt_path": prepared_receipt_path},
     }
     receipt_ref = write_rearm_receipt(receipt, receipt_dir, now=current, prepared_path=Path(prepared_receipt_path))
@@ -415,14 +433,25 @@ def load_recovery_evidence(
         blockers = ()
     if incident.get("stage") != "ready":
         issues.append("incident is not ready")
+    incident_repairer_run = _normalized_string(incident.get("repairer_run_id"))
+    focused_verifier_run = _normalized_string(focused.get("verifier_run_id"))
+    if incident_repairer_run is None or _normalized_string(repairer_run_id) is None or incident_repairer_run.casefold() != _normalized_string(repairer_run_id).casefold():
+        issues.append("incident repairer_run_id does not bind CLI repairer")
+    if focused_verifier_run is None or _normalized_string(verifier_run_id) is None or focused_verifier_run.casefold() != _normalized_string(verifier_run_id).casefold():
+        issues.append("focused proof verifier_run_id does not bind CLI verifier")
     history = incident.get("history")
     lifecycle_ready = (
-        incident.get("stage") == "ready"
+        incident.get("schema_version") == "tradingagents.incident.v1"
+        and incident.get("stage") == "ready"
         and isinstance(history, list)
         and any(isinstance(event, dict) and event.get("to_stage") == "ready" for event in history)
         and bool(_string_items(incident.get("evidence_refs")))
     )
-    root_cause = incident.get("root_cause_resolved", lifecycle_ready)
+    root_cause = lifecycle_ready
+    if incident.get("root_cause_resolved") is False:
+        root_cause = False
+    if not lifecycle_ready:
+        issues.append("incident lacks canonical ready lifecycle proof")
     focused_passed = focused.get("focused_tests_passed", focused.get("passed"))
     passing_tests = _string_items(focused.get("passing_tests"))
     promotion_fresh = promotion.get("promotion_evidence_fresh", promotion.get("fresh"))

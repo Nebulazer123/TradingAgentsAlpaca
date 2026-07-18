@@ -3816,7 +3816,7 @@ def policy_refresh_live_control(
             print(json.dumps(payload, indent=2))
         else:
             console.print(payload["reason"])
-        return
+        raise typer.Exit(1)
     expires_at = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(
         hours=ttl_hours
     )
@@ -3887,6 +3887,8 @@ def policy_recover_incident(
         console.print(f"Verified recovery receipt: {payload['receipt']['receipt_path']}")
     else:
         console.print("Recovery re-arm blocked: " + "; ".join(payload["issues"]))
+    if not payload["ready"]:
+        raise typer.Exit(1)
 
 
 @policy_app.command("sync-promotion")

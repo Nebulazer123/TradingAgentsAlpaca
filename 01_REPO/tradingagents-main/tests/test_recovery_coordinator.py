@@ -46,10 +46,14 @@ def _evidence(**overrides):
         path.write_text("{}", encoding="utf-8")
         source_paths[name] = str(path.resolve())
         source_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest_path = source_dir / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
     values.update({
         "source_bindings": {"incident_id": "inc-nflx-rule-conflict", "symbol": "NFLX", "broker_account": "live", "environment": "test", "source_revision": "abc"},
         "source_packet_paths": source_paths,
         "source_packet_sha256": source_hashes,
+        "recovery_manifest_path": str(manifest_path.resolve()),
+        "recovery_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     })
     values.update(overrides)
     return RecoveryEvidence(**values)
@@ -189,7 +193,7 @@ def test_recovery_cli_returns_fail_closed_json_for_malformed_packet(tmp_path):
         ],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
     assert json.loads(result.stdout)["ready"] is False
 
 
@@ -203,7 +207,7 @@ def test_refresh_live_control_cannot_unfreeze_frozen_state(tmp_path):
         ["policy", "refresh-live-control", "--reason", "bypass", "--control-path", str(control_path), "--json-output"],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
     assert json.loads(result.stdout)["refreshed"] is False
     assert control_path.read_text(encoding="utf-8") == original
 
@@ -212,8 +216,8 @@ def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
     now = dt.datetime.now(tz=dt.timezone.utc)
     bindings = {"incident_id": "inc-1", "symbol": "NFLX", "broker_account": "live", "environment": "production", "source_revision": "abc123"}
     packets = {
-        "incident": {**bindings, "stage": "ready", "root_cause_resolved": True, "repairer_role_id": "repair", "generated_at": now.isoformat()},
-        "focused": {"focused_tests_passed": True, "passing_tests": ["tests/test_x.py::test_ok"], "verifier_role_id": "verify", "source_revision": "abc123", "generated_at": now.isoformat()},
+        "incident": {**bindings, "schema_version": "tradingagents.incident.v1", "stage": "ready", "history": [{"to_stage": "ready"}], "evidence_refs": ["proof"], "repairer_run_id": "repair-1", "repairer_role_id": "repair", "generated_at": now.isoformat()},
+        "focused": {"focused_tests_passed": True, "passing_tests": ["tests/test_x.py::test_ok"], "verifier_run_id": "verify-1", "verifier_role_id": "verify", "source_revision": "abc123", "generated_at": now.isoformat()},
         "promotion": {"promotion_evidence_fresh": True, "issues": [], "generated_at": now.isoformat()},
         "reconciliation": {"read_only": True, "execution_authority": "none", "can_submit_orders": False, "matched": True, "issues": [], "broker_write_calls": 0, "generated_at": now.isoformat()},
     }
@@ -299,7 +303,7 @@ def test_recovery_manifest_packet_swap_blocks_without_changing_frozen_control(tm
         ],
     )
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert json.loads(result.stdout)["ready"] is False
     assert control_path.read_text(encoding="utf-8") == original
 

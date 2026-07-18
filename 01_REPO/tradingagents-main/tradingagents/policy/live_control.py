@@ -44,6 +44,8 @@ def load_live_control_state(
         return None, ["live control state must be a JSON object"]
 
     issues: list[str] = []
+    if type(state.get("frozen")) is not bool:
+        issues.append("live control state frozen must be a literal boolean")
     if state.get("frozen") is True:
         reason = str(state.get("reason") or "no reason recorded")
         issues.append(f"live control state is frozen: {reason}")
@@ -58,14 +60,18 @@ def load_live_control_state(
     elif expires_at <= current:
         issues.append(f"dead-man expired at {expires_at.isoformat()}")
 
+    recovery_fields = {"recovery_receipt_path", "recovery_receipt_sha256", "recovery_incident_id", "recovery_mode"}
+    has_recovery_marker = any(key in state for key in recovery_fields)
+    if has_recovery_marker and (set(key for key in recovery_fields if key in state) != recovery_fields or state.get("recovery_mode") != "verified_recovery" or state.get("frozen") is not False or not isinstance(state.get("recovery_incident_id"), str) or not state["recovery_incident_id"].strip()):
+        issues.append("verified recovery control has incomplete or unsafe markers")
     receipt_path = state.get("recovery_receipt_path")
     receipt_digest = state.get("recovery_receipt_sha256")
-    if receipt_path is not None or receipt_digest is not None:
+    if has_recovery_marker:
         if not isinstance(receipt_path, str) or not receipt_path.strip():
             issues.append("verified recovery control missing receipt path")
         elif not isinstance(receipt_digest, str) or len(receipt_digest) != 64 or any(char not in "0123456789abcdef" for char in receipt_digest):
             issues.append("verified recovery control missing receipt digest")
-        elif not Path(receipt_path).is_absolute():
+        elif not Path(receipt_path).is_absolute() or str(Path(receipt_path).resolve()) != receipt_path:
             issues.append("verified recovery receipt path must be absolute")
         else:
             candidate = Path(receipt_path)
@@ -98,6 +104,16 @@ def load_live_control_state(
                 ):
                     issues.append("verified recovery receipt lacks source proof")
                 else:
+                    source_bindings = receipt["source_bindings"]
+                    source_hashes = receipt["source_packet_sha256"]
+                    source_paths = receipt["source_packet_paths"]
+                    if (
+                        any(not isinstance(source_bindings[key], str) or not source_bindings[key].strip() for key in source_bindings)
+                        or source_bindings.get("incident_id") != state.get("recovery_incident_id")
+                        or any(not isinstance(source_hashes[key], str) or len(source_hashes[key]) != 64 or any(char not in "0123456789abcdef" for char in source_hashes[key]) for key in source_hashes)
+                        or any(not isinstance(source_paths[key], str) or not source_paths[key] or not Path(source_paths[key]).is_absolute() or str(Path(source_paths[key]).resolve()) != source_paths[key] for key in source_paths)
+                    ):
+                        issues.append("verified recovery receipt has invalid source proof")
                     receipt_expires_raw = receipt.get("expires_at")
                     receipt_issued_raw = receipt.get("issued_at")
                     receipt_expires_at = parse_control_time(str(receipt_expires_raw or ""))
