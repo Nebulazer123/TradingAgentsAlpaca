@@ -919,7 +919,7 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
         or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
         default=None,
     )
-    return {
+    summary = {
         "active_incident_count": len(active),
         "oldest_active_incident_minutes": oldest_minutes,
         "unowned_incident_count": sum(
@@ -930,6 +930,27 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
         ),
         "latest_incident_ref": rel(latest[1]) if latest else None,
     }
+    if latest is not None:
+        payload = latest[0]
+        recovery = payload.get("recovery")
+        if isinstance(recovery, dict):
+            artifact = recovery.get("last_artifact")
+            summary["recovery_owner"] = str(payload.get("owner_role") or "") or None
+            summary["recovery_phase"] = str(recovery.get("phase") or "") or None
+            summary["recovery_lease_expires_at"] = str(payload.get("lease_expires_at") or "") or None
+            summary["recovery_last_artifact"] = (
+                str(artifact.get("path") or "") if isinstance(artifact, dict) else None
+            ) or None
+            summary["recovery_last_failure"] = (
+                str((recovery.get("last_failure") or {}).get("kind") or "")
+                if isinstance(recovery.get("last_failure"), dict)
+                else None
+            ) or None
+            summary["recovery_next_retry_at"] = str(recovery.get("next_retry_at") or "") or None
+            summary["recovery_external_blocker"] = (
+                str((payload.get("external_blockers") or [None])[0] or "") or None
+            )
+    return summary
 
 
 def path_is_under(path: Path, root: Path) -> bool:

@@ -639,6 +639,28 @@ def test_self_heal_plan_escalates_forbidden_effects_without_active_fix(tmp_path:
     assert signal["verify_command"] is None
 
 
+def test_self_heal_plan_routes_policy_conflict_to_owned_verified_recovery(tmp_path: Path):
+    _write_context(
+        tmp_path,
+        flags=[
+            {
+                "label": "policy_rule_conflict",
+                "reason": "approval_conflict",
+                "symbol": "NFLX",
+                "path": "results/policy/latest.json",
+            }
+        ],
+    )
+
+    packet = build_self_heal_plan(tmp_path)
+
+    signal = packet["signals"][0]
+    assert signal["classification"] == "recoverable_integrity"
+    assert signal["status"] == "owned_recovery_ready"
+    assert signal["recommended_action"] == "coordinate_verified_recovery"
+    assert signal["owner_role"] == "reliability_controller"
+
+
 def test_self_heal_plan_dedupes_already_recorded_safe_signals(tmp_path: Path):
     _write_context(
         tmp_path,
