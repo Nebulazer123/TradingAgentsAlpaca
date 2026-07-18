@@ -3286,7 +3286,14 @@ def research_self_heal_plan(
         output_dir=output_dir,
         safe_reverify_minutes=safe_reverify_minutes,
     )
-    if execute_safe:
+    # Owned integrity recovery is the autonomous default; `--execute-safe`
+    # additionally runs the pre-existing safe observer refreshes.
+    if execute_safe or any(
+        isinstance(signal, dict)
+        and signal.get("classification") == "recoverable_integrity"
+        and signal.get("status") == "owned_recovery_ready"
+        for signal in packet.get("signals") or []
+    ):
         packet = execute_self_heal_plan(packet, repo_root=Path.cwd())
     json_path, markdown_path = write_self_heal_plan(packet, output_dir)
     payload = dict(packet)

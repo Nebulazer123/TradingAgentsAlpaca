@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tradingagents.orchestration.self_heal import (
+    build_production_recovery_request,
     classify_recovery_signal,
     coordinate_verified_recovery,
     recovery_recipe,
@@ -24,6 +25,8 @@ BINDINGS = {
 
 def _control(tmp_path: Path) -> Path:
     path = tmp_path / "live_control.json"
+    if path.exists():
+        return path
     write_live_control_state(
         path,
         frozen=True,
@@ -178,10 +181,15 @@ def test_transient_retry_exhaustion_remains_owned_and_frozen_with_follow_on_time
     assert second["failure"]["kind"] == "transient"
     assert third["status"] == "frozen"
     assert third["failure"]["kind"] == "transient_exhausted"
-    assert third["next_retry_at"] == (NOW + dt.timedelta(seconds=270)).isoformat()
+    assert third["next_retry_at"] is None
     incident = json.loads((tmp_path / "results" / "control_plane" / "incidents" / BINDINGS["incident_id"] / "latest.json").read_text())
     assert incident["stage"] == "repairing"
     assert incident["owner_role"] == "reliability_controller"
+    state = json.loads((tmp_path / "results" / "control_plane" / "recovery" / BINDINGS["incident_id"] / "state.json").read_text())
+    assert state["follow_on_required"] is True
+    follow_on = _run(tmp_path, calls, adapters=_adapters(calls), now=NOW + dt.timedelta(seconds=270))
+    assert follow_on["status"] == "monitoring"
+    assert follow_on["recovery_run_id"].endswith("-follow-1")
 
 
 def test_permanent_and_forbidden_failures_stop_frozen_without_rearm(tmp_path):
@@ -303,3 +311,84 @@ def test_recovery_module_has_no_order_write_calls_or_shell_execution():
 
     for forbidden_call in ("submit_order(", "cancel_order(", "replace_order(", "close_position(", "subprocess.run("):
         assert forbidden_call not in source
+
+
+def test_production_recovery_request_uses_fixed_structured_adapters(tmp_path):
+    request = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "symbol": "NFLX",
+            "path": "results/policy/latest.json",
+        },
+        repo_root=tmp_path,
+    )
+
+    assert request["incident_id"].startswith("self-heal-")
+    assert request["bindings"]["symbol"] == "NFLX"
+    assert set(request["adapters"]) == {
+        "resolve_authority",
+        "regenerate_evidence",
+        "sync_promotion",
+        "reconcile",
+        "focused_verify",
+    }
+    assert request["adapters"]["reconcile"]({"phase": "reconcile"})["outcome"] == "failed"
+
+
+def test_existing_corrupt_state_fails_closed_without_reinitializing(tmp_path):
+    recovery_root = tmp_path / "results" / "control_plane" / "recovery"
+    state_path = recovery_root / BINDINGS["incident_id"] / "state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text("{bad", encoding="utf-8")
+
+    result = _run(tmp_path, [])
+
+    assert result["status"] == "corrupt_state"
+    assert state_path.read_text(encoding="utf-8") == "{bad"
+
+
+def test_malformed_orphan_packet_is_not_recovered_as_completed(tmp_path):
+    calls: list[str] = []
+    _run(tmp_path, calls, adapters=_adapters(calls, fail={"phase": "regenerate_evidence"}))
+    orphan = tmp_path / "results" / "control_plane" / "recovery" / BINDINGS["incident_id"] / "recovery-nflx-1" / "packets" / "regenerate_evidence.json"
+    orphan.write_text(json.dumps({"generated_at": NOW.isoformat()}), encoding="utf-8")
+
+    result = _run(tmp_path, calls)
+
+    assert result["status"] == "frozen"
+    assert result["failure"]["kind"] == "permanent_integrity"
+
+
+def test_expired_persisted_owner_lock_is_quarantined_and_taken_over(tmp_path):
+    calls: list[str] = []
+    _run(tmp_path, calls, adapters=_adapters(calls, fail={"phase": "resolve_authority", "failure_type": "transient"}))
+    lock = tmp_path / "results" / "control_plane" / "recovery" / BINDINGS["incident_id"] / ".owner.lock"
+    lock.write_text(json.dumps({"schema_version": "tradingagents.recovery_lock.v1", "incident_id": BINDINGS["incident_id"], "owner_run_id": "repair-old", "lease_expires_at": (NOW - dt.timedelta(minutes=1)).isoformat()}), encoding="utf-8")
+
+    result = _run(tmp_path, calls, owner_run_id="repair-new", now=NOW + dt.timedelta(minutes=31))
+
+    assert result["status"] == "monitoring"
+    assert list(lock.parent.glob(".owner.stale-*"))
+
+
+def test_rearm_return_crash_recovers_active_task5_control_without_second_rearm(tmp_path):
+    calls: list[str] = []
+    rearm_calls = []
+
+    from tradingagents.orchestration.recovery import rearm_after_verified_recovery
+
+    def counted_rearm(**kwargs):
+        rearm_calls.append(kwargs)
+        return rearm_after_verified_recovery(**kwargs)
+
+    def crash(boundary):
+        if boundary["boundary"] == "after_rearm_return":
+            raise SystemExit("after rearm")
+
+    with pytest.raises(SystemExit, match="after rearm"):
+        _run(tmp_path, calls, rearm=counted_rearm, fault_hook=crash)
+    resumed = _run(tmp_path, calls, rearm=counted_rearm)
+
+    assert resumed["status"] == "monitoring"
+    assert len(rearm_calls) == 1

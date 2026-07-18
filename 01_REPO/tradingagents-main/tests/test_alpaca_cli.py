@@ -6105,6 +6105,35 @@ def test_research_self_heal_plan_can_execute_allowlisted_safe_refresh(monkeypatc
     assert payload["verified_count"] == 1
 
 
+def test_research_self_heal_plan_dispatches_owned_recovery_without_execute_safe(monkeypatch, tmp_path):
+    def fake_build(repo_root, *, max_signals, output_dir, safe_reverify_minutes=15):
+        return {
+            "schema_version": 1,
+            "kind": "tradingagents_self_heal_plan",
+            "generated_at": "2026-06-03T00:00:00+00:00",
+            "analysis_only": True,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "signal_count": 1,
+            "active_plan_count": 0,
+            "escalation_count": 0,
+            "deduped_prior_count": 0,
+            "max_severity": "high",
+            "status": "owned_recovery_ready",
+            "signals": [{"classification": "recoverable_integrity", "status": "owned_recovery_ready"}],
+        }
+
+    called = []
+    monkeypatch.setattr(cli_main, "build_self_heal_plan", fake_build)
+    monkeypatch.setattr(cli_main, "execute_self_heal_plan", lambda packet, *, repo_root: called.append(repo_root) or {**packet, "owned_recovery_count": 1})
+
+    result = runner.invoke(app, ["research", "self-heal-plan", "--output-dir", str(tmp_path), "--no-refresh-context", "--json-output"])
+
+    assert result.exit_code == 0, result.output
+    assert called
+    assert json.loads(result.stdout)["owned_recovery_count"] == 1
+
+
 def test_research_reddit_watchlist_packet_writes_compact_policy(tmp_path):
     result = runner.invoke(
         app,

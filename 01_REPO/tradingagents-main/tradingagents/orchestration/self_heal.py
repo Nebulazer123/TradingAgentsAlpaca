@@ -17,8 +17,13 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from tradingagents.orchestration.recovery import RecoveryEvidence, rearm_after_verified_recovery
+from tradingagents.orchestration.incidents import is_safe_incident_id
+from tradingagents.orchestration.recovery import (
+    load_recovery_evidence,
+    rearm_after_verified_recovery,
+)
 from tradingagents.policy.io import atomic_write_text
+from tradingagents.policy.live_control import load_live_control_state
 
 UTC = dt.timezone.utc
 DEFAULT_CONTEXT_DIR = Path("results/_context")
@@ -292,6 +297,14 @@ def _recovery_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _path_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def _append_recovery_event(root: Path, payload: Mapping[str, Any]) -> None:
     root.mkdir(parents=True, exist_ok=True)
     line = _recovery_json(payload)
@@ -304,24 +317,85 @@ def _append_recovery_event(root: Path, payload: Mapping[str, Any]) -> None:
         os.close(descriptor)
 
 
-def _read_recovery_state(path: Path) -> dict[str, Any] | None:
+def _read_recovery_state(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.exists():
+        return None, None
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
+        return None, "corrupt_state"
+    if not isinstance(value, dict):
+        return None, "corrupt_state"
+    required = {"schema_version", "incident_id", "bindings", "recovery_run_id", "owner_role", "owner_run_id", "attempt", "phase", "phase_outputs", "lease_expires_at", "idempotency_keys", "incident_history"}
+    if value.get("schema_version") != "tradingagents.self_heal_recovery.v1" or not required.issubset(value):
+        return None, "corrupt_state"
+    if (
+        not isinstance(value["bindings"], dict)
+        or not isinstance(value["phase_outputs"], dict)
+        or not isinstance(value["idempotency_keys"], list)
+        or not isinstance(value["incident_history"], list)
+        or type(value["attempt"]) is not int
+        or value["attempt"] < 0
+        or _parse_datetime(value["lease_expires_at"]) is None
+        or value.get("phase") not in {*RECOVERY_PHASES, "monitoring"}
+    ):
+        return None, "corrupt_state"
+    if not all(is_safe_incident_id(item) for item in (value["incident_id"], value["recovery_run_id"], value["owner_run_id"])):
+        return None, "corrupt_state"
+    if not all(isinstance(item, str) and is_safe_incident_id(item) for item in value["idempotency_keys"]):
+        return None, "corrupt_state"
+    if not all(isinstance(item, Mapping) for item in value["incident_history"]):
+        return None, "corrupt_state"
+    if not set(value["phase_outputs"]).issubset(RECOVERY_PHASES) or not all(isinstance(item, Mapping) and isinstance(item.get("path"), str) and isinstance(item.get("sha256"), str) and len(item["sha256"]) == 64 for item in value["phase_outputs"].values()):
+        return None, "corrupt_state"
+    return value, None
 
 
 def _write_recovery_state(path: Path, state: Mapping[str, Any]) -> None:
     atomic_write_text(path, json.dumps(state, indent=2, sort_keys=True))
 
 
-def _recovery_lock(path: Path) -> int | None:
+def _recovery_lock(
+    path: Path, *, incident_id: str, owner_run_id: str, lease_expires_at: str, now: dt.datetime
+) -> tuple[int | None, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        return None
+    metadata = {"schema_version": "tradingagents.recovery_lock.v1", "incident_id": incident_id, "owner_run_id": owner_run_id, "lease_expires_at": lease_expires_at}
+    took_over = False
+    for _ in range(3):
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                existing = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None, "corrupt_lock"
+            if not isinstance(existing, dict) or existing.get("schema_version") != "tradingagents.recovery_lock.v1" or existing.get("incident_id") != incident_id or not is_safe_incident_id(existing.get("owner_run_id")):
+                return None, "corrupt_lock"
+            expiry = _parse_datetime(existing.get("lease_expires_at"))
+            if expiry is None:
+                return None, "corrupt_lock"
+            if expiry > now:
+                return None, "owner_busy"
+            # A rename quarantines a stale lock atomically; exactly one
+            # contender can win and retry O_EXCL.
+            try:
+                os.replace(path, path.with_name(f".owner.stale-{hashlib.sha256(path.read_bytes()).hexdigest()[:12]}"))
+                took_over = True
+            except FileNotFoundError:
+                pass
+            continue
+        encoded = _recovery_json(metadata)
+        try:
+            if os.write(descriptor, encoded) != len(encoded):
+                raise OSError("incomplete recovery lock write")
+            os.fsync(descriptor)
+        except Exception:
+            os.close(descriptor)
+            with suppress(FileNotFoundError):
+                path.unlink()
+            raise
+        return descriptor, "stale_takeover" if took_over else "acquired"
+    return None, "owner_busy"
 
 
 def _release_recovery_lock(path: Path, descriptor: int) -> None:
@@ -353,6 +427,28 @@ def _valid_phase_record(record: object) -> bool:
         return _recovery_digest(Path(path)) == digest
     except OSError:
         return False
+
+
+def _valid_phase_packet(path: Path, phase: str, bindings: Mapping[str, str]) -> bool:
+    try:
+        packet = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(packet, dict) or any(packet.get(key) != value for key, value in bindings.items()):
+        return False
+    if _parse_datetime(packet.get("generated_at")) is None:
+        return False
+    if phase == "ready_incident":
+        return packet.get("schema_version") == "tradingagents.incident.v1" and packet.get("stage") == "ready" and isinstance(packet.get("history"), list) and isinstance(packet.get("evidence_refs"), list)
+    if phase == "manifest":
+        return packet.get("schema_version") == "tradingagents.recovery_manifest.v1" and packet.get("kind") == "verified_recovery_manifest" and isinstance(packet.get("packet_sha256"), dict) and isinstance(packet.get("packet_paths"), dict)
+    if phase == "reconcile":
+        return packet.get("read_only") is True and packet.get("execution_authority") == "none" and packet.get("can_submit_orders") is False and type(packet.get("broker_write_calls")) is int
+    if phase == "focused_verify":
+        return packet.get("focused_tests_passed") is True and isinstance(packet.get("passing_tests"), list) and isinstance(packet.get("verifier_run_id"), str) and isinstance(packet.get("verifier_role_id"), str)
+    if phase == "sync_promotion":
+        return packet.get("promotion_evidence_fresh") is True and isinstance(packet.get("issues"), list)
+    return True
 
 
 def _canonical_packet(packet: Mapping[str, Any], bindings: Mapping[str, str], now: dt.datetime) -> dict[str, Any]:
@@ -457,6 +553,56 @@ def _record_recovery_incident(
     atomic_write_text(incident_root / "latest.json", json.dumps(payload, indent=2, sort_keys=True))
 
 
+def build_production_recovery_request(
+    signal: Mapping[str, Any], *, repo_root: str | Path
+) -> dict[str, Any]:
+    """Build the non-test dispatch contract for a recoverable plan signal.
+
+    The adapters intentionally receive no command string. They consume only the
+    fixed signal/context packet locations; missing proof is a durable transient
+    recovery state, never a manual or silently skipped outcome. Real runtime
+    integrations can replace the packet producers, not this authority boundary.
+    """
+    root = Path(repo_root).resolve()
+    symbol = str(signal.get("symbol") or "NFLX").upper()
+    signature = _trigger_signature(signal)
+    incident_id = f"self-heal-{hashlib.sha256(signature.encode()).hexdigest()[:20]}"
+    bindings = {
+        "incident_id": incident_id,
+        "symbol": symbol,
+        "broker_account": str(signal.get("broker_account") or "unresolved"),
+        "environment": str(signal.get("environment") or "local"),
+        "source_revision": str(signal.get("source_revision") or "unresolved"),
+    }
+    source = signal.get("path")
+    source_path = (root / str(source)).resolve() if isinstance(source, str) and not Path(source).is_absolute() else None
+
+    def unavailable(phase: str, detail: str) -> dict[str, Any]:
+        return {"outcome": "failed", "failure_type": "transient", "detail": f"{phase}: {detail}"}
+
+    def packet_for(phase: str) -> dict[str, Any]:
+        if source_path is None or not _path_under(source_path, root) or not source_path.exists():
+            return unavailable(phase, "canonical source packet is temporarily unavailable")
+        payload = _read_json(source_path)
+        if not payload:
+            return unavailable(phase, "canonical source packet is not valid JSON")
+        # The production dispatcher deliberately does not infer proof from CLI
+        # prose. It waits for canonical packet producers to supply strict fields.
+        phase_packets = payload.get("recovery_packets")
+        if not isinstance(phase_packets, Mapping) or not isinstance(phase_packets.get(phase), Mapping):
+            return unavailable(phase, "canonical phase packet is not yet available")
+        return {"packet": dict(phase_packets[phase])}
+
+    return {
+        "incident_id": incident_id,
+        "bindings": bindings,
+        "owner_run_id": f"self-heal-owner-{hashlib.sha256((signature + ':owner').encode()).hexdigest()[:16]}",
+        "recovery_run_id": f"self-heal-run-{hashlib.sha256((signature + ':run').encode()).hexdigest()[:16]}",
+        "idempotency_key": f"self-heal-delivery-{hashlib.sha256(signature.encode()).hexdigest()[:16]}",
+        "adapters": {phase: (lambda _arguments, phase=phase: packet_for(phase)) for phase in ("resolve_authority", "regenerate_evidence", "sync_promotion", "reconcile", "focused_verify")},
+    }
+
+
 def coordinate_verified_recovery(
     *,
     incident_id: str,
@@ -487,17 +633,34 @@ def coordinate_verified_recovery(
         raise ValueError("canonical recovery bindings are required")
     if not isinstance(owner_run_id, str) or not owner_run_id.strip() or not isinstance(recovery_run_id, str) or not recovery_run_id.strip():
         raise ValueError("recovery and owner run IDs are required")
+    if not all(is_safe_incident_id(value) for value in (incident_id, owner_run_id, recovery_run_id)):
+        return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe recovery identifier")}
+    if idempotency_key is not None and (not isinstance(idempotency_key, str) or not is_safe_incident_id(idempotency_key)):
+        return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe idempotency key")}
     current = _recovery_now(now)
     root = Path(recovery_root).resolve()
     incident_root = root / incident_id
     run_root = incident_root / recovery_run_id
     state_path = incident_root / "state.json"
     lock_path = incident_root / ".owner.lock"
-    descriptor = _recovery_lock(lock_path)
+    if not all(_path_under(path, root) for path in (incident_root, run_root, state_path, lock_path)):
+        return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "recovery path escapes root")}
+    descriptor, lock_status = _recovery_lock(
+        lock_path,
+        incident_id=incident_id,
+        owner_run_id=owner_run_id,
+        lease_expires_at=(current + dt.timedelta(minutes=RECOVERY_LEASE_MINUTES)).isoformat(),
+        now=current,
+    )
     if descriptor is None:
+        if lock_status == "corrupt_lock":
+            return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "recovery lock is malformed")}
         return {"status": "owner_busy", "incident_id": incident_id, "phase": None}
     try:
-        state = _read_recovery_state(state_path)
+        state, state_error = _read_recovery_state(state_path)
+        if state_error is not None:
+            _append_recovery_event(incident_root, {"event": "corrupt_state", "incident_id": incident_id, "at": current.isoformat()})
+            return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "persisted recovery state is malformed")}
         if state is None:
             state = {
                 "schema_version": "tradingagents.self_heal_recovery.v1",
@@ -520,8 +683,25 @@ def coordinate_verified_recovery(
                 "created_at": current.isoformat(),
             }
             _append_recovery_event(incident_root, {"event": "recovery_opened", "incident_id": incident_id, "owner_run_id": owner_run_id, "at": current.isoformat()})
-        if state.get("bindings") != canonical_bindings or state.get("recovery_run_id") != recovery_run_id:
+        if lock_status == "stale_takeover":
+            state["incident_history"].append({"event": "lock_stale_takeover", "at": current.isoformat(), "owner_run_id": owner_run_id})
+            _append_recovery_event(incident_root, {"event": "lock_stale_takeover", "incident_id": incident_id, "owner_run_id": owner_run_id, "at": current.isoformat()})
+        if state.get("bindings") != canonical_bindings or (state.get("recovery_run_id") != recovery_run_id and state.get("parent_recovery_run_id") != recovery_run_id):
             return {"status": "identity_mismatch_frozen", "incident_id": incident_id, "phase": state.get("phase")}
+        prior_failure = state.get("last_failure") or {}
+        if prior_failure.get("kind") == "transient_exhausted" and state.get("follow_on_required") is True:
+            not_before = _parse_datetime(state.get("follow_on_not_before"))
+            if not_before is not None and not_before > current:
+                return {"status": "frozen", "incident_id": incident_id, "phase": state.get("phase"), "failure": prior_failure}
+            parent_run = str(state.get("parent_recovery_run_id") or recovery_run_id)
+            follow_count = int(state.get("follow_on_count") or 0) + 1
+            next_run = f"{parent_run}-follow-{follow_count}"
+            if not is_safe_incident_id(next_run):
+                return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe follow-on recovery run")}
+            state.update({"parent_recovery_run_id": parent_run, "recovery_run_id": next_run, "follow_on_count": follow_count, "follow_on_required": False, "follow_on_not_before": None, "attempt": 0, "phase": RECOVERY_PHASES[0], "phase_outputs": {}, "last_failure": None, "next_retry_at": None})
+            run_root = incident_root / next_run
+            state["incident_history"].append({"event": "follow_on_opened", "at": current.isoformat(), "recovery_run_id": next_run})
+            _append_recovery_event(incident_root, {"event": "follow_on_opened", "incident_id": incident_id, "recovery_run_id": next_run, "at": current.isoformat()})
         completed_keys = set(state.get("idempotency_keys") or [])
         if idempotency_key and idempotency_key in completed_keys:
             return {"status": "duplicate", "incident_id": incident_id, "phase": state.get("phase")}
@@ -555,7 +735,7 @@ def coordinate_verified_recovery(
         for phase in RECOVERY_PHASES:
             record = state["phase_outputs"].get(phase)
             if record is not None:
-                if not _valid_phase_record(record):
+                if not _path_under(Path(record["path"]), run_root) or not _valid_phase_record(record) or not _valid_phase_packet(Path(record["path"]), phase, canonical_bindings):
                     state["last_failure"] = _recovery_failure("permanent_integrity", f"tampered completed artifact for {phase}")
                     state["incident_stage"] = "repairing"
                     _write_recovery_state(state_path, state)
@@ -568,6 +748,12 @@ def coordinate_verified_recovery(
             # deterministic orphan packet. Recover it rather than rerunning the
             # external adapter and duplicating a broker read or verifier pass.
             if phase_path.exists():
+                if not _valid_phase_packet(phase_path, phase, canonical_bindings):
+                    state["last_failure"] = _recovery_failure("permanent_integrity", f"malformed orphan artifact for {phase}")
+                    _write_recovery_state(state_path, state)
+                    _append_recovery_event(incident_root, {"event": "orphan_artifact_invalid", "incident_id": incident_id, "phase": phase, "at": current.isoformat()})
+                    _record_recovery_incident(root, state, now=current)
+                    return {"status": "frozen", "incident_id": incident_id, "phase": phase, "failure": state["last_failure"]}
                 state["phase_outputs"][phase] = _phase_record(phase_path)
                 state["last_artifact"] = state["phase_outputs"][phase]
                 state["phase"] = RECOVERY_PHASES[min(RECOVERY_PHASES.index(phase) + 1, len(RECOVERY_PHASES) - 1)]
@@ -591,42 +777,65 @@ def coordinate_verified_recovery(
                     }
                 elif phase == "manifest":
                     source_names = {"incident": "ready_incident", "reconciliation": "reconcile", "promotion": "sync_promotion", "focused": "focused_verify"}
+                    focused_packet = json.loads(Path(state["phase_outputs"]["focused_verify"]["path"]).read_text(encoding="utf-8"))
                     packet = {
                         "schema_version": "tradingagents.recovery_manifest.v1",
                         "kind": "verified_recovery_manifest",
                         "packet_sha256": {name: state["phase_outputs"][source]["sha256"] for name, source in source_names.items()},
                         "packet_paths": {name: state["phase_outputs"][source]["path"] for name, source in source_names.items()},
+                        "repairer_run_id": owner_run_id,
+                        "repairer_role_id": owner_role,
+                        "verifier_run_id": focused_packet.get("verifier_run_id"),
+                        "verifier_role_id": focused_packet.get("verifier_role_id"),
                     }
                 elif phase == "rearm":
                     source_names = {"incident": "ready_incident", "reconciliation": "reconcile", "promotion": "sync_promotion", "focused": "focused_verify"}
                     paths = {name: state["phase_outputs"][source]["path"] for name, source in source_names.items()}
+                    prior_intent = state.get("rearm_intent")
+                    if isinstance(prior_intent, Mapping):
+                        control_state, control_issues = load_live_control_state(control_path, now=current)
+                        if control_state is not None and not control_issues and control_state.get("frozen") is False and control_state.get("recovery_incident_id") == incident_id and control_state.get("recovery_receipt_path"):
+                            packet = {"kind": "verified_rearm_result", "receipt_path": control_state["recovery_receipt_path"], "receipt_sha256": control_state["recovery_receipt_sha256"], "can_submit_orders": False, "recovered_after_crash": True}
+                            packet = _canonical_packet(packet, canonical_bindings, current)
+                            record = _write_phase_packet(phase_path, packet)
+                            state["phase_outputs"][phase] = record
+                            state["last_artifact"] = record
+                            state["phase"] = "monitoring"
+                            _write_recovery_state(state_path, state)
+                            continue
+                        if control_state is not None and control_state.get("frozen") is False:
+                            raise ValueError("rearm intent conflicts with active control")
                     focused = json.loads(Path(paths["focused"]).read_text(encoding="utf-8"))
                     verifier_run_id = focused.get("verifier_run_id")
                     verifier_role_id = focused.get("verifier_role_id")
                     if not isinstance(verifier_run_id, str) or not isinstance(verifier_role_id, str) or verifier_run_id == owner_run_id or verifier_role_id == owner_role:
                         raise ValueError("focused verifier identity must be distinct")
                     state["verifier_run_id"] = verifier_run_id
-                    evidence = RecoveryEvidence(
-                        incident_id=incident_id,
+                    evidence, evidence_issues = load_recovery_evidence(
+                        incident_path=paths["incident"],
+                        reconciliation_path=paths["reconciliation"],
+                        promotion_sync_path=paths["promotion"],
+                        focused_proof_path=paths["focused"],
+                        recovery_manifest_path=state["phase_outputs"]["manifest"]["path"],
                         repairer_run_id=owner_run_id,
                         verifier_run_id=verifier_run_id,
-                        repairer_role_id=owner_role,
-                        verifier_role_id=verifier_role_id,
-                        root_cause_resolved=True,
-                        focused_tests_passed=focused.get("focused_tests_passed") is True,
-                        promotion_evidence_fresh=json.loads(Path(paths["promotion"]).read_text(encoding="utf-8")).get("promotion_evidence_fresh") is True,
-                        promotion_issues=tuple(json.loads(Path(paths["promotion"]).read_text(encoding="utf-8")).get("issues", [])),
-                        broker_reconciliation_matched=json.loads(Path(paths["reconciliation"]).read_text(encoding="utf-8")).get("matched") is True,
-                        broker_reconciliation_issues=tuple(json.loads(Path(paths["reconciliation"]).read_text(encoding="utf-8")).get("issues", [])),
-                        broker_write_calls=json.loads(Path(paths["reconciliation"]).read_text(encoding="utf-8")).get("broker_write_calls", -1),
-                        external_blockers=(),
-                        source_bindings=canonical_bindings,
-                        source_packet_paths=paths,
-                        source_packet_sha256={name: state["phase_outputs"][source]["sha256"] for name, source in source_names.items()},
-                        recovery_manifest_path=state["phase_outputs"]["manifest"]["path"],
-                        recovery_manifest_sha256=state["phase_outputs"]["manifest"]["sha256"],
+                        now=current,
                     )
+                    if evidence is None or evidence_issues:
+                        raise ValueError("Task 5 evidence rejected: " + "; ".join(evidence_issues))
+                    state["rearm_intent"] = {
+                        "incident_id": incident_id,
+                        "manifest_path": state["phase_outputs"]["manifest"]["path"],
+                        "manifest_sha256": state["phase_outputs"]["manifest"]["sha256"],
+                        "control_path": str(Path(control_path).resolve()),
+                        "idempotency_key": idempotency_key,
+                    }
+                    _write_recovery_state(state_path, state)
+                    if callable(fault_hook):
+                        fault_hook({"boundary": "before_rearm_call", "phase": phase})
                     result = rearm(evidence=evidence, control_path=control_path, receipt_dir=receipt_dir, ttl_minutes=90, now=current)
+                    if callable(fault_hook):
+                        fault_hook({"boundary": "after_rearm_return", "phase": phase})
                     packet = {"kind": "verified_rearm_result", "receipt_path": result["receipt_path"], "receipt_sha256": result["receipt_sha256"], "can_submit_orders": False}
                 else:
                     adapter = adapters.get(phase)
@@ -650,7 +859,9 @@ def coordinate_verified_recovery(
                     state["incident_stage"] = "repairing"
                     if failure["kind"] == "transient":
                         state["last_failure"] = _recovery_failure("transient_exhausted", failure["detail"])
-                        state["next_retry_at"] = (current + dt.timedelta(seconds=RECOVERY_BACKOFF_SECONDS[-1])).isoformat()
+                        state["next_retry_at"] = None
+                        state["follow_on_required"] = True
+                        state["follow_on_not_before"] = (current + dt.timedelta(seconds=RECOVERY_BACKOFF_SECONDS[-1])).isoformat()
                 _write_recovery_state(state_path, state)
                 _append_recovery_event(incident_root, {"event": "phase_failed", "incident_id": incident_id, "phase": phase, "attempt": state["attempt"], "failure": state["last_failure"], "at": current.isoformat()})
                 _record_recovery_incident(root, state, now=current)
@@ -672,7 +883,7 @@ def coordinate_verified_recovery(
         _write_recovery_state(state_path, state)
         _append_recovery_event(incident_root, {"event": "recovery_monitoring", "incident_id": incident_id, "at": current.isoformat()})
         _record_recovery_incident(root, state, now=current)
-        return {"status": "monitoring", "incident_id": incident_id, "phase": "monitoring", "recovery_run_id": recovery_run_id}
+        return {"status": "monitoring", "incident_id": incident_id, "phase": "monitoring", "recovery_run_id": state["recovery_run_id"]}
     finally:
         _release_recovery_lock(lock_path, descriptor)
 
@@ -1549,11 +1760,25 @@ def execute_self_heal_plan(
     verify_failed_count = 0
     skipped_escalated_count = 0
     skipped_unallowed_count = 0
+    owned_recovery_count = 0
     for signal in updated.get("signals") or []:
         if not isinstance(signal, dict):
             continue
         if signal.get("escalation_required") is True:
             skipped_escalated_count += 1
+            continue
+        if signal.get("classification") == "recoverable_integrity" and signal.get("status") == "owned_recovery_ready":
+            request = build_production_recovery_request(signal, repo_root=root)
+            recovery = coordinate_verified_recovery(
+                **request,
+                control_path=root / "results" / "policy" / "live_control.json",
+                receipt_dir=root / "results" / "control_plane" / "rearm_receipts",
+                recovery_root=root / "results" / "control_plane" / "recovery",
+            )
+            signal["recovery_result"] = recovery
+            signal["status"] = "owned_recovery_dispatched"
+            signal["recovery_status"] = recovery.get("status")
+            owned_recovery_count += 1
             continue
         if signal.get("status") != "planned" or signal.get("classification") != "safe_autofix":
             continue
@@ -1608,6 +1833,7 @@ def execute_self_heal_plan(
     updated["verify_failed_count"] = verify_failed_count
     updated["skipped_escalated_count"] = skipped_escalated_count
     updated["skipped_unallowed_count"] = skipped_unallowed_count
+    updated["owned_recovery_count"] = owned_recovery_count
     updated["active_plan_count"] = sum(1 for signal in updated.get("signals") or [] if signal.get("status") == "planned")
     updated["escalation_count"] = sum(
         1 for signal in updated.get("signals") or [] if signal.get("escalation_required") is True
