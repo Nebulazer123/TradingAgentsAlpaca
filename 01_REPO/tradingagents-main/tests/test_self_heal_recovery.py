@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from tradingagents.orchestration.self_heal import (
+    RECOVERY_PHASES,
+    _valid_phase_packet,
     build_production_recovery_request,
     classify_recovery_signal,
     coordinate_verified_recovery,
@@ -38,9 +40,28 @@ def _control(tmp_path: Path) -> Path:
 
 def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
     packets = {
-        "resolve_authority": {"root_cause_resolved": True},
-        "regenerate_evidence": {"promotion_evidence_fresh": True},
-        "sync_promotion": {"promotion_evidence_fresh": True, "issues": []},
+        "resolve_authority": {
+            "kind": "recovery_authority",
+            "allowed": True,
+            "requires_additional_decision": False,
+            "authority_source": "pre_registered_policy_rule",
+            "decision_owner": "execution_operator",
+        },
+        "regenerate_evidence": {
+            "analysis_only": True,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "packet_path": "/tmp/loss-review-evidence.json",
+            "hourly_packet_path": "/tmp/hourly-supervisor.json",
+        },
+        "sync_promotion": {
+            "promotion_evidence_fresh": True,
+            "issues": [],
+            "arm_live": False,
+            "ci_green": False,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+        },
         "reconcile": {
             "read_only": True,
             "execution_authority": "none",
@@ -250,6 +271,46 @@ def test_competing_owner_is_noop_and_stale_lease_takeover_is_audited(tmp_path):
     assert '"event":"lease_taken_over"' in events
 
 
+def test_stale_takeover_revalidates_prior_phase_owner_without_rewriting_it(tmp_path):
+    calls: list[str] = []
+    first = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(
+            calls,
+            fail={"phase": "focused_verify", "failure_type": "transient"},
+        ),
+    )
+    assert first["status"] == "frozen"
+    resolve_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "recovery-nflx-1"
+        / "packets"
+        / "resolve_authority.json"
+    )
+    original_owner = json.loads(resolve_path.read_text(encoding="utf-8"))[
+        "owner_run_id"
+    ]
+
+    resumed = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(calls),
+        owner_run_id="repair-nflx-2",
+        now=NOW + dt.timedelta(minutes=30),
+    )
+
+    assert resumed["status"] == "monitoring", resumed
+    assert (
+        json.loads(resolve_path.read_text(encoding="utf-8"))["owner_run_id"]
+        == original_owner
+    )
+
+
 def test_crash_after_durable_phase_packet_resumes_without_duplicate_adapter_call(tmp_path):
     calls: list[str] = []
 
@@ -412,3 +473,605 @@ def test_rearm_return_crash_recovers_active_task5_control_without_second_rearm(t
 
     assert resumed["status"] == "monitoring"
     assert len(rearm_calls) == 1
+
+
+def test_all_phase_packet_validators_reject_metadata_complete_false_greens(tmp_path):
+    common = {
+        **BINDINGS,
+        "generated_at": NOW.isoformat(),
+        "recovery_run_id": "recovery-nflx-1",
+        "owner_run_id": "repair-nflx-1",
+        "owner_role": "reliability_controller",
+    }
+    state = {
+        "bindings": dict(BINDINGS),
+        "recovery_run_id": "recovery-nflx-1",
+        "owner_run_id": "repair-nflx-1",
+        "owner_role": "reliability_controller",
+        "phase_outputs": {},
+    }
+
+    for phase in RECOVERY_PHASES:
+        packet_path = tmp_path / f"{phase}.json"
+        packet_path.write_text(
+            json.dumps(
+                {
+                    **common,
+                    "phase": phase,
+                    "schema_version": (
+                        "tradingagents.incident.v1"
+                        if phase == "ready_incident"
+                        else (
+                            "tradingagents.recovery_manifest.v1"
+                            if phase == "manifest"
+                            else "tradingagents.recovery_phase.v1"
+                        )
+                    ),
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert (
+            _valid_phase_packet(
+                packet_path,
+                phase,
+                BINDINGS,
+                state=state,
+                phase_outputs={},
+                control_path=tmp_path / "live_control.json",
+                now=NOW,
+                idempotency_key="delivery-1",
+            )
+            is False
+        ), phase
+
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text(
+        json.dumps(
+            {
+                **common,
+                "phase": "unknown",
+                "schema_version": "tradingagents.recovery_phase.v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert (
+        _valid_phase_packet(
+            unknown,
+            "unknown",
+            BINDINGS,
+            state=state,
+            phase_outputs={},
+            control_path=tmp_path / "live_control.json",
+            now=NOW,
+            idempotency_key="delivery-1",
+        )
+        is False
+    )
+
+
+def test_each_valid_phase_packet_passes_then_one_invariant_mutation_fails(tmp_path):
+    calls: list[str] = []
+    assert _run(tmp_path, calls, idempotency_key="delivery-1")["status"] == "monitoring"
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    mutations = {
+        "resolve_authority": lambda packet: packet.update({"allowed": False}),
+        "regenerate_evidence": lambda packet: packet.update(
+            {"analysis_only": False}
+        ),
+        "sync_promotion": lambda packet: packet.update({"arm_live": True}),
+        "reconcile": lambda packet: packet.update({"matched": False}),
+        "focused_verify": lambda packet: packet.update(
+            {"verifier_run_id": packet["owner_run_id"]}
+        ),
+        "ready_incident": lambda packet: packet.update({"evidence_refs": []}),
+        "manifest": lambda packet: packet.update({"packet_paths": {}}),
+        "rearm": lambda packet: packet.update({"receipt_sha256": "0" * 64}),
+    }
+
+    for phase in RECOVERY_PHASES:
+        phase_path = Path(state["phase_outputs"][phase]["path"])
+        original = phase_path.read_text(encoding="utf-8")
+        assert _valid_phase_packet(
+            phase_path,
+            phase,
+            BINDINGS,
+            state=state,
+            phase_outputs=state["phase_outputs"],
+            control_path=tmp_path / "live_control.json",
+            now=NOW,
+            idempotency_key="delivery-1",
+        ), phase
+        packet = json.loads(original)
+        mutations[phase](packet)
+        phase_path.write_text(json.dumps(packet), encoding="utf-8")
+        assert (
+            _valid_phase_packet(
+                phase_path,
+                phase,
+                BINDINGS,
+                state=state,
+                phase_outputs=state["phase_outputs"],
+                control_path=tmp_path / "live_control.json",
+                now=NOW,
+                idempotency_key="delivery-1",
+            )
+            is False
+        ), phase
+        phase_path.write_text(original, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda state: state["bindings"].update({"extra": "not-canonical"}),
+        lambda state: state.update({"follow_on_count": True}),
+        lambda state: state.update(
+            {
+                "follow_on_required": True,
+                "follow_on_not_before": "2026-07-18T12:05:00",
+                "parent_recovery_run_id": "../unsafe",
+            }
+        ),
+        lambda state: state["phase_outputs"].update(
+            {
+                "reconcile": {
+                    "path": "/tmp/out-of-order.json",
+                    "sha256": "a" * 64,
+                }
+            }
+        ),
+    ],
+)
+def test_malformed_persisted_state_schema_is_corrupt_and_never_raises(
+    tmp_path, mutate
+):
+    calls: list[str] = []
+    first = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(
+            calls,
+            fail={"phase": "resolve_authority", "failure_type": "transient"},
+        ),
+    )
+    assert first["status"] == "frozen"
+    state_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    mutate(state)
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    result = _run(tmp_path, calls, now=NOW + dt.timedelta(seconds=30))
+
+    assert result["status"] == "corrupt_state"
+    control, _issues = load_live_control_state(_control(tmp_path), now=NOW)
+    assert control["frozen"] is True
+
+
+def test_crash_resume_rejects_changed_receipt_identity_and_idempotency(tmp_path):
+    calls: list[str] = []
+    rearm_calls: list[dict] = []
+    from tradingagents.orchestration.recovery import rearm_after_verified_recovery
+
+    def counted_rearm(**kwargs):
+        rearm_calls.append(kwargs)
+        return rearm_after_verified_recovery(**kwargs)
+
+    def crash(boundary):
+        if boundary["boundary"] == "after_rearm_return":
+            raise SystemExit("after rearm")
+
+    with pytest.raises(SystemExit, match="after rearm"):
+        _run(
+            tmp_path,
+            calls,
+            idempotency_key="delivery-1",
+            fault_hook=crash,
+            rearm=counted_rearm,
+        )
+
+    control_path = tmp_path / "live_control.json"
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    receipt_path = Path(control["recovery_receipt_path"])
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["repairer_run_id"] = "other-repairer"
+    receipt_path.write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    control["recovery_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    control_path.write_text(json.dumps(control), encoding="utf-8")
+
+    changed_identity = _run(
+        tmp_path,
+        calls,
+        idempotency_key="delivery-1",
+        rearm=counted_rearm,
+    )
+    assert changed_identity["status"] == "frozen"
+    assert changed_identity["phase"] == "rearm"
+    assert len(rearm_calls) == 1
+    assert calls.count("reconcile") == 1
+    frozen_control, _issues = load_live_control_state(control_path, now=NOW)
+    assert frozen_control["frozen"] is True
+
+    other_tmp = tmp_path / "idempotency"
+    other_calls: list[str] = []
+    other_rearm_calls: list[dict] = []
+
+    def other_counted_rearm(**kwargs):
+        other_rearm_calls.append(kwargs)
+        return rearm_after_verified_recovery(**kwargs)
+
+    with pytest.raises(SystemExit, match="after rearm"):
+        _run(
+            other_tmp,
+            other_calls,
+            idempotency_key="delivery-1",
+            fault_hook=crash,
+            rearm=other_counted_rearm,
+        )
+    changed_delivery = _run(
+        other_tmp,
+        other_calls,
+        idempotency_key="delivery-2",
+        rearm=other_counted_rearm,
+    )
+    assert changed_delivery["status"] == "frozen"
+    assert changed_delivery["phase"] == "rearm"
+    assert len(other_rearm_calls) == 1
+    assert other_calls.count("reconcile") == 1
+    frozen_other, _issues = load_live_control_state(
+        other_tmp / "live_control.json", now=NOW
+    )
+    assert frozen_other["frozen"] is True
+
+
+def test_rearm_intent_requires_exact_schema_and_rearm_orphan_needs_active_receipt(
+    tmp_path,
+):
+    calls: list[str] = []
+
+    def crash_after_return(boundary):
+        if boundary["boundary"] == "after_rearm_return":
+            raise SystemExit("after rearm")
+
+    with pytest.raises(SystemExit, match="after rearm"):
+        _run(
+            tmp_path / "intent",
+            calls,
+            idempotency_key="delivery-1",
+            fault_hook=crash_after_return,
+        )
+    state_path = (
+        tmp_path
+        / "intent"
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "state.json"
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["rearm_intent"]["unexpected"] = "false-green"
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    malformed_intent = _run(
+        tmp_path / "intent",
+        calls,
+        idempotency_key="delivery-1",
+    )
+    assert malformed_intent["status"] == "corrupt_state"
+
+    orphan_calls: list[str] = []
+
+    def crash_after_manifest_packet(boundary):
+        if (
+            boundary["boundary"] == "after_phase_fsync"
+            and boundary["phase"] == "manifest"
+        ):
+            raise SystemExit("manifest packet orphan")
+
+    with pytest.raises(SystemExit, match="manifest packet orphan"):
+        _run(
+            tmp_path / "orphan",
+            orphan_calls,
+            idempotency_key="delivery-1",
+            fault_hook=crash_after_manifest_packet,
+        )
+    orphan = (
+        tmp_path
+        / "orphan"
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "recovery-nflx-1"
+        / "packets"
+        / "rearm.json"
+    )
+    packet = {
+        **BINDINGS,
+        "generated_at": NOW.isoformat(),
+        "phase": "rearm",
+        "recovery_run_id": "recovery-nflx-1",
+        "owner_run_id": "repair-nflx-1",
+        "owner_role": "reliability_controller",
+        "schema_version": "tradingagents.recovery_phase.v1",
+    }
+    orphan.write_text(
+        json.dumps(packet),
+        encoding="utf-8",
+    )
+    rearm_calls: list[dict] = []
+
+    def counted_rearm(**kwargs):
+        rearm_calls.append(kwargs)
+        raise AssertionError("fake rearm orphan must not call rearm")
+
+    orphan_result = _run(
+        tmp_path / "orphan",
+        orphan_calls,
+        idempotency_key="delivery-1",
+        rearm=counted_rearm,
+    )
+    assert orphan_result["status"] == "frozen"
+    assert orphan_result["phase"] == "rearm"
+    assert rearm_calls == []
+    orphan_control, _issues = load_live_control_state(
+        tmp_path / "orphan" / "live_control.json", now=NOW
+    )
+    assert orphan_control["frozen"] is True
+
+
+def test_thin_manifest_orphan_stops_before_rearm_and_keeps_control_frozen(tmp_path):
+    calls: list[str] = []
+
+    def crash(boundary):
+        if (
+            boundary["boundary"] == "after_phase_fsync"
+            and boundary["phase"] == "manifest"
+        ):
+            raise SystemExit("manifest orphan")
+
+    with pytest.raises(SystemExit, match="manifest orphan"):
+        _run(tmp_path, calls, fault_hook=crash)
+    manifest = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "recovery-nflx-1"
+        / "packets"
+        / "manifest.json"
+    )
+    packet = json.loads(manifest.read_text(encoding="utf-8"))
+    packet["packet_paths"] = {}
+    packet["packet_sha256"] = {}
+    manifest.write_text(json.dumps(packet), encoding="utf-8")
+    rearm_calls: list[dict] = []
+
+    def counted_rearm(**kwargs):
+        rearm_calls.append(kwargs)
+        raise AssertionError("thin manifest must stop before rearm")
+
+    result = _run(tmp_path, calls, rearm=counted_rearm)
+
+    assert result["status"] == "frozen"
+    assert result["phase"] == "manifest"
+    assert rearm_calls == []
+    control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
+    assert control["frozen"] is True
+
+
+def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
+    tmp_path,
+):
+    hourly_path = (
+        tmp_path
+        / "results"
+        / "hourly_supervisor"
+        / "hourly-supervisor-nflx.json"
+    )
+    hourly_path.parent.mkdir(parents=True)
+    supervisor = {
+        "symbol": "NFLX",
+        "decision_id": "loss-exit-NFLX-20260718",
+        "allowed": True,
+        "policy_rule_exit": True,
+        "allowed_exit_reason": "policy_stop_floor",
+        "allowed_exit_reason_source": "pre-registered exit policy rule",
+        "exit_policy_rule": "catastrophic_stop",
+        "exit_policy_rationale": "The pre-registered rule fired.",
+        "blockers": [],
+        "blocked_reasons": [],
+        "source_packet_ids": ["supervisor-nflx"],
+    }
+    advisory = {
+        "symbol": "NFLX",
+        "requires_board_decision": False,
+        "decision_owner": "execution_operator",
+    }
+    hourly_path.write_text(
+        json.dumps(
+            {
+                "generated_at": NOW.isoformat(),
+                "decision": "loss-review",
+                "evidence": {"loss_exit_review": supervisor},
+            }
+        ),
+        encoding="utf-8",
+    )
+    evidence_path = tmp_path / "results" / "loss_review_evidence" / "latest.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "symbol": "NFLX",
+                "payload": {
+                    "symbol": "NFLX",
+                    "entry_context": {"symbol": "NFLX", "account": "live"},
+                    "hourly_packet_path": str(hourly_path.relative_to(tmp_path)),
+                    "supervisor_review_authority": supervisor,
+                    "advisory_analysis": advisory,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = tmp_path / "results" / "paper_strategy_tournament" / "latest.json"
+    promotion = tmp_path / "results" / "policy" / "promotion_state.json"
+    envelope = tmp_path / "config" / "risk_envelope.yaml"
+    for path, content in (
+        (report, "{}"),
+        (promotion, "{}"),
+        (envelope, "tiny_live_tranche_usd: 25\n"),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    invocations: list[list[str]] = []
+
+    class Result:
+        def __init__(self, *, stdout="", stderr="", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    def runner(argv, **_kwargs):
+        invocations.append(list(argv))
+        if argv[:3] == ["git", "rev-parse", "HEAD"]:
+            return Result(stdout="source-revision\n")
+        if "loss-review-evidence" in argv:
+            return Result(
+                stdout=json.dumps(
+                    {
+                        "symbol": "NFLX",
+                        "analysis_only": True,
+                        "can_submit_orders": False,
+                        "execution_authority": "none",
+                        "packet_path": str(evidence_path),
+                        "hourly_packet_path": str(hourly_path),
+                    }
+                )
+            )
+        if "sync-promotion" in argv:
+            return Result(
+                stdout=json.dumps(
+                    {
+                        "issues_by_sleeve": {},
+                        "arm_live": False,
+                        "ci_green": False,
+                        "can_submit_orders": False,
+                        "execution_authority": "none",
+                    }
+                )
+            )
+        if "reconcile-symbol-incident" in argv:
+            return Result(
+                stdout=json.dumps(
+                    {
+                        "read_only": True,
+                        "execution_authority": "none",
+                        "can_submit_orders": False,
+                        "matched": True,
+                        "issues": [],
+                        "broker_write_calls": 0,
+                    }
+                )
+            )
+        if "pytest" in argv:
+            return Result(stdout="passed")
+        raise AssertionError(argv)
+
+    request = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "symbol": "NFLX",
+            "path": str(evidence_path.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+
+    assert request["ready"] is True
+    assert request["bindings"]["broker_account"] == "live"
+    authority = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority"}
+    )
+    assert authority["packet"]["authority_source"] == "pre_registered_policy_rule"
+    for phase in (
+        "regenerate_evidence",
+        "sync_promotion",
+        "reconcile",
+        "focused_verify",
+    ):
+        assert request["adapters"][phase]({"phase": phase}).get("packet")
+    assert all(isinstance(argv, list) for argv in invocations)
+    assert any("--no-arm-live" in argv and "--no-ci-green" in argv for argv in invocations)
+    assert any("reconcile-symbol-incident" in argv for argv in invocations)
+
+    conflicting = json.loads(evidence_path.read_text(encoding="utf-8"))
+    conflicting["payload"]["entry_context"]["account"] = "paper"
+    evidence_path.write_text(json.dumps(conflicting), encoding="utf-8")
+    rejected = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "symbol": "NFLX",
+            "path": str(evidence_path.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+    assert rejected["ready"] is False
+
+    missing = json.loads(evidence_path.read_text(encoding="utf-8"))
+    missing["payload"]["entry_context"].pop("account")
+    evidence_path.write_text(json.dumps(missing), encoding="utf-8")
+    missing_account = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "symbol": "NFLX",
+            "path": str(evidence_path.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+    assert missing_account["ready"] is False
+
+    signal_conflict = missing
+    signal_conflict["payload"]["entry_context"]["account"] = "live"
+    evidence_path.write_text(json.dumps(signal_conflict), encoding="utf-8")
+    paper_signal = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "symbol": "NFLX",
+            "broker_account": "paper",
+            "path": str(evidence_path.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+    assert paper_signal["ready"] is False
