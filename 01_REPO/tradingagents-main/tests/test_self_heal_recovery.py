@@ -333,7 +333,32 @@ def test_production_recovery_request_uses_fixed_structured_adapters(tmp_path):
         "reconcile",
         "focused_verify",
     }
-    assert request["adapters"]["reconcile"]({"phase": "reconcile"})["outcome"] == "failed"
+    assert request["adapters"]["resolve_authority"]({"phase": "resolve_authority"})["outcome"] == "failed"
+
+
+def test_production_request_preserves_msft_and_rejects_preassembled_packets(tmp_path):
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps({"recovery_packets": {"reconcile": {"matched": True}}}), encoding="utf-8")
+    context = {
+        "symbol": "MSFT",
+        "broker_account": "paper-a",
+        "environment": "test",
+        "source_revision": "abc123",
+        "supervisor_path": "missing-supervisor.json",
+        "advisory_path": "missing-advisory.json",
+        "hourly_dir": "missing-hourly",
+        "report_path": "missing-report.json",
+        "envelope_path": "missing-envelope.yaml",
+        "promotion_state_path": "missing-state.json",
+        "reconciliation_packet_paths": ["source.json"],
+    }
+    request = build_production_recovery_request(
+        {"label": "policy_rule_conflict", "reason": "approval_conflict", "symbol": "MSFT", "path": "source.json", "recovery_context": context}, repo_root=tmp_path
+    )
+
+    assert request["bindings"]["symbol"] == "MSFT"
+    assert request["bindings"]["broker_account"] == "paper-a"
+    assert request["adapters"]["resolve_authority"]({"phase": "resolve_authority"})["outcome"] == "failed"
 
 
 def test_existing_corrupt_state_fails_closed_without_reinitializing(tmp_path):
@@ -364,7 +389,7 @@ def test_expired_persisted_owner_lock_is_quarantined_and_taken_over(tmp_path):
     calls: list[str] = []
     _run(tmp_path, calls, adapters=_adapters(calls, fail={"phase": "resolve_authority", "failure_type": "transient"}))
     lock = tmp_path / "results" / "control_plane" / "recovery" / BINDINGS["incident_id"] / ".owner.lock"
-    lock.write_text(json.dumps({"schema_version": "tradingagents.recovery_lock.v1", "incident_id": BINDINGS["incident_id"], "owner_run_id": "repair-old", "lease_expires_at": (NOW - dt.timedelta(minutes=1)).isoformat()}), encoding="utf-8")
+    lock.write_text(json.dumps({"schema_version": "tradingagents.recovery_lock.v1", "incident_id": BINDINGS["incident_id"], "owner_run_id": "repair-old", "lease_expires_at": (NOW - dt.timedelta(minutes=1)).isoformat(), "token": "old-owner-token"}), encoding="utf-8")
 
     result = _run(tmp_path, calls, owner_run_id="repair-new", now=NOW + dt.timedelta(minutes=31))
 

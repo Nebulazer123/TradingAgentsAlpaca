@@ -11,7 +11,9 @@ import datetime as dt
 import hashlib
 import json
 import os
+import secrets
 import subprocess
+import sys
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
@@ -22,6 +24,7 @@ from tradingagents.orchestration.recovery import (
     load_recovery_evidence,
     rearm_after_verified_recovery,
 )
+from tradingagents.policy.decision_authority import resolve_exit_authority
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.live_control import load_live_control_state
 
@@ -326,7 +329,7 @@ def _read_recovery_state(path: Path) -> tuple[dict[str, Any] | None, str | None]
         return None, "corrupt_state"
     if not isinstance(value, dict):
         return None, "corrupt_state"
-    required = {"schema_version", "incident_id", "bindings", "recovery_run_id", "owner_role", "owner_run_id", "attempt", "phase", "phase_outputs", "lease_expires_at", "idempotency_keys", "incident_history"}
+    required = {"schema_version", "incident_id", "bindings", "recovery_run_id", "owner_role", "owner_run_id", "attempt", "phase", "phase_outputs", "lease_expires_at", "idempotency_keys", "incident_history", "created_at", "last_failure", "last_artifact", "next_retry_at", "external_blockers", "incident_stage"}
     if value.get("schema_version") != "tradingagents.self_heal_recovery.v1" or not required.issubset(value):
         return None, "corrupt_state"
     if (
@@ -337,6 +340,12 @@ def _read_recovery_state(path: Path) -> tuple[dict[str, Any] | None, str | None]
         or type(value["attempt"]) is not int
         or value["attempt"] < 0
         or _parse_datetime(value["lease_expires_at"]) is None
+        or _parse_datetime(value["created_at"]) is None
+        or not isinstance(value["owner_role"], str)
+        or not isinstance(value["external_blockers"], list)
+        or value["next_retry_at"] is not None and _parse_datetime(value["next_retry_at"]) is None
+        or value["last_failure"] is not None and not isinstance(value["last_failure"], Mapping)
+        or value["last_artifact"] is not None and not isinstance(value["last_artifact"], Mapping)
         or value.get("phase") not in {*RECOVERY_PHASES, "monitoring"}
     ):
         return None, "corrupt_state"
@@ -357,9 +366,10 @@ def _write_recovery_state(path: Path, state: Mapping[str, Any]) -> None:
 
 def _recovery_lock(
     path: Path, *, incident_id: str, owner_run_id: str, lease_expires_at: str, now: dt.datetime
-) -> tuple[int | None, str]:
+) -> tuple[int | None, str, str | None]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    metadata = {"schema_version": "tradingagents.recovery_lock.v1", "incident_id": incident_id, "owner_run_id": owner_run_id, "lease_expires_at": lease_expires_at}
+    token = secrets.token_hex(16)
+    metadata = {"schema_version": "tradingagents.recovery_lock.v1", "incident_id": incident_id, "owner_run_id": owner_run_id, "lease_expires_at": lease_expires_at, "token": token}
     took_over = False
     for _ in range(3):
         try:
@@ -368,14 +378,14 @@ def _recovery_lock(
             try:
                 existing = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
-                return None, "corrupt_lock"
-            if not isinstance(existing, dict) or existing.get("schema_version") != "tradingagents.recovery_lock.v1" or existing.get("incident_id") != incident_id or not is_safe_incident_id(existing.get("owner_run_id")):
-                return None, "corrupt_lock"
+                return None, "corrupt_lock", None
+            if not isinstance(existing, dict) or existing.get("schema_version") != "tradingagents.recovery_lock.v1" or existing.get("incident_id") != incident_id or not is_safe_incident_id(existing.get("owner_run_id")) or not isinstance(existing.get("token"), str):
+                return None, "corrupt_lock", None
             expiry = _parse_datetime(existing.get("lease_expires_at"))
             if expiry is None:
-                return None, "corrupt_lock"
+                return None, "corrupt_lock", None
             if expiry > now:
-                return None, "owner_busy"
+                return None, "owner_busy", None
             # A rename quarantines a stale lock atomically; exactly one
             # contender can win and retry O_EXCL.
             try:
@@ -394,14 +404,19 @@ def _recovery_lock(
             with suppress(FileNotFoundError):
                 path.unlink()
             raise
-        return descriptor, "stale_takeover" if took_over else "acquired"
-    return None, "owner_busy"
+        return descriptor, "stale_takeover" if took_over else "acquired", token
+    return None, "owner_busy", None
 
 
-def _release_recovery_lock(path: Path, descriptor: int) -> None:
+def _release_recovery_lock(path: Path, descriptor: int, token: str | None) -> None:
     os.close(descriptor)
-    with suppress(FileNotFoundError):
-        path.unlink()
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(current, dict) and current.get("token") == token:
+        with suppress(FileNotFoundError):
+            path.unlink()
 
 
 def _recovery_failure(kind: str, detail: str, *, external: bool = False) -> dict[str, Any]:
@@ -436,7 +451,7 @@ def _valid_phase_packet(path: Path, phase: str, bindings: Mapping[str, str]) -> 
         return False
     if not isinstance(packet, dict) or any(packet.get(key) != value for key, value in bindings.items()):
         return False
-    if _parse_datetime(packet.get("generated_at")) is None:
+    if _parse_datetime(packet.get("generated_at")) is None or packet.get("phase") != phase or not all(isinstance(packet.get(key), str) and packet[key] for key in ("recovery_run_id", "owner_run_id", "owner_role", "schema_version")):
         return False
     if phase == "ready_incident":
         return packet.get("schema_version") == "tradingagents.incident.v1" and packet.get("stage") == "ready" and isinstance(packet.get("history"), list) and isinstance(packet.get("evidence_refs"), list)
@@ -554,7 +569,7 @@ def _record_recovery_incident(
 
 
 def build_production_recovery_request(
-    signal: Mapping[str, Any], *, repo_root: str | Path
+    signal: Mapping[str, Any], *, repo_root: str | Path, command_runner: Any = subprocess.run
 ) -> dict[str, Any]:
     """Build the non-test dispatch contract for a recoverable plan signal.
 
@@ -564,34 +579,111 @@ def build_production_recovery_request(
     integrations can replace the packet producers, not this authority boundary.
     """
     root = Path(repo_root).resolve()
-    symbol = str(signal.get("symbol") or "NFLX").upper()
     signature = _trigger_signature(signal)
     incident_id = f"self-heal-{hashlib.sha256(signature.encode()).hexdigest()[:20]}"
+    context = signal.get("recovery_context")
+    required = {"symbol", "broker_account", "environment", "source_revision", "supervisor_path", "advisory_path", "hourly_dir", "report_path", "envelope_path", "promotion_state_path", "reconciliation_packet_paths"}
+    if not isinstance(context, Mapping) or not required.issubset(context):
+        context = {}
+    symbol = str(context.get("symbol") or signal.get("symbol") or "missing_symbol").upper()
     bindings = {
         "incident_id": incident_id,
         "symbol": symbol,
-        "broker_account": str(signal.get("broker_account") or "unresolved"),
-        "environment": str(signal.get("environment") or "local"),
-        "source_revision": str(signal.get("source_revision") or "unresolved"),
+        "broker_account": str(context.get("broker_account") or "missing_account"),
+        "environment": str(context.get("environment") or "missing_environment"),
+        "source_revision": str(context.get("source_revision") or "missing_revision"),
     }
-    source = signal.get("path")
-    source_path = (root / str(source)).resolve() if isinstance(source, str) and not Path(source).is_absolute() else None
 
     def unavailable(phase: str, detail: str) -> dict[str, Any]:
         return {"outcome": "failed", "failure_type": "transient", "detail": f"{phase}: {detail}"}
 
-    def packet_for(phase: str) -> dict[str, Any]:
-        if source_path is None or not _path_under(source_path, root) or not source_path.exists():
-            return unavailable(phase, "canonical source packet is temporarily unavailable")
-        payload = _read_json(source_path)
-        if not payload:
-            return unavailable(phase, "canonical source packet is not valid JSON")
-        # The production dispatcher deliberately does not infer proof from CLI
-        # prose. It waits for canonical packet producers to supply strict fields.
-        phase_packets = payload.get("recovery_packets")
-        if not isinstance(phase_packets, Mapping) or not isinstance(phase_packets.get(phase), Mapping):
-            return unavailable(phase, "canonical phase packet is not yet available")
-        return {"packet": dict(phase_packets[phase])}
+    def context_path(name: str) -> Path | None:
+        raw = context.get(name)
+        if not isinstance(raw, str) or not raw:
+            return None
+        candidate = Path(raw)
+        path = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+        return path if _path_under(path, root) else None
+
+    def run_json(phase: str, argv: list[str]) -> dict[str, Any]:
+        result = command_runner(argv, cwd=str(root), capture_output=True, text=True, timeout=120)
+        if int(getattr(result, "returncode", 1)) != 0:
+            return unavailable(phase, _compact_text(getattr(result, "stderr", "command failed")))
+        try:
+            payload = json.loads(str(getattr(result, "stdout", "")))
+        except json.JSONDecodeError:
+            return unavailable(phase, "canonical command did not emit JSON")
+        return {"packet": payload} if isinstance(payload, dict) else unavailable(phase, "canonical command emitted non-object JSON")
+
+    def authority(_arguments: Mapping[str, Any]) -> dict[str, Any]:
+        supervisor_path, advisory_path = context_path("supervisor_path"), context_path("advisory_path")
+        supervisor, advisory = _read_json(supervisor_path) if supervisor_path else {}, _read_json(advisory_path) if advisory_path else {}
+        if not supervisor_path or not advisory_path or not supervisor or not advisory:
+            return unavailable("resolve_authority", "canonical supervisor/advisory packets are unavailable")
+        verdict = resolve_exit_authority(supervisor_review=supervisor, advisory_analysis=advisory)
+        if verdict.allowed is not True or verdict.requires_additional_decision is True:
+            return {"outcome": "failed", "failure_type": "permanent", "detail": "canonical exit authority is not internally allowed"}
+        return {"packet": {"kind": "recovery_authority", "schema_version": "tradingagents.recovery_phase.v1", "allowed": True, "authority_source": verdict.authority_source, "decision_owner": verdict.decision_owner}}
+
+    def regenerate(_arguments: Mapping[str, Any]) -> dict[str, Any]:
+        hourly_dir = context_path("hourly_dir")
+        if hourly_dir is None:
+            return unavailable("regenerate_evidence", "hourly evidence directory is unavailable")
+        return run_json("regenerate_evidence", [sys.executable, "-m", "cli.main", "research", "loss-review-evidence", "--hourly-dir", str(hourly_dir), "--json-output"])
+
+    def promotion(_arguments: Mapping[str, Any]) -> dict[str, Any]:
+        paths = [context_path(name) for name in ("report_path", "envelope_path", "promotion_state_path")]
+        if any(path is None for path in paths):
+            return unavailable("sync_promotion", "named promotion inputs are unavailable")
+        report, envelope, state = paths
+        result = run_json("sync_promotion", [sys.executable, "-m", "cli.main", "policy", "sync-promotion", "--report-path", str(report), "--envelope-path", str(envelope), "--state-path", str(state), "--no-arm-live", "--no-ci-green", "--json-output"])
+        packet = result.get("packet") if isinstance(result, Mapping) else None
+        if not isinstance(packet, dict) or not isinstance(packet.get("issues_by_sleeve"), Mapping):
+            return unavailable("sync_promotion", "canonical promotion result is incomplete")
+        issues = [str(issue) for values in packet["issues_by_sleeve"].values() if isinstance(values, list) for issue in values]
+        return {"packet": {**packet, "promotion_evidence_fresh": not issues, "issues": issues}}
+
+    def reconcile(_arguments: Mapping[str, Any]) -> dict[str, Any]:
+        raw_paths = context.get("reconciliation_packet_paths")
+        if not isinstance(raw_paths, list) or not raw_paths:
+            return unavailable("reconcile", "canonical reconciliation packet paths are unavailable")
+        paths = [context_path_value(value) for value in raw_paths]
+        if any(path is None for path in paths):
+            return unavailable("reconcile", "reconciliation path escapes the repo")
+        argv = [sys.executable, "-m", "cli.main", "alpaca", "reconcile-symbol-incident", "--symbol", symbol]
+        for path in paths:
+            argv.extend(["--packet-path", str(path)])
+        result = run_json("reconcile", [*argv, "--json-output"])
+        packet = result.get("packet") if isinstance(result, Mapping) else None
+        required_reconciliation = {"read_only", "execution_authority", "can_submit_orders", "matched", "issues", "broker_write_calls"}
+        if not isinstance(packet, dict) or not required_reconciliation.issubset(packet):
+            return unavailable("reconcile", "canonical reconciliation result is incomplete")
+        return result
+
+    def context_path_value(raw: object) -> Path | None:
+        if not isinstance(raw, str):
+            return None
+        candidate = Path(raw)
+        path = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+        return path if _path_under(path, root) else None
+
+    def focused(_arguments: Mapping[str, Any]) -> dict[str, Any]:
+        revision = command_runner(["git", "rev-parse", "HEAD"], cwd=str(root), capture_output=True, text=True, timeout=30)
+        if int(getattr(revision, "returncode", 1)) != 0 or str(getattr(revision, "stdout", "")).strip() != bindings["source_revision"]:
+            return unavailable("focused_verify", "checkout source revision does not match recovery binding")
+        result = command_runner([sys.executable, "-m", "pytest", "tests/test_recovery_coordinator.py", "tests/test_self_heal_recovery.py", "-q"], cwd=str(root), capture_output=True, text=True, timeout=120)
+        if int(getattr(result, "returncode", 1)) != 0:
+            return unavailable("focused_verify", "fixed focused verification failed")
+        return {
+            "packet": {
+                "kind": "recovery_focused_proof",
+                "schema_version": "tradingagents.recovery_phase.v1",
+                "focused_tests_passed": True,
+                "passing_tests": ["tests/test_recovery_coordinator.py", "tests/test_self_heal_recovery.py"],
+                "verifier_run_id": f"self-heal-verifier-{hashlib.sha256(signature.encode()).hexdigest()[:16]}",
+                "verifier_role_id": "independent_verifier",
+            }
+        }
 
     return {
         "incident_id": incident_id,
@@ -599,7 +691,7 @@ def build_production_recovery_request(
         "owner_run_id": f"self-heal-owner-{hashlib.sha256((signature + ':owner').encode()).hexdigest()[:16]}",
         "recovery_run_id": f"self-heal-run-{hashlib.sha256((signature + ':run').encode()).hexdigest()[:16]}",
         "idempotency_key": f"self-heal-delivery-{hashlib.sha256(signature.encode()).hexdigest()[:16]}",
-        "adapters": {phase: (lambda _arguments, phase=phase: packet_for(phase)) for phase in ("resolve_authority", "regenerate_evidence", "sync_promotion", "reconcile", "focused_verify")},
+        "adapters": {"resolve_authority": authority, "regenerate_evidence": regenerate, "sync_promotion": promotion, "reconcile": reconcile, "focused_verify": focused},
     }
 
 
@@ -645,7 +737,7 @@ def coordinate_verified_recovery(
     lock_path = incident_root / ".owner.lock"
     if not all(_path_under(path, root) for path in (incident_root, run_root, state_path, lock_path)):
         return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "recovery path escapes root")}
-    descriptor, lock_status = _recovery_lock(
+    descriptor, lock_status, lock_token = _recovery_lock(
         lock_path,
         incident_id=incident_id,
         owner_run_id=owner_run_id,
@@ -797,6 +889,7 @@ def coordinate_verified_recovery(
                         if control_state is not None and not control_issues and control_state.get("frozen") is False and control_state.get("recovery_incident_id") == incident_id and control_state.get("recovery_receipt_path"):
                             packet = {"kind": "verified_rearm_result", "receipt_path": control_state["recovery_receipt_path"], "receipt_sha256": control_state["recovery_receipt_sha256"], "can_submit_orders": False, "recovered_after_crash": True}
                             packet = _canonical_packet(packet, canonical_bindings, current)
+                            packet.update({"phase": phase, "recovery_run_id": state["recovery_run_id"], "owner_run_id": state["owner_run_id"], "owner_role": state["owner_role"], "schema_version": "tradingagents.recovery_phase.v1"})
                             record = _write_phase_packet(phase_path, packet)
                             state["phase_outputs"][phase] = record
                             state["last_artifact"] = record
@@ -843,6 +936,15 @@ def coordinate_verified_recovery(
                         raise ValueError(f"missing recovery adapter for {phase}")
                     packet = _adapter_packet(adapter({"incident_id": incident_id, "bindings": dict(canonical_bindings), "owner_run_id": owner_run_id, "owner_role": owner_role, "recovery_run_id": recovery_run_id, "phase": phase, "phase_outputs": dict(state["phase_outputs"])}))
                 packet = _canonical_packet(packet, canonical_bindings, current)
+                packet.update(
+                    {
+                        "phase": phase,
+                        "recovery_run_id": state["recovery_run_id"],
+                        "owner_run_id": state["owner_run_id"],
+                        "owner_role": state["owner_role"],
+                        "schema_version": packet.get("schema_version", "tradingagents.recovery_phase.v1"),
+                    }
+                )
                 record = _write_phase_packet(phase_path, packet)
                 if callable(fault_hook):
                     fault_hook({"boundary": "after_phase_fsync", "phase": phase, "path": str(phase_path)})
@@ -885,7 +987,7 @@ def coordinate_verified_recovery(
         _record_recovery_incident(root, state, now=current)
         return {"status": "monitoring", "incident_id": incident_id, "phase": "monitoring", "recovery_run_id": state["recovery_run_id"]}
     finally:
-        _release_recovery_lock(lock_path, descriptor)
+        _release_recovery_lock(lock_path, descriptor, lock_token)
 
 
 # Clear aliases make the coordinator discoverable to callers that describe the
@@ -1108,6 +1210,11 @@ def _plan_flag_signals(flags_payload: Mapping[str, Any]) -> list[dict[str, Any]]
                 "severity": _severity(reason),
                 "path": item.get("path"),
                 "meaning": item.get("meaning"),
+                "symbol": item.get("symbol"),
+                "broker_account": item.get("broker_account"),
+                "environment": item.get("environment"),
+                "source_revision": item.get("source_revision"),
+                "recovery_context": item.get("recovery_context"),
                 "requested_effects": list(item.get("requested_effects") or []),
                 "forbidden_effects": list(item.get("forbidden_effects") or []),
             }
@@ -1447,6 +1554,11 @@ def _classify_self_heal_signal(
         "severity": trigger.get("severity") or _severity(reason),
         "path": trigger.get("path"),
         "summary": _compact_text(trigger.get("summary") or trigger.get("meaning")),
+        "symbol": trigger.get("symbol"),
+        "broker_account": trigger.get("broker_account"),
+        "environment": trigger.get("environment"),
+        "source_revision": trigger.get("source_revision"),
+        "recovery_context": dict(trigger.get("recovery_context") or {}) if isinstance(trigger.get("recovery_context"), Mapping) else None,
         "count": trigger.get("count"),
         "root_cause_signature": signature,
         "forbidden_effects": list(FORBIDDEN_EFFECTS),
