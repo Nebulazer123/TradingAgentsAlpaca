@@ -462,10 +462,100 @@ def test_alpaca_reconcile_orcl_incident_writes_read_only_packet(monkeypatch, tmp
     assert payload["can_submit_orders"] is False
     assert payload["read_only"] is True
     assert payload["execution_authority"] == "none"
+    assert payload["broker_write_calls"] == 0
     assert payload["final_old_sell_state"] == "filled"
     assert payload["old_sell_orders"][0]["client_order_id"] == "ta-tiny-old-orcl-sell"
     assert live_client.submitted == []
     assert (tmp_path / "orcl" / "latest.json").exists()
+
+
+def test_alpaca_reconcile_symbol_incident_writes_generic_zero_write_packet(monkeypatch, tmp_path):
+    packet_path = tmp_path / "nflx.json"
+    packet_path.write_text(
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "symbol": "NFLX",
+                        "side": "buy",
+                        "account": "live",
+                        "idempotency_key": "ta-tiny-nflx-1",
+                    }
+                ],
+                "submitted": [
+                    {
+                        "client_order_id": "ta-tiny-nflx-1",
+                        "symbol": "NFLX",
+                        "side": "buy",
+                        "type": "limit",
+                        "qty": "1",
+                        "limit_price": "10.00",
+                        "status": "accepted",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _ReadOnlyClient:
+        def __init__(self):
+            self.write_calls = []
+
+        def list_positions(self):
+            return [{"symbol": "NFLX", "qty": "1"}]
+
+        def list_orders(self, status="all"):
+            return [
+                {
+                    "client_order_id": "ta-tiny-nflx-1",
+                    "symbol": "NFLX",
+                    "side": "buy",
+                    "type": "limit",
+                    "qty": "1",
+                    "limit_price": "10.00",
+                    "status": "accepted",
+                }
+            ]
+
+        def get_order_by_client_order_id(self, client_order_id):
+            return self.list_orders()[0] if client_order_id == "ta-tiny-nflx-1" else None
+
+        def submit_order(self, *args, **kwargs):
+            self.write_calls.append(("submit", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+    live_client = _ReadOnlyClient()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: live_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "reconcile-symbol-incident",
+            "--symbol",
+            "NFLX",
+            "--packet-path",
+            str(packet_path),
+            "--expected-qty",
+            "1",
+            "--output-dir",
+            str(tmp_path / "reconciliation"),
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["kind"] == "symbol_broker_reconciliation"
+    assert payload["symbol"] == "NFLX"
+    assert payload["read_only"] is True
+    assert payload["can_submit_orders"] is False
+    assert payload["execution_authority"] == "none"
+    assert payload["broker_write_calls"] == 0
+    assert payload["matched"] is True
+    assert live_client.write_calls == []
+    assert (tmp_path / "reconciliation" / "latest.json").exists()
 
 
 def test_alpaca_reconcile_orcl_incident_discovers_symbol_sell_packet(monkeypatch, tmp_path):

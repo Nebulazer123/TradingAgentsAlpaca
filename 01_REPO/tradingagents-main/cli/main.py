@@ -11,7 +11,7 @@ import urllib.request
 from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import ROUND_DOWN, Decimal
 from functools import lru_cache, wraps
 from pathlib import Path
@@ -66,7 +66,10 @@ from tradingagents.brokers.alpaca import (
     find_order_by_client_order_id,
     validate_live_entry_allowed,
 )
-from tradingagents.brokers.alpaca_reconciliation import reconcile_orcl_sell_state
+from tradingagents.brokers.alpaca_reconciliation import (
+    reconcile_orcl_sell_state,
+    reconcile_symbol_incident,
+)
 from tradingagents.brokers.alpaca_supervisor import (
     AGGRESSIVE_CANDIDATE_UNIVERSE,
     CENTRAL,
@@ -95,6 +98,7 @@ from tradingagents.brokers.alpaca_supervisor import (
     load_latest_overnight_plan,
     load_latest_premarket_brief,
     market_session_label,
+    resolve_live_sleeve,
     serialize_hourly_decision,
     should_notify_supervisor,
     supervisor_live_client_order_id,
@@ -102,7 +106,6 @@ from tradingagents.brokers.alpaca_supervisor import (
     validate_hourly_supervisor_actions,
     validate_overnight_plan_against_candidates,
     validate_premarket_brief_against_candidates,
-    resolve_live_sleeve,
     validate_supervisor_live_submit_allowed,
     write_hourly_decision_packet,
     write_overnight_plan_packet,
@@ -8935,6 +8938,7 @@ def alpaca_reconcile_orcl_incident(
         "analysis_only": True,
         "can_submit_orders": False,
         "execution_authority": "none",
+        "broker_write_calls": 0,
         "packet_discovery_issues": discovery_issues,
         **payload,
     }
@@ -8953,6 +8957,54 @@ def alpaca_reconcile_orcl_incident(
     )
     console.print(f"open_orders={len(packet['open_orcl_orders'])}")
     console.print(f"recent_fills={len(packet['recent_orcl_fills'])}")
+    console.print(f"packet={output_path}")
+
+
+@alpaca_app.command("reconcile-symbol-incident")
+def alpaca_reconcile_symbol_incident(
+    symbol: str = typer.Option(..., "--symbol"),
+    packet_paths: list[Path] = typer.Option(
+        [],
+        "--packet-path",
+        help="Captured packet JSON to reconcile. Repeat for multiple packets.",
+    ),
+    expected_qty: str | None = typer.Option(None, "--expected-qty"),
+    output_dir: Path = typer.Option(
+        Path("results/control_plane/reconciliation"),
+        "--output-dir",
+        help="Directory for the read-only symbol reconciliation packet.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Build read-only broker reconciliation evidence for one symbol."""
+
+    reconciliation = reconcile_symbol_incident(
+        symbol=symbol,
+        packet_paths=packet_paths,
+        live_client=_alpaca_live_client(),
+        expected_qty=expected_qty,
+    )
+    generated_at = datetime.datetime.now(tz=datetime.timezone.utc)
+    packet = {
+        "schema_version": 1,
+        "kind": "symbol_broker_reconciliation",
+        "generated_at": generated_at.isoformat(timespec="seconds"),
+        "read_only": True,
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        **asdict(reconciliation),
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"symbol-reconciliation-{generated_at:%Y%m%d-%H%M%S}.json"
+    packet["json_path"] = str(output_path)
+    json_text = json.dumps(packet, indent=2, sort_keys=True)
+    output_path.write_text(json_text, encoding="utf-8")
+    (output_dir / "latest.json").write_text(json_text, encoding="utf-8")
+    if json_output:
+        typer.echo(json_text)
+        return
+    console.print(f"symbol={packet['symbol']} matched={packet['matched']}")
     console.print(f"packet={output_path}")
 
 

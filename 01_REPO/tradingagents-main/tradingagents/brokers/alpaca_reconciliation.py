@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from collections.abc import Iterable, Mapping, Sequence
-from decimal import Decimal
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from tradingagents.brokers.alpaca import compact_alpaca_order, find_order_by_client_order_id
+from tradingagents.execution.reconcile import reconcile_latest_packet_live_orders
 
 UTC = datetime.timezone.utc
 DEFAULT_ORCL_SYMBOL = "ORCL"
@@ -35,6 +38,20 @@ _OPEN_OR_UNKNOWN_STATUSES = {
     "pending_cancel",
     "pending_new",
 }
+_SYMBOL_RE = re.compile(r"[A-Z][A-Z0-9.]{0,5}")
+
+
+@dataclass(frozen=True)
+class SymbolReconciliationResult:
+    symbol: str
+    matched: bool
+    position: dict
+    open_orders: list[dict]
+    recent_fills: list[dict]
+    checked_client_order_ids: list[str]
+    issues: list[str] = field(default_factory=list)
+    read_only: bool = True
+    broker_write_calls: int = 0
 
 
 def classify_orcl_old_sell_state(
@@ -73,6 +90,11 @@ def reconcile_orcl_sell_state(
     """Build read-only ORCL reconciliation evidence from packets plus live broker state."""
 
     symbol = _normalize_symbol(symbol)
+    generic_result = reconcile_symbol_incident(
+        symbol=symbol,
+        packet_paths=order_packet_paths,
+        live_client=live_client,
+    )
     packet_paths = [Path(path) for path in order_packet_paths]
     packet_orders: list[dict] = []
     packet_read_issues: list[dict] = []
@@ -93,21 +115,72 @@ def reconcile_orcl_sell_state(
         _enrich_order_from_live(order, live_client) for order in old_sell_orders
     ]
 
-    positions = _safe_list_positions(live_client)
-    open_orders = _filter_symbol_orders(_safe_list_orders(live_client, "open"), symbol)
-    all_orders = _filter_symbol_orders(_safe_list_orders(live_client, "all"), symbol)
-    recent_fills = _recent_fills(all_orders, symbol=symbol, limit=max_recent_fills)
     final_state = classify_orcl_old_sell_state(reconciled_orders)
 
     return {
         "order_packet_paths": [str(path) for path in packet_paths],
         "old_sell_orders": reconciled_orders,
-        "current_orcl_position": _extract_position(positions, symbol),
-        "open_orcl_orders": open_orders,
-        "recent_orcl_fills": recent_fills,
+        "current_orcl_position": generic_result.position,
+        "open_orcl_orders": generic_result.open_orders,
+        "recent_orcl_fills": generic_result.recent_fills[:max_recent_fills],
         "final_old_sell_state": final_state,
         "packet_read_issues": packet_read_issues,
     }
+
+
+def reconcile_symbol_incident(
+    *,
+    symbol: str,
+    packet_paths: Sequence[str | Path],
+    live_client,
+    expected_qty: Decimal | str | None = None,
+) -> SymbolReconciliationResult:
+    """Reconcile one symbol's packet evidence with live broker reads only."""
+
+    target_symbol = _require_symbol(symbol)
+    resolved_paths = [Path(path) for path in packet_paths]
+    issues: list[str] = []
+    checked_client_order_ids: list[str] = []
+
+    for packet_path in resolved_paths:
+        packet, packet_issue = _read_packet_with_issue(packet_path)
+        if packet_issue:
+            issues.append(f"packet read issue for {packet_path}: {packet_issue}")
+            continue
+        packet_result = reconcile_latest_packet_live_orders(
+            _symbol_packet_for_idempotency(packet, target_symbol),
+            order_lookup=lambda client_order_id: find_order_by_client_order_id(
+                live_client,
+                client_order_id,
+            ),
+        )
+        issues.extend(packet_result.issues)
+        checked_client_order_ids.extend(packet_result.checked_client_order_ids)
+
+    positions = _safe_list_positions(live_client)
+    raw_position = _extract_position(positions, target_symbol)
+    open_orders = _filter_symbol_orders(_safe_list_orders(live_client, "open"), target_symbol)
+    all_orders = _safe_list_orders(live_client, "all")
+    recent_fills = _recent_fills(all_orders, symbol=target_symbol)
+
+    _append_position_issues(
+        issues,
+        position=raw_position,
+        symbol=target_symbol,
+        expected_qty=expected_qty,
+    )
+    _append_unknown_order_issues(issues, open_orders, checked_client_order_ids)
+    _append_unknown_fill_issues(issues, recent_fills, checked_client_order_ids)
+
+    return SymbolReconciliationResult(
+        symbol=target_symbol,
+        matched=not issues,
+        position=raw_position,
+        open_orders=open_orders,
+        recent_fills=recent_fills,
+        checked_client_order_ids=checked_client_order_ids,
+        issues=issues,
+    )
 
 
 def _iter_orcl_sell_orders_from_packet(
@@ -175,6 +248,101 @@ def _extract_order_payload(order: Mapping, *, fallback_keys: tuple[str, ...]) ->
         if isinstance(nested, Mapping):
             return nested
     return order
+
+
+def _symbol_packet_for_idempotency(packet: Mapping, symbol: str) -> dict:
+    """Keep only the requested symbol before reusing generic idempotency checks."""
+
+    result = {
+        key: packet.get(key)
+        for key in (
+            "submitted_order_count",
+            "submitted_count",
+            "live_submitted_order_count",
+            "metrics",
+        )
+        if key in packet
+    }
+    result["actions"] = [
+        action
+        for action in packet.get("actions") or []
+        if isinstance(action, Mapping) and _normalize_symbol(action.get("symbol")) == symbol
+    ]
+    result["submitted"] = [
+        submitted
+        for submitted in packet.get("submitted") or []
+        if isinstance(submitted, Mapping)
+        and _normalize_symbol(
+            _extract_order_payload(
+                submitted,
+                fallback_keys=("live_response", "live_order", "live", "intent", "order"),
+            ).get("symbol")
+        )
+        == symbol
+    ]
+    result["reconciled_orders"] = [
+        reconciled
+        for reconciled in packet.get("reconciled_orders") or []
+        if isinstance(reconciled, Mapping)
+        and _normalize_symbol(
+            _extract_order_payload(
+                reconciled,
+                fallback_keys=("live_response", "live_order", "live", "order", "intent"),
+            ).get("symbol")
+        )
+        == symbol
+    ]
+    return result
+
+
+def _append_position_issues(
+    issues: list[str],
+    *,
+    position: Mapping,
+    symbol: str,
+    expected_qty: Decimal | str | None,
+) -> None:
+    actual_qty = _strict_decimal(position.get("qty"))
+    if actual_qty is None:
+        issues.append(f"malformed broker position quantity for {symbol}")
+        return
+    if expected_qty is None:
+        if actual_qty != 0:
+            issues.append(f"unexpected live position for {symbol}: {actual_qty}")
+        return
+    expected_decimal = _strict_decimal(expected_qty)
+    if expected_decimal is None:
+        raise ValueError("expected_qty must be a decimal value")
+    if abs(actual_qty - expected_decimal) > Decimal("0.000001"):
+        issues.append(
+            f"position mismatch for {symbol}: expected {expected_decimal} got {actual_qty}"
+        )
+
+
+def _append_unknown_order_issues(
+    issues: list[str],
+    open_orders: Sequence[Mapping],
+    checked_client_order_ids: Sequence[str],
+) -> None:
+    known_ids = set(checked_client_order_ids)
+    for order in open_orders:
+        client_order_id = _stringify(order.get("client_order_id"))
+        if not client_order_id or client_order_id not in known_ids:
+            label = client_order_id or "missing client_order_id"
+            issues.append(f"unexpected open order at broker: {label}")
+
+
+def _append_unknown_fill_issues(
+    issues: list[str],
+    recent_fills: Sequence[Mapping],
+    checked_client_order_ids: Sequence[str],
+) -> None:
+    known_ids = set(checked_client_order_ids)
+    for fill in recent_fills:
+        client_order_id = _stringify(fill.get("client_order_id"))
+        if not client_order_id or client_order_id not in known_ids:
+            label = client_order_id or "missing client_order_id"
+            issues.append(f"unexpected recent fill at broker: {label}")
 
 
 def _extract_order_record(
@@ -453,8 +621,22 @@ def _normalize_status(value: object) -> str:
 def _to_decimal(value: object) -> Decimal:
     try:
         return Decimal(str(value))
-    except (TypeError, ValueError):
+    except (InvalidOperation, TypeError, ValueError):
         return Decimal("0")
+
+
+def _strict_decimal(value: object) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _require_symbol(value: object) -> str:
+    symbol = _normalize_symbol(value)
+    if not _SYMBOL_RE.fullmatch(symbol):
+        raise ValueError("invalid symbol")
+    return symbol
 
 
 def _normalize_symbol(value: object) -> str:
