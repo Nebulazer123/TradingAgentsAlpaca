@@ -45,11 +45,36 @@ def _loss_review_source_packet(
         "blockers": [],
         "blocked_reasons": [],
         "source_packet_ids": [f"supervisor-{symbol.lower()}"],
+        "source_identity": "hourly_supervisor.loss_exit_review",
     }
     advisory = {
         "symbol": symbol,
+        "review_allowed_after_refresh": True,
+        "authority_source": "pre_registered_policy_rule",
         "requires_board_decision": False,
         "decision_owner": "execution_operator",
+        "loss_exit_candidate": {
+            "allowed_exit_reason_candidate": "policy_stop_floor",
+            "allowed_exit_reason_source": "pre-registered exit policy rule",
+            "confidence": None,
+            "confidence_tier": "pre_registered_policy",
+            "reason_summary": "The pre-registered rule fired.",
+            "drivers": [
+                "pre-registered exit rule remains authoritative: policy_stop_floor"
+            ],
+            "approval_effect": "preserves_pre_registered_policy_approval",
+            "requires_board_decision": False,
+            "requires_tradeable_session": True,
+            "can_submit_orders": False,
+        },
+        "forbidden_effects": [
+            "create_trade_intent",
+            "size_position",
+            "submit_order",
+            "promote_sleeve",
+            "waive_live_gate",
+            "mark_loss_exit_allowed",
+        ],
     }
     source_ref = f"local://{hourly_packet_path}"
     return {
@@ -90,6 +115,7 @@ def _loss_review_source_packet(
             "entry_context": {"symbol": symbol, "account": account},
             "entry_context_found": True,
             "advisory_analysis": advisory,
+            "next_action": "pre_registered_policy_approval_preserved",
             "analysis_only": True,
             "execution_authority": "none",
             "forbidden_effects": [
@@ -130,7 +156,7 @@ def _promotion_source_packet(*, symbol: str = "NFLX") -> dict:
         "summary": "promotion state synchronized",
         "promoted": [],
         "demoted": [],
-        "issues_by_sleeve": {"default": []},
+        "issues_by_sleeve": {"pullback-support": []},
         "state_path": "/tmp/promotion-state.json",
         "report_path": "/tmp/paper-tournament.json",
         "arm_live": False,
@@ -147,7 +173,43 @@ def _promotion_source_packet(*, symbol: str = "NFLX") -> dict:
                 "arm_live": False,
                 "ci_green": False,
             },
-            "sleeves": {"default": {"symbol": symbol, "live_enabled": False}},
+            "sleeves": {
+                "pullback-support": {
+                    "stage": "tiny_live_eligible",
+                    "live_enabled": False,
+                    "ci_green": True,
+                    "shadow_confirmed": True,
+                    "preregistered": True,
+                    "benchmark_gate_passed": True,
+                    "cost_gate_passed": True,
+                    "recent_alpha_gate_passed": True,
+                    "capacity_gate_passed": True,
+                    "validation_report_ref": "results/paper_strategy_tournament/latest.json",
+                    "risk_envelope_ref": "config/risk_envelope.yaml",
+                    "promoted_at": NOW.isoformat(),
+                    "metrics": {
+                        "benchmark_excess_return": "3.53",
+                        "cost_adjusted_alpha": "3.53",
+                        "recent_alpha": "3.53",
+                        "capacity_usd": "10353.62",
+                        "requested_tiny_live_tranche_usd": "25.00",
+                    },
+                    "issues": [],
+                    "source": {
+                        "kind": "paper_tournament",
+                        "tournament_id": "tournament-20260718",
+                        "report_generated_at": NOW.isoformat(),
+                        "candidate_reason": "positive paper strategy",
+                    },
+                    "evidence_metrics": {
+                        "total_return": "353.62",
+                        "total_return_pct": "3.53",
+                        "max_drawdown_pct": "-1.91",
+                        "win_rate_pct": "71.42",
+                        "tracked_days": 14,
+                    },
+                }
+            },
         },
     }
 
@@ -170,9 +232,38 @@ def _reconciliation_source_packet(*, symbol: str = "NFLX") -> dict:
             "market_value": "0",
             "avg_entry_price": "0",
         },
-        "open_orders": [],
-        "recent_fills": [],
-        "checked_client_order_ids": [],
+        "open_orders": [
+            {
+                "id": "broker-open-nflx-1",
+                "client_order_id": "open-nflx-1",
+                "symbol": symbol,
+                "side": "sell",
+                "type": "limit",
+                "time_in_force": "day",
+                "qty": "1",
+                "limit_price": "100",
+                "status": "accepted",
+                "submitted_at": NOW.isoformat(),
+                "updated_at": NOW.isoformat(),
+            }
+        ],
+        "recent_fills": [
+            {
+                "id": "broker-fill-nflx-1",
+                "client_order_id": "fill-nflx-1",
+                "symbol": symbol,
+                "side": "buy",
+                "type": "market",
+                "time_in_force": "day",
+                "qty": "1",
+                "status": "filled",
+                "filled_qty": "1",
+                "filled_avg_price": "100",
+                "submitted_at": NOW.isoformat(),
+                "updated_at": NOW.isoformat(),
+            }
+        ],
+        "checked_client_order_ids": ["open-nflx-1", "fill-nflx-1"],
         "issues": [],
         "broker_write_calls": 0,
     }
@@ -894,6 +985,76 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
         ),
         (
             "regenerate_evidence",
+            "supervisor allowed authority",
+            lambda packet: packet["payload"]["supervisor_review_authority"].update(
+                {"allowed": False}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "supervisor additional decision",
+            lambda packet: packet["payload"]["supervisor_review_authority"].update(
+                {"requires_additional_decision": True}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "supervisor blockers",
+            lambda packet: packet["payload"]["supervisor_review_authority"].update(
+                {"blockers": ["manual approval required"]}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "supervisor blocked reasons",
+            lambda packet: packet["payload"]["supervisor_review_authority"].update(
+                {"blocked_reasons": ["policy authority unresolved"]}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "pre-registered policy authority",
+            lambda packet: packet["payload"]["supervisor_review_authority"].update(
+                {"policy_rule_exit": False}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "policy rule binding",
+            lambda packet: packet["payload"]["supervisor_review_authority"].update(
+                {"exit_policy_rule": "time_stop"}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "advisory board decision",
+            lambda packet: packet["payload"]["advisory_analysis"].update(
+                {"requires_board_decision": True}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "advisory decision owner",
+            lambda packet: packet["payload"]["advisory_analysis"].update(
+                {"decision_owner": "portfolio_executive"}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "advisory authority source",
+            lambda packet: packet["payload"]["advisory_analysis"].update(
+                {"authority_source": "advisory_research"}
+            ),
+        ),
+        (
+            "regenerate_evidence",
+            "advisory preserved approval",
+            lambda packet: packet["payload"]["advisory_analysis"][
+                "loss_exit_candidate"
+            ].update({"approval_effect": "board_review_input_not_loss_exit_approval"}),
+        ),
+        (
+            "regenerate_evidence",
             "forbidden effect rails",
             lambda packet: packet["payload"].update({"forbidden_effects": []}),
         ),
@@ -933,6 +1094,65 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
         ),
         (
             "sync_promotion",
+            "promoted string ids",
+            lambda packet: packet.update({"promoted": [True]}),
+        ),
+        (
+            "sync_promotion",
+            "demoted string ids",
+            lambda packet: packet.update({"demoted": [7]}),
+        ),
+        (
+            "sync_promotion",
+            "sleeve record shape",
+            lambda packet: packet["state"].update(
+                {"sleeves": {"default": "not-a-record"}}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "sleeve symbol binding",
+            lambda packet: packet["state"]["sleeves"]["pullback-support"].update(
+                {"symbol": "TSLA"}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "sleeve stage",
+            lambda packet: packet["state"]["sleeves"]["pullback-support"].update(
+                {"stage": "live"}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "sleeve live flag",
+            lambda packet: packet["state"]["sleeves"]["pullback-support"].update(
+                {"live_enabled": "false"}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "sleeve gate consistency",
+            lambda packet: packet["state"]["sleeves"]["pullback-support"].update(
+                {"preregistered": False}
+            ),
+        ),
+        (
+            "sync_promotion",
+            "sleeve source identity",
+            lambda packet: packet["state"]["sleeves"]["pullback-support"][
+                "source"
+            ].update({"kind": "self_attested"}),
+        ),
+        (
+            "sync_promotion",
+            "sleeve metrics",
+            lambda packet: packet["state"]["sleeves"]["pullback-support"][
+                "metrics"
+            ].update({"capacity_usd": "NaN"}),
+        ),
+        (
+            "sync_promotion",
             "source state path",
             lambda packet: packet.update({"state_path": ""}),
         ),
@@ -963,6 +1183,21 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
         ),
         (
             "reconcile",
+            "position quantity",
+            lambda packet: packet["position"].update({"qty": "NaN"}),
+        ),
+        (
+            "reconcile",
+            "position required numeric field",
+            lambda packet: packet["position"].pop("notional"),
+        ),
+        (
+            "reconcile",
+            "position finite market value",
+            lambda packet: packet["position"].update({"market_value": "Infinity"}),
+        ),
+        (
+            "reconcile",
             "open orders shape",
             lambda packet: packet.update({"open_orders": {}}),
         ),
@@ -972,6 +1207,35 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
             lambda packet: packet.update(
                 {"open_orders": [{"symbol": "NFLX", "status": "open"}]}
             ),
+        ),
+        (
+            "reconcile",
+            "minimal open order",
+            lambda packet: packet.update(
+                {
+                    "open_orders": [
+                        {
+                            "symbol": "NFLX",
+                            "client_order_id": "open-nflx-1",
+                        }
+                    ]
+                }
+            ),
+        ),
+        (
+            "reconcile",
+            "open order status",
+            lambda packet: packet["open_orders"][0].update({"status": "filled"}),
+        ),
+        (
+            "reconcile",
+            "open order side",
+            lambda packet: packet["open_orders"][0].pop("side"),
+        ),
+        (
+            "reconcile",
+            "open order finite quantity",
+            lambda packet: packet["open_orders"][0].update({"qty": "NaN"}),
         ),
         (
             "reconcile",
@@ -986,6 +1250,29 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
                         }
                     ]
                 }
+            ),
+        ),
+        (
+            "reconcile",
+            "recent fill open status",
+            lambda packet: packet["recent_fills"][0].update({"status": "open"}),
+        ),
+        (
+            "reconcile",
+            "recent fill positive quantity",
+            lambda packet: packet["recent_fills"][0].update({"filled_qty": "0"}),
+        ),
+        (
+            "reconcile",
+            "recent fill finite quantity",
+            lambda packet: packet["recent_fills"][0].update({"filled_qty": "NaN"}),
+        ),
+        (
+            "reconcile",
+            "recent fill timestamp",
+            lambda packet: (
+                packet["recent_fills"][0].pop("submitted_at"),
+                packet["recent_fills"][0].pop("updated_at"),
             ),
         ),
         (
@@ -1025,6 +1312,63 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
             is False
         ), (phase, invariant)
         phase_path.write_text(original, encoding="utf-8")
+
+    promotion_path = Path(state["phase_outputs"]["sync_promotion"]["path"])
+    promotion_original = promotion_path.read_text(encoding="utf-8")
+    empty_promotion = json.loads(promotion_original)
+    empty_promotion["promoted"] = []
+    empty_promotion["demoted"] = []
+    empty_promotion["issues_by_sleeve"] = {}
+    empty_promotion["state"]["sleeves"] = {}
+    promotion_path.write_text(json.dumps(empty_promotion), encoding="utf-8")
+    assert _valid_phase_packet(
+        promotion_path,
+        "sync_promotion",
+        BINDINGS,
+        state=state,
+        phase_outputs=state["phase_outputs"],
+        control_path=tmp_path / "live_control.json",
+        now=NOW,
+        idempotency_key="delivery-1",
+    )
+    promotion_path.write_text(promotion_original, encoding="utf-8")
+
+    reconciliation_path = Path(state["phase_outputs"]["reconcile"]["path"])
+    reconciliation_original = reconciliation_path.read_text(encoding="utf-8")
+    canceled_partial_fill = json.loads(reconciliation_original)
+    canceled_partial_fill["recent_fills"][0]["status"] = "canceled"
+    canceled_partial_fill["recent_fills"][0]["filled_qty"] = "0.5"
+    reconciliation_path.write_text(
+        json.dumps(canceled_partial_fill), encoding="utf-8"
+    )
+    assert _valid_phase_packet(
+        reconciliation_path,
+        "reconcile",
+        BINDINGS,
+        state=state,
+        phase_outputs=state["phase_outputs"],
+        control_path=tmp_path / "live_control.json",
+        now=NOW,
+        idempotency_key="delivery-1",
+    )
+    empty_reconciliation = json.loads(reconciliation_original)
+    empty_reconciliation["open_orders"] = []
+    empty_reconciliation["recent_fills"] = []
+    empty_reconciliation["checked_client_order_ids"] = []
+    reconciliation_path.write_text(
+        json.dumps(empty_reconciliation), encoding="utf-8"
+    )
+    assert _valid_phase_packet(
+        reconciliation_path,
+        "reconcile",
+        BINDINGS,
+        state=state,
+        phase_outputs=state["phase_outputs"],
+        control_path=tmp_path / "live_control.json",
+        now=NOW,
+        idempotency_key="delivery-1",
+    )
+    reconciliation_path.write_text(reconciliation_original, encoding="utf-8")
 
 
 @pytest.mark.parametrize(

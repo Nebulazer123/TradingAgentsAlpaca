@@ -18,6 +18,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from contextlib import suppress
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -846,6 +847,96 @@ def _nonempty_recovery_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _finite_recovery_decimal(
+    value: object, *, positive: bool = False, nonnegative: bool = False
+) -> Decimal | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite():
+        return None
+    if positive and parsed <= 0:
+        return None
+    if nonnegative and parsed < 0:
+        return None
+    return parsed
+
+
+def _valid_preserved_policy_authority(
+    *,
+    packet: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    supervisor: Mapping[str, Any],
+    advisory: Mapping[str, Any],
+    symbol: str,
+) -> bool:
+    candidate = advisory.get("loss_exit_candidate")
+    verdict = resolve_exit_authority(
+        supervisor_review=supervisor,
+        advisory_analysis=advisory,
+    )
+    forbidden_effects = [
+        "create_trade_intent",
+        "size_position",
+        "submit_order",
+        "promote_sleeve",
+        "waive_live_gate",
+        "mark_loss_exit_allowed",
+    ]
+    return (
+        supervisor.get("symbol") == symbol
+        and _nonempty_recovery_string(supervisor.get("decision_id"))
+        and supervisor.get("allowed") is True
+        and supervisor.get("policy_rule_exit") is True
+        and _nonempty_recovery_string(supervisor.get("allowed_exit_reason"))
+        and _nonempty_recovery_string(
+            supervisor.get("allowed_exit_reason_source")
+        )
+        and _nonempty_recovery_string(supervisor.get("exit_policy_rule"))
+        and _nonempty_recovery_string(supervisor.get("exit_policy_rationale"))
+        and supervisor.get("blockers") == []
+        and supervisor.get("blocked_reasons") == []
+        and _packet_string_list(supervisor.get("source_packet_ids"))
+        and supervisor.get("source_identity")
+        == "hourly_supervisor.loss_exit_review"
+        and supervisor.get("requires_additional_decision") in (None, False)
+        and verdict.allowed is True
+        and verdict.authority_source == "pre_registered_policy_rule"
+        and verdict.requires_additional_decision is False
+        and verdict.decision_owner == "execution_operator"
+        and advisory.get("symbol") == symbol
+        and advisory.get("review_allowed_after_refresh") is True
+        and advisory.get("authority_source") == verdict.authority_source
+        and advisory.get("requires_board_decision") is False
+        and advisory.get("requires_additional_decision") in (None, False)
+        and advisory.get("decision_owner") == verdict.decision_owner
+        and advisory.get("forbidden_effects") == forbidden_effects
+        and isinstance(candidate, Mapping)
+        and candidate.get("allowed_exit_reason_candidate")
+        == supervisor.get("allowed_exit_reason")
+        and candidate.get("allowed_exit_reason_source")
+        == supervisor.get("allowed_exit_reason_source")
+        and candidate.get("confidence") is None
+        and candidate.get("confidence_tier") == "pre_registered_policy"
+        and _nonempty_recovery_string(candidate.get("reason_summary"))
+        and _packet_string_list(candidate.get("drivers"), nonempty=True)
+        and candidate.get("approval_effect")
+        == "preserves_pre_registered_policy_approval"
+        and candidate.get("requires_board_decision") is False
+        and candidate.get("requires_tradeable_session") is True
+        and candidate.get("can_submit_orders") is False
+        and payload.get("review_allowed") is True
+        and payload.get("next_action")
+        == "pre_registered_policy_approval_preserved"
+        and packet.get("review_allowed") is True
+        and packet.get("next_action")
+        == "pre_registered_policy_approval_preserved"
+    )
+
+
 def _valid_loss_review_phase_packet(
     packet: Mapping[str, Any], bindings: Mapping[str, str]
 ) -> bool:
@@ -944,6 +1035,13 @@ def _valid_loss_review_phase_packet(
         and isinstance(advisory, Mapping)
         and advisory.get("symbol") == symbol
         and packet.get("entry_context") == entry_context
+        and _valid_preserved_policy_authority(
+            packet=packet,
+            payload=payload,
+            supervisor=supervisor,
+            advisory=advisory,
+            symbol=symbol,
+        )
     )
 
 
@@ -953,6 +1051,9 @@ def _valid_promotion_phase_packet(
     issues_by_sleeve = packet.get("issues_by_sleeve")
     state = packet.get("state")
     source = state.get("source") if isinstance(state, Mapping) else None
+    sleeves = state.get("sleeves") if isinstance(state, Mapping) else None
+    promoted = packet.get("promoted")
+    demoted = packet.get("demoted")
     return (
         packet.get("schema_version") == "tradingagents.recovery_phase.v1"
         and packet.get("source_schema_version") == "1.1.0"
@@ -963,11 +1064,14 @@ def _valid_promotion_phase_packet(
         and packet.get("issues") == []
         and isinstance(issues_by_sleeve, Mapping)
         and all(
-            isinstance(issues, list) and not issues
-            for issues in issues_by_sleeve.values()
+            _nonempty_recovery_string(sleeve_id)
+            and isinstance(issues, list)
+            and not issues
+            for sleeve_id, issues in issues_by_sleeve.items()
         )
-        and isinstance(packet.get("promoted"), list)
-        and isinstance(packet.get("demoted"), list)
+        and _packet_string_list(promoted)
+        and _packet_string_list(demoted)
+        and not set(promoted).intersection(demoted)
         and _nonempty_recovery_string(packet.get("state_path"))
         and _nonempty_recovery_string(packet.get("report_path"))
         and packet.get("arm_live") is False
@@ -976,7 +1080,29 @@ def _valid_promotion_phase_packet(
         and packet.get("execution_authority") == "none"
         and isinstance(state, Mapping)
         and state.get("schema_version") == packet.get("source_schema_version")
-        and isinstance(state.get("sleeves"), Mapping)
+        and _parse_aware_recovery_time(state.get("generated_at")) is not None
+        and isinstance(sleeves, Mapping)
+        and all(
+            _nonempty_recovery_string(sleeve_id)
+            and isinstance(record, Mapping)
+            and _valid_promotion_sleeve_record(
+                record,
+                symbol=bindings["symbol"],
+            )
+            for sleeve_id, record in sleeves.items()
+        )
+        and set(promoted).issubset(sleeves)
+        and set(demoted).issubset(sleeves)
+        and set(issues_by_sleeve).issubset(sleeves)
+        and all(
+            sleeves[sleeve_id].get("stage") == "tiny_live_eligible"
+            for sleeve_id in promoted
+        )
+        and all(
+            sleeves[sleeve_id].get("stage") == "paper_only"
+            and sleeves[sleeve_id].get("live_enabled") is False
+            for sleeve_id in demoted
+        )
         and isinstance(source, Mapping)
         and source.get("kind") == "paper_tournament_sync"
         and source.get("arm_live") is False
@@ -986,16 +1112,179 @@ def _valid_promotion_phase_packet(
     )
 
 
-def _valid_reconciliation_collection(
-    value: object, *, symbol: str, checked_client_order_ids: set[str]
+def _valid_promotion_sleeve_record(
+    record: Mapping[str, Any], *, symbol: str
 ) -> bool:
-    return isinstance(value, list) and all(
-        isinstance(item, Mapping)
-        and item.get("symbol") == symbol
-        and _nonempty_recovery_string(item.get("client_order_id"))
-        and item.get("client_order_id") in checked_client_order_ids
-        for item in value
+    stage = record.get("stage")
+    live_enabled = record.get("live_enabled")
+    gates = (
+        "preregistered",
+        "ci_green",
+        "shadow_confirmed",
+        "benchmark_gate_passed",
+        "cost_gate_passed",
+        "recent_alpha_gate_passed",
+        "capacity_gate_passed",
     )
+    if (
+        stage not in {"paper_only", "tiny_live_eligible"}
+        or type(live_enabled) is not bool
+        or any(type(record.get(name)) is not bool for name in gates)
+        or not _nonempty_recovery_string(record.get("validation_report_ref"))
+        or not _nonempty_recovery_string(record.get("risk_envelope_ref"))
+    ):
+        return False
+    record_symbol = record.get("symbol")
+    if record_symbol is not None and str(record_symbol).strip().upper() != symbol:
+        return False
+    issues = record.get("issues")
+    if issues is not None and not _packet_string_list(issues):
+        return False
+    if stage == "paper_only" and live_enabled is not False:
+        return False
+    if stage == "tiny_live_eligible" and (
+        not all(record.get(name) is True for name in gates)
+        or issues not in (None, [])
+    ):
+        return False
+    for timestamp_name in ("promoted_at", "demoted_at"):
+        timestamp = record.get(timestamp_name)
+        if timestamp is not None and _parse_aware_recovery_time(timestamp) is None:
+            return False
+    source = record.get("source")
+    if source is not None and (
+        not isinstance(source, Mapping)
+        or source.get("kind") != "paper_tournament"
+        or not _nonempty_recovery_string(source.get("tournament_id"))
+        or _parse_aware_recovery_time(source.get("report_generated_at")) is None
+        or not _nonempty_recovery_string(source.get("candidate_reason"))
+    ):
+        return False
+    metrics = record.get("metrics")
+    metric_names = {
+        "benchmark_excess_return",
+        "cost_adjusted_alpha",
+        "recent_alpha",
+        "capacity_usd",
+        "requested_tiny_live_tranche_usd",
+    }
+    if metrics is not None and (
+        not isinstance(metrics, Mapping)
+        or set(metrics) != metric_names
+        or any(
+            _finite_recovery_decimal(metrics.get(name)) is None
+            for name in metric_names
+        )
+    ):
+        return False
+    evidence_metrics = record.get("evidence_metrics")
+    evidence_decimal_names = {
+        "total_return",
+        "total_return_pct",
+        "max_drawdown_pct",
+        "win_rate_pct",
+    }
+    if evidence_metrics is not None and (
+        not isinstance(evidence_metrics, Mapping)
+        or set(evidence_metrics)
+        != {*evidence_decimal_names, "tracked_days"}
+        or any(
+            _finite_recovery_decimal(evidence_metrics.get(name)) is None
+            for name in evidence_decimal_names
+        )
+        or type(evidence_metrics.get("tracked_days")) is not int
+        or evidence_metrics.get("tracked_days") < 0
+    ):
+        return False
+    return all(
+        not (
+            ("digest" in str(name).casefold() or str(name).endswith("_sha256"))
+            and not _valid_recovery_digest(value)
+        )
+        for name, value in record.items()
+    )
+
+
+def _valid_reconciliation_collection(
+    value: object,
+    *,
+    symbol: str,
+    checked_client_order_ids: set[str],
+    collection: str,
+) -> bool:
+    if not isinstance(value, list):
+        return False
+    numeric_fields = (
+        "qty",
+        "notional",
+        "limit_price",
+        "filled_qty",
+        "filled_avg_price",
+    )
+    for item in value:
+        if (
+            not isinstance(item, Mapping)
+            or item.get("symbol") != symbol
+            or not _nonempty_recovery_string(item.get("client_order_id"))
+            or item.get("client_order_id") not in checked_client_order_ids
+            or str(item.get("side") or "").strip().lower() not in {"buy", "sell"}
+            or any(
+                field in item
+                and _finite_recovery_decimal(
+                    item.get(field),
+                    nonnegative=True,
+                )
+                is None
+                for field in numeric_fields
+            )
+        ):
+            return False
+        status = str(item.get("status") or "").strip().lower()
+        pending = status.startswith("pending_")
+        if collection == "open_orders":
+            if (
+                status
+                not in {"open", "new", "accepted", "partially_filled"}
+                and not pending
+            ):
+                return False
+            qty = _finite_recovery_decimal(item.get("qty"), positive=True)
+            notional = _finite_recovery_decimal(
+                item.get("notional"), positive=True
+            )
+            if qty is None and notional is None:
+                return False
+        elif collection == "recent_fills":
+            if status in {"open", "new", "accepted"} or pending:
+                return False
+            filled_qty = _finite_recovery_decimal(
+                item.get("filled_qty"), positive=True
+            )
+            if filled_qty is None:
+                return False
+            qty = (
+                _finite_recovery_decimal(item.get("qty"), positive=True)
+                if "qty" in item
+                else None
+            )
+            if "qty" in item and (qty is None or filled_qty > qty):
+                return False
+            if (
+                "filled_avg_price" in item
+                and _finite_recovery_decimal(
+                    item.get("filled_avg_price"), positive=True
+                )
+                is None
+            ):
+                return False
+            if not any(
+                _parse_aware_recovery_time(item.get(name)) is not None
+                for name in ("filled_at", "updated_at", "submitted_at")
+            ):
+                return False
+        else:
+            return False
+    return True
 
 
 def _valid_reconciliation_phase_packet(
@@ -1007,6 +1296,12 @@ def _valid_reconciliation_phase_packet(
     if not _packet_string_list(checked):
         return False
     checked_ids = set(checked)
+    required_position_numbers = (
+        "qty",
+        "notional",
+        "market_value",
+        "avg_entry_price",
+    )
     return (
         packet.get("schema_version") == "tradingagents.recovery_phase.v1"
         and packet.get("source_schema_version") == 1
@@ -1024,16 +1319,27 @@ def _valid_reconciliation_phase_packet(
         and packet.get("broker_write_calls") == 0
         and isinstance(position, Mapping)
         and position.get("symbol") == symbol
-        and _nonempty_recovery_string(position.get("qty"))
+        and all(
+            name in position
+            and _finite_recovery_decimal(position.get(name)) is not None
+            for name in required_position_numbers
+        )
+        and (
+            "avg_entry_price_hint" not in position
+            or _finite_recovery_decimal(position.get("avg_entry_price_hint"))
+            is not None
+        )
         and _valid_reconciliation_collection(
             packet.get("open_orders"),
             symbol=symbol,
             checked_client_order_ids=checked_ids,
+            collection="open_orders",
         )
         and _valid_reconciliation_collection(
             packet.get("recent_fills"),
             symbol=symbol,
             checked_client_order_ids=checked_ids,
+            collection="recent_fills",
         )
     )
 
