@@ -877,6 +877,50 @@ def parse_packet_timestamp(value: Any) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
+    """Return only the five incident fields permitted in compact context."""
+
+    incidents_root = ROOT / "results" / "control_plane" / "incidents"
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=dt.timezone.utc)
+    else:
+        current = current.astimezone(dt.timezone.utc)
+    active: list[tuple[dict[str, Any], Path]] = []
+    if incidents_root.exists():
+        for snapshot_path in incidents_root.glob("*/latest.json"):
+            payload = read_json(snapshot_path)
+            if isinstance(payload, dict) and payload.get("stage") != "closed":
+                active.append((payload, snapshot_path))
+
+    oldest_minutes = 0
+    if active:
+        ages = [
+            max(0, int((current - created).total_seconds() // 60))
+            for payload, _path in active
+            if (created := parse_packet_timestamp(payload.get("created_at"))) is not None
+        ]
+        oldest_minutes = max(ages, default=0)
+    latest = max(
+        active,
+        key=lambda item: parse_packet_timestamp(item[0].get("updated_at"))
+        or parse_packet_timestamp(item[0].get("created_at"))
+        or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        default=None,
+    )
+    return {
+        "active_incident_count": len(active),
+        "oldest_active_incident_minutes": oldest_minutes,
+        "unowned_incident_count": sum(
+            not str(payload.get("owner_role") or "").strip() for payload, _path in active
+        ),
+        "external_blocked_count": sum(
+            payload.get("stage") == "external_blocked" for payload, _path in active
+        ),
+        "latest_incident_ref": rel(latest[1]) if latest else None,
+    }
+
+
 def path_is_under(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -3147,6 +3191,7 @@ def collect_snapshot(*, refresh: bool = True) -> dict[str, Any]:
             "Open raw packets only for listed flags or task-specific drilldown.",
         ],
         "latest_packets": packets,
+        "incidents": summarize_incidents(),
         "flags": flags,
         "next_open": next_open,
     }

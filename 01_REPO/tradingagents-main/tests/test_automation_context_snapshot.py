@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
 from pathlib import Path
@@ -42,3 +43,41 @@ def test_overnight_summary_exposes_original_graph_tickers(tmp_path):
     assert summary["original_graph_selected_tickers"] == ["MSFT"]
     assert summary["original_graph_successful_tickers"] == ["MSFT"]
     assert summary["original_graph_failed_tickers"] == []
+
+
+def test_snapshot_exposes_only_compact_incident_status(tmp_path, monkeypatch):
+    snapshot = _load_snapshot_module()
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+    incident_dir = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "incidents"
+        / "inc-nflx-rule-conflict"
+    )
+    incident_dir.mkdir(parents=True)
+    (incident_dir / "latest.json").write_text(
+        json.dumps(
+            {
+                "incident_id": "inc-nflx-rule-conflict",
+                "stage": "external_blocked",
+                "owner_role": "reliability_controller",
+                "created_at": "2026-07-18T00:00:00+00:00",
+                "history": [{"raw": "must not appear"}],
+                "evidence_refs": ["private-evidence"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = snapshot.summarize_incidents(
+        now=dt.datetime(2026, 7, 18, 0, 12, tzinfo=dt.timezone.utc)
+    )
+
+    assert summary == {
+        "active_incident_count": 1,
+        "oldest_active_incident_minutes": 12,
+        "unowned_incident_count": 0,
+        "external_blocked_count": 1,
+        "latest_incident_ref": "results/control_plane/incidents/inc-nflx-rule-conflict/latest.json",
+    }
