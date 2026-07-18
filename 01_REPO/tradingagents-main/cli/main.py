@@ -247,6 +247,7 @@ from tradingagents.policy.live_control import (
     _write_live_control_state_locked,
     live_control_lock,
     load_live_control_state,
+    parse_control_time,
     write_live_control_state,
 )
 from tradingagents.policy.order_rate_limit import record_live_order_submission
@@ -3879,33 +3880,98 @@ def policy_recover_incident(
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Re-arm a frozen live-control lease from independently verified packets."""
-    evidence, parse_issues = load_recovery_evidence(
-        incident_path=incident_path,
-        reconciliation_path=reconciliation_path,
-        promotion_sync_path=promotion_sync_path,
-        focused_proof_path=focused_proof_path,
-        recovery_manifest_path=recovery_manifest_path,
-        repairer_run_id=repairer_run_id,
-        verifier_run_id=verifier_run_id,
-    )
-    if evidence is None:
-        payload: dict[str, Any] = {"ready": False, "issues": list(parse_issues), "can_submit_orders": False}
-    else:
-        verdict = evaluate_rearm_readiness(evidence)
-        if not verdict.ready:
-            payload = {"ready": False, "issues": list(verdict.issues), "can_submit_orders": False}
+    control_absolute = control_path.resolve()
+    accepted_control_preimage_sha256: str | None = None
+    control_acceptance_issues: list[str] = []
+    with live_control_lock(control_absolute):
+        try:
+            control_preimage = control_absolute.read_bytes()
+        except OSError:
+            control_acceptance_issues.append(
+                "existing live control is not valid"
+            )
         else:
-            try:
-                receipt = rearm_after_verified_recovery(
-                    evidence=evidence,
-                    control_path=control_path,
-                    receipt_dir=receipt_dir,
-                    ttl_minutes=ttl_minutes,
+            control_state, control_issues = load_live_control_state(
+                control_absolute
+            )
+            unsafe_control_issues = [
+                issue
+                for issue in control_issues
+                if not issue.startswith("live control state is frozen:")
+                and not issue.startswith("dead-man expired at ")
+            ]
+            if (
+                control_state is None
+                or control_state.get("frozen") is not True
+                or not isinstance(control_state.get("reason"), str)
+                or not control_state["reason"].strip()
+                or parse_control_time(
+                    str(control_state.get("dead_man_expires_at", ""))
                 )
-            except (OSError, ValueError) as exc:
-                payload = {"ready": False, "issues": [str(exc)], "can_submit_orders": False}
+                is None
+                or unsafe_control_issues
+            ):
+                control_acceptance_issues.append(
+                    "existing live control must be a valid frozen state"
+                )
             else:
-                payload = {"ready": True, "receipt": receipt, "can_submit_orders": False}
+                accepted_control_preimage_sha256 = hashlib.sha256(
+                    control_preimage
+                ).hexdigest()
+
+    if accepted_control_preimage_sha256 is None:
+        payload: dict[str, Any] = {
+            "ready": False,
+            "issues": control_acceptance_issues,
+            "can_submit_orders": False,
+        }
+    else:
+        evidence, parse_issues = load_recovery_evidence(
+            incident_path=incident_path,
+            reconciliation_path=reconciliation_path,
+            promotion_sync_path=promotion_sync_path,
+            focused_proof_path=focused_proof_path,
+            recovery_manifest_path=recovery_manifest_path,
+            repairer_run_id=repairer_run_id,
+            verifier_run_id=verifier_run_id,
+        )
+        if evidence is None:
+            payload = {
+                "ready": False,
+                "issues": list(parse_issues),
+                "can_submit_orders": False,
+            }
+        else:
+            verdict = evaluate_rearm_readiness(evidence)
+            if not verdict.ready:
+                payload = {
+                    "ready": False,
+                    "issues": list(verdict.issues),
+                    "can_submit_orders": False,
+                }
+            else:
+                try:
+                    receipt = rearm_after_verified_recovery(
+                        evidence=evidence,
+                        control_path=control_path,
+                        receipt_dir=receipt_dir,
+                        ttl_minutes=ttl_minutes,
+                        expected_control_preimage_sha256=(
+                            accepted_control_preimage_sha256
+                        ),
+                    )
+                except (OSError, ValueError) as exc:
+                    payload = {
+                        "ready": False,
+                        "issues": [str(exc)],
+                        "can_submit_orders": False,
+                    }
+                else:
+                    payload = {
+                        "ready": True,
+                        "receipt": receipt,
+                        "can_submit_orders": False,
+                    }
     if json_output:
         print(json.dumps(payload, indent=2, sort_keys=True))
     elif payload["ready"]:

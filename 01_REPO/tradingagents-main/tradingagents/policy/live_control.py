@@ -55,6 +55,116 @@ def parse_control_time(value: str) -> datetime.datetime | None:
     return parsed.astimezone(UTC)
 
 
+def _recovery_closure_issues(
+    receipt: dict[str, Any],
+    *,
+    receipt_path: Path,
+    control_path: Path,
+) -> list[str]:
+    issues: list[str] = []
+    required = {
+        "incident",
+        "reconciliation",
+        "promotion",
+        "focused",
+        "manifest",
+        "promotion_report",
+        "promotion_envelope",
+        "promotion_prepare",
+        "promotion_stage",
+        "promotion_commit",
+        "promotion_canonical",
+    }
+    closure = receipt.get("promotion_transaction_closure")
+    if not isinstance(closure, dict) or set(closure) != required:
+        return ["verified recovery receipt lacks exact promotion closure"]
+    closure_root = receipt_path.with_name(
+        receipt_path.name + ".closure"
+    ).resolve()
+    snapshot_paths: set[Path] = set()
+    source_paths: dict[str, Path] = {}
+    digests: dict[str, str] = {}
+    for name in required:
+        record = closure.get(name)
+        if not isinstance(record, dict) or set(record) != {
+            "source_path",
+            "snapshot_path",
+            "sha256",
+        }:
+            issues.append(
+                f"verified recovery closure record is invalid for {name}"
+            )
+            continue
+        source_raw = record.get("source_path")
+        snapshot_raw = record.get("snapshot_path")
+        digest = record.get("sha256")
+        if (
+            not isinstance(source_raw, str)
+            or not Path(source_raw).is_absolute()
+            or str(Path(source_raw).resolve()) != source_raw
+            or not isinstance(snapshot_raw, str)
+            or not Path(snapshot_raw).is_absolute()
+            or str(Path(snapshot_raw).resolve()) != snapshot_raw
+            or not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            issues.append(
+                f"verified recovery closure reference is invalid for {name}"
+            )
+            continue
+        source_path = Path(source_raw)
+        snapshot_path = Path(snapshot_raw)
+        if (
+            snapshot_path.parent != closure_root
+            or snapshot_path.name != f"{name}.bin"
+            or snapshot_path in {receipt_path.resolve(), control_path.resolve()}
+            or snapshot_path == source_path
+        ):
+            issues.append(
+                f"verified recovery closure path is unsafe for {name}"
+            )
+            continue
+        if snapshot_path in snapshot_paths:
+            issues.append("verified recovery closure snapshot paths collide")
+            continue
+        snapshot_paths.add(snapshot_path)
+        source_paths[name] = source_path
+        digests[name] = digest
+        try:
+            actual = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+        except OSError:
+            issues.append(
+                f"verified recovery closure snapshot is unavailable for {name}"
+            )
+        else:
+            if actual != digest:
+                issues.append(
+                    f"verified recovery closure snapshot digest mismatch for {name}"
+                )
+    phase_paths = receipt.get("source_packet_paths")
+    phase_hashes = receipt.get("source_packet_sha256")
+    if isinstance(phase_paths, dict) and isinstance(phase_hashes, dict):
+        for name in ("incident", "reconciliation", "promotion", "focused"):
+            if (
+                source_paths.get(name) != Path(str(phase_paths.get(name)))
+                or digests.get(name) != phase_hashes.get(name)
+            ):
+                issues.append(
+                    f"verified recovery closure source binding mismatch for {name}"
+                )
+    manifest_path = receipt.get("recovery_manifest_path")
+    if (
+        source_paths.get("manifest") != Path(str(manifest_path))
+        or digests.get("manifest")
+        != receipt.get("recovery_manifest_sha256")
+    ):
+        issues.append("verified recovery closure manifest binding mismatch")
+    if snapshot_paths & set(source_paths.values()):
+        issues.append("verified recovery closure source and snapshot paths collide")
+    return issues
+
+
 def load_live_control_state(
     path: str | Path,
     *,
@@ -89,7 +199,9 @@ def load_live_control_state(
 
     recovery_fields = {"recovery_receipt_path", "recovery_receipt_sha256", "recovery_incident_id", "recovery_mode"}
     has_recovery_marker = any(key in state for key in recovery_fields) or (
-        isinstance(state.get("reason"), str) and state["reason"].startswith("verified recovery ")
+        state.get("frozen") is False
+        and isinstance(state.get("reason"), str)
+        and state["reason"].startswith("verified recovery ")
     )
     if has_recovery_marker and (set(key for key in recovery_fields if key in state) != recovery_fields or state.get("recovery_mode") != "verified_recovery" or state.get("frozen") is not False or not isinstance(state.get("recovery_incident_id"), str) or not state["recovery_incident_id"].strip()):
         issues.append("verified recovery control has incomplete or unsafe markers")
@@ -168,6 +280,13 @@ def load_live_control_state(
                                 issues.append("verified recovery manifest hash mismatch")
                         except OSError:
                             issues.append("verified recovery manifest is unavailable")
+                    issues.extend(
+                        _recovery_closure_issues(
+                            receipt,
+                            receipt_path=candidate,
+                            control_path=control_path,
+                        )
+                    )
                     receipt_expires_raw = receipt.get("expires_at")
                     receipt_issued_raw = receipt.get("issued_at")
                     receipt_expires_at = parse_control_time(str(receipt_expires_raw or ""))

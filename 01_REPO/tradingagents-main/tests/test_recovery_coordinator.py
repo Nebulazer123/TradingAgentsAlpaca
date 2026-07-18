@@ -9,12 +9,13 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import cli.main as cli_main
 from cli.main import app
 from tradingagents.orchestration import recovery as recovery_module
 from tradingagents.orchestration.incidents import Incident, IncidentStage, transition_incident
 from tradingagents.orchestration.recovery import (
-    RecoveryEvidence,
     evaluate_rearm_readiness,
+    load_recovery_evidence,
     rearm_after_verified_recovery,
     write_rearm_receipt,
 )
@@ -23,43 +24,15 @@ from tradingagents.policy.live_control import load_live_control_state, write_liv
 NOW = dt.datetime(2026, 7, 18, 12, 0, tzinfo=dt.timezone.utc)
 
 
+def _control_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _evidence(**overrides):
-    values = {
-        "incident_id": "inc-nflx-rule-conflict",
-        "repairer_run_id": "repair-1",
-        "verifier_run_id": "verify-1",
-        "repairer_role_id": "repairer",
-        "verifier_role_id": "verifier",
-        "root_cause_resolved": True,
-        "focused_tests_passed": True,
-        "promotion_evidence_fresh": True,
-        "promotion_issues": (),
-        "broker_reconciliation_matched": True,
-        "broker_reconciliation_issues": (),
-        "broker_write_calls": 0,
-        "external_blockers": (),
-    }
     source_dir = Path(tempfile.mkdtemp())
-    source_paths = {}
-    source_hashes = {}
-    for name in ("incident", "reconciliation", "promotion", "focused"):
-        path = source_dir / f"{name}.json"
-        path.write_text("{}", encoding="utf-8")
-        source_paths[name] = str(path.resolve())
-        source_hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    manifest_path = source_dir / "manifest.json"
-    manifest_path.write_text("{}", encoding="utf-8")
-    values.update(
-        {
-            "source_bindings": {"incident_id": "inc-nflx-rule-conflict", "symbol": "NFLX", "broker_account": "live", "environment": "test", "source_revision": "abc"},
-            "source_packet_paths": source_paths,
-            "source_packet_sha256": source_hashes,
-            "recovery_manifest_path": str(manifest_path.resolve()),
-            "recovery_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
-        }
-    )
-    values.update(overrides)
-    return RecoveryEvidence(**values)
+    bundle = _write_cli_recovery_bundle(source_dir, now=NOW)
+    evidence = _loaded_bundle_evidence(bundle, now=NOW)
+    return replace(evidence, **overrides)
 
 
 def test_clean_independent_evidence_is_ready():
@@ -73,7 +46,7 @@ def test_clean_independent_evidence_is_ready():
     "overrides",
     [
         {"verifier_run_id": "repair-1"},
-        {"verifier_role_id": "repairer"},
+        {"verifier_role_id": "repair"},
         {"root_cause_resolved": False},
         {"focused_tests_passed": False},
         {"promotion_evidence_fresh": False},
@@ -104,6 +77,7 @@ def test_verified_recovery_writes_receipt_before_bounded_live_control(tmp_path):
         receipt_dir=receipt_dir,
         ttl_minutes=15,
         now=NOW,
+        expected_control_preimage_sha256=_control_sha256(control_path),
     )
 
     state, issues = load_live_control_state(control_path, now=NOW)
@@ -129,6 +103,7 @@ def test_rearm_rejects_non_strict_or_out_of_range_ttl(tmp_path, ttl):
             receipt_dir=tmp_path / "rearm",
             ttl_minutes=ttl,
             now=NOW,
+            expected_control_preimage_sha256=_control_sha256(control_path),
         )
 
     assert control_path.read_text(encoding="utf-8") == original
@@ -149,6 +124,7 @@ def test_rearm_requires_existing_valid_frozen_control(tmp_path):
             control_path=control_path,
             receipt_dir=tmp_path / "rearm",
             now=NOW,
+            expected_control_preimage_sha256=_control_sha256(control_path),
         )
 
 
@@ -165,6 +141,7 @@ def test_tampered_recovery_receipt_closes_live_control(tmp_path):
         control_path=control_path,
         receipt_dir=tmp_path / "rearm",
         now=NOW,
+        expected_control_preimage_sha256=_control_sha256(control_path),
     )
     receipt_path = Path(result["receipt_path"])
     receipt_path.write_text('{"tampered": true}', encoding="utf-8")
@@ -172,6 +149,41 @@ def test_tampered_recovery_receipt_closes_live_control(tmp_path):
     _state, issues = load_live_control_state(control_path, now=NOW)
 
     assert any("receipt" in issue for issue in issues)
+
+
+@pytest.mark.parametrize("tamper_mode", ["change", "delete"])
+def test_missing_or_changed_promotion_closure_snapshot_closes_control(
+    tmp_path,
+    tamper_mode,
+):
+    control_path = tmp_path / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=NOW + dt.timedelta(days=1),
+    )
+    result = rearm_after_verified_recovery(
+        evidence=_evidence(),
+        control_path=control_path,
+        receipt_dir=tmp_path / "rearm",
+        now=NOW,
+        expected_control_preimage_sha256=_control_sha256(control_path),
+    )
+    receipt = json.loads(Path(result["receipt_path"]).read_text())
+    snapshot = Path(
+        receipt["promotion_transaction_closure"]["promotion_report"][
+            "snapshot_path"
+        ]
+    )
+    if tamper_mode == "change":
+        snapshot.write_bytes(snapshot.read_bytes() + b"changed")
+    else:
+        snapshot.unlink()
+
+    _state, issues = load_live_control_state(control_path, now=NOW)
+
+    assert any("closure" in issue for issue in issues)
 
 
 def test_recovery_cli_returns_fail_closed_json_for_malformed_packet(tmp_path):
@@ -454,6 +466,23 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
     }
 
 
+def _loaded_bundle_evidence(bundle, *, now):
+    paths = bundle["paths"]
+    evidence, issues = load_recovery_evidence(
+        incident_path=paths["incident"],
+        reconciliation_path=paths["reconciliation"],
+        promotion_sync_path=paths["promotion"],
+        focused_proof_path=paths["focused"],
+        recovery_manifest_path=bundle["manifest_path"],
+        repairer_run_id="repair-1",
+        verifier_run_id="verify-1",
+        now=now,
+    )
+    assert issues == ()
+    assert evidence is not None
+    return evidence
+
+
 def _invoke_cli_recovery(bundle, tmp_path):
     paths = bundle["paths"]
     return CliRunner().invoke(
@@ -482,6 +511,196 @@ def _invoke_cli_recovery(bundle, tmp_path):
             "--json-output",
         ],
     )
+
+
+@pytest.mark.parametrize(
+    "promotion_payload",
+    [
+        "{}",
+        "{not-json",
+        json.dumps(
+            {
+                "promotion_evidence_fresh": True,
+                "issues": [],
+                "generated_at": NOW.isoformat(),
+            }
+        ),
+    ],
+    ids=["empty-object", "unparseable", "missing-state-reference"],
+)
+def test_direct_rearm_requires_full_promotion_transaction_revalidation(
+    tmp_path,
+    promotion_payload,
+):
+    evidence = _evidence()
+    promotion_path = Path(evidence.source_packet_paths["promotion"])
+    promotion_path.write_text(promotion_payload, encoding="utf-8")
+    source_hashes = dict(evidence.source_packet_sha256)
+    source_hashes["promotion"] = hashlib.sha256(
+        promotion_path.read_bytes()
+    ).hexdigest()
+    evidence = replace(evidence, source_packet_sha256=source_hashes)
+    control_path = tmp_path / "control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=NOW + dt.timedelta(days=1),
+        now=NOW,
+    )
+    original = control_path.read_bytes()
+
+    with pytest.raises(ValueError, match="promotion"):
+        rearm_after_verified_recovery(
+            evidence=evidence,
+            control_path=control_path,
+            receipt_dir=tmp_path / "rearm",
+            now=NOW,
+            expected_control_preimage_sha256=hashlib.sha256(
+                original
+            ).hexdigest(),
+        )
+
+    assert control_path.read_bytes() == original
+    assert not list((tmp_path / "rearm").glob("verified-rearm-*.json"))
+    assert not (tmp_path / "rearm" / "latest.json").exists()
+
+
+def test_direct_rearm_requires_explicit_frozen_control_preimage(tmp_path):
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    bundle = _write_cli_recovery_bundle(tmp_path, now=now)
+    evidence = _loaded_bundle_evidence(bundle, now=now)
+    original = bundle["control_path"].read_bytes()
+
+    with pytest.raises(ValueError, match="preimage"):
+        rearm_after_verified_recovery(
+            evidence=evidence,
+            control_path=bundle["control_path"],
+            receipt_dir=tmp_path / "rearm",
+            now=now,
+            expected_control_preimage_sha256=None,
+        )
+
+    assert bundle["control_path"].read_bytes() == original
+    assert not (tmp_path / "rearm" / "latest.json").exists()
+
+
+def test_recovery_cli_binds_control_preimage_before_evidence_parse(
+    tmp_path,
+    monkeypatch,
+):
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    bundle = _write_cli_recovery_bundle(tmp_path, now=now)
+    control_path = bundle["control_path"]
+    original_loader = cli_main.load_recovery_evidence
+
+    def load_then_install_newer_freeze(*args, **kwargs):
+        loaded = original_loader(*args, **kwargs)
+        write_live_control_state(
+            control_path,
+            frozen=True,
+            reason="newer independent safety freeze",
+            dead_man_expires_at=now + dt.timedelta(days=1),
+            now=now,
+        )
+        return loaded
+
+    monkeypatch.setattr(
+        cli_main,
+        "load_recovery_evidence",
+        load_then_install_newer_freeze,
+    )
+
+    result = _invoke_cli_recovery(bundle, tmp_path)
+
+    assert result.exit_code == 1, result.output
+    control, _issues = load_live_control_state(control_path, now=now)
+    assert control["frozen"] is True
+    assert control["reason"] == "newer independent safety freeze"
+    assert "recovery_receipt_path" not in control
+    assert not (tmp_path / "rearm" / "latest.json").exists()
+
+
+@pytest.mark.parametrize("nested_input", ["report", "envelope"])
+def test_rearm_snapshots_full_nested_promotion_closure_before_opening_control(
+    tmp_path,
+    monkeypatch,
+    nested_input,
+):
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    bundle = _write_cli_recovery_bundle(tmp_path, now=now)
+    evidence = _loaded_bundle_evidence(bundle, now=now)
+    promotion = json.loads(
+        bundle["paths"]["promotion"].read_text(encoding="utf-8")
+    )
+    recovery_commit = promotion["recovery_commit"]
+    nested_path = Path(recovery_commit[f"{nested_input}_path"])
+    original_loader = recovery_module.load_recovery_evidence
+
+    def load_then_mutate_nested_input(*args, **kwargs):
+        loaded = original_loader(*args, **kwargs)
+        nested_path.write_bytes(nested_path.read_bytes() + b"\nchanged")
+        return loaded
+
+    monkeypatch.setattr(
+        recovery_module,
+        "load_recovery_evidence",
+        load_then_mutate_nested_input,
+    )
+    original_control = bundle["control_path"].read_bytes()
+
+    with pytest.raises(ValueError, match="promotion|closure|input"):
+        rearm_after_verified_recovery(
+            evidence=evidence,
+            control_path=bundle["control_path"],
+            receipt_dir=tmp_path / "rearm",
+            now=now,
+            expected_control_preimage_sha256=hashlib.sha256(
+                original_control
+            ).hexdigest(),
+        )
+
+    assert bundle["control_path"].read_bytes() == original_control
+    assert not (tmp_path / "rearm" / "latest.json").exists()
+
+
+def test_post_replace_control_fsync_error_adopts_exact_open_control(
+    tmp_path,
+    monkeypatch,
+):
+    now = dt.datetime.now(tz=dt.timezone.utc)
+    bundle = _write_cli_recovery_bundle(tmp_path, now=now)
+    evidence = _loaded_bundle_evidence(bundle, now=now)
+    original_writer = recovery_module._write_live_control_state_locked
+
+    def write_then_raise(*args, **kwargs):
+        original_writer(*args, **kwargs)
+        raise OSError("injected parent-directory fsync failure")
+
+    monkeypatch.setattr(
+        recovery_module,
+        "_write_live_control_state_locked",
+        write_then_raise,
+    )
+
+    result = rearm_after_verified_recovery(
+        evidence=evidence,
+        control_path=bundle["control_path"],
+        receipt_dir=tmp_path / "rearm",
+        now=now,
+        expected_control_preimage_sha256=_control_sha256(
+            bundle["control_path"]
+        ),
+    )
+
+    control, issues = load_live_control_state(
+        bundle["control_path"],
+        now=now,
+    )
+    assert issues == []
+    assert control["frozen"] is False
+    assert control["recovery_receipt_path"] == result["receipt_path"]
+    assert (tmp_path / "rearm" / "latest.json").exists()
 
 
 def test_recovery_cli_rearms_from_hash_bound_manifest_packets(tmp_path):
@@ -619,7 +838,13 @@ def test_receipt_latest_failure_keeps_frozen_control_byte_identical(monkeypatch,
     monkeypatch.setattr("tradingagents.orchestration.recovery.atomic_write_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("latest failed")))
 
     with pytest.raises(OSError, match="latest failed"):
-        rearm_after_verified_recovery(evidence=_evidence(), control_path=control_path, receipt_dir=tmp_path / "rearm", now=NOW)
+        rearm_after_verified_recovery(
+            evidence=_evidence(),
+            control_path=control_path,
+            receipt_dir=tmp_path / "rearm",
+            now=NOW,
+            expected_control_preimage_sha256=_control_sha256(control_path),
+        )
 
     assert control_path.read_text(encoding="utf-8") == original
 
@@ -654,7 +879,13 @@ def test_direct_evidence_cannot_bypass_source_packet_proof(tmp_path):
 
     evidence = _evidence(source_bindings={}, source_packet_paths={}, source_packet_sha256={})
     with pytest.raises(ValueError, match="source"):
-        rearm_after_verified_recovery(evidence=evidence, control_path=control_path, receipt_dir=tmp_path / "rearm", now=NOW)
+        rearm_after_verified_recovery(
+            evidence=evidence,
+            control_path=control_path,
+            receipt_dir=tmp_path / "rearm",
+            now=NOW,
+            expected_control_preimage_sha256=_control_sha256(control_path),
+        )
 
 
 def test_relative_receipt_and_boolean_write_count_close_control(tmp_path):
@@ -672,7 +903,13 @@ def test_expired_frozen_control_can_recover_with_current_evidence(tmp_path):
     control_path = tmp_path / "control.json"
     write_live_control_state(control_path, frozen=True, reason="safe expired freeze", dead_man_expires_at=NOW - dt.timedelta(days=1))
 
-    result = rearm_after_verified_recovery(evidence=_evidence(), control_path=control_path, receipt_dir=tmp_path / "rearm", now=NOW)
+    result = rearm_after_verified_recovery(
+        evidence=_evidence(),
+        control_path=control_path,
+        receipt_dir=tmp_path / "rearm",
+        now=NOW,
+        expected_control_preimage_sha256=_control_sha256(control_path),
+    )
 
     assert result["can_submit_orders"] is False
 
@@ -748,7 +985,13 @@ def test_rearm_rejects_control_receipt_latest_collision_without_mutating_frozen_
     original = '{"frozen": true, "reason": "incident", "dead_man_expires_at": "2026-07-19T12:00:00+00:00"}'
     control_path.write_text(original)
     with pytest.raises(ValueError, match="collides"):
-        rearm_after_verified_recovery(evidence=_evidence(), control_path=control_path, receipt_dir=control_path.parent, now=NOW)
+        rearm_after_verified_recovery(
+            evidence=_evidence(),
+            control_path=control_path,
+            receipt_dir=control_path.parent,
+            now=NOW,
+            expected_control_preimage_sha256=_control_sha256(control_path),
+        )
     assert control_path.read_text() == original
 
 

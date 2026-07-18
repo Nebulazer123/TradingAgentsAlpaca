@@ -25,6 +25,7 @@ from typing import Any
 from tradingagents.orchestration.incidents import is_safe_incident_id
 from tradingagents.orchestration.recovery import (
     load_recovery_evidence,
+    publish_rearm_receipt,
     rearm_after_verified_recovery,
 )
 from tradingagents.policy.decision_authority import resolve_exit_authority
@@ -794,67 +795,92 @@ def _recovery_lock(
     path.parent.mkdir(parents=True, exist_ok=True)
     token = secrets.token_hex(16)
     metadata = {"schema_version": "tradingagents.recovery_lock.v1", "incident_id": incident_id, "owner_run_id": owner_run_id, "lease_expires_at": lease_expires_at, "token": token}
-    took_over = False
-    for _ in range(3):
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
         try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            return None, "owner_busy", None
+
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        existing_raw = os.read(descriptor, 1_048_577)
+        if len(existing_raw) > 1_048_576:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+            return None, "corrupt_lock", None
+
+        took_over = False
+        if existing_raw:
             try:
-                probe = os.open(path, os.O_RDONLY)
-                try:
-                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    os.close(probe)
-                    return None, "owner_busy", None
-                fcntl.flock(probe, fcntl.LOCK_UN)
-                os.close(probe)
-            except OSError:
-                return None, "owner_busy", None
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                existing = json.loads(existing_raw)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
                 return None, "corrupt_lock", None
-            if not isinstance(existing, dict) or existing.get("schema_version") != "tradingagents.recovery_lock.v1" or existing.get("incident_id") != incident_id or not is_safe_incident_id(existing.get("owner_run_id")) or not isinstance(existing.get("token"), str):
+            if (
+                not isinstance(existing, dict)
+                or existing.get("schema_version")
+                != "tradingagents.recovery_lock.v1"
+                or existing.get("incident_id") != incident_id
+                or not is_safe_incident_id(existing.get("owner_run_id"))
+                or not isinstance(existing.get("token"), str)
+                or not existing["token"]
+            ):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
                 return None, "corrupt_lock", None
             expiry = _parse_datetime(existing.get("lease_expires_at"))
             if expiry is None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
                 return None, "corrupt_lock", None
             if expiry > now:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
                 return None, "owner_busy", None
-            # A rename quarantines a stale lock atomically; exactly one
-            # contender can win and retry O_EXCL.
-            try:
-                os.replace(path, path.with_name(f".owner.stale-{hashlib.sha256(path.read_bytes()).hexdigest()[:12]}"))
-                took_over = True
-            except FileNotFoundError:
-                pass
-            continue
+            stale_path = path.with_name(
+                ".owner.stale-"
+                + hashlib.sha256(existing_raw).hexdigest()[:12]
+            )
+            _write_immutable_recovery_bytes(stale_path, existing_raw)
+            took_over = True
+
         encoded = _recovery_json(metadata)
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if os.write(descriptor, encoded) != len(encoded):
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.ftruncate(descriptor, 0)
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(descriptor, encoded[offset:])
+            if written <= 0:
                 raise OSError("incomplete recovery lock write")
-            os.fsync(descriptor)
-        except Exception:
-            os.close(descriptor)
-            with suppress(FileNotFoundError):
-                path.unlink()
-            raise
+            offset += written
+        os.fsync(descriptor)
         return descriptor, "stale_takeover" if took_over else "acquired", token
-    return None, "owner_busy", None
+    except Exception:
+        with suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with suppress(OSError):
+            os.close(descriptor)
+        raise
 
 
 def _release_recovery_lock(path: Path, descriptor: int, token: str | None) -> None:
-    with suppress(OSError):
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-    os.close(descriptor)
     try:
-        current = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if isinstance(current, dict) and current.get("token") == token:
-        with suppress(FileNotFoundError):
-            path.unlink()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = os.read(descriptor, 1_048_577)
+        try:
+            current = json.loads(raw) if raw else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            current = None
+        if isinstance(current, dict) and current.get("token") == token:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.ftruncate(descriptor, 0)
+            os.fsync(descriptor)
+    finally:
+        with suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _recovery_failure(kind: str, detail: str, *, external: bool = False) -> dict[str, Any]:
@@ -1030,6 +1056,44 @@ def _freeze_recovery_control(control_path: str | Path, *, reason: str) -> None:
         frozen=True,
         reason=f"verified recovery frozen: {_redact_recovery_detail(reason)[:180]}",
     )
+
+
+def _preserve_frozen_or_close_recovery_control(
+    control_path: str | Path,
+    *,
+    reason: str,
+    now: dt.datetime,
+    state: Mapping[str, Any] | None = None,
+    idempotency_key: str | None = None,
+) -> str:
+    """Preserve a safety freeze or close every non-exact recovery control."""
+
+    control_absolute = Path(control_path).resolve()
+    with live_control_lock(control_absolute):
+        try:
+            current = json.loads(control_absolute.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            current = None
+        if isinstance(current, Mapping) and current.get("frozen") is True:
+            return "preserved_frozen"
+        if state is not None and _active_rearm_matches_intent(
+            state,
+            control_path=control_absolute,
+            now=now,
+            idempotency_key=idempotency_key,
+        ):
+            return "preserved_exact_active_rearm"
+        _write_live_control_state_locked(
+            control_absolute,
+            frozen=True,
+            reason=(
+                "verified recovery frozen: "
+                + _redact_recovery_detail(reason)[:180]
+            ),
+            dead_man_expires_at=now + dt.timedelta(hours=6),
+            now=now,
+        )
+        return "closed"
 
 
 def _establish_recovery_control_freeze(
@@ -3168,36 +3232,90 @@ def coordinate_verified_recovery(
     incident identity, and can only unfreeze through the injected Task 5 rearm
     function (which defaults to :func:`rearm_after_verified_recovery`).
     """
+    try:
+        current = _recovery_now(now)
+    except ValueError:
+        _preserve_frozen_or_close_recovery_control(
+            control_path,
+            reason="recovery time is invalid",
+            now=dt.datetime.now(tz=UTC),
+        )
+        raise
+
+    def fail_closed(
+        reason: str,
+        *,
+        persisted_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        _preserve_frozen_or_close_recovery_control(
+            control_path,
+            reason=reason,
+            now=current,
+            state=persisted_state,
+            idempotency_key=idempotency_key,
+        )
+
     required_bindings = {"incident_id", "symbol", "broker_account", "environment", "source_revision"}
-    canonical_bindings = dict(bindings)
-    canonical_bindings["incident_id"] = incident_id
-    if set(canonical_bindings) != required_bindings or not all(isinstance(value, str) and value.strip() for value in canonical_bindings.values()):
+    try:
+        canonical_bindings = dict(bindings)
+        canonical_bindings["incident_id"] = incident_id
+        bindings_valid = set(canonical_bindings) == required_bindings and all(
+            isinstance(value, str) and value.strip()
+            for value in canonical_bindings.values()
+        )
+    except Exception:
+        fail_closed("canonical recovery bindings are unreadable")
+        raise ValueError("canonical recovery bindings are required") from None
+    if not bindings_valid:
+        fail_closed("canonical recovery bindings are invalid")
         raise ValueError("canonical recovery bindings are required")
     if not isinstance(owner_run_id, str) or not owner_run_id.strip() or not isinstance(recovery_run_id, str) or not recovery_run_id.strip():
+        fail_closed("recovery or owner run identifier is blank")
         raise ValueError("recovery and owner run IDs are required")
     if not all(
         is_safe_incident_id(value)
         for value in (incident_id, owner_run_id, recovery_run_id, owner_role)
     ):
+        fail_closed("unsafe recovery identifier")
         return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe recovery identifier")}
     if idempotency_key is not None and (not isinstance(idempotency_key, str) or not is_safe_incident_id(idempotency_key)):
+        fail_closed("unsafe idempotency key")
         return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe idempotency key")}
-    current = _recovery_now(now)
     root = Path(recovery_root).resolve()
     incident_root = root / incident_id
     run_root = incident_root / recovery_run_id
     state_path = incident_root / "state.json"
     lock_path = incident_root / ".owner.lock"
     if not all(_path_under(path, root) for path in (incident_root, run_root, state_path, lock_path)):
+        fail_closed("recovery path escapes root")
         return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "recovery path escapes root")}
-    descriptor, lock_status, lock_token = _recovery_lock(
-        lock_path,
-        incident_id=incident_id,
-        owner_run_id=owner_run_id,
-        lease_expires_at=(current + dt.timedelta(minutes=RECOVERY_LEASE_MINUTES)).isoformat(),
-        now=current,
-    )
+    try:
+        descriptor, lock_status, lock_token = _recovery_lock(
+            lock_path,
+            incident_id=incident_id,
+            owner_run_id=owner_run_id,
+            lease_expires_at=(
+                current + dt.timedelta(minutes=RECOVERY_LEASE_MINUTES)
+            ).isoformat(),
+            now=current,
+        )
+    except Exception:
+        fail_closed("recovery lock acquisition failed")
+        raise
     if descriptor is None:
+        busy_state: Mapping[str, Any] | None = None
+        if lock_status == "owner_busy":
+            candidate_state, candidate_error = _read_recovery_state(state_path)
+            if candidate_error is None:
+                busy_state = candidate_state
+        fail_closed(
+            (
+                "recovery lock is malformed"
+                if lock_status == "corrupt_lock"
+                else "recovery owner is busy"
+            ),
+            persisted_state=busy_state,
+        )
         if lock_status == "corrupt_lock":
             return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "recovery lock is malformed")}
         return {"status": "owner_busy", "incident_id": incident_id, "phase": None}
@@ -3205,6 +3323,7 @@ def coordinate_verified_recovery(
         state, state_error = _read_recovery_state(state_path)
         if state_error == "legacy_v1":
             assert isinstance(state, dict)
+            fail_closed("legacy v1 recovery requires a frozen migration")
             if (
                 state.get("incident_id") != incident_id
                 or state.get("bindings") != canonical_bindings
@@ -3235,6 +3354,7 @@ def coordinate_verified_recovery(
             _write_immutable_recovery_bytes(legacy_path, legacy_bytes)
             next_run = f"{recovery_run_id}-v2-follow-1"
             if not is_safe_incident_id(next_run):
+                fail_closed("unsafe v2 recovery follow-on identifier")
                 return {
                     "status": "corrupt_state",
                     "incident_id": incident_id,
@@ -3296,10 +3416,7 @@ def coordinate_verified_recovery(
                 },
             )
         elif state_error is not None:
-            _freeze_recovery_control(
-                control_path,
-                reason="persisted recovery state is malformed",
-            )
+            fail_closed("persisted recovery state is malformed")
             _append_recovery_event(incident_root, {"event": "corrupt_state", "incident_id": incident_id, "at": current.isoformat()})
             return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "persisted recovery state is malformed")}
         if state is None:
@@ -3335,9 +3452,11 @@ def coordinate_verified_recovery(
             state["incident_history"].append({"event": "lock_stale_takeover", "at": current.isoformat(), "owner_run_id": owner_run_id})
             _append_recovery_event(incident_root, {"event": "lock_stale_takeover", "incident_id": incident_id, "owner_run_id": owner_run_id, "at": current.isoformat()})
         if state.get("bindings") != canonical_bindings or (state.get("recovery_run_id") != recovery_run_id and state.get("parent_recovery_run_id") != recovery_run_id):
+            fail_closed("persisted recovery identity mismatch")
             return {"status": "identity_mismatch_frozen", "incident_id": incident_id, "phase": state.get("phase")}
         run_root = incident_root / str(state["recovery_run_id"])
         if not _path_under(run_root, root):
+            fail_closed("persisted recovery run path escapes root")
             return {
                 "status": "corrupt_state",
                 "incident_id": incident_id,
@@ -3351,11 +3470,16 @@ def coordinate_verified_recovery(
         if prior_failure.get("kind") == "transient_exhausted" and state.get("follow_on_required") is True:
             not_before = _parse_datetime(state.get("follow_on_not_before"))
             if not_before is not None and not_before > current:
+                fail_closed(
+                    "recovery follow-on is not ready",
+                    persisted_state=state,
+                )
                 return {"status": "frozen", "incident_id": incident_id, "phase": state.get("phase"), "failure": prior_failure}
             parent_run = str(state.get("parent_recovery_run_id") or recovery_run_id)
             follow_count = int(state.get("follow_on_count") or 0) + 1
             next_run = f"{parent_run}-follow-{follow_count}"
             if not is_safe_incident_id(next_run):
+                fail_closed("unsafe follow-on recovery run")
                 return {"status": "corrupt_state", "incident_id": incident_id, "phase": None, "failure": _recovery_failure("permanent_integrity", "unsafe follow-on recovery run")}
             state.update(
                 {
@@ -3389,11 +3513,19 @@ def coordinate_verified_recovery(
             _append_recovery_event(incident_root, {"event": "follow_on_opened", "incident_id": incident_id, "recovery_run_id": next_run, "at": current.isoformat()})
         completed_keys = set(state.get("idempotency_keys") or [])
         if idempotency_key and idempotency_key in completed_keys:
+            fail_closed(
+                "duplicate recovery delivery",
+                persisted_state=state,
+            )
             return {"status": "duplicate", "incident_id": incident_id, "phase": state.get("phase")}
         if (
             state.get("phase") == "monitoring"
             and set(state.get("phase_outputs", {})) == set(RECOVERY_PHASES)
         ):
+            fail_closed(
+                "completed recovery monitoring",
+                persisted_state=state,
+            )
             return {
                 "status": "monitoring",
                 "incident_id": incident_id,
@@ -3403,6 +3535,10 @@ def coordinate_verified_recovery(
         lease = _parse_datetime(state.get("lease_expires_at"))
         existing_owner = state.get("owner_run_id")
         if existing_owner != owner_run_id and lease is not None and lease > current:
+            fail_closed(
+                "different recovery owner remains active",
+                persisted_state=state,
+            )
             return {"status": "owner_active", "incident_id": incident_id, "phase": state.get("phase"), "owner_run_id": existing_owner}
         if existing_owner != owner_run_id:
             state["owner_run_id"] = owner_run_id
@@ -3595,6 +3731,18 @@ def coordinate_verified_recovery(
                                     reason="active receipt does not match persisted intent",
                                 )
                                 raise ValueError("rearm intent does not match active receipt")
+                            publish_rearm_receipt(
+                                {
+                                    "receipt_path": control_state[
+                                        "recovery_receipt_path"
+                                    ],
+                                    "receipt_sha256": control_state[
+                                        "recovery_receipt_sha256"
+                                    ],
+                                },
+                                receipt_dir,
+                                now=current,
+                            )
                             packet = {"kind": "verified_rearm_result", "receipt_path": control_state["recovery_receipt_path"], "receipt_sha256": control_state["recovery_receipt_sha256"], "can_submit_orders": False, "recovered_after_crash": True}
                             packet = _canonical_packet(packet, canonical_bindings, current)
                             packet.update({"phase": phase, "recovery_run_id": state["recovery_run_id"], "owner_run_id": state["owner_run_id"], "owner_role": state["owner_role"], "schema_version": "tradingagents.recovery_phase.v1"})

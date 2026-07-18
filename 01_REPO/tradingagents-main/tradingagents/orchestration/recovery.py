@@ -8,7 +8,7 @@ import json
 import os
 import secrets
 from collections.abc import Mapping
-from contextlib import nullcontext, suppress
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -257,16 +257,171 @@ def publish_rearm_receipt(
     )
 
 
+def _promotion_closure_references(
+    evidence: RecoveryEvidence,
+    promotion: Mapping[str, Any],
+) -> dict[str, tuple[Path, str]]:
+    recovery_commit = promotion.get("recovery_commit")
+    prepare_ref = promotion.get("promotion_prepare")
+    commit_ref = promotion.get("promotion_commit")
+    references: dict[str, tuple[object, object]] = {
+        name: (
+            evidence.source_packet_paths.get(name),
+            evidence.source_packet_sha256.get(name),
+        )
+        for name in ("incident", "reconciliation", "promotion", "focused")
+    }
+    references["manifest"] = (
+        evidence.recovery_manifest_path,
+        evidence.recovery_manifest_sha256,
+    )
+    if isinstance(recovery_commit, Mapping):
+        references["promotion_report"] = (
+            recovery_commit.get("report_path"),
+            recovery_commit.get("report_sha256"),
+        )
+        references["promotion_envelope"] = (
+            recovery_commit.get("envelope_path"),
+            recovery_commit.get("envelope_sha256"),
+        )
+    if isinstance(prepare_ref, Mapping):
+        references["promotion_prepare"] = (
+            prepare_ref.get("path"),
+            prepare_ref.get("sha256"),
+        )
+    references["promotion_stage"] = (
+        promotion.get("staged_state_path"),
+        promotion.get("staged_state_sha256"),
+    )
+    if isinstance(commit_ref, Mapping):
+        references["promotion_commit"] = (
+            commit_ref.get("path"),
+            commit_ref.get("sha256"),
+        )
+    references["promotion_canonical"] = (
+        promotion.get("state_path"),
+        promotion.get("canonical_after_sha256"),
+    )
+    required = {
+        "incident",
+        "reconciliation",
+        "promotion",
+        "focused",
+        "manifest",
+        "promotion_report",
+        "promotion_envelope",
+        "promotion_prepare",
+        "promotion_stage",
+        "promotion_commit",
+        "promotion_canonical",
+    }
+    if set(references) != required:
+        raise ValueError(
+            "rearm blocked: promotion transaction closure is incomplete"
+        )
+    closure: dict[str, tuple[Path, str]] = {}
+    for name, (raw_path, raw_digest) in references.items():
+        path = _canonical_reference(raw_path)
+        digest = _sha256_reference(raw_digest)
+        if path is None or digest is None:
+            raise ValueError(
+                "rearm blocked: promotion transaction closure reference is "
+                f"invalid for {name}"
+            )
+        closure[name] = (path, digest)
+    return closure
+
+
+def _snapshot_promotion_closure(
+    references: Mapping[str, tuple[Path, str]],
+    *,
+    receipt_path: Path,
+) -> dict[str, dict[str, str]]:
+    closure_dir = receipt_path.with_name(receipt_path.name + ".closure")
+    closure_dir.mkdir(parents=True, exist_ok=False)
+    snapshot: dict[str, dict[str, str]] = {}
+    for name, (source_path, expected_digest) in references.items():
+        try:
+            raw = source_path.read_bytes()
+        except OSError:
+            raise ValueError(
+                f"rearm blocked: promotion transaction closure is unavailable for {name}"
+            ) from None
+        if hashlib.sha256(raw).hexdigest() != expected_digest:
+            raise ValueError(
+                f"rearm blocked: promotion transaction closure changed for {name}"
+            )
+        target = closure_dir / f"{name}.bin"
+        descriptor = os.open(
+            target,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            offset = 0
+            while offset < len(raw):
+                written = os.write(descriptor, raw[offset:])
+                if written <= 0:
+                    raise OSError(
+                        "incomplete promotion closure snapshot write"
+                    )
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        snapshot[name] = {
+            "source_path": str(source_path),
+            "snapshot_path": str(target.resolve()),
+            "sha256": expected_digest,
+        }
+    parent_descriptor = os.open(closure_dir, os.O_RDONLY)
+    try:
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+    return snapshot
+
+
+def _control_accepts_exact_receipt(
+    control_path: Path,
+    *,
+    receipt_ref: Mapping[str, str],
+    evidence: RecoveryEvidence,
+    reason: str,
+    expires_at: dt.datetime,
+    now: dt.datetime,
+) -> bool:
+    state, issues = load_live_control_state(control_path, now=now)
+    return (
+        state is not None
+        and not issues
+        and state.get("frozen") is False
+        and state.get("reason") == reason
+        and parse_control_time(str(state.get("dead_man_expires_at", "")))
+        == expires_at.astimezone(UTC).replace(microsecond=0)
+        and state.get("recovery_receipt_path")
+        == receipt_ref.get("receipt_path")
+        and state.get("recovery_receipt_sha256")
+        == receipt_ref.get("receipt_sha256")
+        and state.get("recovery_incident_id") == evidence.incident_id.strip()
+        and state.get("recovery_mode") == "verified_recovery"
+    )
+
+
 def rearm_after_verified_recovery(
     *,
     evidence: RecoveryEvidence,
     control_path: str | Path,
     receipt_dir: str | Path,
+    expected_control_preimage_sha256: str,
     ttl_minutes: int = MAX_REARM_TTL_MINUTES,
     now: dt.datetime | None = None,
-    expected_control_preimage_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Re-arm only a currently frozen control after durable independent evidence."""
+    if _sha256_reference(expected_control_preimage_sha256) is None:
+        raise ValueError(
+            "rearm blocked: expected frozen control preimage is required"
+        )
     verdict = evaluate_rearm_readiness(evidence)
     if not verdict.ready:
         raise ValueError("rearm blocked: " + "; ".join(verdict.issues))
@@ -290,45 +445,46 @@ def rearm_after_verified_recovery(
             Path(str(promotion_packet_path)).read_text(encoding="utf-8")
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        promotion_packet = None
-    if isinstance(promotion_packet, Mapping) and "state_path" in promotion_packet:
-        candidate = _canonical_reference(promotion_packet.get("state_path"))
-        if candidate is None:
-            raise ValueError(
-                "rearm blocked: promotion canonical path is invalid"
-            )
-        promotion_canonical_path = candidate
-
-    promotion_guard = (
-        promotion_state_lock(promotion_canonical_path)
-        if promotion_canonical_path is not None
-        else nullcontext()
+        raise ValueError(
+            "rearm blocked: promotion packet is unreadable"
+        ) from None
+    if not isinstance(promotion_packet, Mapping):
+        raise ValueError(
+            "rearm blocked: promotion packet must be an object"
+        )
+    promotion_canonical_path = _canonical_reference(
+        promotion_packet.get("state_path")
     )
-    with promotion_guard:
-        if promotion_canonical_path is not None:
-            refreshed, refresh_issues = load_recovery_evidence(
-                incident_path=evidence.source_packet_paths["incident"],
-                reconciliation_path=evidence.source_packet_paths[
-                    "reconciliation"
-                ],
-                promotion_sync_path=evidence.source_packet_paths["promotion"],
-                focused_proof_path=evidence.source_packet_paths["focused"],
-                recovery_manifest_path=evidence.recovery_manifest_path,
-                repairer_run_id=evidence.repairer_run_id,
-                verifier_run_id=evidence.verifier_run_id,
-                now=current,
+    if promotion_canonical_path is None:
+        raise ValueError(
+            "rearm blocked: promotion canonical transaction reference is "
+            "required"
+        )
+    closure_references = _promotion_closure_references(
+        evidence,
+        promotion_packet,
+    )
+
+    with promotion_state_lock(promotion_canonical_path):
+        refreshed, refresh_issues = load_recovery_evidence(
+            incident_path=evidence.source_packet_paths["incident"],
+            reconciliation_path=evidence.source_packet_paths[
+                "reconciliation"
+            ],
+            promotion_sync_path=evidence.source_packet_paths["promotion"],
+            focused_proof_path=evidence.source_packet_paths["focused"],
+            recovery_manifest_path=evidence.recovery_manifest_path,
+            repairer_run_id=evidence.repairer_run_id,
+            verifier_run_id=evidence.verifier_run_id,
+            now=current,
+        )
+        if refreshed is None or refresh_issues or refreshed != evidence:
+            detail = (
+                "; ".join(refresh_issues)
+                if refresh_issues
+                else "recovery evidence changed before re-arm"
             )
-            if (
-                refreshed is None
-                or refresh_issues
-                or refreshed != evidence
-            ):
-                detail = (
-                    "; ".join(refresh_issues)
-                    if refresh_issues
-                    else "recovery evidence changed before re-arm"
-                )
-                raise ValueError("rearm blocked: " + detail)
+            raise ValueError("rearm blocked: " + detail)
 
         for key, expected in evidence.source_packet_sha256.items():
             try:
@@ -367,19 +523,21 @@ def rearm_after_verified_recovery(
             accepted_preimage_sha256 = hashlib.sha256(
                 control_preimage
             ).hexdigest()
-            if (
-                expected_control_preimage_sha256 is not None
-                and accepted_preimage_sha256
-                != expected_control_preimage_sha256
-            ):
+            if accepted_preimage_sha256 != expected_control_preimage_sha256:
                 raise ValueError(
                     "rearm blocked: live control no longer matches the "
                     "recovery-owned freeze"
                 )
-            state, _control_issues = load_live_control_state(
+            state, control_issues = load_live_control_state(
                 control_absolute_path,
                 now=current,
             )
+            unsafe_control_issues = [
+                issue
+                for issue in control_issues
+                if not issue.startswith("live control state is frozen:")
+                and not issue.startswith("dead-man expired at ")
+            ]
             if (
                 state is None
                 or _normalized_string(state.get("reason")) is None
@@ -387,6 +545,7 @@ def rearm_after_verified_recovery(
                     str(state.get("dead_man_expires_at", ""))
                 )
                 is None
+                or unsafe_control_issues
             ):
                 raise ValueError(
                     "rearm blocked: existing live control is not valid"
@@ -408,6 +567,10 @@ def rearm_after_verified_recovery(
                 raise ValueError(
                     "rearm blocked: control path collides with receipt path"
                 )
+            closure_snapshot = _snapshot_promotion_closure(
+                closure_references,
+                receipt_path=Path(prepared_receipt_path),
+            )
             reason = f"verified recovery {evidence.incident_id.strip()}"
             receipt = {
                 "schema_version": 1,
@@ -431,6 +594,7 @@ def rearm_after_verified_recovery(
                 "source_packet_paths": dict(evidence.source_packet_paths),
                 "recovery_manifest_path": evidence.recovery_manifest_path,
                 "recovery_manifest_sha256": evidence.recovery_manifest_sha256,
+                "promotion_transaction_closure": closure_snapshot,
                 "control_binding": {
                     "control_path": control_absolute,
                     "incident_id": evidence.incident_id.strip(),
@@ -470,16 +634,95 @@ def rearm_after_verified_recovery(
                     expected_preimage_sha256=accepted_preimage_sha256,
                     now=current,
                 )
-            except Exception:
-                if prior_latest is None:
-                    with suppress(FileNotFoundError):
-                        latest_path.unlink()
+            except Exception as write_error:
+                if _control_accepts_exact_receipt(
+                    control_absolute_path,
+                    receipt_ref=receipt_ref,
+                    evidence=evidence,
+                    reason=reason,
+                    expires_at=expires_at,
+                    now=current,
+                ):
+                    try:
+                        publish_rearm_receipt(
+                            receipt_ref,
+                            receipt_dir,
+                            now=current,
+                        )
+                    except Exception:
+                        try:
+                            _write_live_control_state_locked(
+                                control_absolute_path,
+                                frozen=True,
+                                reason=(
+                                    "verified recovery frozen: receipt pointer "
+                                    "repair failed"
+                                ),
+                                dead_man_expires_at=current
+                                + dt.timedelta(hours=6),
+                                now=current,
+                            )
+                        except Exception:
+                            closed, _closed_issues = load_live_control_state(
+                                control_absolute_path,
+                                now=current,
+                            )
+                            if (
+                                not isinstance(closed, Mapping)
+                                or closed.get("frozen") is not True
+                            ):
+                                raise RuntimeError(
+                                    "rearm opened control but could not repair "
+                                    "the receipt pointer or restore a freeze"
+                                ) from write_error
+                        raise
+                    else:
+                        written = control_absolute_path
                 else:
-                    atomic_write_text(
-                        latest_path,
-                        prior_latest.decode("utf-8"),
+                    control_state, _control_issues = (
+                        load_live_control_state(
+                            control_absolute_path,
+                            now=current,
+                        )
                     )
-                raise
+                    if (
+                        not isinstance(control_state, Mapping)
+                        or control_state.get("frozen") is not True
+                    ):
+                        try:
+                            _write_live_control_state_locked(
+                                control_absolute_path,
+                                frozen=True,
+                                reason=(
+                                    "verified recovery frozen: live-control "
+                                    "transition failed"
+                                ),
+                                dead_man_expires_at=current
+                                + dt.timedelta(hours=6),
+                                now=current,
+                            )
+                        except Exception:
+                            closed, _closed_issues = load_live_control_state(
+                                control_absolute_path,
+                                now=current,
+                            )
+                            if (
+                                not isinstance(closed, Mapping)
+                                or closed.get("frozen") is not True
+                            ):
+                                raise RuntimeError(
+                                    "rearm blocked and live control could not "
+                                    "be frozen"
+                                ) from write_error
+                    if prior_latest is None:
+                        with suppress(FileNotFoundError):
+                            latest_path.unlink()
+                    else:
+                        atomic_write_text(
+                            latest_path,
+                            prior_latest.decode("utf-8"),
+                        )
+                    raise
             return {
                 **receipt_ref,
                 "control_path": str(written),

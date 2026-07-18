@@ -1,6 +1,8 @@
 import datetime as dt
 import hashlib
 import json
+import threading
+import time
 from dataclasses import asdict
 from decimal import Decimal
 from pathlib import Path
@@ -9,6 +11,7 @@ import pytest
 
 from tradingagents.brokers import alpaca_reconciliation
 from tradingagents.orchestration import recovery as recovery_module
+from tradingagents.orchestration import self_heal as self_heal_module
 from tradingagents.orchestration.recovery import rearm_after_verified_recovery
 from tradingagents.orchestration.self_heal import (
     RECOVERY_FOCUSED_TESTS,
@@ -2072,6 +2075,224 @@ def test_production_request_preserves_msft_and_rejects_preassembled_packets(tmp_
     assert request["adapters"]["resolve_authority"]({"phase": "resolve_authority"})["outcome"] == "failed"
 
 
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "bad_bindings",
+        "blank_owner",
+        "unsafe_owner",
+        "unsafe_idempotency",
+        "path_escape",
+        "corrupt_lock",
+        "owner_busy",
+        "legacy_identity_mismatch",
+    ],
+)
+def test_every_ambiguous_recovery_entry_exit_freezes_open_control(
+    tmp_path,
+    scenario,
+):
+    control_path = tmp_path / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="unsafe open control before ambiguous recovery",
+        dead_man_expires_at=NOW + dt.timedelta(hours=1),
+        now=NOW,
+    )
+    recovery_root = tmp_path / "recovery"
+    incident_root = recovery_root / BINDINGS["incident_id"]
+    bindings = dict(BINDINGS)
+    owner_run_id = "repair-nflx-1"
+    idempotency_key = None
+    expect_error = False
+
+    if scenario == "bad_bindings":
+        bindings.pop("source_revision")
+        expect_error = True
+    elif scenario == "blank_owner":
+        owner_run_id = ""
+        expect_error = True
+    elif scenario == "unsafe_owner":
+        owner_run_id = "../unsafe-owner"
+    elif scenario == "unsafe_idempotency":
+        idempotency_key = "../unsafe-delivery"
+    elif scenario == "path_escape":
+        recovery_root.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        incident_root.symlink_to(outside, target_is_directory=True)
+    elif scenario == "corrupt_lock":
+        incident_root.mkdir(parents=True)
+        (incident_root / ".owner.lock").write_text("{bad", encoding="utf-8")
+    elif scenario == "owner_busy":
+        incident_root.mkdir(parents=True)
+        (incident_root / ".owner.lock").write_text(
+            json.dumps(
+                {
+                    "schema_version": "tradingagents.recovery_lock.v1",
+                    "incident_id": BINDINGS["incident_id"],
+                    "owner_run_id": "other-owner",
+                    "lease_expires_at": (
+                        NOW + dt.timedelta(minutes=10)
+                    ).isoformat(),
+                    "token": "other-owner-token",
+                }
+            ),
+            encoding="utf-8",
+        )
+    elif scenario == "legacy_identity_mismatch":
+        incident_root.mkdir(parents=True)
+        (incident_root / "state.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "tradingagents.self_heal_recovery.v1",
+                    "incident_id": "different-incident",
+                    "bindings": bindings,
+                    "recovery_run_id": "recovery-nflx-1",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    arguments = {
+        "incident_id": BINDINGS["incident_id"],
+        "bindings": bindings,
+        "adapters": _adapters([]),
+        "owner_run_id": owner_run_id,
+        "recovery_run_id": "recovery-nflx-1",
+        "control_path": control_path,
+        "receipt_dir": tmp_path / "receipts",
+        "recovery_root": recovery_root,
+        "idempotency_key": idempotency_key,
+        "now": NOW,
+    }
+    if expect_error:
+        with pytest.raises(ValueError):
+            coordinate_verified_recovery(**arguments)
+    else:
+        coordinate_verified_recovery(**arguments)
+
+    control, _issues = load_live_control_state(control_path, now=NOW)
+    assert control["frozen"] is True
+
+
+@pytest.mark.parametrize("scenario", ["identity_mismatch", "owner_active"])
+def test_ambiguous_persisted_recovery_exit_freezes_reopened_control(
+    tmp_path,
+    scenario,
+):
+    calls: list[str] = []
+    first = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(
+            calls,
+            fail={"phase": "resolve_authority", "failure_type": "transient"},
+        ),
+    )
+    assert first["status"] == "frozen"
+    control_path = tmp_path / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="unsafe reopened control",
+        dead_man_expires_at=NOW + dt.timedelta(hours=1),
+        now=NOW,
+    )
+    arguments = {
+        "incident_id": BINDINGS["incident_id"],
+        "bindings": (
+            {**BINDINGS, "symbol": "MSFT"}
+            if scenario == "identity_mismatch"
+            else BINDINGS
+        ),
+        "adapters": _adapters(calls),
+        "owner_run_id": (
+            "repair-nflx-1"
+            if scenario == "identity_mismatch"
+            else "repair-nflx-2"
+        ),
+        "recovery_run_id": "recovery-nflx-1",
+        "control_path": control_path,
+        "receipt_dir": tmp_path / "receipts",
+        "recovery_root": (
+            tmp_path / "results" / "control_plane" / "recovery"
+        ),
+        "now": NOW + dt.timedelta(seconds=1),
+    }
+
+    result = coordinate_verified_recovery(**arguments)
+
+    assert result["status"] in {"identity_mismatch_frozen", "owner_active"}
+    control, _issues = load_live_control_state(
+        control_path,
+        now=NOW + dt.timedelta(seconds=1),
+    )
+    assert control["frozen"] is True
+
+
+def test_owner_busy_preserves_existing_recovery_freeze_byte_for_byte(tmp_path):
+    control_path = _control(tmp_path)
+    original = control_path.read_bytes()
+    incident_root = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+    )
+    incident_root.mkdir(parents=True)
+    (incident_root / ".owner.lock").write_text(
+        json.dumps(
+            {
+                "schema_version": "tradingagents.recovery_lock.v1",
+                "incident_id": BINDINGS["incident_id"],
+                "owner_run_id": "other-owner",
+                "lease_expires_at": (NOW + dt.timedelta(minutes=10)).isoformat(),
+                "token": "other-owner-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(tmp_path, [])
+
+    assert result["status"] == "owner_busy"
+    assert control_path.read_bytes() == original
+
+
+@pytest.mark.parametrize("delivery_mode", ["duplicate", "monitoring"])
+@pytest.mark.parametrize("tamper_receipt", [False, True])
+def test_completed_early_return_preserves_open_only_for_exact_active_receipt(
+    tmp_path,
+    delivery_mode,
+    tamper_receipt,
+):
+    calls: list[str] = []
+    idempotency_key = "delivery-1" if delivery_mode == "duplicate" else None
+    first = _run(tmp_path, calls, idempotency_key=idempotency_key)
+    assert first["status"] == "monitoring"
+    control_path = tmp_path / "live_control.json"
+    before = control_path.read_bytes()
+    if tamper_receipt:
+        control = json.loads(before)
+        Path(control["recovery_receipt_path"]).write_text(
+            '{"tampered":true}',
+            encoding="utf-8",
+        )
+
+    result = _run(tmp_path, calls, idempotency_key=idempotency_key)
+
+    assert result["status"] == delivery_mode
+    control, _issues = load_live_control_state(control_path, now=NOW)
+    if tamper_receipt:
+        assert control["frozen"] is True
+    else:
+        assert control["frozen"] is False
+        assert control_path.read_bytes() == before
+
+
 def test_existing_corrupt_state_fails_closed_without_reinitializing(tmp_path):
     recovery_root = tmp_path / "results" / "control_plane" / "recovery"
     state_path = recovery_root / BINDINGS["incident_id"] / "state.json"
@@ -2120,6 +2341,91 @@ def test_expired_persisted_owner_lock_is_quarantined_and_taken_over(tmp_path):
     assert list(lock.parent.glob(".owner.stale-*"))
 
 
+def test_stale_owner_lock_allows_exactly_one_two_contender_takeover(
+    tmp_path,
+    monkeypatch,
+):
+    lock_path = tmp_path / "recovery" / "incident-1" / ".owner.lock"
+    lock_path.parent.mkdir(parents=True)
+    stale = {
+        "schema_version": "tradingagents.recovery_lock.v1",
+        "incident_id": "incident-1",
+        "owner_run_id": "old-owner",
+        "lease_expires_at": (NOW - dt.timedelta(minutes=1)).isoformat(),
+        "token": "old-token",
+    }
+    lock_path.write_text(json.dumps(stale), encoding="utf-8")
+    original_replace = self_heal_module.os.replace
+    first_replace_done = threading.Event()
+    replace_order_lock = threading.Lock()
+    replace_count = 0
+
+    def force_old_aba_window(source, destination):
+        nonlocal replace_count
+        with replace_order_lock:
+            replace_count += 1
+            order = replace_count
+        if order == 1:
+            result = original_replace(source, destination)
+            first_replace_done.set()
+            return result
+        assert first_replace_done.wait(timeout=2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                current = json.loads(lock_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                time.sleep(0.001)
+                continue
+            if current.get("token") != stale["token"]:
+                break
+            time.sleep(0.001)
+        else:  # pragma: no cover - makes a failed deterministic setup explicit
+            raise AssertionError("first contender did not publish its lock")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(self_heal_module.os, "replace", force_old_aba_window)
+    start = threading.Barrier(2)
+    results: list[tuple[int | None, str, str | None]] = []
+
+    def contend(owner_run_id):
+        start.wait()
+        results.append(
+            self_heal_module._recovery_lock(
+                lock_path,
+                incident_id="incident-1",
+                owner_run_id=owner_run_id,
+                lease_expires_at=(NOW + dt.timedelta(minutes=10)).isoformat(),
+                now=NOW,
+            )
+        )
+
+    contenders = [
+        threading.Thread(target=contend, args=(f"owner-{index}",))
+        for index in range(2)
+    ]
+    for contender in contenders:
+        contender.start()
+    for contender in contenders:
+        contender.join(timeout=5)
+        assert not contender.is_alive()
+
+    acquired = [result for result in results if result[0] is not None]
+    busy = [result for result in results if result[0] is None]
+    try:
+        assert len(acquired) == 1
+        assert len(busy) == 1
+        assert busy[0][1] == "owner_busy"
+    finally:
+        for descriptor, _status, token in acquired:
+            assert descriptor is not None
+            self_heal_module._release_recovery_lock(
+                lock_path,
+                descriptor,
+                token,
+            )
+
+
 def test_rearm_return_crash_recovers_active_task5_control_without_second_rearm(tmp_path):
     calls: list[str] = []
     rearm_calls = []
@@ -2136,10 +2442,13 @@ def test_rearm_return_crash_recovers_active_task5_control_without_second_rearm(t
 
     with pytest.raises(SystemExit, match="after rearm"):
         _run(tmp_path, calls, rearm=counted_rearm, fault_hook=crash)
+    latest_path = tmp_path / "receipts" / "latest.json"
+    latest_path.unlink()
     resumed = _run(tmp_path, calls, rearm=counted_rearm)
 
     assert resumed["status"] == "monitoring"
     assert len(rearm_calls) == 1
+    assert latest_path.exists()
 
 
 def test_all_phase_packet_validators_reject_metadata_complete_false_greens(tmp_path):
