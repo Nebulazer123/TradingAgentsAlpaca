@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "experiment": "autonomous_growth",
+  "decision_owner": "machine",
+  "machine_actions": [
+    "trade_decision",
+    "strategy_change",
+    "risk_change",
+    "promotion_change",
+    "freeze",
+    "repair",
+    "verify",
+    "rearm",
+    "order_submit"
+  ],
+  "human_actions": [
+    "capital_change",
+    "account_identity_change",
+    "credential_change",
+    "charter_change"
+  ],
+  "recovery_may_submit_orders": false,
+  "max_rearm_ttl_minutes": 90
+}
