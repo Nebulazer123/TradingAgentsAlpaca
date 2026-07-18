@@ -883,6 +883,127 @@ def test_live_gate_allows_current_pre_registered_policy_time_stop_review(tmp_pat
     assert result.allowed is True
 
 
+@pytest.mark.parametrize("reason", [["policy_stop_floor"], {"reason": "policy_stop_floor"}])
+def test_live_gate_fails_closed_for_unhashable_policy_reason(tmp_path, reason):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(allowed_exit_reason=reason),
+    )
+
+    assert result.allowed is False
+
+
+def test_live_gate_fails_closed_for_nonstring_nonpolicy_reason(tmp_path):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(
+            allowed_exit_reason=["policy_stop_floor"],
+            policy_rule_exit=False,
+        ),
+    )
+
+    assert result.allowed is False
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "symbol",
+        "side",
+        "decision_id",
+        "allowed_exit_reason",
+        "allowed_exit_reason_source",
+        "exit_policy_rule",
+        "exit_policy_rationale",
+        "evidence_generated_at",
+    ],
+)
+@pytest.mark.parametrize("value", [{"invalid": True}, ["invalid"], True])
+def test_live_gate_rejects_nonstring_policy_text_fields(tmp_path, field, value):
+    result = _policy_exit_gate_result(tmp_path, _policy_exit_review(**{field: value}))
+
+    assert result.allowed is False
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "current_price",
+        "average_entry_price",
+        "estimated_realized_loss",
+        "unrealized_pnl_percent",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [{"invalid": True}, True, 0, "not-a-number", "NaN", "Infinity"],
+)
+def test_live_gate_rejects_invalid_policy_numeric_fields(tmp_path, field, value):
+    result = _policy_exit_gate_result(tmp_path, _policy_exit_review(**{field: value}))
+
+    assert result.allowed is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("current_price", "83.37"),
+        ("average_entry_price", "69.28"),
+        ("estimated_realized_loss", "0.01"),
+        ("unrealized_pnl_percent", "0.01"),
+    ],
+)
+def test_live_gate_rejects_policy_values_that_do_not_prove_a_loss(tmp_path, field, value):
+    result = _policy_exit_gate_result(tmp_path, _policy_exit_review(**{field: value}))
+
+    assert result.allowed is False
+
+
+@pytest.mark.parametrize("source_packet_ids", ["packet", {"packet": True}])
+def test_live_gate_rejects_malformed_policy_source_packet_ids(tmp_path, source_packet_ids):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(source_packet_ids=source_packet_ids),
+    )
+
+    assert result.allowed is False
+
+
+@pytest.mark.parametrize("value", [{}, (), False, 0])
+def test_live_gate_rejects_malformed_or_falsey_policy_timestamp(tmp_path, value):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(evidence_generated_at=value),
+    )
+
+    assert result.allowed is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("current_price", 69),
+        ("average_entry_price", Decimal("83.37")),
+        ("estimated_realized_loss", "-4.52"),
+        ("unrealized_pnl_percent", Decimal("-16.90")),
+    ],
+)
+def test_live_gate_allows_valid_policy_numeric_scalar_forms(tmp_path, field, value):
+    result = _policy_exit_gate_result(tmp_path, _policy_exit_review(**{field: value}))
+
+    assert result.allowed is True
+
+
+@pytest.mark.parametrize("value", [{}, (), False, 0])
+def test_live_gate_rejects_malformed_or_falsey_discretionary_timestamp(tmp_path, value):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _approved_loss_review(evidence_generated_at=value),
+    )
+
+    assert result.allowed is False
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

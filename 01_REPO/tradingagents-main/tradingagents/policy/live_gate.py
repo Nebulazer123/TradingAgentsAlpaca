@@ -6,7 +6,7 @@ import datetime
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -57,22 +57,22 @@ LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
     "blocked_reasons",
 )
 
-POLICY_LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
+POLICY_LOSS_EXIT_TEXT_FIELDS = (
     "symbol",
     "side",
     "decision_id",
+    "allowed_exit_reason",
+    "allowed_exit_reason_source",
+    "exit_policy_rule",
+    "exit_policy_rationale",
+    "evidence_generated_at",
+)
+
+POLICY_LOSS_EXIT_NUMERIC_FIELDS = (
     "current_price",
     "average_entry_price",
     "estimated_realized_loss",
     "unrealized_pnl_percent",
-    "allowed_exit_reason",
-    "allowed_exit_reason_source",
-    "policy_rule_exit",
-    "exit_policy_rule",
-    "exit_policy_rationale",
-    "evidence_generated_at",
-    "allowed",
-    "blocked_reasons",
 )
 
 
@@ -219,8 +219,9 @@ def _missing_review_fields(review: Mapping[str, Any]) -> list[str]:
 
 
 def _is_policy_exit_claim(review: Mapping[str, Any]) -> bool:
+    reason = review.get("allowed_exit_reason")
     return (
-        review.get("allowed_exit_reason") in POLICY_EXIT_RULE_IDS
+        isinstance(reason, str) and reason in POLICY_EXIT_RULE_IDS
         or (
             "policy_rule_exit" in review
             and review.get("policy_rule_exit") is not False
@@ -228,17 +229,81 @@ def _is_policy_exit_claim(review: Mapping[str, Any]) -> bool:
     )
 
 
-def _missing_policy_review_fields(review: Mapping[str, Any]) -> list[str]:
-    missing = []
-    for review_field in POLICY_LOSS_EXIT_REVIEW_REQUIRED_FIELDS:
-        value = review.get(review_field)
-        if review_field == "blocked_reasons":
-            if value is None:
-                missing.append(review_field)
-            continue
-        if value in (None, "", []):
-            missing.append(review_field)
-    return missing
+def _empty_sequence_issue(
+    review: Mapping[str, Any],
+    field_name: str,
+    *,
+    optional: bool,
+) -> str | None:
+    if field_name not in review:
+        return None if optional else f"{field_name} is missing"
+    value = review.get(field_name)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return f"{field_name} must be an empty sequence"
+    if value:
+        return f"{field_name} must be empty"
+    return None
+
+
+def _finite_policy_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _policy_field_issues(review: Mapping[str, Any]) -> list[str]:
+    issues: list[str] = []
+    for field_name in POLICY_LOSS_EXIT_TEXT_FIELDS:
+        value = review.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            issues.append(f"{field_name} must be a non-empty string")
+
+    decimals: dict[str, Decimal] = {}
+    for field_name in POLICY_LOSS_EXIT_NUMERIC_FIELDS:
+        value = _finite_policy_decimal(review.get(field_name))
+        if value is None:
+            issues.append(f"{field_name} must be a finite decimal value")
+        else:
+            decimals[field_name] = value
+    if decimals.get("current_price", Decimal("0")) <= Decimal("0"):
+        issues.append("current_price must be greater than zero")
+    if decimals.get("average_entry_price", Decimal("0")) <= Decimal("0"):
+        issues.append("average_entry_price must be greater than zero")
+    if (
+        "current_price" in decimals
+        and "average_entry_price" in decimals
+        and decimals["current_price"] >= decimals["average_entry_price"]
+    ):
+        issues.append("current_price must be below average_entry_price for a policy loss exit")
+    if decimals.get("estimated_realized_loss", Decimal("0")) >= Decimal("0"):
+        issues.append("estimated_realized_loss must be below zero")
+    if decimals.get("unrealized_pnl_percent", Decimal("0")) >= Decimal("0"):
+        issues.append("unrealized_pnl_percent must be below zero")
+
+    for field_name, optional in (("blocked_reasons", False), ("blockers", True)):
+        issue = _empty_sequence_issue(review, field_name, optional=optional)
+        if issue is not None:
+            issues.append(issue)
+    return issues
+
+
+def _parse_evidence_generated_at(value: Any) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return parsed.astimezone(datetime.timezone.utc)
+    except (OverflowError, ValueError):
+        return None
 
 
 def _review_binding_and_freshness_issues(
@@ -249,33 +314,35 @@ def _review_binding_and_freshness_issues(
 ) -> list[str]:
     issues: list[str] = []
     action_decision_id, action_client_order_id, action_symbol = _current_action_identity(action)
-    review_decision_id = str(review.get("decision_id") or "")
+    review_decision_id = (
+        review.get("decision_id") if isinstance(review.get("decision_id"), str) else ""
+    )
     if action_decision_id and review_decision_id != action_decision_id:
         issues.append("decision_id does not match current action")
-    if action_symbol and str(review.get("symbol") or "").upper() != action_symbol:
+    review_symbol = review.get("symbol") if isinstance(review.get("symbol"), str) else ""
+    if action_symbol and review_symbol.upper() != action_symbol:
         issues.append("symbol does not match current action")
-    action_side = "sell" if _is_sell_action(action) else str(_action_value(action, "side", "")).lower()
-    if action_side and str(review.get("side") or "").lower() != action_side:
+    action_side = (
+        "sell" if _is_sell_action(action) else str(_action_value(action, "side", "")).lower()
+    )
+    review_side = review.get("side") if isinstance(review.get("side"), str) else ""
+    if action_side and review_side.lower() != action_side:
         issues.append("side does not match current action")
     if action_client_order_id:
-        review_order_id = str(review.get("client_order_id") or review.get("proposed_order_id") or "")
+        review_order_id = review.get("client_order_id") or review.get("proposed_order_id") or ""
+        if not isinstance(review_order_id, str):
+            review_order_id = ""
         if review_order_id and review_order_id != action_client_order_id:
             issues.append("client_order_id/proposed_order_id does not match current action")
 
-    generated_at = review.get("evidence_generated_at")
-    if now is not None and generated_at:
-        try:
-            parsed = datetime.datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
-        except (TypeError, ValueError):
-            issues.append("evidence_generated_at is not an ISO timestamp")
-        else:
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-            age = now.astimezone(datetime.timezone.utc) - parsed.astimezone(
-                datetime.timezone.utc
-            )
-            if age < datetime.timedelta(0) or age > datetime.timedelta(hours=6):
-                issues.append("loss_exit_review is stale for current submit")
+    parsed = _parse_evidence_generated_at(review.get("evidence_generated_at"))
+    if parsed is None:
+        issues.append("evidence_generated_at is not an ISO timestamp")
+    elif now is not None:
+        reference_now = now.astimezone(datetime.timezone.utc)
+        age = reference_now - parsed
+        if age < datetime.timedelta(0) or age > datetime.timedelta(hours=6):
+            issues.append("loss_exit_review is stale for current submit")
     return issues
 
 
@@ -285,21 +352,22 @@ def _policy_loss_exit_review_issues(
     *,
     now: datetime.datetime | None,
 ) -> list[str]:
-    issues = _missing_policy_review_fields(review)
-    policy_review = dict(review)
-    # The live contract makes blockers optional, but the shared authority
-    # resolver validates it when present. Normalize absence to its only safe
-    # value so the final gate can still require the resolver's verdict.
-    policy_review.setdefault("blockers", [])
-    verdict = resolve_exit_authority(
-        supervisor_review=policy_review,
-        advisory_analysis=None,
-    )
-    if not (
-        verdict.allowed is True
-        and verdict.authority_source == "pre_registered_policy_rule"
-    ):
-        issues.append(f"policy exit authority denied: {verdict.reason}")
+    issues = _policy_field_issues(review)
+    if not issues:
+        policy_review = dict(review)
+        # The live contract makes blockers optional, but the shared authority
+        # resolver validates it when present. Normalize absence to its only safe
+        # value so the final gate can still require the resolver's verdict.
+        policy_review.setdefault("blockers", [])
+        verdict = resolve_exit_authority(
+            supervisor_review=policy_review,
+            advisory_analysis=None,
+        )
+        if not (
+            verdict.allowed is True
+            and verdict.authority_source == "pre_registered_policy_rule"
+        ):
+            issues.append(f"policy exit authority denied: {verdict.reason}")
     issues.extend(_review_binding_and_freshness_issues(action, review, now=now))
     return sorted(set(issues))
 
@@ -329,7 +397,8 @@ def _loss_exit_review_issues(
     issues = _missing_review_fields(review)
     if review.get("allowed") is not True:
         issues.append("loss_exit_review.allowed is not true")
-    reason = str(review.get("allowed_exit_reason") or "")
+    reason_value = review.get("allowed_exit_reason")
+    reason = reason_value if isinstance(reason_value, str) else ""
     if reason not in STRICT_ALLOWED_LOSS_EXIT_REASONS:
         issues.append(
             "allowed_exit_reason must be one of "
