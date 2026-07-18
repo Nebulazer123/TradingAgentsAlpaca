@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -52,6 +53,12 @@ ALLOWED_TRANSITIONS = {
     IncidentStage.EXTERNAL_BLOCKED: {IncidentStage.DIAGNOSING},
     IncidentStage.CLOSED: set(),
 }
+
+_SAFE_INCIDENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def is_safe_incident_id(value: object) -> bool:
+    return isinstance(value, str) and _SAFE_INCIDENT_ID.fullmatch(value) is not None
 
 
 def _as_utc(value: dt.datetime | None) -> dt.datetime:
@@ -175,8 +182,10 @@ class IncidentStore:
         self.root = Path(root)
 
     def record(self, incident: Incident, *, event: str) -> Incident:
+        if not is_safe_incident_id(incident.incident_id):
+            raise ValueError("invalid incident_id")
         serialized = incident.to_dict()
-        incident_snapshot = self.root / "incidents" / incident.incident_id / "latest.json"
+        incident_snapshot = self.root / incident.incident_id / "latest.json"
         atomic_write_text(incident_snapshot, json.dumps(serialized, indent=2, sort_keys=True))
         self._append_event(incident, event)
         atomic_write_text(self.root / "latest.json", json.dumps(serialized, indent=2, sort_keys=True))
@@ -186,15 +195,20 @@ class IncidentStore:
         event_path = self.root / "events.jsonl"
         event_path.parent.mkdir(parents=True, exist_ok=True)
         compact_event = {
-            "event": event,
+            "event": str(event)[:128],
             "incident_id": incident.incident_id,
             "stage": incident.stage.value,
-            "owner_role": incident.owner_role,
-            "updated_at": incident.updated_at,
+            "owner_role": str(incident.owner_role)[:128],
+            "updated_at": str(incident.updated_at)[:64],
         }
-        # A real append is required here: atomic replacement would rewrite history.
-        with event_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(compact_event, separators=(",", ":"), sort_keys=True))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        encoded_line = (
+            json.dumps(compact_event, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode("utf-8")
+        # A single O_APPEND write keeps concurrent records from interleaving lines.
+        descriptor = os.open(event_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            if os.write(descriptor, encoded_line) != len(encoded_line):
+                raise OSError("incomplete incident event append")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)

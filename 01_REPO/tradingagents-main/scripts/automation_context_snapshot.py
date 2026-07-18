@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 import tomllib
 
+from tradingagents.orchestration.incidents import IncidentStage, is_safe_incident_id
 from tradingagents.storage.json_cache import JsonFileCache
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -890,7 +891,17 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
     if incidents_root.exists():
         for snapshot_path in incidents_root.glob("*/latest.json"):
             payload = read_json(snapshot_path)
-            if isinstance(payload, dict) and payload.get("stage") != "closed":
+            if not isinstance(payload, dict):
+                continue
+            if not is_safe_incident_id(payload.get("incident_id")):
+                continue
+            try:
+                stage = IncidentStage(payload.get("stage"))
+            except ValueError:
+                continue
+            if parse_packet_timestamp(payload.get("created_at")) is None:
+                continue
+            if stage is not IncidentStage.CLOSED:
                 active.append((payload, snapshot_path))
 
     oldest_minutes = 0

@@ -81,3 +81,40 @@ def test_snapshot_exposes_only_compact_incident_status(tmp_path, monkeypatch):
         "external_blocked_count": 1,
         "latest_incident_ref": "results/control_plane/incidents/inc-nflx-rule-conflict/latest.json",
     }
+
+
+def test_snapshot_skips_malformed_or_invalid_incident_snapshots(tmp_path, monkeypatch):
+    snapshot = _load_snapshot_module()
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+    incidents_root = tmp_path / "results" / "control_plane" / "incidents"
+    for directory_name, payload in {
+        "empty": {},
+        "bad-stage": {
+            "incident_id": "inc-bad-stage",
+            "stage": "unknown",
+            "created_at": "2026-07-18T00:00:00+00:00",
+        },
+        "bad-created-at": {
+            "incident_id": "inc-bad-date",
+            "stage": "detected",
+            "created_at": "not-a-date",
+        },
+        "bad-id": {
+            "incident_id": "../outside",
+            "stage": "detected",
+            "created_at": "2026-07-18T00:00:00+00:00",
+        },
+    }.items():
+        incident_dir = incidents_root / directory_name
+        incident_dir.mkdir(parents=True)
+        (incident_dir / "latest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 7, 18, 0, 12, tzinfo=dt.timezone.utc)
+    ) == {
+        "active_incident_count": 0,
+        "oldest_active_incident_minutes": 0,
+        "unowned_incident_count": 0,
+        "external_blocked_count": 0,
+        "latest_incident_ref": None,
+    }
