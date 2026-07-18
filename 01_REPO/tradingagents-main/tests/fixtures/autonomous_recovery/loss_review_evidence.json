@@ -1,0 +1,86 @@
+{
+  "schema_version": "1.0.0",
+  "packet_id": "source-evidence-nflx-loss-review",
+  "generated_at": "2026-07-18T12:00:00+00:00",
+  "analysis_only": true,
+  "sources": [
+    {
+      "schema_version": "1.0.0",
+      "source": "loss_review_evidence",
+      "as_of": "2026-07-18T12:00:00+00:00",
+      "path": "local://results/hourly_supervisor/hourly-supervisor-nflx.json",
+      "quality": "high"
+    }
+  ],
+  "source_refs": [
+    "local://results/hourly_supervisor/hourly-supervisor-nflx.json"
+  ],
+  "input_hashes": {
+    "request": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "freshness": {
+    "as_of": "2026-07-18T12:00:00+00:00",
+    "stale": false,
+    "read_only": true,
+    "can_submit_orders": false,
+    "source_packet_count": 2
+  },
+  "tool_route": "local_loss_review_evidence",
+  "redaction_status": "no_secrets_seen",
+  "source_name": "loss_review_evidence",
+  "evidence_type": "loss_review_evidence",
+  "subject": "NFLX",
+  "symbol": "NFLX",
+  "payload": {
+    "symbol": "NFLX",
+    "hourly_packet_path": "results/hourly_supervisor/hourly-supervisor-nflx.json",
+    "hourly_decision": "loss-review",
+    "review_allowed": true,
+    "entry_context": {
+      "symbol": "NFLX",
+      "account": "live"
+    },
+    "entry_context_found": true,
+    "next_action": "pre_registered_policy_approval_preserved",
+    "analysis_only": true,
+    "execution_authority": "none",
+    "forbidden_effects": [
+      "create_trade_intent",
+      "size_position",
+      "submit_order",
+      "promote_sleeve",
+      "waive_live_gate",
+      "mark_loss_exit_allowed"
+    ]
+  },
+  "quality": "medium",
+  "packet_path": "__PACKET_PATH__",
+  "can_submit_orders": false,
+  "execution_authority": "none",
+  "hourly_packet_path": "results/hourly_supervisor/hourly-supervisor-nflx.json",
+  "hourly_decision": "loss-review",
+  "review_allowed": true,
+  "entry_context_found": true,
+  "entry_context": {
+    "symbol": "NFLX",
+    "account": "live"
+  },
+  "evidence_needs": [
+    "company_specific_news"
+  ],
+  "evidence_coverage_by_need": {
+    "company_specific_news": true
+  },
+  "remaining_blockers_before_refresh_count": 1,
+  "resolved_blockers_by_refresh": [
+    "company-specific news check"
+  ],
+  "remaining_blocker_count": 0,
+  "resolved_blocker_count": 1,
+  "next_action": "pre_registered_policy_approval_preserved",
+  "source_packet_count": 1,
+  "source_packet_paths": {
+    "provider-nflx": "/fixture/provider-nflx.json"
+  },
+  "summary_packet_path": "/fixture/provider-nflx-summary.json"
+}

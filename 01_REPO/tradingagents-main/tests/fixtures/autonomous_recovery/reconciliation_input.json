@@ -1,0 +1,21 @@
+{
+  "actions": [
+    {
+      "symbol": "NFLX",
+      "side": "buy",
+      "account": "live",
+      "idempotency_key": "open-nflx-1"
+    }
+  ],
+  "submitted": [
+    {
+      "client_order_id": "open-nflx-1",
+      "symbol": "NFLX",
+      "side": "buy",
+      "type": "limit",
+      "qty": "1",
+      "limit_price": "100",
+      "status": "accepted"
+    }
+  ]
+}

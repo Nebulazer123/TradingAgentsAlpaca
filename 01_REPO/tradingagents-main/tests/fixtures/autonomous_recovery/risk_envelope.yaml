@@ -1,0 +1,10 @@
+account_max_capital_at_risk_usd: 250.00
+per_name_cap_usd: 50.00
+per_sector_cap_pct: 0.20
+aggregate_beta_cap: 1.25
+daily_loss_halt_usd: 25.00
+max_drawdown_halt_pct: 0.05
+tiny_live_tranche_usd: 25.00
+tiny_live_max_loss_usd: 5.00
+new_sleeve_auto_promote: false
+alert_email: ops@example.com
