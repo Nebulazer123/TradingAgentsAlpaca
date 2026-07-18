@@ -1112,6 +1112,10 @@ def test_alpaca_supervise_hourly_dry_run_logs_without_submitting(monkeypatch, tm
 
 
 def test_alpaca_supervise_hourly_compact_json_output_points_to_raw_packet(monkeypatch, tmp_path):
+    envelope_path = tmp_path / "config" / "risk_envelope.yaml"
+    envelope_path.parent.mkdir()
+    _write_test_risk_envelope(envelope_path)
+    monkeypatch.chdir(tmp_path)
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
@@ -1139,7 +1143,7 @@ def test_alpaca_supervise_hourly_compact_json_output_points_to_raw_packet(monkey
     assert payload["submitted_count"] == 0
     assert payload["portfolio_summary"]["live"]["position_count"] == 1
     assert payload["portfolio_summary"]["live"]["equity"] == "200.00"
-    envelope, envelope_issues = load_risk_envelope("config/risk_envelope.yaml")
+    envelope, envelope_issues = load_risk_envelope(envelope_path)
     assert envelope is not None, envelope_issues
     assert payload["live_budget"]["mode"] == envelope.live_budget_mode
     assert Path(payload["raw_packet_path"]).exists()
