@@ -8,7 +8,7 @@ import re
 import stat
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -107,9 +107,9 @@ class LearningContext:
     source_forecast_ids: tuple[str, ...]
     source_packet_ids: tuple[str, ...]
     source_hypothesis_ids: tuple[str, ...]
-    analysis_only: bool = True
-    execution_authority: str = "none"
-    can_submit_orders: bool = False
+    analysis_only: bool = field(default=True, init=False)
+    execution_authority: str = field(default="none", init=False)
+    can_submit_orders: bool = field(default=False, init=False)
 
 
 def normalize_learning_as_of(value: str | dt.datetime) -> dt.datetime:
@@ -386,6 +386,13 @@ def _window_is_valid(
         or intended_end > as_of.date()
         or expected_entry != expected_entry_session(intended_start)
         or expected_exit != expected_exit_session(intended_end)
+        or expected_entry > ticker_entry
+        or expected_entry > benchmark_entry
+        or ticker_entry > ticker_exit
+        or benchmark_entry > benchmark_exit
+        or ticker_exit > expected_exit
+        or benchmark_exit > expected_exit
+        or expected_exit > as_of.date()
         or ticker_entry != benchmark_entry
         or ticker_exit != benchmark_exit
         or not quality_flags <= _QUALITY_FLAGS
@@ -703,7 +710,7 @@ def _forecast_rows(
             row["agent"],
         )
     )
-    return rows[:MAX_INFLUENCE_ROWS]
+    return rows
 
 
 def _safe_lifecycle_context(value: Any) -> dict[str, str] | None:
@@ -858,7 +865,7 @@ def _hypothesis_rows(
             row["hypothesis_id"],
         )
     )
-    return rows[:MAX_HYPOTHESIS_ROWS]
+    return rows
 
 
 def _bounded_payload(
@@ -875,7 +882,14 @@ def _bounded_payload(
         ("influence", influence_rows),
         ("hypotheses", hypothesis_rows),
     ):
+        row_limit = (
+            MAX_INFLUENCE_ROWS
+            if key == "influence"
+            else MAX_HYPOTHESIS_ROWS
+        )
         for row in rows:
+            if len(payload[key]) >= row_limit:
+                break
             candidate = {
                 **payload,
                 key: [*payload[key], dict(row)],

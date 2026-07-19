@@ -167,6 +167,20 @@ def test_learning_context_module_contract_exists():
     assert normalize_learning_as_of
 
 
+def test_learning_context_authority_cannot_be_overridden_at_construction():
+    with pytest.raises(TypeError):
+        LearningContext(
+            schema_version=1,
+            as_of="2026-07-18T00:00:00+00:00",
+            rendered="{}",
+            source_observation_ids=(),
+            source_forecast_ids=(),
+            source_packet_ids=(),
+            source_hypothesis_ids=(),
+            analysis_only=False,
+        )
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     (
@@ -420,6 +434,65 @@ def test_verified_degraded_holiday_window_remains_eligible():
     assert context.source_forecast_ids == ("af-safe-001",)
 
 
+@pytest.mark.parametrize(
+    "window",
+    (
+        _window(
+            ticker_entry_date="2026-07-12",
+            benchmark_entry_date="2026-07-12",
+        ),
+        _window(
+            ticker_exit_date="2026-07-18",
+            benchmark_exit_date="2026-07-18",
+        ),
+        _window(
+            ticker_entry_date="2026-07-19",
+            benchmark_entry_date="2026-07-19",
+            ticker_exit_date="2026-07-19",
+            benchmark_exit_date="2026-07-19",
+        ),
+    ),
+)
+def test_price_window_dates_must_stay_inside_expected_and_as_of_bounds(window):
+    context = build_learning_context(
+        observations=[_forecast_observation(resolution_window=window)],
+        as_of=AS_OF,
+        ticker="NFLX",
+        min_resolved=1,
+    )
+    assert context.source_forecast_ids == ()
+
+
+def test_valid_one_session_window_remains_eligible():
+    context = build_learning_context(
+        observations=[
+            _forecast_observation(
+                created_at="2026-07-13T10:00:00+00:00",
+                resolve_after="2026-07-13T15:00:00+00:00",
+                resolved_at="2026-07-13T15:00:00+00:00",
+                resolution_window={
+                    **_window(),
+                    "intended_start": "2026-07-13",
+                    "intended_end": "2026-07-13",
+                    "expected_entry_session": "2026-07-13",
+                    "expected_exit_session": "2026-07-13",
+                    "expected_session_count": 1,
+                    "ticker_entry_date": "2026-07-13",
+                    "ticker_exit_date": "2026-07-13",
+                    "benchmark_entry_date": "2026-07-13",
+                    "benchmark_exit_date": "2026-07-13",
+                    "ticker_session_count": 1,
+                    "benchmark_session_count": 1,
+                },
+            )
+        ],
+        as_of=AS_OF,
+        ticker="NFLX",
+        min_resolved=1,
+    )
+    assert context.source_forecast_ids == ("af-safe-001",)
+
+
 def test_context_and_horizon_are_filtered_before_influence():
     observations = [
         _forecast_observation(),
@@ -534,6 +607,32 @@ def test_character_budget_adds_only_whole_rows():
     assert len(full.rendered) <= 4000
     assert len(constrained.rendered) <= 256
     assert "af-safe-" not in constrained.rendered or json.loads(constrained.rendered)
+
+
+def test_oversized_top_influence_row_is_skipped_and_four_later_rows_backfill():
+    observations = [
+        _forecast_observation(index, agent="agent_top")
+        for index in range(1, 21)
+    ]
+    observations.extend(
+        _forecast_observation(100 + index, agent=f"agent_{letter}")
+        for index, letter in enumerate("abcde", start=1)
+    )
+
+    context = build_learning_context(
+        observations=observations,
+        as_of=AS_OF,
+        ticker="NFLX",
+        min_resolved=1,
+        max_chars=1800,
+    )
+
+    assert [row["agent"] for row in _decoded(context)["influence"]] == [
+        "agent_a",
+        "agent_b",
+        "agent_c",
+        "agent_d",
+    ]
 
 
 def test_registration_owned_cross_ticker_hypothesis_is_rendered():
@@ -696,6 +795,49 @@ def test_hypothesis_order_and_four_row_cap():
         "hyp-safe-002",
         "hyp-safe-003",
         "hyp-safe-004",
+    )
+
+
+def test_oversized_top_hypothesis_row_is_skipped_and_four_later_rows_backfill():
+    observations = [
+        _lifecycle_observation(
+            1000,
+            hypothesis_id="hyp-top",
+            occurred_at="2026-07-10T14:00:00+00:00",
+        )
+    ]
+    observations.extend(
+        _lifecycle_observation(
+            1000 + index,
+            hypothesis_id="hyp-top",
+            event_type="prior_retracted",
+            from_status="preregistered",
+            to_status="preregistered",
+            occurred_at=f"2026-07-18T14:{index:02d}:00+00:00",
+        )
+        for index in range(1, 21)
+    )
+    observations.extend(
+        _lifecycle_observation(
+            2000 + index,
+            hypothesis_id=f"hyp-later-{index}",
+            occurred_at=f"2026-07-{10 + index:02d}T14:00:00+00:00",
+        )
+        for index in range(1, 6)
+    )
+
+    context = build_learning_context(
+        observations=observations,
+        as_of=AS_OF,
+        ticker="NFLX",
+        max_chars=1800,
+    )
+
+    assert context.source_hypothesis_ids == (
+        "hyp-later-1",
+        "hyp-later-2",
+        "hyp-later-3",
+        "hyp-later-4",
     )
 
 
