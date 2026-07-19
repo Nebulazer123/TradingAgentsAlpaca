@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from tradingagents.dataflows._official_common import (
-    OfficialDataError,
+    RecoverableDataflowError,
     get_text_response,
     record_connector_health,
 )
@@ -59,7 +59,7 @@ def _fetch_subreddit(
             connector_name="reddit_public",
         )
         payload = json.loads(result.text)
-    except OfficialDataError as exc:
+    except RecoverableDataflowError as exc:
         if "HTTP 403" in str(exc):
             logger.warning("Reddit public endpoint blocked for r/%s · %s: %s", sub, ticker, exc)
             return None

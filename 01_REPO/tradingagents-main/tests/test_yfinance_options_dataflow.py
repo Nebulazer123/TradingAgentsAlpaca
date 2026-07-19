@@ -1,6 +1,13 @@
 import sys
 from types import SimpleNamespace
 
+import pytest
+
+from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
+    OfficialDataError,
+    RecoverableDataflowError,
+)
 from tradingagents.dataflows.yfinance_options import fetch_yfinance_options_iv_flow
 
 
@@ -75,3 +82,27 @@ def test_fetch_yfinance_options_iv_flow_writes_analysis_only_packet(monkeypatch)
     assert packet.payload["put_iv_weighted_by_open_interest_sample"] == 0.5
     assert packet.freshness["downrank_evidence"] is True
     assert packet.freshness["connector_status"] == "configured_public_supplemental"
+
+
+def test_yfinance_options_without_expirations_is_unavailable(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: SimpleNamespace(options=[])),
+    )
+
+    with pytest.raises(DataUnavailableError, match="no option expirations"):
+        fetch_yfinance_options_iv_flow("NVDA")
+
+
+def test_yfinance_options_missing_symbol_remains_terminal(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: pytest.fail("ticker must not be built")),
+    )
+
+    with pytest.raises(OfficialDataError, match="ticker symbol") as exc_info:
+        fetch_yfinance_options_iv_flow("")
+
+    assert not isinstance(exc_info.value, RecoverableDataflowError)

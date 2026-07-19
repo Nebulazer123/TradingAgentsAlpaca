@@ -13,7 +13,10 @@ from urllib.parse import quote
 import pandas as pd
 
 from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    DataUnavailableError,
     OfficialDataError,
+    RecoverableDataflowError,
     cached_safe_fetch_evidence,
     evidence_packet,
     official_cache_key,
@@ -306,8 +309,14 @@ _CANDIDATE_FIELDS = (
 
 def _json_object_from_file(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DataTransportError(
+            f"broker supervisor packet could not be read: {type(exc).__name__}"
+        ) from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
         raise OfficialDataError(f"broker supervisor packet could not be read: {exc}") from exc
     if not isinstance(payload, dict):
         raise OfficialDataError("broker supervisor packet is not a JSON object")
@@ -319,7 +328,9 @@ def _latest_broker_snapshot_path(snapshot_dir: str | Path) -> Path:
     if root.is_file():
         return root
     if not root.exists():
-        raise OfficialDataError(f"no supervisor snapshot directory found at {root}")
+        raise DataUnavailableError(
+            f"no supervisor snapshot directory found at {root}"
+        )
     latest = root / "latest.json"
     if latest.exists():
         return latest
@@ -329,7 +340,9 @@ def _latest_broker_snapshot_path(snapshot_dir: str | Path) -> Path:
         if _is_raw_json_packet_path(path)
     ]
     if not candidates:
-        raise OfficialDataError(f"no supervisor snapshot packet found at {root}")
+        raise DataUnavailableError(
+            f"no supervisor snapshot packet found at {root}"
+        )
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
@@ -608,7 +621,7 @@ def _cik_for_symbol(company_tickers_payload: dict[str, Any], symbol: str) -> str
             cik = item.get("cik_str")
             if cik is not None:
                 return str(cik)
-    raise OfficialDataError(f"SEC CIK not found for ticker {target}")
+    raise DataUnavailableError(f"SEC CIK not found for ticker {target}")
 
 
 def _fetch_sec_submissions_by_symbol(symbol: str) -> SourceEvidencePacket:
@@ -779,7 +792,7 @@ def _yfinance_quote_cache_is_usable(
             symbol,
             _today(now),
         )
-    except OfficialDataError:
+    except DataUnavailableError:
         return False
     return True
 
@@ -804,9 +817,12 @@ def _read_source_cache_packet(
         if not path.exists():
             continue
         try:
-            cached = SourceEvidencePacket.model_validate_json(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise DataTransportError(
+                f"cached {evidence_need} evidence could not be read: {type(exc).__name__}"
+            ) from exc
+        cached = SourceEvidencePacket.model_validate_json(text)
         if cached.tool_route == "local:research_gap" or cached.freshness.get("gap_category"):
             continue
         if evidence_need == "quote_price_context":
@@ -818,7 +834,14 @@ def _read_source_cache_packet(
             current = now or datetime.datetime.now(tz=datetime.timezone.utc)
             if current.tzinfo is None:
                 current = current.replace(tzinfo=datetime.timezone.utc)
-            age_seconds = max(current.timestamp() - path.stat().st_mtime, 0.0)
+            try:
+                modified_at = path.stat().st_mtime
+            except OSError as exc:
+                raise DataTransportError(
+                    f"cached {evidence_need} evidence could not be inspected: "
+                    f"{type(exc).__name__}"
+                ) from exc
+            age_seconds = max(current.timestamp() - modified_at, 0.0)
             if age_seconds > _cache_ttl_seconds(evidence_need):
                 continue
             if cached.source_name == "yfinance" and not _yfinance_quote_cache_is_usable(
@@ -861,7 +884,9 @@ def _read_source_cache_packet(
             redaction_status="no_secrets_seen",
             freshness_extra={"read_only": True, "cache": {"state": "hit", "source": cached.source_name}},
         )
-    raise OfficialDataError(f"no cached {evidence_need} evidence for {symbol}")
+    raise DataUnavailableError(
+        f"no cached {evidence_need} evidence for {symbol}"
+    )
 
 
 def _unsupported_attempt(candidate: ProviderFallbackCandidate, *, evidence_need: str) -> dict[str, Any]:
@@ -1128,7 +1153,7 @@ def build_ticker_provider_research_packets(
                         candidate_sources=candidate_sources,
                         now=now,
                     )
-                except OfficialDataError as exc:
+                except RecoverableDataflowError as exc:
                     attempts.append(
                         _cache_miss_attempt(candidate, evidence_need=evidence_need, reason=str(exc))
                     )

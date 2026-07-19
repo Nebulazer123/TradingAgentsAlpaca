@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
     OfficialDataError,
     evidence_packet,
     now_iso,
@@ -87,7 +88,9 @@ def fetch_yfinance_earnings_calendar(
             calendar["earnings_dates_error"] = f"{type(exc).__name__}: earnings dates unavailable"
 
     if not calendar and not earnings_dates:
-        raise OfficialDataError(f"yfinance returned no earnings calendar data for {ticker_symbol}")
+        raise DataUnavailableError(
+            f"yfinance returned no earnings calendar data for {ticker_symbol}"
+        )
 
     as_of = now_iso()
     payload = {

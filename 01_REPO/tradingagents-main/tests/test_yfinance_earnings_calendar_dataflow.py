@@ -3,6 +3,13 @@ from __future__ import annotations
 import sys
 from types import SimpleNamespace
 
+import pytest
+
+from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
+    OfficialDataError,
+    RecoverableDataflowError,
+)
 from tradingagents.dataflows.yfinance_earnings_calendar import fetch_yfinance_earnings_calendar
 
 
@@ -49,3 +56,28 @@ def test_yfinance_earnings_calendar_packet_is_read_only_and_downranked(monkeypat
     assert packet.payload["calendar"]["Earnings Date"] == "2026-07-21"
     assert packet.freshness["downrank_evidence"] is True
     assert packet.tool_route == "dataflow:yfinance_earnings_calendar"
+
+
+def test_yfinance_earnings_calendar_without_usable_dates_is_unavailable(monkeypatch):
+    ticker = SimpleNamespace(calendar={}, get_earnings_dates=lambda **_kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: ticker),
+    )
+
+    with pytest.raises(DataUnavailableError, match="no earnings calendar data"):
+        fetch_yfinance_earnings_calendar("CRM")
+
+
+def test_yfinance_earnings_calendar_missing_symbol_remains_terminal(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: pytest.fail("ticker must not be built")),
+    )
+
+    with pytest.raises(OfficialDataError, match="ticker symbol") as exc_info:
+        fetch_yfinance_earnings_calendar("")
+
+    assert not isinstance(exc_info.value, RecoverableDataflowError)

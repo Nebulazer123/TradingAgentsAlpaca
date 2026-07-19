@@ -913,10 +913,8 @@ def safe_fetch_evidence(
 ) -> SourceEvidencePacket:
     try:
         return fetcher()
-    except OfficialDataError as exc:
+    except RecoverableDataflowError as exc:
         reason = _sanitize_reason(str(exc))
-    except Exception as exc:  # pragma: no cover - exact network errors vary by source
-        reason = f"{type(exc).__name__}: source fetch failed"
     return blocked_evidence_packet(
         source_name=source_name,
         evidence_type=evidence_type,
@@ -1028,10 +1026,8 @@ def cached_safe_fetch_evidence(
 
     try:
         packet = fetcher()
-    except OfficialDataError as exc:
+    except RecoverableDataflowError as exc:
         reason = _sanitize_reason(str(exc))
-    except Exception as exc:  # pragma: no cover - exact source failures vary.
-        reason = f"{type(exc).__name__}: source fetch failed"
     else:
         write_official_evidence_cache(packet, cache_key=cache_key, cache_dir=cache_dir)
         record_connector_health(

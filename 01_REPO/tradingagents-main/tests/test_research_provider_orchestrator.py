@@ -6,11 +6,18 @@ from pathlib import Path
 import pandas as pd
 import pytest
 import yfinance as yf
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.main import app
-from tradingagents.dataflows._official_common import evidence_packet
+from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    DataUnavailableError,
+    OfficialDataError,
+    VendorNotConfiguredError,
+    evidence_packet,
+)
 from tradingagents.research import provider_orchestrator as orchestrator
 from tradingagents.research.provider_fallbacks import load_provider_fallback_config
 from tradingagents.research.provider_orchestrator import (
@@ -18,7 +25,7 @@ from tradingagents.research.provider_orchestrator import (
     TickerProviderResearchResult,
     build_ticker_provider_research_packets,
 )
-from tradingagents.schemas.research import CrawlerRunPacket
+from tradingagents.schemas.research import CrawlerRunPacket, SourceEvidencePacket
 
 runner = CliRunner()
 
@@ -34,6 +41,14 @@ def _packet(source_name: str, *, evidence_type: str = "market_news", symbol: str
         quality="medium" if source_name != "google_news_rss" else "low",
         tool_route=f"{source_name}_test",
     )
+
+
+def _source_packet_validation_error():
+    try:
+        SourceEvidencePacket.model_validate({})
+    except Exception as exc:  # noqa: BLE001 - return the concrete Pydantic error.
+        return exc
+    raise AssertionError("invalid packet unexpectedly validated")
 
 
 def _quote_packet(
@@ -498,7 +513,7 @@ def test_ticker_provider_bundle_falls_to_gap_when_yfinance_short_interest_blocks
         orchestrator,
         "fetch_yfinance_short_interest",
         lambda symbol: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("yfinance returned no short-interest fields")
+            DataUnavailableError("yfinance returned no short-interest fields")
         ),
     )
 
@@ -608,7 +623,7 @@ def test_ticker_provider_bundle_falls_to_gap_when_fmp_transcript_blocks(
         orchestrator,
         "fetch_fmp_latest_earning_call_transcript",
         lambda symbol: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("FMP_API_KEY is not set")
+            VendorNotConfiguredError("FMP_API_KEY is not set")
         ),
     )
 
@@ -648,14 +663,14 @@ def test_ticker_provider_bundle_falls_through_when_youtube_transcript_blocks(
         orchestrator,
         "fetch_youtube_earnings_transcript_packet",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("youtube_transcript MCP timed out")
+            DataTransportError("youtube_transcript MCP timed out")
         ),
     )
     monkeypatch.setattr(
         orchestrator,
         "fetch_fmp_latest_earning_call_transcript",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("FMP_API_KEY is not set")
+            VendorNotConfiguredError("FMP_API_KEY is not set")
         ),
     )
 
@@ -686,6 +701,74 @@ def test_ticker_provider_bundle_falls_through_when_youtube_transcript_blocks(
         and attempt["blocked"] is True
         for attempt in result.route_attempts
     )
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda: TypeError("provider contract failure"),
+        lambda: AssertionError("provider invariant failure"),
+        lambda: OfficialDataError("malformed provider evidence"),
+        _source_packet_validation_error,
+    ],
+)
+def test_ticker_provider_bundle_aborts_on_nonrecoverable_provider_failure(
+    monkeypatch,
+    tmp_path,
+    error_factory,
+):
+    now = datetime.datetime(2026, 7, 19, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    cache_path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="KO",
+        evidence_need="earnings_transcripts",
+        source_name="youtube_transcript",
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        _packet(
+            "youtube_transcript",
+            evidence_type="earnings_transcripts",
+            symbol="KO",
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    stale_time = now.timestamp() - (25 * 60 * 60)
+    os.utime(cache_path, (stale_time, stale_time))
+    error = error_factory()
+    later_calls = []
+
+    def broken_youtube(*_args, **_kwargs):
+        raise error
+
+    def later_fmp(*_args, **_kwargs):
+        later_calls.append("fmp")
+        return _packet("fmp", evidence_type="earnings_transcripts", symbol="KO")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_youtube_earnings_transcript_packet",
+        broken_youtube,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_fmp_latest_earning_call_transcript",
+        later_fmp,
+    )
+
+    with pytest.raises(type(error)) as exc_info:
+        build_ticker_provider_research_packets(
+            "ko",
+            evidence_needs=("earnings_transcripts",),
+            disabled_sources={"official_cache", "benzinga"},
+            max_packets_per_need=1,
+            cache_dir=cache_dir,
+            now=now,
+        )
+
+    assert exc_info.value is error
+    assert later_calls == []
 
 
 def test_ticker_provider_bundle_uses_yfinance_options_before_gap(monkeypatch, tmp_path):
@@ -888,7 +971,7 @@ def test_ticker_provider_bundle_blocks_twitter_when_mcp_recent_search_unauthoriz
         orchestrator,
         "fetch_twitter_recent_search_packet",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError(
+            DataTransportError(
                 "twitter-research MCP failed: Unauthorized recent search access"
             )
         ),
@@ -1097,7 +1180,7 @@ def test_stale_yfinance_refresh_cannot_return_stale_yfinance_cache(monkeypatch, 
         orchestrator,
         "_fetch_yfinance_quote_price_context",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError(
+            DataUnavailableError(
                 "yfinance daily OHLCV for NVDA requested as-of 2026-07-06; "
                 "actual latest 2025-07-06: stale"
             )
@@ -1187,7 +1270,7 @@ def test_recent_invalid_yfinance_quote_cache_forces_refresh_and_falls_through(
 
     def stale_refresh(*_args, **_kwargs):
         refresh_calls.append(True)
-        raise orchestrator.OfficialDataError(
+        raise DataUnavailableError(
             "yfinance daily OHLCV for NVDA requested as-of 2026-07-06; "
             "actual latest 2025-07-06: stale"
         )
@@ -1236,7 +1319,7 @@ def test_stale_yfinance_continues_to_other_configured_quote_routes(
         orchestrator,
         "_fetch_yfinance_quote_price_context",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("stale yfinance OHLCV")
+            DataUnavailableError("stale yfinance OHLCV")
         ),
     )
     if later_source == "massive":
@@ -1481,6 +1564,71 @@ def test_ticker_provider_bundle_records_official_cache_miss(tmp_path):
         and attempt["status"] == "cache_miss"
         for attempt in result.route_attempts
     )
+
+
+def test_invalid_official_cache_packet_propagates_without_cache_miss_or_later_fetch(
+    monkeypatch,
+    tmp_path,
+):
+    cache_dir = tmp_path / "cache"
+    cache_path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="NVDA",
+        evidence_need="market_news",
+        source_name="google_news_rss",
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("{}", encoding="utf-8")
+    cache_miss_calls = []
+    later_calls = []
+    original_cache_miss_attempt = orchestrator._cache_miss_attempt
+
+    def cache_miss_attempt(*args, **kwargs):
+        cache_miss_calls.append(True)
+        return original_cache_miss_attempt(*args, **kwargs)
+
+    def later_google(*_args, **_kwargs):
+        later_calls.append("google_news_rss")
+        return _packet("google_news_rss")
+
+    monkeypatch.setattr(orchestrator, "_cache_miss_attempt", cache_miss_attempt)
+    monkeypatch.setattr(orchestrator, "fetch_google_news_rss", later_google)
+
+    with pytest.raises(ValidationError):
+        build_ticker_provider_research_packets(
+            "nvda",
+            evidence_needs=("market_news",),
+            disabled_sources={
+                "alpaca_news",
+                "crawlee",
+                "eodhd",
+                "finnhub",
+                "fmp",
+                "marketaux",
+                "newsapi",
+                "reddit",
+                "reddit_watchlist",
+                "scrapingbee",
+                "tiingo",
+                "twitter",
+            },
+            max_packets_per_need=1,
+            cache_dir=cache_dir,
+        )
+
+    assert cache_miss_calls == []
+    assert later_calls == []
+
+
+def test_absent_broker_snapshot_and_sec_coverage_are_typed_unavailable(tmp_path):
+    with pytest.raises(DataUnavailableError, match="no supervisor snapshot directory"):
+        orchestrator._latest_broker_snapshot_path(tmp_path / "missing")
+
+    with pytest.raises(DataUnavailableError, match="SEC CIK not found"):
+        orchestrator._cik_for_symbol(
+            {"0": {"ticker": "MSFT", "cik_str": 789019}},
+            "NFLX",
+        )
 
 
 def test_ticker_provider_bundle_uses_sec_edgar_for_fundamentals(monkeypatch, tmp_path):

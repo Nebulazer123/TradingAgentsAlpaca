@@ -10,6 +10,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
     OfficialDataError,
     evidence_packet,
     now_iso,
@@ -123,7 +124,9 @@ def fetch_yfinance_options_iv_flow(
     ticker = yf.Ticker(ticker_symbol)
     expirations = list(getattr(ticker, "options", None) or [])
     if not expirations:
-        raise OfficialDataError(f"yfinance returned no option expirations for {ticker_symbol}")
+        raise DataUnavailableError(
+            f"yfinance returned no option expirations for {ticker_symbol}"
+        )
 
     expiration_packets: list[dict[str, Any]] = []
     all_calls: list[dict[str, Any]] = []

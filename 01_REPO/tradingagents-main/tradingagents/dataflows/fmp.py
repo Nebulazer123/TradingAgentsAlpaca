@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from ._official_common import (
+    DataUnavailableError,
     OfficialDataError,
     env_value,
     evidence_packet,
@@ -213,7 +214,7 @@ def fetch_fmp_earning_call_transcript(
     )
     transcript_items = _items(packet.payload)
     if not any(_transcript_text(item) for item in transcript_items):
-        raise OfficialDataError(
+        raise DataUnavailableError(
             f"FMP returned no transcript text for {ticker} Q{fiscal_quarter} {fiscal_year}"
         )
     packet.freshness["read_only"] = True
@@ -272,7 +273,9 @@ def fetch_fmp_latest_earning_call_transcript(
         sort_date = str(item.get("date") or item.get("fiscalDateEnding") or "")
         dated_candidates.append((sort_date, year, quarter))
     if not dated_candidates:
-        raise OfficialDataError(f"FMP returned no earnings transcript dates for {ticker}")
+        raise DataUnavailableError(
+            f"FMP returned no earnings transcript dates for {ticker}"
+        )
     _sort_date, latest_year, latest_quarter = sorted(dated_candidates, reverse=True)[0]
     return fetch_fmp_earning_call_transcript(
         ticker,

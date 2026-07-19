@@ -1,8 +1,13 @@
 import json
 import time
 
+import pytest
+
 from tradingagents.dataflows import reddit, stocktwits
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    OfficialDataError,
+)
 
 
 def test_reddit_fetch_stops_after_public_endpoint_403(monkeypatch):
@@ -10,7 +15,7 @@ def test_reddit_fetch_stops_after_public_endpoint_403(monkeypatch):
 
     def fake_get_text_response(url, **kwargs):
         calls.append((url, kwargs))
-        raise OfficialDataError("HTTP 403: blocked")
+        raise DataTransportError("HTTP 403: blocked")
 
     monkeypatch.setattr(reddit, "get_text_response", fake_get_text_response)
 
@@ -25,6 +30,24 @@ def test_reddit_fetch_stops_after_public_endpoint_403(monkeypatch):
     assert calls[0][1]["connector_name"] == "reddit_public"
     assert "Reddit public endpoint returned HTTP 403" in block
     assert "official Reddit API credentials" in block
+
+
+def test_reddit_terminal_dataflow_failure_propagates(monkeypatch):
+    terminal_error = OfficialDataError("internal dataflow contract failure")
+
+    def fail_terminal(*_args, **_kwargs):
+        raise terminal_error
+
+    monkeypatch.setattr(reddit, "get_text_response", fail_terminal)
+
+    with pytest.raises(OfficialDataError) as exc_info:
+        reddit.fetch_reddit_posts(
+            "CRM",
+            subreddits=("stocks",),
+            inter_request_delay=0,
+        )
+
+    assert exc_info.value is terminal_error
 
 
 def test_stocktwits_fetch_uses_shared_resilient_client(monkeypatch):
