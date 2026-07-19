@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "experiment_starting_cash_usd": "200",
+  "candidate_min_order_usd": "10",
+  "max_active_candidates": 4,
+  "mutations_per_cycle": 2,
+  "minimum_tracked_days": 5,
+  "minimum_closed_trades": 10,
+  "minimum_walk_forward_windows": 3,
+  "maximum_paper_drawdown_pct": "-10",
+  "mutation_bounds": {
+    "current-aggressive": {
+      "min_score": "0.05"
+    },
+    "pullback-support": {
+      "min_daily_change_fraction": "0.005",
+      "max_daily_change_fraction": "0.005",
+      "max_volume_ratio": "0.5"
+    },
+    "catalyst-relative-strength": {
+      "min_score": "0.05"
+    }
+  },
+  "analysis_only": true,
+  "execution_authority": "none",
+  "can_submit_orders": false
+}
