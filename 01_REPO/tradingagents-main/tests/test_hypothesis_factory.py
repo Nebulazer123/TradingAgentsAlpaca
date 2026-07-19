@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import cli.main as cli_main
 import tradingagents.evals.hypothesis_factory as hypothesis_factory_module
 from tradingagents.evals.agent_intelligence_ledger import AgentForecast, write_ledger
 from tradingagents.evals.hypothesis_factory import (
@@ -379,6 +380,73 @@ def test_factory_records_real_availability_separately_from_semantic_now(tmp_path
     } == {producer_time.isoformat(timespec="seconds")}
 
 
+def test_factory_samples_availability_after_one_frozen_semantic_time(
+    monkeypatch,
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    semantic_time = dt.datetime(2026, 7, 18, 20, 0, 0, tzinfo=dt.timezone.utc)
+    available_time = semantic_time + dt.timedelta(seconds=1)
+    wall_times = [semantic_time, *([available_time] * 10)]
+    original_now = hypothesis_factory_module._now_utc
+
+    def semantic_clock(value=None):
+        if value is not None:
+            return original_now(value)
+        return wall_times.pop(0)
+
+    def availability_clock():
+        return wall_times.pop(0)
+
+    monkeypatch.setattr(hypothesis_factory_module, "_now_utc", semantic_clock)
+    availability_root = tmp_path / "availability"
+    payload = run_hypothesis_factory(
+        ledger_path=ledger_path,
+        store_path=tmp_path / "hypotheses.jsonl",
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        availability_root=availability_root,
+        availability_clock=availability_clock,
+    )
+
+    observations = LearningAvailabilityLedger(availability_root).verify()
+    assert payload["learning_observed_count"] == len(observations) > 0
+    assert {row.effective_at for row in observations} == {
+        semantic_time.isoformat(timespec="seconds")
+    }
+    assert {row.recorded_at for row in observations} == {
+        available_time.isoformat(timespec="seconds")
+    }
+
+
+def test_hypothesis_cli_does_not_inject_an_early_availability_time(
+    monkeypatch,
+    tmp_path,
+):
+    captured = {}
+
+    def fake_factory(**kwargs):
+        captured.update(kwargs)
+        return {"analysis_only": True}
+
+    monkeypatch.setattr(cli_main, "run_hypothesis_factory", fake_factory)
+    cli_main.research_hypothesis_factory(
+        ledger_path=tmp_path / "ledger.jsonl",
+        store_path=tmp_path / "hypotheses.jsonl",
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=tmp_path / "lifecycle.jsonl",
+        learning_availability_root=tmp_path / "availability",
+        min_sample=1,
+        edge_threshold="0.15",
+        require_audited_labels=True,
+        json_output=True,
+    )
+
+    assert "producer_recorded_at" not in captured
+
+
 def test_factory_recovers_lifecycle_to_availability_crash_gap(monkeypatch, tmp_path):
     ledger_path = tmp_path / "ledger.jsonl"
     write_ledger(_in_sample_cohort(), path=ledger_path)
@@ -418,6 +486,7 @@ def test_factory_recovers_lifecycle_to_availability_crash_gap(monkeypatch, tmp_p
     lifecycle_events, corrupt = load_lifecycle_events_with_stats(lifecycle_path)
     assert corrupt == 0
     assert lifecycle_events
+    assert not Path(factory_paths["store_path"]).exists()
     assert not availability_root.exists()
 
     monkeypatch.setattr(
@@ -439,6 +508,113 @@ def test_factory_recovers_lifecycle_to_availability_crash_gap(monkeypatch, tmp_p
     assert recovered["lifecycle_appended_event_count"] == 0
     assert recovered["learning_observed_count"] == len(lifecycle_events)
     assert recovered["learning_newly_recorded_count"] == len(lifecycle_events)
+    assert Path(factory_paths["store_path"]).exists()
+
+
+def test_factory_crash_before_lifecycle_append_preserves_old_store_and_events(
+    monkeypatch,
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    store_path = tmp_path / "hypotheses.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=store_path,
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=lifecycle_path,
+        availability_root=tmp_path / "availability",
+    )
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    run_hypothesis_factory(
+        **factory_paths,
+        now=MINE_AT,
+        producer_recorded_at=dt.datetime(
+            2026,
+            7,
+            18,
+            18,
+            0,
+            tzinfo=dt.timezone.utc,
+        ),
+    )
+    bad_id = next(
+        item.hypothesis_id
+        for item in load_hypotheses(store_path)
+        if item.context == {"agent": "bad_agent"}
+    )
+    old_store = store_path.read_bytes()
+    old_events, _ = load_lifecycle_events_with_stats(lifecycle_path)
+    out_of_sample = [
+        *[
+            _forecast("bad_agent", False, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+        *[
+            _forecast("good_agent", True, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+    ]
+    write_ledger([*_in_sample_cohort(), *out_of_sample], path=ledger_path)
+    real_append = hypothesis_factory_module.append_lifecycle_events
+    attempted_types = set()
+
+    def crash_before_append(events, *, path):
+        attempted_types.update(event.event_type for event in events)
+        raise RuntimeError("crash before lifecycle append")
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "append_lifecycle_events",
+        crash_before_append,
+    )
+    with pytest.raises(RuntimeError, match="before lifecycle append"):
+        run_hypothesis_factory(
+            **factory_paths,
+            now=OUT_OF_SAMPLE_AT,
+            producer_recorded_at=dt.datetime(
+                2026,
+                7,
+                18,
+                19,
+                0,
+                tzinfo=dt.timezone.utc,
+            ),
+        )
+    assert EVENT_HYPOTHESIS_SUPPORTED in attempted_types
+    assert EVENT_PRIOR_EMITTED in attempted_types
+    assert store_path.read_bytes() == old_store
+    assert load_lifecycle_events_with_stats(lifecycle_path)[0] == old_events
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "append_lifecycle_events",
+        real_append,
+    )
+    recovered = run_hypothesis_factory(
+        **factory_paths,
+        now=OUT_OF_SAMPLE_AT,
+        producer_recorded_at=dt.datetime(
+            2026,
+            7,
+            18,
+            20,
+            0,
+            tzinfo=dt.timezone.utc,
+        ),
+    )
+    assert recovered["lifecycle_appended_event_count"] > 0
+    assert next(
+        item for item in load_hypotheses(store_path) if item.hypothesis_id == bad_id
+    ).status == STATUS_SUPPORTED
+    recovered_types = {
+        event.event_type
+        for event in load_lifecycle_events_with_stats(lifecycle_path)[0]
+        if event.hypothesis_id == bad_id
+    }
+    assert EVENT_HYPOTHESIS_SUPPORTED in recovered_types
+    assert EVENT_PRIOR_EMITTED in recovered_types
 
 
 def test_run_factory_records_first_supported_verdict_in_lifecycle(tmp_path):

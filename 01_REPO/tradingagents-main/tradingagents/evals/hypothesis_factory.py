@@ -529,6 +529,7 @@ def run_hypothesis_factory(
     ``lifecycle_path`` overrides it.
     """
 
+    semantic_now = _now_utc(now)
     lifecycle_store = (
         Path(lifecycle_path)
         if lifecycle_path is not None
@@ -543,18 +544,6 @@ def run_hypothesis_factory(
             else Path(store_path).parent / "learning_availability"
         )
     )
-    producer_time = (
-        producer_recorded_at
-        if producer_recorded_at is not None
-        else (
-            availability_clock()
-            if availability_clock is not None
-            else datetime.datetime.now(tz=UTC)
-        )
-    )
-    if not isinstance(producer_time, datetime.datetime):
-        raise ValueError("availability clock must return a datetime")
-    producer_time = producer_time.replace(microsecond=0)
     forecasts = load_ledger(ledger_path)
     existing, corrupt_store_line_count = load_hypotheses_with_stats(store_path)
     resolved = [f for f in forecasts if f.resolved and f.outcome is not None]
@@ -567,23 +556,22 @@ def run_hypothesis_factory(
         forecasts,
         min_sample=min_sample,
         edge_threshold=edge_threshold,
-        now=now,
+        now=semantic_now,
         require_audited_labels=require_audited_labels,
     )
     merged, appended = merge_hypotheses(existing, mined)
     evaluated = evaluate_hypotheses(
         merged,
         forecasts,
-        now=now,
+        now=semantic_now,
         require_audited_labels=require_audited_labels,
     )
-    write_hypotheses(evaluated, path=store_path)
     priors = research_priors(evaluated)
     known_events, corrupt_lifecycle_line_count = load_lifecycle_events_with_stats(lifecycle_store)
     lifecycle_events = hypothesis_lifecycle_events(
         existing,
         evaluated,
-        evaluated_at=_now_utc(now).isoformat(timespec="seconds"),
+        evaluated_at=semantic_now.isoformat(timespec="seconds"),
         known_events=known_events,
         prior_multipliers={
             str(row["hypothesis_id"]): str(row["multiplier"]) for row in priors["priors"]
@@ -593,11 +581,24 @@ def run_hypothesis_factory(
     all_lifecycle_events, corrupt_lifecycle_after = load_lifecycle_events_with_stats(
         lifecycle_store
     )
+    producer_time = (
+        producer_recorded_at
+        if producer_recorded_at is not None
+        else (
+            availability_clock()
+            if availability_clock is not None
+            else datetime.datetime.now(tz=UTC)
+        )
+    )
+    if not isinstance(producer_time, datetime.datetime):
+        raise ValueError("availability clock must return a datetime")
+    producer_time = producer_time.replace(microsecond=0)
     availability_admissions = observe_lifecycle_events(
         all_lifecycle_events,
         availability_root=availability_store,
         recorded_at=producer_time,
     )
+    write_hypotheses(evaluated, path=store_path)
     lifecycle_event_type_counts: dict[str, int] = {}
     for event in lifecycle_events:
         lifecycle_event_type_counts[event.event_type] = (
@@ -617,7 +618,7 @@ def run_hypothesis_factory(
         "summary_path": str(summary_path),
         "lifecycle_path": str(lifecycle_store),
         "lifecycle_appended_event_count": lifecycle_appended_count,
-        "lifecycle_total_event_count": len(known_events) + lifecycle_appended_count,
+        "lifecycle_total_event_count": len(all_lifecycle_events),
         "lifecycle_event_type_counts": lifecycle_event_type_counts,
         "corrupt_lifecycle_line_count": max(
             corrupt_lifecycle_line_count,

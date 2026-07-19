@@ -1971,7 +1971,6 @@ def research_hypothesis_factory(
     forecasts created after preregistration can support or refute them, and
     supported hypotheses become bounded advisory priors, never order authority.
     """
-    producer_recorded_at = _learning_producer_now()
     payload = run_hypothesis_factory(
         ledger_path=ledger_path,
         store_path=store_path,
@@ -1979,7 +1978,6 @@ def research_hypothesis_factory(
         summary_path=summary_path,
         lifecycle_path=lifecycle_path,
         availability_root=learning_availability_root,
-        producer_recorded_at=producer_recorded_at,
         min_sample=min_sample,
         edge_threshold=Decimal(edge_threshold),
         require_audited_labels=require_audited_labels,
