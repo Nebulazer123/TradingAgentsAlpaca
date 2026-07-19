@@ -277,6 +277,9 @@ class WorkPacket:
             raise ValueError("allowed_effects must be unique")
         if len(clean_forbidden) != len(set(clean_forbidden)):
             raise ValueError("forbidden_effects must be unique")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise ValueError("confidence must be an int or float")
+        clean_confidence = float(confidence)
         packet = cls(
             schema_version=WORK_PACKET_SCHEMA_VERSION,
             packet_id=build_packet_id(clean_run_id, clean_kind),
@@ -297,7 +300,7 @@ class WorkPacket:
                 recommendation,
                 field="recommendation",
             ),
-            confidence=float(confidence) if not isinstance(confidence, bool) else confidence,
+            confidence=clean_confidence,
             allowed_effects=tuple(sorted(clean_allowed)),
             forbidden_effects=tuple(
                 sorted(REQUIRED_FORBIDDEN_EFFECTS | set(clean_forbidden))

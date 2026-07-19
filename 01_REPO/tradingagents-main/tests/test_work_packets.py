@@ -265,6 +265,15 @@ def test_confidence_rejects_bool_out_of_range_nan_and_infinity(tmp_path, confide
         _packet(tmp_path, confidence=confidence)
 
 
+@pytest.mark.parametrize("confidence", ["0.5", None])
+def test_confidence_rejects_non_numeric_values_with_value_error(
+    tmp_path,
+    confidence,
+):
+    with pytest.raises(ValueError, match="confidence must be an int or float"):
+        _packet(tmp_path, confidence=confidence)
+
+
 def test_time_contract_rejects_naive_equal_and_expired_values(tmp_path):
     with pytest.raises(ValueError, match="timezone-aware"):
         _packet(tmp_path, now=NOW.replace(tzinfo=None))
