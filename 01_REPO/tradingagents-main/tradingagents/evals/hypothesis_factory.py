@@ -871,6 +871,182 @@ def _clear_pending_transaction(store_path: str | Path) -> None:
     _fsync_directory_path(path.parent)
 
 
+def _lifecycle_event_bytes(event: HypothesisLifecycleEvent) -> bytes:
+    return json.dumps(event.as_dict(), sort_keys=True).encode("utf-8")
+
+
+def _valid_lifecycle_event_bytes(
+    payload: bytes,
+) -> HypothesisLifecycleEvent | None:
+    try:
+        decoded = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    event_fields = set(HypothesisLifecycleEvent.__dataclass_fields__)
+    if not isinstance(decoded, Mapping) or set(decoded) != event_fields:
+        return None
+    try:
+        event = HypothesisLifecycleEvent(**decoded)
+        _strict_utc_seconds(
+            event.occurred_at,
+            field_name="lifecycle occurred_at",
+        )
+    except (TypeError, ValueError, PendingHypothesisTransactionError):
+        return None
+    if (
+        event.analysis_only is not True
+        or event.execution_authority != "none"
+        or not isinstance(event.event_id, str)
+        or not event.event_id
+    ):
+        return None
+    return event
+
+
+def _repair_pending_lifecycle_tail(
+    path: str | Path,
+    pending_events: Sequence[HypothesisLifecycleEvent],
+) -> None:
+    lifecycle_path = Path(path)
+    try:
+        descriptor = os.open(
+            lifecycle_path,
+            os.O_RDWR | _NOFOLLOW,
+        )
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise PendingHypothesisTransactionError(
+            "lifecycle ledger could not be opened safely"
+        ) from exc
+    repaired = False
+    try:
+        try:
+            state = os.fstat(descriptor)
+            if not stat.S_ISREG(state.st_mode):
+                raise OSError("lifecycle descriptor is invalid")
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            ledger_bytes = b"".join(chunks)
+        except OSError as exc:
+            raise PendingHypothesisTransactionError(
+                "lifecycle ledger could not be inspected safely"
+            ) from exc
+        if not ledger_bytes or ledger_bytes.endswith(b"\n"):
+            return
+        tail_start = ledger_bytes.rfind(b"\n") + 1
+        tail = ledger_bytes[tail_start:]
+        complete_event = _valid_lifecycle_event_bytes(tail)
+        if (
+            complete_event is not None
+            and _lifecycle_event_bytes(complete_event) == tail
+        ):
+            try:
+                os.lseek(descriptor, 0, os.SEEK_END)
+                if os.write(descriptor, b"\n") != 1:
+                    raise OSError("incomplete lifecycle newline repair")
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise PendingHypothesisTransactionError(
+                    "complete lifecycle tail could not be repaired"
+                ) from exc
+            repaired = True
+        else:
+            pending_payloads = [
+                _lifecycle_event_bytes(event) for event in pending_events
+            ]
+            if not tail or not any(
+                len(tail) < len(payload) and payload.startswith(tail)
+                for payload in pending_payloads
+            ):
+                raise PendingHypothesisTransactionError(
+                    "unrelated incomplete lifecycle tail cannot be repaired"
+                )
+            try:
+                os.ftruncate(descriptor, tail_start)
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise PendingHypothesisTransactionError(
+                    "pending lifecycle tail could not be repaired"
+                ) from exc
+            repaired = True
+    finally:
+        os.close(descriptor)
+    if repaired:
+        _fsync_directory_path(lifecycle_path.parent)
+
+
+def _fsync_lifecycle_ledger(path: str | Path) -> None:
+    lifecycle_path = Path(path)
+    try:
+        state = lifecycle_path.lstat()
+    except OSError as exc:
+        raise PendingHypothesisTransactionError(
+            "lifecycle ledger could not be inspected for durability"
+        ) from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+        raise PendingHypothesisTransactionError(
+            "lifecycle ledger must be a regular file"
+        )
+    try:
+        descriptor = os.open(
+            lifecycle_path,
+            os.O_RDONLY | _NOFOLLOW,
+        )
+    except OSError as exc:
+        raise PendingHypothesisTransactionError(
+            "lifecycle ledger could not be opened for durability"
+        ) from exc
+    try:
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("lifecycle descriptor is invalid")
+            os.fsync(descriptor)
+        except OSError as exc:
+            raise PendingHypothesisTransactionError(
+                "lifecycle ledger could not be made durable"
+            ) from exc
+    finally:
+        os.close(descriptor)
+    _fsync_directory_path(lifecycle_path.parent)
+
+
+def _require_pending_lifecycle_events(
+    path: str | Path,
+    pending_events: Sequence[HypothesisLifecycleEvent],
+    valid_events: Sequence[HypothesisLifecycleEvent],
+) -> None:
+    expected_by_id = {
+        event.event_id: event
+        for event in pending_events
+    }
+    valid_by_id: dict[str, list[HypothesisLifecycleEvent]] = {}
+    for event in valid_events:
+        if event.event_id in expected_by_id:
+            valid_by_id.setdefault(event.event_id, []).append(event)
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise PendingHypothesisTransactionError(
+            "lifecycle ledger could not be verified"
+        ) from exc
+    raw_lines = raw.splitlines()
+    for event_id, expected in expected_by_id.items():
+        valid_matches = valid_by_id.get(event_id, [])
+        canonical_payload = _lifecycle_event_bytes(expected)
+        if (
+            valid_matches != [expected]
+            or raw_lines.count(canonical_payload) != 1
+        ):
+            raise PendingHypothesisTransactionError(
+                "pending lifecycle event is missing or mismatched"
+            )
+
+
 def merge_hypotheses(
     existing: Sequence[ResearchHypothesis],
     candidates: Iterable[ResearchHypothesis],
@@ -1176,9 +1352,16 @@ def _run_hypothesis_factory_locked(
         _write_pending_transaction(store_path, pending_transaction)
 
     priors = research_priors(evaluated)
+    _repair_pending_lifecycle_tail(lifecycle_store, lifecycle_events)
     lifecycle_appended_count = append_lifecycle_events(lifecycle_events, path=lifecycle_store)
+    _fsync_lifecycle_ledger(lifecycle_store)
     all_lifecycle_events, corrupt_lifecycle_after = load_lifecycle_events_with_stats(
         lifecycle_store
+    )
+    _require_pending_lifecycle_events(
+        lifecycle_store,
+        lifecycle_events,
+        all_lifecycle_events,
     )
     producer_time = (
         producer_recorded_at

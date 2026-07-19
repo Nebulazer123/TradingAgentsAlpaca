@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import multiprocessing
+import os
 import time
 from decimal import Decimal
 from pathlib import Path
@@ -868,6 +869,239 @@ def test_factory_serializes_concurrent_entries_without_duplicate_events(tmp_path
     assert not hypothesis_factory_module._pending_transaction_path(
         store_path
     ).exists()
+
+
+def test_factory_repairs_exact_pending_event_prefix_after_torn_append(
+    monkeypatch,
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    store_path = tmp_path / "hypotheses.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    availability_root = tmp_path / "availability"
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=store_path,
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=lifecycle_path,
+        availability_root=availability_root,
+    )
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    run_hypothesis_factory(**factory_paths, now=MINE_AT)
+    bad_id = next(
+        item.hypothesis_id
+        for item in load_hypotheses(store_path)
+        if item.context == {"agent": "bad_agent"}
+    )
+    out_of_sample = [
+        *[
+            _forecast("bad_agent", False, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+        *[
+            _forecast("good_agent", True, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+    ]
+    write_ledger([*_in_sample_cohort(), *out_of_sample], path=ledger_path)
+    real_append = hypothesis_factory_module.append_lifecycle_events
+
+    def tear_first_event(events, *, path):
+        event_bytes = json.dumps(events[0].as_dict(), sort_keys=True).encode()
+        lifecycle = Path(path)
+        with lifecycle.open("ab") as handle:
+            handle.write(event_bytes[: len(event_bytes) // 2])
+            handle.flush()
+            os.fsync(handle.fileno())
+        raise RuntimeError("torn lifecycle append")
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "append_lifecycle_events",
+        tear_first_event,
+    )
+    with pytest.raises(RuntimeError, match="torn lifecycle append"):
+        run_hypothesis_factory(**factory_paths, now=OUT_OF_SAMPLE_AT)
+    assert not lifecycle_path.read_bytes().endswith(b"\n")
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "append_lifecycle_events",
+        real_append,
+    )
+
+    recovered = run_hypothesis_factory(
+        **factory_paths,
+        now="2026-04-01T00:00:00+00:00",
+    )
+
+    assert recovered["lifecycle_appended_event_count"] > 0
+    assert lifecycle_path.read_bytes().endswith(b"\n")
+    _, corrupt = load_lifecycle_events_with_stats(lifecycle_path)
+    assert corrupt == 0
+    transition_events = [
+        event
+        for event in load_lifecycle_events_with_stats(lifecycle_path)[0]
+        if event.hypothesis_id == bad_id
+        and event.event_type
+        in {EVENT_HYPOTHESIS_SUPPORTED, EVENT_PRIOR_EMITTED}
+    ]
+    assert [event.event_type for event in transition_events] == [
+        EVENT_HYPOTHESIS_SUPPORTED,
+        EVENT_PRIOR_EMITTED,
+    ]
+    assert {event.occurred_at for event in transition_events} == {
+        OUT_OF_SAMPLE_AT
+    }
+    observed_ids = {
+        observation.source_id
+        for observation in LearningAvailabilityLedger(availability_root).verify()
+    }
+    assert observed_ids.issuperset(
+        {event.event_id for event in transition_events}
+    )
+    assert next(
+        item for item in load_hypotheses(store_path) if item.hypothesis_id == bad_id
+    ).status == STATUS_SUPPORTED
+    assert not hypothesis_factory_module._pending_transaction_path(
+        store_path
+    ).exists()
+
+
+def test_factory_rejects_unrelated_torn_lifecycle_tail_without_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    store_path = tmp_path / "hypotheses.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=store_path,
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=lifecycle_path,
+        availability_root=tmp_path / "availability",
+    )
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    run_hypothesis_factory(**factory_paths, now=MINE_AT)
+    out_of_sample = [
+        *[
+            _forecast("bad_agent", False, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+        *[
+            _forecast("good_agent", True, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+    ]
+    write_ledger([*_in_sample_cohort(), *out_of_sample], path=ledger_path)
+    real_append = hypothesis_factory_module.append_lifecycle_events
+
+    def append_unrelated_tail(events, *, path):
+        del events
+        with Path(path).open("ab") as handle:
+            handle.write(b'{"unrelated":"corrupt"')
+            handle.flush()
+            os.fsync(handle.fileno())
+        raise RuntimeError("unrelated torn tail")
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "append_lifecycle_events",
+        append_unrelated_tail,
+    )
+    with pytest.raises(RuntimeError, match="unrelated torn tail"):
+        run_hypothesis_factory(**factory_paths, now=OUT_OF_SAMPLE_AT)
+    pending_path = hypothesis_factory_module._pending_transaction_path(store_path)
+    old_pending = pending_path.read_bytes()
+    old_store = store_path.read_bytes()
+    old_lifecycle = lifecycle_path.read_bytes()
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "append_lifecycle_events",
+        real_append,
+    )
+
+    with pytest.raises(
+        hypothesis_factory_module.PendingHypothesisTransactionError,
+        match="unrelated incomplete lifecycle tail",
+    ):
+        run_hypothesis_factory(
+            **factory_paths,
+            now="2026-04-01T00:00:00+00:00",
+        )
+
+    assert pending_path.read_bytes() == old_pending
+    assert store_path.read_bytes() == old_store
+    assert lifecycle_path.read_bytes() == old_lifecycle
+
+
+def test_factory_rejects_mismatched_pending_event_before_state_publication(
+    monkeypatch,
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    store_path = tmp_path / "hypotheses.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=store_path,
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=lifecycle_path,
+        availability_root=tmp_path / "availability",
+    )
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    run_hypothesis_factory(**factory_paths, now=MINE_AT)
+    old_store = store_path.read_bytes()
+    old_observation_ids = {
+        observation.observation_id
+        for observation in LearningAvailabilityLedger(
+            tmp_path / "availability"
+        ).verify()
+    }
+    out_of_sample = [
+        *[
+            _forecast("bad_agent", False, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+        *[
+            _forecast("good_agent", True, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+    ]
+    write_ledger([*_in_sample_cohort(), *out_of_sample], path=ledger_path)
+
+    def append_mismatched_event(events, *, path):
+        mismatched = events[0].as_dict()
+        mismatched["note"] = f"{mismatched['note']} mismatched"
+        with Path(path).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(mismatched, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return 1
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "append_lifecycle_events",
+        append_mismatched_event,
+    )
+    with pytest.raises(
+        hypothesis_factory_module.PendingHypothesisTransactionError,
+        match="missing or mismatched",
+    ):
+        run_hypothesis_factory(**factory_paths, now=OUT_OF_SAMPLE_AT)
+
+    pending_path = hypothesis_factory_module._pending_transaction_path(store_path)
+    assert pending_path.exists()
+    assert store_path.read_bytes() == old_store
+    assert {
+        observation.observation_id
+        for observation in LearningAvailabilityLedger(
+            tmp_path / "availability"
+        ).verify()
+    } == old_observation_ids
 
 
 def test_run_factory_records_first_supported_verdict_in_lifecycle(tmp_path):
