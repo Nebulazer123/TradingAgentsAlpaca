@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import tradingagents.orchestration.decision_ledger as decision_ledger_module
 from tradingagents.orchestration.decision_ledger import (
     DECISION_LEDGER_SCHEMA_VERSION,
     DecisionLedger,
@@ -327,6 +328,57 @@ def test_crash_after_packet_fsync_retries_orphan_object_cleanly(
     assert [event.sequence for event in recovered.verify()] == [1]
 
 
+def test_failed_packet_fsync_orphan_is_redurable_before_journal(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "ledger"
+    packet = _packet(tmp_path)
+    ledger = DecisionLedger(root)
+    real_fsync = os.fsync
+    failed = False
+
+    def fail_first_regular_fsync(descriptor):
+        nonlocal failed
+        state = os.fstat(descriptor)
+        if not failed and stat.S_ISREG(state.st_mode):
+            failed = True
+            raise OSError("injected packet fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(decision_ledger_module.os, "fsync", fail_first_regular_fsync)
+    with pytest.raises(LedgerCorruptionError, match="packet object.*durable"):
+        ledger.record(packet, now=NOW)
+
+    packet_path = root / "packets" / f"{packet.packet_id}.json"
+    original_state = packet_path.stat()
+    original_bytes = packet_path.read_bytes()
+    assert original_bytes == packet.canonical_json_bytes()
+    assert not (root / "events.jsonl").exists()
+
+    monkeypatch.setattr(decision_ledger_module.os, "fsync", real_fsync)
+    fsync_order = []
+
+    def track_recovery_fsync(descriptor):
+        state = os.fstat(descriptor)
+        fsync_order.append((state.st_ino, stat.S_ISDIR(state.st_mode)))
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(decision_ledger_module.os, "fsync", track_recovery_fsync)
+    assert ledger.record(packet, now=NOW) == packet_path
+
+    event_inode = (root / "events.jsonl").stat().st_ino
+    packet_inode = original_state.st_ino
+    packets_dir_inode = (root / "packets").stat().st_ino
+    packet_fsync = fsync_order.index((packet_inode, False))
+    directory_fsync = fsync_order.index((packets_dir_inode, True))
+    event_fsync = fsync_order.index((event_inode, False))
+    assert packet_fsync < directory_fsync < event_fsync
+    assert packet_path.stat().st_ino == packet_inode
+    assert packet_path.read_bytes() == original_bytes
+    assert len(ledger.verify()) == 1
+
+
 def test_crash_after_event_fsync_rebuilds_pointer_without_duplicate(
     tmp_path,
     monkeypatch,
@@ -351,6 +403,102 @@ def test_crash_after_event_fsync_rebuilds_pointer_without_duplicate(
     assert len(recovered.verify()) == 1
     assert recovered.record(packet, now=NOW).is_file()
     assert (root / "events.jsonl").read_bytes() == journal_before
+
+
+@pytest.mark.parametrize("recovery_method", ["record", "rebuild"])
+def test_failed_event_fsync_is_redurable_before_pointer_publication(
+    tmp_path,
+    monkeypatch,
+    recovery_method,
+):
+    root = tmp_path / "ledger"
+    packet = _packet(tmp_path)
+    ledger = DecisionLedger(root)
+    real_fsync = os.fsync
+    regular_fsync_count = 0
+
+    def fail_journal_fsync(descriptor):
+        nonlocal regular_fsync_count
+        state = os.fstat(descriptor)
+        if stat.S_ISREG(state.st_mode):
+            regular_fsync_count += 1
+            if regular_fsync_count == 2:
+                raise OSError("injected journal fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(decision_ledger_module.os, "fsync", fail_journal_fsync)
+    with pytest.raises(LedgerCorruptionError, match="event journal.*durable"):
+        ledger.record(packet, now=NOW)
+
+    journal_path = root / "events.jsonl"
+    journal_before = journal_path.read_bytes()
+    journal_inode = journal_path.stat().st_ino
+    root_inode = root.stat().st_ino
+    assert len(journal_before.splitlines()) == 1
+    assert not (root / "latest" / f"{packet.kind}.json").exists()
+
+    monkeypatch.setattr(decision_ledger_module.os, "fsync", real_fsync)
+    real_atomic_write_text = decision_ledger_module.atomic_write_text
+    persistence_order = []
+
+    def track_recovery_fsync(descriptor):
+        state = os.fstat(descriptor)
+        if state.st_ino == journal_inode:
+            persistence_order.append("journal")
+        elif state.st_ino == root_inode:
+            persistence_order.append("root")
+        return real_fsync(descriptor)
+
+    def track_pointer_publish(path, text, *, encoding="utf-8"):
+        persistence_order.append("pointer")
+        return real_atomic_write_text(path, text, encoding=encoding)
+
+    monkeypatch.setattr(decision_ledger_module.os, "fsync", track_recovery_fsync)
+    monkeypatch.setattr(
+        decision_ledger_module,
+        "atomic_write_text",
+        track_pointer_publish,
+    )
+    if recovery_method == "record":
+        ledger.record(packet, now=NOW)
+    else:
+        ledger.rebuild()
+
+    assert persistence_order.index("journal") < persistence_order.index("root")
+    assert persistence_order.index("root") < persistence_order.index("pointer")
+    assert journal_path.stat().st_ino == journal_inode
+    assert journal_path.read_bytes() == journal_before
+    assert len(ledger.verify()) == 1
+
+
+def test_existing_empty_journal_is_redurable_before_first_append(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "ledger"
+    ledger = DecisionLedger(root)
+    ledger.rebuild()
+    journal_path = root / "events.jsonl"
+    journal_path.write_bytes(b"")
+    journal_inode = journal_path.stat().st_ino
+    root_inode = root.stat().st_ino
+    real_fsync = os.fsync
+    persistence_order = []
+
+    def track_fsync(descriptor):
+        state = os.fstat(descriptor)
+        if state.st_ino == journal_inode:
+            persistence_order.append("journal")
+        elif state.st_ino == root_inode:
+            persistence_order.append("root")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(decision_ledger_module.os, "fsync", track_fsync)
+    ledger.record(_packet(tmp_path), now=NOW)
+
+    assert persistence_order[:3] == ["journal", "root", "journal"]
+    assert journal_path.stat().st_ino == journal_inode
+    assert len(ledger.verify()) == 1
 
 
 def test_historical_objects_verify_but_expired_new_admission_rejects(tmp_path):
@@ -510,6 +658,18 @@ def test_symlinked_managed_directory_is_rejected(tmp_path, managed_name):
         DecisionLedger(root).record(packet, now=NOW)
 
     assert list(outside.iterdir()) == []
+
+
+def test_final_component_root_symlink_is_rejected_before_resolution(tmp_path):
+    real_root = tmp_path / "real-ledger"
+    real_root.mkdir()
+    supplied_root = tmp_path / "ledger-link"
+    os.symlink(real_root, supplied_root)
+
+    with pytest.raises(LedgerCorruptionError, match="root.*symlink"):
+        DecisionLedger(supplied_root)
+
+    assert list(real_root.iterdir()) == []
 
 
 @pytest.mark.parametrize("managed_name", [".ledger.lock", "events.jsonl"])

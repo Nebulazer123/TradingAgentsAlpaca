@@ -190,7 +190,20 @@ class DecisionLedger:
     """Persist and replay immutable work packets under one exclusive lock."""
 
     def __init__(self, root: str | Path):
-        self.root = Path(root).expanduser().resolve()
+        lexical_root = Path(
+            os.path.abspath(os.fspath(Path(root).expanduser()))
+        )
+        try:
+            lexical_state = lexical_root.lstat()
+        except FileNotFoundError:
+            lexical_state = None
+        except OSError as exc:
+            raise LedgerCorruptionError(
+                "ledger root could not be inspected"
+            ) from exc
+        if lexical_state is not None and stat.S_ISLNK(lexical_state.st_mode):
+            raise LedgerCorruptionError("ledger root must not be a symlink")
+        self.root = lexical_root.resolve()
         self._lock_path = self.root / ".ledger.lock"
         self._events_path = self.root / "events.jsonl"
         self._packets_dir = self.root / "packets"
@@ -217,8 +230,12 @@ class DecisionLedger:
         with self._locked():
             self._ensure_managed_directories()
             events = self._replay(evidence_root=evidence_root)
+            self._redurable_journal_if_present()
             packet_path = self._packet_path(packet.packet_id)
-            if self._path_state(packet_path, label="packet object") is None:
+            object_existed = (
+                self._path_state(packet_path, label="packet object") is not None
+            )
+            if not object_existed:
                 self._write_immutable_packet(packet_path, packet_bytes)
                 self._after_packet_fsync(packet_path)
             else:
@@ -246,6 +263,13 @@ class DecisionLedger:
                     )
                 self._repair_latest(events)
                 return packet_path
+
+            if object_existed:
+                self._redurable_regular_file(
+                    packet_path,
+                    label="packet object",
+                )
+                self._fsync_directory(self._packets_dir)
 
             event = LedgerEvent(
                 schema_version=DECISION_LEDGER_SCHEMA_VERSION,
@@ -280,6 +304,7 @@ class DecisionLedger:
         with self._locked():
             self._ensure_managed_directories()
             events = self._replay(evidence_root=evidence_root)
+            self._redurable_journal_if_present()
             self._repair_latest(events)
             return events
 
@@ -434,9 +459,47 @@ class DecisionLedger:
                 raise LedgerCorruptionError(
                     f"directory descriptor is invalid: {path.name}"
                 )
-            os.fsync(descriptor)
+            try:
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise LedgerCorruptionError(
+                    f"directory could not be made durable: {path.name}"
+                ) from exc
         finally:
             os.close(descriptor)
+
+    def _redurable_regular_file(self, path: Path, *, label: str) -> None:
+        state = self._path_state(path, label=label)
+        if state is None:
+            raise LedgerCorruptionError(f"{label} is missing")
+        self._require_regular_state(state, label=label)
+        try:
+            descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW)
+        except OSError as exc:
+            raise LedgerCorruptionError(
+                f"{label} could not be reopened safely"
+            ) from exc
+        try:
+            self._require_regular_descriptor(descriptor, label=label)
+            try:
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise LedgerCorruptionError(
+                    f"{label} could not be made durable"
+                ) from exc
+        finally:
+            os.close(descriptor)
+
+    def _redurable_journal_if_present(self) -> None:
+        state = self._path_state(self._events_path, label="event journal")
+        if state is None:
+            return
+        self._require_regular_state(state, label="event journal")
+        self._redurable_regular_file(
+            self._events_path,
+            label="event journal",
+        )
+        self._fsync_directory(self.root)
 
     def _read_regular(self, path: Path, *, label: str) -> bytes:
         state = self._path_state(path, label=label)
@@ -482,13 +545,18 @@ class DecisionLedger:
             ) from exc
         try:
             self._require_regular_descriptor(descriptor, label="packet object")
-            offset = 0
-            while offset < len(payload):
-                written = os.write(descriptor, payload[offset:])
-                if written <= 0:
-                    raise OSError("incomplete immutable packet write")
-                offset += written
-            os.fsync(descriptor)
+            try:
+                offset = 0
+                while offset < len(payload):
+                    written = os.write(descriptor, payload[offset:])
+                    if written <= 0:
+                        raise OSError("incomplete immutable packet write")
+                    offset += written
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise LedgerCorruptionError(
+                    "packet object could not be made durable"
+                ) from exc
         finally:
             os.close(descriptor)
         self._fsync_directory(self._packets_dir)
@@ -616,9 +684,14 @@ class DecisionLedger:
             ) from exc
         try:
             self._require_regular_descriptor(descriptor, label="event journal")
-            if os.write(descriptor, line) != len(line):
-                raise OSError("incomplete decision event append")
-            os.fsync(descriptor)
+            try:
+                if os.write(descriptor, line) != len(line):
+                    raise OSError("incomplete decision event append")
+                os.fsync(descriptor)
+            except OSError as exc:
+                raise LedgerCorruptionError(
+                    "event journal could not be made durable"
+                ) from exc
         finally:
             os.close(descriptor)
         if state is None:
