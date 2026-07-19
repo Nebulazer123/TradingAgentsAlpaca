@@ -9,10 +9,14 @@ safety envelope of every emitted packet.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
+import tradingagents.evals.hypothesis_factory as hypothesis_factory_module
 from tradingagents.evals.agent_intelligence_ledger import AgentForecast, write_ledger
 from tradingagents.evals.hypothesis_factory import (
     STATUS_PREREGISTERED,
@@ -34,6 +38,7 @@ from tradingagents.evals.hypothesis_lifecycle import (
     EVENT_PRIOR_EMITTED,
     load_lifecycle_events_with_stats,
 )
+from tradingagents.evals.learning_availability import LearningAvailabilityLedger
 
 MINE_AT = "2026-02-01T00:00:00+00:00"
 IN_SAMPLE_AT = "2026-01-05T00:00:00+00:00"
@@ -311,6 +316,9 @@ def test_run_factory_appends_lifecycle_registrations_idempotently(tmp_path):
     # tmp-path runs never touch the real results tree.
     lifecycle_path = Path(payload["lifecycle_path"])
     assert lifecycle_path == store_path.with_name("lifecycle.jsonl")
+    assert payload["learning_availability_root"] == str(
+        tmp_path / "learning_availability"
+    )
     events, corrupt = load_lifecycle_events_with_stats(lifecycle_path)
     assert corrupt == 0
     assert payload["corrupt_lifecycle_line_count"] == 0
@@ -327,6 +335,110 @@ def test_run_factory_appends_lifecycle_registrations_idempotently(tmp_path):
     again = run_hypothesis_factory(**factory_paths, now=MINE_AT)
     assert again["lifecycle_appended_event_count"] == 0
     assert again["lifecycle_total_event_count"] == payload["hypothesis_count"]
+
+
+def test_factory_records_real_availability_separately_from_semantic_now(tmp_path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    availability_root = tmp_path / "availability"
+    producer_time = dt.datetime(2026, 7, 18, 18, 30, tzinfo=dt.timezone.utc)
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=tmp_path / "hypotheses.jsonl",
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        availability_root=availability_root,
+    )
+
+    payload = run_hypothesis_factory(
+        **factory_paths,
+        now=MINE_AT,
+        producer_recorded_at=producer_time,
+    )
+
+    observations = LearningAvailabilityLedger(availability_root).verify()
+    assert payload["learning_availability_root"] == str(availability_root)
+    assert payload["learning_observed_count"] == payload["lifecycle_total_event_count"]
+    assert payload["learning_newly_recorded_count"] == payload["lifecycle_total_event_count"]
+    assert {row.source_kind for row in observations} == {"hypothesis_lifecycle"}
+    assert {row.recorded_at for row in observations} == {
+        producer_time.isoformat(timespec="seconds")
+    }
+    assert {row.effective_at for row in observations} == {MINE_AT}
+
+    again = run_hypothesis_factory(
+        **factory_paths,
+        now=MINE_AT,
+        producer_recorded_at=producer_time + dt.timedelta(hours=1),
+    )
+    assert again["learning_observed_count"] == len(observations)
+    assert again["learning_newly_recorded_count"] == 0
+    assert {
+        row.recorded_at
+        for row in LearningAvailabilityLedger(availability_root).verify()
+    } == {producer_time.isoformat(timespec="seconds")}
+
+
+def test_factory_recovers_lifecycle_to_availability_crash_gap(monkeypatch, tmp_path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    availability_root = tmp_path / "availability"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=tmp_path / "hypotheses.jsonl",
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=lifecycle_path,
+        availability_root=availability_root,
+        now=MINE_AT,
+    )
+    real_observe = hypothesis_factory_module.observe_lifecycle_events
+
+    def crash_before_availability(*args, **kwargs):
+        raise RuntimeError("crash after lifecycle append")
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "observe_lifecycle_events",
+        crash_before_availability,
+    )
+    with pytest.raises(RuntimeError, match="lifecycle append"):
+        run_hypothesis_factory(
+            **factory_paths,
+            producer_recorded_at=dt.datetime(
+                2026,
+                7,
+                18,
+                19,
+                0,
+                tzinfo=dt.timezone.utc,
+            ),
+        )
+    lifecycle_events, corrupt = load_lifecycle_events_with_stats(lifecycle_path)
+    assert corrupt == 0
+    assert lifecycle_events
+    assert not availability_root.exists()
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "observe_lifecycle_events",
+        real_observe,
+    )
+    recovered = run_hypothesis_factory(
+        **factory_paths,
+        producer_recorded_at=dt.datetime(
+            2026,
+            7,
+            18,
+            20,
+            0,
+            tzinfo=dt.timezone.utc,
+        ),
+    )
+    assert recovered["lifecycle_appended_event_count"] == 0
+    assert recovered["learning_observed_count"] == len(lifecycle_events)
+    assert recovered["learning_newly_recorded_count"] == len(lifecycle_events)
 
 
 def test_run_factory_records_first_supported_verdict_in_lifecycle(tmp_path):

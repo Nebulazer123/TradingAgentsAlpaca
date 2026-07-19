@@ -176,6 +176,7 @@ from tradingagents.evals.execution_board import (
     write_execution_board_review,
 )
 from tradingagents.evals.hypothesis_factory import run_hypothesis_factory
+from tradingagents.evals.learning_availability import observe_forecasts
 from tradingagents.evals.overnight_calibration import (
     build_overnight_calibration_guard,
     latest_walk_forward_cohort_path,
@@ -924,6 +925,21 @@ def _ledger_window_lookup(symbol: str, start_date: str, end_date: str):
     )
 
 
+def _learning_producer_now() -> datetime.datetime:
+    return datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
+
+
+def _forecast_learning_availability_root(
+    ledger_path: Path,
+    override: Path | None,
+) -> Path:
+    if override is not None:
+        return override
+    if ledger_path == DEFAULT_LEDGER_PATH:
+        return Path("results/learning_availability")
+    return ledger_path.parent / "learning_availability"
+
+
 def _static_price_lookup_from_rows(rows: list[Any]):
     by_key: dict[tuple[str, str, str], tuple[Any, Any]] = {}
     for row in rows:
@@ -1488,6 +1504,11 @@ def research_agent_ledger_resolve(
         "--resolution-quality-path",
         help="Machine-readable resolution-window quality summary output path.",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     context_ticker: str = typer.Option("", "--context-ticker"),
     context_setup: str = typer.Option("", "--context-setup"),
@@ -1502,6 +1523,11 @@ def research_agent_ledger_resolve(
     mismatched ticker/benchmark sessions, stale data) are deferred with a
     machine-readable reason instead of being scored against bad windows.
     """
+    producer_recorded_at = _learning_producer_now()
+    availability_root = _forecast_learning_availability_root(
+        ledger_path,
+        learning_availability_root,
+    )
     forecasts = load_ledger(ledger_path)
     unaudited_before = sum(
         1 for forecast in forecasts if forecast.resolved and not forecast.label_quality
@@ -1509,6 +1535,7 @@ def research_agent_ledger_resolve(
     resolved, quality_reports = resolve_forecasts_with_quality(
         forecasts,
         window_lookup=_ledger_window_lookup,
+        now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
     quality_summary = summarize_resolution_quality(
@@ -1516,6 +1543,11 @@ def research_agent_ledger_resolve(
         unaudited_resolved_count=unaudited_before,
     )
     write_ledger(resolved, path=ledger_path)
+    availability_admissions = observe_forecasts(
+        resolved,
+        availability_root=availability_root,
+        recorded_at=producer_recorded_at,
+    )
     write_summary(resolved, path=summary_path)
     resolution_quality_path.parent.mkdir(parents=True, exist_ok=True)
     resolution_quality_path.write_text(
@@ -1539,6 +1571,11 @@ def research_agent_ledger_resolve(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "resolution_quality_path": str(resolution_quality_path),
+        "learning_availability_root": str(availability_root),
+        "learning_observed_count": len(availability_admissions),
+        "learning_newly_recorded_count": sum(
+            admission.created for admission in availability_admissions
+        ),
         "forecast_count": len(resolved),
         "newly_resolved_count": after - before,
         "resolved_count": after,
@@ -1578,6 +1615,11 @@ def research_ledger_quality_audit(
         "--quality-path",
         help="Machine-readable resolution-window quality summary output path.",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     backup: bool = typer.Option(
         True,
@@ -1594,6 +1636,11 @@ def research_ledger_quality_audit(
     longer be verified, is downgraded to suspect so mining excludes it.
     Analysis-only; no execution authority.
     """
+    producer_recorded_at = _learning_producer_now()
+    availability_root = _forecast_learning_availability_root(
+        ledger_path,
+        learning_availability_root,
+    )
     forecasts, corrupt_line_count = load_ledger_with_stats(ledger_path)
     resolved_count = sum(1 for forecast in forecasts if forecast.resolved)
     backup_path: Path | None = None
@@ -1606,9 +1653,15 @@ def research_ledger_quality_audit(
     audited, quality_reports = audit_resolved_forecasts(
         forecasts,
         window_lookup=_ledger_window_lookup,
+        now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
     write_ledger(audited, path=ledger_path)
+    availability_admissions = observe_forecasts(
+        audited,
+        availability_root=availability_root,
+        recorded_at=producer_recorded_at,
+    )
     write_summary(audited, path=summary_path)
     quality_summary = summarize_resolution_quality(quality_reports)
     quality_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1628,6 +1681,11 @@ def research_ledger_quality_audit(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "quality_path": str(quality_path),
+        "learning_availability_root": str(availability_root),
+        "learning_observed_count": len(availability_admissions),
+        "learning_newly_recorded_count": sum(
+            admission.created for admission in availability_admissions
+        ),
         "backup_path": str(backup_path) if backup_path else None,
         "forecast_count": len(audited),
         "resolved_forecast_count": resolved_count,
@@ -1668,6 +1726,11 @@ def research_agent_ledger_update(
         "--summary-path",
         help="Agent score summary output path.",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     benchmark: str = typer.Option("SPY", "--benchmark"),
     horizon_days: int = typer.Option(5, "--horizon-days", min=1, max=60),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
@@ -1691,6 +1754,11 @@ def research_agent_ledger_update(
     It mutates only ledger/summary files and has no execution authority.
     """
 
+    producer_recorded_at = _learning_producer_now()
+    availability_root = _forecast_learning_availability_root(
+        ledger_path,
+        learning_availability_root,
+    )
     threshold = Decimal(alpha_threshold_pct)
     overnight_forecasts = []
     overnight_payload = _read_json_packet(overnight_packet)
@@ -1728,6 +1796,7 @@ def research_agent_ledger_update(
     resolved, quality_reports = resolve_forecasts_with_quality(
         forecasts,
         window_lookup=_ledger_window_lookup,
+        now=producer_recorded_at,
         alpha_threshold_pct=threshold,
     )
     quality_summary = summarize_resolution_quality(
@@ -1735,6 +1804,11 @@ def research_agent_ledger_update(
         unaudited_resolved_count=unaudited_before,
     )
     write_ledger(resolved, path=ledger_path)
+    availability_admissions = observe_forecasts(
+        resolved,
+        availability_root=availability_root,
+        recorded_at=producer_recorded_at,
+    )
     write_summary(resolved, path=summary_path)
     after_resolved = sum(1 for forecast in resolved if forecast.resolved)
     summary = summarize_agent_scores(resolved)
@@ -1762,6 +1836,11 @@ def research_agent_ledger_update(
         "include_mirofish": include_mirofish,
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
+        "learning_availability_root": str(availability_root),
+        "learning_observed_count": len(availability_admissions),
+        "learning_newly_recorded_count": sum(
+            admission.created for admission in availability_admissions
+        ),
         "forecast_count": len(resolved),
         "discovered_forecast_count": len(discovered_forecasts),
         "overnight_forecast_count": len(overnight_forecasts),
@@ -1860,6 +1939,11 @@ def research_hypothesis_factory(
         "--lifecycle-path",
         help="Append-only hypothesis lifecycle event ledger (never rewritten).",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     min_sample: int = typer.Option(
         12,
         "--min-sample",
@@ -1887,12 +1971,15 @@ def research_hypothesis_factory(
     forecasts created after preregistration can support or refute them, and
     supported hypotheses become bounded advisory priors, never order authority.
     """
+    producer_recorded_at = _learning_producer_now()
     payload = run_hypothesis_factory(
         ledger_path=ledger_path,
         store_path=store_path,
         priors_path=priors_path,
         summary_path=summary_path,
         lifecycle_path=lifecycle_path,
+        availability_root=learning_availability_root,
+        producer_recorded_at=producer_recorded_at,
         min_sample=min_sample,
         edge_threshold=Decimal(edge_threshold),
         require_audited_labels=require_audited_labels,

@@ -28,7 +28,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
@@ -43,6 +43,7 @@ from tradingagents.evals.hypothesis_lifecycle import (
     hypothesis_lifecycle_events,
     load_lifecycle_events_with_stats,
 )
+from tradingagents.evals.learning_availability import observe_lifecycle_events
 from tradingagents.evals.resolution_quality import (
     LABEL_QUALITY_SUSPECT,
     MINABLE_LABEL_QUALITIES,
@@ -54,6 +55,7 @@ UTC = datetime.timezone.utc
 DEFAULT_STORE_PATH = Path("results/hypothesis_factory/hypotheses.jsonl")
 DEFAULT_PRIORS_PATH = Path("results/hypothesis_factory/priors.json")
 DEFAULT_SUMMARY_PATH = Path("results/hypothesis_factory/summary.json")
+DEFAULT_LEARNING_AVAILABILITY_ROOT = Path("results/learning_availability")
 
 DEFAULT_MIN_SAMPLE = 12
 DEFAULT_EDGE_THRESHOLD = Decimal("0.15")
@@ -510,6 +512,9 @@ def run_hypothesis_factory(
     priors_path: str | Path = DEFAULT_PRIORS_PATH,
     summary_path: str | Path = DEFAULT_SUMMARY_PATH,
     lifecycle_path: str | Path | None = None,
+    availability_root: str | Path | None = None,
+    producer_recorded_at: datetime.datetime | None = None,
+    availability_clock: Callable[[], datetime.datetime] | None = None,
     min_sample: int = DEFAULT_MIN_SAMPLE,
     edge_threshold: Decimal | str = DEFAULT_EDGE_THRESHOLD,
     now: datetime.datetime | str | None = None,
@@ -529,6 +534,27 @@ def run_hypothesis_factory(
         if lifecycle_path is not None
         else Path(store_path).with_name("lifecycle.jsonl")
     )
+    availability_store = (
+        Path(availability_root)
+        if availability_root is not None
+        else (
+            DEFAULT_LEARNING_AVAILABILITY_ROOT
+            if Path(store_path) == DEFAULT_STORE_PATH
+            else Path(store_path).parent / "learning_availability"
+        )
+    )
+    producer_time = (
+        producer_recorded_at
+        if producer_recorded_at is not None
+        else (
+            availability_clock()
+            if availability_clock is not None
+            else datetime.datetime.now(tz=UTC)
+        )
+    )
+    if not isinstance(producer_time, datetime.datetime):
+        raise ValueError("availability clock must return a datetime")
+    producer_time = producer_time.replace(microsecond=0)
     forecasts = load_ledger(ledger_path)
     existing, corrupt_store_line_count = load_hypotheses_with_stats(store_path)
     resolved = [f for f in forecasts if f.resolved and f.outcome is not None]
@@ -564,6 +590,14 @@ def run_hypothesis_factory(
         },
     )
     lifecycle_appended_count = append_lifecycle_events(lifecycle_events, path=lifecycle_store)
+    all_lifecycle_events, corrupt_lifecycle_after = load_lifecycle_events_with_stats(
+        lifecycle_store
+    )
+    availability_admissions = observe_lifecycle_events(
+        all_lifecycle_events,
+        availability_root=availability_store,
+        recorded_at=producer_time,
+    )
     lifecycle_event_type_counts: dict[str, int] = {}
     for event in lifecycle_events:
         lifecycle_event_type_counts[event.event_type] = (
@@ -585,7 +619,15 @@ def run_hypothesis_factory(
         "lifecycle_appended_event_count": lifecycle_appended_count,
         "lifecycle_total_event_count": len(known_events) + lifecycle_appended_count,
         "lifecycle_event_type_counts": lifecycle_event_type_counts,
-        "corrupt_lifecycle_line_count": corrupt_lifecycle_line_count,
+        "corrupt_lifecycle_line_count": max(
+            corrupt_lifecycle_line_count,
+            corrupt_lifecycle_after,
+        ),
+        "learning_availability_root": str(availability_store),
+        "learning_observed_count": len(availability_admissions),
+        "learning_newly_recorded_count": sum(
+            admission.created for admission in availability_admissions
+        ),
         "forecast_count": len(forecasts),
         "resolved_forecast_count": len(resolved),
         "require_audited_labels": require_audited_labels,
