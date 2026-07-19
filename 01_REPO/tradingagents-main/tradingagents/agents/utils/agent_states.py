@@ -48,6 +48,12 @@ class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     asset_type: Annotated[str, "Asset type under analysis such as stock or crypto"]
     trade_date: Annotated[str, "What date we are trading at"]
+    run_id: Annotated[str, "Stable logical graph-run identity"]
+    run_started_at: Annotated[str, "Checkpoint-stable real UTC run start"]
+    decision_packet_refs: Annotated[
+        list[dict], "Compact decision packet references"
+    ]
+    learning_context: Annotated[str, "Bounded point-in-time learning context"]
 
     sender: Annotated[str, "Agent that sent this message"]
 

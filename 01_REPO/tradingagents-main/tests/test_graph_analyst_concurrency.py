@@ -71,7 +71,11 @@ def test_graph_setup_uses_batched_analyst_fanout_when_concurrency_enabled(monkey
     assert ("Msg Clear Sentiment", "Analyst Batch 1 Complete") in graph.edges
     assert ("Msg Clear News", "Analyst Batch 2 Complete") in graph.edges
     assert ("Msg Clear Fundamentals", "Analyst Batch 2 Complete") in graph.edges
-    assert ("Analyst Batch 2 Complete", "Bull Researcher") in graph.edges
+    assert (
+        "Analyst Batch 2 Complete",
+        "Research Evidence Packet",
+    ) in graph.edges
+    assert ("Research Evidence Packet", "Bull Researcher") in graph.edges
     assert "tools_social" not in graph.nodes
 
     start_route = next(path for source, path, _path_map in graph.conditional_edges if source == START)
@@ -170,7 +174,10 @@ def _route_to_end_logic():
     return logic
 
 
-def test_concurrent_graph_executes_end_to_end_with_branch_local_message_ids(monkeypatch):
+def test_concurrent_graph_executes_end_to_end_with_branch_local_message_ids(
+    monkeypatch,
+    tmp_path,
+):
     """Regression for the 2026-07-11 overnight 3/3 graph failure: run the
     REAL compiled LangGraph with analyst_concurrency_limit=2, stub analyst
     nodes that emit branch-local AI message ids (as Gemini does), and the
@@ -240,11 +247,20 @@ def test_concurrent_graph_executes_end_to_end_with_branch_local_message_ids(monk
         conditional_logic=_route_to_end_logic(),
         analyst_concurrency_limit=2,
         tool_free_analysts={"market", "social", "news", "fundamentals"},
+        ledger_root=tmp_path / "ledger",
+        evidence_root=tmp_path / "evidence",
     ).setup_graph(["market", "social", "news", "fundamentals"])
 
     compiled = workflow.compile()
+    from tradingagents.graph.propagation import Propagator
+
+    initial_state = Propagator().create_initial_state(
+        "TEST",
+        "2026-07-19",
+    )
+    initial_state["messages"] = [HumanMessage(content="seed", id="seed-1")]
     result = compiled.invoke(
-        {"messages": [HumanMessage(content="seed", id="seed-1")]},
+        initial_state,
         {"recursion_limit": 50},
     )
 

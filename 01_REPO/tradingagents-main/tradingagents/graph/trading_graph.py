@@ -3,7 +3,9 @@
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+import re
+from collections.abc import Mapping
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,15 +37,115 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.orchestration.work_packets import build_packet_id
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
+from .packet_nodes import (
+    DECISION_PACKET_REF_SCHEMA_VERSION,
+    PACKET_HANDOFF_SCHEMA_VERSION,
+    build_graph_run_id,
+)
 from .propagation import Propagator
 from .reflection import Reflector
 from .setup import GraphSetup
 from .signal_processing import SignalProcessor
 
 CHECKPOINT_SIGNATURE_SCHEMA_VERSION = 1
+_LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CHECKPOINT_PACKET_REF_FIELDS = {
+    "schema_version",
+    "packet_id",
+    "kind",
+    "packet_sha256",
+    "packet_path",
+    "evidence_sha256",
+    "analysis_only",
+    "execution_authority",
+    "can_submit_orders",
+}
+_CHECKPOINT_PACKET_KIND_ORDER = (
+    "research_evidence",
+    "trader_proposal",
+    "portfolio_decision",
+)
+
+
+def _checkpoint_run_start(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("checkpoint run_started_at must be canonical UTC seconds")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            "checkpoint run_started_at must be canonical UTC seconds"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("checkpoint run_started_at must be canonical UTC seconds")
+    normalized = parsed.astimezone(timezone.utc)
+    if (
+        normalized.microsecond != 0
+        or normalized.isoformat(timespec="seconds") != value
+    ):
+        raise ValueError("checkpoint run_started_at must be canonical UTC seconds")
+    return value
+
+
+def _checkpoint_packet_refs(value: Any, *, run_id: str) -> list[dict]:
+    if not isinstance(value, list):
+        raise ValueError("checkpoint decision_packet_refs must be a list")
+    if len(value) > len(_CHECKPOINT_PACKET_KIND_ORDER):
+        raise ValueError("checkpoint decision_packet_refs contains extra items")
+    expected_kinds = list(_CHECKPOINT_PACKET_KIND_ORDER[: len(value)])
+    normalized = []
+    packet_ids = []
+    for index, (reference, expected_kind) in enumerate(
+        zip(value, expected_kinds, strict=True)
+    ):
+        if (
+            not isinstance(reference, Mapping)
+            or set(reference) != _CHECKPOINT_PACKET_REF_FIELDS
+        ):
+            raise ValueError(
+                f"checkpoint decision_packet_refs[{index}] has invalid fields"
+            )
+        if type(reference["schema_version"]) is not int or (
+            reference["schema_version"] != DECISION_PACKET_REF_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"checkpoint decision_packet_refs[{index}] has invalid schema"
+            )
+        packet_id = build_packet_id(run_id, expected_kind)
+        if (
+            reference["packet_id"] != packet_id
+            or reference["kind"] != expected_kind
+            or reference["packet_path"] != f"packets/{packet_id}.json"
+        ):
+            raise ValueError(
+                f"checkpoint decision_packet_refs[{index}] has invalid identity"
+            )
+        if (
+            not isinstance(reference["packet_sha256"], str)
+            or _LOWER_SHA256.fullmatch(reference["packet_sha256"]) is None
+            or not isinstance(reference["evidence_sha256"], str)
+            or _LOWER_SHA256.fullmatch(reference["evidence_sha256"]) is None
+        ):
+            raise ValueError(
+                f"checkpoint decision_packet_refs[{index}] has invalid digest"
+            )
+        if (
+            reference["analysis_only"] is not True
+            or reference["execution_authority"] != "none"
+            or reference["can_submit_orders"] is not False
+        ):
+            raise ValueError(
+                f"checkpoint decision_packet_refs[{index}] has invalid authority"
+            )
+        packet_ids.append(packet_id)
+        normalized.append(dict(reference))
+    if len(packet_ids) != len(set(packet_ids)):
+        raise ValueError("checkpoint decision_packet_refs contains duplicates")
+    return normalized
 
 
 class TradingAgentsGraph:
@@ -86,6 +188,7 @@ class TradingAgentsGraph:
                 sorted(set(self.config.get("tool_free_analysts", [])))
             ),
             "source_revision": self.config.get("checkpoint_source_revision"),
+            "packet_handoff_schema_version": PACKET_HANDOFF_SCHEMA_VERSION,
         }
 
         # Update the interface's config
@@ -139,10 +242,17 @@ class TradingAgentsGraph:
                 "analyst_concurrency_limit"
             ],
             tool_free_analysts=set(self._checkpoint_shape["tool_free_analysts"]),
+            ledger_root=(
+                Path(self.config["results_dir"])
+                / "control_plane"
+                / "decisions"
+            ),
+            evidence_root=Path(self.config["results_dir"]),
         )
 
         self.propagator = Propagator(
             max_recur_limit=self.config.get("max_recur_limit", 100),
+            run_signature_factory=self._run_signature,
         )
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
@@ -389,6 +499,15 @@ class TradingAgentsGraph:
                     "checkpoint_source_revision must be a clean revision token"
                 )
 
+        packet_handoff_schema_version = shape["packet_handoff_schema_version"]
+        if (
+            type(packet_handoff_schema_version) is not int
+            or packet_handoff_schema_version < 1
+        ):
+            raise ValueError(
+                "packet_handoff_schema_version must be a positive integer"
+            )
+
         payload = {
             "schema_version": schema_version,
             "selected_analysts": list(shape["selected_analysts"]),
@@ -398,6 +517,7 @@ class TradingAgentsGraph:
             "analyst_concurrency_limit": shape["analyst_concurrency_limit"],
             "tool_free_analysts": list(shape["tool_free_analysts"]),
             "source_revision": source_revision,
+            "packet_handoff_schema_version": packet_handoff_schema_version,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
@@ -411,9 +531,13 @@ class TradingAgentsGraph:
         a per-ticker SqliteSaver so a crashed run can resume from the last
         successful node only under the same ticker, date, and graph shape.
         """
-        checkpoint_signature = None
-        if self.config.get("checkpoint_enabled"):
-            checkpoint_signature = self._run_signature(asset_type)
+        checkpoint_signature = self._run_signature(asset_type)
+        if not isinstance(checkpoint_signature, str):
+            if isinstance(self, TradingAgentsGraph):
+                raise ValueError("graph run signature must be a string")
+            # Preserve legacy duck-typed callers of this unbound method. Real
+            # TradingAgentsGraph instances always use the frozen graph shape.
+            checkpoint_signature = "standalone-v1"
 
         self.ticker = company_name
 
@@ -462,23 +586,56 @@ class TradingAgentsGraph:
         checkpoint_signature: str | None = None,
     ):
         """Execute the graph and write the resulting state to disk and memory log."""
-        # Initialize state — inject memory log context for PM.
-        past_context = self.memory_log.get_past_context(company_name)
-        init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date, asset_type=asset_type, past_context=past_context
+        if checkpoint_signature is None:
+            checkpoint_signature = self._run_signature(asset_type)
+        expected_run_id = build_graph_run_id(
+            company_name,
+            str(trade_date),
+            asset_type,
+            checkpoint_signature,
         )
         args = self.propagator.get_graph_args()
+        invocation_state = None
+        checkpoint_values: Mapping[str, Any] | None = None
 
         # Only an identical ticker, date, and graph-shape signature may resume.
         if self.config.get("checkpoint_enabled"):
-            if checkpoint_signature is None:
-                checkpoint_signature = self._run_signature(asset_type)
             tid = thread_id(company_name, str(trade_date), checkpoint_signature)
             args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = tid
+            snapshot = self.graph.get_state(args["config"])
+            raw_values = getattr(snapshot, "values", None)
+            if raw_values:
+                if not isinstance(raw_values, Mapping):
+                    raise ValueError("checkpoint values must be a mapping")
+                checkpoint_values = raw_values
+                if raw_values.get("run_id") != expected_run_id:
+                    raise ValueError(
+                        "checkpoint run_id does not match the logical graph run"
+                    )
+                _checkpoint_run_start(raw_values.get("run_started_at"))
+                _checkpoint_packet_refs(
+                    raw_values.get("decision_packet_refs"),
+                    run_id=expected_run_id,
+                )
+                if not isinstance(raw_values.get("learning_context"), str):
+                    raise ValueError(
+                        "checkpoint learning_context must be a string"
+                    )
+
+        if checkpoint_values is None:
+            # Construct exactly one fresh state only after checkpoint inspection.
+            past_context = self.memory_log.get_past_context(company_name)
+            invocation_state = self.propagator.create_initial_state(
+                company_name,
+                trade_date,
+                asset_type=asset_type,
+                past_context=past_context,
+                run_id=expected_run_id,
+            )
 
         if self.debug:
             trace = []
-            for chunk in self.graph.stream(init_agent_state, **args):
+            for chunk in self.graph.stream(invocation_state, **args):
                 if len(chunk["messages"]) == 0:
                     pass
                 else:
@@ -490,7 +647,7 @@ class TradingAgentsGraph:
             for chunk in trace:
                 final_state.update(chunk)
         else:
-            final_state = self.graph.invoke(init_agent_state, **args)
+            final_state = self.graph.invoke(invocation_state, **args)
 
         # Store current state for reflection.
         self.curr_state = final_state

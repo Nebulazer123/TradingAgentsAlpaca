@@ -189,6 +189,10 @@ def _bare_signature_graph(
             sorted(set(graph.config["tool_free_analysts"]))
         ),
         "source_revision": graph.config.get("checkpoint_source_revision"),
+        "packet_handoff_schema_version": graph.config.get(
+            "packet_handoff_schema_version",
+            1,
+        ),
     }
     return graph
 
@@ -214,6 +218,7 @@ def test_run_signature_is_stable_canonical_and_allowlisted():
         "asset_type",
         "max_debate_rounds",
         "max_risk_discuss_rounds",
+        "packet_handoff_schema_version",
         "schema_version",
         "selected_analysts",
         "source_revision",
@@ -256,6 +261,11 @@ def test_run_signature_is_stable_canonical_and_allowlisted():
             ("market", "news"),
             "stock",
             {"checkpoint_source_revision": "a" * 40},
+        ),
+        (
+            ("market", "news"),
+            "stock",
+            {"packet_handoff_schema_version": 2},
         ),
     ),
 )
@@ -351,10 +361,15 @@ def test_constructor_consumes_analyst_generator_once_and_freezes_same_order(
         "GraphSetup",
         _GraphSetup,
     )
+
+    def _propagator(**kwargs):
+        captured["propagator_kwargs"] = kwargs
+        return object()
+
     monkeypatch.setattr(
         trading_graph_module,
         "Propagator",
-        lambda **_kwargs: object(),
+        _propagator,
     )
     monkeypatch.setattr(
         trading_graph_module,
@@ -385,6 +400,15 @@ def test_constructor_consumes_analyst_generator_once_and_freezes_same_order(
     assert graph.selected_analysts == ("news", "market")
     assert captured["workflow_analysts"] == ("news", "market")
     assert graph._checkpoint_shape["selected_analysts"] == ("news", "market")
+    assert graph._checkpoint_shape["packet_handoff_schema_version"] == 1
+    assert captured["setup_kwargs"]["ledger_root"] == (
+        tmp_path / "results" / "control_plane" / "decisions"
+    )
+    assert captured["setup_kwargs"]["evidence_root"] == tmp_path / "results"
+    assert (
+        captured["propagator_kwargs"]["run_signature_factory"].__self__
+        is graph
+    )
     assert json.loads(graph._run_signature("stock"))["selected_analysts"] == [
         "news",
         "market",
@@ -406,6 +430,15 @@ def test_run_signature_rejects_non_clean_source_revision(bad_revision):
         config_overrides={"checkpoint_source_revision": bad_revision}
     )
     with pytest.raises(ValueError, match="checkpoint_source_revision"):
+        graph._run_signature("stock")
+
+
+@pytest.mark.parametrize("bad_version", (True, False, 0, -1, 1.0, "1"))
+def test_run_signature_rejects_invalid_packet_handoff_version(bad_version):
+    graph = _bare_signature_graph()
+    graph._checkpoint_shape["packet_handoff_schema_version"] = bad_version
+
+    with pytest.raises(ValueError, match="packet_handoff_schema_version"):
         graph._run_signature("stock")
 
 
@@ -496,6 +529,9 @@ def test_trading_graph_uses_one_signature_for_lookup_resume_and_clear(
     observed = []
 
     class _RuntimeGraph:
+        def get_state(self, _config):
+            return type("_Snapshot", (), {"values": {}})()
+
         def invoke(self, _state, **_kwargs):
             return {"final_trade_decision": "HOLD"}
 
@@ -581,6 +617,245 @@ def test_trading_graph_uses_one_signature_for_lookup_resume_and_clear(
     ]
 
 
+def test_run_graph_resumes_saved_state_with_none_and_preserves_all_fields(
+    monkeypatch,
+    tmp_path,
+):
+    from tradingagents.graph import trading_graph as trading_graph_module
+    from tradingagents.graph.packet_nodes import build_graph_run_id
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+    from tradingagents.orchestration.work_packets import build_packet_id
+
+    signature = '{"packet_handoff_schema_version":1,"shape":"saved"}'
+    run_id = build_graph_run_id("TEST", "2026-04-20", "stock", signature)
+    packet_id = build_packet_id(run_id, "research_evidence")
+    packet_ref = {
+        "schema_version": 1,
+        "packet_id": packet_id,
+        "kind": "research_evidence",
+        "packet_sha256": "a" * 64,
+        "packet_path": f"packets/{packet_id}.json",
+        "evidence_sha256": "b" * 64,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    saved = {
+        "run_id": run_id,
+        "run_started_at": "2026-04-20T13:30:00+00:00",
+        "decision_packet_refs": [packet_ref],
+        "learning_context": "saved bounded context",
+        "market_report": "saved market report",
+        "investment_debate_state": {"judge_decision": "saved debate"},
+        "final_trade_decision": "HOLD",
+    }
+    invocations = []
+
+    class _RuntimeGraph:
+        def get_state(self, config):
+            invocations.append(("get_state", config))
+            return type("_Snapshot", (), {"values": saved})()
+
+        def invoke(self, state, **kwargs):
+            invocations.append(("invoke", state, kwargs))
+            return dict(saved)
+
+    class _Propagator:
+        @staticmethod
+        def get_graph_args():
+            return {"config": {"recursion_limit": 100}}
+
+        @staticmethod
+        def create_initial_state(*_args, **_kwargs):
+            raise AssertionError("resume must not construct fresh state")
+
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {
+        "checkpoint_enabled": True,
+        "data_cache_dir": str(tmp_path),
+    }
+    graph.graph = _RuntimeGraph()
+    graph.propagator = _Propagator()
+    graph.debug = False
+    graph.memory_log = type(
+        "_Memory",
+        (),
+        {
+            "get_past_context": staticmethod(
+                lambda _ticker: (_ for _ in ()).throw(
+                    AssertionError("resume must preserve saved context")
+                )
+            ),
+            "store_decision": staticmethod(lambda **_kwargs: None),
+        },
+    )()
+    graph._log_state = lambda _date, _state: None
+    graph.process_signal = lambda signal: signal
+    cleared = []
+    monkeypatch.setattr(
+        trading_graph_module,
+        "thread_id",
+        lambda *_args: "saved-thread",
+    )
+    monkeypatch.setattr(
+        trading_graph_module,
+        "clear_checkpoint",
+        lambda *_args: cleared.append(True),
+    )
+
+    result, signal = graph._run_graph(
+        "TEST",
+        "2026-04-20",
+        checkpoint_signature=signature,
+    )
+
+    assert invocations[0][0] == "get_state"
+    assert invocations[1][0:2] == ("invoke", None)
+    assert result == saved
+    assert result["decision_packet_refs"] == [packet_ref]
+    assert result["learning_context"] == "saved bounded context"
+    assert result["market_report"] == "saved market report"
+    assert result["investment_debate_state"] == {
+        "judge_decision": "saved debate"
+    }
+    assert signal == "HOLD"
+    assert cleared == [True]
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("run_id", "run_started_at", "packet_refs", "learning_context"),
+)
+def test_run_graph_rejects_malformed_saved_identity_before_invocation(
+    monkeypatch,
+    tmp_path,
+    corruption,
+):
+    from tradingagents.graph import trading_graph as trading_graph_module
+    from tradingagents.graph.packet_nodes import build_graph_run_id
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+    from tradingagents.orchestration.work_packets import build_packet_id
+
+    signature = '{"packet_handoff_schema_version":1,"shape":"saved"}'
+    run_id = build_graph_run_id("TEST", "2026-04-20", "stock", signature)
+    packet_id = build_packet_id(run_id, "research_evidence")
+    saved = {
+        "run_id": run_id,
+        "run_started_at": "2026-04-20T13:30:00+00:00",
+        "decision_packet_refs": [
+            {
+                "schema_version": 1,
+                "packet_id": packet_id,
+                "kind": "research_evidence",
+                "packet_sha256": "a" * 64,
+                "packet_path": f"packets/{packet_id}.json",
+                "evidence_sha256": "b" * 64,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
+        ],
+        "learning_context": "saved context",
+        "final_trade_decision": "HOLD",
+    }
+    if corruption == "run_id":
+        saved["run_id"] = "graph-" + "f" * 64
+    elif corruption == "run_started_at":
+        saved["run_started_at"] = "2026-04-20T13:30:00Z"
+    elif corruption == "packet_refs":
+        saved["decision_packet_refs"][0]["execution_authority"] = "live"
+    else:
+        saved["learning_context"] = 3
+    invoked = []
+
+    class _RuntimeGraph:
+        def get_state(self, _config):
+            return type("_Snapshot", (), {"values": saved})()
+
+        def invoke(self, _state, **_kwargs):
+            invoked.append(True)
+            return saved
+
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {
+        "checkpoint_enabled": True,
+        "data_cache_dir": str(tmp_path),
+    }
+    graph.graph = _RuntimeGraph()
+    graph.propagator = type(
+        "_Propagator",
+        (),
+        {
+            "get_graph_args": staticmethod(lambda: {}),
+            "create_initial_state": staticmethod(
+                lambda *_args, **_kwargs: invoked.append("fresh")
+            ),
+        },
+    )()
+    graph.debug = False
+    graph.memory_log = type("_Memory", (), {})()
+    monkeypatch.setattr(
+        trading_graph_module,
+        "thread_id",
+        lambda *_args: "saved-thread",
+    )
+
+    with pytest.raises(ValueError, match="checkpoint"):
+        graph._run_graph(
+            "TEST",
+            "2026-04-20",
+            checkpoint_signature=signature,
+        )
+
+    assert invoked == []
+
+
+def test_propagate_freezes_signature_before_noncheckpoint_side_effects():
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {"checkpoint_enabled": False}
+    graph._checkpointer_ctx = None
+    graph.workflow = type(
+        "_Workflow",
+        (),
+        {"compile": staticmethod(lambda: object())},
+    )()
+    order = []
+    graph._run_signature = lambda asset: (
+        order.append(("signature", asset)) or "frozen-signature"
+    )
+    graph._resolve_pending_entries = lambda ticker: order.append(
+        ("resolve", ticker)
+    )
+    graph._run_graph = lambda *_args, **kwargs: (
+        order.append(("run", kwargs["checkpoint_signature"]))
+        or ("state", "signal")
+    )
+
+    assert graph.propagate("TEST", "2026-04-20") == ("state", "signal")
+    assert order == [
+        ("signature", "stock"),
+        ("resolve", "TEST"),
+        ("run", "frozen-signature"),
+    ]
+
+
+def test_real_graph_rejects_nonstring_signature_before_side_effects():
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    graph = object.__new__(TradingAgentsGraph)
+    graph.config = {"checkpoint_enabled": False}
+    graph._run_signature = lambda _asset: object()
+    side_effects = []
+    graph._resolve_pending_entries = lambda _ticker: side_effects.append(True)
+
+    with pytest.raises(ValueError, match="graph run signature"):
+        graph.propagate("TEST", "2026-04-20")
+
+    assert side_effects == []
+
+
 def test_invalid_signature_config_fails_before_run_side_effects(tmp_path):
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -597,6 +872,7 @@ def test_invalid_signature_config_fails_before_run_side_effects(tmp_path):
         "analyst_concurrency_limit": 1,
         "tool_free_analysts": (),
         "source_revision": None,
+        "packet_handoff_schema_version": 1,
     }
     side_effects = []
     graph._resolve_pending_entries = lambda _ticker: side_effects.append("resolved")
