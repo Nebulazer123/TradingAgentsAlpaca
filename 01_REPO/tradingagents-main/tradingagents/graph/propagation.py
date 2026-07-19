@@ -11,6 +11,7 @@ from tradingagents.agents.utils.agent_states import (
 from tradingagents.graph.packet_nodes import build_graph_run_id
 
 _UTC = dt.timezone.utc
+_LEARNING_CONTEXT_OMITTED = object()
 
 
 def _canonical_run_start(value: str) -> str:
@@ -46,10 +47,17 @@ class Propagator:
         self,
         max_recur_limit=100,
         run_signature_factory: Callable[[str], str] | None = None,
+        learning_context_factory: Callable[[str, str, str], str] | None = None,
     ):
         """Initialize with configuration parameters."""
+        if (
+            learning_context_factory is not None
+            and not callable(learning_context_factory)
+        ):
+            raise ValueError("learning_context_factory must be callable")
         self.max_recur_limit = max_recur_limit
         self.run_signature_factory = run_signature_factory
+        self.learning_context_factory = learning_context_factory
 
     def create_initial_state(
         self,
@@ -59,14 +67,30 @@ class Propagator:
         past_context: str = "",
         run_id: str | None = None,
         run_started_at: str | None = None,
-        learning_context: str = "",
+        learning_context: str | object = _LEARNING_CONTEXT_OMITTED,
     ) -> dict[str, Any]:
         """Create the initial state for the agent graph."""
         company = _canonical_text(company_name, field="company_name")
         canonical_date = _canonical_text(str(trade_date), field="trade_date")
         canonical_asset = _canonical_text(asset_type, field="asset_type")
-        if not isinstance(learning_context, str):
+        if learning_context is _LEARNING_CONTEXT_OMITTED:
+            stable_learning_context = (
+                self.learning_context_factory(
+                    company,
+                    canonical_date,
+                    canonical_asset,
+                )
+                if self.learning_context_factory is not None
+                else ""
+            )
+            if not isinstance(stable_learning_context, str):
+                raise ValueError(
+                    "learning_context_factory must return a string"
+                )
+        elif not isinstance(learning_context, str):
             raise ValueError("learning_context must be a string")
+        else:
+            stable_learning_context = learning_context
         if run_id is None:
             signature = (
                 self.run_signature_factory(canonical_asset)
@@ -96,7 +120,7 @@ class Propagator:
             "run_id": stable_run_id,
             "run_started_at": stable_run_start,
             "decision_packet_refs": [],
-            "learning_context": learning_context,
+            "learning_context": stable_learning_context,
             "past_context": past_context,
             "investment_debate_state": InvestDebateState(
                 {

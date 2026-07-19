@@ -8983,6 +8983,7 @@ def run_analysis(checkpoint: bool = False):
             selections["ticker"],
             selections["analysis_date"],
             asset_type=selections["asset_type"],
+            past_context="",
         )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)

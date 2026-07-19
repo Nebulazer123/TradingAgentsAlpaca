@@ -36,6 +36,10 @@ from tradingagents.agents.utils.memory import TradingMemoryLog
 from tradingagents.dataflows.config import set_config
 from tradingagents.dataflows.utils import safe_ticker_component
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.evals.learning_context import (
+    build_learning_context,
+    learning_context_from_store,
+)
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.orchestration.work_packets import build_packet_id
 
@@ -169,6 +173,7 @@ class TradingAgentsGraph:
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self._learning_context_options = self._validate_learning_context_config()
         if selected_analysts is None:
             selected_analysts = ["market", "social", "news", "fundamentals"]
         self.selected_analysts = tuple(selected_analysts)
@@ -253,6 +258,7 @@ class TradingAgentsGraph:
         self.propagator = Propagator(
             max_recur_limit=self.config.get("max_recur_limit", 100),
             run_signature_factory=self._run_signature,
+            learning_context_factory=self._learning_context_for_run,
         )
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)
@@ -266,6 +272,88 @@ class TradingAgentsGraph:
         self.workflow = self.graph_setup.setup_graph(self.selected_analysts)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
+
+    def _validate_learning_context_config(self) -> dict[str, Any]:
+        """Validate and freeze the graph-owned point-in-time learning reader."""
+        if "learning_context_ticker" in self.config:
+            raise ValueError(
+                "learning_context_ticker is forbidden; the runtime ticker is authoritative"
+            )
+        root = self.config.get("learning_context_root")
+        if root is None:
+            resolved_root = (
+                Path(self.config["results_dir"]) / "learning_availability"
+            )
+        elif (
+            isinstance(root, str)
+            and bool(root)
+            and root.strip() == root
+        ):
+            resolved_root = Path(root)
+        else:
+            raise ValueError(
+                "learning_context_root must be None or a nonempty canonical string"
+            )
+
+        option_names = (
+            "learning_context_setup",
+            "learning_context_sector",
+            "learning_context_regime",
+            "learning_context_evidence_type",
+            "learning_context_horizon",
+        )
+        options = {}
+        for name in option_names:
+            value = self.config.get(name)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{name} must be None or a string")
+            options[name.removeprefix("learning_context_")] = value
+
+        max_chars = self.config.get("learning_context_max_chars", 4_000)
+        if type(max_chars) is not int or not 256 <= max_chars <= 4_000:
+            raise ValueError(
+                "learning_context_max_chars must be an integer from 256 through 4000"
+            )
+        min_resolved = self.config.get("learning_context_min_resolved", 3)
+        if (
+            type(min_resolved) is not int
+            or not 1 <= min_resolved <= 10_000
+        ):
+            raise ValueError(
+                "learning_context_min_resolved must be an integer from 1 through 10000"
+            )
+
+        # Reuse the strict public builder's token validation once at graph
+        # construction. Empty observations make this side-effect free.
+        build_learning_context(
+            observations=(),
+            as_of="2000-01-01",
+            ticker="VALIDATION",
+            **options,
+            max_chars=max_chars,
+            min_resolved=min_resolved,
+        )
+        return {
+            "availability_root": resolved_root,
+            **options,
+            "max_chars": max_chars,
+            "min_resolved": min_resolved,
+        }
+
+    def _learning_context_for_run(
+        self,
+        company: str,
+        trade_date: str,
+        asset_type: str,
+    ) -> str:
+        """Read one advisory context for a fresh graph state."""
+        del asset_type
+        context = learning_context_from_store(
+            as_of=trade_date,
+            ticker=company,
+            **self._learning_context_options,
+        )
+        return context.rendered
 
     def _get_provider_kwargs(self) -> dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -624,12 +712,11 @@ class TradingAgentsGraph:
 
         if checkpoint_values is None:
             # Construct exactly one fresh state only after checkpoint inspection.
-            past_context = self.memory_log.get_past_context(company_name)
             invocation_state = self.propagator.create_initial_state(
                 company_name,
                 trade_date,
                 asset_type=asset_type,
-                past_context=past_context,
+                past_context="",
                 run_id=expected_run_id,
             )
 
