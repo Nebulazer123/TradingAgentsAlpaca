@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import pandas as pd
+
 from tradingagents.dataflows._official_common import (
     OfficialDataError,
     cached_safe_fetch_evidence,
@@ -45,6 +47,7 @@ from tradingagents.dataflows.massive import (
 from tradingagents.dataflows.newsapi import fetch_newsapi_everything
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.sec import fetch_sec_company_tickers, fetch_sec_submissions
+from tradingagents.dataflows.stockstats_utils import validate_daily_ohlcv
 from tradingagents.dataflows.tiingo import (
     fetch_tiingo_daily_prices,
     fetch_tiingo_news,
@@ -193,8 +196,14 @@ def _fetch_yfinance_quote_price_context(
 
     ticker = yf.Ticker(symbol)
     history = ticker.history(period="1mo", interval="1d", auto_adjust=False)
-    if history is None or history.empty:
-        raise OfficialDataError(f"yfinance returned no price history for {symbol}")
+    requested_as_of = _today(now)
+    actual_latest = validate_daily_ohlcv(
+        history,
+        "yfinance",
+        symbol,
+        requested_as_of,
+    )
+    actual_latest_date = actual_latest.date().isoformat()
     fast_info = getattr(ticker, "fast_info", None)
     if fast_info is not None:
         try:
@@ -230,7 +239,12 @@ def _fetch_yfinance_quote_price_context(
         ),
         tool_route="dataflow:yfinance",
         redaction_status="no_secrets_seen",
-        freshness_extra={"read_only": True},
+        as_of=actual_latest_date,
+        freshness_extra={
+            "read_only": True,
+            "requested_as_of": requested_as_of.isoformat(),
+            "actual_latest_bar": actual_latest_date,
+        },
     )
 
 
@@ -750,6 +764,7 @@ def _read_source_cache_packet(
     symbol: str,
     evidence_need: str,
     candidate_sources: Sequence[str],
+    now: datetime.datetime | None = None,
 ) -> SourceEvidencePacket:
     for source_name in candidate_sources:
         if source_name == "official_cache":
@@ -768,6 +783,31 @@ def _read_source_cache_packet(
             continue
         if cached.tool_route == "local:research_gap" or cached.freshness.get("gap_category"):
             continue
+        if evidence_need == "quote_price_context":
+            cache = cached.freshness.get("cache")
+            if cached.freshness.get("stale"):
+                continue
+            if isinstance(cache, dict) and cache.get("state") == "stale_fallback":
+                continue
+            current = now or datetime.datetime.now(tz=datetime.timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=datetime.timezone.utc)
+            age_seconds = max(current.timestamp() - path.stat().st_mtime, 0.0)
+            if age_seconds > _cache_ttl_seconds(evidence_need):
+                continue
+            if cached.source_name == "yfinance":
+                actual_latest_bar = cached.freshness.get("actual_latest_bar")
+                if not actual_latest_bar:
+                    continue
+                try:
+                    validate_daily_ohlcv(
+                        pd.DataFrame({"Date": [actual_latest_bar]}),
+                        "yfinance official cache",
+                        symbol,
+                        _today(now),
+                    )
+                except OfficialDataError:
+                    continue
         source_ref = f"local://{path.as_posix()}"
         return evidence_packet(
             source_name="official_cache",
@@ -1067,6 +1107,7 @@ def build_ticker_provider_research_packets(
                         symbol=ticker,
                         evidence_need=evidence_need,
                         candidate_sources=candidate_sources,
+                        now=now,
                     )
                 except OfficialDataError as exc:
                     attempts.append(
@@ -1109,7 +1150,13 @@ def build_ticker_provider_research_packets(
                 source_ref=f"{candidate.route}:{ticker}",
                 cache_dir=cache_dir,
                 now=now,
-                allow_stale_on_error=candidate.source_name not in NO_STALE_CACHE_SOURCES,
+                allow_stale_on_error=(
+                    candidate.source_name not in NO_STALE_CACHE_SOURCES
+                    and not (
+                        candidate.source_name == "yfinance"
+                        and evidence_need == "quote_price_context"
+                    )
+                ),
             )
             if not _blocked_packet_counts_as_evidence(packet, candidate):
                 attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))

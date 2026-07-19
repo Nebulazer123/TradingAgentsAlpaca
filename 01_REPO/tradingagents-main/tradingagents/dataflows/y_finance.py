@@ -1,11 +1,18 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated
 
 import pandas as pd
 import yfinance as yf
 from dateutil.relativedelta import relativedelta
 
-from .stockstats_utils import StockstatsUtils, filter_financials_by_date, load_ohlcv, yf_retry
+from ._official_common import OfficialDataError
+from .stockstats_utils import (
+    StockstatsUtils,
+    filter_financials_by_date,
+    load_ohlcv,
+    validate_daily_ohlcv,
+    yf_retry,
+)
 
 
 def get_YFin_data_online(
@@ -14,20 +21,29 @@ def get_YFin_data_online(
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ):
 
-    datetime.strptime(start_date, "%Y-%m-%d")
-    datetime.strptime(end_date, "%Y-%m-%d")
+    context = (
+        f"yfinance daily OHLCV for {symbol.upper()} requested as-of {end_date}"
+    )
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+    except (TypeError, ValueError) as exc:
+        raise OfficialDataError(f"{context}: invalid start_date {start_date}") from exc
+    try:
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+    except (TypeError, ValueError) as exc:
+        raise OfficialDataError(f"{context}: invalid end_date {end_date}") from exc
+    if start > end:
+        raise OfficialDataError(
+            f"{context}: start_date must be on or before end_date"
+        )
+    exclusive_end = (end + timedelta(days=1)).strftime("%Y-%m-%d")
 
     # Create ticker object
     ticker = yf.Ticker(symbol.upper())
 
     # Fetch historical data for the specified date range
-    data = yf_retry(lambda: ticker.history(start=start_date, end=end_date))
-
-    # Check if data is empty
-    if data.empty:
-        return (
-            f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
-        )
+    data = yf_retry(lambda: ticker.history(start=start_date, end=exclusive_end))
+    validate_daily_ohlcv(data, "yfinance", symbol.upper(), end)
 
     # Remove timezone info from index for cleaner output
     if data.index.tz is not None:

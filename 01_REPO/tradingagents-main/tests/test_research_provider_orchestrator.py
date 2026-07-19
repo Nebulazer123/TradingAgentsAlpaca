@@ -1,6 +1,11 @@
+import datetime
 import json
+import os
 from pathlib import Path
 
+import pandas as pd
+import pytest
+import yfinance as yf
 from typer.testing import CliRunner
 
 from cli import main as cli_main
@@ -29,6 +34,56 @@ def _packet(source_name: str, *, evidence_type: str = "market_news", symbol: str
         quality="medium" if source_name != "google_news_rss" else "low",
         tool_route=f"{source_name}_test",
     )
+
+
+def _quote_packet(
+    source_name: str,
+    *,
+    symbol: str = "NVDA",
+    requested_as_of: str = "2026-07-06",
+    actual_latest_bar: str | None = "2026-07-02",
+    stale: bool = False,
+    cache_state: str | None = None,
+):
+    freshness_extra = {"requested_as_of": requested_as_of}
+    if actual_latest_bar is not None:
+        freshness_extra["actual_latest_bar"] = actual_latest_bar
+    if cache_state is not None:
+        freshness_extra["cache"] = {"state": cache_state}
+    return evidence_packet(
+        source_name=source_name,
+        evidence_type="quote_price_context",
+        subject=symbol,
+        symbol=symbol,
+        source_ref=f"https://example.test/{source_name}/{symbol}",
+        payload={"source": source_name, "symbol": symbol},
+        quality="low" if source_name == "yfinance" else "medium",
+        tool_route=f"{source_name}_test",
+        as_of=actual_latest_bar or requested_as_of,
+        stale=stale,
+        freshness_extra=freshness_extra,
+    )
+
+
+def _write_provider_cache(
+    cache_dir,
+    *,
+    source_name: str,
+    packet,
+    now: datetime.datetime,
+    age_seconds: int = 0,
+):
+    path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="NVDA",
+        evidence_need="quote_price_context",
+        source_name=source_name,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(packet.model_dump_json(), encoding="utf-8")
+    timestamp = now.timestamp() - age_seconds
+    os.utime(path, (timestamp, timestamp))
+    return path
 
 
 def test_ticker_provider_bundle_collects_broad_overlapping_news_sources(monkeypatch, tmp_path):
@@ -889,6 +944,293 @@ def test_ticker_provider_bundle_uses_yfinance_price_context(monkeypatch, tmp_pat
         and attempt["cost_tier"] == "free_unmetered"
         for attempt in result.route_attempts
     )
+
+
+def test_fetch_yfinance_quote_price_context_rejects_stale_history(monkeypatch):
+    class FakeTicker:
+        fast_info = {}
+
+        def __init__(self, _symbol):
+            pass
+
+        def history(self, **_kwargs):
+            return pd.DataFrame(
+                {"Close": [100.0]},
+                index=pd.DatetimeIndex(["2025-07-06"], name="Date"),
+            )
+
+    monkeypatch.setattr(yf, "Ticker", FakeTicker)
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+
+    with pytest.raises(orchestrator.OfficialDataError) as exc_info:
+        orchestrator._fetch_yfinance_quote_price_context("NVDA", now=now)
+
+    message = str(exc_info.value)
+    assert "yfinance" in message
+    assert "NVDA" in message
+    assert "requested as-of 2026-07-06" in message
+    assert "actual latest 2025-07-06" in message
+
+
+def test_fetch_yfinance_quote_price_context_uses_actual_final_bar_metadata(monkeypatch):
+    class FakeTicker:
+        fast_info = {"last_price": 100.0}
+
+        def __init__(self, _symbol):
+            pass
+
+        def history(self, **_kwargs):
+            return pd.DataFrame(
+                {"Open": [99.0], "Close": [100.0]},
+                index=pd.DatetimeIndex(["2026-07-02T00:00:00-04:00"], name="Date"),
+            )
+
+    monkeypatch.setattr(yf, "Ticker", FakeTicker)
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+
+    packet = orchestrator._fetch_yfinance_quote_price_context("NVDA", now=now)
+
+    assert packet.as_of == "2026-07-02"
+    assert packet.freshness["as_of"] == "2026-07-02"
+    assert packet.freshness["requested_as_of"] == "2026-07-06"
+    assert packet.freshness["actual_latest_bar"] == "2026-07-02"
+    assert packet.analysis_only is True
+    assert packet.payload["execution_authority"] == "none"
+
+
+@pytest.mark.parametrize(
+    "bad_cache_case",
+    ["stale", "stale_fallback", "expired", "missing_actual_bar", "stale_actual_bar"],
+)
+def test_official_quote_cache_skips_unusable_yfinance_and_scans_later_sources(
+    tmp_path, bad_cache_case
+):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    yfinance_packet = _quote_packet(
+        "yfinance",
+        actual_latest_bar=None if bad_cache_case == "missing_actual_bar" else (
+            "2025-07-06" if bad_cache_case == "stale_actual_bar" else "2026-07-02"
+        ),
+        stale=bad_cache_case == "stale",
+        cache_state="stale_fallback" if bad_cache_case == "stale_fallback" else None,
+    )
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=yfinance_packet,
+        now=now,
+        age_seconds=301 if bad_cache_case == "expired" else 0,
+    )
+    _write_provider_cache(
+        cache_dir,
+        source_name="tiingo",
+        packet=_quote_packet("tiingo"),
+        now=now,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={"broker_snapshot", "massive", "finnhub", "fmp", "alpha_vantage"},
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["official_cache"]
+    assert result.packets[0].payload["cached_source_name"] == "tiingo"
+
+
+def test_non_quote_official_cache_admission_is_unchanged_for_old_packet(tmp_path):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="NVDA",
+        evidence_need="market_news",
+        source_name="google_news_rss",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cached = _packet("google_news_rss", symbol="NVDA")
+    path.write_text(cached.model_dump_json(), encoding="utf-8")
+    expired_timestamp = now.timestamp() - (7 * 24 * 60 * 60)
+    os.utime(path, (expired_timestamp, expired_timestamp))
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("market_news",),
+        disabled_sources={
+            "alpaca_news",
+            "crawlee",
+            "eodhd",
+            "finnhub",
+            "fmp",
+            "marketaux",
+            "newsapi",
+            "reddit",
+            "reddit_watchlist",
+            "scrapingbee",
+            "tiingo",
+            "twitter",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["official_cache"]
+    assert result.packets[0].payload["cached_packet_id"] == cached.packet_id
+
+
+def test_stale_yfinance_refresh_cannot_return_stale_yfinance_cache(monkeypatch, tmp_path):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=_quote_packet("yfinance"),
+        now=now,
+        age_seconds=301,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            orchestrator.OfficialDataError(
+                "yfinance daily OHLCV for NVDA requested as-of 2026-07-06; "
+                "actual latest 2025-07-06: stale"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_tiingo_daily_prices",
+        lambda *_args, **_kwargs: _quote_packet("tiingo"),
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={
+            "broker_snapshot",
+            "official_cache",
+            "massive",
+            "finnhub",
+            "fmp",
+            "alpha_vantage",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["tiingo"]
+    yfinance_attempt = next(
+        attempt for attempt in result.route_attempts if attempt["source_name"] == "yfinance"
+    )
+    assert yfinance_attempt["blocked"] is True
+    assert yfinance_attempt["cache_state"] != "stale_fallback"
+
+
+def test_fresh_yfinance_quote_cache_hit_remains_enabled(monkeypatch, tmp_path):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=_quote_packet("yfinance"),
+        now=now,
+        age_seconds=299,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        lambda *_args, **_kwargs: pytest.fail("fresh five-minute cache must avoid refresh"),
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={
+            "broker_snapshot",
+            "official_cache",
+            "massive",
+            "finnhub",
+            "tiingo",
+            "fmp",
+            "alpha_vantage",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["yfinance"]
+    assert result.packets[0].freshness["cache"]["state"] == "hit"
+
+
+@pytest.mark.parametrize("later_source", ["massive", "alpha_vantage"])
+def test_stale_yfinance_continues_to_other_configured_quote_routes(
+    monkeypatch, tmp_path, later_source
+):
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            orchestrator.OfficialDataError("stale yfinance OHLCV")
+        ),
+    )
+    if later_source == "massive":
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_massive_previous_day_bar",
+            lambda *_args, **_kwargs: _quote_packet("massive"),
+        )
+    else:
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_alpha_vantage_stock_raw",
+            lambda *_args, **_kwargs: {"symbol": "NVDA", "latest": "2026-07-02"},
+        )
+    disabled_sources = {
+        "broker_snapshot",
+        "official_cache",
+        "finnhub",
+        "tiingo",
+        "fmp",
+        "massive",
+        "alpha_vantage",
+    }
+    disabled_sources.remove(later_source)
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources=disabled_sources,
+        max_packets_per_need=1,
+        cache_dir=tmp_path / "cache",
+        now=datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc),
+    )
+
+    assert [packet.source_name for packet in result.packets] == [later_source]
+    assert result.route_attempts[0]["source_name"] == "yfinance"
+    assert result.route_attempts[0]["blocked"] is True
+
+
+def test_quote_provider_configuration_order_is_unchanged():
+    config = load_provider_fallback_config()
+
+    assert config["fallbacks"]["quote_price_context"] == [
+        {"source_name": "broker_snapshot", "route": "alpaca:read_only_snapshot", "cost_tier": "connected_mcp_read", "priority": 10},
+        {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 20},
+        {"source_name": "massive", "route": "dataflow:massive", "cost_tier": "paid_limited", "priority": 30},
+        {"source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free_limited", "priority": 40},
+        {"source_name": "tiingo", "route": "dataflow:tiingo", "cost_tier": "free_limited", "priority": 45},
+        {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 50},
+        {"source_name": "alpha_vantage", "route": "dataflow:alpha_vantage", "cost_tier": "free_limited", "priority": 60},
+        {"source_name": "yfinance", "route": "dataflow:yfinance", "cost_tier": "free_unmetered", "priority": 90},
+    ]
 
 
 def test_ticker_provider_bundle_uses_sanitized_broker_snapshot(tmp_path):
