@@ -7,6 +7,7 @@ import pytest
 
 import tradingagents.default_config as default_config
 from tradingagents.dataflows import decision_vendor_adapters, interface
+from tradingagents.dataflows._official_common import OfficialDataError
 from tradingagents.dataflows.config import set_config
 
 
@@ -144,6 +145,40 @@ def test_route_to_vendor_preserves_non_transient_errors(monkeypatch):
 
     with pytest.raises(ValueError, match="bad indicator name"):
         interface.route_to_vendor("get_indicators", "CRM", "bad_indicator")
+
+
+def test_route_to_vendor_falls_back_on_official_data_error(monkeypatch):
+    calls = []
+
+    def point_in_time_rejection(*_args, **_kwargs):
+        calls.append("alpha_vantage")
+        raise OfficialDataError("historical Alpha Vantage evidence unavailable")
+
+    def fallback(*_args, **_kwargs):
+        calls.append("yfinance")
+        return "historical fallback evidence"
+
+    monkeypatch.setitem(
+        interface.VENDOR_METHODS,
+        "get_balance_sheet",
+        {
+            "alpha_vantage": point_in_time_rejection,
+            "yfinance": fallback,
+        },
+    )
+    set_config(
+        {"tool_vendors": {"get_balance_sheet": "alpha_vantage,yfinance"}}
+    )
+
+    assert (
+        interface.route_to_vendor(
+            "get_balance_sheet",
+            "NFLX",
+            curr_date="2024-02-15",
+        )
+        == "historical fallback evidence"
+    )
+    assert calls == ["alpha_vantage", "yfinance"]
 
 
 def test_decision_path_vendor_map_exposes_promoted_research_sources():
