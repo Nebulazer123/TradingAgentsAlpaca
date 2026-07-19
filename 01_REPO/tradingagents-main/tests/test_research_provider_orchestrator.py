@@ -1170,6 +1170,64 @@ def test_fresh_yfinance_quote_cache_hit_remains_enabled(monkeypatch, tmp_path):
     assert result.packets[0].freshness["cache"]["state"] == "hit"
 
 
+@pytest.mark.parametrize("actual_latest_bar", [None, "2025-07-06"])
+def test_recent_invalid_yfinance_quote_cache_forces_refresh_and_falls_through(
+    monkeypatch, tmp_path, actual_latest_bar
+):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=_quote_packet("yfinance", actual_latest_bar=actual_latest_bar),
+        now=now,
+        age_seconds=299,
+    )
+    refresh_calls = []
+
+    def stale_refresh(*_args, **_kwargs):
+        refresh_calls.append(True)
+        raise orchestrator.OfficialDataError(
+            "yfinance daily OHLCV for NVDA requested as-of 2026-07-06; "
+            "actual latest 2025-07-06: stale"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        stale_refresh,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_tiingo_daily_prices",
+        lambda *_args, **_kwargs: _quote_packet("tiingo"),
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={
+            "broker_snapshot",
+            "official_cache",
+            "massive",
+            "finnhub",
+            "fmp",
+            "alpha_vantage",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert refresh_calls == [True]
+    assert [packet.source_name for packet in result.packets] == ["tiingo"]
+    yfinance_attempt = next(
+        attempt for attempt in result.route_attempts if attempt["source_name"] == "yfinance"
+    )
+    assert yfinance_attempt["blocked"] is True
+    assert yfinance_attempt["cache_state"] != "hit"
+
+
 @pytest.mark.parametrize("later_source", ["massive", "alpha_vantage"])
 def test_stale_yfinance_continues_to_other_configured_quote_routes(
     monkeypatch, tmp_path, later_source

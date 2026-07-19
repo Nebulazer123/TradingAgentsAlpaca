@@ -982,12 +982,16 @@ def cached_safe_fetch_evidence(
     cache_dir: str | Path = "results/official_data_cache",
     now: datetime.datetime | None = None,
     allow_stale_on_error: bool = True,
+    cached_packet_validator: Callable[[SourceEvidencePacket], bool] | None = None,
 ) -> SourceEvidencePacket:
     path = _cache_path(cache_dir, cache_key)
     cached = _load_cached_packet(path)
+    cached_is_usable = cached is not None and (
+        cached_packet_validator is None or cached_packet_validator(cached)
+    )
     if cached is not None and path.exists():
         age_seconds = _cache_age_seconds(path, now=now)
-        if age_seconds <= ttl_seconds:
+        if age_seconds <= ttl_seconds and cached_is_usable:
             record_connector_health(
                 source_name,
                 success=True,
@@ -1023,7 +1027,7 @@ def cached_safe_fetch_evidence(
             ttl_seconds=ttl_seconds,
         )
 
-    if allow_stale_on_error and cached is not None and path.exists():
+    if allow_stale_on_error and cached_is_usable and cached is not None and path.exists():
         record_connector_health(
             source_name,
             success=False,

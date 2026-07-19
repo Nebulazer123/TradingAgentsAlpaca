@@ -758,6 +758,32 @@ def _provider_cache_key(*, symbol: str, evidence_need: str, source_name: str) ->
     return official_cache_key(*parts)
 
 
+def _yfinance_quote_cache_is_usable(
+    packet: SourceEvidencePacket,
+    *,
+    symbol: str,
+    now: datetime.datetime | None,
+) -> bool:
+    cache = packet.freshness.get("cache")
+    if packet.freshness.get("stale"):
+        return False
+    if isinstance(cache, dict) and cache.get("state") == "stale_fallback":
+        return False
+    actual_latest_bar = packet.freshness.get("actual_latest_bar")
+    if not actual_latest_bar:
+        return False
+    try:
+        validate_daily_ohlcv(
+            pd.DataFrame({"Date": [actual_latest_bar]}),
+            "yfinance provider cache",
+            symbol,
+            _today(now),
+        )
+    except OfficialDataError:
+        return False
+    return True
+
+
 def _read_source_cache_packet(
     cache_dir: str | Path,
     *,
@@ -795,19 +821,12 @@ def _read_source_cache_packet(
             age_seconds = max(current.timestamp() - path.stat().st_mtime, 0.0)
             if age_seconds > _cache_ttl_seconds(evidence_need):
                 continue
-            if cached.source_name == "yfinance":
-                actual_latest_bar = cached.freshness.get("actual_latest_bar")
-                if not actual_latest_bar:
-                    continue
-                try:
-                    validate_daily_ohlcv(
-                        pd.DataFrame({"Date": [actual_latest_bar]}),
-                        "yfinance official cache",
-                        symbol,
-                        _today(now),
-                    )
-                except OfficialDataError:
-                    continue
+            if cached.source_name == "yfinance" and not _yfinance_quote_cache_is_usable(
+                cached,
+                symbol=symbol,
+                now=now,
+            ):
+                continue
         source_ref = f"local://{path.as_posix()}"
         return evidence_packet(
             source_name="official_cache",
@@ -1156,6 +1175,18 @@ def build_ticker_provider_research_packets(
                         candidate.source_name == "yfinance"
                         and evidence_need == "quote_price_context"
                     )
+                ),
+                cached_packet_validator=(
+                    (
+                        lambda cached: _yfinance_quote_cache_is_usable(
+                            cached,
+                            symbol=ticker,
+                            now=now,
+                        )
+                    )
+                    if candidate.source_name == "yfinance"
+                    and evidence_need == "quote_price_context"
+                    else None
                 ),
             )
             if not _blocked_packet_counts_as_evidence(packet, candidate):
