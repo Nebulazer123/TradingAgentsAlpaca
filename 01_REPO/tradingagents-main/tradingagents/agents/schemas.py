@@ -18,9 +18,31 @@ so that:
 
 from __future__ import annotations
 
+import math
 from enum import Enum
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+_NULLISH_OPTIONAL_FLOATS = {"", "null", "none"}
+
+
+def _normalize_optional_float(value: Any) -> Any:
+    """Normalize only the narrow absence markers allowed for optional prices."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("boolean is not a valid optional price")
+    if isinstance(value, str) and value.strip().lower() in _NULLISH_OPTIONAL_FLOATS:
+        return None
+    return value
+
+
+def _require_finite_optional_float(value: float | None) -> float | None:
+    """Reject NaN and infinities after Pydantic has parsed a numeric value."""
+    if value is not None and not math.isfinite(value):
+        raise ValueError("optional price must be finite")
+    return value
 
 # ---------------------------------------------------------------------------
 # Shared rating types
@@ -135,6 +157,16 @@ class TraderProposal(BaseModel):
         description="Optional sizing guidance, e.g. '5% of portfolio'.",
     )
 
+    @field_validator("entry_price", "stop_loss", mode="before")
+    @classmethod
+    def normalize_optional_prices(cls, value: Any) -> Any:
+        return _normalize_optional_float(value)
+
+    @field_validator("entry_price", "stop_loss")
+    @classmethod
+    def require_finite_optional_prices(cls, value: float | None) -> float | None:
+        return _require_finite_optional_float(value)
+
 
 def render_trader_proposal(proposal: TraderProposal) -> str:
     """Render a TraderProposal to markdown.
@@ -202,6 +234,19 @@ class PortfolioDecision(BaseModel):
         default=None,
         description="Optional recommended holding period, e.g. '3-6 months'.",
     )
+
+    @field_validator("price_target", mode="before")
+    @classmethod
+    def normalize_optional_price_target(cls, value: Any) -> Any:
+        return _normalize_optional_float(value)
+
+    @field_validator("price_target")
+    @classmethod
+    def require_finite_optional_price_target(
+        cls,
+        value: float | None,
+    ) -> float | None:
+        return _require_finite_optional_float(value)
 
 
 def render_pm_decision(decision: PortfolioDecision) -> str:

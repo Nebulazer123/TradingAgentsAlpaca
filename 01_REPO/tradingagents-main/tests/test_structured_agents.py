@@ -10,11 +10,13 @@ decision-making agents share the same shape.
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from tradingagents.agents.managers.research_manager import create_research_manager
 from tradingagents.agents.researchers.bear_researcher import create_bear_researcher
 from tradingagents.agents.researchers.bull_researcher import create_bull_researcher
 from tradingagents.agents.schemas import (
+    PortfolioDecision,
     PortfolioRating,
     ResearchPlan,
     TraderAction,
@@ -62,6 +64,89 @@ class TestRenderTraderProposal:
         assert "Stop Loss" not in md
         assert "Position Sizing" not in md
         assert "FINAL TRANSACTION PROPOSAL: **SELL**" in md
+
+
+def _proposal_with_optional_float(field_name: str, value: object):
+    payload = {
+        "action": TraderAction.HOLD,
+        "reasoning": "No directional edge.",
+        field_name: value,
+    }
+    return TraderProposal(**payload)
+
+
+def _decision_with_optional_float(field_name: str, value: object):
+    payload = {
+        "rating": PortfolioRating.HOLD,
+        "executive_summary": "No change.",
+        "investment_thesis": "Evidence remains balanced.",
+        field_name: value,
+    }
+    return PortfolioDecision(**payload)
+
+
+_OPTIONAL_FLOAT_BUILDERS = (
+    pytest.param(_proposal_with_optional_float, "entry_price", id="trader-entry"),
+    pytest.param(_proposal_with_optional_float, "stop_loss", id="trader-stop"),
+    pytest.param(_decision_with_optional_float, "price_target", id="portfolio-target"),
+)
+
+
+@pytest.mark.unit
+class TestOptionalFloatValidation:
+    @pytest.mark.parametrize(("build", "field_name"), _OPTIONAL_FLOAT_BUILDERS)
+    @pytest.mark.parametrize(
+        "value",
+        (None, "", "   ", "null", " NULL ", "None", " none "),
+    )
+    def test_narrow_nullish_values_mean_absent(self, build, field_name, value):
+        model = build(field_name, value)
+        assert getattr(model, field_name) is None
+
+    @pytest.mark.parametrize(("build", "field_name"), _OPTIONAL_FLOAT_BUILDERS)
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        (("189.5", 189.5), ("-0.25", -0.25), ("1e3", 1000.0)),
+    )
+    def test_finite_numeric_strings_are_accepted(
+        self,
+        build,
+        field_name,
+        value,
+        expected,
+    ):
+        model = build(field_name, value)
+        assert getattr(model, field_name) == expected
+
+    @pytest.mark.parametrize(("build", "field_name"), _OPTIONAL_FLOAT_BUILDERS)
+    @pytest.mark.parametrize(
+        "value",
+        (
+            True,
+            False,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "1e10000",
+            {},
+            [],
+            "arbitrary text",
+            "N/A",
+            "-",
+            "TBD",
+        ),
+    )
+    def test_non_finite_or_non_numeric_values_are_rejected(
+        self,
+        build,
+        field_name,
+        value,
+    ):
+        with pytest.raises(ValidationError):
+            build(field_name, value)
 
 
 @pytest.mark.unit
@@ -116,6 +201,55 @@ def _structured_trader_llm(captured: dict, proposal: TraderProposal | None = Non
     llm = MagicMock()
     llm.with_structured_output.return_value = structured
     return llm
+
+
+@pytest.mark.unit
+def test_explicit_none_uses_plain_response_without_calling_renderer():
+    """A parser miss is a deliberate free-text path, not render(None)."""
+    from tradingagents.agents.utils.structured import invoke_structured_or_freetext
+
+    structured = MagicMock()
+    structured.invoke.return_value = None
+    plain = MagicMock()
+    plain.invoke.return_value = MagicMock(content="Unstructured research context.")
+    render = MagicMock()
+
+    result = invoke_structured_or_freetext(
+        structured,
+        plain,
+        "same prompt",
+        render=render,
+        agent_name="Research Manager",
+    )
+
+    assert result == "Unstructured research context."
+    render.assert_not_called()
+    plain.invoke.assert_called_once_with("same prompt")
+
+
+@pytest.mark.unit
+def test_valid_parsed_object_is_rendered_without_plain_fallback():
+    from tradingagents.agents.utils.structured import invoke_structured_or_freetext
+
+    plan = ResearchPlan(
+        recommendation=PortfolioRating.OVERWEIGHT,
+        rationale="Demand remains durable.",
+        strategic_actions="Scale exposure within risk limits.",
+    )
+    structured = MagicMock()
+    structured.invoke.return_value = plan
+    plain = MagicMock()
+
+    result = invoke_structured_or_freetext(
+        structured,
+        plain,
+        "prompt",
+        render=render_research_plan,
+        agent_name="Research Manager",
+    )
+
+    assert result == render_research_plan(plan)
+    plain.invoke.assert_not_called()
 
 
 @pytest.mark.unit
