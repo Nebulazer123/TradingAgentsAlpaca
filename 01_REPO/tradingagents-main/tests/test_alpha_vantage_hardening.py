@@ -6,7 +6,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from tradingagents.dataflows import alpha_vantage_fundamentals as fundamentals
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
+    OfficialDataError,
+    RecoverableDataflowError,
+)
 
 
 def _statement_payload(*rows: dict[str, str]) -> str:
@@ -197,11 +201,13 @@ def test_none_cutoff_preserves_unparsed_live_response(monkeypatch):
 
 @pytest.mark.parametrize("body", ["{not-json", "[]", '"scalar"', "null"])
 def test_filtered_evidence_rejects_malformed_or_non_dictionary_json(body):
-    with pytest.raises(OfficialDataError, match="Alpha Vantage"):
+    with pytest.raises(OfficialDataError, match="Alpha Vantage") as exc_info:
         fundamentals._filter_reports_by_date(body, "2024-02-15")
 
+    assert not isinstance(exc_info.value, RecoverableDataflowError)
 
-def test_historical_statement_with_no_usable_reports_raises_official_data_error(
+
+def test_historical_statement_with_no_usable_reports_is_unavailable(
     monkeypatch,
 ):
     payload = json.dumps(
@@ -222,7 +228,7 @@ def test_historical_statement_with_no_usable_reports_raises_official_data_error(
         lambda *_args, **_kwargs: payload,
     )
 
-    with pytest.raises(OfficialDataError, match="no usable historical"):
+    with pytest.raises(DataUnavailableError, match="no usable historical"):
         fundamentals.get_income_statement("NFLX", curr_date="2024-02-15")
 
 
@@ -235,7 +241,7 @@ def test_historical_overview_rejects_current_snapshot_without_request(monkeypatc
 
     monkeypatch.setattr(fundamentals, "_make_api_request", request)
 
-    with pytest.raises(OfficialDataError, match="historical OVERVIEW"):
+    with pytest.raises(DataUnavailableError, match="historical OVERVIEW"):
         fundamentals.get_fundamentals("NFLX", curr_date="2024-02-15")
 
     assert calls == []

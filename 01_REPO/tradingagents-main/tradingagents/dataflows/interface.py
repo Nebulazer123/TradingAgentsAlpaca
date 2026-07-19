@@ -5,9 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import requests
-
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import RecoverableDataflowError
 
 # Import from vendor-specific modules
 from .alpha_vantage import (
@@ -37,7 +35,6 @@ from .alpha_vantage import (
 from .alpha_vantage import (
     get_stock as get_alpha_vantage_stock,
 )
-from .alpha_vantage_common import AlphaVantageRateLimitError
 
 # Configuration and routing logic
 from .config import get_config
@@ -67,8 +64,8 @@ from .decision_vendor_adapters import (
     get_reddit_sentiment_context,
     get_release_calendar_context,
     get_sec_fundamentals,
-    get_supplemental_market_context,
     get_stocktwits_sentiment_context,
+    get_supplemental_market_context,
     get_tiingo_news_adapter,
     get_tiingo_stock_data,
     get_treasury_macro_context,
@@ -254,14 +251,6 @@ SOURCE_CATEGORY_COVERAGE = [
         ],
     },
 ]
-
-TRANSIENT_VENDOR_EXCEPTIONS = (
-    AlphaVantageRateLimitError,
-    OfficialDataError,
-    requests.RequestException,
-    TimeoutError,
-    ConnectionError,
-)
 
 MERGEABLE_METHODS = {
     "get_news": {
@@ -507,7 +496,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                 vendor_results.append((vendor, result))
                 if len(vendor_results) >= int(merge_policy["max_sources"]):
                     break
-            except TRANSIENT_VENDOR_EXCEPTIONS as exc:
+            except RecoverableDataflowError as exc:
                 fallback_errors.append(_fallback_error_summary(vendor, exc))
                 continue
 
@@ -534,7 +523,7 @@ def route_to_vendor(method: str, *args, **kwargs):
                 fallback_errors.append(_fallback_error_summary(vendor, "returned empty data"))
                 continue
             return result
-        except TRANSIENT_VENDOR_EXCEPTIONS as exc:
+        except RecoverableDataflowError as exc:
             fallback_errors.append(_fallback_error_summary(vendor, exc))
             continue
 

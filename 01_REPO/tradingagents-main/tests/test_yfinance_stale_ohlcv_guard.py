@@ -4,7 +4,11 @@ import pandas as pd
 import pytest
 
 from tradingagents.dataflows import stockstats_utils, y_finance
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
+    OfficialDataError,
+    RecoverableDataflowError,
+)
 
 
 @pytest.mark.parametrize(
@@ -33,7 +37,7 @@ def test_validate_daily_ohlcv_accepts_daily_market_gaps_within_ten_days(latest_d
 def test_validate_daily_ohlcv_rejects_stale_observations(latest_date, as_of, expected_age):
     frame = pd.DataFrame({"Date": [latest_date], "Close": [100.0]})
 
-    with pytest.raises(OfficialDataError) as exc_info:
+    with pytest.raises(DataUnavailableError) as exc_info:
         stockstats_utils.validate_daily_ohlcv(frame, "yfinance", "MSFT", as_of)
 
     message = str(exc_info.value)
@@ -47,7 +51,7 @@ def test_validate_daily_ohlcv_rejects_stale_observations(latest_date, as_of, exp
 def test_validate_daily_ohlcv_rejects_future_observation():
     frame = pd.DataFrame({"Date": ["2026-07-07"], "Close": [100.0]})
 
-    with pytest.raises(OfficialDataError) as exc_info:
+    with pytest.raises(DataUnavailableError) as exc_info:
         stockstats_utils.validate_daily_ohlcv(frame, "yfinance", "MSFT", "2026-07-06")
 
     message = str(exc_info.value)
@@ -70,7 +74,7 @@ def test_validate_daily_ohlcv_rejects_future_observation():
     ],
 )
 def test_validate_daily_ohlcv_rejects_empty_or_dateless_frames(frame, reason):
-    with pytest.raises(OfficialDataError) as exc_info:
+    with pytest.raises(DataUnavailableError) as exc_info:
         stockstats_utils.validate_daily_ohlcv(frame, "yfinance", "MSFT", "2026-07-06")
 
     message = str(exc_info.value)
@@ -119,6 +123,7 @@ def test_validate_daily_ohlcv_rejects_invalid_requested_as_of():
     with pytest.raises(OfficialDataError) as exc_info:
         stockstats_utils.validate_daily_ohlcv(frame, "yfinance", "MSFT", "not-a-date")
 
+    assert not isinstance(exc_info.value, RecoverableDataflowError)
     message = str(exc_info.value)
     assert "yfinance" in message
     assert "MSFT" in message

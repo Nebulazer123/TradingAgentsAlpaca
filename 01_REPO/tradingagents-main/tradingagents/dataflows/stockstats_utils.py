@@ -8,7 +8,7 @@ import yfinance as yf
 from stockstats import wrap
 from yfinance.exceptions import YFRateLimitError
 
-from ._official_common import OfficialDataError
+from ._official_common import DataUnavailableError, OfficialDataError
 from .config import get_config
 from .utils import safe_ticker_component
 
@@ -44,7 +44,7 @@ def validate_daily_ohlcv(
     if as_of is None:
         raise OfficialDataError(f"{context}: invalid requested as-of date")
     if frame is None or frame.empty:
-        raise OfficialDataError(f"{context}: empty OHLCV frame")
+        raise DataUnavailableError(f"{context}: empty OHLCV frame")
 
     date_columns = {
         column
@@ -64,18 +64,18 @@ def validate_daily_ohlcv(
         if timestamp is not None:
             observations.append(timestamp)
     if not observations:
-        raise OfficialDataError(f"{context}: no parseable observation dates")
+        raise DataUnavailableError(f"{context}: no parseable observation dates")
 
     latest = max(observations)
     latest_label = latest.date().isoformat()
     if latest > as_of:
-        raise OfficialDataError(
+        raise DataUnavailableError(
             f"{context}; actual latest {latest_label}: latest observation is "
             "after the requested as-of date"
         )
     age_days = (as_of - latest).days
     if age_days > max_stale_days:
-        raise OfficialDataError(
+        raise DataUnavailableError(
             f"{context}; actual latest {latest_label}: latest observation is "
             f"{age_days} calendar days before requested as-of; maximum is "
             f"{max_stale_days}"

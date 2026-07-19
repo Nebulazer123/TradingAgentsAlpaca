@@ -16,10 +16,10 @@ from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from tradingagents.research.release_calendar import build_release_calendar_packet
 from tradingagents.schemas.research import SourceEvidencePacket
 
-from ._official_common import OfficialDataError
-from ._official_common import SECRET_PARAM_NAMES
+from ._official_common import SECRET_PARAM_NAMES, DataUnavailableError, OfficialDataError
 from .alpaca_news import fetch_alpaca_news
 from .bea import fetch_bea_data
 from .bls import fetch_bls_timeseries
@@ -42,14 +42,13 @@ from .marketaux import fetch_marketaux_news
 from .massive import fetch_massive_daily_prices
 from .newsapi import fetch_newsapi_everything
 from .reddit import fetch_reddit_posts
-from .yfinance_earnings_calendar import fetch_yfinance_earnings_calendar
-from .yfinance_options import fetch_yfinance_options_iv_flow
-from .yfinance_short_interest import fetch_yfinance_short_interest
 from .sec import fetch_sec_company_tickers, fetch_sec_companyfacts, fetch_sec_submissions
 from .stocktwits import fetch_stocktwits_messages
 from .tiingo import fetch_tiingo_daily_prices, fetch_tiingo_news
 from .treasury_fiscal import fetch_treasury_fiscal
-from tradingagents.research.release_calendar import build_release_calendar_packet
+from .yfinance_earnings_calendar import fetch_yfinance_earnings_calendar
+from .yfinance_options import fetch_yfinance_options_iv_flow
+from .yfinance_short_interest import fetch_yfinance_short_interest
 
 
 def _packet_payload_preview(packet: SourceEvidencePacket, *, max_chars: int = 4_000) -> str:
@@ -220,18 +219,27 @@ def get_finnhub_fundamentals(ticker: str, curr_date: str | None = None) -> str:
 
 def _sec_cik_for_symbol(ticker: str) -> str:
     symbol = _symbol(ticker)
+    if not symbol or re.fullmatch(r"[A-Z0-9][A-Z0-9.-]*", symbol) is None:
+        raise ValueError("ticker must be a non-empty SEC symbol")
     packet = fetch_sec_company_tickers()
     payload = packet.payload
-    entries = payload.values() if isinstance(payload, dict) else []
+    if not isinstance(payload, dict):
+        raise OfficialDataError("SEC company-ticker payload must be a dictionary")
+    entries = payload.values()
     for entry in entries:
         if not isinstance(entry, dict):
-            continue
-        if str(entry.get("ticker") or "").upper() == symbol:
-            cik = str(entry.get("cik_str") or "")
-            if cik:
-                return cik
-            break
-    raise OfficialDataError(f"SEC CIK not found for ticker {symbol}")
+            raise OfficialDataError(
+                "SEC company-ticker payload contains a malformed entry"
+            )
+        entry_symbol = str(entry.get("ticker") or "").strip().upper()
+        cik = str(entry.get("cik_str") or "").strip()
+        if not entry_symbol or not cik.isdigit():
+            raise OfficialDataError(
+                "SEC company-ticker payload contains an invalid ticker or CIK entry"
+            )
+        if entry_symbol == symbol:
+            return cik
+    raise DataUnavailableError(f"SEC CIK not found for ticker {symbol}")
 
 
 def get_sec_fundamentals(ticker: str, curr_date: str | None = None) -> str:

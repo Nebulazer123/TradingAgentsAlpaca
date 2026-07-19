@@ -2,7 +2,10 @@ import json
 import re
 from datetime import date, datetime, timezone
 
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
+    OfficialDataError,
+)
 
 from .alpha_vantage_common import _make_api_request
 
@@ -115,7 +118,7 @@ def _filter_reports_by_date(
         usable_report_count += len(filtered_reports)
 
     if historical_cutoff and usable_report_count == 0:
-        raise OfficialDataError(
+        raise DataUnavailableError(
             "Alpha Vantage returned no usable historical statement reports"
         )
     return json.dumps(payload)
@@ -153,13 +156,13 @@ def get_fundamentals(ticker: str, curr_date: str = None) -> str:
 
     cutoff = _parse_exact_date(curr_date, field_name="curr_date")
     if cutoff < _utc_date():
-        raise OfficialDataError(
+        raise DataUnavailableError(
             "Alpha Vantage historical OVERVIEW is unavailable because the "
             "endpoint only returns a current snapshot"
         )
     result = _make_api_request("OVERVIEW", params)
     if cutoff < _utc_date():
-        raise OfficialDataError(
+        raise DataUnavailableError(
             "Alpha Vantage historical OVERVIEW became stale during the request"
         )
     return result
