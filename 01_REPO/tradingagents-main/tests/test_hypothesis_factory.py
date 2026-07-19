@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import multiprocessing
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -44,6 +46,18 @@ from tradingagents.evals.learning_availability import LearningAvailabilityLedger
 MINE_AT = "2026-02-01T00:00:00+00:00"
 IN_SAMPLE_AT = "2026-01-05T00:00:00+00:00"
 OUT_OF_SAMPLE_AT = "2026-03-05T00:00:00+00:00"
+
+
+def _concurrent_factory_worker(paths, start, results):
+    try:
+        hypothesis_factory_module._before_hypothesis_store_publish = (
+            lambda: time.sleep(0.2)
+        )
+        start.wait(timeout=5)
+        payload = run_hypothesis_factory(**paths, now=MINE_AT)
+        results.put(("ok", payload["lifecycle_appended_event_count"]))
+    except Exception as exc:  # pragma: no cover - reported in the parent process
+        results.put(("error", repr(exc)))
 
 
 def _forecast(
@@ -615,6 +629,245 @@ def test_factory_crash_before_lifecycle_append_preserves_old_store_and_events(
     }
     assert EVENT_HYPOTHESIS_SUPPORTED in recovered_types
     assert EVENT_PRIOR_EMITTED in recovered_types
+
+
+def test_factory_pre_store_crash_replays_original_transition_time_on_later_retry(
+    monkeypatch,
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    store_path = tmp_path / "hypotheses.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    availability_root = tmp_path / "availability"
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=store_path,
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=lifecycle_path,
+        availability_root=availability_root,
+    )
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    run_hypothesis_factory(
+        **factory_paths,
+        now=MINE_AT,
+        producer_recorded_at=dt.datetime(
+            2026,
+            7,
+            18,
+            18,
+            0,
+            tzinfo=dt.timezone.utc,
+        ),
+    )
+    bad_id = next(
+        item.hypothesis_id
+        for item in load_hypotheses(store_path)
+        if item.context == {"agent": "bad_agent"}
+    )
+    out_of_sample = [
+        *[
+            _forecast("bad_agent", False, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+        *[
+            _forecast("good_agent", True, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+    ]
+    write_ledger([*_in_sample_cohort(), *out_of_sample], path=ledger_path)
+
+    def crash_before_store():
+        raise RuntimeError("crash after lifecycle and availability")
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "_before_hypothesis_store_publish",
+        crash_before_store,
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="lifecycle and availability"):
+        run_hypothesis_factory(
+            **factory_paths,
+            now=OUT_OF_SAMPLE_AT,
+            producer_recorded_at=dt.datetime(
+                2026,
+                7,
+                18,
+                19,
+                0,
+                tzinfo=dt.timezone.utc,
+            ),
+        )
+    assert next(
+        item for item in load_hypotheses(store_path) if item.hypothesis_id == bad_id
+    ).status == STATUS_PREREGISTERED
+    first_events = [
+        event
+        for event in load_lifecycle_events_with_stats(lifecycle_path)[0]
+        if event.hypothesis_id == bad_id
+        and event.event_type
+        in {EVENT_HYPOTHESIS_SUPPORTED, EVENT_PRIOR_EMITTED}
+    ]
+    assert [event.event_type for event in first_events] == [
+        EVENT_HYPOTHESIS_SUPPORTED,
+        EVENT_PRIOR_EMITTED,
+    ]
+    assert {event.occurred_at for event in first_events} == {OUT_OF_SAMPLE_AT}
+    assert {
+        observation.source_id
+        for observation in LearningAvailabilityLedger(availability_root).verify()
+    }.issuperset({event.event_id for event in first_events})
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "_before_hypothesis_store_publish",
+        lambda: None,
+        raising=False,
+    )
+    recovered = run_hypothesis_factory(
+        **factory_paths,
+        now="2026-04-01T00:00:00+00:00",
+        producer_recorded_at=dt.datetime(
+            2026,
+            7,
+            18,
+            20,
+            0,
+            tzinfo=dt.timezone.utc,
+        ),
+    )
+    assert recovered["lifecycle_appended_event_count"] == 0
+    final_events = [
+        event
+        for event in load_lifecycle_events_with_stats(lifecycle_path)[0]
+        if event.hypothesis_id == bad_id
+        and event.event_type
+        in {EVENT_HYPOTHESIS_SUPPORTED, EVENT_PRIOR_EMITTED}
+    ]
+    assert [event.event_type for event in final_events] == [
+        EVENT_HYPOTHESIS_SUPPORTED,
+        EVENT_PRIOR_EMITTED,
+    ]
+    assert {event.occurred_at for event in final_events} == {OUT_OF_SAMPLE_AT}
+    assert next(
+        item for item in load_hypotheses(store_path) if item.hypothesis_id == bad_id
+    ).status == STATUS_SUPPORTED
+
+
+def test_factory_rejects_corrupt_pending_transaction_without_replacing_it(
+    monkeypatch,
+    tmp_path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    store_path = tmp_path / "hypotheses.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    factory_paths = dict(
+        ledger_path=ledger_path,
+        store_path=store_path,
+        priors_path=tmp_path / "priors.json",
+        summary_path=tmp_path / "summary.json",
+        lifecycle_path=lifecycle_path,
+        availability_root=tmp_path / "availability",
+    )
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    run_hypothesis_factory(**factory_paths, now=MINE_AT)
+    out_of_sample = [
+        *[
+            _forecast("bad_agent", False, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+        *[
+            _forecast("good_agent", True, created_at=OUT_OF_SAMPLE_AT, index=i)
+            for i in range(8)
+        ],
+    ]
+    write_ledger([*_in_sample_cohort(), *out_of_sample], path=ledger_path)
+
+    def crash_before_store():
+        raise RuntimeError("leave pending transaction")
+
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "_before_hypothesis_store_publish",
+        crash_before_store,
+    )
+    with pytest.raises(RuntimeError, match="leave pending"):
+        run_hypothesis_factory(**factory_paths, now=OUT_OF_SAMPLE_AT)
+
+    pending_path = hypothesis_factory_module._pending_transaction_path(store_path)
+    tampered = json.loads(pending_path.read_text(encoding="utf-8"))
+    tampered["semantic_now"] = "2026-04-01T00:00:00+00:00"
+    pending_path.write_text(
+        json.dumps(tampered, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    corrupt_pending = pending_path.read_bytes()
+    old_store = store_path.read_bytes()
+    old_lifecycle = lifecycle_path.read_bytes()
+    monkeypatch.setattr(
+        hypothesis_factory_module,
+        "_before_hypothesis_store_publish",
+        lambda: None,
+    )
+
+    with pytest.raises(
+        hypothesis_factory_module.PendingHypothesisTransactionError,
+        match="digest mismatch",
+    ):
+        run_hypothesis_factory(
+            **factory_paths,
+            now="2026-04-01T00:00:00+00:00",
+        )
+
+    assert pending_path.read_bytes() == corrupt_pending
+    assert store_path.read_bytes() == old_store
+    assert lifecycle_path.read_bytes() == old_lifecycle
+
+
+def test_factory_serializes_concurrent_entries_without_duplicate_events(tmp_path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    store_path = tmp_path / "hypotheses.jsonl"
+    lifecycle_path = tmp_path / "lifecycle.jsonl"
+    write_ledger(_in_sample_cohort(), path=ledger_path)
+    factory_paths = {
+        "ledger_path": str(ledger_path),
+        "store_path": str(store_path),
+        "priors_path": str(tmp_path / "priors.json"),
+        "summary_path": str(tmp_path / "summary.json"),
+        "lifecycle_path": str(lifecycle_path),
+        "availability_root": str(tmp_path / "availability"),
+    }
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_concurrent_factory_worker,
+            args=(factory_paths, start, results),
+        )
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    for worker in workers:
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert worker.exitcode == 0
+    outcomes = [results.get(timeout=2) for _ in workers]
+
+    assert [status for status, _ in outcomes] == ["ok", "ok"]
+    append_counts = sorted(count for _, count in outcomes)
+    assert append_counts[0] == 0
+    assert append_counts[1] > 0
+    events, corrupt = load_lifecycle_events_with_stats(lifecycle_path)
+    assert corrupt == 0
+    assert len({event.event_id for event in events}) == len(events)
+    assert load_hypotheses(store_path)
+    assert not hypothesis_factory_module._pending_transaction_path(
+        store_path
+    ).exists()
 
 
 def test_run_factory_records_first_supported_verdict_in_lifecycle(tmp_path):
