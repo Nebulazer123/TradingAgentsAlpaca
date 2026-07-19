@@ -81,3 +81,71 @@ def test_yfinance_earnings_calendar_missing_symbol_remains_terminal(monkeypatch)
         fetch_yfinance_earnings_calendar("")
 
     assert not isinstance(exc_info.value, RecoverableDataflowError)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TypeError("provider contract failure"),
+        AssertionError("provider invariant failure"),
+        OfficialDataError("malformed provider evidence"),
+    ],
+)
+def test_yfinance_earnings_dates_failure_propagates_unchanged(monkeypatch, error):
+    def fail_dates(**_kwargs):
+        raise error
+
+    ticker = SimpleNamespace(
+        calendar={"Earnings Date": "2026-07-21"},
+        get_earnings_dates=fail_dates,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: ticker),
+    )
+
+    with pytest.raises(type(error)) as exc_info:
+        fetch_yfinance_earnings_calendar("CRM")
+
+    assert exc_info.value is error
+
+
+def test_yfinance_calendar_object_serialization_failure_propagates(monkeypatch):
+    error = AssertionError("calendar serialization invariant failure")
+
+    class BrokenCalendar:
+        def to_dict(self):
+            raise error
+
+    ticker = SimpleNamespace(calendar=BrokenCalendar())
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: ticker),
+    )
+
+    with pytest.raises(AssertionError) as exc_info:
+        fetch_yfinance_earnings_calendar("CRM")
+
+    assert exc_info.value is error
+
+
+def test_yfinance_calendar_scalar_normalization_failure_propagates(monkeypatch):
+    error = OfficialDataError("calendar scalar contract failure")
+
+    class BrokenScalar:
+        def item(self):
+            raise error
+
+    ticker = SimpleNamespace(calendar={"Earnings Date": BrokenScalar()})
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: ticker),
+    )
+
+    with pytest.raises(OfficialDataError) as exc_info:
+        fetch_yfinance_earnings_calendar("CRM")
+
+    assert exc_info.value is error

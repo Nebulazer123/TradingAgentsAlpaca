@@ -944,11 +944,8 @@ def _cache_age_seconds(path: Path, *, now: datetime.datetime | None = None) -> f
 def _load_cached_packet(path: Path) -> SourceEvidencePacket | None:
     if not path.exists():
         return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return SourceEvidencePacket.model_validate(payload)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return SourceEvidencePacket.model_validate(payload)
 
 
 def _with_cache_state(

@@ -806,6 +806,98 @@ def test_ticker_provider_bundle_uses_yfinance_options_before_gap(monkeypatch, tm
     assert not any(packet.source_name == "options_iv_flow_gap" for packet in result.packets)
 
 
+def test_ticker_provider_bundle_uses_configured_yfinance_earnings_calendar_order(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    def fetch_calendar(symbol):
+        calls.append(symbol)
+        packet = _packet(
+            "yfinance_earnings_calendar",
+            evidence_type="earnings_calendar",
+            symbol=symbol,
+        )
+        packet.payload["execution_authority"] = "none"
+        return packet
+
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_yfinance_earnings_calendar",
+        fetch_calendar,
+        raising=False,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("earnings_calendar",),
+        max_packets_per_need=1,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert calls == ["NVDA"]
+    assert [attempt["source_name"] for attempt in result.route_attempts] == [
+        "official_cache",
+        "release_calendar_watchlist",
+        "yfinance_earnings_calendar",
+    ]
+    assert [attempt["status"] for attempt in result.route_attempts] == [
+        "cache_miss",
+        "unsupported_in_local_orchestrator",
+        "packet_written",
+    ]
+    assert [packet.source_name for packet in result.packets] == [
+        "yfinance_earnings_calendar"
+    ]
+    assert result.packets[0].analysis_only is True
+    assert result.packets[0].payload["execution_authority"] == "none"
+    assert result.summary_packet is not None
+    assert result.summary_packet.payload["execution_authority"] == "none"
+
+
+def test_ticker_provider_bundle_falls_back_from_unavailable_earnings_calendar_to_gap(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_yfinance_earnings_calendar",
+        lambda _symbol: (_ for _ in ()).throw(
+            DataUnavailableError("no current earnings dates")
+        ),
+        raising=False,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("earnings_calendar",),
+        disabled_sources={"official_cache"},
+        max_packets_per_need=1,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert [packet.source_name for packet in result.packets] == [
+        "earnings_calendar_gap"
+    ]
+    assert [attempt["source_name"] for attempt in result.route_attempts] == [
+        "release_calendar_watchlist",
+        "yfinance_earnings_calendar",
+        "earnings_calendar_gap",
+    ]
+    yfinance_attempt = next(
+        attempt
+        for attempt in result.route_attempts
+        if attempt["source_name"] == "yfinance_earnings_calendar"
+    )
+    assert yfinance_attempt["status"] == "packet_written"
+    assert yfinance_attempt["blocked"] is True
+    gap = result.packets[0]
+    assert gap.analysis_only is True
+    assert gap.payload["execution_authority"] == "none"
+    assert gap.freshness["blocked"] is True
+
+
 def test_ticker_provider_bundle_skips_depleted_limited_sources(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator,
@@ -894,6 +986,88 @@ def test_ticker_provider_bundle_uses_public_reddit_social_context(monkeypatch, t
         and attempt["status"] == "packet_written"
         for attempt in result.route_attempts
     )
+
+
+@pytest.mark.parametrize("failure_mode", ["typed_transport", "invalid_external_json"])
+def test_ticker_provider_bundle_records_reddit_failure_as_blocked_attempt(
+    monkeypatch,
+    tmp_path,
+    failure_mode,
+):
+    if failure_mode == "typed_transport":
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_reddit_posts",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DataTransportError("Reddit public transport failed")
+            ),
+        )
+    else:
+        from tradingagents.dataflows import reddit as reddit_dataflow
+
+        class InvalidJsonResponse:
+            text = "not JSON"
+
+        monkeypatch.setattr(
+            reddit_dataflow,
+            "get_text_response",
+            lambda *_args, **_kwargs: InvalidJsonResponse(),
+        )
+
+    twitter_calls = []
+
+    def fetch_twitter(symbol, *, evidence_need):
+        twitter_calls.append(symbol)
+        return evidence_packet(
+            source_name="twitter",
+            evidence_type=evidence_need,
+            subject=f"twitter context for {symbol}",
+            symbol=symbol,
+            source_ref=f"docker-mcp://twitter-research/{symbol}",
+            payload={
+                "symbol": symbol,
+                "read_only": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+            },
+            quality="low",
+            tool_route="docker:twitter-research",
+            freshness_extra={"read_only": True, "blocked": False},
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_twitter_recent_search_packet",
+        fetch_twitter,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("social_sentiment",),
+        disabled_sources={
+            "facebook",
+            "google_news_rss",
+            "instagram",
+            "linkedin",
+            "official_cache",
+            "reddit_watchlist",
+            "social_watchlist",
+        },
+        max_packets_per_need=2,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert twitter_calls == ["NVDA"]
+    assert [packet.source_name for packet in result.packets] == ["twitter"]
+    reddit_attempt = next(
+        attempt
+        for attempt in result.route_attempts
+        if attempt["source_name"] == "reddit"
+    )
+    assert reddit_attempt["status"] == "packet_written"
+    assert reddit_attempt["blocked"] is True
+    assert result.packets[0].freshness["blocked"] is False
+    assert result.packets[0].payload["execution_authority"] == "none"
 
 
 def test_ticker_provider_bundle_uses_twitter_mcp_social_context(monkeypatch, tmp_path):

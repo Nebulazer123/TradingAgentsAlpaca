@@ -5,27 +5,24 @@ which do not require an API key. Public throughput is ~10 requests per
 minute per IP, well within budget for a single agent run that queries
 a handful of finance subreddits per ticker.
 
-Returns formatted plaintext blocks ready for prompt injection. Degrades
-gracefully — returns a placeholder string rather than raising, so callers
-never have to special-case missing data.
+Returns formatted plaintext blocks ready for prompt injection. Typed source
+failures propagate to the provider boundary so they can become blocked
+evidence or select another configured route.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 import time
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 from tradingagents.dataflows._official_common import (
-    RecoverableDataflowError,
+    DataTransportError,
     get_text_response,
     record_connector_health,
 )
-
-logger = logging.getLogger(__name__)
 
 _API = "https://www.reddit.com/r/{sub}/search.json?{qs}"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
@@ -42,7 +39,7 @@ def _fetch_subreddit(
     limit: int,
     timeout: float,
     time_filter: str,
-) -> list[dict] | None:
+) -> list[dict]:
     qs = urlencode({
         "q": ticker,
         "restrict_sr": "on",
@@ -51,20 +48,14 @@ def _fetch_subreddit(
         "limit": limit,
     })
     url = _API.format(sub=sub, qs=qs)
+    result = get_text_response(
+        url,
+        headers={"User-Agent": _UA, "Accept": "application/json"},
+        timeout=timeout,
+        connector_name="reddit_public",
+    )
     try:
-        result = get_text_response(
-            url,
-            headers={"User-Agent": _UA, "Accept": "application/json"},
-            timeout=timeout,
-            connector_name="reddit_public",
-        )
         payload = json.loads(result.text)
-    except RecoverableDataflowError as exc:
-        if "HTTP 403" in str(exc):
-            logger.warning("Reddit public endpoint blocked for r/%s · %s: %s", sub, ticker, exc)
-            return None
-        logger.warning("Reddit fetch failed for r/%s · %s: %s", sub, ticker, exc)
-        return []
     except json.JSONDecodeError as exc:
         record_connector_health(
             "reddit_public",
@@ -72,8 +63,9 @@ def _fetch_subreddit(
             error="JSONDecodeError: Reddit public endpoint returned invalid JSON",
             write=True,
         )
-        logger.warning("Reddit fetch failed for r/%s · %s: %s", sub, ticker, exc)
-        return []
+        raise DataTransportError(
+            "Reddit public endpoint returned invalid JSON"
+        ) from exc
     children = (payload.get("data") or {}).get("children") or []
     return [c.get("data", {}) for c in children if isinstance(c, dict)]
 
@@ -155,14 +147,6 @@ def fetch_reddit_posts(
         if i > 0:
             time.sleep(inter_request_delay)
         posts = _fetch_subreddit(ticker, sub, limit_per_sub, timeout, time_filter)
-        if posts is None:
-            blocks.append(
-                "Reddit public endpoint returned HTTP 403 for "
-                f"r/{sub} while fetching {ticker.upper()}; skipped remaining "
-                "public Reddit queries. Add official Reddit API credentials "
-                "or use another social data vendor to restore this source."
-            )
-            break
         posts = [post for post in posts if _in_date_window(post, start_date, end_date)]
         total_posts += len(posts)
         if not posts:
@@ -187,8 +171,6 @@ def fetch_reddit_posts(
             )
         blocks.append("\n".join(lines))
 
-    if total_posts == 0 and any("HTTP 403" in block for block in blocks):
-        return "\n\n".join(blocks)
     if total_posts == 0:
         return (
             f"<no Reddit posts found mentioning {ticker.upper()} across "

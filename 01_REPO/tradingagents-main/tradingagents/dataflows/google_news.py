@@ -126,6 +126,8 @@ def fetch_google_news_rss(
     end_date: str | None = None,
     session: Any | None = None,
 ) -> Any:
+    _parse_date_bound(start_date, end_of_day=False)
+    _parse_date_bound(end_date, end_of_day=True)
     params = {"hl": hl, "gl": gl, "ceid": ceid}
     url = BASE_URL
     subject = "top_stories"

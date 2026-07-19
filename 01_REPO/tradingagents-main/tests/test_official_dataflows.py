@@ -1,6 +1,8 @@
 import json
+from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from tradingagents.dataflows import (
     _official_common as official_common,
@@ -555,6 +557,114 @@ def test_cached_safe_fetch_uses_fresh_official_cache(tmp_path):
     assert second.payload == {"observations": []}
 
 
+@pytest.mark.parametrize(
+    ("cache_text", "expected_error"),
+    [
+        ("{", json.JSONDecodeError),
+        ("{}", ValidationError),
+    ],
+)
+def test_cached_safe_fetch_propagates_corrupt_existing_cache_without_fetching(
+    tmp_path,
+    cache_text,
+    expected_error,
+):
+    cache_key = official_cache_key("fred", "corrupt-cache", expected_error.__name__)
+    cache_path = official_common._cache_path(tmp_path, cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(cache_text, encoding="utf-8")
+    fetch_calls = []
+
+    def fetcher():
+        fetch_calls.append(True)
+        raise AssertionError("corrupt cache must abort before refresh")
+
+    with pytest.raises(expected_error):
+        cached_safe_fetch_evidence(
+            fetcher,
+            cache_key=cache_key,
+            ttl_seconds=3600,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            cache_dir=tmp_path,
+        )
+
+    assert fetch_calls == []
+
+
+def test_cached_safe_fetch_propagates_unreadable_existing_cache_without_fetching(
+    monkeypatch,
+    tmp_path,
+):
+    cache_key = official_cache_key("fred", "unreadable-cache")
+    cache_path = official_common._cache_path(tmp_path, cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("{}", encoding="utf-8")
+    original_read_text = Path.read_text
+    fetch_calls = []
+
+    def unreadable_target(path, *args, **kwargs):
+        if path == cache_path:
+            raise PermissionError("cache read denied")
+        return original_read_text(path, *args, **kwargs)
+
+    def fetcher():
+        fetch_calls.append(True)
+        raise AssertionError("unreadable cache must abort before refresh")
+
+    monkeypatch.setattr(Path, "read_text", unreadable_target)
+
+    with pytest.raises(PermissionError, match="cache read denied"):
+        cached_safe_fetch_evidence(
+            fetcher,
+            cache_key=cache_key,
+            ttl_seconds=3600,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            cache_dir=tmp_path,
+        )
+
+    assert fetch_calls == []
+
+
+def test_cached_safe_fetch_does_not_treat_unstatable_cache_as_absent(
+    monkeypatch,
+    tmp_path,
+):
+    cache_key = official_cache_key("fred", "unstatable-cache")
+    cache_path = official_common._cache_path(tmp_path, cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("{}", encoding="utf-8")
+    original_stat = Path.stat
+    fetch_calls = []
+
+    def unstatable_target(path, *args, **kwargs):
+        if path == cache_path:
+            raise PermissionError("cache stat denied")
+        return original_stat(path, *args, **kwargs)
+
+    def fetcher():
+        fetch_calls.append(True)
+        raise AssertionError("unstatable cache must abort before refresh")
+
+    monkeypatch.setattr(Path, "stat", unstatable_target)
+
+    with pytest.raises(PermissionError, match="cache stat denied"):
+        cached_safe_fetch_evidence(
+            fetcher,
+            cache_key=cache_key,
+            ttl_seconds=3600,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            cache_dir=tmp_path,
+        )
+
+    assert fetch_calls == []
+
+
 @pytest.mark.parametrize("error_type", [DataTransportError, DataUnavailableError])
 def test_cached_safe_fetch_returns_stale_cache_on_recoverable_refresh_failure(
     tmp_path,
@@ -1065,14 +1175,17 @@ def test_google_news_unusable_external_rss_is_transport_failure(rss):
 
 
 def test_google_news_invalid_caller_date_remains_terminal():
+    session = FakeSession(text="not XML")
+
     with pytest.raises(OfficialDataError, match="date filter") as exc_info:
         google_news.fetch_google_news_rss(
             query="AAPL stock",
             start_date="not-a-date",
-            session=FakeSession(text="<rss><channel /></rss>"),
+            session=session,
         )
 
     assert not isinstance(exc_info.value, RecoverableDataflowError)
+    assert session.calls == []
 
 
 def test_scrapingbee_uses_key_but_writes_only_redacted_preview():

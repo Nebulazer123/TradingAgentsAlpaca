@@ -56,6 +56,9 @@ from tradingagents.dataflows.tiingo import (
     fetch_tiingo_news,
     fetch_tiingo_ticker_metadata,
 )
+from tradingagents.dataflows.yfinance_earnings_calendar import (
+    fetch_yfinance_earnings_calendar,
+)
 from tradingagents.dataflows.yfinance_options import fetch_yfinance_options_iv_flow
 from tradingagents.dataflows.yfinance_short_interest import fetch_yfinance_short_interest
 from tradingagents.research.crawler_policy import CrawlerPolicy
@@ -98,6 +101,10 @@ RESEARCH_GAP_EVIDENCE_NEEDS = {
     "options_iv_flow": {
         "why_it_matters": "0DTE/gamma/IV context can affect intraday dip-buy and spike-sell behavior.",
         "suggested_routes": ["massive_options_or_polygon_options", "dedicated_options_vendor"],
+    },
+    "earnings_calendar": {
+        "why_it_matters": "Upcoming earnings can materially change event risk and trade timing.",
+        "suggested_routes": ["issuer_ir_calendar", "exchange_or_vendor_earnings_calendar"],
     },
 }
 
@@ -966,6 +973,8 @@ def _fetcher_for_candidate(
         return lambda: _fetch_yfinance_quote_price_context(symbol, now=now)
     if source == "yfinance_options" and evidence_need == "options_iv_flow":
         return lambda: fetch_yfinance_options_iv_flow(symbol)
+    if source == "yfinance_earnings_calendar" and evidence_need == "earnings_calendar":
+        return lambda: fetch_yfinance_earnings_calendar(symbol)
     if source == "yfinance_short_interest" and evidence_need == "short_interest":
         return lambda: fetch_yfinance_short_interest(symbol)
     if source == "sec_edgar" and evidence_need == "fundamentals_profile":

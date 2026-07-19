@@ -24,11 +24,8 @@ def _json_safe(value: Any) -> Any:
         return value
     if hasattr(value, "isoformat"):
         return value.isoformat()
-    try:
-        if hasattr(value, "item"):
-            return _json_safe(value.item())
-    except Exception:  # noqa: BLE001 - best-effort normalization for pandas/numpy scalars.
-        pass
+    if hasattr(value, "item"):
+        return _json_safe(value.item())
     return str(value)
 
 
@@ -53,10 +50,7 @@ def _calendar_payload(calendar: Any) -> dict[str, Any]:
     if isinstance(calendar, dict):
         return {str(key): _json_safe(value) for key, value in calendar.items()}
     if hasattr(calendar, "to_dict"):
-        try:
-            value = calendar.to_dict()
-        except Exception:  # noqa: BLE001 - yfinance can vary by version.
-            return {}
+        value = calendar.to_dict()
         if isinstance(value, dict):
             return {str(key): _json_safe(item) for key, item in value.items()}
     return {}
@@ -79,13 +73,10 @@ def fetch_yfinance_earnings_calendar(
     calendar = _calendar_payload(getattr(ticker, "calendar", None))
     earnings_dates: list[dict[str, Any]] = []
     if hasattr(ticker, "get_earnings_dates"):
-        try:
-            earnings_dates = _records_from_frame(
-                ticker.get_earnings_dates(limit=max(1, int(max_rows))),
-                max_rows=max_rows,
-            )
-        except Exception as exc:  # noqa: BLE001 - keep calendar packet usable if this optional call fails.
-            calendar["earnings_dates_error"] = f"{type(exc).__name__}: earnings dates unavailable"
+        earnings_dates = _records_from_frame(
+            ticker.get_earnings_dates(limit=max(1, int(max_rows))),
+            max_rows=max_rows,
+        )
 
     if not calendar and not earnings_dates:
         raise DataUnavailableError(
