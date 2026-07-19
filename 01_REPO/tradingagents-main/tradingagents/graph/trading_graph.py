@@ -43,6 +43,8 @@ from .reflection import Reflector
 from .setup import GraphSetup
 from .signal_processing import SignalProcessor
 
+CHECKPOINT_SIGNATURE_SCHEMA_VERSION = 1
+
 
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
@@ -67,6 +69,24 @@ class TradingAgentsGraph:
         self.callbacks = callbacks or []
         if selected_analysts is None:
             selected_analysts = ["market", "social", "news", "fundamentals"]
+        self.selected_analysts = tuple(selected_analysts)
+        self._checkpoint_shape = {
+            "schema_version": self.config.get(
+                "checkpoint_signature_schema_version",
+                CHECKPOINT_SIGNATURE_SCHEMA_VERSION,
+            ),
+            "selected_analysts": self.selected_analysts,
+            "max_debate_rounds": self.config["max_debate_rounds"],
+            "max_risk_discuss_rounds": self.config["max_risk_discuss_rounds"],
+            "analyst_concurrency_limit": self.config.get(
+                "analyst_concurrency_limit",
+                1,
+            ),
+            "tool_free_analysts": tuple(
+                sorted(set(self.config.get("tool_free_analysts", [])))
+            ),
+            "source_revision": self.config.get("checkpoint_source_revision"),
+        }
 
         # Update the interface's config
         set_config(self.config)
@@ -105,16 +125,20 @@ class TradingAgentsGraph:
 
         # Initialize components
         self.conditional_logic = ConditionalLogic(
-            max_debate_rounds=self.config["max_debate_rounds"],
-            max_risk_discuss_rounds=self.config["max_risk_discuss_rounds"],
+            max_debate_rounds=self._checkpoint_shape["max_debate_rounds"],
+            max_risk_discuss_rounds=self._checkpoint_shape[
+                "max_risk_discuss_rounds"
+            ],
         )
         self.graph_setup = GraphSetup(
             self.quick_thinking_llm,
             self.deep_thinking_llm,
             self.tool_nodes,
             self.conditional_logic,
-            analyst_concurrency_limit=self.config.get("analyst_concurrency_limit", 1),
-            tool_free_analysts=set(self.config.get("tool_free_analysts", [])),
+            analyst_concurrency_limit=self._checkpoint_shape[
+                "analyst_concurrency_limit"
+            ],
+            tool_free_analysts=set(self._checkpoint_shape["tool_free_analysts"]),
         )
 
         self.propagator = Propagator(
@@ -129,7 +153,7 @@ class TradingAgentsGraph:
         self.log_states_dict = {}  # date to full state dict
 
         # Set up the graph: keep the workflow for recompilation with a checkpointer.
-        self.workflow = self.graph_setup.setup_graph(selected_analysts)
+        self.workflow = self.graph_setup.setup_graph(self.selected_analysts)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
 
@@ -144,6 +168,11 @@ class TradingAgentsGraph:
 
         max_retries = self.config.get("llm_max_retries")
         if max_retries is not None:
+            if type(max_retries) is not int or max_retries < 0:
+                raise ValueError(
+                    "llm_max_retries must be a non-negative integer, "
+                    f"got {max_retries!r}"
+                )
             kwargs["max_retries"] = max_retries
 
         max_output_tokens = self.config.get("llm_max_output_tokens")
@@ -334,6 +363,44 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
+    def _run_signature(self, asset_type: str) -> str:
+        """Return the canonical allowlisted identity of this decision graph."""
+        shape = self._checkpoint_shape
+        schema_version = shape["schema_version"]
+        if type(schema_version) is not int or schema_version < 1:
+            raise ValueError(
+                "checkpoint_signature_schema_version must be a positive integer"
+            )
+
+        source_revision = shape["source_revision"]
+        if source_revision is not None:
+            valid_revision = (
+                isinstance(source_revision, str)
+                and bool(source_revision)
+                and source_revision == source_revision.strip()
+                and not source_revision.lower().endswith("-dirty")
+                and all(
+                    character.isalnum() or character in "._-"
+                    for character in source_revision
+                )
+            )
+            if not valid_revision:
+                raise ValueError(
+                    "checkpoint_source_revision must be a clean revision token"
+                )
+
+        payload = {
+            "schema_version": schema_version,
+            "selected_analysts": list(shape["selected_analysts"]),
+            "asset_type": asset_type,
+            "max_debate_rounds": shape["max_debate_rounds"],
+            "max_risk_discuss_rounds": shape["max_risk_discuss_rounds"],
+            "analyst_concurrency_limit": shape["analyst_concurrency_limit"],
+            "tool_free_analysts": list(shape["tool_free_analysts"]),
+            "source_revision": source_revision,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
         """Run the trading agents graph for a company on a specific date.
 
@@ -342,8 +409,12 @@ class TradingAgentsGraph:
         from the ticker; programmatic callers pass it explicitly. When
         ``checkpoint_enabled`` is set in config, the graph is recompiled with
         a per-ticker SqliteSaver so a crashed run can resume from the last
-        successful node on a subsequent invocation with the same ticker+date.
+        successful node only under the same ticker, date, and graph shape.
         """
+        checkpoint_signature = None
+        if self.config.get("checkpoint_enabled"):
+            checkpoint_signature = self._run_signature(asset_type)
+
         self.ticker = company_name
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
@@ -358,7 +429,10 @@ class TradingAgentsGraph:
             self.graph = self.workflow.compile(checkpointer=saver)
 
             step = checkpoint_step(
-                self.config["data_cache_dir"], company_name, str(trade_date)
+                self.config["data_cache_dir"],
+                company_name,
+                str(trade_date),
+                checkpoint_signature,
             )
             if step is not None:
                 logger.info(
@@ -368,14 +442,25 @@ class TradingAgentsGraph:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         try:
-            return self._run_graph(company_name, trade_date, asset_type=asset_type)
+            return self._run_graph(
+                company_name,
+                trade_date,
+                asset_type=asset_type,
+                checkpoint_signature=checkpoint_signature,
+            )
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
                 self._checkpointer_ctx = None
                 self.graph = self.workflow.compile()
 
-    def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
+    def _run_graph(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        checkpoint_signature: str | None = None,
+    ):
         """Execute the graph and write the resulting state to disk and memory log."""
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
@@ -384,9 +469,11 @@ class TradingAgentsGraph:
         )
         args = self.propagator.get_graph_args()
 
-        # Inject thread_id so same ticker+date resumes, different date starts fresh.
+        # Only an identical ticker, date, and graph-shape signature may resume.
         if self.config.get("checkpoint_enabled"):
-            tid = thread_id(company_name, str(trade_date))
+            if checkpoint_signature is None:
+                checkpoint_signature = self._run_signature(asset_type)
+            tid = thread_id(company_name, str(trade_date), checkpoint_signature)
             args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = tid
 
         if self.debug:
@@ -421,7 +508,10 @@ class TradingAgentsGraph:
         # Clear checkpoint on successful completion to avoid stale state.
         if self.config.get("checkpoint_enabled"):
             clear_checkpoint(
-                self.config["data_cache_dir"], company_name, str(trade_date)
+                self.config["data_cache_dir"],
+                company_name,
+                str(trade_date),
+                checkpoint_signature,
             )
 
         return final_state, self.process_signal(final_state["final_trade_decision"])
