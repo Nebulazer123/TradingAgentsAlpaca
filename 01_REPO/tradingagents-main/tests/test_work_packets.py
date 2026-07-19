@@ -395,7 +395,7 @@ def test_from_dict_rejects_authority_overrides(tmp_path, field, value):
 def test_from_dict_round_trip_is_exact(tmp_path):
     packet = _packet(tmp_path)
 
-    restored = WorkPacket.from_dict(packet.compact())
+    restored = WorkPacket.from_dict(packet.compact(), now=NOW)
 
     assert restored == packet
     assert restored.canonical_json_bytes() == packet.canonical_json_bytes()
@@ -419,6 +419,29 @@ def test_from_dict_accepts_historical_packet_with_aware_clock_inside_lifetime(
     )
 
     assert restored.canonical_json_bytes() == packet.canonical_json_bytes()
+
+
+def test_from_dict_accepts_historical_packet_with_clock_at_created_at(tmp_path):
+    packet = _historical_packet(tmp_path)
+
+    restored = WorkPacket.from_dict(
+        packet.compact(),
+        now=HISTORICAL_NOW,
+    )
+
+    assert restored.canonical_json_bytes() == packet.canonical_json_bytes()
+
+
+def test_from_dict_rejects_historical_packet_with_clock_before_created_at(
+    tmp_path,
+):
+    packet = _historical_packet(tmp_path)
+
+    with pytest.raises(ValueError, match="packet not yet valid"):
+        WorkPacket.from_dict(
+            packet.compact(),
+            now=HISTORICAL_NOW - dt.timedelta(seconds=1),
+        )
 
 
 def test_from_dict_rejects_historical_packet_with_clock_at_expiry(tmp_path):

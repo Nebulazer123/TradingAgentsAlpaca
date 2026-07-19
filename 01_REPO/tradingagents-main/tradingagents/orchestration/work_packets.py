@@ -478,6 +478,8 @@ class WorkPacket:
         if expiry is None:
             issues.append("expires_at must be UTC ISO-8601 seconds")
         if created is not None and expiry is not None:
+            if current < created:
+                issues.append("packet not yet valid")
             if expiry <= created:
                 issues.append("expires_at must be strictly after created_at")
             if expiry <= current:
