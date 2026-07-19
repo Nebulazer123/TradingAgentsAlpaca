@@ -315,7 +315,12 @@ class WorkPacket:
         return packet
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> WorkPacket:
+    def from_dict(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        now: dt.datetime | None = None,
+    ) -> WorkPacket:
         if not isinstance(payload, Mapping):
             raise ValueError("work packet payload must be a mapping")
         payload_keys = tuple(payload)
@@ -374,7 +379,7 @@ class WorkPacket:
             allowed_effects=tuple(payload["allowed_effects"]),
             forbidden_effects=tuple(payload["forbidden_effects"]),
         )
-        _raise_for_issues(packet.validate(verify_evidence=False))
+        _raise_for_issues(packet.validate(now=now, verify_evidence=False))
         return packet
 
     def compact(self) -> dict[str, Any]:

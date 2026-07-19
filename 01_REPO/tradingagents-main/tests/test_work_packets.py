@@ -19,6 +19,7 @@ from tradingagents.orchestration.work_packets import (
 
 UTC = dt.timezone.utc
 NOW = dt.datetime(2030, 1, 2, 15, 4, 5, tzinfo=UTC)
+HISTORICAL_NOW = dt.datetime(2020, 1, 2, 15, 4, 5, tzinfo=UTC)
 ALLOWED_KINDS = {
     "research_evidence",
     "research_synthesis",
@@ -83,6 +84,14 @@ def _packet(tmp_path: Path, **overrides) -> WorkPacket:
     }
     values.update(overrides)
     return WorkPacket.create(**values)
+
+
+def _historical_packet(tmp_path: Path) -> WorkPacket:
+    return _packet(
+        tmp_path,
+        now=HISTORICAL_NOW,
+        expires_at=HISTORICAL_NOW + dt.timedelta(hours=2),
+    )
 
 
 @pytest.mark.parametrize(
@@ -390,6 +399,46 @@ def test_from_dict_round_trip_is_exact(tmp_path):
 
     assert restored == packet
     assert restored.canonical_json_bytes() == packet.canonical_json_bytes()
+
+
+def test_from_dict_without_now_rejects_expired_historical_packet(tmp_path):
+    packet = _historical_packet(tmp_path)
+
+    with pytest.raises(ValueError, match="packet expired"):
+        WorkPacket.from_dict(packet.compact())
+
+
+def test_from_dict_accepts_historical_packet_with_aware_clock_inside_lifetime(
+    tmp_path,
+):
+    packet = _historical_packet(tmp_path)
+
+    restored = WorkPacket.from_dict(
+        packet.compact(),
+        now=HISTORICAL_NOW + dt.timedelta(hours=1),
+    )
+
+    assert restored.canonical_json_bytes() == packet.canonical_json_bytes()
+
+
+def test_from_dict_rejects_historical_packet_with_clock_at_expiry(tmp_path):
+    packet = _historical_packet(tmp_path)
+
+    with pytest.raises(ValueError, match="packet expired"):
+        WorkPacket.from_dict(
+            packet.compact(),
+            now=HISTORICAL_NOW + dt.timedelta(hours=2),
+        )
+
+
+def test_from_dict_rejects_naive_historical_validation_clock(tmp_path):
+    packet = _historical_packet(tmp_path)
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        WorkPacket.from_dict(
+            packet.compact(),
+            now=(HISTORICAL_NOW + dt.timedelta(hours=1)).replace(tzinfo=None),
+        )
 
 
 def test_from_dict_rejects_packet_id_that_does_not_match_run_and_kind(tmp_path):
