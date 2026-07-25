@@ -350,10 +350,12 @@ def test_graph_has_exact_packet_nodes_and_boundary_edges(
 
 
 def test_real_concurrent_join_publishes_research_once(monkeypatch, tmp_path):
+    from tradingagents.graph import packet_nodes as packet_nodes_module
     from tradingagents.graph import setup as setup_module
     from tradingagents.graph.conditional_logic import ConditionalLogic
     from tradingagents.graph.setup import GraphSetup
 
+    monkeypatch.setattr(packet_nodes_module, "_utc_now", lambda: NOW)
     report_fields = {
         "create_prefetched_market_analyst": "market_report",
         "create_prefetched_news_analyst": "news_report",
