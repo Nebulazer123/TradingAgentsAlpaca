@@ -1,0 +1,998 @@
+from __future__ import annotations
+
+import ast
+import dataclasses
+import datetime as dt
+import hashlib
+import json
+import os
+import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+import tradingagents.strategy._immutable_evidence_store as evidence_store_module
+from tradingagents.strategy._immutable_evidence_store import (
+    STRATEGY_EVIDENCE_STORE_SCHEMA_VERSION,
+    EvidenceBackdatingError,
+    EvidenceCandidate,
+    EvidenceCollisionError,
+    EvidenceCorruptionError,
+    EvidenceEnvelope,
+    EvidenceEvent,
+    EvidencePointer,
+    ImmutableStrategyEvidenceStore,
+)
+
+UTC = dt.timezone.utc
+FIRST = dt.datetime(2030, 1, 2, 15, 4, 5, tzinfo=UTC)
+LATER = FIRST + dt.timedelta(seconds=10)
+EARLIER = FIRST - dt.timedelta(seconds=1)
+ZERO_HASH = "0" * 64
+ALLOWED_KINDS = (
+    "evaluation-registration",
+    "genome-window",
+    "promotion-evidence",
+    "baseline-genome",
+    "mutation-record",
+)
+ENVELOPE_KEYS = {
+    "schema_version",
+    "kind",
+    "object_id",
+    "effective_at",
+    "recorded_at",
+    "retry_material_sha256",
+    "payload_sha256",
+    "payload",
+    "analysis_only",
+    "execution_authority",
+    "can_submit_orders",
+}
+EVENT_KEYS = {
+    "schema_version",
+    "sequence",
+    "kind",
+    "object_id",
+    "object_sha256",
+    "retry_material_sha256",
+    "effective_at",
+    "recorded_at",
+    "previous_event_sha256",
+    "analysis_only",
+    "execution_authority",
+    "can_submit_orders",
+}
+POINTER_KEYS = {
+    "schema_version",
+    "kind",
+    "sequence",
+    "object_id",
+    "object_sha256",
+    "event_sha256",
+    "recorded_at",
+    "analysis_only",
+    "execution_authority",
+    "can_submit_orders",
+}
+
+
+def _canonical(payload: dict[str, object]) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+class _Clock:
+    def __init__(self, *values: dt.datetime):
+        self._values = list(values)
+        self._lock = threading.Lock()
+
+    def __call__(self) -> dt.datetime:
+        with self._lock:
+            if len(self._values) > 1:
+                return self._values.pop(0)
+            return self._values[0]
+
+
+def _candidate(
+    *,
+    kind: str = "evaluation-registration",
+    effective_at: str = "2030-01-02T14:00:00+00:00",
+    payload: dict[str, object] | None = None,
+) -> EvidenceCandidate:
+    return EvidenceCandidate(
+        kind=kind,
+        effective_at=effective_at,
+        payload=payload
+        or {
+            "registration_key": "NFLX-primary",
+            "windows": [
+                {"start": "2029-01-01", "end": "2029-03-31"},
+                {"start": "2029-04-01", "end": "2029-06-30"},
+            ],
+            "enabled": True,
+            "attempt": 1,
+            "note": None,
+        },
+    )
+
+
+def _admit(
+    tmp_path: Path,
+    *,
+    candidate: EvidenceCandidate | None = None,
+    clock: _Clock | None = None,
+) -> tuple[
+    ImmutableStrategyEvidenceStore,
+    Path,
+    EvidenceCandidate,
+    object,
+]:
+    root = tmp_path / "evidence"
+    selected = candidate or _candidate()
+    store = ImmutableStrategyEvidenceStore(root, clock=clock or _Clock(FIRST))
+    admission = store.admit_checked(selected, validate=lambda _prior, _new: None)
+    return store, root, selected, admission
+
+
+def _journal_lines(root: Path) -> list[bytes]:
+    return (root / "events.jsonl").read_bytes().splitlines()
+
+
+def _event_dict(root: Path, index: int = 0) -> dict[str, object]:
+    return json.loads(_journal_lines(root)[index])
+
+
+def _pointer_dict(
+    root: Path,
+    kind: str = "evaluation-registration",
+) -> dict[str, object]:
+    return json.loads((root / "latest" / f"{kind}.json").read_bytes())
+
+
+def _rewrite_event(root: Path, payload: dict[str, object]) -> None:
+    (root / "events.jsonl").write_bytes(_canonical(payload) + b"\n")
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[bytes, int, int]]:
+    snapshot: dict[str, tuple[bytes, int, int]] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            state = path.stat()
+            snapshot[str(path.relative_to(root))] = (
+                path.read_bytes(),
+                state.st_mtime_ns,
+                state.st_size,
+            )
+    return snapshot
+
+
+def test_candidate_deep_freezes_nested_payload_and_authority():
+    source = {
+        "items": [{"name": "alpha", "flags": [True, False]}],
+        "nothing": None,
+    }
+    candidate = _candidate(payload=source)
+    source["items"][0]["name"] = "changed"  # type: ignore[index]
+    source["items"].append({"name": "late"})  # type: ignore[union-attr]
+
+    assert candidate.payload["items"][0]["name"] == "alpha"  # type: ignore[index]
+    assert candidate.payload["items"][0]["flags"] == (True, False)  # type: ignore[index]
+    assert candidate.analysis_only is True
+    assert candidate.execution_authority == "none"
+    assert candidate.can_submit_orders is False
+    with pytest.raises((TypeError, dataclasses.FrozenInstanceError)):
+        candidate.kind = "mutation-record"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        candidate.payload["extra"] = "forbidden"  # type: ignore[index]
+
+
+def test_admit_writes_exact_canonical_object_event_pointer_layout(tmp_path):
+    store, root, candidate, admission = _admit(tmp_path)
+    envelope = admission.envelope
+    event = admission.event
+
+    retry_material = {
+        "kind": candidate.kind,
+        "effective_at": candidate.effective_at,
+        "payload": {
+            "attempt": 1,
+            "enabled": True,
+            "note": None,
+            "registration_key": "NFLX-primary",
+            "windows": [
+                {"end": "2029-03-31", "start": "2029-01-01"},
+                {"end": "2029-06-30", "start": "2029-04-01"},
+            ],
+        },
+    }
+    retry_digest = hashlib.sha256(_canonical(retry_material)).hexdigest()
+    expected_id = f"evaluation-registration-{retry_digest}"
+    payload_digest = hashlib.sha256(
+        _canonical(retry_material["payload"])
+    ).hexdigest()
+
+    assert STRATEGY_EVIDENCE_STORE_SCHEMA_VERSION == 1
+    assert admission.created is True
+    assert admission.path == (
+        root / "objects" / candidate.kind / f"{expected_id}.json"
+    )
+    assert envelope.to_dict() == {
+        "schema_version": 1,
+        "kind": candidate.kind,
+        "object_id": expected_id,
+        "effective_at": candidate.effective_at,
+        "recorded_at": "2030-01-02T15:04:05+00:00",
+        "retry_material_sha256": retry_digest,
+        "payload_sha256": payload_digest,
+        "payload": retry_material["payload"],
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    assert set(envelope.to_dict()) == ENVELOPE_KEYS
+    assert admission.path.read_bytes() == envelope.canonical_json_bytes()
+    assert not admission.path.read_bytes().endswith(b"\n")
+    assert EvidenceEnvelope.from_dict(envelope.to_dict()) == envelope
+
+    object_digest = hashlib.sha256(envelope.canonical_json_bytes()).hexdigest()
+    assert event.to_dict() == {
+        "schema_version": 1,
+        "sequence": 1,
+        "kind": candidate.kind,
+        "object_id": expected_id,
+        "object_sha256": object_digest,
+        "retry_material_sha256": retry_digest,
+        "effective_at": candidate.effective_at,
+        "recorded_at": envelope.recorded_at,
+        "previous_event_sha256": ZERO_HASH,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    assert set(event.to_dict()) == EVENT_KEYS
+    assert EvidenceEvent.from_dict(event.to_dict()) == event
+    assert (root / "events.jsonl").read_bytes() == (
+        event.canonical_json_bytes() + b"\n"
+    )
+
+    pointer = EvidencePointer.from_dict(_pointer_dict(root))
+    assert pointer.to_dict() == {
+        "schema_version": 1,
+        "kind": candidate.kind,
+        "sequence": 1,
+        "object_id": expected_id,
+        "object_sha256": object_digest,
+        "event_sha256": hashlib.sha256(
+            event.canonical_json_bytes()
+        ).hexdigest(),
+        "recorded_at": envelope.recorded_at,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    assert set(pointer.to_dict()) == POINTER_KEYS
+    assert (root / "latest" / f"{candidate.kind}.json").read_bytes() == (
+        pointer.canonical_json_bytes()
+    )
+    assert store.verify() == (envelope,)
+    assert store.envelopes() == (envelope,)
+    assert store.envelopes(kind=candidate.kind) == (envelope,)
+    assert store.envelopes(kind="mutation-record") == ()
+
+    for path in (
+        root / ".strategy-evidence.lock",
+        root / "events.jsonl",
+        admission.path,
+        root / "latest" / f"{candidate.kind}.json",
+    ):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert path.stat().st_nlink == 1
+
+
+@pytest.mark.parametrize(
+    ("model", "field", "value"),
+    [
+        ("envelope", "schema_version", True),
+        ("envelope", "analysis_only", False),
+        ("envelope", "execution_authority", "live"),
+        ("envelope", "can_submit_orders", True),
+        ("envelope", "payload_sha256", "A" * 64),
+        ("event", "sequence", 0),
+        ("event", "previous_event_sha256", "A" * 64),
+        ("event", "analysis_only", False),
+        ("pointer", "sequence", True),
+        ("pointer", "event_sha256", "bad"),
+        ("pointer", "can_submit_orders", True),
+    ],
+)
+def test_frozen_models_reject_bad_schema_or_authority(
+    tmp_path,
+    model,
+    field,
+    value,
+):
+    _, root, _, admission = _admit(tmp_path)
+    if model == "envelope":
+        parser = EvidenceEnvelope.from_dict
+        payload = admission.envelope.to_dict()
+    elif model == "event":
+        parser = EvidenceEvent.from_dict
+        payload = _event_dict(root)
+    else:
+        parser = EvidencePointer.from_dict
+        payload = _pointer_dict(root)
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        parser(payload)
+
+
+@pytest.mark.parametrize("model", ["envelope", "event", "pointer"])
+def test_frozen_models_reject_unknown_and_missing_fields(tmp_path, model):
+    _, root, _, admission = _admit(tmp_path)
+    if model == "envelope":
+        parser = EvidenceEnvelope.from_dict
+        payload = admission.envelope.to_dict()
+    elif model == "event":
+        parser = EvidenceEvent.from_dict
+        payload = _event_dict(root)
+    else:
+        parser = EvidencePointer.from_dict
+        payload = _pointer_dict(root)
+
+    unknown = dict(payload, live=True)
+    with pytest.raises(ValueError):
+        parser(unknown)
+    missing = dict(payload)
+    missing.pop(next(iter(payload)))
+    with pytest.raises(ValueError):
+        parser(missing)
+
+
+def test_second_event_binds_immediately_prior_event_hash(tmp_path):
+    store, root, _, first = _admit(tmp_path)
+    second_candidate = _candidate(
+        kind="baseline-genome",
+        payload={"genome_id": "g-1", "generation": 0},
+    )
+    second = store.admit_checked(
+        second_candidate,
+        validate=lambda _prior, _new: None,
+    )
+
+    assert second.event.sequence == 2
+    assert second.event.previous_event_sha256 == hashlib.sha256(
+        first.event.canonical_json_bytes()
+    ).hexdigest()
+    assert store.verify() == (first.envelope, second.envelope)
+
+
+def test_exact_and_later_retry_are_event_silent_and_keep_first_seen_time(tmp_path):
+    root = tmp_path / "evidence"
+    clock = _Clock(FIRST, LATER)
+    store = ImmutableStrategyEvidenceStore(root, clock=clock)
+    candidate = _candidate()
+
+    first = store.admit_checked(candidate, validate=lambda _prior, _new: None)
+    second = store.admit_checked(candidate, validate=lambda _prior, _new: None)
+
+    assert first.created is True
+    assert second.created is False
+    assert second.envelope == first.envelope
+    assert second.event == first.event
+    assert second.envelope.recorded_at == "2030-01-02T15:04:05+00:00"
+    assert len(_journal_lines(root)) == 1
+
+
+def test_retry_with_clock_before_stored_first_seen_fails_without_mutation(tmp_path):
+    store, root, candidate, _ = _admit(tmp_path)
+    before = _tree_snapshot(root)
+    earlier_store = ImmutableStrategyEvidenceStore(root, clock=_Clock(EARLIER))
+
+    with pytest.raises(EvidenceBackdatingError):
+        earlier_store.admit_checked(
+            candidate,
+            validate=lambda _prior, _new: None,
+        )
+
+    assert _tree_snapshot(root) == before
+    assert store.verify()
+
+
+def test_changed_material_gets_distinct_identity(tmp_path):
+    store, _, _, first = _admit(tmp_path)
+    changed = _candidate(payload={"registration_key": "NFLX-secondary"})
+    second = store.admit_checked(changed, validate=lambda _prior, _new: None)
+
+    assert second.envelope.object_id != first.envelope.object_id
+    assert second.envelope.retry_material_sha256 != (
+        first.envelope.retry_material_sha256
+    )
+
+
+def test_existing_object_path_with_different_bytes_is_a_collision(tmp_path):
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+    with pytest.raises(RuntimeError):
+        crashing.admit_checked(candidate, validate=lambda _prior, _new: None)
+    object_path = next((root / "objects").rglob("*.json"))
+    object_path.write_bytes(b"{}")
+
+    with pytest.raises(EvidenceCollisionError):
+        ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER)).admit_checked(
+            candidate,
+            validate=lambda _prior, _new: None,
+        )
+
+    assert not (root / "events.jsonl").exists()
+
+
+def test_concurrent_identical_admissions_create_one_object_and_event(tmp_path):
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+
+    def worker(_index: int):
+        store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+        return store.admit_checked(
+            candidate,
+            validate=lambda _prior, _new: None,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        admissions = list(pool.map(worker, range(24)))
+
+    assert sum(admission.created for admission in admissions) == 1
+    assert len({item.envelope.object_id for item in admissions}) == 1
+    assert len(_journal_lines(root)) == 1
+    assert len(tuple((root / "objects").rglob("*.json"))) == 1
+    assert len(ImmutableStrategyEvidenceStore(root).verify()) == 1
+
+
+def test_validator_race_on_one_logical_slot_commits_only_one_candidate(tmp_path):
+    root = tmp_path / "evidence"
+    candidates = (
+        _candidate(payload={"slot": "NFLX-primary", "choice": "alpha"}),
+        _candidate(payload={"slot": "NFLX-primary", "choice": "beta"}),
+    )
+
+    def validate(
+        prior: tuple[EvidenceEnvelope, ...],
+        new: EvidenceEnvelope,
+    ) -> None:
+        if any(
+            envelope.payload.get("slot") == new.payload.get("slot")
+            for envelope in prior
+        ):
+            raise ValueError("logical slot is already occupied")
+
+    def worker(candidate: EvidenceCandidate):
+        store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+        try:
+            return store.admit_checked(candidate, validate=validate)
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(worker, candidates))
+
+    assert sum(not isinstance(item, Exception) for item in outcomes) == 1
+    assert sum(isinstance(item, ValueError) for item in outcomes) == 1
+    assert len(_journal_lines(root)) == 1
+    assert len(ImmutableStrategyEvidenceStore(root).verify()) == 1
+
+
+class _CrashAfterObject(ImmutableStrategyEvidenceStore):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._crash = True
+
+    def _after_object_fsync(self, _path: Path) -> None:
+        if self._crash:
+            self._crash = False
+            raise RuntimeError("crash after object fsync")
+
+
+class _CrashAfterEvent(ImmutableStrategyEvidenceStore):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._crash = True
+
+    def _after_event_fsync(self, _event: EvidenceEvent) -> None:
+        if self._crash:
+            self._crash = False
+            raise RuntimeError("crash after event fsync")
+
+
+def test_crash_after_object_fsync_leaves_adoptable_orphan_with_original_time(
+    tmp_path,
+):
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crashing.admit_checked(candidate, validate=lambda _prior, _new: None)
+
+    objects = tuple((root / "objects").rglob("*.json"))
+    assert len(objects) == 1
+    assert not (root / "events.jsonl").exists()
+    assert not tuple((root / "latest").glob("*.json"))
+
+    repaired = ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER))
+    admission = repaired.admit_checked(
+        candidate,
+        validate=lambda _prior, _new: None,
+    )
+    assert admission.created is True
+    assert admission.envelope.recorded_at == "2030-01-02T15:04:05+00:00"
+    assert len(_journal_lines(root)) == 1
+    assert repaired.verify() == (admission.envelope,)
+
+
+def test_crash_after_event_fsync_retry_is_event_silent_and_repairs_pointer(
+    tmp_path,
+):
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    crashing = _CrashAfterEvent(root, clock=_Clock(FIRST))
+
+    with pytest.raises(RuntimeError, match="event fsync"):
+        crashing.admit_checked(candidate, validate=lambda _prior, _new: None)
+
+    assert len(_journal_lines(root)) == 1
+    assert not (root / "latest" / f"{candidate.kind}.json").exists()
+    with pytest.raises(EvidenceCorruptionError, match="pointer"):
+        ImmutableStrategyEvidenceStore(root).verify()
+
+    repaired = ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER))
+    admission = repaired.admit_checked(
+        candidate,
+        validate=lambda _prior, _new: None,
+    )
+    assert admission.created is False
+    assert len(_journal_lines(root)) == 1
+    assert repaired.verify() == (admission.envelope,)
+
+
+def test_orphan_object_is_redurable_before_its_event_is_appended(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+    with pytest.raises(RuntimeError):
+        crashing.admit_checked(candidate, validate=lambda _prior, _new: None)
+    orphan = next((root / "objects").rglob("*.json"))
+    orphan_inode = orphan.stat().st_ino
+
+    fsynced_inodes: list[int] = []
+    real_fsync = evidence_store_module.os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        state = os.fstat(descriptor)
+        if stat.S_ISREG(state.st_mode):
+            fsynced_inodes.append(state.st_ino)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(evidence_store_module.os, "fsync", recording_fsync)
+    ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER)).admit_checked(
+        candidate,
+        validate=lambda _prior, _new: None,
+    )
+
+    assert orphan_inode in fsynced_inodes
+
+
+def test_existing_journal_is_redurable_before_next_append(tmp_path, monkeypatch):
+    store, root, _, _ = _admit(tmp_path)
+    journal_inode = (root / "events.jsonl").stat().st_ino
+    operations: list[tuple[str, int]] = []
+    real_fsync = evidence_store_module.os.fsync
+    real_write = evidence_store_module.os.write
+
+    def recording_fsync(descriptor: int) -> None:
+        state = os.fstat(descriptor)
+        if stat.S_ISREG(state.st_mode):
+            operations.append(("fsync", state.st_ino))
+        real_fsync(descriptor)
+
+    def recording_write(descriptor: int, payload: bytes) -> int:
+        state = os.fstat(descriptor)
+        if stat.S_ISREG(state.st_mode):
+            operations.append(("write", state.st_ino))
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(evidence_store_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(evidence_store_module.os, "write", recording_write)
+    store.admit_checked(
+        _candidate(
+            kind="baseline-genome",
+            payload={"genome_id": "g-1", "generation": 0},
+        ),
+        validate=lambda _prior, _new: None,
+    )
+
+    first_journal_fsync = operations.index(("fsync", journal_inode))
+    journal_write = operations.index(("write", journal_inode))
+    assert first_journal_fsync < journal_write
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("torn", "torn"),
+        ("blank", "blank"),
+        ("malformed", "malformed"),
+        ("noncanonical", "noncanonical"),
+        ("sequence", "sequence"),
+        ("prior_hash", "chain"),
+        ("authority", "authority"),
+        ("repeated", "repeated"),
+    ],
+)
+def test_journal_corruption_fails_closed(tmp_path, mutation, message):
+    store, root, _, _ = _admit(tmp_path)
+    if mutation == "torn":
+        path = root / "events.jsonl"
+        path.write_bytes(path.read_bytes()[:-1])
+    elif mutation == "blank":
+        path = root / "events.jsonl"
+        path.write_bytes(path.read_bytes() + b"\n")
+    elif mutation == "malformed":
+        (root / "events.jsonl").write_bytes(b"{bad}\n")
+    elif mutation == "noncanonical":
+        payload = _event_dict(root)
+        (root / "events.jsonl").write_bytes(
+            json.dumps(payload, sort_keys=False).encode() + b"\n"
+        )
+    elif mutation == "repeated":
+        line = _journal_lines(root)[0]
+        repeated = json.loads(line)
+        repeated["sequence"] = 2
+        repeated["previous_event_sha256"] = hashlib.sha256(line).hexdigest()
+        (root / "events.jsonl").write_bytes(
+            line + b"\n" + _canonical(repeated) + b"\n"
+        )
+    else:
+        payload = _event_dict(root)
+        if mutation == "sequence":
+            payload["sequence"] = 2
+        elif mutation == "prior_hash":
+            payload["previous_event_sha256"] = "1" * 64
+        else:
+            payload["execution_authority"] = "live"
+        _rewrite_event(root, payload)
+
+    with pytest.raises(EvidenceCorruptionError, match=message):
+        store.verify()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "changed_payload", "changed_authority", "wrong_path"],
+)
+def test_object_corruption_or_missing_binding_fails_closed(tmp_path, mutation):
+    store, root, _, admission = _admit(tmp_path)
+    object_path = admission.path
+    if mutation == "missing":
+        object_path.unlink()
+    elif mutation == "wrong_path":
+        moved = object_path.with_name(
+            "evaluation-registration-" + "f" * 64 + ".json"
+        )
+        object_path.rename(moved)
+    else:
+        payload = admission.envelope.to_dict()
+        if mutation == "changed_payload":
+            payload["payload"]["registration_key"] = "tampered"  # type: ignore[index]
+        else:
+            payload["can_submit_orders"] = True
+        object_path.write_bytes(_canonical(payload))
+
+    with pytest.raises(EvidenceCorruptionError):
+        store.verify()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "stale", "corrupt"])
+def test_verify_rejects_pointer_damage_without_repairing(tmp_path, mutation):
+    store, root, candidate, _ = _admit(tmp_path)
+    pointer = root / "latest" / f"{candidate.kind}.json"
+    if mutation == "missing":
+        pointer.unlink()
+    elif mutation == "stale":
+        payload = _pointer_dict(root)
+        payload["sequence"] = 2
+        pointer.write_bytes(_canonical(payload))
+    else:
+        pointer.write_bytes(b"{bad}")
+    before = _tree_snapshot(root)
+
+    with pytest.raises(EvidenceCorruptionError, match="pointer"):
+        store.verify()
+
+    assert _tree_snapshot(root) == before
+
+
+@pytest.mark.parametrize("mutation", ["missing", "stale", "corrupt"])
+def test_rebuild_repairs_only_derived_pointer_state(tmp_path, mutation):
+    store, root, candidate, admission = _admit(tmp_path)
+    pointer = root / "latest" / f"{candidate.kind}.json"
+    object_before = admission.path.read_bytes()
+    journal_before = (root / "events.jsonl").read_bytes()
+    if mutation == "missing":
+        pointer.unlink()
+    elif mutation == "stale":
+        payload = _pointer_dict(root)
+        payload["sequence"] = 99
+        pointer.write_bytes(_canonical(payload))
+    else:
+        pointer.write_bytes(b"{bad}")
+
+    assert store.rebuild() == (admission.envelope,)
+
+    assert admission.path.read_bytes() == object_before
+    assert (root / "events.jsonl").read_bytes() == journal_before
+    assert store.verify() == (admission.envelope,)
+
+
+def test_rebuild_removes_stale_allowed_kind_pointer_without_event(tmp_path):
+    store, root, _, _ = _admit(tmp_path)
+    stale = root / "latest" / "mutation-record.json"
+    payload = _pointer_dict(root)
+    payload["kind"] = "mutation-record"
+    stale.write_bytes(_canonical(payload))
+    stale.chmod(0o600)
+
+    store.rebuild()
+
+    assert not stale.exists()
+    assert store.verify()
+
+
+def test_verify_on_missing_root_is_read_only(tmp_path):
+    root = tmp_path / "never-created"
+    store = ImmutableStrategyEvidenceStore(root)
+
+    assert store.verify() == ()
+    assert store.envelopes() == ()
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "replacement"),
+    [
+        ("lock", "symlink"),
+        ("events", "symlink"),
+        ("objects", "symlink"),
+        ("latest", "symlink"),
+        ("object", "symlink"),
+        ("pointer", "symlink"),
+        ("events", "fifo"),
+    ],
+)
+def test_managed_paths_reject_symlinks_and_nonregular_files(
+    tmp_path,
+    target,
+    replacement,
+):
+    store, root, candidate, admission = _admit(tmp_path)
+    outside = tmp_path / "outside"
+    outside.write_text("outside")
+    paths = {
+        "lock": root / ".strategy-evidence.lock",
+        "events": root / "events.jsonl",
+        "objects": root / "objects",
+        "latest": root / "latest",
+        "object": admission.path,
+        "pointer": root / "latest" / f"{candidate.kind}.json",
+    }
+    selected = paths[target]
+    if selected.is_dir():
+        selected.rename(selected.with_name(selected.name + "-real"))
+    else:
+        selected.unlink()
+    if replacement == "fifo":
+        os.mkfifo(selected)
+    else:
+        selected.symlink_to(outside, target_is_directory=False)
+
+    with pytest.raises(EvidenceCorruptionError):
+        store.verify()
+
+
+def test_root_and_symlinked_parent_are_rejected_without_touching_target(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    root_link = tmp_path / "root-link"
+    root_link.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(EvidenceCorruptionError, match="symlink"):
+        ImmutableStrategyEvidenceStore(root_link)
+    assert not tuple(target.iterdir())
+
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(target, target_is_directory=True)
+    with pytest.raises(EvidenceCorruptionError, match="symlink"):
+        ImmutableStrategyEvidenceStore(parent_link / "nested")
+    assert not tuple(target.iterdir())
+
+
+@pytest.mark.parametrize("target", ["lock", "events", "object", "pointer"])
+def test_managed_regular_files_reject_hard_links(tmp_path, target):
+    store, root, candidate, admission = _admit(tmp_path)
+    paths = {
+        "lock": root / ".strategy-evidence.lock",
+        "events": root / "events.jsonl",
+        "object": admission.path,
+        "pointer": root / "latest" / f"{candidate.kind}.json",
+    }
+    os.link(paths[target], tmp_path / f"{target}-hardlink")
+
+    with pytest.raises(EvidenceCorruptionError, match="link"):
+        store.verify()
+
+
+@pytest.mark.parametrize("target", ["lock", "events", "object", "pointer"])
+def test_managed_regular_files_reject_unsafe_modes(tmp_path, target):
+    store, root, candidate, admission = _admit(tmp_path)
+    paths = {
+        "lock": root / ".strategy-evidence.lock",
+        "events": root / "events.jsonl",
+        "object": admission.path,
+        "pointer": root / "latest" / f"{candidate.kind}.json",
+    }
+    paths[target].chmod(0o666)
+
+    with pytest.raises(EvidenceCorruptionError, match="mode"):
+        store.verify()
+
+
+def test_managed_path_escape_is_rejected(tmp_path):
+    store, _, _, _ = _admit(tmp_path)
+    store._events_path = tmp_path / "outside-events.jsonl"
+
+    with pytest.raises(EvidenceCorruptionError, match="escapes"):
+        store.verify()
+
+
+@pytest.mark.parametrize(
+    "candidate_factory",
+    [
+        lambda: EvidenceCandidate(
+            kind="../registration",
+            effective_at="2030-01-02T14:00:00+00:00",
+            payload={},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T09:00:00-05:00",
+            payload={},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T14:00:00.123456+00:00",
+            payload={},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T14:00:00+00:00",
+            payload={"bad": 1.5},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T14:00:00+00:00",
+            payload={"bad": b"bytes"},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T14:00:00+00:00",
+            payload={1: "non-string-key"},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T14:00:00+00:00",
+            payload={"too_deep": [[[[[[[[[[[[[[[[[[[[None]]]]]]]]]]]]]]]]]]]]},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T14:00:00+00:00",
+            payload={"too_long": "x" * 100_000},
+        ),
+        lambda: EvidenceCandidate(
+            kind="evaluation-registration",
+            effective_at="2030-01-02T14:00:00+00:00",
+            payload={f"k-{index}": index for index in range(20_000)},
+        ),
+    ],
+)
+def test_invalid_candidate_inputs_do_not_create_root(tmp_path, candidate_factory):
+    root = tmp_path / "evidence"
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+
+    with pytest.raises(ValueError):
+        candidate = candidate_factory()
+        store.admit_checked(candidate, validate=lambda _prior, _new: None)
+
+    assert not root.exists()
+
+
+def test_callback_failure_writes_no_object_event_or_pointer(tmp_path):
+    root = tmp_path / "evidence"
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+
+    with pytest.raises(ValueError, match="policy rejected"):
+        store.admit_checked(
+            _candidate(),
+            validate=lambda _prior, _new: (_ for _ in ()).throw(
+                ValueError("policy rejected")
+            ),
+        )
+
+    assert not tuple((root / "objects").rglob("*.json"))
+    assert not (root / "events.jsonl").exists()
+    assert not tuple((root / "latest").glob("*.json"))
+
+
+def test_kind_filter_rejects_unknown_kind_without_mutating_store(tmp_path):
+    store, root, _, _ = _admit(tmp_path)
+    before = _tree_snapshot(root)
+
+    with pytest.raises(ValueError):
+        store.envelopes(kind="../bad")
+
+    assert _tree_snapshot(root) == before
+
+
+def test_import_and_literal_isolation_from_execution_surfaces():
+    source_path = (
+        Path(evidence_store_module.__file__).resolve()
+    )
+    source = source_path.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    }
+    forbidden_import_fragments = {
+        "broker",
+        "alpaca",
+        "promotion",
+        "live_gate",
+        "execution",
+        "order",
+        "supervisor",
+        "network",
+        "requests",
+        "httpx",
+        "openai",
+        "langgraph",
+    }
+    assert not any(
+        fragment in imported_name
+        for imported_name in imported
+        for fragment in forbidden_import_fragments
+    )
+
+    string_literals = {
+        node.value.lower()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    forbidden_authority_literals = {
+        "submit_order",
+        "submit_orders",
+        "live_control",
+        "broker_order",
+    }
+    assert string_literals.isdisjoint(forbidden_authority_literals)
