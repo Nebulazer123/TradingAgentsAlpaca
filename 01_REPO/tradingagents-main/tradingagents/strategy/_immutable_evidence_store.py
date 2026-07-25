@@ -31,6 +31,12 @@ _ALLOWED_KINDS = frozenset(
         "mutation-record",
     }
 )
+_STAGED_POINTER_NAME = re.compile(
+    r"^\.(?P<kind>"
+    + "|".join(re.escape(kind) for kind in sorted(_ALLOWED_KINDS))
+    + r")\.(?P<pid>[1-9][0-9]*)\.(?P<thread>[1-9][0-9]*)"
+    r"\.(?P<nonce>[1-9][0-9]*)\.tmp$"
+)
 _MAX_JSON_DEPTH = 16
 _MAX_JSON_NODES = 10_000
 _MAX_STRING_BYTES = 65_536
@@ -645,7 +651,10 @@ class ImmutableStrategyEvidenceStore:
         ).hexdigest()
 
         with self._locked(create=True):
-            self._ensure_managed_directories(create=True)
+            self._ensure_managed_directories(
+                create=True,
+                recover_staged_pointers=True,
+            )
             events, snapshot = self._replay()
             event_by_id = {event.object_id: event for event in events}
             now, recorded_at = _clock_stamp(self._clock)
@@ -775,7 +784,10 @@ class ImmutableStrategyEvidenceStore:
         if self._root_is_absent():
             return ()
         with self._locked(create=False):
-            self._ensure_managed_directories(create=False)
+            self._ensure_managed_directories(
+                create=False,
+                recover_staged_pointers=False,
+            )
             events, envelopes = self._replay()
             self._verify_latest(events)
             return envelopes
@@ -785,8 +797,12 @@ class ImmutableStrategyEvidenceStore:
         if self._root_is_absent():
             return ()
         with self._locked(create=False):
-            self._ensure_managed_directories(create=False)
+            self._ensure_managed_directories(
+                create=False,
+                recover_staged_pointers=True,
+            )
             events, envelopes = self._replay()
+            self._redurable_journal_if_present()
             self._repair_latest(events)
             return envelopes
 
@@ -878,7 +894,12 @@ class ImmutableStrategyEvidenceStore:
             state = self._path_state(self.root, label="evidence root")
         self._require_directory_state(state, label="evidence root")
 
-    def _ensure_managed_directories(self, *, create: bool) -> None:
+    def _ensure_managed_directories(
+        self,
+        *,
+        create: bool,
+        recover_staged_pointers: bool,
+    ) -> None:
         created = False
         for path, label in (
             (self._objects_dir, "objects directory"),
@@ -902,7 +923,9 @@ class ImmutableStrategyEvidenceStore:
         if created:
             self._fsync_directory(self.root)
         self._inspect_object_directory_entries()
-        self._inspect_latest_directory_entries()
+        self._inspect_latest_directory_entries(
+            recover_staged_pointers=recover_staged_pointers,
+        )
 
     def _ensure_kind_directory(self, kind: str, *, create: bool) -> Path:
         path = self._kind_directory(kind)
@@ -959,7 +982,11 @@ class ImmutableStrategyEvidenceStore:
                     label="evidence object",
                 )
 
-    def _inspect_latest_directory_entries(self) -> None:
+    def _inspect_latest_directory_entries(
+        self,
+        *,
+        recover_staged_pointers: bool,
+    ) -> None:
         allowed_names = {f"{kind}.json" for kind in _ALLOWED_KINDS}
         try:
             entries = tuple(self._latest_dir.iterdir())
@@ -967,15 +994,59 @@ class ImmutableStrategyEvidenceStore:
             raise EvidenceCorruptionError(
                 "latest directory could not be listed"
             ) from exc
+        staged: list[tuple[Path, int, int]] = []
         for path in entries:
-            if path.name not in allowed_names:
+            if path.name in allowed_names:
+                state = self._path_state(path, label="latest pointer")
+                if state is None:
+                    raise EvidenceCorruptionError(
+                        "latest pointer disappeared"
+                    )
+                self._require_regular_state(state, label="latest pointer")
+                continue
+            if (
+                not recover_staged_pointers
+                or _STAGED_POINTER_NAME.fullmatch(path.name) is None
+            ):
                 raise EvidenceCorruptionError(
                     f"unknown latest pointer path: {path.name}"
                 )
-            state = self._path_state(path, label="latest pointer")
+            state = self._path_state(path, label="staged latest pointer")
             if state is None:
-                raise EvidenceCorruptionError("latest pointer disappeared")
-            self._require_regular_state(state, label="latest pointer")
+                raise EvidenceCorruptionError(
+                    "staged latest pointer disappeared"
+                )
+            self._require_regular_state(
+                state,
+                label="staged latest pointer",
+            )
+            staged.append((path, state.st_dev, state.st_ino))
+        for path, expected_device, expected_inode in staged:
+            state = self._path_state(path, label="staged latest pointer")
+            if state is None:
+                raise EvidenceCorruptionError(
+                    "staged latest pointer disappeared"
+                )
+            self._require_regular_state(
+                state,
+                label="staged latest pointer",
+            )
+            if (
+                state.st_dev != expected_device
+                or state.st_ino != expected_inode
+            ):
+                raise EvidenceCorruptionError(
+                    "staged latest pointer changed during recovery"
+                )
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise EvidenceCorruptionError(
+                    "staged latest pointer could not be removed"
+                ) from exc
+        if staged:
+            self._fsync_directory(self._latest_dir)
+            self._fsync_directory(self.root)
 
     def _lstat_uncontained(
         self,
@@ -1107,6 +1178,8 @@ class ImmutableStrategyEvidenceStore:
         if state is None:
             raise EvidenceCorruptionError(f"{label} is missing")
         self._require_regular_state(state, label=label)
+        if state.st_size > _MAX_CANONICAL_BYTES:
+            raise EvidenceCorruptionError(f"{label} is too large")
         try:
             descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW)
         except OSError as exc:
@@ -1118,16 +1191,22 @@ class ImmutableStrategyEvidenceStore:
                 descriptor,
                 label=label,
             )
+            if descriptor_state.st_size > _MAX_CANONICAL_BYTES:
+                raise EvidenceCorruptionError(f"{label} is too large")
             if (
                 state.st_dev != descriptor_state.st_dev
                 or state.st_ino != descriptor_state.st_ino
             ):
                 raise EvidenceCorruptionError(f"{label} changed while opening")
             chunks: list[bytes] = []
+            total_bytes = 0
             while True:
                 chunk = os.read(descriptor, 64 * 1024)
                 if not chunk:
                     break
+                total_bytes += len(chunk)
+                if total_bytes > _MAX_CANONICAL_BYTES:
+                    raise EvidenceCorruptionError(f"{label} is too large")
                 chunks.append(chunk)
             return b"".join(chunks)
         except OSError as exc:
@@ -1394,10 +1473,14 @@ class ImmutableStrategyEvidenceStore:
         return tuple(orphans)
 
     def _append_event(self, event: EvidenceEvent) -> None:
+        line = event.canonical_json_bytes() + b"\n"
         state = self._path_state(self._events_path, label="event journal")
         if state is not None:
             self._require_regular_state(state, label="event journal")
-        line = event.canonical_json_bytes() + b"\n"
+            if state.st_size + len(line) > _MAX_CANONICAL_BYTES:
+                raise EvidenceCorruptionError("event journal is too large")
+        elif len(line) > _MAX_CANONICAL_BYTES:
+            raise EvidenceCorruptionError("event journal is too large")
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW
         try:
             descriptor = os.open(self._events_path, flags, 0o600)
@@ -1406,10 +1489,12 @@ class ImmutableStrategyEvidenceStore:
                 "event journal could not be opened safely"
             ) from exc
         try:
-            self._require_regular_descriptor(
+            descriptor_state = self._require_regular_descriptor(
                 descriptor,
                 label="event journal",
             )
+            if descriptor_state.st_size + len(line) > _MAX_CANONICAL_BYTES:
+                raise EvidenceCorruptionError("event journal is too large")
             try:
                 if os.write(descriptor, line) != len(line):
                     raise OSError("incomplete evidence event append")
@@ -1512,8 +1597,6 @@ class ImmutableStrategyEvidenceStore:
             label="latest directory",
         )
         expected = self._last_events(events)
-        removed = False
-        redurable_existing = False
         for kind in sorted(_ALLOWED_KINDS):
             path = self._pointer_path(kind)
             state = self._path_state(path, label="latest pointer")
@@ -1530,7 +1613,6 @@ class ImmutableStrategyEvidenceStore:
                         raise EvidenceCorruptionError(
                             f"stale latest pointer could not be removed: {kind}"
                         ) from exc
-                    removed = True
                 continue
             pointer = self._pointer_for(event)
             expected_bytes = pointer.canonical_json_bytes()
@@ -1541,12 +1623,10 @@ class ImmutableStrategyEvidenceStore:
                         path,
                         label="latest pointer",
                     )
-                    redurable_existing = True
                     continue
             self._publish_pointer(pointer)
-        if removed or redurable_existing:
-            self._fsync_directory(self._latest_dir)
-            self._fsync_directory(self.root)
+        self._fsync_directory(self._latest_dir)
+        self._fsync_directory(self.root)
 
     def _verify_latest(self, events: tuple[EvidenceEvent, ...]) -> None:
         self._require_real_directory(

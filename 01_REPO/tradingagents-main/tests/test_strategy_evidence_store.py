@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -639,9 +641,11 @@ def test_crash_after_event_fsync_retry_is_event_silent_and_repairs_pointer(
     assert repaired.verify() == (admission.envelope,)
 
 
-def test_exact_retry_redurabilizes_visible_event_before_pointer_after_fsync_error(
+@pytest.mark.parametrize("recovery", ["retry", "rebuild"])
+def test_recovery_redurabilizes_visible_event_before_pointer_after_fsync_error(
     tmp_path,
     monkeypatch,
+    recovery,
 ):
     root = tmp_path / "evidence"
     candidate = _candidate()
@@ -692,18 +696,174 @@ def test_exact_retry_redurabilizes_visible_event_before_pointer_after_fsync_erro
     assert not tuple((root / "latest").glob("*.json"))
     operations.clear()
 
-    admission = ImmutableStrategyEvidenceStore(
-        root,
-        clock=_Clock(LATER),
-    ).admit_checked(candidate, validate=lambda _prior, _new: None)
+    if recovery == "retry":
+        admission = ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(LATER),
+        ).admit_checked(candidate, validate=lambda _prior, _new: None)
+        assert admission.created is False
+        expected = (admission.envelope,)
+    else:
+        expected = store.rebuild()
 
-    assert admission.created is False
     assert operations.index("journal-fsync") < operations.index("root-fsync")
     assert operations.index("root-fsync") < operations.index("pointer-write")
     assert len(_journal_lines(root)) == 1
-    assert ImmutableStrategyEvidenceStore(root).verify() == (
-        admission.envelope,
+    assert ImmutableStrategyEvidenceStore(root).verify() == expected
+
+
+@pytest.mark.parametrize("recovery", ["retry", "rebuild"])
+def test_process_crash_with_fsynced_staged_pointer_is_recoverable(
+    tmp_path,
+    recovery,
+):
+    root = tmp_path / "evidence"
+    candidate = _candidate(
+        payload={"registration_key": "NFLX-staged-pointer-crash"},
     )
+    script = """
+import datetime as dt
+import os
+import sys
+from pathlib import Path
+
+import tradingagents.strategy._immutable_evidence_store as evidence_store_module
+from tradingagents.strategy._immutable_evidence_store import (
+    EvidenceCandidate,
+    ImmutableStrategyEvidenceStore,
+)
+
+root = Path(sys.argv[1])
+candidate = EvidenceCandidate(
+    kind="evaluation-registration",
+    effective_at="2030-01-02T14:00:00+00:00",
+    payload={"registration_key": "NFLX-staged-pointer-crash"},
+)
+real_replace = evidence_store_module.os.replace
+
+def crash_before_pointer_replace(source, destination):
+    source_path = Path(source)
+    if (
+        source_path.parent == root / "latest"
+        and source_path.name.startswith(".evaluation-registration.")
+        and source_path.name.endswith(".tmp")
+    ):
+        os._exit(73)
+    real_replace(source, destination)
+
+evidence_store_module.os.replace = crash_before_pointer_replace
+store = ImmutableStrategyEvidenceStore(
+    root,
+    clock=lambda: dt.datetime(
+        2030,
+        1,
+        2,
+        15,
+        4,
+        5,
+        tzinfo=dt.timezone.utc,
+    ),
+)
+store.admit_checked(candidate, validate=lambda _prior, _new: None)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 73, result.stderr
+    staged = tuple((root / "latest").glob(".*.tmp"))
+    assert len(staged) == 1
+    staged_state = staged[0].lstat()
+    assert stat.S_ISREG(staged_state.st_mode)
+    assert stat.S_IMODE(staged_state.st_mode) == 0o600
+    assert staged_state.st_nlink == 1
+    assert len(_journal_lines(root)) == 1
+    assert not (root / "latest" / f"{candidate.kind}.json").exists()
+    before_verify = _tree_snapshot(root)
+
+    with pytest.raises(EvidenceCorruptionError, match="latest pointer"):
+        ImmutableStrategyEvidenceStore(root).verify()
+
+    assert _tree_snapshot(root) == before_verify
+    if recovery == "retry":
+        admission = ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(LATER),
+        ).admit_checked(candidate, validate=lambda _prior, _new: None)
+        assert admission.created is False
+        expected = (admission.envelope,)
+    else:
+        expected = ImmutableStrategyEvidenceStore(root).rebuild()
+
+    assert not tuple((root / "latest").glob(".*.tmp"))
+    assert ImmutableStrategyEvidenceStore(root).verify() == expected
+    assert len(_journal_lines(root)) == 1
+
+
+@pytest.mark.parametrize("recovery", ["retry", "rebuild"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "arbitrary",
+        "malformed",
+        "disallowed_kind",
+        "symlink",
+        "hardlink",
+        "directory",
+        "unsafe_mode",
+    ],
+)
+def test_recovery_rejects_unowned_or_unsafe_staged_pointer_entries(
+    tmp_path,
+    recovery,
+    mutation,
+):
+    store, root, candidate, _ = _admit(tmp_path)
+    safe_name = ".evaluation-registration.1.2.3.tmp"
+    if mutation == "arbitrary":
+        staged = root / "latest" / ".unrelated.tmp"
+        staged.write_bytes(b"unrelated")
+    elif mutation == "malformed":
+        staged = root / "latest" / ".evaluation-registration.1.2.bad.tmp"
+        staged.write_bytes(b"malformed")
+    elif mutation == "disallowed_kind":
+        staged = root / "latest" / ".not-allowed.1.2.3.tmp"
+        staged.write_bytes(b"disallowed")
+    elif mutation == "symlink":
+        target = tmp_path / "outside-symlink-target"
+        target.write_bytes(b"outside")
+        staged = root / "latest" / safe_name
+        staged.symlink_to(target)
+    elif mutation == "hardlink":
+        target = tmp_path / "outside-hardlink-target"
+        target.write_bytes(b"outside")
+        target.chmod(0o600)
+        staged = root / "latest" / safe_name
+        os.link(target, staged)
+    elif mutation == "directory":
+        staged = root / "latest" / safe_name
+        staged.mkdir(mode=0o700)
+    else:
+        staged = root / "latest" / safe_name
+        staged.write_bytes(b"unsafe")
+        staged.chmod(0o644)
+    if mutation in {"arbitrary", "malformed", "disallowed_kind"}:
+        staged.chmod(0o600)
+
+    with pytest.raises(EvidenceCorruptionError):
+        if recovery == "retry":
+            store.admit_checked(
+                candidate,
+                validate=lambda _prior, _new: None,
+            )
+        else:
+            store.rebuild()
+
+    assert staged.exists() or staged.is_symlink()
 
 
 @pytest.mark.parametrize("recovery", ["retry", "rebuild"])
@@ -985,6 +1145,51 @@ def test_rebuild_removes_stale_allowed_kind_pointer_without_event(tmp_path):
     assert store.verify()
 
 
+def test_rebuild_redurabilizes_prior_stale_pointer_deletion_after_fsync_error(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+    with pytest.raises(ValueError, match="initialize only"):
+        store.admit_checked(
+            _candidate(),
+            validate=lambda _prior, _new: (_ for _ in ()).throw(
+                ValueError("initialize only")
+            ),
+        )
+    stale = root / "latest" / "mutation-record.json"
+    stale.write_bytes(b"stale")
+    stale.chmod(0o600)
+    latest_inode = (root / "latest").stat().st_ino
+    root_inode = root.stat().st_ino
+    fail_latest_fsync = True
+    operations: list[str] = []
+    real_fsync = evidence_store_module.os.fsync
+
+    def failing_once_fsync(descriptor: int) -> None:
+        nonlocal fail_latest_fsync
+        state = os.fstat(descriptor)
+        if stat.S_ISDIR(state.st_mode) and state.st_ino == latest_inode:
+            if fail_latest_fsync:
+                fail_latest_fsync = False
+                operations.append("latest-fsync-error")
+                raise OSError("injected latest directory fsync failure")
+            operations.append("latest-fsync")
+        elif stat.S_ISDIR(state.st_mode) and state.st_ino == root_inode:
+            operations.append("root-fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(evidence_store_module.os, "fsync", failing_once_fsync)
+    with pytest.raises(EvidenceCorruptionError, match="latest"):
+        store.rebuild()
+
+    assert not stale.exists()
+    operations.clear()
+    assert store.rebuild() == ()
+    assert operations.index("latest-fsync") < operations.index("root-fsync")
+
+
 def test_verify_on_missing_root_is_read_only(tmp_path):
     root = tmp_path / "never-created"
     store = ImmutableStrategyEvidenceStore(root)
@@ -1081,6 +1286,38 @@ def test_managed_regular_files_reject_unsafe_modes(tmp_path, target):
 
     with pytest.raises(EvidenceCorruptionError, match="mode"):
         store.verify()
+
+
+@pytest.mark.parametrize("target", ["events", "object", "pointer"])
+def test_oversized_managed_files_fail_before_their_contents_are_read(
+    tmp_path,
+    monkeypatch,
+    target,
+):
+    store, root, candidate, admission = _admit(tmp_path)
+    paths = {
+        "events": root / "events.jsonl",
+        "object": admission.path,
+        "pointer": root / "latest" / f"{candidate.kind}.json",
+    }
+    selected = paths[target]
+    with selected.open("r+b") as stream:
+        stream.truncate(1_048_577)
+    selected_inode = selected.stat().st_ino
+    selected_reads = 0
+    real_read = evidence_store_module.os.read
+
+    def recording_read(descriptor: int, size: int) -> bytes:
+        nonlocal selected_reads
+        if os.fstat(descriptor).st_ino == selected_inode:
+            selected_reads += 1
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(evidence_store_module.os, "read", recording_read)
+    with pytest.raises(EvidenceCorruptionError, match="too large"):
+        store.verify()
+
+    assert selected_reads == 0
 
 
 def test_managed_path_escape_is_rejected(tmp_path):
