@@ -537,6 +537,83 @@ def test_crash_after_object_fsync_leaves_adoptable_orphan_with_original_time(
     assert repaired.verify() == (admission.envelope,)
 
 
+def test_valid_unrelated_orphan_blocks_backdated_admission_without_journaling(
+    tmp_path,
+):
+    root = tmp_path / "evidence"
+    orphan_candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crashing.admit_checked(
+            orphan_candidate,
+            validate=lambda _prior, _new: None,
+        )
+    before = _tree_snapshot(root)
+    different_candidate = _candidate(
+        kind="baseline-genome",
+        payload={"genome_id": "g-1", "generation": 0},
+    )
+
+    with pytest.raises(EvidenceBackdatingError):
+        ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(EARLIER),
+        ).admit_checked(
+            different_candidate,
+            validate=lambda _prior, _new: None,
+        )
+
+    assert _tree_snapshot(root) == before
+    assert not (root / "events.jsonl").exists()
+    assert ImmutableStrategyEvidenceStore(root).verify() == ()
+
+
+def test_malformed_unrelated_orphan_cannot_forge_backdating_watermark(
+    tmp_path,
+):
+    root = tmp_path / "evidence"
+    orphan_candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crashing.admit_checked(
+            orphan_candidate,
+            validate=lambda _prior, _new: None,
+        )
+    orphan_path = next((root / "objects").rglob("*.json"))
+    malformed = json.loads(orphan_path.read_bytes())
+    malformed["recorded_at"] = "2099-01-01T00:00:00+00:00"
+    malformed["payload_sha256"] = "f" * 64
+    orphan_path.write_bytes(_canonical(malformed))
+    different_candidate = _candidate(
+        kind="baseline-genome",
+        payload={"genome_id": "g-1", "generation": 0},
+    )
+    observed_snapshots: list[tuple[EvidenceEnvelope, ...]] = []
+
+    admission = ImmutableStrategyEvidenceStore(
+        root,
+        clock=_Clock(EARLIER),
+    ).admit_checked(
+        different_candidate,
+        validate=lambda prior, _new: observed_snapshots.append(prior),
+    )
+
+    assert admission.created is True
+    assert admission.envelope.recorded_at == "2030-01-02T15:04:04+00:00"
+    assert observed_snapshots == [()]
+    assert ImmutableStrategyEvidenceStore(root).verify() == (
+        admission.envelope,
+    )
+    with pytest.raises(EvidenceCollisionError):
+        ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(LATER),
+        ).admit_checked(
+            orphan_candidate,
+            validate=lambda _prior, _new: None,
+        )
+
+
 def test_crash_after_event_fsync_retry_is_event_silent_and_repairs_pointer(
     tmp_path,
 ):
@@ -560,6 +637,156 @@ def test_crash_after_event_fsync_retry_is_event_silent_and_repairs_pointer(
     assert admission.created is False
     assert len(_journal_lines(root)) == 1
     assert repaired.verify() == (admission.envelope,)
+
+
+def test_exact_retry_redurabilizes_visible_event_before_pointer_after_fsync_error(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    journal_inode: list[int] = []
+    fail_journal_fsync = True
+    operations: list[str] = []
+    real_write = evidence_store_module.os.write
+    real_fsync = evidence_store_module.os.fsync
+
+    def recording_write(descriptor: int, payload: bytes) -> int:
+        written = real_write(descriptor, payload)
+        if (
+            payload.endswith(b"\n")
+            and b'"previous_event_sha256"' in payload
+        ):
+            inode = os.fstat(descriptor).st_ino
+            journal_inode[:] = [inode]
+            operations.append("journal-write")
+        elif b'"event_sha256"' in payload:
+            operations.append("pointer-write")
+        return written
+
+    def failing_once_fsync(descriptor: int) -> None:
+        nonlocal fail_journal_fsync
+        state = os.fstat(descriptor)
+        if journal_inode and state.st_ino == journal_inode[0]:
+            if fail_journal_fsync:
+                fail_journal_fsync = False
+                operations.append("journal-fsync-error")
+                raise OSError("injected journal fsync failure")
+            operations.append("journal-fsync")
+        elif stat.S_ISDIR(state.st_mode) and root.exists():
+            if state.st_ino == root.stat().st_ino:
+                operations.append("root-fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(evidence_store_module.os, "write", recording_write)
+    monkeypatch.setattr(evidence_store_module.os, "fsync", failing_once_fsync)
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+
+    with pytest.raises(
+        EvidenceCorruptionError,
+        match="event journal could not be made durable",
+    ):
+        store.admit_checked(candidate, validate=lambda _prior, _new: None)
+
+    assert len(_journal_lines(root)) == 1
+    assert not tuple((root / "latest").glob("*.json"))
+    operations.clear()
+
+    admission = ImmutableStrategyEvidenceStore(
+        root,
+        clock=_Clock(LATER),
+    ).admit_checked(candidate, validate=lambda _prior, _new: None)
+
+    assert admission.created is False
+    assert operations.index("journal-fsync") < operations.index("root-fsync")
+    assert operations.index("root-fsync") < operations.index("pointer-write")
+    assert len(_journal_lines(root)) == 1
+    assert ImmutableStrategyEvidenceStore(root).verify() == (
+        admission.envelope,
+    )
+
+
+@pytest.mark.parametrize("recovery", ["retry", "rebuild"])
+def test_recovery_redurabilizes_visible_pointer_after_final_fsync_error(
+    tmp_path,
+    monkeypatch,
+    recovery,
+):
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    pointer_path = root / "latest" / f"{candidate.kind}.json"
+    pointer_inode: list[int] = []
+    fail_final_pointer_fsync = True
+    operations: list[str] = []
+    real_replace = evidence_store_module.os.replace
+    real_fsync = evidence_store_module.os.fsync
+
+    def recording_replace(source: Path, destination: Path) -> None:
+        real_replace(source, destination)
+        if Path(destination) == pointer_path:
+            pointer_inode[:] = [pointer_path.stat().st_ino]
+
+    def failing_final_pointer_fsync(descriptor: int) -> None:
+        nonlocal fail_final_pointer_fsync
+        state = os.fstat(descriptor)
+        if pointer_inode and state.st_ino == pointer_inode[0]:
+            if fail_final_pointer_fsync:
+                fail_final_pointer_fsync = False
+                operations.append("pointer-fsync-error")
+                raise OSError("injected final pointer fsync failure")
+            operations.append("pointer-fsync")
+        elif stat.S_ISDIR(state.st_mode) and root.exists():
+            latest = root / "latest"
+            if latest.exists() and state.st_ino == latest.stat().st_ino:
+                operations.append("latest-fsync")
+            elif state.st_ino == root.stat().st_ino:
+                operations.append("root-fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        evidence_store_module.os,
+        "replace",
+        recording_replace,
+    )
+    monkeypatch.setattr(
+        evidence_store_module.os,
+        "fsync",
+        failing_final_pointer_fsync,
+    )
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+
+    with pytest.raises(
+        EvidenceCorruptionError,
+        match="latest pointer could not be made durable",
+    ):
+        store.admit_checked(candidate, validate=lambda _prior, _new: None)
+
+    assert pointer_path.exists()
+    assert EvidencePointer.from_dict(json.loads(pointer_path.read_bytes()))
+    assert len(_journal_lines(root)) == 1
+    operations.clear()
+    assert ImmutableStrategyEvidenceStore(root).verify()
+    assert operations == []
+
+    if recovery == "retry":
+        recovered = ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(LATER),
+        ).admit_checked(candidate, validate=lambda _prior, _new: None)
+        assert recovered.created is False
+        expected = (recovered.envelope,)
+    else:
+        expected = store.rebuild()
+
+    assert operations.index("pointer-fsync") < operations.index("latest-fsync")
+    latest_fsync = operations.index("latest-fsync")
+    assert any(
+        index > latest_fsync and operation == "root-fsync"
+        for index, operation in enumerate(operations)
+    )
+    operations.clear()
+    assert ImmutableStrategyEvidenceStore(root).verify() == expected
+    assert operations == []
 
 
 def test_orphan_object_is_redurable_before_its_event_is_appended(

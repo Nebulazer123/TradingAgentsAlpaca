@@ -649,7 +649,10 @@ class ImmutableStrategyEvidenceStore:
             events, snapshot = self._replay()
             event_by_id = {event.object_id: event for event in events}
             now, recorded_at = _clock_stamp(self._clock)
-            for existing in snapshot:
+            valid_orphans = self._valid_orphan_envelopes(
+                admitted_object_ids=frozenset(event_by_id)
+            )
+            for existing in (*snapshot, *valid_orphans):
                 if now < _parse_canonical_utc(
                     existing.recorded_at,
                     label="recorded_at",
@@ -714,6 +717,7 @@ class ImmutableStrategyEvidenceStore:
                 self._callback_state.active = False
 
             if prior_event is not None:
+                self._redurable_journal_if_present()
                 self._repair_latest(events)
                 return EvidenceAdmission(
                     envelope=envelope,
@@ -1345,6 +1349,50 @@ class ImmutableStrategyEvidenceStore:
             expected_previous = hashlib.sha256(line).hexdigest()
         return tuple(events), tuple(envelopes)
 
+    def _valid_orphan_envelopes(
+        self,
+        *,
+        admitted_object_ids: frozenset[str],
+    ) -> tuple[EvidenceEnvelope, ...]:
+        orphans: list[EvidenceEnvelope] = []
+        for kind in sorted(_ALLOWED_KINDS):
+            kind_path = self._kind_directory(kind)
+            state = self._path_state(
+                kind_path,
+                label="object kind directory",
+            )
+            if state is None:
+                continue
+            self._require_directory_state(
+                state,
+                label="object kind directory",
+            )
+            try:
+                children = tuple(sorted(kind_path.iterdir()))
+            except OSError as exc:
+                raise EvidenceCorruptionError(
+                    "object kind directory could not be listed"
+                ) from exc
+            pattern = re.compile(
+                rf"^{re.escape(kind)}-[0-9a-f]{{64}}\.json$"
+            )
+            for object_path in children:
+                if pattern.fullmatch(object_path.name) is None:
+                    continue
+                object_id = object_path.name.removesuffix(".json")
+                if object_id in admitted_object_ids:
+                    continue
+                try:
+                    envelope, _ = self._read_envelope(
+                        object_path,
+                        expected_kind=kind,
+                        expected_id=object_id,
+                    )
+                except EvidenceCorruptionError:
+                    continue
+                orphans.append(envelope)
+        return tuple(orphans)
+
     def _append_event(self, event: EvidenceEvent) -> None:
         state = self._path_state(self._events_path, label="event journal")
         if state is not None:
@@ -1465,6 +1513,7 @@ class ImmutableStrategyEvidenceStore:
         )
         expected = self._last_events(events)
         removed = False
+        redurable_existing = False
         for kind in sorted(_ALLOWED_KINDS):
             path = self._pointer_path(kind)
             state = self._path_state(path, label="latest pointer")
@@ -1488,9 +1537,14 @@ class ImmutableStrategyEvidenceStore:
             if state is not None:
                 current = self._read_regular(path, label="latest pointer")
                 if current == expected_bytes:
+                    self._redurable_regular_file(
+                        path,
+                        label="latest pointer",
+                    )
+                    redurable_existing = True
                     continue
             self._publish_pointer(pointer)
-        if removed:
+        if removed or redurable_existing:
             self._fsync_directory(self._latest_dir)
             self._fsync_directory(self.root)
 
