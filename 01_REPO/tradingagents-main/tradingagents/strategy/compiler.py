@@ -5,7 +5,15 @@ from __future__ import annotations
 import enum
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from decimal import ROUND_DOWN, Decimal
+from decimal import (
+    ROUND_DOWN,
+    Context,
+    Decimal,
+    DivisionByZero,
+    InvalidOperation,
+    Overflow,
+    localcontext,
+)
 
 from tradingagents.strategy.genome import (
     CatalystRelativeStrengthParameters,
@@ -17,6 +25,7 @@ from tradingagents.strategy.genome import (
 )
 
 PAPER_DECISION_SCHEMA_VERSION = 1
+PAPER_COMPILER_DECIMAL_PRECISION = 50
 
 _MARKET_SESSIONS = frozenset(
     {"pre_open", "open_window", "regular", "pre_close", "closed"}
@@ -50,6 +59,14 @@ _HOLD_REASONS = frozenset(
     }
 )
 _CENT = Decimal("0.01")
+_MAX_MONEY = Decimal("1000000000000000000")
+_MAX_OBSERVATION_SIGNIFICANT_DIGITS = 34
+_MAX_OBSERVATION_DECIMAL_PLACES = 12
+# Leave one integral digit for the price buffer and two fractional digits for
+# cent quantization without exceeding the fixed compiler precision.
+_MAX_OBSERVATION_ADJUSTED_EXPONENT = PAPER_COMPILER_DECIMAL_PRECISION - 4
+_PAPER_COMPILER_DECIMAL_EMIN = -999
+_PAPER_COMPILER_DECIMAL_EMAX = 999
 
 
 class PaperDecisionAction(str, enum.Enum):
@@ -97,11 +114,46 @@ def _validate_decimal(
         )
 
 
+def _validate_observation_decimal(
+    value: object,
+    *,
+    field_name: str,
+    minimum: Decimal,
+    maximum: Decimal | None,
+    positive: bool = False,
+) -> None:
+    _validate_decimal(
+        value,
+        field_name=field_name,
+        minimum=minimum,
+        maximum=maximum,
+        positive=positive,
+    )
+    decimal_tuple = value.as_tuple()
+    if len(decimal_tuple.digits) > _MAX_OBSERVATION_SIGNIFICANT_DIGITS:
+        raise ValueError(
+            f"{field_name} must have at most "
+            f"{_MAX_OBSERVATION_SIGNIFICANT_DIGITS} significant digits"
+        )
+    if value.adjusted() > _MAX_OBSERVATION_ADJUSTED_EXPONENT:
+        raise ValueError(f"{field_name} magnitude is too large")
+    exponent = decimal_tuple.exponent
+    if (
+        type(exponent) is not int
+        or exponent < -_MAX_OBSERVATION_DECIMAL_PLACES
+    ):
+        raise ValueError(
+            f"{field_name} must have at most "
+            f"{_MAX_OBSERVATION_DECIMAL_PLACES} decimal places"
+        )
+
+
 def _validate_money_decimal(value: object, *, field_name: str) -> None:
     _validate_decimal(
         value,
         field_name=field_name,
         minimum=Decimal("0"),
+        maximum=_MAX_MONEY,
     )
     exponent = value.as_tuple().exponent
     if type(exponent) is not int or exponent < -2:
@@ -122,6 +174,16 @@ def _validate_market_session(value: object) -> None:
         raise TypeError("market_session must be a string")
     if value not in _MARKET_SESSIONS:
         raise ValueError(f"unknown market_session: {value}")
+
+
+def _new_compiler_decimal_context() -> Context:
+    return Context(
+        prec=PAPER_COMPILER_DECIMAL_PRECISION,
+        rounding=ROUND_DOWN,
+        Emin=_PAPER_COMPILER_DECIMAL_EMIN,
+        Emax=_PAPER_COMPILER_DECIMAL_EMAX,
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+    )
 
 
 def _validate_canonical_money_string(
@@ -175,25 +237,26 @@ class StrategyObservation:
 
     def __post_init__(self) -> None:
         _validate_symbol(self.symbol, field_name="symbol")
-        _validate_decimal(
+        _validate_observation_decimal(
             self.score,
             field_name="score",
             minimum=Decimal("0"),
             maximum=Decimal("1"),
         )
-        _validate_decimal(
+        _validate_observation_decimal(
             self.current_price,
             field_name="current_price",
             minimum=Decimal("0"),
+            maximum=None,
             positive=True,
         )
-        _validate_decimal(
+        _validate_observation_decimal(
             self.daily_change_fraction,
             field_name="daily_change_fraction",
             minimum=Decimal("-1"),
             maximum=Decimal("10"),
         )
-        _validate_decimal(
+        _validate_observation_decimal(
             self.volume_ratio,
             field_name="volume_ratio",
             minimum=Decimal("0"),
@@ -401,6 +464,11 @@ def compile_genome_paper_decision(
     if type(state) is not PaperCandidateState:
         raise TypeError("state must be a PaperCandidateState")
     _validate_market_session(market_session)
+    observation_symbols = [
+        observation.symbol for observation in observations_snapshot
+    ]
+    if len(set(observation_symbols)) != len(observation_symbols):
+        raise ValueError("duplicate observation symbol")
 
     if genome.family is StrategyFamily.HOLD_CASH:
         return _hold_decision(
@@ -421,98 +489,114 @@ def compile_genome_paper_decision(
             reason_code="policy_disabled",
         )
 
-    available = state.cash_usd - state.reserved_buy_notional_usd
-    if available < 0:
-        available = Decimal("0")
-    minimum_order = Decimal(policy.candidate_min_order_usd)
-    notional = available
-    if notional < minimum_order:
-        return _hold_decision(
-            genome,
-            market_session=market_session,
-            reason_code="insufficient_virtual_cash",
-        )
-
-    excluded_symbols = set(state.held_symbols) | set(state.open_buy_symbols)
-    available_observations = [
-        observation
-        for observation in observations_snapshot
-        if observation.symbol not in excluded_symbols
-    ]
-
-    eligible: list[StrategyObservation]
-    if genome.family is StrategyFamily.CURRENT_AGGRESSIVE:
-        parameters = genome.parameters
-        if type(parameters) is not CurrentAggressiveParameters:
-            raise TypeError("current-aggressive parameters do not match")
-        minimum_score = Decimal(parameters.min_score)
-        eligible = [
-            observation
-            for observation in available_observations
-            if observation.score >= minimum_score
-        ]
-        eligible.sort(key=lambda observation: (-observation.score, observation.symbol))
-    elif genome.family is StrategyFamily.PULLBACK_SUPPORT:
-        parameters = genome.parameters
-        if type(parameters) is not PullbackSupportParameters:
-            raise TypeError("pullback-support parameters do not match")
-        minimum_change = Decimal(parameters.min_daily_change_fraction)
-        maximum_change = Decimal(parameters.max_daily_change_fraction)
-        maximum_volume = Decimal(parameters.max_volume_ratio)
-        eligible = [
-            observation
-            for observation in available_observations
-            if minimum_change
-            <= observation.daily_change_fraction
-            <= maximum_change
-            and observation.volume_ratio <= maximum_volume
-        ]
-        eligible.sort(
-            key=lambda observation: (
-                -observation.volume_ratio,
-                abs(observation.daily_change_fraction),
-                observation.symbol,
+    with localcontext(_new_compiler_decimal_context()):
+        available = state.cash_usd - state.reserved_buy_notional_usd
+        if available < 0:
+            available = Decimal("0")
+        minimum_order = Decimal(policy.candidate_min_order_usd)
+        notional = available
+        if notional < minimum_order:
+            return _hold_decision(
+                genome,
+                market_session=market_session,
+                reason_code="insufficient_virtual_cash",
             )
-        )
-    else:
-        parameters = genome.parameters
-        if type(parameters) is not CatalystRelativeStrengthParameters:
-            raise TypeError("catalyst-relative-strength parameters do not match")
-        minimum_score = Decimal(parameters.min_score)
-        eligible = [
+
+        excluded_symbols = set(state.held_symbols) | set(state.open_buy_symbols)
+        available_observations = [
             observation
-            for observation in available_observations
-            if observation.time_sensitive is True
-            and observation.score >= minimum_score
+            for observation in observations_snapshot
+            if observation.symbol not in excluded_symbols
         ]
-        eligible.sort(key=lambda observation: (-observation.score, observation.symbol))
 
-    if not eligible:
-        return _hold_decision(
-            genome,
-            market_session=market_session,
-            reason_code="no_eligible_observation",
+        eligible: list[StrategyObservation]
+        if genome.family is StrategyFamily.CURRENT_AGGRESSIVE:
+            parameters = genome.parameters
+            if type(parameters) is not CurrentAggressiveParameters:
+                raise TypeError("current-aggressive parameters do not match")
+            minimum_score = Decimal(parameters.min_score)
+            eligible = [
+                observation
+                for observation in available_observations
+                if observation.score >= minimum_score
+            ]
+            eligible.sort(key=lambda observation: observation.symbol)
+            eligible.sort(
+                key=lambda observation: observation.score,
+                reverse=True,
+            )
+        elif genome.family is StrategyFamily.PULLBACK_SUPPORT:
+            parameters = genome.parameters
+            if type(parameters) is not PullbackSupportParameters:
+                raise TypeError("pullback-support parameters do not match")
+            minimum_change = Decimal(parameters.min_daily_change_fraction)
+            maximum_change = Decimal(parameters.max_daily_change_fraction)
+            maximum_volume = Decimal(parameters.max_volume_ratio)
+            eligible = [
+                observation
+                for observation in available_observations
+                if minimum_change
+                <= observation.daily_change_fraction
+                <= maximum_change
+                and observation.volume_ratio <= maximum_volume
+            ]
+            eligible.sort(key=lambda observation: observation.symbol)
+            eligible.sort(
+                key=lambda observation: (
+                    observation.daily_change_fraction.copy_abs()
+                )
+            )
+            eligible.sort(
+                key=lambda observation: observation.volume_ratio,
+                reverse=True,
+            )
+        else:
+            parameters = genome.parameters
+            if type(parameters) is not CatalystRelativeStrengthParameters:
+                raise TypeError(
+                    "catalyst-relative-strength parameters do not match"
+                )
+            minimum_score = Decimal(parameters.min_score)
+            eligible = [
+                observation
+                for observation in available_observations
+                if observation.time_sensitive is True
+                and observation.score >= minimum_score
+            ]
+            eligible.sort(key=lambda observation: observation.symbol)
+            eligible.sort(
+                key=lambda observation: observation.score,
+                reverse=True,
+            )
+
+        if not eligible:
+            return _hold_decision(
+                genome,
+                market_session=market_session,
+                reason_code="no_eligible_observation",
+            )
+
+        selected = eligible[0]
+        notional_usd = format(
+            notional.quantize(_CENT, rounding=ROUND_DOWN),
+            ".2f",
         )
-
-    selected = eligible[0]
-    notional_usd = format(
-        notional.quantize(_CENT, rounding=ROUND_DOWN),
-        ".2f",
-    )
-    price_buffer = Decimal("1.003" if market_session == "pre_open" else "1.002")
-    limit_price = selected.current_price * price_buffer
-    limit_price = limit_price.quantize(_CENT, rounding=ROUND_DOWN)
-    if limit_price <= 0:
-        raise ValueError("limit_price must remain positive after rounding")
-    return GenomePaperDecision(
-        genome_id=genome.genome_id,
-        family=genome.family,
-        action=PaperDecisionAction.BUY,
-        symbol=selected.symbol,
-        notional_usd=notional_usd,
-        limit_price=format(limit_price, ".2f"),
-        market_session=market_session,
-        extended_hours=market_session == "pre_open",
-        reason_code=_BUY_REASON_BY_FAMILY[genome.family],
-        rejected_observation_count=0,
-    )
+        price_buffer = Decimal(
+            "1.003" if market_session == "pre_open" else "1.002"
+        )
+        limit_price = selected.current_price * price_buffer
+        limit_price = limit_price.quantize(_CENT, rounding=ROUND_DOWN)
+        if limit_price <= 0:
+            raise ValueError("limit_price must remain positive after rounding")
+        return GenomePaperDecision(
+            genome_id=genome.genome_id,
+            family=genome.family,
+            action=PaperDecisionAction.BUY,
+            symbol=selected.symbol,
+            notional_usd=notional_usd,
+            limit_price=format(limit_price, ".2f"),
+            market_session=market_session,
+            extended_hours=market_session == "pre_open",
+            reason_code=_BUY_REASON_BY_FAMILY[genome.family],
+            rejected_observation_count=0,
+        )

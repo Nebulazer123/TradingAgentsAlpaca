@@ -3,7 +3,12 @@ from __future__ import annotations
 import ast
 import dataclasses
 import json
-from decimal import Decimal
+from decimal import (
+    ROUND_UP,
+    Decimal,
+    Inexact,
+    getcontext,
+)
 from pathlib import Path
 from typing import Any
 
@@ -846,3 +851,238 @@ def test_compiler_contains_no_runtime_or_external_operation_literals() -> None:
 
     assert forbidden.isdisjoint(source)
     assert all(reason_code in source for reason_code in ALLOWED_REASON_CODES)
+
+
+def _decimal_context_signature() -> tuple[object, ...]:
+    context = getcontext()
+    return (
+        context.prec,
+        context.rounding,
+        context.Emin,
+        context.Emax,
+        context.capitals,
+        context.clamp,
+        dict(context.traps),
+        dict(context.flags),
+    )
+
+
+@pytest.mark.parametrize(
+    ("family", "observations", "expected_symbol"),
+    [
+        (
+            StrategyFamily.CURRENT_AGGRESSIVE,
+            [
+                _observation(
+                    "AAPL",
+                    score=Decimal("0.8000000"),
+                    current_price=Decimal("100.005"),
+                ),
+                _observation(
+                    "MSFT",
+                    score=Decimal("0.8000001"),
+                    current_price=Decimal("100.005"),
+                ),
+            ],
+            "MSFT",
+        ),
+        (
+            StrategyFamily.PULLBACK_SUPPORT,
+            [
+                _observation(
+                    "AAPL",
+                    current_price=Decimal("100.005"),
+                    daily_change=Decimal("-0.0100001"),
+                    volume_ratio=Decimal("2.0000000"),
+                ),
+                _observation(
+                    "MSFT",
+                    current_price=Decimal("100.005"),
+                    daily_change=Decimal("-0.0100000"),
+                    volume_ratio=Decimal("2.0000001"),
+                ),
+            ],
+            "MSFT",
+        ),
+        (
+            StrategyFamily.CATALYST_RELATIVE_STRENGTH,
+            [
+                _observation(
+                    "AAPL",
+                    score=Decimal("0.8000000"),
+                    current_price=Decimal("100.005"),
+                ),
+                _observation(
+                    "MSFT",
+                    score=Decimal("0.8000001"),
+                    current_price=Decimal("100.005"),
+                ),
+            ],
+            "MSFT",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("market_session", "expected_limit_price"),
+    [("pre_open", "100.30"), ("regular", "100.20")],
+)
+def test_compiler_is_independent_of_hostile_caller_decimal_context(
+    family: StrategyFamily,
+    observations: list[StrategyObservation],
+    expected_symbol: str,
+    market_session: str,
+    expected_limit_price: str,
+) -> None:
+    genome = _genome(family)
+    policy = _policy()
+    state = _state(cash=Decimal("500.00"), reserved=Decimal("1.23"))
+    expected = compile_genome_paper_decision(
+        genome,
+        policy,
+        observations,
+        state,
+        market_session=market_session,
+    ).canonical_json_bytes()
+    caller = getcontext()
+    original = caller.copy()
+    try:
+        caller.prec = 2
+        caller.rounding = ROUND_UP
+        caller.Emin = -2
+        caller.Emax = 2
+        caller.traps[Inexact] = True
+        caller.clear_flags()
+        caller.flags[Inexact] = True
+        before = _decimal_context_signature()
+
+        actual = compile_genome_paper_decision(
+            genome,
+            policy,
+            tuple(reversed(observations)),
+            state,
+            market_session=market_session,
+        )
+
+        assert actual.canonical_json_bytes() == expected
+        assert actual.symbol == expected_symbol
+        assert actual.notional_usd == "498.77"
+        assert actual.limit_price == expected_limit_price
+        assert _decimal_context_signature() == before
+    finally:
+        getcontext().prec = original.prec
+        getcontext().rounding = original.rounding
+        getcontext().Emin = original.Emin
+        getcontext().Emax = original.Emax
+        getcontext().capitals = original.capitals
+        getcontext().clamp = original.clamp
+        getcontext().traps = original.traps
+        getcontext().flags = original.flags
+
+
+@pytest.mark.parametrize(
+    ("field_name", "bad_value"),
+    [
+        ("score", Decimal("0." + "1" * 35)),
+        ("current_price", Decimal("1.0000000000001")),
+        ("current_price", Decimal("1E+47")),
+        ("daily_change_fraction", Decimal("-0.0000000000001")),
+        ("volume_ratio", Decimal("1.0000000000001")),
+    ],
+)
+def test_observation_rejects_excessive_digits_scale_or_magnitude(
+    field_name: str,
+    bad_value: Decimal,
+) -> None:
+    values: dict[str, object] = {
+        "symbol": "NFLX",
+        "score": Decimal("0.8"),
+        "current_price": Decimal("10"),
+        "daily_change_fraction": Decimal("-0.01"),
+        "volume_ratio": Decimal("1"),
+        "time_sensitive": True,
+    }
+    values[field_name] = bad_value
+
+    with pytest.raises(ValueError, match=field_name):
+        StrategyObservation(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("price", "expected_limit_price"),
+    [
+        (
+            Decimal("1234567890123456789012345678901234"),
+            "1237037025903703702590370370259036.46",
+        ),
+        (
+            Decimal("1E+34"),
+            "10020000000000000000000000000000000.00",
+        ),
+    ],
+)
+def test_observation_accepts_bounded_large_price(
+    price: Decimal,
+    expected_limit_price: str,
+) -> None:
+    decision = _compile(observations=[_observation(current_price=price)])
+
+    assert decision.limit_price == expected_limit_price
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ["cash_usd", "reserved_buy_notional_usd"],
+)
+def test_candidate_state_rejects_excessive_money_magnitude(
+    field_name: str,
+) -> None:
+    values: dict[str, object] = {
+        "cash_usd": Decimal("200.00"),
+        "reserved_buy_notional_usd": Decimal("0.00"),
+        "held_symbols": (),
+        "open_buy_symbols": (),
+    }
+    values[field_name] = Decimal("1000000000000000000.01")
+
+    with pytest.raises(ValueError, match=field_name):
+        PaperCandidateState(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("family", "policy", "state", "session"),
+    [
+        (StrategyFamily.HOLD_CASH, _policy(), _state(), "regular"),
+        (StrategyFamily.CURRENT_AGGRESSIVE, _policy(), _state(), "closed"),
+        (
+            StrategyFamily.PULLBACK_SUPPORT,
+            _policy(enabled=False),
+            _state(),
+            "regular",
+        ),
+        (
+            StrategyFamily.CATALYST_RELATIVE_STRENGTH,
+            _policy(),
+            _state(cash=Decimal("9.99")),
+            "regular",
+        ),
+    ],
+)
+def test_duplicate_observation_symbols_fail_closed_before_selection(
+    family: StrategyFamily,
+    policy: StrategyEvolutionPolicy,
+    state: PaperCandidateState,
+    session: str,
+) -> None:
+    duplicates = [
+        _observation("NFLX", current_price=Decimal("10")),
+        _observation("NFLX", current_price=Decimal("20")),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate observation symbol"):
+        compile_genome_paper_decision(
+            _genome(family),
+            policy,
+            duplicates,
+            state,
+            market_session=session,
+        )

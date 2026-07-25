@@ -1,6 +1,7 @@
 """Inert, data-only strategy definitions."""
 
 from .compiler import (
+    PAPER_COMPILER_DECIMAL_PRECISION,
     PAPER_DECISION_SCHEMA_VERSION,
     GenomePaperDecision,
     PaperCandidateState,
@@ -26,6 +27,7 @@ from .genome import (
 )
 
 __all__ = [
+    "PAPER_COMPILER_DECIMAL_PRECISION",
     "PAPER_DECISION_SCHEMA_VERSION",
     "STRATEGY_EVOLUTION_POLICY_SCHEMA_VERSION",
     "STRATEGY_GENOME_SCHEMA_VERSION",
