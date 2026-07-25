@@ -21,6 +21,7 @@ import pytest
 from tradingagents.strategy.compiler import StrategyObservation
 from tradingagents.strategy.evaluator import (
     EVALUATOR_DECIMAL_PRECISION,
+    EVALUATOR_MAX_CLOSED_TRADE_OPPORTUNITIES,
     EVALUATOR_VERSION,
     GENOME_WINDOW_RESULT_SCHEMA_VERSION,
     STRATEGY_EVALUATION_POLICY_SCHEMA_VERSION,
@@ -375,6 +376,114 @@ def test_close_before_open_fixed_horizon_compounds_profit_above_200() -> None:
     assert Decimal(second.entry_budget_usd) > Decimal("200")
     assert Decimal(result.ending_equity_usd) > Decimal(first.net_exit_proceeds_usd)
     assert result.equity_curve_usd[-1] == result.ending_equity_usd
+
+
+def test_profit_grown_cash_beyond_legacy_compiler_ceiling_reinvests() -> None:
+    result = _evaluate(
+        [
+            "0.01",
+            "0.01",
+            "0.01",
+            "0.01",
+            "0.01",
+            "1000000000000",
+            "1000000000000",
+            "1000000000000",
+            "1000000000000",
+            "1000000000000",
+            "1000000000000",
+        ],
+        evolution_policy=_evolution_policy(starting_cash="1000000"),
+    )
+
+    assert result.closed_trade_count == 2
+    first, second = result.trades
+    assert first.exit_session == second.entry_session
+    assert Decimal(first.net_exit_proceeds_usd) > Decimal(
+        "1000000000000000000"
+    )
+    assert second.entry_budget_usd == first.net_exit_proceeds_usd
+    assert (
+        GenomeWindowResult.from_dict(result.to_dict()).canonical_json_bytes()
+        == result.canonical_json_bytes()
+    )
+
+
+def test_repeated_profit_growth_uses_safe_evaluator_cent_floor() -> None:
+    prices = [
+        "0.01",
+        "1000000000000",
+        "0.01",
+        "1000000000000",
+        "0.01",
+        "1000000000000",
+        "0.01",
+        "1000000000000",
+        "0.01",
+        "1000000000000",
+    ]
+    frames = list(_frames(prices))
+    for index in (1, 3, 5, 7):
+        frames[index] = dataclasses.replace(
+            frames[index],
+            observations=(
+                _observation(
+                    Decimal(prices[index]),
+                    score=Decimal("0.6"),
+                ),
+            ),
+        )
+    result = evaluate_genome_window(
+        _genome(),
+        _evolution_policy(starting_cash="1000000"),
+        _evaluation_policy(holding_sessions=1),
+        frames,
+        evaluation_as_of=frames[-1].recorded_at,
+    )
+
+    assert result.closed_trade_count == 5
+    assert Decimal(result.trades[-1].entry_budget_usd).adjusted() > 50
+    for earlier, later in zip(
+        result.trades,
+        result.trades[1:],
+        strict=False,
+    ):
+        assert later.entry_budget_usd == earlier.net_exit_proceeds_usd
+
+
+def test_evaluator_closed_trade_capacity_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert EVALUATOR_MAX_CLOSED_TRADE_OPPORTUNITIES == 41
+    assert 6 + (24 * EVALUATOR_MAX_CLOSED_TRADE_OPPORTUNITIES) == 990
+    assert 6 + (24 * (EVALUATOR_MAX_CLOSED_TRADE_OPPORTUNITIES + 1)) == 1014
+    policy = _evaluation_policy(holding_sessions=1)
+    accepted_frames = _frames(["100"] * 42)
+    accepted = evaluate_genome_window(
+        _genome(StrategyFamily.HOLD_CASH),
+        _evolution_policy(),
+        policy,
+        accepted_frames,
+        evaluation_as_of=accepted_frames[-1].recorded_at,
+    )
+    assert accepted.closed_trade_count == 0
+
+    def forbidden_compile(*args: object, **kwargs: object) -> object:
+        raise AssertionError("capacity rejection must precede compiler arithmetic")
+
+    monkeypatch.setattr(
+        "tradingagents.strategy.evaluator.compile_genome_paper_decision",
+        forbidden_compile,
+    )
+    rejected_frames = _frames(["100"] * 43)
+    with pytest.raises(ValueError, match="41"):
+        evaluate_genome_window(
+            _genome(),
+            _evolution_policy(),
+            policy,
+            rejected_frames,
+            evaluation_as_of=rejected_frames[-1].recorded_at,
+        )
 
 
 def test_minimum_order_no_orphan_and_fractional_high_price() -> None:

@@ -26,6 +26,7 @@ from tradingagents.strategy.genome import (
 
 PAPER_DECISION_SCHEMA_VERSION = 1
 PAPER_COMPILER_DECIMAL_PRECISION = 50
+PAPER_MONEY_MAXIMUM = Decimal("1E+995")
 
 _MARKET_SESSIONS = frozenset(
     {"pre_open", "open_window", "regular", "pre_close", "closed"}
@@ -59,7 +60,6 @@ _HOLD_REASONS = frozenset(
     }
 )
 _CENT = Decimal("0.01")
-_MAX_MONEY = Decimal("1000000000000000000")
 _MAX_OBSERVATION_SIGNIFICANT_DIGITS = 34
 _MAX_OBSERVATION_DECIMAL_PLACES = 12
 # Leave one integral digit for the price buffer and two fractional digits for
@@ -153,7 +153,7 @@ def _validate_money_decimal(value: object, *, field_name: str) -> None:
         value,
         field_name=field_name,
         minimum=Decimal("0"),
-        maximum=_MAX_MONEY,
+        maximum=PAPER_MONEY_MAXIMUM,
     )
     exponent = value.as_tuple().exponent
     if type(exponent) is not int or exponent < -2:
@@ -184,6 +184,58 @@ def _new_compiler_decimal_context() -> Context:
         Emax=_PAPER_COMPILER_DECIMAL_EMAX,
         traps=[InvalidOperation, DivisionByZero, Overflow],
     )
+
+
+def floor_paper_money_to_cents(value: Decimal) -> Decimal:
+    """Floor bounded non-negative paper money to cents without context use."""
+    _validate_decimal(
+        value,
+        field_name="paper money",
+        minimum=Decimal("0"),
+        maximum=PAPER_MONEY_MAXIMUM,
+    )
+    if value == 0:
+        return Decimal("0.00")
+    _, digits, exponent = value.as_tuple()
+    if type(exponent) is not int:
+        raise ValueError("paper money exponent must be finite")
+    digits_to_drop = -2 - exponent
+    if digits_to_drop <= 0:
+        return value
+    if digits_to_drop >= len(digits):
+        return Decimal("0.00")
+    return Decimal((0, digits[:-digits_to_drop], -2))
+
+
+def _paper_money_cent_units(value: Decimal) -> int:
+    _, digits, exponent = value.as_tuple()
+    if type(exponent) is not int or exponent < -2:
+        raise ValueError("paper money must have two-decimal precision or less")
+    coefficient = 0
+    for digit in digits:
+        coefficient = coefficient * 10 + digit
+    return coefficient * (10 ** (exponent + 2))
+
+
+def _paper_money_from_cent_units(value: int) -> Decimal:
+    if value == 0:
+        return Decimal("0.00")
+    return Decimal(
+        (
+            0,
+            tuple(int(character) for character in str(value)),
+            -2,
+        )
+    )
+
+
+def _available_paper_money(state: PaperCandidateState) -> Decimal:
+    available_units = max(
+        0,
+        _paper_money_cent_units(state.cash_usd)
+        - _paper_money_cent_units(state.reserved_buy_notional_usd),
+    )
+    return _paper_money_from_cent_units(available_units)
 
 
 def _validate_canonical_money_string(
@@ -489,12 +541,10 @@ def compile_genome_paper_decision(
             reason_code="policy_disabled",
         )
 
+    available = _available_paper_money(state)
     with localcontext(_new_compiler_decimal_context()):
-        available = state.cash_usd - state.reserved_buy_notional_usd
-        if available < 0:
-            available = Decimal("0")
         minimum_order = Decimal(policy.candidate_min_order_usd)
-        notional = available
+        notional = floor_paper_money_to_cents(available)
         if notional < minimum_order:
             return _hold_decision(
                 genome,
@@ -577,10 +627,7 @@ def compile_genome_paper_decision(
             )
 
         selected = eligible[0]
-        notional_usd = format(
-            notional.quantize(_CENT, rounding=ROUND_DOWN),
-            ".2f",
-        )
+        notional_usd = format(notional, ".2f")
         price_buffer = Decimal(
             "1.003" if market_session == "pre_open" else "1.002"
         )

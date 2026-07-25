@@ -9,7 +9,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import (
-    ROUND_DOWN,
     ROUND_HALF_EVEN,
     Context,
     Decimal,
@@ -22,10 +21,12 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.strategy.compiler import (
+    PAPER_MONEY_MAXIMUM,
     PaperCandidateState,
     PaperDecisionAction,
     StrategyObservation,
     compile_genome_paper_decision,
+    floor_paper_money_to_cents,
 )
 from tradingagents.strategy.genome import (
     StrategyEvolutionPolicy,
@@ -51,7 +52,20 @@ _MAX_PRICE_SIGNIFICANT_DIGITS = 34
 _MAX_PRICE_DECIMAL_PLACES = 12
 _EVALUATOR_DECIMAL_EMIN = -999
 _EVALUATOR_DECIMAL_EMAX = 999
-_CENT = Decimal("0.01")
+_MAX_STARTING_CASH_ADJUSTED_EXPONENT = 6
+_MAX_PRICE_RATIO_ADJUSTED_EXPONENT = 24
+EVALUATOR_MAX_CLOSED_TRADE_OPPORTUNITIES = min(
+    (
+        _EVALUATOR_DECIMAL_EMAX
+        - _MAX_STARTING_CASH_ADJUSTED_EXPONENT
+    )
+    // _MAX_PRICE_RATIO_ADJUSTED_EXPONENT,
+    (
+        PAPER_MONEY_MAXIMUM.adjusted()
+        - _MAX_STARTING_CASH_ADJUSTED_EXPONENT
+    )
+    // _MAX_PRICE_RATIO_ADJUSTED_EXPONENT,
+)
 
 
 def _new_decimal_context() -> Context:
@@ -975,9 +989,8 @@ class GenomeWindowResult:
                     raise ValueError(
                         "trade entry budget exceeds then-available cash"
                     )
-                expected_entry_budget = replayed_cash.quantize(
-                    _CENT,
-                    rounding=ROUND_DOWN,
+                expected_entry_budget = floor_paper_money_to_cents(
+                    replayed_cash
                 )
                 if entry_budget != expected_entry_budget:
                     raise ValueError(
@@ -1177,11 +1190,22 @@ def _validate_window_inputs(
 ) -> None:
     if len(frames) < holding_sessions + 1:
         raise ValueError("insufficient frame horizon")
+    if any(type(frame) is not EvaluationFrame for frame in frames):
+        raise TypeError("frames must contain EvaluationFrame objects")
+    closed_trade_opportunities = (
+        len(frames) - 1
+    ) // holding_sessions
+    if (
+        closed_trade_opportunities
+        > EVALUATOR_MAX_CLOSED_TRADE_OPPORTUNITIES
+    ):
+        raise ValueError(
+            "evaluation window exceeds the fixed numeric capacity of "
+            f"{EVALUATOR_MAX_CLOSED_TRADE_OPPORTUNITIES} closed trades"
+        )
     previous_date: date | None = None
     previous_effective: datetime | None = None
     for frame in frames:
-        if type(frame) is not EvaluationFrame:
-            raise TypeError("frames must contain EvaluationFrame objects")
         if previous_date is not None and frame.session_date <= previous_date:
             raise ValueError("session dates must be unique and increasing")
         if previous_effective is not None and frame.effective_at <= previous_effective:
@@ -1283,7 +1307,7 @@ def evaluate_genome_window(
 
             enough_frames_remain = frame_index + evaluation_policy.holding_sessions < len(frames_snapshot)
             if open_position is None and enough_frames_remain:
-                compiler_cash = cash.quantize(_CENT, rounding=ROUND_DOWN)
+                compiler_cash = floor_paper_money_to_cents(cash)
                 decision = compile_genome_paper_decision(
                     genome,
                     evolution_policy,

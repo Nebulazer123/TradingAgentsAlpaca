@@ -16,11 +16,13 @@ import pytest
 
 from tradingagents.strategy.compiler import (
     PAPER_DECISION_SCHEMA_VERSION,
+    PAPER_MONEY_MAXIMUM,
     GenomePaperDecision,
     PaperCandidateState,
     PaperDecisionAction,
     StrategyObservation,
     compile_genome_paper_decision,
+    floor_paper_money_to_cents,
 )
 from tradingagents.strategy.genome import (
     CatalystRelativeStrengthMutationBounds,
@@ -1042,10 +1044,63 @@ def test_candidate_state_rejects_excessive_money_magnitude(
         "held_symbols": (),
         "open_buy_symbols": (),
     }
-    values[field_name] = Decimal("1000000000000000000.01")
+    values[field_name] = Decimal(
+        "1" + ("0" * 995) + ".01"
+    )
 
     with pytest.raises(ValueError, match=field_name):
         PaperCandidateState(**values)  # type: ignore[arg-type]
+
+
+def test_candidate_state_accepts_expanded_exact_maximum_and_reserved_cents() -> None:
+    maximum = Decimal("1E+995")
+    assert maximum == PAPER_MONEY_MAXIMUM
+
+    maximum_state = _state(cash=maximum)
+    maximum_decision = _compile(state=maximum_state)
+    assert maximum_decision.notional_usd == (
+        "1" + ("0" * 995) + ".00"
+    )
+
+    reserved_state = _state(
+        cash=maximum,
+        reserved=Decimal("0.01"),
+    )
+    reserved_decision = _compile(state=reserved_state)
+    assert reserved_decision.notional_usd == (
+        ("9" * 995) + ".99"
+    )
+
+
+def test_safe_cent_floor_handles_huge_values_under_hostile_context() -> None:
+    huge_subcent = Decimal(("9" * 100) + ".129")
+    expected = Decimal(("9" * 100) + ".12")
+    caller = getcontext()
+    original = caller.copy()
+    try:
+        caller.prec = 2
+        caller.rounding = ROUND_UP
+        caller.Emin = -2
+        caller.Emax = 2
+        caller.traps[Inexact] = True
+        caller.clear_flags()
+        caller.flags[Inexact] = True
+        before = _decimal_context_signature()
+
+        assert floor_paper_money_to_cents(huge_subcent) == expected
+        assert floor_paper_money_to_cents(Decimal("1E+995")) == Decimal(
+            "1E+995"
+        )
+        assert _decimal_context_signature() == before
+    finally:
+        getcontext().prec = original.prec
+        getcontext().rounding = original.rounding
+        getcontext().Emin = original.Emin
+        getcontext().Emax = original.Emax
+        getcontext().capitals = original.capitals
+        getcontext().clamp = original.clamp
+        getcontext().traps = original.traps
+        getcontext().flags = original.flags
 
 
 @pytest.mark.parametrize(
