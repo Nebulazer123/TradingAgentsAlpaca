@@ -880,6 +880,26 @@ class GenomeWindowResult:
             raise ValueError("false_positive_count does not match trades")
         if any(trade.genome_id != self.genome_id for trade in self.trades):
             raise ValueError("trade genome_id does not match window")
+        if self.trades:
+            holding_horizon = self.trades[0].holding_sessions
+            if any(
+                trade.holding_sessions != holding_horizon
+                for trade in self.trades
+            ):
+                raise ValueError(
+                    "all trades must use the same holding horizon"
+                )
+            if holding_horizon >= self.tracked_sessions:
+                raise ValueError(
+                    "trade holding horizon must be less than tracked sessions"
+                )
+            maximum_trade_capacity = (
+                self.tracked_sessions - 1
+            ) // holding_horizon
+            if self.closed_trade_count > maximum_trade_capacity:
+                raise ValueError(
+                    "closed trade count exceeds fixed-horizon window capacity"
+                )
         window_start = date.fromisoformat(self.window_start)
         window_end = date.fromisoformat(self.window_end)
         previous_exit: date | None = None
@@ -954,6 +974,14 @@ class GenomeWindowResult:
                 if entry_budget > replayed_cash:
                     raise ValueError(
                         "trade entry budget exceeds then-available cash"
+                    )
+                expected_entry_budget = replayed_cash.quantize(
+                    _CENT,
+                    rounding=ROUND_DOWN,
+                )
+                if entry_budget != expected_entry_budget:
+                    raise ValueError(
+                        "trade entry budget must equal quantized available cash"
                     )
                 if replayed_cash - entry_budget < 0:
                     raise ValueError("virtual cash cannot be negative at entry")

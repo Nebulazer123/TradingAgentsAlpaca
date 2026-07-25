@@ -835,6 +835,75 @@ def test_result_replay_preserves_subcent_cash_between_trades() -> None:
     )
 
 
+def test_result_replay_binds_fixed_horizon_and_window_capacity() -> None:
+    single = _evaluate(["100"] * 6)
+    relabeled = dataclasses.replace(
+        single.trades[0],
+        holding_sessions=999,
+    )
+    with pytest.raises(ValueError, match="horizon"):
+        dataclasses.replace(single, trades=(relabeled,))
+
+    multiple = _evaluate(
+        ["100", "100", "100", "100", "100", "110", "110", "110", "110", "110", "121"]
+    )
+    first, second = multiple.trades
+    assert first.holding_sessions == second.holding_sessions == 5
+    assert multiple.tracked_sessions == 11
+    assert first.exit_session == second.entry_session
+
+    mixed_second = dataclasses.replace(second, holding_sessions=6)
+    with pytest.raises(ValueError, match="same holding horizon"):
+        dataclasses.replace(
+            multiple,
+            trades=(first, mixed_second),
+        )
+
+    six_session_first = dataclasses.replace(first, holding_sessions=6)
+    with pytest.raises(ValueError, match="capacity"):
+        dataclasses.replace(
+            multiple,
+            trades=(six_session_first, mixed_second),
+        )
+
+    assert (
+        GenomeWindowResult.from_dict(multiple.to_dict()).canonical_json_bytes()
+        == multiple.canonical_json_bytes()
+    )
+
+
+def test_result_replay_rejects_coherent_cash_underdeployment() -> None:
+    result = _evaluate(["100"] * 6)
+    payload = result.to_dict()
+    underdeployed_trade = {
+        **payload["trades"][0],
+        "entry_budget_usd": "10",
+        "entry_cost_usd": "0.01",
+        "entry_exposure_usd": "9.99",
+        "gross_exit_value_usd": "9.99",
+        "exit_cost_usd": "0.00999",
+        "net_exit_proceeds_usd": "9.98001",
+        "gross_pnl_usd": "0",
+        "gross_return_fraction": "0",
+        "realized_cost_drag_fraction": "0.001999",
+        "net_return_fraction": "-0.001999",
+        "pnl_usd": "-0.01999",
+        "excess_return_fraction": "-0.001999",
+    }
+    underdeployed = {
+        **payload,
+        "ending_equity_usd": "199.98001",
+        "net_return_fraction": "-0.00009995",
+        "benchmark_excess_return_fraction": "-0.00009995",
+        "max_drawdown_fraction": "-0.00009995",
+        "trades": [underdeployed_trade],
+        "equity_curve_usd": ["200", *(["199.98001"] * 6)],
+    }
+
+    with pytest.raises(ValueError, match="quantized"):
+        GenomeWindowResult.from_dict(underdeployed)
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
