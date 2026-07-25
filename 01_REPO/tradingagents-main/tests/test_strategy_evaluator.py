@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import (
@@ -29,6 +30,7 @@ from tradingagents.strategy.evaluator import (
     GenomeWindowResult,
     StrategyEvaluationPolicy,
     evaluate_genome_window,
+    evaluation_frames_from_dict,
     evaluation_frames_sha256,
     load_strategy_evaluation_policy,
 )
@@ -196,6 +198,27 @@ def _write_payload(tmp_path: Path, payload: object) -> Path:
     return path
 
 
+def _rebind_window_id(payload: dict[str, Any]) -> dict[str, Any]:
+    rebound = dict(payload)
+    binding = {
+        "evaluation_as_of": rebound["evaluation_as_of"],
+        "evaluation_policy_sha256": rebound["evaluation_policy_sha256"],
+        "evaluator_version": rebound["evaluator_version"],
+        "evolution_policy_sha256": rebound["evolution_policy_sha256"],
+        "genome_canonical_sha256": rebound["genome_canonical_sha256"],
+        "input_frames_sha256": rebound["input_frames_sha256"],
+        "ordered_decision_sha256s": rebound["ordered_decision_sha256s"],
+    }
+    rebound["window_id"] = hashlib.sha256(
+        json.dumps(
+            binding,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return rebound
+
+
 def test_exact_config_and_cost_conversion() -> None:
     policy = load_strategy_evaluation_policy(POLICY_PATH)
 
@@ -221,6 +244,9 @@ def test_exact_config_and_cost_conversion() -> None:
         ("commission_bps_per_side", 0, TypeError),
         ("commission_bps_per_side", "1e1", ValueError),
         ("commission_bps_per_side", "-0", ValueError),
+        ("commission_bps_per_side", "0.0", ValueError),
+        ("commission_bps_per_side", "1.0", ValueError),
+        ("half_spread_bps_per_side", "1.00", ValueError),
         ("half_spread_bps_per_side", "-1", ValueError),
         ("slippage_bps_per_side", "1000.1", ValueError),
         ("round_trip_sides", True, TypeError),
@@ -467,6 +493,124 @@ def test_frame_canonicalization_and_data_changes_bind_hashes() -> None:
     assert json.loads(frames[0].canonical_json_bytes()) == frames[0].to_dict()
 
 
+def test_strict_frame_and_mark_round_trip() -> None:
+    frames = _frames(
+        ["10.000000000001", "11.000000000001"],
+        benchmark_prices=["100.000000000001", "101.000000000001"],
+    )
+    payload = [frame.to_dict() for frame in frames]
+
+    restored_mark = EvaluationMark.from_dict(payload[0]["marks"][0])
+    restored_frame = EvaluationFrame.from_dict(payload[0])
+    restored_frames = evaluation_frames_from_dict(payload)
+
+    assert restored_mark.to_dict() == frames[0].marks[0].to_dict()
+    assert restored_frame.canonical_json_bytes() == frames[0].canonical_json_bytes()
+    assert tuple(
+        frame.canonical_json_bytes() for frame in restored_frames
+    ) == tuple(frame.canonical_json_bytes() for frame in frames)
+    assert evaluation_frames_sha256(restored_frames) == evaluation_frames_sha256(
+        frames
+    )
+
+    from tradingagents.strategy import (
+        evaluation_frames_from_dict as exported_frames_from_dict,
+    )
+
+    assert exported_frames_from_dict is evaluation_frames_from_dict
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        "frames",
+        {},
+        (),
+        [None],
+        [{"symbol": "NFLX"}],
+    ],
+)
+def test_frame_array_parser_rejects_wrong_shapes(payload: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        evaluation_frames_from_dict(payload)
+
+
+def test_frame_parsers_reject_unknown_missing_and_noncanonical_material() -> None:
+    frame_payload = _frames(["100"])[0].to_dict()
+    mark_payload = frame_payload["marks"][0]
+
+    for payload in (
+        {key: value for key, value in mark_payload.items() if key != "price"},
+        {**mark_payload, "extra": True},
+        {**mark_payload, "price": 100},
+        {**mark_payload, "price": "100.0"},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            EvaluationMark.from_dict(payload)
+
+    invalid_frames = (
+        {key: value for key, value in frame_payload.items() if key != "marks"},
+        {**frame_payload, "extra": True},
+        {**frame_payload, "session_date": 20260701},
+        {**frame_payload, "effective_at": "2026-07-01T14:30:00+00:00"},
+        {**frame_payload, "recorded_at": "2026-07-01T14:31:00"},
+        {**frame_payload, "observations": {}},
+        {**frame_payload, "marks": {}},
+        {**frame_payload, "benchmark_price": 100},
+        {**frame_payload, "benchmark_price": "100.0"},
+    )
+    for payload in invalid_frames:
+        with pytest.raises((TypeError, ValueError)):
+            EvaluationFrame.from_dict(payload)
+
+    observation = frame_payload["observations"][0]
+    invalid_observations = (
+        {key: value for key, value in observation.items() if key != "score"},
+        {**observation, "extra": True},
+        {**observation, "score": Decimal("0.8")},
+        {**observation, "score": "0.80"},
+        {**observation, "current_price": "100.0"},
+        {**observation, "daily_change_fraction": "-0.010"},
+        {**observation, "volume_ratio": "1.0"},
+        {**observation, "time_sensitive": 1},
+    )
+    for changed_observation in invalid_observations:
+        payload = {
+            **frame_payload,
+            "observations": [changed_observation],
+        }
+        with pytest.raises((TypeError, ValueError)):
+            EvaluationFrame.from_dict(payload)
+
+
+def test_frame_parser_rejects_time_order_mark_mismatch_and_array_reordering() -> None:
+    frames = _frames(["100", "101"])
+    frame_payload = frames[0].to_dict()
+
+    for payload in (
+        {
+            **frame_payload,
+            "effective_at": "2026-07-02T14:30:00Z",
+        },
+        {
+            **frame_payload,
+            "recorded_at": "2026-07-01T14:29:59Z",
+        },
+        {
+            **frame_payload,
+            "marks": [{"symbol": "NFLX", "price": "101"}],
+        },
+    ):
+        with pytest.raises(ValueError):
+            EvaluationFrame.from_dict(payload)
+
+    with pytest.raises(ValueError, match="increasing"):
+        evaluation_frames_from_dict(
+            [frames[1].to_dict(), frames[0].to_dict()]
+        )
+
+
 def test_lineage_policy_and_decisions_bind_window_id() -> None:
     frames = _frames(["100"] * 6)
     first = evaluate_genome_window(
@@ -552,6 +696,143 @@ def test_strict_result_and_trade_round_trip_and_tamper_rejection() -> None:
     ):
         with pytest.raises((TypeError, ValueError)):
             EvaluatedTrade.from_dict(payload)
+
+
+def test_result_replay_binds_trade_dates_order_and_non_overlap() -> None:
+    single = _evaluate(["100"] * 6)
+    single_payload = single.to_dict()
+    trade_payload = dict(single_payload["trades"][0])
+
+    for changed_trade in (
+        {**trade_payload, "entry_session": "2026-06-30"},
+        {**trade_payload, "exit_session": "2026-07-07"},
+    ):
+        forged = {**single_payload, "trades": [changed_trade]}
+        with pytest.raises(ValueError, match="window"):
+            GenomeWindowResult.from_dict(forged)
+
+    multiple = _evaluate(
+        ["100", "100", "100", "100", "100", "110", "110", "110", "110", "110", "121"]
+    )
+    first, second = multiple.trades
+    assert first.exit_session == second.entry_session
+    assert (
+        GenomeWindowResult.from_dict(multiple.to_dict()).canonical_json_bytes()
+        == multiple.canonical_json_bytes()
+    )
+
+    with pytest.raises(ValueError, match="chronological"):
+        dataclasses.replace(multiple, trades=tuple(reversed(multiple.trades)))
+
+    overlapping_second = dataclasses.replace(
+        second,
+        entry_session="2026-07-05",
+    )
+    with pytest.raises(ValueError, match="overlap"):
+        dataclasses.replace(
+            multiple,
+            trades=(first, overlapping_second),
+        )
+
+
+def test_result_replay_binds_trade_hashes_as_ordered_subsequence() -> None:
+    multiple = _evaluate(
+        ["100", "100", "100", "100", "100", "110", "110", "110", "110", "110", "121"]
+    )
+    first_hash, second_hash = multiple.ordered_decision_sha256s
+
+    too_few = multiple.to_dict()
+    too_few["ordered_decision_sha256s"] = [first_hash]
+    with pytest.raises(ValueError, match="decision"):
+        GenomeWindowResult.from_dict(_rebind_window_id(too_few))
+
+    reversed_stream = multiple.to_dict()
+    reversed_stream["ordered_decision_sha256s"] = [second_hash, first_hash]
+    with pytest.raises(ValueError, match="subsequence"):
+        GenomeWindowResult.from_dict(_rebind_window_id(reversed_stream))
+
+    absent_stream = multiple.to_dict()
+    absent_stream["ordered_decision_sha256s"] = ["0" * 64, "1" * 64]
+    with pytest.raises(ValueError, match="subsequence"):
+        GenomeWindowResult.from_dict(_rebind_window_id(absent_stream))
+
+    duplicate_stream = multiple.to_dict()
+    duplicate_stream["ordered_decision_sha256s"] = [
+        first_hash,
+        first_hash,
+        second_hash,
+    ]
+    restored = GenomeWindowResult.from_dict(
+        _rebind_window_id(duplicate_stream)
+    )
+    assert [trade.decision_sha256 for trade in restored.trades] == [
+        first_hash,
+        second_hash,
+    ]
+
+    reused_duplicate = multiple.to_dict()
+    reused_duplicate["trades"][1]["decision_sha256"] = first_hash
+    with pytest.raises(ValueError, match="subsequence"):
+        GenomeWindowResult.from_dict(reused_duplicate)
+
+
+def test_result_replay_rejects_forged_cash_and_oversized_budget() -> None:
+    result = _evaluate(["100"] * 6)
+    payload = result.to_dict()
+
+    forged_cash = {
+        **payload,
+        "ending_equity_usd": "199",
+        "net_return_fraction": "-0.005",
+        "benchmark_excess_return_fraction": "-0.005",
+        "max_drawdown_fraction": "-0.005",
+        "equity_curve_usd": ["200", *(["199"] * 6)],
+    }
+    with pytest.raises(ValueError, match="cash"):
+        GenomeWindowResult.from_dict(forged_cash)
+
+    trade_payload = {
+        **payload["trades"][0],
+        "entry_budget_usd": "201",
+        "entry_cost_usd": "0.201",
+        "entry_exposure_usd": "200.799",
+        "gross_exit_value_usd": "200.799",
+        "exit_cost_usd": "0.200799",
+        "net_exit_proceeds_usd": "200.598201",
+        "pnl_usd": "-0.401799",
+        "net_return_fraction": "-0.001999",
+        "realized_cost_drag_fraction": "0.001999",
+        "excess_return_fraction": "-0.001999",
+    }
+    oversized = {
+        **payload,
+        "ending_equity_usd": "199.598201",
+        "net_return_fraction": "-0.002008995",
+        "benchmark_excess_return_fraction": "-0.002008995",
+        "max_drawdown_fraction": "-0.002008995",
+        "trades": [trade_payload],
+        "equity_curve_usd": ["200", *(["199.598201"] * 6)],
+    }
+    with pytest.raises(ValueError, match="available cash"):
+        GenomeWindowResult.from_dict(oversized)
+
+
+def test_result_replay_preserves_subcent_cash_between_trades() -> None:
+    result = _evaluate(
+        ["100", "100", "100", "100", "100", "110", "110", "110", "110", "110", "121"]
+    )
+    cash = Decimal(result.starting_cash_usd)
+    first, second = result.trades
+    for trade in result.trades:
+        assert Decimal(trade.entry_budget_usd) <= cash
+        cash += Decimal(trade.pnl_usd)
+
+    assert Decimal(first.net_exit_proceeds_usd) - Decimal(second.entry_budget_usd) == Decimal("0.00022")
+    assert cash == Decimal(result.ending_equity_usd)
+    assert (
+        GenomeWindowResult.from_dict(result.to_dict()).canonical_json_bytes()
+        == result.canonical_json_bytes()
+    )
 
 
 @pytest.mark.parametrize(
@@ -690,7 +971,15 @@ def test_deterministic_under_hostile_decimal_context_and_input_immutable() -> No
             frames,
             evaluation_as_of=frames[-1].recorded_at,
         )
+        restored_hostile = GenomeWindowResult.from_dict(
+            json.loads(hostile.canonical_json_bytes())
+        )
+        restored_frames = evaluation_frames_from_dict(
+            [frame.to_dict() for frame in frames]
+        )
         assert hostile.canonical_json_bytes() == baseline.canonical_json_bytes()
+        assert restored_hostile.canonical_json_bytes() == hostile.canonical_json_bytes()
+        assert evaluation_frames_sha256(restored_frames) == hostile.input_frames_sha256
         assert hostile.window_id == baseline.window_id
         assert tuple(frame.canonical_json_bytes() for frame in frames) == before
         assert context.prec == hostile_context_before.prec

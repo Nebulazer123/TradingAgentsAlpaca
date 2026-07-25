@@ -20,6 +20,7 @@ from .evaluator import (
     GenomeWindowResult,
     StrategyEvaluationPolicy,
     evaluate_genome_window,
+    evaluation_frames_from_dict,
     evaluation_frames_sha256,
     load_strategy_evaluation_policy,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "StrategyMutationBounds",
     "StrategyObservation",
     "compile_genome_paper_decision",
+    "evaluation_frames_from_dict",
     "evaluation_frames_sha256",
     "evaluate_genome_window",
     "load_strategy_evaluation_policy",

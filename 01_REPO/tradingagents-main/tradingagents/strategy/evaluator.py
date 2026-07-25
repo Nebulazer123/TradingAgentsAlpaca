@@ -134,7 +134,10 @@ def _canonical_bps(
     parsed = Decimal(value)
     if parsed < 0 or parsed > 1000:
         raise ValueError(f"{field_name} must be between 0 and 1000")
-    return _decimal_text(parsed)
+    canonical = _decimal_text(parsed)
+    if canonical != value:
+        raise ValueError(f"{field_name} must be a canonical decimal string")
+    return canonical
 
 
 def _validate_price(value: object, *, field_name: str) -> None:
@@ -164,6 +167,23 @@ def _validate_utc_datetime(value: object, *, field_name: str) -> None:
 def _datetime_text(value: datetime) -> str:
     _validate_utc_datetime(value, field_name="datetime")
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_utc_datetime_text(
+    value: object,
+    *,
+    field_name: str,
+) -> datetime:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO UTC datetime") from exc
+    _validate_utc_datetime(parsed, field_name=field_name)
+    if _datetime_text(parsed) != value:
+        raise ValueError(f"{field_name} must be canonical UTC")
+    return parsed
 
 
 def _validate_hash(value: object, *, field_name: str) -> None:
@@ -376,8 +396,66 @@ class EvaluationMark:
         _validate_symbol(self.symbol, field_name="symbol")
         _validate_price(self.price, field_name="price")
 
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> EvaluationMark:
+        values = _require_exact_fields(
+            payload,
+            {"symbol", "price"},
+            field_name="evaluation mark",
+        )
+        price = _validate_canonical_decimal_text(
+            values["price"],
+            field_name="price",
+        )
+        return cls(
+            symbol=values["symbol"],
+            price=price,
+        )
+
     def to_dict(self) -> dict[str, str]:
         return {"symbol": self.symbol, "price": _decimal_text(self.price)}
+
+
+def _strategy_observation_from_dict(
+    payload: Mapping[str, object],
+) -> StrategyObservation:
+    values = _require_exact_fields(
+        payload,
+        {
+            "symbol",
+            "score",
+            "current_price",
+            "daily_change_fraction",
+            "volume_ratio",
+            "time_sensitive",
+        },
+        field_name="strategy observation",
+    )
+    if type(values["time_sensitive"]) is not bool:
+        raise TypeError("time_sensitive must be a boolean")
+    return StrategyObservation(
+        symbol=values["symbol"],
+        score=_validate_canonical_decimal_text(
+            values["score"],
+            field_name="score",
+        ),
+        current_price=_validate_canonical_decimal_text(
+            values["current_price"],
+            field_name="current_price",
+        ),
+        daily_change_fraction=_validate_canonical_decimal_text(
+            values["daily_change_fraction"],
+            field_name="daily_change_fraction",
+        ),
+        volume_ratio=_validate_canonical_decimal_text(
+            values["volume_ratio"],
+            field_name="volume_ratio",
+        ),
+        time_sensitive=values["time_sensitive"],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +503,57 @@ class EvaluationFrame:
                 raise ValueError("observation price must match same-frame mark")
         _validate_price(self.benchmark_price, field_name="benchmark_price")
 
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+    ) -> EvaluationFrame:
+        values = _require_exact_fields(
+            payload,
+            {
+                "session_date",
+                "effective_at",
+                "recorded_at",
+                "market_session",
+                "observations",
+                "marks",
+                "benchmark_price",
+            },
+            field_name="evaluation frame",
+        )
+        _validate_date_text(
+            values["session_date"],
+            field_name="session_date",
+        )
+        if type(values["observations"]) is not list:
+            raise TypeError("observations must be a list")
+        if type(values["marks"]) is not list:
+            raise TypeError("marks must be a list")
+        return cls(
+            session_date=date.fromisoformat(values["session_date"]),
+            effective_at=_parse_utc_datetime_text(
+                values["effective_at"],
+                field_name="effective_at",
+            ),
+            recorded_at=_parse_utc_datetime_text(
+                values["recorded_at"],
+                field_name="recorded_at",
+            ),
+            market_session=values["market_session"],
+            observations=tuple(
+                _strategy_observation_from_dict(observation)
+                for observation in values["observations"]
+            ),
+            marks=tuple(
+                EvaluationMark.from_dict(mark)
+                for mark in values["marks"]
+            ),
+            benchmark_price=_validate_canonical_decimal_text(
+                values["benchmark_price"],
+                field_name="benchmark_price",
+            ),
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "session_date": self.session_date.isoformat(),
@@ -448,6 +577,24 @@ class EvaluationFrame:
 
     def canonical_json_bytes(self) -> bytes:
         return _canonical_json_bytes(self.to_dict())
+
+
+def evaluation_frames_from_dict(
+    payload: object,
+) -> tuple[EvaluationFrame, ...]:
+    if type(payload) is not list:
+        raise TypeError("evaluation frames must be a list")
+    frames = tuple(EvaluationFrame.from_dict(frame) for frame in payload)
+    previous_date: date | None = None
+    previous_effective: datetime | None = None
+    for frame in frames:
+        if previous_date is not None and frame.session_date <= previous_date:
+            raise ValueError("evaluation frame dates must be strictly increasing")
+        if previous_effective is not None and frame.effective_at <= previous_effective:
+            raise ValueError("evaluation frame times must be strictly increasing")
+        previous_date = frame.session_date
+        previous_effective = frame.effective_at
+    return frames
 
 
 def evaluation_frames_sha256(
@@ -721,12 +868,44 @@ class GenomeWindowResult:
             raise TypeError("trades must be an exact tuple of EvaluatedTrade")
         if self.closed_trade_count != len(self.trades):
             raise ValueError("closed_trade_count does not match trades")
+        if type(self.ordered_decision_sha256s) is not tuple:
+            raise TypeError("ordered_decision_sha256s must be an exact tuple")
+        for digest in self.ordered_decision_sha256s:
+            _validate_hash(digest, field_name="ordered decision digest")
+        if len(self.trades) > len(self.ordered_decision_sha256s):
+            raise ValueError("trade count cannot exceed decision count")
         if self.winning_trade_count != sum(trade.won for trade in self.trades):
             raise ValueError("winning_trade_count does not match trades")
         if self.false_positive_count != sum(trade.false_positive for trade in self.trades):
             raise ValueError("false_positive_count does not match trades")
         if any(trade.genome_id != self.genome_id for trade in self.trades):
             raise ValueError("trade genome_id does not match window")
+        window_start = date.fromisoformat(self.window_start)
+        window_end = date.fromisoformat(self.window_end)
+        previous_exit: date | None = None
+        for trade in self.trades:
+            entry_session = date.fromisoformat(trade.entry_session)
+            exit_session = date.fromisoformat(trade.exit_session)
+            if entry_session < window_start or exit_session > window_end:
+                raise ValueError("trade sessions must remain inside the window")
+            if previous_exit is not None and entry_session < previous_exit:
+                raise ValueError(
+                    "trades must be chronological and may not overlap"
+                )
+            previous_exit = exit_session
+        decision_index = 0
+        for trade in self.trades:
+            while (
+                decision_index < len(self.ordered_decision_sha256s)
+                and self.ordered_decision_sha256s[decision_index]
+                != trade.decision_sha256
+            ):
+                decision_index += 1
+            if decision_index == len(self.ordered_decision_sha256s):
+                raise ValueError(
+                    "trade decision hashes must be an ordered subsequence"
+                )
+            decision_index += 1
         result_values = {
             name: _validate_canonical_decimal_text(
                 getattr(self, name),
@@ -769,6 +948,22 @@ class GenomeWindowResult:
             raise ValueError("equity curve must end with ending equity")
         with localcontext(_new_decimal_context()):
             starting = result_values["starting_cash_usd"]
+            replayed_cash = starting
+            for trade in self.trades:
+                entry_budget = Decimal(trade.entry_budget_usd)
+                if entry_budget > replayed_cash:
+                    raise ValueError(
+                        "trade entry budget exceeds then-available cash"
+                    )
+                if replayed_cash - entry_budget < 0:
+                    raise ValueError("virtual cash cannot be negative at entry")
+                replayed_cash += Decimal(trade.pnl_usd)
+                if replayed_cash < 0:
+                    raise ValueError("virtual cash cannot be negative after close")
+            if replayed_cash != result_values["ending_equity_usd"]:
+                raise ValueError(
+                    "ending_equity_usd does not match sequential cash replay"
+                )
             expected_gross = starting + sum(
                 (Decimal(trade.gross_pnl_usd) for trade in self.trades),
                 start=Decimal("0"),
@@ -794,10 +989,6 @@ class GenomeWindowResult:
             "evaluation_policy_sha256",
         ):
             _validate_hash(getattr(self, name), field_name=name)
-        if type(self.ordered_decision_sha256s) is not tuple:
-            raise TypeError("ordered_decision_sha256s must be an exact tuple")
-        for digest in self.ordered_decision_sha256s:
-            _validate_hash(digest, field_name="ordered decision digest")
         expected_window_id = _sha256(
             _canonical_json_bytes(
                 _window_binding_payload(
