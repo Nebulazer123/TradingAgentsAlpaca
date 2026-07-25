@@ -1103,6 +1103,87 @@ def test_safe_cent_floor_handles_huge_values_under_hostile_context() -> None:
         getcontext().flags = original.flags
 
 
+def test_zero_cent_units_guard_precedes_exponent_work() -> None:
+    tree = ast.parse(COMPILER_PATH.read_text(encoding="utf-8"))
+    cent_units = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_paper_money_cent_units"
+    )
+    first_statement = cent_units.body[0]
+
+    assert isinstance(first_statement, ast.If)
+    assert isinstance(first_statement.test, ast.Compare)
+    assert isinstance(first_statement.body[0], ast.Return)
+    assert isinstance(first_statement.body[0].value, ast.Constant)
+    assert first_statement.body[0].value.value == 0
+
+
+@pytest.mark.parametrize(
+    ("cash", "reserved", "expected_action", "expected_notional"),
+    [
+        (
+            Decimal("0E+1000000000"),
+            Decimal("0.00"),
+            PaperDecisionAction.HOLD_CASH,
+            "0.00",
+        ),
+        (
+            Decimal("200.00"),
+            Decimal("0E+1000000000"),
+            PaperDecisionAction.BUY,
+            "200.00",
+        ),
+    ],
+)
+def test_huge_exponent_zero_money_is_constant_time_under_hostile_context(
+    cash: Decimal,
+    reserved: Decimal,
+    expected_action: PaperDecisionAction,
+    expected_notional: str,
+) -> None:
+    state = _state(cash=cash, reserved=reserved)
+    caller = getcontext()
+    original = caller.copy()
+    try:
+        caller.prec = 2
+        caller.rounding = ROUND_UP
+        caller.Emin = -2
+        caller.Emax = 2
+        caller.traps[Inexact] = True
+        caller.clear_flags()
+        caller.flags[Inexact] = True
+        before = _decimal_context_signature()
+
+        decision = _compile(state=state)
+
+        assert decision.action is expected_action
+        assert decision.notional_usd == expected_notional
+        assert _decimal_context_signature() == before
+    finally:
+        getcontext().prec = original.prec
+        getcontext().rounding = original.rounding
+        getcontext().Emin = original.Emin
+        getcontext().Emax = original.Emax
+        getcontext().capitals = original.capitals
+        getcontext().clamp = original.clamp
+        getcontext().traps = original.traps
+        getcontext().flags = original.flags
+
+
+def test_normal_cash_minus_reserved_remains_exact() -> None:
+    decision = _compile(
+        state=_state(
+            cash=Decimal("200.12"),
+            reserved=Decimal("0.11"),
+        )
+    )
+
+    assert decision.action is PaperDecisionAction.BUY
+    assert decision.notional_usd == "200.01"
+
+
 @pytest.mark.parametrize(
     ("family", "policy", "state", "session"),
     [

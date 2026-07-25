@@ -208,6 +208,8 @@ def floor_paper_money_to_cents(value: Decimal) -> Decimal:
 
 
 def _paper_money_cent_units(value: Decimal) -> int:
+    if value == 0:
+        return 0
     _, digits, exponent = value.as_tuple()
     if type(exponent) is not int or exponent < -2:
         raise ValueError("paper money must have two-decimal precision or less")
