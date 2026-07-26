@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import datetime as dt
+import gc
 import hashlib
 import json
 import os
@@ -1037,6 +1038,37 @@ def test_existing_journal_is_redurable_before_next_append(tmp_path, monkeypatch)
     assert first_journal_fsync < journal_write
 
 
+def test_missing_journal_redurability_still_fsyncs_pinned_root(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+    fsynced_inodes: list[int] = []
+    real_fsync = evidence_store_module.os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        fsynced_inodes.append(os.fstat(descriptor).st_ino)
+        real_fsync(descriptor)
+
+    with store._locked(create=True):
+        store._ensure_managed_directories(
+            create=True,
+            recover_staged_pointers=True,
+        )
+        assert not (root / "events.jsonl").exists()
+        root_inode = os.fstat(store._transaction().root_fd).st_ino
+        monkeypatch.setattr(
+            evidence_store_module.os,
+            "fsync",
+            recording_fsync,
+        )
+
+        store._redurable_journal_if_present()
+
+    assert fsynced_inodes == [root_inode]
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -1211,7 +1243,11 @@ def test_rebuild_redurabilizes_prior_stale_pointer_deletion_after_fsync_error(
     assert not stale.exists()
     operations.clear()
     assert store.rebuild() == ()
-    assert operations.index("latest-fsync") < operations.index("root-fsync")
+    latest_fsync = operations.index("latest-fsync")
+    assert any(
+        index > latest_fsync and operation == "root-fsync"
+        for index, operation in enumerate(operations)
+    )
 
 
 def test_verify_on_missing_root_is_read_only(tmp_path):
@@ -1908,6 +1944,159 @@ assert observed and "callback" in observed[0]
     assert completed.returncode == 0, completed.stderr
 
 
+def test_cross_root_validators_cannot_deadlock_each_other(tmp_path):
+    root_a = tmp_path / "evidence-a"
+    root_b = tmp_path / "evidence-b"
+    script = f"""
+import datetime as dt
+import threading
+from pathlib import Path
+from tradingagents.strategy._immutable_evidence_store import (
+    EvidenceCandidate,
+    ImmutableStrategyEvidenceStore,
+    StrategyEvidenceStoreError,
+)
+clock = lambda: dt.datetime(2030, 1, 2, 15, 4, 5, tzinfo=dt.timezone.utc)
+store_a = ImmutableStrategyEvidenceStore(Path({str(root_a)!r}), clock=clock)
+store_b = ImmutableStrategyEvidenceStore(Path({str(root_b)!r}), clock=clock)
+barrier = threading.Barrier(2)
+outcomes = []
+outcomes_lock = threading.Lock()
+
+def candidate(slot):
+    return EvidenceCandidate(
+        kind="evaluation-registration",
+        effective_at="2030-01-02T14:00:00+00:00",
+        payload={{"slot": slot}},
+    )
+
+def run(label, source, target):
+    def validate(_prior, _new):
+        barrier.wait(timeout=1)
+        try:
+            target.verify()
+        except StrategyEvidenceStoreError as exc:
+            with outcomes_lock:
+                outcomes.append((label, "blocked", "callback" in str(exc)))
+        else:
+            with outcomes_lock:
+                outcomes.append((label, "allowed", False))
+    try:
+        source.admit_checked(candidate(label), validate=validate)
+    except Exception as exc:
+        with outcomes_lock:
+            outcomes.append((label, type(exc).__name__, str(exc)))
+    else:
+        with outcomes_lock:
+            outcomes.append((label, "admitted", True))
+
+threads = [
+    threading.Thread(
+        target=run,
+        args=("a", store_a, store_b),
+        daemon=True,
+    ),
+    threading.Thread(
+        target=run,
+        args=("b", store_b, store_a),
+        daemon=True,
+    ),
+]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join(timeout=1)
+assert not any(thread.is_alive() for thread in threads), "validators deadlocked"
+assert sorted(outcomes) == [
+    ("a", "admitted", True),
+    ("a", "blocked", True),
+    ("b", "admitted", True),
+    ("b", "blocked", True),
+]
+assert len(store_a.verify()) == 1
+assert len(store_b.verify()) == 1
+"""
+    started = time.monotonic()
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(evidence_store_module.__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert time.monotonic() - started < 3
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_validator_rejects_every_public_entry_across_roots_and_clears(
+    tmp_path,
+):
+    first = ImmutableStrategyEvidenceStore(
+        tmp_path / "evidence-a",
+        clock=_Clock(FIRST),
+    )
+    second = ImmutableStrategyEvidenceStore(
+        tmp_path / "evidence-b",
+        clock=_Clock(FIRST),
+    )
+    nested = _candidate(payload={"slot": "nested"})
+    observed: list[str] = []
+
+    def validate(
+        _prior: tuple[EvidenceEnvelope, ...],
+        _new: EvidenceEnvelope,
+    ) -> None:
+        calls = (
+            lambda: second.admit_checked(
+                nested,
+                validate=lambda _prior, _new: None,
+            ),
+            second.verify,
+            second.rebuild,
+            second.envelopes,
+        )
+        for call in calls:
+            with pytest.raises(
+                evidence_store_module.StrategyEvidenceStoreError,
+                match="validation callback",
+            ) as raised:
+                call()
+            observed.append(str(raised.value))
+
+    admitted = first.admit_checked(_candidate(), validate=validate)
+
+    assert len(observed) == 4
+    assert first.verify() == (admitted.envelope,)
+    assert second.verify() == ()
+    nested_admission = second.admit_checked(
+        nested,
+        validate=lambda _prior, _new: None,
+    )
+    assert second.envelopes() == (nested_admission.envelope,)
+    assert second.rebuild() == (nested_admission.envelope,)
+
+
+def test_process_root_lock_registry_releases_inactive_roots(tmp_path):
+    before = frozenset(evidence_store_module._ROOT_PROCESS_LOCKS)
+    created_keys: set[str] = set()
+
+    for index in range(64):
+        store = ImmutableStrategyEvidenceStore(tmp_path / f"evidence-{index}")
+        created_keys.add(os.fspath(store.root))
+        process_lock = store._process_root_lock()
+        process_lock.acquire()
+        process_lock.release()
+
+    del process_lock
+    del store
+    gc.collect()
+
+    assert created_keys.isdisjoint(evidence_store_module._ROOT_PROCESS_LOCKS)
+    assert before.issubset(evidence_store_module._ROOT_PROCESS_LOCKS)
+
+
 @pytest.mark.parametrize(
     "candidate_factory",
     [
@@ -1984,6 +2173,12 @@ def test_callback_failure_writes_no_object_event_or_pointer(tmp_path):
     assert not tuple((root / "objects").rglob("*.json"))
     assert not (root / "events.jsonl").exists()
     assert not tuple((root / "latest").glob("*.json"))
+    assert store.verify() == ()
+    admitted = store.admit_checked(
+        _candidate(payload={"slot": "after-validator-failure"}),
+        validate=lambda _prior, _new: None,
+    )
+    assert store.envelopes() == (admitted.envelope,)
 
 
 def test_kind_filter_rejects_unknown_kind_without_mutating_store(tmp_path):

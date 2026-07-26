@@ -11,6 +11,7 @@ import re
 import stat
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -45,8 +46,10 @@ _MAX_JOURNAL_LINE_BYTES = 1_048_576
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _ROOT_PROCESS_LOCKS_GUARD = threading.Lock()
-_ROOT_PROCESS_LOCKS: dict[str, threading.Lock] = {}
-_CALLBACK_ROOTS = threading.local()
+_ROOT_PROCESS_LOCKS: weakref.WeakValueDictionary[str, threading.Lock] = (
+    weakref.WeakValueDictionary()
+)
+_VALIDATOR_ACTIVITY = threading.local()
 _AUTHORITY_FIELDS = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -660,13 +663,13 @@ class ImmutableStrategyEvidenceStore:
             None,
         ],
     ) -> EvidenceAdmission:
+        self._reject_callback_reentry()
         if not isinstance(candidate, EvidenceCandidate):
             raise StrategyEvidenceStoreError(
                 "candidate must be an EvidenceCandidate"
             )
         if not callable(validate):
             raise StrategyEvidenceStoreError("validate must be callable")
-        self._reject_callback_reentry()
         retry_bytes = _retry_material_bytes(
             kind=candidate.kind,
             effective_at=candidate.effective_at,
@@ -747,12 +750,8 @@ class ImmutableStrategyEvidenceStore:
                     "store clock is earlier than object first-seen evidence"
                 )
 
-            callback_roots = self._callback_roots()
-            callback_roots.add(os.fspath(self.root))
-            try:
+            with self._validator_active():
                 validate(snapshot, envelope)
-            finally:
-                callback_roots.remove(os.fspath(self.root))
             self._validate_transaction()
 
             if prior_event is not None:
@@ -847,6 +846,7 @@ class ImmutableStrategyEvidenceStore:
         *,
         kind: str | None = None,
     ) -> tuple[EvidenceEnvelope, ...]:
+        self._reject_callback_reentry()
         if kind is not None:
             _require_kind(kind)
         envelopes = self.verify()
@@ -861,17 +861,22 @@ class ImmutableStrategyEvidenceStore:
         """Protected deterministic seam after a journal event is durable."""
 
     def _reject_callback_reentry(self) -> None:
-        if os.fspath(self.root) in self._callback_roots():
+        if getattr(_VALIDATOR_ACTIVITY, "depth", 0) > 0:
             raise StrategyEvidenceStoreError(
                 "validation callback must not call the evidence store"
             )
 
-    def _callback_roots(self) -> set[str]:
-        roots = getattr(_CALLBACK_ROOTS, "active", None)
-        if roots is None:
-            roots = set()
-            _CALLBACK_ROOTS.active = roots
-        return roots
+    @contextmanager
+    def _validator_active(self) -> Iterator[None]:
+        prior_depth = getattr(_VALIDATOR_ACTIVITY, "depth", 0)
+        _VALIDATOR_ACTIVITY.depth = prior_depth + 1
+        try:
+            yield
+        finally:
+            if prior_depth == 0:
+                del _VALIDATOR_ACTIVITY.depth
+            else:
+                _VALIDATOR_ACTIVITY.depth = prior_depth
 
     def _process_root_lock(self) -> threading.Lock:
         key = os.fspath(self.root)
@@ -1722,13 +1727,12 @@ class ImmutableStrategyEvidenceStore:
 
     def _redurable_journal_if_present(self) -> None:
         state = self._path_state(self._events_path, label="event journal")
-        if state is None:
-            return
-        self._require_regular_state(state, label="event journal")
-        self._redurable_regular_file(
-            self._events_path,
-            label="event journal",
-        )
+        if state is not None:
+            self._require_regular_state(state, label="event journal")
+            self._redurable_regular_file(
+                self._events_path,
+                label="event journal",
+            )
         self._fsync_directory(self.root)
 
     def _kind_directory(self, kind: str) -> Path:
