@@ -70,6 +70,17 @@ from .promotion_evidence import (
     StrategyPromotionEvidenceLedger,
     build_evaluation_source_manifest,
     build_evaluation_window_spec,
+    require_active_evaluation_runtime,
+)
+from .staged_intent import (
+    STAGED_PAPER_INTENT_KIND,
+    STAGED_PAPER_INTENT_MAX_TTL_SECONDS,
+    STAGED_PAPER_INTENT_SCHEMA_VERSION,
+    STRATEGY_OBSERVATION_REASON_MAX_UTF8_BYTES,
+    STRATEGY_OBSERVATION_SOURCE_MAX_BYTES,
+    StagedPaperIntent,
+    StrategyObservationEvidence,
+    StrategyStagedIntentLedger,
 )
 
 __all__ = [
@@ -87,6 +98,11 @@ __all__ = [
     "STRATEGY_EVOLUTION_POLICY_SCHEMA_VERSION",
     "STRATEGY_GENOME_SCHEMA_VERSION",
     "STRATEGY_PROMOTION_EVIDENCE_SCHEMA_VERSION",
+    "STAGED_PAPER_INTENT_MAX_TTL_SECONDS",
+    "STAGED_PAPER_INTENT_KIND",
+    "STAGED_PAPER_INTENT_SCHEMA_VERSION",
+    "STRATEGY_OBSERVATION_REASON_MAX_UTF8_BYTES",
+    "STRATEGY_OBSERVATION_SOURCE_MAX_BYTES",
     "BASELINE_GENOME_REGISTRATION_SCHEMA_VERSION",
     "MUTATION_CYCLE_MATERIAL_SCHEMA_VERSION",
     "MUTATION_DECIMAL_CONTEXT_PRECISION",
@@ -123,7 +139,10 @@ __all__ = [
     "StrategyPromotionEvidence",
     "StrategyPromotionEvidenceError",
     "StrategyPromotionEvidenceLedger",
+    "StagedPaperIntent",
+    "StrategyStagedIntentLedger",
     "StrategyObservation",
+    "StrategyObservationEvidence",
     "compile_genome_paper_decision",
     "build_evaluation_source_manifest",
     "build_evaluation_window_spec",
@@ -134,4 +153,5 @@ __all__ = [
     "evaluate_genome_window",
     "load_strategy_evaluation_policy",
     "load_strategy_evolution_policy",
+    "require_active_evaluation_runtime",
 ]

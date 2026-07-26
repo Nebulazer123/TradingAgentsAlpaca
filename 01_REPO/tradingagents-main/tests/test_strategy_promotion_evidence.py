@@ -459,6 +459,92 @@ def test_manifest_rejects_extra_missing_reordered_and_forged_material(mutator):
         EvaluationSourceManifest.from_dict(mutator(manifest.to_dict()))
 
 
+def test_require_active_evaluation_runtime_returns_exact_registered_manifest(
+    tmp_path,
+):
+    # Break caught: the public verifier rebuilds bytes without binding loaded modules.
+    from tradingagents.strategy import require_active_evaluation_runtime
+
+    _ledger, registration, repo, _commit = _register(tmp_path)
+
+    active = require_active_evaluation_runtime(repo, registration)
+
+    assert active == registration.evaluation_source_manifest
+    assert (
+        active.canonical_json_bytes()
+        == registration.evaluation_source_manifest.canonical_json_bytes()
+    )
+
+
+def test_require_active_evaluation_runtime_rejects_wrong_registration_type(
+    tmp_path,
+):
+    # Break caught: an arbitrary registration-shaped object reaches repository I/O.
+    from tradingagents.strategy import require_active_evaluation_runtime
+
+    missing_repo = tmp_path / "must-not-be-read"
+    with pytest.raises(
+        TypeError,
+        match="registration must be a StrategyEvaluationRegistration",
+    ):
+        require_active_evaluation_runtime(missing_repo, object())  # type: ignore[arg-type]
+
+    assert not missing_repo.exists()
+
+
+def test_require_active_evaluation_runtime_rejects_active_source_drift(
+    tmp_path,
+    monkeypatch,
+):
+    # Break caught: calculation bytes drift while an old registration stays usable.
+    import tradingagents.strategy.promotion_evidence as module
+    from tradingagents.strategy import require_active_evaluation_runtime
+
+    _ledger, registration, repo, _commit = _register(tmp_path)
+    _drift_source(monkeypatch, module.EVALUATION_SOURCE_PATHS[0])
+
+    with pytest.raises(ValueError, match="loaded calculation source"):
+        require_active_evaluation_runtime(repo, registration)
+
+
+def test_require_active_evaluation_runtime_rejects_separate_loaded_checkout(
+    tmp_path,
+):
+    # Break caught: byte-identical files substitute for the checkout owning imports.
+    from tradingagents.strategy import require_active_evaluation_runtime
+
+    _ledger, registration, _repo, _commit = _register(tmp_path)
+    separate_repo, _separate_commit = _separate_calculation_repo(tmp_path)
+
+    with pytest.raises(ValueError, match="loaded calculation source"):
+        require_active_evaluation_runtime(separate_repo, registration)
+
+
+def test_require_active_evaluation_runtime_preserves_public_facade_error(
+    tmp_path,
+    monkeypatch,
+):
+    # Break caught: repository startup failures leak as an unstable exception family.
+    import tradingagents.strategy.promotion_evidence as module
+    from tradingagents.strategy import require_active_evaluation_runtime
+
+    _ledger, registration, repo, _commit = _register(tmp_path)
+    failure = OSError("local Git unavailable")
+
+    def failed_git(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(module.subprocess, "run", failed_git)
+
+    with pytest.raises(
+        module.StrategyPromotionEvidenceError,
+        match="Git worktree preflight failed",
+    ) as observed:
+        require_active_evaluation_runtime(repo, registration)
+
+    assert observed.value.__cause__ is failure
+
+
 def test_registration_binds_clean_commit_git_objects_manifest_and_identity(
     tmp_path,
 ):

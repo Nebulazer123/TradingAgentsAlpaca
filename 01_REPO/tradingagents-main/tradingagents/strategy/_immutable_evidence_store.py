@@ -19,6 +19,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 STRATEGY_EVIDENCE_STORE_SCHEMA_VERSION = 1
+STAGED_PAPER_INTENT_KIND = "staged-paper-intent"
 
 _UTC = dt.timezone.utc
 _ZERO_HASH = "0" * 64
@@ -30,6 +31,7 @@ _ALLOWED_KINDS = frozenset(
         "promotion-evidence",
         "baseline-genome",
         "mutation-record",
+        STAGED_PAPER_INTENT_KIND,
     }
 )
 _STAGED_POINTER_NAME = re.compile(
@@ -675,6 +677,11 @@ class ImmutableStrategyEvidenceStore:
             [tuple[EvidenceEnvelope, ...], EvidenceEnvelope],
             None,
         ],
+        validate_orphans: Callable[
+            [tuple[EvidenceEnvelope, ...], EvidenceEnvelope],
+            None,
+        ]
+        | None = None,
     ) -> EvidenceAdmission:
         self._reject_callback_reentry()
         if not isinstance(candidate, EvidenceCandidate):
@@ -683,6 +690,10 @@ class ImmutableStrategyEvidenceStore:
             )
         if not callable(validate):
             raise StrategyEvidenceStoreError("validate must be callable")
+        if validate_orphans is not None and not callable(validate_orphans):
+            raise StrategyEvidenceStoreError(
+                "validate_orphans must be callable or None"
+            )
         retry_bytes = _retry_material_bytes(
             kind=candidate.kind,
             effective_at=candidate.effective_at,
@@ -765,6 +776,8 @@ class ImmutableStrategyEvidenceStore:
 
             with self._validator_active():
                 validate(snapshot, envelope)
+                if validate_orphans is not None:
+                    validate_orphans(valid_orphans, envelope)
             self._validate_transaction()
 
             if prior_event is not None:

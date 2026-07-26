@@ -541,6 +541,135 @@ def test_crash_after_object_fsync_leaves_adoptable_orphan_with_original_time(
     assert repaired.verify() == (admission.envelope,)
 
 
+def test_validate_orphans_receives_only_strict_orphans_and_exact_candidate_under_lock(
+    tmp_path,
+):
+    # Break caught: orphan validation sees malformed objects or runs outside the lock.
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crashing.admit_checked(
+            candidate,
+            validate=lambda _prior, _new: None,
+        )
+    expected_orphan = EvidenceEnvelope.from_dict(
+        json.loads(next((root / "objects").rglob("*.json")).read_bytes())
+    )
+    malformed_dir = root / "objects" / "baseline-genome"
+    malformed_dir.mkdir()
+    malformed_path = malformed_dir / f"baseline-genome-{'f' * 64}.json"
+    malformed_path.write_bytes(b"{}")
+    malformed_path.chmod(0o600)
+
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER))
+    observed: list[
+        tuple[
+            tuple[EvidenceEnvelope, ...],
+            EvidenceEnvelope,
+        ]
+    ] = []
+
+    def validate(
+        admitted: tuple[EvidenceEnvelope, ...],
+        new: EvidenceEnvelope,
+    ) -> None:
+        assert admitted == ()
+        assert new == expected_orphan
+
+    def validate_orphans(
+        orphans: tuple[EvidenceEnvelope, ...],
+        new: EvidenceEnvelope,
+    ) -> None:
+        process_lock = store._process_root_lock()
+        assert process_lock.acquire(blocking=False) is False
+        assert store._transaction().root_fd >= 0
+        observed.append((orphans, new))
+
+    admission = store.admit_checked(
+        candidate,
+        validate=validate,
+        validate_orphans=validate_orphans,
+    )
+
+    assert observed == [((expected_orphan,), expected_orphan)]
+    assert admission.envelope == expected_orphan
+    assert store.verify() == (expected_orphan,)
+    assert malformed_path.read_bytes() == b"{}"
+
+
+def test_validate_orphans_rejection_precedes_candidate_object_event_and_pointer(
+    tmp_path,
+):
+    # Break caught: a rejected orphan conflict leaves partial candidate durability.
+    root = tmp_path / "evidence"
+    orphan_candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crashing.admit_checked(
+            orphan_candidate,
+            validate=lambda _prior, _new: None,
+        )
+    before = _tree_snapshot(root)
+    changed = _candidate(
+        payload={"slot": "same-logical-slot", "choice": "changed"},
+    )
+
+    def reject(
+        orphans: tuple[EvidenceEnvelope, ...],
+        _new: EvidenceEnvelope,
+    ) -> None:
+        assert len(orphans) == 1
+        raise ValueError("orphan slot conflict")
+
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER))
+    with pytest.raises(ValueError, match="orphan slot conflict"):
+        store.admit_checked(
+            changed,
+            validate=lambda admitted, _new: admitted == (),
+            validate_orphans=reject,
+        )
+
+    assert _tree_snapshot(root) == before
+    assert not (root / "events.jsonl").exists()
+    assert not tuple((root / "latest").glob("*.json"))
+
+
+def test_validate_orphans_exception_cleans_up_and_omitted_callback_stays_compatible(
+    tmp_path,
+):
+    # Break caught: an orphan callback exception wedges validation or adoption.
+    root = tmp_path / "evidence"
+    candidate = _candidate()
+    crashing = _CrashAfterObject(root, clock=_Clock(FIRST))
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crashing.admit_checked(
+            candidate,
+            validate=lambda _prior, _new: None,
+        )
+    store = ImmutableStrategyEvidenceStore(
+        root,
+        clock=_Clock(LATER, LATER),
+    )
+
+    with pytest.raises(RuntimeError, match="orphan callback failed"):
+        store.admit_checked(
+            candidate,
+            validate=lambda _prior, _new: None,
+            validate_orphans=lambda _orphans, _new: (_ for _ in ()).throw(
+                RuntimeError("orphan callback failed")
+            ),
+        )
+
+    assert not hasattr(evidence_store_module._VALIDATOR_ACTIVITY, "depth")
+    admission = store.admit_checked(
+        candidate,
+        validate=lambda _prior, _new: None,
+    )
+    assert admission.created is True
+    assert store.verify() == (admission.envelope,)
+
+
 def test_valid_unrelated_orphan_blocks_backdated_admission_without_journaling(
     tmp_path,
 ):

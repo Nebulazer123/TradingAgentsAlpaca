@@ -1120,6 +1120,22 @@ def build_evaluation_source_manifest(
     return _active_source_manifest(_canonical_repo_root(repo_root))
 
 
+def require_active_evaluation_runtime(
+    repo_root: str | Path,
+    registration: StrategyEvaluationRegistration,
+) -> EvaluationSourceManifest:
+    """Require the loaded calculation runtime to match a durable registration."""
+
+    if type(registration) is not StrategyEvaluationRegistration:
+        raise TypeError(
+            "registration must be a StrategyEvaluationRegistration"
+        )
+    return _require_active_manifest(
+        _canonical_repo_root(repo_root),
+        registration,
+    )
+
+
 def _registration_preflight(
     repo_root: Path,
     evaluation_code_commit: str,
