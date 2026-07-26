@@ -567,6 +567,69 @@ def test_model_schema_canonical_round_trip_deep_immutability_and_authority():
         intent.expires_at = "changed"  # type: ignore[misc]
 
 
+@pytest.mark.parametrize("invalid_version", (True, 1.0))
+@pytest.mark.parametrize(
+    "schema_name",
+    ("observation", "evolution_policy", "staged_intent"),
+)
+def test_nested_and_top_level_schema_versions_require_exact_int(
+    schema_name,
+    invalid_version,
+):
+    # Break caught: bool or float 1 is normalized into canonical integer schema 1.
+    from tradingagents.strategy import StagedPaperIntent
+    from tradingagents.strategy.staged_intent import (
+        StrategyObservationEvidence,
+        _strategy_evolution_policy_from_dict,
+    )
+
+    if schema_name == "observation":
+        with pytest.raises(ValueError, match="schema_version"):
+            StrategyObservationEvidence.from_dict(
+                _observation_payload(schema_version=invalid_version)
+            )
+        return
+
+    payload = _staged_model_payload()
+    if schema_name == "evolution_policy":
+        policy_payload = dict(payload["evolution_policy"])
+        policy_payload["schema_version"] = invalid_version
+        with pytest.raises(ValueError, match="schema_version"):
+            _strategy_evolution_policy_from_dict(policy_payload)
+        return
+
+    payload["schema_version"] = invalid_version
+    with pytest.raises(ValueError, match="schema_version"):
+        StagedPaperIntent.from_dict(payload)
+
+
+def test_schema_versions_canonical_round_trip_as_exact_ints():
+    # Break caught: a valid parser round trip changes schema type or canonical bytes.
+    from tradingagents.strategy import StagedPaperIntent
+    from tradingagents.strategy.staged_intent import (
+        StrategyObservationEvidence,
+        _strategy_evolution_policy_from_dict,
+    )
+
+    observation_payload = _observation_payload()
+    observation = StrategyObservationEvidence.from_dict(observation_payload)
+    assert observation.to_dict() == observation_payload
+    assert type(observation.to_dict()["schema_version"]) is int
+
+    staged_payload = _staged_model_payload()
+    policy_payload = staged_payload["evolution_policy"]
+    policy = _strategy_evolution_policy_from_dict(policy_payload)
+    assert policy.to_dict() == policy_payload
+    assert type(policy.to_dict()["schema_version"]) is int
+
+    intent = StagedPaperIntent.from_dict(staged_payload)
+    assert intent.to_dict() == staged_payload
+    assert type(intent.to_dict()["schema_version"]) is int
+    assert intent.canonical_json_bytes() == _canonical_test_bytes(
+        staged_payload
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (
@@ -810,6 +873,34 @@ def _stage_once(
         expires_at=dt.datetime(2030, 4, 1, 14, 15, tzinfo=UTC),
     )
     return ledger, intent
+
+
+@pytest.mark.parametrize("invalid_version", (True, 1.0))
+def test_invalid_observation_schema_rejects_before_staged_event(
+    tmp_path,
+    invalid_version,
+):
+    # Break caught: invalid observation schema normalizes and gains durability.
+    from tradingagents.strategy import StrategyObservationEvidence
+
+    root, registration, evidence = _durable_internal_evidence(tmp_path)
+    before = (root / "events.jsonl").read_bytes()
+
+    with pytest.raises(ValueError, match="schema_version"):
+        observation = StrategyObservationEvidence.from_dict(
+            _observation_payload(schema_version=invalid_version)
+        )
+        _stage_with_times(
+            root,
+            registration,
+            evidence,
+            clock_time=dt.datetime(2030, 4, 1, 14, 0, 5, tzinfo=UTC),
+            effective_at=dt.datetime(2030, 4, 1, 14, 0, tzinfo=UTC),
+            expires_at=dt.datetime(2030, 4, 1, 14, 15, tzinfo=UTC),
+            observations=[observation],
+        )
+
+    assert (root / "events.jsonl").read_bytes() == before
 
 
 def _stage_with_times(
@@ -1899,6 +1990,172 @@ def test_nonstaged_tail_preserves_projection_slot_and_exact_retry(tmp_path):
         )
 
 
+def _direct_store_replay_fixture(
+    tmp_path,
+    *,
+    promotion_after_staged,
+    duplicate_slot,
+):
+    from tradingagents.strategy import (
+        StagedPaperIntent,
+        StrategyPromotionEvidence,
+        StrategyStagedIntentLedger,
+    )
+    from tradingagents.strategy._immutable_evidence_store import (
+        EvidenceCandidate,
+    )
+
+    source_root, registration, evidence = _durable_internal_evidence(
+        tmp_path / "source"
+    )
+    source_ledger, original_intent = _stage_once(
+        source_root,
+        registration,
+        evidence,
+    )
+    source_snapshot = source_ledger._store.verify()
+    registration_envelope = next(
+        envelope
+        for envelope in source_snapshot
+        if envelope.object_id == registration.registration_id
+    )
+    window_envelopes = tuple(
+        envelope
+        for envelope in source_snapshot
+        if envelope.kind == "genome-window"
+    )
+    promotion_envelope = next(
+        envelope
+        for envelope in source_snapshot
+        if envelope.object_id == evidence.evidence_id
+    )
+    staged_envelope = next(
+        envelope
+        for envelope in source_snapshot
+        if envelope.object_id == original_intent.staged_intent_id
+    )
+    prefix_clock_values = (
+        dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC),
+        dt.datetime(2030, 1, 22, 16, 1, tzinfo=UTC),
+        dt.datetime(2030, 2, 22, 16, 1, tzinfo=UTC),
+        dt.datetime(2030, 3, 22, 16, 1, tzinfo=UTC),
+    )
+    if promotion_after_staged:
+        clock_values = (
+            *prefix_clock_values,
+            dt.datetime(2030, 4, 1, 14, 0, 5, tzinfo=UTC),
+            dt.datetime(2030, 4, 1, 14, 0, 6, tzinfo=UTC),
+        )
+    else:
+        clock_values = (
+            *prefix_clock_values,
+            dt.datetime(2030, 3, 22, 16, 2, tzinfo=UTC),
+            dt.datetime(2030, 4, 1, 14, 0, 5, tzinfo=UTC),
+            dt.datetime(2030, 4, 1, 14, 0, 6, tzinfo=UTC),
+        )
+    ledger = StrategyStagedIntentLedger(
+        tmp_path / "target-evidence",
+        repo_root=REPO_ROOT,
+        clock=_Clock(*clock_values),
+    )
+
+    def admit_envelope(envelope):
+        envelope_dict = json.loads(envelope.canonical_json_bytes())
+        ledger._store.admit_checked(
+            EvidenceCandidate(
+                kind=envelope.kind,
+                effective_at=envelope.effective_at,
+                payload=envelope_dict["payload"],
+            ),
+            validate=lambda _snapshot, _candidate: None,
+        )
+
+    admit_envelope(registration_envelope)
+    for envelope in window_envelopes:
+        admit_envelope(envelope)
+    if not promotion_after_staged:
+        admit_envelope(promotion_envelope)
+        admit_envelope(staged_envelope)
+    else:
+        future_promotion_payload = evidence.to_dict()
+        future_promotion_payload["recorded_at"] = (
+            "2030-04-01T14:00:06+00:00"
+        )
+        future_promotion = StrategyPromotionEvidence.from_dict(
+            future_promotion_payload
+        )
+        future_bound_payload = original_intent.to_dict()
+        future_bound_payload["promotion_evidence_sha256"] = hashlib.sha256(
+            future_promotion.canonical_json_bytes()
+        ).hexdigest()
+        _reidentify_staged_payload(future_bound_payload)
+        future_bound_intent = StagedPaperIntent.from_dict(
+            future_bound_payload
+        )
+        ledger._store.admit_checked(
+            EvidenceCandidate(
+                kind="staged-paper-intent",
+                effective_at=future_bound_intent.effective_at,
+                payload=future_bound_intent._evidence_payload(),
+            ),
+            validate=lambda _snapshot, _candidate: None,
+        )
+    if promotion_after_staged:
+        admit_envelope(promotion_envelope)
+
+    changed_intent = None
+    if duplicate_slot:
+        changed_payload = original_intent.to_dict()
+        changed_payload["expires_at"] = "2030-04-01T14:14:59+00:00"
+        _reidentify_staged_payload(changed_payload)
+        changed_intent = StagedPaperIntent.from_dict(changed_payload)
+        ledger._store.admit_checked(
+            EvidenceCandidate(
+                kind="staged-paper-intent",
+                effective_at=changed_intent.effective_at,
+                payload=changed_intent._evidence_payload(),
+            ),
+            validate=lambda _snapshot, _candidate: None,
+        )
+    return ledger, original_intent, changed_intent
+
+
+@pytest.mark.parametrize("operation", ("verify", "rebuild"))
+def test_replay_rejects_promotion_dependency_appended_after_intent(
+    tmp_path,
+    operation,
+):
+    # Break caught: replay resolves staged dependencies from future journal events.
+    (tmp_path / "source").mkdir()
+    ledger, _intent, _changed = _direct_store_replay_fixture(
+        tmp_path,
+        promotion_after_staged=True,
+        duplicate_slot=False,
+    )
+
+    with pytest.raises(ValueError, match="promotion evidence"):
+        getattr(ledger, operation)()
+
+
+@pytest.mark.parametrize("operation", ("verify", "rebuild"))
+def test_replay_rejects_two_distinct_intents_for_one_logical_slot(
+    tmp_path,
+    operation,
+):
+    # Break caught: direct-store history preserves two meanings for one slot.
+    (tmp_path / "source").mkdir()
+    ledger, original, changed = _direct_store_replay_fixture(
+        tmp_path,
+        promotion_after_staged=False,
+        duplicate_slot=True,
+    )
+    assert changed is not None
+    assert changed.staged_intent_id != original.staged_intent_id
+
+    with pytest.raises(ValueError, match="logical slot"):
+        getattr(ledger, operation)()
+
+
 @pytest.mark.parametrize(
     "session_date",
     ("2030-4-01", "2030-04-31", "2030-04-01T00:00:00"),
@@ -1915,12 +2172,38 @@ def test_session_date_rejects_noncanonical_or_impossible_syntax(session_date):
         StagedPaperIntent.from_dict(payload)
 
 
+def _imported_modules(source):
+    tree = ast.parse(source)
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.add(node.module)
+    return imported
+
+
+def test_import_guard_detects_fully_qualified_forbidden_paths():
+    # Break caught: splitting only the first component hides TradingAgents imports.
+    source = """
+import tradingagents.brokers.adapter
+from tradingagents.execution.orders import submit
+from tradingagents.policy.live_gate import require_gate
+"""
+
+    assert _imported_modules(source) == {
+        "tradingagents.brokers.adapter",
+        "tradingagents.execution.orders",
+        "tradingagents.policy.live_gate",
+    }
+
+
 def test_staged_intent_import_and_call_isolation():
     # Break caught: evidence staging acquires execution, network, or model authority.
     source_path = REPO_ROOT / "tradingagents" / "strategy" / "staged_intent.py"
     source = source_path.read_text()
     tree = ast.parse(source)
-    forbidden_roots = {
+    forbidden_prefixes = {
         "brokers",
         "execution",
         "live_control",
@@ -1931,21 +2214,31 @@ def test_staged_intent_import_and_call_isolation():
         "httpx",
         "openai",
         "anthropic",
+        "tradingagents.brokers",
+        "tradingagents.cli",
+        "tradingagents.execution",
+        "tradingagents.llm_clients",
+        "tradingagents.policy.live_control",
+        "tradingagents.policy.live_gate",
+        "tradingagents.promotion_sync",
     }
-    imported = set()
+    imported = _imported_modules(source)
     called_names = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name.split(".")[0] for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module is not None:
-            imported.add(node.module.split(".")[0])
-        elif isinstance(node, ast.Call):
+        if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name):
                 called_names.add(node.func.id)
             elif isinstance(node.func, ast.Attribute):
                 called_names.add(node.func.attr)
 
-    assert imported.isdisjoint(forbidden_roots)
+    violations = {
+        imported_module
+        for imported_module in imported
+        for forbidden_prefix in forbidden_prefixes
+        if imported_module == forbidden_prefix
+        or imported_module.startswith(f"{forbidden_prefix}.")
+    }
+    assert violations == set()
     assert called_names.isdisjoint(
         {"submit_order", "cancel_order", "replace_order"}
     )

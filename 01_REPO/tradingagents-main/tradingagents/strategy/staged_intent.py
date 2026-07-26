@@ -252,7 +252,10 @@ def _strategy_evolution_policy_from_dict(
         ),
         label="strategy evolution policy",
     )
-    if values["schema_version"] != 1:
+    if (
+        type(values["schema_version"]) is not int
+        or values["schema_version"] != 1
+    ):
         raise ValueError("strategy evolution policy schema_version does not match")
     if values["analysis_only"] is not True:
         raise ValueError("strategy evolution policy analysis_only must be true")
@@ -523,7 +526,10 @@ class StrategyObservationEvidence:
             _OBSERVATION_KEYS,
             label="strategy observation evidence",
         )
-        if values["schema_version"] != _OBSERVATION_SCHEMA_VERSION:
+        if (
+            type(values["schema_version"]) is not int
+            or values["schema_version"] != _OBSERVATION_SCHEMA_VERSION
+        ):
             raise ValueError("observation schema_version does not match")
         return cls(
             symbol=values["symbol"],  # type: ignore[arg-type]
@@ -743,7 +749,10 @@ class StagedPaperIntent:
             _STAGED_INTENT_KEYS,
             label="staged paper intent",
         )
-        if values["schema_version"] != STAGED_PAPER_INTENT_SCHEMA_VERSION:
+        if (
+            type(values["schema_version"]) is not int
+            or values["schema_version"] != STAGED_PAPER_INTENT_SCHEMA_VERSION
+        ):
             raise ValueError("staged intent schema_version does not match")
         if values["analysis_only"] is not True:
             raise ValueError("staged intent analysis_only must be true")
@@ -1244,16 +1253,19 @@ class StrategyStagedIntentLedger:
         snapshot: tuple[EvidenceEnvelope, ...],
     ) -> tuple[StagedPaperIntent, ...]:
         intents: list[StagedPaperIntent] = []
+        prefix: list[EvidenceEnvelope] = []
+        object_id_by_slot: dict[tuple[str, str, str], str] = {}
         for envelope in snapshot:
             if envelope.kind != STAGED_PAPER_INTENT_KIND:
+                prefix.append(envelope)
                 continue
             intent = _staged_intent_from_envelope(envelope)
             registration = _registration_from_snapshot(
-                snapshot,
+                prefix,
                 intent.registration_id,
             )
             promotion_evidence = _promotion_from_snapshot(
-                snapshot,
+                prefix,
                 intent.promotion_evidence_id,
             )
             manifest_before = require_active_evaluation_runtime(
@@ -1288,5 +1300,16 @@ class StrategyStagedIntentLedger:
                 candidate_state=intent.candidate_state,
                 decision=decision,
             )
+            slot = _logical_slot(intent)
+            existing_object_id = object_id_by_slot.get(slot)
+            if (
+                existing_object_id is not None
+                and existing_object_id != intent.staged_intent_id
+            ):
+                raise ValueError(
+                    "staged intent logical slot has multiple meanings"
+                )
+            object_id_by_slot[slot] = intent.staged_intent_id
             intents.append(intent)
+            prefix.append(envelope)
         return tuple(intents)
