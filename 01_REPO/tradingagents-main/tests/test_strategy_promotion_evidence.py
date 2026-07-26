@@ -40,7 +40,11 @@ def _run_git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _calculation_repo(tmp_path: Path) -> tuple[Path, str]:
+def _calculation_repo(_tmp_path: Path) -> tuple[Path, str]:
+    return REPO_ROOT, _run_git(REPO_ROOT, "rev-parse", "HEAD")
+
+
+def _separate_calculation_repo(tmp_path: Path) -> tuple[Path, str]:
     from tradingagents.strategy.promotion_evidence import EVALUATION_SOURCE_PATHS
 
     repo = tmp_path / "calculation-repo"
@@ -51,10 +55,41 @@ def _calculation_repo(tmp_path: Path) -> tuple[Path, str]:
     for path in EVALUATION_SOURCE_PATHS:
         target = repo / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(f"frozen calculation bytes: {path}\n".encode())
+        target.write_bytes((REPO_ROOT / path).read_bytes())
     _run_git(repo, "add", "--", *EVALUATION_SOURCE_PATHS)
     _run_git(repo, "commit", "-qm", "frozen calculation sources")
     return repo, _run_git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture(autouse=True)
+def _treat_loaded_repo_as_clean_for_read_only_unit_preflight(monkeypatch):
+    import tradingagents.strategy.promotion_evidence as module
+
+    original = module._git_text
+
+    def controlled_git_text(repo: Path, *args: str) -> str:
+        if (
+            repo.resolve() == REPO_ROOT.resolve()
+            and args == ("status", "--porcelain")
+        ):
+            return ""
+        return original(repo, *args)
+
+    monkeypatch.setattr(module, "_git_text", controlled_git_text)
+
+
+def _drift_source(monkeypatch, relative: str) -> None:
+    import tradingagents.strategy.promotion_evidence as module
+
+    original = module._read_regular_source
+
+    def drifted(repo_root: Path, candidate: str) -> bytes:
+        active = original(repo_root, candidate)
+        if candidate == relative:
+            return active + b"drift\n"
+        return active
+
+    monkeypatch.setattr(module, "_read_regular_source", drifted)
 
 
 def _policies():
@@ -351,10 +386,11 @@ def test_registration_binds_clean_commit_git_objects_manifest_and_identity(
     assert registration.genome_canonical_sha256 == hashlib.sha256(registration.genome.canonical_json_bytes()).hexdigest()
     assert registration.evolution_policy_sha256 == hashlib.sha256(registration.evolution_policy.canonical_json_bytes()).hexdigest()
     assert registration.evaluation_policy_sha256 == hashlib.sha256(registration.evaluation_policy.canonical_json_bytes()).hexdigest()
+    git_prefix = _run_git(repo, "rev-parse", "--show-prefix")
     for source in registration.evaluation_source_manifest.files:
         assert source.sha256 == hashlib.sha256((repo / source.path).read_bytes()).hexdigest()
         git_bytes = subprocess.run(
-            ("git", "show", f"{commit}:{source.path}"),
+            ("git", "show", f"{commit}:{git_prefix}{source.path}"),
             cwd=repo,
             check=True,
             capture_output=True,
@@ -439,9 +475,12 @@ def test_registration_rejects_malformed_code_commit_without_event(
     assert not (tmp_path / "evidence").exists()
 
 
-def test_registration_rejects_dirty_head_and_git_object_byte_drift(tmp_path):
+def test_registration_rejects_unbound_dirty_stale_and_git_object_provenance(
+    tmp_path,
+    monkeypatch,
+):
+    import tradingagents.strategy.promotion_evidence as module
     from tradingagents.strategy.promotion_evidence import (
-        EVALUATION_SOURCE_PATHS,
         StrategyPromotionEvidenceLedger,
     )
 
@@ -452,8 +491,14 @@ def test_registration_rejects_dirty_head_and_git_object_byte_drift(tmp_path):
         repo_root=repo,
         clock=_Clock(dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC)),
     )
-    dirty_path = repo / EVALUATION_SOURCE_PATHS[0]
-    dirty_path.write_bytes(b"dirty active bytes\n")
+    controlled_git_text = module._git_text
+
+    def dirty_git_text(repo_root: Path, *args: str) -> str:
+        if args == ("status", "--porcelain"):
+            return " M tradingagents/strategy/compiler.py"
+        return controlled_git_text(repo_root, *args)
+
+    monkeypatch.setattr(module, "_git_text", dirty_git_text)
 
     with pytest.raises(ValueError, match="clean"):
         ledger.register(
@@ -466,10 +511,16 @@ def test_registration_rejects_dirty_head_and_git_object_byte_drift(tmp_path):
         )
     assert not (tmp_path / "evidence").exists()
 
-    _run_git(repo, "checkout", "--", EVALUATION_SOURCE_PATHS[0])
-    _run_git(repo, "update-index", "--assume-unchanged", EVALUATION_SOURCE_PATHS[0])
-    dirty_path.write_bytes(b"hidden active byte drift\n")
-    assert _run_git(repo, "status", "--porcelain") == ""
+    monkeypatch.setattr(module, "_git_text", controlled_git_text)
+    original_git_bytes = module._git_bytes
+
+    def drifted_git_bytes(repo_root: Path, *args: str) -> bytes:
+        active = original_git_bytes(repo_root, *args)
+        if args[-1].endswith("tradingagents/strategy/compiler.py"):
+            return active + b"drift\n"
+        return active
+
+    monkeypatch.setattr(module, "_git_bytes", drifted_git_bytes)
 
     with pytest.raises(ValueError, match="Git object"):
         ledger.register(
@@ -481,6 +532,47 @@ def test_registration_rejects_dirty_head_and_git_object_byte_drift(tmp_path):
             effective_at=dt.datetime(2029, 12, 31, 15, 0, tzinfo=UTC),
         )
     assert not (tmp_path / "evidence").exists()
+
+    monkeypatch.setattr(module, "_git_bytes", original_git_bytes)
+    separate_repo, separate_commit = _separate_calculation_repo(tmp_path)
+    separate = StrategyPromotionEvidenceLedger(
+        tmp_path / "separate-evidence",
+        repo_root=separate_repo,
+        clock=_Clock(dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC)),
+    )
+    with pytest.raises(ValueError, match="loaded calculation source"):
+        separate.register(
+            genome=_genome(),
+            evolution_policy=evolution_policy,
+            evaluation_policy=evaluation_policy,
+            windows=_windows(),
+            evaluation_code_commit=separate_commit,
+            effective_at=dt.datetime(2029, 12, 31, 15, 0, tzinfo=UTC),
+        )
+    assert not (tmp_path / "separate-evidence").exists()
+
+    captured = module._LOADED_CALCULATION_SOURCES
+    stale = dataclasses.replace(captured[0], sha256="0" * 64)
+    monkeypatch.setattr(
+        module,
+        "_LOADED_CALCULATION_SOURCES",
+        (stale, *captured[1:]),
+    )
+    stale_ledger = StrategyPromotionEvidenceLedger(
+        tmp_path / "stale-evidence",
+        repo_root=repo,
+        clock=_Clock(dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC)),
+    )
+    with pytest.raises(ValueError, match="loaded calculation source"):
+        stale_ledger.register(
+            genome=_genome(),
+            evolution_policy=evolution_policy,
+            evaluation_policy=evaluation_policy,
+            windows=_windows(),
+            evaluation_code_commit=commit,
+            effective_at=dt.datetime(2029, 12, 31, 15, 0, tzinfo=UTC),
+        )
+    assert not (tmp_path / "stale-evidence").exists()
 
 
 def test_registration_rejects_late_first_seen_and_invalid_schedule(tmp_path):
@@ -747,10 +839,12 @@ def test_window_admission_is_next_ordinal_only_and_rejects_claimed_result(
 
 def test_window_allows_unrelated_descendant_head_but_rejects_source_drift(
     tmp_path,
+    monkeypatch,
 ):
+    import tradingagents.strategy.promotion_evidence as module
     from tradingagents.strategy.promotion_evidence import EVALUATION_SOURCE_PATHS
 
-    ledger, registration, repo, _commit = _register(
+    ledger, registration, _repo, _commit = _register(
         tmp_path,
         clock=_Clock(
             dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC),
@@ -758,11 +852,14 @@ def test_window_allows_unrelated_descendant_head_but_rejects_source_drift(
             dt.datetime(2030, 2, 22, 16, 1, tzinfo=UTC),
         ),
     )
-    unrelated = repo / "README.md"
-    unrelated.write_text("unrelated descendant\n", encoding="utf-8")
-    _run_git(repo, "add", "README.md")
-    _run_git(repo, "commit", "-qm", "unrelated descendant")
-    assert _run_git(repo, "rev-parse", "HEAD") != registration.evaluation_code_commit
+    original_git_text = module._git_text
+
+    def descendant_git_text(repo_root: Path, *args: str) -> str:
+        if args == ("rev-parse", "HEAD"):
+            return "f" * 40
+        return original_git_text(repo_root, *args)
+
+    monkeypatch.setattr(module, "_git_text", descendant_git_text)
 
     frames1, result1 = _evaluate_registered_window(registration, 1)
     admitted = ledger.admit_window(
@@ -773,9 +870,16 @@ def test_window_allows_unrelated_descendant_head_but_rejects_source_drift(
     )
     assert admitted.ordinal == 1
 
-    drifted = repo / EVALUATION_SOURCE_PATHS[1]
-    drifted.write_bytes(drifted.read_bytes() + b"drift\n")
     frames2, result2 = _evaluate_registered_window(registration, 2)
+    _drift_source(monkeypatch, EVALUATION_SOURCE_PATHS[1])
+    evaluator_called = False
+
+    def forbidden_evaluator(*_args, **_kwargs):
+        nonlocal evaluator_called
+        evaluator_called = True
+        raise AssertionError("evaluator ran before loaded-source binding")
+
+    monkeypatch.setattr(module, "evaluate_genome_window", forbidden_evaluator)
     with pytest.raises(ValueError, match="manifest"):
         ledger.admit_window(
             registration.registration_id,
@@ -783,6 +887,7 @@ def test_window_allows_unrelated_descendant_head_but_rejects_source_drift(
             frames2,
             result2,
         )
+    assert evaluator_called is False
     assert (tmp_path / "evidence" / "events.jsonl").read_bytes().count(b"\n") == 2
 
 
@@ -1071,12 +1176,12 @@ def test_each_reachable_gate_can_fail_into_durable_paper_learning_evidence(
 def test_every_calculation_source_drift_makes_registration_inert_on_verify(
     tmp_path,
     source_index,
+    monkeypatch,
 ):
     from tradingagents.strategy.promotion_evidence import EVALUATION_SOURCE_PATHS
 
-    ledger, _registration, repo, _commit = _register(tmp_path)
-    source = repo / EVALUATION_SOURCE_PATHS[source_index]
-    source.write_bytes(source.read_bytes() + b"drift\n")
+    ledger, _registration, _repo, _commit = _register(tmp_path)
+    _drift_source(monkeypatch, EVALUATION_SOURCE_PATHS[source_index])
 
     with pytest.raises(ValueError, match="manifest"):
         ledger.verify()
@@ -1084,10 +1189,11 @@ def test_every_calculation_source_drift_makes_registration_inert_on_verify(
 
 def test_manifest_drift_blocks_assembly_verify_and_rebuild_without_event(
     tmp_path,
+    monkeypatch,
 ):
     from tradingagents.strategy.promotion_evidence import EVALUATION_SOURCE_PATHS
 
-    ledger, registration, repo, _commit = _register(
+    ledger, registration, _repo, _commit = _register(
         tmp_path,
         clock=_Clock(
             dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC),
@@ -1098,8 +1204,7 @@ def test_manifest_drift_blocks_assembly_verify_and_rebuild_without_event(
     )
     _admit_all(ledger, registration)
     before = (tmp_path / "evidence" / "events.jsonl").read_bytes()
-    source = repo / EVALUATION_SOURCE_PATHS[3]
-    source.write_bytes(source.read_bytes() + b"drift\n")
+    _drift_source(monkeypatch, EVALUATION_SOURCE_PATHS[3])
 
     with pytest.raises(ValueError, match="manifest"):
         ledger.assemble(registration.registration_id)

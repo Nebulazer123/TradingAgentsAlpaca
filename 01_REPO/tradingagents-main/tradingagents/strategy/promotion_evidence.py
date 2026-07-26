@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import (
@@ -62,6 +63,20 @@ EVALUATION_SOURCE_PATHS = (
     "config/strategy_evolution.json",
     "config/strategy_evaluation.json",
 )
+_CALCULATION_MODULE_PATHS = (
+    (
+        "tradingagents.strategy.compiler",
+        "tradingagents/strategy/compiler.py",
+    ),
+    (
+        "tradingagents.strategy.evaluator",
+        "tradingagents/strategy/evaluator.py",
+    ),
+    (
+        "tradingagents.strategy.genome",
+        "tradingagents/strategy/genome.py",
+    ),
+)
 
 _LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LOWER_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -70,6 +85,14 @@ _UTC = dt.timezone.utc
 
 class StrategyPromotionEvidenceError(ValueError):
     """Base failure for immutable strategy promotion evidence."""
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedCalculationSource:
+    module_name: str
+    relative_path: str
+    canonical_path: Path
+    sha256: str
 
 
 def _canonical_json_bytes(payload: object) -> bytes:
@@ -844,8 +867,10 @@ def _canonical_repo_root(repo_root: str | Path) -> Path:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    if Path(top).resolve() != lexical.resolve():
-        raise ValueError("repo_root must be the Git worktree root")
+    try:
+        lexical.resolve().relative_to(Path(top).resolve())
+    except ValueError as exc:
+        raise ValueError("repo_root must be inside its Git worktree") from exc
     return lexical
 
 
@@ -908,6 +933,111 @@ def _read_regular_source(repo_root: Path, relative: str) -> bytes:
         os.close(descriptor)
 
 
+def _capture_loaded_calculation_sources() -> tuple[_LoadedCalculationSource, ...]:
+    captured: list[_LoadedCalculationSource] = []
+    for module_name, relative in _CALCULATION_MODULE_PATHS:
+        module = sys.modules.get(module_name)
+        module_file = getattr(module, "__file__", None)
+        if module is None or type(module_file) is not str:
+            raise RuntimeError(
+                f"loaded calculation module is unavailable: {module_name}"
+            )
+        lexical = Path(os.path.abspath(module_file))
+        _reject_symlink_components(
+            lexical,
+            label=f"loaded calculation source {module_name}",
+        )
+        try:
+            canonical = lexical.resolve(strict=True)
+            state = canonical.stat()
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"loaded calculation source is missing: {module_name}"
+            ) from exc
+        if not stat.S_ISREG(state.st_mode) or canonical.suffix != ".py":
+            raise RuntimeError(
+                f"loaded calculation source must be a Python source file: {module_name}"
+            )
+        try:
+            source_bytes = canonical.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"loaded calculation source cannot be read: {module_name}"
+            ) from exc
+        captured.append(
+            _LoadedCalculationSource(
+                module_name=module_name,
+                relative_path=relative,
+                canonical_path=canonical,
+                sha256=_sha256(source_bytes),
+            )
+        )
+    return tuple(captured)
+
+
+_LOADED_CALCULATION_SOURCES = _capture_loaded_calculation_sources()
+
+
+def _require_loaded_source_binding(
+    repo_root: Path,
+    active_manifest: EvaluationSourceManifest,
+    *,
+    registered_manifest: EvaluationSourceManifest | None = None,
+) -> None:
+    active_by_path = {
+        source.path: source.sha256 for source in active_manifest.files
+    }
+    registered_by_path = (
+        {
+            source.path: source.sha256
+            for source in registered_manifest.files
+        }
+        if registered_manifest is not None
+        else None
+    )
+    for captured in _LOADED_CALCULATION_SOURCES:
+        module = sys.modules.get(captured.module_name)
+        module_file = getattr(module, "__file__", None)
+        if module is None or type(module_file) is not str:
+            raise ValueError(
+                f"loaded calculation module is unavailable: {captured.module_name}"
+            )
+        try:
+            current_loaded_path = Path(
+                os.path.abspath(module_file)
+            ).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"loaded calculation source is missing: {captured.module_name}"
+            ) from exc
+        if current_loaded_path != captured.canonical_path:
+            raise ValueError(
+                "loaded calculation module path changed after provenance capture"
+            )
+        try:
+            expected = (repo_root / captured.relative_path).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"loaded calculation source is missing: {captured.relative_path}"
+            ) from exc
+        if expected != captured.canonical_path:
+            raise ValueError(
+                "loaded calculation source path does not match repo_root"
+            )
+        if active_by_path.get(captured.relative_path) != captured.sha256:
+            raise ValueError(
+                "loaded calculation source fingerprint does not match active manifest bytes"
+            )
+        if (
+            registered_by_path is not None
+            and registered_by_path.get(captured.relative_path)
+            != captured.sha256
+        ):
+            raise ValueError(
+                "loaded calculation source fingerprint does not match registration"
+            )
+
+
 def _active_source_snapshot(
     repo_root: Path,
 ) -> tuple[EvaluationSourceManifest, tuple[bytes, ...]]:
@@ -927,6 +1057,7 @@ def _active_source_snapshot(
 
 def _active_source_manifest(repo_root: Path) -> EvaluationSourceManifest:
     manifest, _source_bytes = _active_source_snapshot(repo_root)
+    _require_loaded_source_binding(repo_root, manifest)
     return manifest
 
 
@@ -949,11 +1080,17 @@ def _registration_preflight(
     if _git_text(repo_root, "status", "--porcelain") != "":
         raise ValueError("evaluation checkout must be clean")
     manifest, active_files = _active_source_snapshot(repo_root)
+    _require_loaded_source_binding(repo_root, manifest)
+    git_prefix = _git_text(repo_root, "rev-parse", "--show-prefix")
+    if git_prefix.startswith("/") or any(
+        part == ".." for part in Path(git_prefix).parts
+    ):
+        raise ValueError("Git worktree prefix is invalid")
     for source, active in zip(manifest.files, active_files, strict=True):
         committed = _git_bytes(
             repo_root,
             "show",
-            f"{evaluation_code_commit}:{source.path}",
+            f"{evaluation_code_commit}:{git_prefix}{source.path}",
         )
         if active != committed:
             raise ValueError("active bytes do not match Git object bytes")
@@ -1181,6 +1318,11 @@ def _require_active_manifest(
     registration: StrategyEvaluationRegistration,
 ) -> EvaluationSourceManifest:
     active = _active_source_manifest(repo_root)
+    _require_loaded_source_binding(
+        repo_root,
+        active,
+        registered_manifest=registration.evaluation_source_manifest,
+    )
     if active.canonical_json_bytes() != registration.evaluation_source_manifest.canonical_json_bytes() or _sha256(active.canonical_json_bytes()) != registration.evaluation_runtime_sha256:
         raise ValueError("active calculation manifest does not match registration")
     return active
@@ -1778,6 +1920,7 @@ class StrategyPromotionEvidenceLedger:
         if parsed_result.canonical_json_bytes() != result.canonical_json_bytes():
             raise ValueError("result material does not round trip exactly")
 
+        _active_source_manifest(self._repo_root)
         preflight_snapshot = self._store.rebuild()
         registration = _registered_by_id(
             preflight_snapshot,
@@ -1895,6 +2038,7 @@ class StrategyPromotionEvidenceLedger:
             kind="evaluation-registration",
             label="registration_id",
         )
+        _active_source_manifest(self._repo_root)
         preflight_snapshot = self._store.rebuild()
         registration = _registered_by_id(
             preflight_snapshot,
@@ -1969,10 +2113,12 @@ class StrategyPromotionEvidenceLedger:
         return StrategyPromotionEvidence.from_envelope(admission.envelope)
 
     def verify(self) -> tuple[StrategyPromotionEvidence, ...]:
+        _active_source_manifest(self._repo_root)
         snapshot = self._store.verify()
         return self._verify_snapshot(snapshot)
 
     def rebuild(self) -> tuple[StrategyPromotionEvidence, ...]:
+        _active_source_manifest(self._repo_root)
         snapshot = self._store.rebuild()
         return self._verify_snapshot(snapshot)
 
