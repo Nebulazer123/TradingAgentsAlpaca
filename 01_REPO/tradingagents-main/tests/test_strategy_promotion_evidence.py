@@ -274,6 +274,95 @@ def test_promotion_evidence_module_exists():
     assert module.__name__ == "tradingagents.strategy.promotion_evidence"
 
 
+def test_promotion_decimal_parser_accepts_frozen_task_6b_boundaries():
+    import tradingagents.strategy.promotion_evidence as module
+
+    positive_boundary = "1" + ("0" * 995)
+    fine_scale_boundary = "0." + ("0" * 1047) + "1"
+    fifty_significant_digits = "0." + ("1234567890" * 4) + "1234567891"
+
+    assert module._require_decimal_text(
+        positive_boundary,
+        label="boundary",
+    ) == Decimal("1E+995")
+    assert module._require_decimal_text(
+        fine_scale_boundary,
+        label="boundary",
+    ) == Decimal("1E-1048")
+    assert module._require_decimal_text(
+        fifty_significant_digits,
+        label="boundary",
+    ) == Decimal(fifty_significant_digits)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "0." + ("1234567890" * 4) + "1234567891" + "2",
+        "0." + ("0" * 1048) + "1",
+    ),
+)
+def test_promotion_decimal_parser_rejects_tuple_bounds_before_format(
+    value,
+    monkeypatch,
+):
+    import tradingagents.strategy.promotion_evidence as module
+
+    def forbidden_format(*_args, **_kwargs):
+        raise AssertionError("out-of-envelope Decimal reached fixed-point format")
+
+    monkeypatch.setattr(module, "format", forbidden_format, raising=False)
+
+    with pytest.raises(ValueError, match="canonical decimal text"):
+        module._require_decimal_text(value, label="bounded")
+
+
+@pytest.mark.parametrize("value", ("1E+1000000000", "1E-1000000000"))
+def test_promotion_decimal_parser_rejects_huge_exponents_quickly_without_context_drift(
+    value,
+    monkeypatch,
+):
+    from decimal import Inexact, localcontext
+
+    import tradingagents.strategy.promotion_evidence as module
+
+    def forbidden_format(*_args, **_kwargs):
+        raise AssertionError("huge-exponent Decimal reached fixed-point format")
+
+    monkeypatch.setattr(module, "format", forbidden_format, raising=False)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(module._require_decimal_text, value, label="bounded")
+        with pytest.raises(ValueError, match="canonical decimal text"):
+            future.result(timeout=0.5)
+
+    with localcontext() as context:
+        context.prec = 17
+        context.Emin = -77
+        context.Emax = 77
+        context.flags[Inexact] = True
+        before = (
+            context.prec,
+            context.Emin,
+            context.Emax,
+            context.rounding,
+            dict(context.traps),
+            dict(context.flags),
+        )
+        with pytest.raises(ValueError, match="canonical decimal text"):
+            module._require_decimal_text(value, label="bounded")
+        after = (
+            context.prec,
+            context.Emin,
+            context.Emax,
+            context.rounding,
+            dict(context.traps),
+            dict(context.flags),
+        )
+
+    assert after == before
+
+
 def test_evaluator_contract_preserves_task_6b_signature_and_schema():
     from tradingagents.strategy.evaluator import (
         GenomeWindowResult,
@@ -573,6 +662,85 @@ def test_registration_rejects_unbound_dirty_stale_and_git_object_provenance(
             effective_at=dt.datetime(2029, 12, 31, 15, 0, tzinfo=UTC),
         )
     assert not (tmp_path / "stale-evidence").exists()
+
+
+@pytest.mark.parametrize(
+    "timeout_path",
+    ("canonical_repo_root", "git_text", "git_bytes"),
+)
+def test_git_preflight_timeout_fails_closed_before_evidence_or_evaluator(
+    tmp_path,
+    monkeypatch,
+    timeout_path,
+):
+    import tradingagents.strategy.promotion_evidence as module
+
+    evidence_root = tmp_path / "evidence"
+    original_run = module.subprocess.run
+    observed_calls = []
+    evaluator_calls = 0
+    commit = (
+        _run_git(REPO_ROOT, "rev-parse", "HEAD")
+        if timeout_path != "canonical_repo_root"
+        else None
+    )
+
+    def controlled_run(command, **kwargs):
+        observed_calls.append((command, kwargs))
+        should_timeout = (
+            timeout_path == "canonical_repo_root"
+            and command == ("git", "rev-parse", "--is-inside-work-tree")
+        ) or (
+            timeout_path == "git_text"
+            and command == ("git", "rev-parse", "HEAD")
+        ) or (
+            timeout_path == "git_bytes"
+            and command[:2] == ("git", "show")
+        )
+        if should_timeout:
+            raise subprocess.TimeoutExpired(command, kwargs.get("timeout", -1))
+        return original_run(command, **kwargs)
+
+    def forbidden_evaluator(*_args, **_kwargs):
+        nonlocal evaluator_calls
+        evaluator_calls += 1
+        raise AssertionError("evaluator ran after Git preflight timeout")
+
+    monkeypatch.setattr(module.subprocess, "run", controlled_run)
+    monkeypatch.setattr(module, "evaluate_genome_window", forbidden_evaluator)
+
+    if timeout_path == "canonical_repo_root":
+        with pytest.raises(module.StrategyPromotionEvidenceError, match="timed out"):
+            module.StrategyPromotionEvidenceLedger(
+                evidence_root,
+                repo_root=REPO_ROOT,
+            )
+    else:
+        ledger = module.StrategyPromotionEvidenceLedger(
+            evidence_root,
+            repo_root=REPO_ROOT,
+            clock=_Clock(dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC)),
+        )
+        evolution_policy, evaluation_policy = _policies()
+        with pytest.raises(module.StrategyPromotionEvidenceError, match="timed out"):
+            ledger.register(
+                genome=_genome(),
+                evolution_policy=evolution_policy,
+                evaluation_policy=evaluation_policy,
+                windows=_windows(),
+                evaluation_code_commit=commit,
+                effective_at=dt.datetime(2029, 12, 31, 15, 0, tzinfo=UTC),
+            )
+
+    assert observed_calls
+    for command, kwargs in observed_calls:
+        assert type(command) is tuple
+        assert command[0] == "git"
+        assert Path(kwargs["cwd"]).resolve() == REPO_ROOT.resolve()
+        assert kwargs["timeout"] == module._LOCAL_GIT_TIMEOUT_SECONDS
+        assert kwargs.get("shell", False) is False
+    assert evaluator_calls == 0
+    assert not evidence_root.exists()
 
 
 def test_registration_rejects_late_first_seen_and_invalid_schedule(tmp_path):

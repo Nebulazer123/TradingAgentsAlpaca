@@ -81,6 +81,14 @@ _CALCULATION_MODULE_PATHS = (
 _LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LOWER_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _UTC = dt.timezone.utc
+# All provenance Git reads are local and must fail closed instead of freezing.
+_LOCAL_GIT_TIMEOUT_SECONDS = 10
+_PROMOTION_DECIMAL_MAX_SIGNIFICANT_DIGITS = EVALUATOR_DECIMAL_PRECISION
+_PROMOTION_DECIMAL_MAX_ADJUSTED_EXPONENT = 995
+# Task 6B's Emin -999 and precision 50 allow exact subnormals through -1048.
+_PROMOTION_DECIMAL_MIN_EXPONENT = -1048
+# Sign, "0.", and the finest accepted fixed-point value fit within this bound.
+_PROMOTION_DECIMAL_MAX_TEXT_LENGTH = 1051
 
 
 class StrategyPromotionEvidenceError(ValueError):
@@ -180,11 +188,35 @@ def _decimal_text(value: Decimal) -> str:
 def _require_decimal_text(value: object, *, label: str) -> Decimal:
     if type(value) is not str:
         raise TypeError(f"{label} must be canonical decimal text")
+    if len(value) > _PROMOTION_DECIMAL_MAX_TEXT_LENGTH:
+        raise ValueError(f"{label} must be canonical decimal text")
     try:
         parsed = Decimal(value)
     except InvalidOperation as exc:
         raise ValueError(f"{label} must be canonical decimal text") from exc
-    if _decimal_text(parsed) != value:
+    if not parsed.is_finite():
+        raise ValueError(f"{label} must be canonical decimal text")
+    decimal_tuple = parsed.as_tuple()
+    exponent = decimal_tuple.exponent
+    if type(exponent) is not int:
+        raise ValueError(f"{label} must be canonical decimal text")
+    significant_digits = len(decimal_tuple.digits)
+    while (
+        significant_digits > 1
+        and decimal_tuple.digits[significant_digits - 1] == 0
+    ):
+        significant_digits -= 1
+    if (
+        significant_digits > _PROMOTION_DECIMAL_MAX_SIGNIFICANT_DIGITS
+        or parsed.adjusted() > _PROMOTION_DECIMAL_MAX_ADJUSTED_EXPONENT
+        or exponent < _PROMOTION_DECIMAL_MIN_EXPONENT
+    ):
+        raise ValueError(f"{label} must be canonical decimal text")
+    canonical = _decimal_text(parsed)
+    if (
+        len(canonical) > _PROMOTION_DECIMAL_MAX_TEXT_LENGTH
+        or canonical != value
+    ):
         raise ValueError(f"{label} must be canonical decimal text")
     return parsed
 
@@ -849,24 +881,29 @@ def _canonical_repo_root(repo_root: str | Path) -> Path:
         raise ValueError("repo_root must exist") from exc
     if not stat.S_ISDIR(state.st_mode):
         raise ValueError("repo_root must be a directory")
-    if (
-        subprocess.run(
+    try:
+        inside_worktree = subprocess.run(
             ("git", "rev-parse", "--is-inside-work-tree"),
             cwd=lexical,
             check=False,
             capture_output=True,
             text=True,
+            timeout=_LOCAL_GIT_TIMEOUT_SECONDS,
         ).stdout.strip()
-        != "true"
-    ):
-        raise ValueError("repo_root must be a Git worktree")
-    top = subprocess.run(
-        ("git", "rev-parse", "--show-toplevel"),
-        cwd=lexical,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+        if inside_worktree != "true":
+            raise ValueError("repo_root must be a Git worktree")
+        top = subprocess.run(
+            ("git", "rev-parse", "--show-toplevel"),
+            cwd=lexical,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=_LOCAL_GIT_TIMEOUT_SECONDS,
+        ).stdout.strip()
+    except subprocess.TimeoutExpired as exc:
+        raise StrategyPromotionEvidenceError(
+            "Git worktree preflight timed out"
+        ) from exc
     try:
         lexical.resolve().relative_to(Path(top).resolve())
     except ValueError as exc:
@@ -882,7 +919,10 @@ def _git_text(repo_root: Path, *args: str) -> str:
             check=True,
             capture_output=True,
             text=True,
+            timeout=_LOCAL_GIT_TIMEOUT_SECONDS,
         ).stdout.strip()
+    except subprocess.TimeoutExpired as exc:
+        raise StrategyPromotionEvidenceError("Git preflight timed out") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("Git preflight failed") from exc
 
@@ -894,7 +934,12 @@ def _git_bytes(repo_root: Path, *args: str) -> bytes:
             cwd=repo_root,
             check=True,
             capture_output=True,
+            timeout=_LOCAL_GIT_TIMEOUT_SECONDS,
         ).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise StrategyPromotionEvidenceError(
+            "Git object preflight timed out"
+        ) from exc
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ValueError("Git object preflight failed") from exc
 
