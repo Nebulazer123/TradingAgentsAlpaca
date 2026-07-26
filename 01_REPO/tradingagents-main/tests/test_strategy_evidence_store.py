@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -741,15 +742,27 @@ candidate = EvidenceCandidate(
 )
 real_replace = evidence_store_module.os.replace
 
-def crash_before_pointer_replace(source, destination):
-    source_path = Path(source)
+def crash_before_pointer_replace(
+    source,
+    destination,
+    *,
+    src_dir_fd=None,
+    dst_dir_fd=None,
+):
+    source_name = os.fspath(source)
     if (
-        source_path.parent == root / "latest"
-        and source_path.name.startswith(".evaluation-registration.")
-        and source_path.name.endswith(".tmp")
+        source_name.startswith(".evaluation-registration.")
+        and source_name.endswith(".tmp")
+        and src_dir_fd is not None
+        and dst_dir_fd == src_dir_fd
     ):
         os._exit(73)
-    real_replace(source, destination)
+    real_replace(
+        source,
+        destination,
+        src_dir_fd=src_dir_fd,
+        dst_dir_fd=dst_dir_fd,
+    )
 
 evidence_store_module.os.replace = crash_before_pointer_replace
 store = ImmutableStrategyEvidenceStore(
@@ -881,9 +894,20 @@ def test_recovery_redurabilizes_visible_pointer_after_final_fsync_error(
     real_replace = evidence_store_module.os.replace
     real_fsync = evidence_store_module.os.fsync
 
-    def recording_replace(source: Path, destination: Path) -> None:
-        real_replace(source, destination)
-        if Path(destination) == pointer_path:
+    def recording_replace(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+        if destination == pointer_path.name and dst_dir_fd is not None:
             pointer_inode[:] = [pointer_path.stat().st_ino]
 
     def failing_final_pointer_fsync(descriptor: int) -> None:
@@ -1288,7 +1312,7 @@ def test_managed_regular_files_reject_unsafe_modes(tmp_path, target):
         store.verify()
 
 
-@pytest.mark.parametrize("target", ["events", "object", "pointer"])
+@pytest.mark.parametrize("target", ["object", "pointer"])
 def test_oversized_managed_files_fail_before_their_contents_are_read(
     tmp_path,
     monkeypatch,
@@ -1320,12 +1344,522 @@ def test_oversized_managed_files_fail_before_their_contents_are_read(
     assert selected_reads == 0
 
 
+def test_replay_rejects_one_oversized_journal_line(tmp_path):
+    store, root, _, _ = _admit(tmp_path)
+    (root / "events.jsonl").write_bytes(b"x" * 1_048_577 + b"\n")
+
+    with pytest.raises(EvidenceCorruptionError, match="line.*too large"):
+        store.verify()
+
+
+def test_journal_can_grow_beyond_one_mebibyte_and_remain_replayable(tmp_path):
+    root = tmp_path / "evidence"
+    objects = root / "objects"
+    kind = "evaluation-registration"
+    kind_dir = objects / kind
+    latest = root / "latest"
+    root.mkdir(mode=0o700)
+    objects.mkdir(mode=0o700)
+    kind_dir.mkdir(mode=0o700)
+    latest.mkdir(mode=0o700)
+    lock = root / ".strategy-evidence.lock"
+    lock.touch(mode=0o600)
+
+    lines: list[bytes] = []
+    journal_size = 0
+    previous = ZERO_HASH
+    last_event: EvidenceEvent | None = None
+    sequence = 0
+    while journal_size <= 1_048_576:
+        sequence += 1
+        candidate = _candidate(payload={"ordinal": sequence})
+        retry_bytes = evidence_store_module._retry_material_bytes(
+            kind=kind,
+            effective_at=candidate.effective_at,
+            payload=candidate.payload,
+        )
+        retry_digest = hashlib.sha256(retry_bytes).hexdigest()
+        object_id = f"{kind}-{retry_digest}"
+        envelope = EvidenceEnvelope(
+            kind=kind,
+            object_id=object_id,
+            effective_at=candidate.effective_at,
+            recorded_at="2030-01-02T15:04:05+00:00",
+            retry_material_sha256=retry_digest,
+            payload_sha256=hashlib.sha256(
+                evidence_store_module._payload_bytes(candidate.payload)
+            ).hexdigest(),
+            payload=candidate.payload,
+        )
+        object_bytes = envelope.canonical_json_bytes()
+        object_path = kind_dir / f"{object_id}.json"
+        object_path.write_bytes(object_bytes)
+        object_path.chmod(0o600)
+        event = EvidenceEvent(
+            sequence=sequence,
+            kind=kind,
+            object_id=object_id,
+            object_sha256=hashlib.sha256(object_bytes).hexdigest(),
+            retry_material_sha256=retry_digest,
+            effective_at=envelope.effective_at,
+            recorded_at=envelope.recorded_at,
+            previous_event_sha256=previous,
+        )
+        line = event.canonical_json_bytes()
+        lines.append(line)
+        journal_size += len(line) + 1
+        previous = hashlib.sha256(line).hexdigest()
+        last_event = event
+
+    assert last_event is not None
+    journal = root / "events.jsonl"
+    journal.write_bytes(b"".join(line + b"\n" for line in lines))
+    journal.chmod(0o600)
+    pointer = EvidencePointer(
+        kind=kind,
+        sequence=last_event.sequence,
+        object_id=last_event.object_id,
+        object_sha256=last_event.object_sha256,
+        event_sha256=hashlib.sha256(
+            last_event.canonical_json_bytes()
+        ).hexdigest(),
+        recorded_at=last_event.recorded_at,
+    )
+    pointer_path = latest / f"{kind}.json"
+    pointer_path.write_bytes(pointer.canonical_json_bytes())
+    pointer_path.chmod(0o600)
+
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER))
+    assert len(store.verify()) == len(lines)
+    added = store.admit_checked(
+        _candidate(
+            kind="baseline-genome",
+            payload={"genome_id": "large-journal-boundary"},
+        ),
+        validate=lambda _prior, _new: None,
+    )
+    assert added.event.sequence == len(lines) + 1
+    assert (root / "events.jsonl").stat().st_size > 1_048_576
+    assert len(store.verify()) == len(lines) + 1
+
+
+def test_predictable_journal_line_rejection_creates_no_orphan(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    monkeypatch.setattr(
+        evidence_store_module,
+        "_MAX_JOURNAL_LINE_BYTES",
+        1,
+        raising=False,
+    )
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+
+    with pytest.raises(EvidenceCorruptionError, match="line.*too large"):
+        store.admit_checked(
+            _candidate(),
+            validate=lambda _prior, _new: None,
+        )
+
+    assert not tuple((root / "objects").rglob("*.json"))
+    assert not (root / "events.jsonl").exists()
+
+
 def test_managed_path_escape_is_rejected(tmp_path):
     store, _, _, _ = _admit(tmp_path)
     store._events_path = tmp_path / "outside-events.jsonl"
 
     with pytest.raises(EvidenceCorruptionError, match="escapes"):
         store.verify()
+
+
+def test_replaced_lock_cannot_split_two_store_transactions(tmp_path):
+    root = tmp_path / "evidence"
+    first = _candidate(payload={"slot": "first"})
+    second = _candidate(payload={"slot": "second"})
+    store_a = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+    store_b = ImmutableStrategyEvidenceStore(root, clock=_Clock(LATER))
+    b_started = threading.Event()
+    b_finished = threading.Event()
+    b_outcome: list[object] = []
+    b_thread: list[threading.Thread] = []
+
+    def run_b() -> None:
+        b_started.set()
+        try:
+            b_outcome.append(
+                store_b.admit_checked(
+                    second,
+                    validate=lambda _prior, _new: None,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - diagnostic capture
+            b_outcome.append(exc)
+        finally:
+            b_finished.set()
+
+    def displace_lock(
+        _prior: tuple[EvidenceEnvelope, ...],
+        _new: EvidenceEnvelope,
+    ) -> None:
+        lock_path = root / ".strategy-evidence.lock"
+        lock_path.rename(root / ".strategy-evidence.lock.displaced")
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+        os.close(descriptor)
+        thread = threading.Thread(target=run_b, daemon=True)
+        b_thread.append(thread)
+        thread.start()
+        assert b_started.wait(timeout=1)
+        assert not b_finished.wait(timeout=0.25)
+
+    with pytest.raises(EvidenceCorruptionError, match="lock.*changed"):
+        store_a.admit_checked(first, validate=displace_lock)
+
+    assert b_finished.wait(timeout=2)
+    b_thread[0].join(timeout=1)
+    assert len(b_outcome) == 1
+    assert not isinstance(b_outcome[0], Exception)
+    assert b_outcome[0].event.sequence == 1  # type: ignore[union-attr]
+    assert len(_journal_lines(root)) == 1
+    assert ImmutableStrategyEvidenceStore(root).verify() == (
+        b_outcome[0].envelope,  # type: ignore[union-attr]
+    )
+
+
+def test_replaced_lock_cannot_split_cross_process_transactions(tmp_path):
+    root = tmp_path / "evidence"
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+    child: list[subprocess.Popen[str]] = []
+    script = """
+import datetime as dt
+import sys
+from pathlib import Path
+from tradingagents.strategy._immutable_evidence_store import (
+    EvidenceCandidate,
+    ImmutableStrategyEvidenceStore,
+)
+root = Path(sys.argv[1])
+candidate = EvidenceCandidate(
+    kind="baseline-genome",
+    effective_at="2030-01-02T14:00:00+00:00",
+    payload={"slot": "child"},
+)
+ImmutableStrategyEvidenceStore(
+    root,
+    clock=lambda: dt.datetime(
+        2030, 1, 2, 15, 4, 15, tzinfo=dt.timezone.utc
+    ),
+).admit_checked(candidate, validate=lambda _prior, _new: None)
+"""
+
+    def displace_and_launch(
+        _prior: tuple[EvidenceEnvelope, ...],
+        _new: EvidenceEnvelope,
+    ) -> None:
+        lock_path = root / ".strategy-evidence.lock"
+        lock_path.rename(root / ".strategy-evidence.lock.displaced")
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+        os.close(descriptor)
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(root)],
+            cwd=Path(evidence_store_module.__file__).resolve().parents[2],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        child.append(process)
+        time.sleep(0.25)
+        assert process.poll() is None
+
+    with pytest.raises(EvidenceCorruptionError, match="lock.*changed"):
+        store.admit_checked(
+            _candidate(payload={"slot": "parent"}),
+            validate=displace_and_launch,
+        )
+
+    stdout, stderr = child[0].communicate(timeout=2)
+    assert child[0].returncode == 0, (stdout, stderr)
+    assert len(_journal_lines(root)) == 1
+    assert ImmutableStrategyEvidenceStore(root).verify()[0].payload == {
+        "slot": "child"
+    }
+
+
+def test_kind_directory_swap_before_object_create_never_writes_outside(tmp_path):
+    root = tmp_path / "evidence"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    class SwappingStore(ImmutableStrategyEvidenceStore):
+        def _write_immutable_object(self, path: Path, payload: bytes) -> None:
+            kind_dir = path.parent
+            kind_dir.rename(kind_dir.with_name(f"{kind_dir.name}-displaced"))
+            kind_dir.symlink_to(outside, target_is_directory=True)
+            super()._write_immutable_object(path, payload)
+
+    store = SwappingStore(root, clock=_Clock(FIRST))
+    with pytest.raises(EvidenceCorruptionError):
+        store.admit_checked(
+            _candidate(),
+            validate=lambda _prior, _new: None,
+        )
+
+    assert not tuple(outside.iterdir())
+
+
+def test_kind_directory_swap_during_object_read_fails_closed(tmp_path):
+    store, root, _, admission = _admit(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_copy = outside / admission.path.name
+    outside_copy.write_bytes(admission.path.read_bytes())
+    outside_copy.chmod(0o600)
+
+    class SwappingReadStore(ImmutableStrategyEvidenceStore):
+        swapped = False
+
+        def _read_envelope(
+            self,
+            path: Path,
+            *,
+            expected_kind: str,
+            expected_id: str,
+        ) -> tuple[EvidenceEnvelope, bytes]:
+            if not self.swapped:
+                self.swapped = True
+                kind_dir = path.parent
+                kind_dir.rename(
+                    kind_dir.with_name(f"{kind_dir.name}-displaced")
+                )
+                kind_dir.symlink_to(outside, target_is_directory=True)
+            return super()._read_envelope(
+                path,
+                expected_kind=expected_kind,
+                expected_id=expected_id,
+            )
+
+    with pytest.raises(EvidenceCorruptionError):
+        SwappingReadStore(root).verify()
+
+    assert outside_copy.read_bytes() == admission.envelope.canonical_json_bytes()
+
+
+def test_latest_directory_swap_before_pointer_publish_never_writes_outside(
+    tmp_path,
+):
+    root = tmp_path / "evidence"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    class SwappingPointerStore(ImmutableStrategyEvidenceStore):
+        swapped = False
+
+        def _publish_pointer(self, pointer: EvidencePointer) -> None:
+            if not self.swapped:
+                self.swapped = True
+                latest = self.root / "latest"
+                latest.rename(self.root / "latest-displaced")
+                latest.symlink_to(outside, target_is_directory=True)
+            super()._publish_pointer(pointer)
+
+    with pytest.raises(EvidenceCorruptionError):
+        SwappingPointerStore(root, clock=_Clock(FIRST)).admit_checked(
+            _candidate(),
+            validate=lambda _prior, _new: None,
+        )
+
+    assert not tuple(outside.iterdir())
+
+
+def test_latest_directory_swap_during_pointer_read_fails_closed(tmp_path):
+    store, root, candidate, _ = _admit(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    pointer_name = f"{candidate.kind}.json"
+    pointer_path = root / "latest" / pointer_name
+    outside_pointer = outside / pointer_name
+    pointer_bytes = pointer_path.read_bytes()
+    outside_pointer.write_bytes(pointer_bytes)
+    outside_pointer.chmod(0o600)
+
+    class SwappingPointerReadStore(ImmutableStrategyEvidenceStore):
+        swapped = False
+
+        def _read_regular(self, path: Path, *, label: str) -> bytes:
+            if label == "latest pointer" and not self.swapped:
+                self.swapped = True
+                latest = self.root / "latest"
+                latest.rename(self.root / "latest-displaced")
+                latest.symlink_to(outside, target_is_directory=True)
+            return super()._read_regular(path, label=label)
+
+    with pytest.raises(EvidenceCorruptionError):
+        SwappingPointerReadStore(root).verify()
+
+    assert outside_pointer.read_bytes() == pointer_bytes
+
+
+def test_latest_directory_swap_at_staged_replace_cannot_publish_outside(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_replace = evidence_store_module.os.replace
+    swapped = False
+
+    def swapping_replace(
+        source: str,
+        destination: str,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            latest = root / "latest"
+            displaced = root / "latest-displaced"
+            latest.rename(displaced)
+            latest.symlink_to(outside, target_is_directory=True)
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(
+        evidence_store_module.os,
+        "replace",
+        swapping_replace,
+    )
+    candidate = _candidate()
+    with pytest.raises(EvidenceCorruptionError):
+        ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(FIRST),
+        ).admit_checked(
+            candidate,
+            validate=lambda _prior, _new: None,
+        )
+
+    assert not (outside / f"{candidate.kind}.json").exists()
+
+
+def test_first_admission_fsyncs_root_parent_before_managed_writes(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    parent_inode = tmp_path.stat().st_ino
+    operations: list[tuple[str, int]] = []
+    real_fsync = evidence_store_module.os.fsync
+    real_write = evidence_store_module.os.write
+
+    def recording_fsync(descriptor: int) -> None:
+        operations.append(("fsync", os.fstat(descriptor).st_ino))
+        real_fsync(descriptor)
+
+    def recording_write(descriptor: int, payload: bytes) -> int:
+        operations.append(("write", os.fstat(descriptor).st_ino))
+        return real_write(descriptor, payload)
+
+    monkeypatch.setattr(evidence_store_module.os, "fsync", recording_fsync)
+    monkeypatch.setattr(evidence_store_module.os, "write", recording_write)
+    ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST)).admit_checked(
+        _candidate(),
+        validate=lambda _prior, _new: None,
+    )
+
+    parent_fsync = operations.index(("fsync", parent_inode))
+    first_write = next(
+        index
+        for index, operation in enumerate(operations)
+        if operation[0] == "write"
+    )
+    assert parent_fsync < first_write
+
+
+def test_root_parent_fsync_failure_cannot_report_success(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    parent_inode = tmp_path.stat().st_ino
+    real_fsync = evidence_store_module.os.fsync
+
+    def fail_parent_fsync(descriptor: int) -> None:
+        if os.fstat(descriptor).st_ino == parent_inode:
+            raise OSError("injected root parent fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(evidence_store_module.os, "fsync", fail_parent_fsync)
+    with pytest.raises(EvidenceCorruptionError, match="root.*durable"):
+        ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(FIRST),
+        ).admit_checked(
+            _candidate(),
+            validate=lambda _prior, _new: None,
+        )
+
+    assert not (root / "events.jsonl").exists()
+    assert not tuple((root / "objects").rglob("*.json"))
+
+
+def test_validator_reentry_through_second_store_fails_fast(tmp_path):
+    root = tmp_path / "evidence"
+    script = f"""
+import datetime as dt
+from pathlib import Path
+from tradingagents.strategy._immutable_evidence_store import (
+    EvidenceCandidate,
+    ImmutableStrategyEvidenceStore,
+    StrategyEvidenceStoreError,
+)
+root = Path({str(root)!r})
+clock = lambda: dt.datetime(2030, 1, 2, 15, 4, 5, tzinfo=dt.timezone.utc)
+first = ImmutableStrategyEvidenceStore(root, clock=clock)
+second = ImmutableStrategyEvidenceStore(root, clock=clock)
+candidate = EvidenceCandidate(
+    kind="evaluation-registration",
+    effective_at="2030-01-02T14:00:00+00:00",
+    payload={{"slot": "reentry"}},
+)
+observed = []
+def validate(_prior, _new):
+    try:
+        second.verify()
+    except StrategyEvidenceStoreError as exc:
+        observed.append(str(exc))
+    else:
+        raise AssertionError("cross-instance reentry did not fail")
+first.admit_checked(candidate, validate=validate)
+assert observed and "callback" in observed[0]
+"""
+    started = time.monotonic()
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(evidence_store_module.__file__).resolve().parents[2],
+        text=True,
+        capture_output=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert time.monotonic() - started < 2
+    assert completed.returncode == 0, completed.stderr
 
 
 @pytest.mark.parametrize(

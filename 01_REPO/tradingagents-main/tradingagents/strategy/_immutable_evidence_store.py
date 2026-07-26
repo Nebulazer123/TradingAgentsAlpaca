@@ -41,7 +41,12 @@ _MAX_JSON_DEPTH = 16
 _MAX_JSON_NODES = 10_000
 _MAX_STRING_BYTES = 65_536
 _MAX_CANONICAL_BYTES = 1_048_576
+_MAX_JOURNAL_LINE_BYTES = 1_048_576
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+_ROOT_PROCESS_LOCKS_GUARD = threading.Lock()
+_ROOT_PROCESS_LOCKS: dict[str, threading.Lock] = {}
+_CALLBACK_ROOTS = threading.local()
 _AUTHORITY_FIELDS = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -601,6 +606,29 @@ class EvidenceAdmission:
     created: bool
 
 
+@dataclass(slots=True)
+class _OpenTransaction:
+    root_fd: int
+    root_state: os.stat_result
+    lock_fd: int
+    lock_state: os.stat_result
+    objects_fd: int | None = None
+    objects_state: os.stat_result | None = None
+    latest_fd: int | None = None
+    latest_state: os.stat_result | None = None
+    kind_fds: dict[str, tuple[int, os.stat_result]] = field(
+        default_factory=dict
+    )
+
+    def close(self) -> None:
+        for descriptor, _state in self.kind_fds.values():
+            os.close(descriptor)
+        if self.latest_fd is not None:
+            os.close(self.latest_fd)
+        if self.objects_fd is not None:
+            os.close(self.objects_fd)
+
+
 class ImmutableStrategyEvidenceStore:
     """Persist and replay immutable strategy evidence under one exclusive lock."""
 
@@ -621,7 +649,7 @@ class ImmutableStrategyEvidenceStore:
         self._events_path = self.root / "events.jsonl"
         self._objects_dir = self.root / "objects"
         self._latest_dir = self.root / "latest"
-        self._callback_state = threading.local()
+        self._transaction_state = threading.local()
 
     def admit_checked(
         self,
@@ -671,7 +699,7 @@ class ImmutableStrategyEvidenceStore:
                     )
 
             object_path = self._object_path(candidate.kind, object_id)
-            object_state = self._path_state(object_path, label="evidence object")
+            object_state = self._object_state(candidate.kind, object_id)
             prior_event = event_by_id.get(object_id)
             object_existed = object_state is not None
             if prior_event is not None:
@@ -719,15 +747,19 @@ class ImmutableStrategyEvidenceStore:
                     "store clock is earlier than object first-seen evidence"
                 )
 
-            self._callback_state.active = True
+            callback_roots = self._callback_roots()
+            callback_roots.add(os.fspath(self.root))
             try:
                 validate(snapshot, envelope)
             finally:
-                self._callback_state.active = False
+                callback_roots.remove(os.fspath(self.root))
+            self._validate_transaction()
 
             if prior_event is not None:
+                self._preflight_pointer(self._pointer_for(prior_event))
                 self._redurable_journal_if_present()
                 self._repair_latest(events)
+                self._validate_transaction()
                 return EvidenceAdmission(
                     envelope=envelope,
                     path=object_path,
@@ -735,25 +767,8 @@ class ImmutableStrategyEvidenceStore:
                     created=False,
                 )
 
-            self._redurable_journal_if_present()
-            self._ensure_kind_directory(candidate.kind, create=True)
-            if not object_existed:
-                self._write_immutable_object(
-                    object_path,
-                    envelope.canonical_json_bytes(),
-                )
-                self._after_object_fsync(object_path)
-            else:
-                self._redurable_regular_file(
-                    object_path,
-                    label="evidence object",
-                )
-                self._fsync_directory(self._kind_directory(candidate.kind))
-                self._fsync_directory(self._objects_dir)
-
-            object_sha256 = hashlib.sha256(
-                envelope.canonical_json_bytes()
-            ).hexdigest()
+            envelope_bytes = envelope.canonical_json_bytes()
+            object_sha256 = hashlib.sha256(envelope_bytes).hexdigest()
             previous_hash = (
                 hashlib.sha256(events[-1].canonical_json_bytes()).hexdigest()
                 if events
@@ -769,9 +784,30 @@ class ImmutableStrategyEvidenceStore:
                 recorded_at=envelope.recorded_at,
                 previous_event_sha256=previous_hash,
             )
+            self._preflight_event(event)
+            self._preflight_pointer(self._pointer_for(event))
+            self._redurable_journal_if_present()
+            self._ensure_kind_directory(candidate.kind, create=True)
+            self._validate_transaction()
+            if not object_existed:
+                self._write_immutable_object(
+                    object_path,
+                    envelope_bytes,
+                )
+                self._after_object_fsync(object_path)
+            else:
+                self._redurable_regular_file(
+                    object_path,
+                    label="evidence object",
+                )
+                self._fsync_directory(self._kind_directory(candidate.kind))
+                self._fsync_directory(self._objects_dir)
+
+            self._validate_transaction()
             self._append_event(event)
             self._after_event_fsync(event)
             self._repair_latest((*events, event))
+            self._validate_transaction()
             return EvidenceAdmission(
                 envelope=envelope,
                 path=object_path,
@@ -825,74 +861,221 @@ class ImmutableStrategyEvidenceStore:
         """Protected deterministic seam after a journal event is durable."""
 
     def _reject_callback_reentry(self) -> None:
-        if getattr(self._callback_state, "active", False):
+        if os.fspath(self.root) in self._callback_roots():
             raise StrategyEvidenceStoreError(
                 "validation callback must not call the evidence store"
             )
 
+    def _callback_roots(self) -> set[str]:
+        roots = getattr(_CALLBACK_ROOTS, "active", None)
+        if roots is None:
+            roots = set()
+            _CALLBACK_ROOTS.active = roots
+        return roots
+
+    def _process_root_lock(self) -> threading.Lock:
+        key = os.fspath(self.root)
+        with _ROOT_PROCESS_LOCKS_GUARD:
+            return _ROOT_PROCESS_LOCKS.setdefault(key, threading.Lock())
+
+    def _transaction(self) -> _OpenTransaction:
+        transaction = getattr(self._transaction_state, "current", None)
+        if not isinstance(transaction, _OpenTransaction):
+            raise EvidenceCorruptionError(
+                "evidence operation requires a pinned transaction"
+            )
+        return transaction
+
     def _root_is_absent(self) -> bool:
-        state = self._lstat_uncontained(self.root, label="evidence root")
-        return state is None
+        parent_fd = self._open_directory_chain(self.root.parent)
+        try:
+            state = self._entry_state(
+                parent_fd,
+                self.root.name,
+                label="evidence root",
+            )
+            if state is None:
+                return True
+            self._require_directory_state(state, label="evidence root")
+            return False
+        finally:
+            os.close(parent_fd)
 
     @contextmanager
     def _locked(self, *, create: bool) -> Iterator[None]:
-        self._ensure_root(create=create)
-        state = self._path_state(self._lock_path, label="evidence lock")
-        if state is None and not create:
-            raise EvidenceCorruptionError("evidence lock is missing")
-        if state is not None:
-            self._require_regular_state(state, label="evidence lock")
-        flags = os.O_RDWR | _NOFOLLOW
-        if create:
-            flags |= os.O_CREAT
+        process_lock = self._process_root_lock()
+        process_lock.acquire()
+        root_fd: int | None = None
+        lock_fd: int | None = None
+        transaction: _OpenTransaction | None = None
         try:
-            descriptor = os.open(self._lock_path, flags, 0o600)
-        except OSError as exc:
-            raise EvidenceCorruptionError(
-                "evidence lock could not be opened safely"
-            ) from exc
-        try:
-            descriptor_state = self._require_regular_descriptor(
-                descriptor,
+            self._ensure_root(create=create)
+            root_fd, root_state = self._open_root_descriptor()
+            fcntl.flock(root_fd, fcntl.LOCK_EX)
+            lock_state = self._entry_state(
+                root_fd,
+                ".strategy-evidence.lock",
                 label="evidence lock",
             )
-            if state is None:
-                self._fsync_directory(self.root)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            current = self._path_state(self._lock_path, label="evidence lock")
-            if current is None:
-                raise EvidenceCorruptionError("evidence lock disappeared")
-            self._require_regular_state(current, label="evidence lock")
-            if (
-                current.st_dev != descriptor_state.st_dev
-                or current.st_ino != descriptor_state.st_ino
-            ):
-                raise EvidenceCorruptionError(
-                    "evidence lock changed while being acquired"
+            if lock_state is None and not create:
+                raise EvidenceCorruptionError("evidence lock is missing")
+            if lock_state is not None:
+                self._require_regular_state(lock_state, label="evidence lock")
+            flags = os.O_RDWR | _NOFOLLOW
+            if create:
+                flags |= os.O_CREAT
+            try:
+                lock_fd = os.open(
+                    ".strategy-evidence.lock",
+                    flags,
+                    0o600,
+                    dir_fd=root_fd,
                 )
-            yield
-        finally:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-            finally:
-                os.close(descriptor)
-
-    def _ensure_root(self, *, create: bool) -> None:
-        self._reject_symlink_components(self.root)
-        state = self._path_state(self.root, label="evidence root")
-        if state is None:
-            if not create:
-                raise EvidenceCorruptionError("evidence root is missing")
-            try:
-                self.root.mkdir(mode=0o700, parents=True)
-            except FileExistsError:
-                pass
             except OSError as exc:
                 raise EvidenceCorruptionError(
-                    "evidence root could not be created"
+                    "evidence lock could not be opened safely"
                 ) from exc
-            state = self._path_state(self.root, label="evidence root")
-        self._require_directory_state(state, label="evidence root")
+            descriptor_state = self._require_regular_descriptor(
+                lock_fd,
+                label="evidence lock",
+            )
+            if lock_state is None:
+                self._fsync_descriptor(
+                    root_fd,
+                    label="evidence root",
+                    directory=True,
+                )
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            transaction = _OpenTransaction(
+                root_fd=root_fd,
+                root_state=root_state,
+                lock_fd=lock_fd,
+                lock_state=descriptor_state,
+            )
+            self._transaction_state.current = transaction
+            self._validate_transaction()
+            yield
+            self._validate_transaction()
+        finally:
+            self._transaction_state.current = None
+            if transaction is not None:
+                transaction.close()
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+            if root_fd is not None:
+                try:
+                    fcntl.flock(root_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(root_fd)
+            process_lock.release()
+
+    def _ensure_root(self, *, create: bool) -> None:
+        parent_fd = self._open_directory_chain(self.root.parent)
+        try:
+            state = self._entry_state(
+                parent_fd,
+                self.root.name,
+                label="evidence root",
+            )
+            if state is None:
+                if not create:
+                    raise EvidenceCorruptionError("evidence root is missing")
+                try:
+                    os.mkdir(self.root.name, mode=0o700, dir_fd=parent_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise EvidenceCorruptionError(
+                        "evidence root could not be created"
+                    ) from exc
+                state = self._entry_state(
+                    parent_fd,
+                    self.root.name,
+                    label="evidence root",
+                )
+            self._require_directory_state(state, label="evidence root")
+            if create:
+                try:
+                    os.fsync(parent_fd)
+                except OSError as exc:
+                    raise EvidenceCorruptionError(
+                        "evidence root parent could not be made durable"
+                    ) from exc
+        finally:
+            os.close(parent_fd)
+
+    def _open_directory_chain(self, path: Path) -> int:
+        absolute = Path(os.path.abspath(os.fspath(path)))
+        flags = os.O_RDONLY | _DIRECTORY | _NOFOLLOW
+        try:
+            descriptor = os.open(absolute.anchor, flags)
+        except OSError as exc:
+            raise EvidenceCorruptionError(
+                "trusted evidence parent could not be opened"
+            ) from exc
+        try:
+            for part in absolute.parts[1:]:
+                try:
+                    next_descriptor = os.open(
+                        part,
+                        flags,
+                        dir_fd=descriptor,
+                    )
+                except OSError as exc:
+                    raise EvidenceCorruptionError(
+                        "trusted evidence parent is missing or unsafe"
+                    ) from exc
+                os.close(descriptor)
+                descriptor = next_descriptor
+            state = os.fstat(descriptor)
+            if not stat.S_ISDIR(state.st_mode):
+                raise EvidenceCorruptionError(
+                    "trusted evidence parent must be a directory"
+                )
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _open_root_descriptor(self) -> tuple[int, os.stat_result]:
+        parent_fd = self._open_directory_chain(self.root.parent)
+        try:
+            entry = self._entry_state(
+                parent_fd,
+                self.root.name,
+                label="evidence root",
+            )
+            self._require_directory_state(entry, label="evidence root")
+            try:
+                descriptor = os.open(
+                    self.root.name,
+                    os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise EvidenceCorruptionError(
+                    "evidence root could not be opened safely"
+                ) from exc
+            descriptor_state = os.fstat(descriptor)
+            self._require_directory_state(
+                descriptor_state,
+                label="evidence root",
+            )
+            if (
+                entry is None
+                or entry.st_dev != descriptor_state.st_dev
+                or entry.st_ino != descriptor_state.st_ino
+            ):
+                os.close(descriptor)
+                raise EvidenceCorruptionError(
+                    "evidence root changed while being opened"
+                )
+            return descriptor, descriptor_state
+        finally:
+            os.close(parent_fd)
 
     def _ensure_managed_directories(
         self,
@@ -900,81 +1083,128 @@ class ImmutableStrategyEvidenceStore:
         create: bool,
         recover_staged_pointers: bool,
     ) -> None:
-        created = False
-        for path, label in (
-            (self._objects_dir, "objects directory"),
-            (self._latest_dir, "latest directory"),
-        ):
-            state = self._path_state(path, label=label)
-            if state is None:
-                if not create:
-                    raise EvidenceCorruptionError(f"{label} is missing")
-                try:
-                    path.mkdir(mode=0o700)
-                except FileExistsError:
-                    pass
-                except OSError as exc:
-                    raise EvidenceCorruptionError(
-                        f"{label} could not be created"
-                    ) from exc
-                state = self._path_state(path, label=label)
-                created = True
-            self._require_directory_state(state, label=label)
-        if created:
-            self._fsync_directory(self.root)
+        transaction = self._transaction()
+        if transaction.objects_fd is None:
+            (
+                transaction.objects_fd,
+                transaction.objects_state,
+            ) = self._open_managed_directory(
+                transaction.root_fd,
+                "objects",
+                label="objects directory",
+                create=create,
+            )
+        if transaction.latest_fd is None:
+            (
+                transaction.latest_fd,
+                transaction.latest_state,
+            ) = self._open_managed_directory(
+                transaction.root_fd,
+                "latest",
+                label="latest directory",
+                create=create,
+            )
         self._inspect_object_directory_entries()
         self._inspect_latest_directory_entries(
             recover_staged_pointers=recover_staged_pointers,
         )
+        self._validate_transaction()
 
-    def _ensure_kind_directory(self, kind: str, *, create: bool) -> Path:
-        path = self._kind_directory(kind)
-        state = self._path_state(path, label="object kind directory")
+    def _open_managed_directory(
+        self,
+        parent_fd: int,
+        name: str,
+        *,
+        label: str,
+        create: bool,
+    ) -> tuple[int, os.stat_result]:
+        state = self._entry_state(parent_fd, name, label=label)
         if state is None:
             if not create:
-                raise EvidenceCorruptionError("object kind directory is missing")
+                raise EvidenceCorruptionError(f"{label} is missing")
             try:
-                path.mkdir(mode=0o700)
+                os.mkdir(name, mode=0o700, dir_fd=parent_fd)
             except FileExistsError:
                 pass
             except OSError as exc:
                 raise EvidenceCorruptionError(
-                    "object kind directory could not be created"
+                    f"{label} could not be created"
                 ) from exc
-            state = self._path_state(path, label="object kind directory")
-            self._fsync_directory(self._objects_dir)
-        self._require_directory_state(state, label="object kind directory")
+            self._fsync_descriptor(parent_fd, label=label, directory=True)
+            state = self._entry_state(parent_fd, name, label=label)
+        self._require_directory_state(state, label=label)
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise EvidenceCorruptionError(
+                f"{label} could not be opened safely"
+            ) from exc
+        descriptor_state = os.fstat(descriptor)
+        self._require_directory_state(descriptor_state, label=label)
+        if (
+            state is None
+            or descriptor_state.st_dev != state.st_dev
+            or descriptor_state.st_ino != state.st_ino
+        ):
+            os.close(descriptor)
+            raise EvidenceCorruptionError(f"{label} changed while opening")
+        return descriptor, descriptor_state
+
+    def _ensure_kind_directory(self, kind: str, *, create: bool) -> Path:
+        path = self._kind_directory(kind)
+        transaction = self._transaction()
+        if transaction.objects_fd is None:
+            raise EvidenceCorruptionError("objects directory is not pinned")
+        if kind not in transaction.kind_fds:
+            descriptor, state = self._open_managed_directory(
+                transaction.objects_fd,
+                kind,
+                label="object kind directory",
+                create=create,
+            )
+            transaction.kind_fds[kind] = (descriptor, state)
         return path
 
     def _inspect_object_directory_entries(self) -> None:
+        transaction = self._transaction()
+        if transaction.objects_fd is None:
+            raise EvidenceCorruptionError("objects directory is not pinned")
         try:
-            kind_entries = tuple(self._objects_dir.iterdir())
+            kind_names = tuple(os.listdir(transaction.objects_fd))
         except OSError as exc:
             raise EvidenceCorruptionError(
                 "objects directory could not be listed"
             ) from exc
-        for kind_path in kind_entries:
-            if kind_path.name not in _ALLOWED_KINDS:
+        for kind in kind_names:
+            if kind not in _ALLOWED_KINDS:
                 raise EvidenceCorruptionError(
-                    f"unknown object kind path: {kind_path.name}"
+                    f"unknown object kind path: {kind}"
                 )
-            state = self._path_state(kind_path, label="object kind directory")
-            self._require_directory_state(state, label="object kind directory")
+            self._ensure_kind_directory(kind, create=False)
+            kind_fd, _state = transaction.kind_fds[kind]
             try:
-                children = tuple(kind_path.iterdir())
+                children = tuple(os.listdir(kind_fd))
             except OSError as exc:
                 raise EvidenceCorruptionError(
                     "object kind directory could not be listed"
                 ) from exc
             pattern = re.compile(
-                rf"^{re.escape(kind_path.name)}-[0-9a-f]{{64}}\.json$"
+                rf"^{re.escape(kind)}-[0-9a-f]{{64}}\.json$"
             )
-            for child in children:
-                if pattern.fullmatch(child.name) is None:
+            for child_name in children:
+                if pattern.fullmatch(child_name) is None:
                     raise EvidenceCorruptionError(
-                        f"unknown evidence object path: {child.name}"
+                        f"unknown evidence object path: {child_name}"
                     )
-                child_state = self._path_state(child, label="evidence object")
+                child_state = self._entry_state(
+                    kind_fd,
+                    child_name,
+                    label="evidence object",
+                )
                 if child_state is None:
                     raise EvidenceCorruptionError("evidence object disappeared")
                 self._require_regular_state(
@@ -987,17 +1217,24 @@ class ImmutableStrategyEvidenceStore:
         *,
         recover_staged_pointers: bool,
     ) -> None:
+        transaction = self._transaction()
+        if transaction.latest_fd is None:
+            raise EvidenceCorruptionError("latest directory is not pinned")
         allowed_names = {f"{kind}.json" for kind in _ALLOWED_KINDS}
         try:
-            entries = tuple(self._latest_dir.iterdir())
+            entries = tuple(os.listdir(transaction.latest_fd))
         except OSError as exc:
             raise EvidenceCorruptionError(
                 "latest directory could not be listed"
             ) from exc
-        staged: list[tuple[Path, int, int]] = []
-        for path in entries:
-            if path.name in allowed_names:
-                state = self._path_state(path, label="latest pointer")
+        staged: list[tuple[str, int, int]] = []
+        for name in entries:
+            if name in allowed_names:
+                state = self._entry_state(
+                    transaction.latest_fd,
+                    name,
+                    label="latest pointer",
+                )
                 if state is None:
                     raise EvidenceCorruptionError(
                         "latest pointer disappeared"
@@ -1006,12 +1243,16 @@ class ImmutableStrategyEvidenceStore:
                 continue
             if (
                 not recover_staged_pointers
-                or _STAGED_POINTER_NAME.fullmatch(path.name) is None
+                or _STAGED_POINTER_NAME.fullmatch(name) is None
             ):
                 raise EvidenceCorruptionError(
-                    f"unknown latest pointer path: {path.name}"
+                    f"unknown latest pointer path: {name}"
                 )
-            state = self._path_state(path, label="staged latest pointer")
+            state = self._entry_state(
+                transaction.latest_fd,
+                name,
+                label="staged latest pointer",
+            )
             if state is None:
                 raise EvidenceCorruptionError(
                     "staged latest pointer disappeared"
@@ -1020,9 +1261,13 @@ class ImmutableStrategyEvidenceStore:
                 state,
                 label="staged latest pointer",
             )
-            staged.append((path, state.st_dev, state.st_ino))
-        for path, expected_device, expected_inode in staged:
-            state = self._path_state(path, label="staged latest pointer")
+            staged.append((name, state.st_dev, state.st_ino))
+        for name, expected_device, expected_inode in staged:
+            state = self._entry_state(
+                transaction.latest_fd,
+                name,
+                label="staged latest pointer",
+            )
             if state is None:
                 raise EvidenceCorruptionError(
                     "staged latest pointer disappeared"
@@ -1039,14 +1284,22 @@ class ImmutableStrategyEvidenceStore:
                     "staged latest pointer changed during recovery"
                 )
             try:
-                path.unlink()
+                os.unlink(name, dir_fd=transaction.latest_fd)
             except OSError as exc:
                 raise EvidenceCorruptionError(
                     "staged latest pointer could not be removed"
                 ) from exc
         if staged:
-            self._fsync_directory(self._latest_dir)
-            self._fsync_directory(self.root)
+            self._fsync_descriptor(
+                transaction.latest_fd,
+                label="latest directory",
+                directory=True,
+            )
+            self._fsync_descriptor(
+                transaction.root_fd,
+                label="evidence root",
+                directory=True,
+            )
 
     def _lstat_uncontained(
         self,
@@ -1063,6 +1316,147 @@ class ImmutableStrategyEvidenceStore:
                 f"{label} could not be inspected"
             ) from exc
 
+    def _entry_state(
+        self,
+        parent_fd: int,
+        name: str,
+        *,
+        label: str,
+    ) -> os.stat_result | None:
+        if "/" in name or name in {"", ".", ".."}:
+            raise EvidenceCorruptionError(f"{label} name is unsafe")
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise EvidenceCorruptionError(
+                f"{label} could not be inspected"
+            ) from exc
+
+    def _root_entry_state(self) -> os.stat_result | None:
+        parent_fd = self._open_directory_chain(self.root.parent)
+        try:
+            return self._entry_state(
+                parent_fd,
+                self.root.name,
+                label="evidence root",
+            )
+        finally:
+            os.close(parent_fd)
+
+    def _same_identity(
+        self,
+        left: os.stat_result | None,
+        right: os.stat_result,
+    ) -> bool:
+        return (
+            left is not None
+            and left.st_dev == right.st_dev
+            and left.st_ino == right.st_ino
+        )
+
+    def _validate_directory_identity(
+        self,
+        parent_fd: int,
+        name: str,
+        descriptor: int,
+        expected: os.stat_result,
+        *,
+        label: str,
+    ) -> None:
+        entry = self._entry_state(parent_fd, name, label=label)
+        self._require_directory_state(entry, label=label)
+        descriptor_state = os.fstat(descriptor)
+        self._require_directory_state(descriptor_state, label=label)
+        if (
+            not self._same_identity(entry, expected)
+            or not self._same_identity(descriptor_state, expected)
+        ):
+            raise EvidenceCorruptionError(f"{label} changed during transaction")
+
+    def _validate_transaction(self) -> None:
+        transaction = self._transaction()
+        if (
+            self._lock_path != self.root / ".strategy-evidence.lock"
+            or self._events_path != self.root / "events.jsonl"
+            or self._objects_dir != self.root / "objects"
+            or self._latest_dir != self.root / "latest"
+        ):
+            raise EvidenceCorruptionError(
+                "managed path escapes evidence root"
+            )
+        root_entry = self._root_entry_state()
+        self._require_directory_state(root_entry, label="evidence root")
+        root_descriptor_state = os.fstat(transaction.root_fd)
+        self._require_directory_state(
+            root_descriptor_state,
+            label="evidence root",
+        )
+        if (
+            not self._same_identity(root_entry, transaction.root_state)
+            or not self._same_identity(
+                root_descriptor_state,
+                transaction.root_state,
+            )
+        ):
+            raise EvidenceCorruptionError(
+                "evidence root changed during transaction"
+            )
+        lock_entry = self._entry_state(
+            transaction.root_fd,
+            ".strategy-evidence.lock",
+            label="evidence lock",
+        )
+        if lock_entry is None:
+            raise EvidenceCorruptionError("evidence lock changed or disappeared")
+        self._require_regular_state(lock_entry, label="evidence lock")
+        lock_descriptor_state = self._require_regular_descriptor(
+            transaction.lock_fd,
+            label="evidence lock",
+        )
+        if (
+            not self._same_identity(lock_entry, transaction.lock_state)
+            or not self._same_identity(
+                lock_descriptor_state,
+                transaction.lock_state,
+            )
+        ):
+            raise EvidenceCorruptionError(
+                "evidence lock changed during transaction"
+            )
+        for name, descriptor, expected, label in (
+            (
+                "objects",
+                transaction.objects_fd,
+                transaction.objects_state,
+                "objects directory",
+            ),
+            (
+                "latest",
+                transaction.latest_fd,
+                transaction.latest_state,
+                "latest directory",
+            ),
+        ):
+            if descriptor is not None and expected is not None:
+                self._validate_directory_identity(
+                    transaction.root_fd,
+                    name,
+                    descriptor,
+                    expected,
+                    label=label,
+                )
+        if transaction.objects_fd is not None:
+            for kind, (descriptor, expected) in transaction.kind_fds.items():
+                self._validate_directory_identity(
+                    transaction.objects_fd,
+                    kind,
+                    descriptor,
+                    expected,
+                    label="object kind directory",
+                )
+
     def _path_state(
         self,
         path: Path,
@@ -1070,7 +1464,39 @@ class ImmutableStrategyEvidenceStore:
         label: str,
     ) -> os.stat_result | None:
         self._require_contained(path)
-        return self._lstat_uncontained(path, label=label)
+        transaction = getattr(self._transaction_state, "current", None)
+        if not isinstance(transaction, _OpenTransaction):
+            return self._lstat_uncontained(path, label=label)
+        if path == self.root:
+            return os.fstat(transaction.root_fd)
+        relative = path.relative_to(self.root).parts
+        if len(relative) == 1:
+            return self._entry_state(
+                transaction.root_fd,
+                relative[0],
+                label=label,
+            )
+        if len(relative) == 2 and relative[0] == "objects":
+            if transaction.objects_fd is None:
+                raise EvidenceCorruptionError("objects directory is not pinned")
+            return self._entry_state(
+                transaction.objects_fd,
+                relative[1],
+                label=label,
+            )
+        if len(relative) == 3 and relative[0] == "objects":
+            self._ensure_kind_directory(relative[1], create=False)
+            kind_fd, _state = transaction.kind_fds[relative[1]]
+            return self._entry_state(kind_fd, relative[2], label=label)
+        if len(relative) == 2 and relative[0] == "latest":
+            if transaction.latest_fd is None:
+                raise EvidenceCorruptionError("latest directory is not pinned")
+            return self._entry_state(
+                transaction.latest_fd,
+                relative[1],
+                label=label,
+            )
+        raise EvidenceCorruptionError("managed path is not recognized")
 
     def _require_contained(self, path: Path) -> None:
         try:
@@ -1149,39 +1575,77 @@ class ImmutableStrategyEvidenceStore:
         state = self._path_state(path, label=label)
         self._require_directory_state(state, label=label)
 
-    def _fsync_directory(self, path: Path) -> None:
-        self._require_real_directory(path, label=f"{path.name} directory")
+    def _managed_file_location(self, path: Path) -> tuple[int, str]:
+        self._require_contained(path)
+        transaction = self._transaction()
+        relative = path.relative_to(self.root).parts
+        if len(relative) == 1:
+            return transaction.root_fd, relative[0]
+        if len(relative) == 3 and relative[0] == "objects":
+            self._ensure_kind_directory(relative[1], create=False)
+            return transaction.kind_fds[relative[1]][0], relative[2]
+        if len(relative) == 2 and relative[0] == "latest":
+            if transaction.latest_fd is None:
+                raise EvidenceCorruptionError("latest directory is not pinned")
+            return transaction.latest_fd, relative[1]
+        raise EvidenceCorruptionError("managed file path is not recognized")
+
+    def _fsync_descriptor(
+        self,
+        descriptor: int,
+        *,
+        label: str,
+        directory: bool,
+    ) -> None:
         try:
-            descriptor = os.open(
-                path,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW,
-            )
+            state = os.fstat(descriptor)
+            if directory:
+                self._require_directory_state(state, label=label)
+            else:
+                self._require_regular_state(state, label=label)
+            os.fsync(descriptor)
+        except EvidenceCorruptionError:
+            raise
         except OSError as exc:
             raise EvidenceCorruptionError(
-                f"directory could not be opened: {path.name}"
+                f"{label} could not be made durable"
             ) from exc
-        try:
-            try:
-                state = os.fstat(descriptor)
-                if not stat.S_ISDIR(state.st_mode):
-                    raise OSError("directory descriptor is invalid")
-                os.fsync(descriptor)
-            except OSError as exc:
-                raise EvidenceCorruptionError(
-                    f"directory could not be made durable: {path.name}"
-                ) from exc
-        finally:
-            os.close(descriptor)
+
+    def _fsync_directory(self, path: Path) -> None:
+        transaction = self._transaction()
+        if path == self.root:
+            descriptor = transaction.root_fd
+        elif path == self._objects_dir:
+            descriptor = transaction.objects_fd
+        elif path == self._latest_dir:
+            descriptor = transaction.latest_fd
+        elif path.parent == self._objects_dir:
+            self._ensure_kind_directory(path.name, create=False)
+            descriptor = transaction.kind_fds[path.name][0]
+        else:
+            raise EvidenceCorruptionError("managed directory is not recognized")
+        if descriptor is None:
+            raise EvidenceCorruptionError("managed directory is not pinned")
+        self._fsync_descriptor(
+            descriptor,
+            label=f"{path.name} directory",
+            directory=True,
+        )
 
     def _read_regular(self, path: Path, *, label: str) -> bytes:
-        state = self._path_state(path, label=label)
+        parent_fd, name = self._managed_file_location(path)
+        state = self._entry_state(parent_fd, name, label=label)
         if state is None:
             raise EvidenceCorruptionError(f"{label} is missing")
         self._require_regular_state(state, label=label)
         if state.st_size > _MAX_CANONICAL_BYTES:
             raise EvidenceCorruptionError(f"{label} is too large")
         try:
-            descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW)
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | _NOFOLLOW,
+                dir_fd=parent_fd,
+            )
         except OSError as exc:
             raise EvidenceCorruptionError(
                 f"{label} could not be opened safely"
@@ -1208,6 +1672,10 @@ class ImmutableStrategyEvidenceStore:
                 if total_bytes > _MAX_CANONICAL_BYTES:
                     raise EvidenceCorruptionError(f"{label} is too large")
                 chunks.append(chunk)
+            current = self._entry_state(parent_fd, name, label=label)
+            if not self._same_identity(current, descriptor_state):
+                raise EvidenceCorruptionError(f"{label} changed while reading")
+            self._validate_transaction()
             return b"".join(chunks)
         except OSError as exc:
             raise EvidenceCorruptionError(f"{label} could not be read") from exc
@@ -1215,12 +1683,17 @@ class ImmutableStrategyEvidenceStore:
             os.close(descriptor)
 
     def _redurable_regular_file(self, path: Path, *, label: str) -> None:
-        state = self._path_state(path, label=label)
+        parent_fd, name = self._managed_file_location(path)
+        state = self._entry_state(parent_fd, name, label=label)
         if state is None:
             raise EvidenceCorruptionError(f"{label} is missing")
         self._require_regular_state(state, label=label)
         try:
-            descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW)
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | _NOFOLLOW,
+                dir_fd=parent_fd,
+            )
         except OSError as exc:
             raise EvidenceCorruptionError(
                 f"{label} could not be reopened safely"
@@ -1235,12 +1708,15 @@ class ImmutableStrategyEvidenceStore:
                 or state.st_ino != descriptor_state.st_ino
             ):
                 raise EvidenceCorruptionError(f"{label} changed while opening")
-            try:
-                os.fsync(descriptor)
-            except OSError as exc:
-                raise EvidenceCorruptionError(
-                    f"{label} could not be made durable"
-                ) from exc
+            self._fsync_descriptor(
+                descriptor,
+                label=label,
+                directory=False,
+            )
+            current = self._entry_state(parent_fd, name, label=label)
+            if not self._same_identity(current, descriptor_state):
+                raise EvidenceCorruptionError(f"{label} changed while syncing")
+            self._validate_transaction()
         finally:
             os.close(descriptor)
 
@@ -1275,6 +1751,20 @@ class ImmutableStrategyEvidenceStore:
         self._require_contained(path)
         return path
 
+    def _object_state(
+        self,
+        kind: str,
+        object_id: str,
+    ) -> os.stat_result | None:
+        transaction = self._transaction()
+        self._ensure_kind_directory(kind, create=True)
+        kind_fd, _state = transaction.kind_fds[kind]
+        return self._entry_state(
+            kind_fd,
+            f"{object_id}.json",
+            label="evidence object",
+        )
+
     def _pointer_path(self, kind: str) -> Path:
         _require_kind(kind)
         path = self._latest_dir / f"{kind}.json"
@@ -1282,9 +1772,11 @@ class ImmutableStrategyEvidenceStore:
         return path
 
     def _write_immutable_object(self, path: Path, payload: bytes) -> None:
+        parent_fd, name = self._managed_file_location(path)
+        self._validate_transaction()
         flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW
         try:
-            descriptor = os.open(path, flags, 0o600)
+            descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
         except FileExistsError as exc:
             raise EvidenceCollisionError(
                 "evidence object appeared during locked creation"
@@ -1312,8 +1804,14 @@ class ImmutableStrategyEvidenceStore:
                 ) from exc
         finally:
             os.close(descriptor)
+        created = self._entry_state(parent_fd, name, label="evidence object")
+        if created is None:
+            raise EvidenceCorruptionError("evidence object disappeared")
+        self._require_regular_state(created, label="evidence object")
+        self._validate_transaction()
         self._fsync_directory(path.parent)
         self._fsync_directory(self._objects_dir)
+        self._validate_transaction()
 
     def _read_envelope(
         self,
@@ -1348,26 +1846,102 @@ class ImmutableStrategyEvidenceStore:
             )
         return envelope, raw
 
+    def _journal_lines(self) -> Iterator[bytes]:
+        transaction = self._transaction()
+        state = self._entry_state(
+            transaction.root_fd,
+            "events.jsonl",
+            label="event journal",
+        )
+        if state is None:
+            return
+        self._require_regular_state(state, label="event journal")
+        try:
+            descriptor = os.open(
+                "events.jsonl",
+                os.O_RDONLY | _NOFOLLOW,
+                dir_fd=transaction.root_fd,
+            )
+        except OSError as exc:
+            raise EvidenceCorruptionError(
+                "event journal could not be opened safely"
+            ) from exc
+        try:
+            descriptor_state = self._require_regular_descriptor(
+                descriptor,
+                label="event journal",
+            )
+            if not self._same_identity(state, descriptor_state):
+                raise EvidenceCorruptionError(
+                    "event journal changed while opening"
+                )
+            buffer = b""
+            while True:
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except OSError as exc:
+                    raise EvidenceCorruptionError(
+                        "event journal could not be read"
+                    ) from exc
+                if not chunk:
+                    break
+                buffer += chunk
+                while True:
+                    newline = buffer.find(b"\n")
+                    if newline < 0:
+                        break
+                    line = buffer[:newline]
+                    buffer = buffer[newline + 1 :]
+                    if not line:
+                        raise EvidenceCorruptionError(
+                            "event journal contains a blank line"
+                        )
+                    if len(line) > _MAX_JOURNAL_LINE_BYTES:
+                        raise EvidenceCorruptionError(
+                            "event journal line is too large"
+                        )
+                    yield line
+                if len(buffer) > _MAX_JOURNAL_LINE_BYTES:
+                    raise EvidenceCorruptionError(
+                        "event journal line is too large"
+                    )
+            if buffer:
+                raise EvidenceCorruptionError(
+                    "event journal has a torn final line"
+                )
+            current = self._entry_state(
+                transaction.root_fd,
+                "events.jsonl",
+                label="event journal",
+            )
+            if not self._same_identity(current, descriptor_state):
+                raise EvidenceCorruptionError(
+                    "event journal changed while reading"
+                )
+            self._validate_transaction()
+        finally:
+            os.close(descriptor)
+
     def _replay(
         self,
     ) -> tuple[tuple[EvidenceEvent, ...], tuple[EvidenceEnvelope, ...]]:
-        state = self._path_state(self._events_path, label="event journal")
+        transaction = self._transaction()
+        state = self._entry_state(
+            transaction.root_fd,
+            "events.jsonl",
+            label="event journal",
+        )
         if state is None:
             return (), ()
-        raw = self._read_regular(self._events_path, label="event journal")
-        if not raw:
-            return (), ()
-        if not raw.endswith(b"\n"):
-            raise EvidenceCorruptionError("event journal has a torn final line")
-        lines = raw[:-1].split(b"\n")
-        if any(not line for line in lines):
-            raise EvidenceCorruptionError("event journal contains a blank line")
 
         events: list[EvidenceEvent] = []
         envelopes: list[EvidenceEnvelope] = []
         object_ids: set[str] = set()
         expected_previous = _ZERO_HASH
-        for expected_sequence, line in enumerate(lines, start=1):
+        for expected_sequence, line in enumerate(
+            self._journal_lines(),
+            start=1,
+        ):
             try:
                 decoded = json.loads(line.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1434,10 +2008,14 @@ class ImmutableStrategyEvidenceStore:
         admitted_object_ids: frozenset[str],
     ) -> tuple[EvidenceEnvelope, ...]:
         orphans: list[EvidenceEnvelope] = []
+        transaction = self._transaction()
+        if transaction.objects_fd is None:
+            raise EvidenceCorruptionError("objects directory is not pinned")
         for kind in sorted(_ALLOWED_KINDS):
             kind_path = self._kind_directory(kind)
-            state = self._path_state(
-                kind_path,
+            state = self._entry_state(
+                transaction.objects_fd,
+                kind,
                 label="object kind directory",
             )
             if state is None:
@@ -1446,8 +2024,10 @@ class ImmutableStrategyEvidenceStore:
                 state,
                 label="object kind directory",
             )
+            self._ensure_kind_directory(kind, create=False)
+            kind_fd, _kind_state = transaction.kind_fds[kind]
             try:
-                children = tuple(sorted(kind_path.iterdir()))
+                children = tuple(sorted(os.listdir(kind_fd)))
             except OSError as exc:
                 raise EvidenceCorruptionError(
                     "object kind directory could not be listed"
@@ -1455,12 +2035,13 @@ class ImmutableStrategyEvidenceStore:
             pattern = re.compile(
                 rf"^{re.escape(kind)}-[0-9a-f]{{64}}\.json$"
             )
-            for object_path in children:
-                if pattern.fullmatch(object_path.name) is None:
+            for object_name in children:
+                if pattern.fullmatch(object_name) is None:
                     continue
-                object_id = object_path.name.removesuffix(".json")
+                object_id = object_name.removesuffix(".json")
                 if object_id in admitted_object_ids:
                     continue
+                object_path = kind_path / object_name
                 try:
                     envelope, _ = self._read_envelope(
                         object_path,
@@ -1472,18 +2053,37 @@ class ImmutableStrategyEvidenceStore:
                 orphans.append(envelope)
         return tuple(orphans)
 
-    def _append_event(self, event: EvidenceEvent) -> None:
+    def _preflight_event(self, event: EvidenceEvent) -> bytes:
         line = event.canonical_json_bytes() + b"\n"
-        state = self._path_state(self._events_path, label="event journal")
+        if len(line) - 1 > _MAX_JOURNAL_LINE_BYTES:
+            raise EvidenceCorruptionError("event journal line is too large")
+        return line
+
+    def _preflight_pointer(self, pointer: EvidencePointer) -> bytes:
+        payload = pointer.canonical_json_bytes()
+        if len(payload) > _MAX_CANONICAL_BYTES:
+            raise EvidenceCorruptionError("latest pointer is too large")
+        return payload
+
+    def _append_event(self, event: EvidenceEvent) -> None:
+        line = self._preflight_event(event)
+        transaction = self._transaction()
+        self._validate_transaction()
+        state = self._entry_state(
+            transaction.root_fd,
+            "events.jsonl",
+            label="event journal",
+        )
         if state is not None:
             self._require_regular_state(state, label="event journal")
-            if state.st_size + len(line) > _MAX_CANONICAL_BYTES:
-                raise EvidenceCorruptionError("event journal is too large")
-        elif len(line) > _MAX_CANONICAL_BYTES:
-            raise EvidenceCorruptionError("event journal is too large")
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW
         try:
-            descriptor = os.open(self._events_path, flags, 0o600)
+            descriptor = os.open(
+                "events.jsonl",
+                flags,
+                0o600,
+                dir_fd=transaction.root_fd,
+            )
         except OSError as exc:
             raise EvidenceCorruptionError(
                 "event journal could not be opened safely"
@@ -1493,8 +2093,13 @@ class ImmutableStrategyEvidenceStore:
                 descriptor,
                 label="event journal",
             )
-            if descriptor_state.st_size + len(line) > _MAX_CANONICAL_BYTES:
-                raise EvidenceCorruptionError("event journal is too large")
+            if state is not None and not self._same_identity(
+                state,
+                descriptor_state,
+            ):
+                raise EvidenceCorruptionError(
+                    "event journal changed while opening"
+                )
             try:
                 if os.write(descriptor, line) != len(line):
                     raise OSError("incomplete evidence event append")
@@ -1505,7 +2110,21 @@ class ImmutableStrategyEvidenceStore:
                 ) from exc
         finally:
             os.close(descriptor)
-        self._fsync_directory(self.root)
+        current = self._entry_state(
+            transaction.root_fd,
+            "events.jsonl",
+            label="event journal",
+        )
+        if not self._same_identity(current, descriptor_state):
+            raise EvidenceCorruptionError(
+                "event journal changed while appending"
+            )
+        self._validate_transaction()
+        self._fsync_descriptor(
+            transaction.root_fd,
+            label="evidence root",
+            directory=True,
+        )
 
     def _pointer_for(self, event: EvidenceEvent) -> EvidencePointer:
         return EvidencePointer(
@@ -1529,28 +2148,34 @@ class ImmutableStrategyEvidenceStore:
         return latest
 
     def _publish_pointer(self, pointer: EvidencePointer) -> None:
-        self._require_real_directory(
-            self._latest_dir,
-            label="latest directory",
-        )
+        transaction = self._transaction()
+        if transaction.latest_fd is None:
+            raise EvidenceCorruptionError("latest directory is not pinned")
+        self._validate_transaction()
         path = self._pointer_path(pointer.kind)
-        state = self._path_state(path, label="latest pointer")
+        name = path.name
+        state = self._entry_state(
+            transaction.latest_fd,
+            name,
+            label="latest pointer",
+        )
         if state is not None:
             self._require_regular_state(state, label="latest pointer")
-        payload = pointer.canonical_json_bytes()
-        temp_path = self._latest_dir / (
+        payload = self._preflight_pointer(pointer)
+        temp_name = (
             f".{pointer.kind}.{os.getpid()}.{threading.get_ident()}."
             f"{time.time_ns()}.tmp"
         )
-        self._require_contained(temp_path)
         descriptor: int | None = None
+        staged_state: os.stat_result | None = None
         try:
             descriptor = os.open(
-                temp_path,
+                temp_name,
                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW,
                 0o600,
+                dir_fd=transaction.latest_fd,
             )
-            self._require_regular_descriptor(
+            staged_state = self._require_regular_descriptor(
                 descriptor,
                 label="staged latest pointer",
             )
@@ -1563,14 +2188,34 @@ class ImmutableStrategyEvidenceStore:
             os.fsync(descriptor)
             os.close(descriptor)
             descriptor = None
-            self._require_real_directory(
-                self._latest_dir,
-                label="latest directory",
+            current_staged = self._entry_state(
+                transaction.latest_fd,
+                temp_name,
+                label="staged latest pointer",
             )
-            os.replace(temp_path, path)
+            if not self._same_identity(current_staged, staged_state):
+                raise EvidenceCorruptionError(
+                    "staged latest pointer changed before publication"
+                )
+            self._validate_transaction()
+            os.replace(
+                temp_name,
+                name,
+                src_dir_fd=transaction.latest_fd,
+                dst_dir_fd=transaction.latest_fd,
+            )
+            self._validate_transaction()
             self._redurable_regular_file(path, label="latest pointer")
-            self._fsync_directory(self._latest_dir)
-            self._fsync_directory(self.root)
+            self._fsync_descriptor(
+                transaction.latest_fd,
+                label="latest directory",
+                directory=True,
+            )
+            self._fsync_descriptor(
+                transaction.root_fd,
+                label="evidence root",
+                directory=True,
+            )
         except EvidenceCorruptionError:
             raise
         except OSError as exc:
@@ -1581,7 +2226,9 @@ class ImmutableStrategyEvidenceStore:
             if descriptor is not None:
                 os.close(descriptor)
             try:
-                temp_path.unlink(missing_ok=True)
+                os.unlink(temp_name, dir_fd=transaction.latest_fd)
+            except FileNotFoundError:
+                pass
             except OSError as exc:
                 raise EvidenceCorruptionError(
                     "staged latest pointer could not be cleaned"
@@ -1592,6 +2239,9 @@ class ImmutableStrategyEvidenceStore:
             )
 
     def _repair_latest(self, events: tuple[EvidenceEvent, ...]) -> None:
+        transaction = self._transaction()
+        if transaction.latest_fd is None:
+            raise EvidenceCorruptionError("latest directory is not pinned")
         self._require_real_directory(
             self._latest_dir,
             label="latest directory",
@@ -1608,7 +2258,7 @@ class ImmutableStrategyEvidenceStore:
                         label="latest pointer",
                     )
                     try:
-                        path.unlink()
+                        os.unlink(path.name, dir_fd=transaction.latest_fd)
                     except OSError as exc:
                         raise EvidenceCorruptionError(
                             f"stale latest pointer could not be removed: {kind}"
@@ -1625,8 +2275,17 @@ class ImmutableStrategyEvidenceStore:
                     )
                     continue
             self._publish_pointer(pointer)
-        self._fsync_directory(self._latest_dir)
-        self._fsync_directory(self.root)
+        self._fsync_descriptor(
+            transaction.latest_fd,
+            label="latest directory",
+            directory=True,
+        )
+        self._fsync_descriptor(
+            transaction.root_fd,
+            label="evidence root",
+            directory=True,
+        )
+        self._validate_transaction()
 
     def _verify_latest(self, events: tuple[EvidenceEvent, ...]) -> None:
         self._require_real_directory(
