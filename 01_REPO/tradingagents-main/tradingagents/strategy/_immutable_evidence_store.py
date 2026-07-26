@@ -1786,10 +1786,26 @@ class ImmutableStrategyEvidenceStore:
                 "evidence object could not be created"
             ) from exc
         try:
-            self._require_regular_descriptor(
+            descriptor_state = self._require_regular_descriptor(
                 descriptor,
                 label="evidence object",
             )
+            try:
+                self._validate_transaction()
+            except EvidenceCorruptionError:
+                current = self._entry_state(
+                    parent_fd,
+                    name,
+                    label="evidence object",
+                )
+                if self._same_identity(current, descriptor_state):
+                    os.unlink(name, dir_fd=parent_fd)
+                    self._fsync_descriptor(
+                        parent_fd,
+                        label="object kind directory",
+                        directory=True,
+                    )
+                raise
             try:
                 offset = 0
                 while offset < len(payload):
@@ -1808,7 +1824,22 @@ class ImmutableStrategyEvidenceStore:
         if created is None:
             raise EvidenceCorruptionError("evidence object disappeared")
         self._require_regular_state(created, label="evidence object")
-        self._validate_transaction()
+        try:
+            self._validate_transaction()
+        except EvidenceCorruptionError:
+            current = self._entry_state(
+                parent_fd,
+                name,
+                label="evidence object",
+            )
+            if self._same_identity(current, created):
+                os.unlink(name, dir_fd=parent_fd)
+                self._fsync_descriptor(
+                    parent_fd,
+                    label="object kind directory",
+                    directory=True,
+                )
+            raise
         self._fsync_directory(path.parent)
         self._fsync_directory(self._objects_dir)
         self._validate_transaction()

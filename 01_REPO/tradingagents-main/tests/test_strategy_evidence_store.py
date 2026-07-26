@@ -1616,6 +1616,52 @@ def test_kind_directory_swap_before_object_create_never_writes_outside(tmp_path)
     assert not tuple(outside.iterdir())
 
 
+def test_kind_directory_swap_at_object_open_leaves_no_outside_file(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    displaced = outside / "kind-displaced"
+    real_open = evidence_store_module.os.open
+    swapped = False
+
+    def swapping_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        name = os.fsdecode(path)
+        if (
+            not swapped
+            and dir_fd is not None
+            and flags & os.O_EXCL
+            and name.endswith(".json")
+        ):
+            swapped = True
+            kind_dir = root / "objects" / "evaluation-registration"
+            kind_dir.rename(displaced)
+            kind_dir.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(evidence_store_module.os, "open", swapping_open)
+    with pytest.raises(EvidenceCorruptionError):
+        ImmutableStrategyEvidenceStore(
+            root,
+            clock=_Clock(FIRST),
+        ).admit_checked(
+            _candidate(),
+            validate=lambda _prior, _new: None,
+        )
+
+    assert displaced.is_dir()
+    assert not tuple(displaced.glob("*.json"))
+
+
 def test_kind_directory_swap_during_object_read_fails_closed(tmp_path):
     store, root, _, admission = _admit(tmp_path)
     outside = tmp_path / "outside"
