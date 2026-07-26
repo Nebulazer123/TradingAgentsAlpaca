@@ -53,6 +53,14 @@ from .mutation_registry import (
     build_mutated_genome,
     build_mutation_cycle_id,
 )
+from .paper_execution_authorization import (
+    PAPER_EXECUTION_AUTHORIZATION_KIND,
+    PAPER_EXECUTION_AUTHORIZATION_MAX_TTL_SECONDS,
+    PAPER_EXECUTION_AUTHORIZATION_SCHEMA_VERSION,
+    AuthorizedPaperOrderRequest,
+    StrategyPaperExecutionAuthorizationLedger,
+    paper_account_fingerprint,
+)
 from .promotion_evidence import (
     ADMITTED_GENOME_WINDOW_SCHEMA_VERSION,
     EVALUATION_SOURCE_MANIFEST_SCHEMA_VERSION,
@@ -86,6 +94,9 @@ from .staged_intent import (
 __all__ = [
     "PAPER_COMPILER_DECIMAL_PRECISION",
     "PAPER_DECISION_SCHEMA_VERSION",
+    "PAPER_EXECUTION_AUTHORIZATION_KIND",
+    "PAPER_EXECUTION_AUTHORIZATION_MAX_TTL_SECONDS",
+    "PAPER_EXECUTION_AUTHORIZATION_SCHEMA_VERSION",
     "ADMITTED_GENOME_WINDOW_SCHEMA_VERSION",
     "EVALUATOR_DECIMAL_PRECISION",
     "EVALUATOR_VERSION",
@@ -109,6 +120,7 @@ __all__ = [
     "MUTATION_DECIMAL_MAX_FRACTIONAL_DIGITS",
     "STRATEGY_MUTATION_RECORD_SCHEMA_VERSION",
     "AdmittedGenomeWindow",
+    "AuthorizedPaperOrderRequest",
     "BaselineGenomeRegistration",
     "CatalystRelativeStrengthMutationBounds",
     "CatalystRelativeStrengthParameters",
@@ -139,6 +151,7 @@ __all__ = [
     "StrategyPromotionEvidence",
     "StrategyPromotionEvidenceError",
     "StrategyPromotionEvidenceLedger",
+    "StrategyPaperExecutionAuthorizationLedger",
     "StagedPaperIntent",
     "StrategyStagedIntentLedger",
     "StrategyObservation",
@@ -153,5 +166,6 @@ __all__ = [
     "evaluate_genome_window",
     "load_strategy_evaluation_policy",
     "load_strategy_evolution_policy",
+    "paper_account_fingerprint",
     "require_active_evaluation_runtime",
 ]

@@ -20,6 +20,7 @@ from types import MappingProxyType
 
 STRATEGY_EVIDENCE_STORE_SCHEMA_VERSION = 1
 STAGED_PAPER_INTENT_KIND = "staged-paper-intent"
+PAPER_EXECUTION_AUTHORIZATION_KIND = "paper-execution-authorization"
 
 _UTC = dt.timezone.utc
 _ZERO_HASH = "0" * 64
@@ -32,6 +33,7 @@ _ALLOWED_KINDS = frozenset(
         "baseline-genome",
         "mutation-record",
         STAGED_PAPER_INTENT_KIND,
+        PAPER_EXECUTION_AUTHORIZATION_KIND,
     }
 )
 _STAGED_POINTER_NAME = re.compile(

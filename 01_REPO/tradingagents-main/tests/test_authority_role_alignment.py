@@ -163,11 +163,14 @@ def test_role_contract_does_not_cross_the_chain_of_command(role, forbidden):
     assert allowed.isdisjoint(forbidden)
 
 
-def test_execution_requires_a_separately_authorized_normal_trade_intent():
+def test_execution_requires_bounded_paper_and_separate_normal_trade_inputs():
     execution = _registry()["roles"]["execution_operator"]
 
     assert execution["allowed_actions"] == ["order_submit"]
-    assert execution["required_inputs"] == ["authorized_normal_trade_intent"]
+    assert execution["required_inputs"] == [
+        "authorized_paper_order_request",
+        "authorized_normal_trade_intent",
+    ]
 
 
 def test_strategy_tournament_command_is_intent_only_and_cannot_write_orders():

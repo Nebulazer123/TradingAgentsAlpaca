@@ -126,6 +126,7 @@
         "recovery_order_submit"
       ],
       "required_inputs": [
+        "authorized_paper_order_request",
         "authorized_normal_trade_intent"
       ],
       "command_family": [
