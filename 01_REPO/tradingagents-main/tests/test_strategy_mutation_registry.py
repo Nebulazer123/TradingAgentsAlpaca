@@ -978,6 +978,68 @@ def test_exact_mutation_retry_is_event_silent_and_keeps_first_seen_bytes(
     assert sum(item["kind"] == "mutation-record" for item in events) == 1
 
 
+def test_exact_retry_of_non_tail_ordinal_succeeds_after_later_ordinal(
+    durable_mutation_evidence: _DurableMutationEvidence,
+):
+    # Break caught: applying new-admission ordinal ordering to an exact old retry.
+    from tradingagents.strategy.mutation_registry import build_mutated_genome
+
+    first = _register_mutation(durable_mutation_evidence)
+    _register_mutation(
+        durable_mutation_evidence,
+        ordinal=2,
+        child=build_mutated_genome(
+            durable_mutation_evidence.parent,
+            "current-aggressive.min_score",
+            "-0.1",
+            durable_mutation_evidence.policy,
+        ),
+    )
+
+    retried = _register_mutation(durable_mutation_evidence)
+
+    assert retried.canonical_json_bytes() == first.canonical_json_bytes()
+
+
+@pytest.mark.parametrize("reuse_later_child", (False, True))
+def test_conflicting_non_tail_cycle_slot_or_child_still_rejects(
+    durable_mutation_evidence: _DurableMutationEvidence,
+    reuse_later_child: bool,
+):
+    # Break caught: treating any old slot or child as an exact retry.
+    from tradingagents.strategy.mutation_registry import build_mutated_genome
+
+    _register_mutation(durable_mutation_evidence)
+    later_child = build_mutated_genome(
+        durable_mutation_evidence.parent,
+        "current-aggressive.min_score",
+        "-0.1",
+        durable_mutation_evidence.policy,
+    )
+    _register_mutation(
+        durable_mutation_evidence,
+        ordinal=2,
+        child=later_child,
+    )
+    conflicting_child = (
+        later_child
+        if reuse_later_child
+        else build_mutated_genome(
+            durable_mutation_evidence.parent,
+            "current-aggressive.min_score",
+            "0.05",
+            durable_mutation_evidence.policy,
+        )
+    )
+
+    with pytest.raises(ValueError, match="slot|child"):
+        _register_mutation(
+            durable_mutation_evidence,
+            ordinal=1,
+            child=conflicting_child,
+        )
+
+
 def test_exact_retry_still_revalidates_durable_source_bytes(
     durable_mutation_evidence: _DurableMutationEvidence,
 ):
@@ -1642,6 +1704,153 @@ def test_baseline_schema_bytes_parser_identity_and_authority(
     assert baseline.can_submit_orders is False
 
 
+def test_baseline_direct_model_recomputes_content_identity(
+    durable_mutation_evidence: _DurableMutationEvidence,
+):
+    # Break caught: accepting an arbitrary regex-valid ID on the public model.
+    from tradingagents.strategy._immutable_evidence_store import (
+        ImmutableStrategyEvidenceStore,
+    )
+    from tradingagents.strategy.mutation_registry import (
+        BaselineGenomeRegistration,
+    )
+
+    envelope = next(
+        item
+        for item in ImmutableStrategyEvidenceStore(
+            durable_mutation_evidence.root
+        ).rebuild()
+        if item.kind == "baseline-genome"
+    )
+    baseline = BaselineGenomeRegistration.from_envelope(envelope)
+
+    assert dataclasses.replace(baseline) == baseline
+    assert (
+        BaselineGenomeRegistration.from_envelope(envelope).canonical_json_bytes()
+        == baseline.canonical_json_bytes()
+    )
+    forged_id = "baseline-genome-" + (
+        "0" * 64
+        if not baseline.baseline_id.endswith("0" * 64)
+        else "1" * 64
+    )
+    with pytest.raises(ValueError, match="identity"):
+        dataclasses.replace(baseline, baseline_id=forged_id)
+
+
+def test_verify_and_rebuild_reject_forged_standalone_baseline_authority(
+    tmp_path: Path,
+):
+    # Break caught: skipping baseline parsing when no mutation references it.
+    from tradingagents.strategy.mutation_registry import StrategyMutationRegistry
+
+    genome = StrategyGenome.create(
+        family=StrategyFamily.CURRENT_AGGRESSIVE,
+        parameters=CurrentAggressiveParameters("0.75"),
+        generation=0,
+        parent_id="root",
+    )
+    policy = _policy()
+    payload = {
+        "schema_version": 1,
+        "genome": genome.to_dict(),
+        "genome_canonical_sha256": hashlib.sha256(
+            genome.canonical_json_bytes()
+        ).hexdigest(),
+        "evolution_policy_sha256": hashlib.sha256(
+            policy.canonical_json_bytes()
+        ).hexdigest(),
+        "analysis_only": False,
+        "execution_authority": "orders",
+        "can_submit_orders": True,
+    }
+    root = tmp_path / "forged-standalone-baseline"
+    _admit_material(
+        root,
+        clock=dt.datetime(2030, 1, 1, 15, 1, tzinfo=UTC),
+        kind="baseline-genome",
+        effective_at="2030-01-01T15:00:00+00:00",
+        payload=payload,
+    )
+    registry = StrategyMutationRegistry(root)
+
+    with pytest.raises(ValueError, match="authority"):
+        registry.verify()
+    with pytest.raises(ValueError, match="authority"):
+        registry.rebuild()
+
+
+def test_verify_and_rebuild_reject_duplicate_baseline_replay(
+    durable_mutation_evidence: _DurableMutationEvidence,
+):
+    # Break caught: replaying duplicate semantic/full baseline identities.
+    from tradingagents.strategy._immutable_evidence_store import (
+        ImmutableStrategyEvidenceStore,
+    )
+    from tradingagents.strategy.mutation_registry import StrategyMutationRegistry
+
+    baseline = next(
+        item
+        for item in ImmutableStrategyEvidenceStore(
+            durable_mutation_evidence.root
+        ).rebuild()
+        if item.kind == "baseline-genome"
+    )
+    _admit_material(
+        durable_mutation_evidence.root,
+        clock=dt.datetime(2030, 1, 3, 16, 5, tzinfo=UTC),
+        kind="baseline-genome",
+        effective_at="2029-12-31T14:01:00+00:00",
+        payload=dict(baseline.payload),
+    )
+    registry = StrategyMutationRegistry(durable_mutation_evidence.root)
+
+    with pytest.raises(ValueError, match="duplicate baseline"):
+        registry.verify()
+    with pytest.raises(ValueError, match="duplicate baseline"):
+        registry.rebuild()
+
+
+def test_verify_and_rebuild_reject_baseline_semantic_collision_with_child(
+    durable_mutation_evidence: _DurableMutationEvidence,
+):
+    # Break caught: replay accepting a root that reintroduces a mutation child.
+    from tradingagents.strategy.mutation_registry import StrategyMutationRegistry
+
+    child = _register_mutation(durable_mutation_evidence).child_genome
+    colliding_root = StrategyGenome.create(
+        family=child.family,
+        parameters=child.parameters,
+        generation=0,
+        parent_id="root",
+    )
+    _admit_material(
+        durable_mutation_evidence.root,
+        clock=dt.datetime(2030, 1, 3, 16, 5, tzinfo=UTC),
+        kind="baseline-genome",
+        effective_at="2030-01-03T16:04:00+00:00",
+        payload={
+            "schema_version": 1,
+            "genome": colliding_root.to_dict(),
+            "genome_canonical_sha256": hashlib.sha256(
+                colliding_root.canonical_json_bytes()
+            ).hexdigest(),
+            "evolution_policy_sha256": hashlib.sha256(
+                durable_mutation_evidence.policy.canonical_json_bytes()
+            ).hexdigest(),
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+        },
+    )
+    registry = StrategyMutationRegistry(durable_mutation_evidence.root)
+
+    with pytest.raises(ValueError, match="semantic"):
+        registry.verify()
+    with pytest.raises(ValueError, match="semantic"):
+        registry.rebuild()
+
+
 @pytest.mark.parametrize("defect", ("noop", "family", "generation", "parent_id"))
 def test_registry_rejects_invalid_child_shape(
     durable_mutation_evidence: _DurableMutationEvidence,
@@ -2029,6 +2238,56 @@ def test_mutated_genome_accepts_one_canonical_bounded_field_delta():
         build_mutated_genome(parent, "current-aggressive.min_score", "0.10", _policy())
     with pytest.raises(ValueError):
         build_mutated_genome(parent, "hold-cash.anything", "0.1", _policy())
+
+
+@pytest.mark.parametrize(
+    ("parameter_path", "signed_delta"),
+    (
+        ("pullback-support.min_daily_change_fraction", "0.03"),
+        ("pullback-support.max_daily_change_fraction", "-0.03"),
+    ),
+)
+def test_pullback_mutation_rejects_crossed_min_max_invariants(
+    parameter_path: str,
+    signed_delta: str,
+):
+    # Break caught: bypassing the existing pullback cross-field domain invariant.
+    from tradingagents.strategy.mutation_registry import build_mutated_genome
+
+    parent = StrategyGenome.create(
+        family=StrategyFamily.PULLBACK_SUPPORT,
+        parameters=PullbackSupportParameters("-0.01", "0.01", "1.5"),
+        generation=0,
+        parent_id="root",
+    )
+
+    with pytest.raises(ValueError):
+        build_mutated_genome(
+            parent,
+            parameter_path,
+            signed_delta,
+            _policy(),
+        )
+
+
+def test_mutated_genome_rejects_thirty_three_fractional_digit_delta():
+    # Break caught: accepting a delta beyond the frozen 32-place envelope.
+    from tradingagents.strategy.mutation_registry import build_mutated_genome
+
+    parent = StrategyGenome.create(
+        family=StrategyFamily.CURRENT_AGGRESSIVE,
+        parameters=CurrentAggressiveParameters("0.75"),
+        generation=0,
+        parent_id="root",
+    )
+
+    with pytest.raises(ValueError, match="fixed-point"):
+        build_mutated_genome(
+            parent,
+            "current-aggressive.min_score",
+            "0." + ("0" * 32) + "1",
+            _policy(),
+        )
 
 
 def test_baseline_registration_is_root_only_canonical_and_analysis_only(tmp_path):

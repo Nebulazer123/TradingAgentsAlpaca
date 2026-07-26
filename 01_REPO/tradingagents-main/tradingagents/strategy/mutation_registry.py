@@ -262,6 +262,21 @@ class BaselineGenomeRegistration:
                 raise StrategyMutationRegistryError(f"{label} is not canonical UTC")
         if self.effective_at > self.recorded_at:
             raise StrategyMutationRegistryError("baseline effective_at exceeds recorded_at")
+        expected_baseline_id = _expected_object_id(
+            kind="baseline-genome",
+            effective_at=self.effective_at,
+            payload=self._evidence_payload(),
+        )
+        if self.baseline_id != expected_baseline_id:
+            raise StrategyMutationRegistryError(
+                "baseline_id does not match evidence identity"
+            )
+
+    def _evidence_payload(self) -> dict[str, object]:
+        payload = self.to_dict()
+        for field_name in ("baseline_id", "effective_at", "recorded_at"):
+            del payload[field_name]
+        return payload
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -300,7 +315,7 @@ class BaselineGenomeRegistration:
             raise StrategyMutationRegistryError("baseline schema_version is invalid")
         if payload["analysis_only"] is not True or payload["execution_authority"] != "none" or payload["can_submit_orders"] is not False:
             raise StrategyMutationRegistryError("baseline authority is invalid")
-        return cls(
+        baseline = cls(
             baseline_id=envelope.object_id,
             genome=StrategyGenome.from_dict(payload["genome"]),  # type: ignore[arg-type]
             genome_canonical_sha256=payload["genome_canonical_sha256"],  # type: ignore[arg-type]
@@ -308,6 +323,11 @@ class BaselineGenomeRegistration:
             effective_at=envelope.effective_at,
             recorded_at=envelope.recorded_at,
         )
+        if baseline._evidence_payload() != payload:
+            raise StrategyMutationRegistryError(
+                "baseline payload round trip is not exact"
+            )
+        return baseline
 
 
 @dataclass(frozen=True, slots=True)
@@ -932,11 +952,48 @@ def _validate_mutation_indexes(
 def _validate_mutation_snapshot(
     snapshot: tuple[EvidenceEnvelope, ...],
 ) -> tuple[StrategyMutationRecord, ...]:
+    baselines = tuple(
+        BaselineGenomeRegistration.from_envelope(envelope)
+        for envelope in snapshot
+        if envelope.kind == "baseline-genome"
+    )
     records = tuple(
         StrategyMutationRecord.from_envelope(envelope)
         for envelope in snapshot
         if envelope.kind == "mutation-record"
     )
+    for index, baseline in enumerate(baselines):
+        others = baselines[:index] + baselines[index + 1 :]
+        if any(
+            item.genome.genome_id == baseline.genome.genome_id
+            for item in others
+        ):
+            raise StrategyMutationRegistryError(
+                "duplicate baseline semantic genome"
+            )
+        if any(
+            item.genome_canonical_sha256
+            == baseline.genome_canonical_sha256
+            for item in others
+        ):
+            raise StrategyMutationRegistryError(
+                "duplicate baseline full genome"
+            )
+        if any(
+            item.child_genome.genome_id == baseline.genome.genome_id
+            for item in records
+        ):
+            raise StrategyMutationRegistryError(
+                "duplicate semantic genome from mutation child"
+            )
+        if any(
+            item.child_genome_canonical_sha256
+            == baseline.genome_canonical_sha256
+            for item in records
+        ):
+            raise StrategyMutationRegistryError(
+                "duplicate full genome from mutation child"
+            )
     for record in records:
         _validate_mutation_dependencies(
             snapshot,
@@ -1146,6 +1203,7 @@ class StrategyMutationRegistry:
                 exclude_object_id=(
                     record.mutation_id if exact_retry else None
                 ),
+                replay=exact_retry,
             )
 
         admission = self._store.admit_checked(candidate, validate=validate)
