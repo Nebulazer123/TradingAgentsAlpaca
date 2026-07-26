@@ -928,7 +928,7 @@ def _git_text(repo_root: Path, *args: str) -> str:
     except subprocess.TimeoutExpired as exc:
         raise StrategyPromotionEvidenceError("Git preflight timed out") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValueError("Git preflight failed") from exc
+        raise StrategyPromotionEvidenceError("Git preflight failed") from exc
 
 
 def _git_bytes(repo_root: Path, *args: str) -> bytes:
@@ -945,7 +945,9 @@ def _git_bytes(repo_root: Path, *args: str) -> bytes:
             "Git object preflight timed out"
         ) from exc
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValueError("Git object preflight failed") from exc
+        raise StrategyPromotionEvidenceError(
+            "Git object preflight failed"
+        ) from exc
 
 
 def _read_regular_source(repo_root: Path, relative: str) -> bytes:

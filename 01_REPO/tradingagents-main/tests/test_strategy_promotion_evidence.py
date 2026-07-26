@@ -744,6 +744,102 @@ def test_git_preflight_timeout_fails_closed_before_evidence_or_evaluator(
 
 
 @pytest.mark.parametrize(
+    ("helper", "failure_type", "message"),
+    (
+        ("git_text", OSError, "Git preflight failed"),
+        (
+            "git_text",
+            subprocess.CalledProcessError,
+            "Git preflight failed",
+        ),
+        ("git_bytes", OSError, "Git object preflight failed"),
+        (
+            "git_bytes",
+            subprocess.CalledProcessError,
+            "Git object preflight failed",
+        ),
+    ),
+)
+def test_registration_git_helper_failures_use_facade_error_before_work(
+    tmp_path,
+    monkeypatch,
+    helper,
+    failure_type,
+    message,
+):
+    # Break caught: leaking a plain ValueError from a public Git preflight.
+    import tradingagents.strategy.promotion_evidence as module
+
+    evidence_root = tmp_path / "evidence"
+    commit = _run_git(REPO_ROOT, "rev-parse", "HEAD")
+    ledger = module.StrategyPromotionEvidenceLedger(
+        evidence_root,
+        repo_root=REPO_ROOT,
+        clock=_Clock(dt.datetime(2029, 12, 31, 16, 0, tzinfo=UTC)),
+    )
+    evolution_policy, evaluation_policy = _policies()
+    original_run = module.subprocess.run
+    evaluator_calls = 0
+    store_calls = 0
+    failure = (
+        OSError("local Git unavailable")
+        if failure_type is OSError
+        else subprocess.CalledProcessError(
+            2,
+            ("git", "preflight"),
+        )
+    )
+
+    def controlled_run(command, **kwargs):
+        target = (
+            helper == "git_text"
+            and command == ("git", "rev-parse", "HEAD")
+        ) or (
+            helper == "git_bytes"
+            and command[:2] == ("git", "show")
+        )
+        if target:
+            raise failure
+        return original_run(command, **kwargs)
+
+    def forbidden_evaluator(*_args, **_kwargs):
+        nonlocal evaluator_calls
+        evaluator_calls += 1
+        raise AssertionError("evaluator ran after Git preflight failure")
+
+    def forbidden_store(*_args, **_kwargs):
+        nonlocal store_calls
+        store_calls += 1
+        raise AssertionError("store ran after Git preflight failure")
+
+    monkeypatch.setattr(module.subprocess, "run", controlled_run)
+    monkeypatch.setattr(module, "evaluate_genome_window", forbidden_evaluator)
+    monkeypatch.setattr(
+        type(ledger._store),
+        "admit_checked",
+        forbidden_store,
+    )
+
+    with pytest.raises(
+        module.StrategyPromotionEvidenceError,
+        match=message,
+    ) as caught:
+        ledger.register(
+            genome=_genome(),
+            evolution_policy=evolution_policy,
+            evaluation_policy=evaluation_policy,
+            windows=_windows(),
+            evaluation_code_commit=commit,
+            effective_at=dt.datetime(2029, 12, 31, 15, 0, tzinfo=UTC),
+        )
+
+    assert caught.value.__cause__ is failure
+    assert evaluator_calls == 0
+    assert store_calls == 0
+    assert not evidence_root.exists()
+
+
+@pytest.mark.parametrize(
     ("failure_path", "failure_type"),
     (
         ("inside_oserror", OSError),
