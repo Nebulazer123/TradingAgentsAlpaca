@@ -2615,6 +2615,185 @@ def test_review_fix_aggregate_tuple_conflict_and_later_unrelated_event(
     )
 
 
+def test_final_aggregate_cross_set_collision_rejects_unrelated_candidate(
+    tmp_path,
+) -> None:
+    from tests.test_strategy_paper_execution_authorization import _authorize_once
+    from tests.test_strategy_staged_intent import _stage_with_times
+    from tradingagents.strategy._immutable_evidence_store import (
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    root, registration, promotion, observation_a = _admitted_buy_case(tmp_path)
+    module = importlib.import_module("tradingagents.strategy.shadow_attestation")
+    attestation_a = module.StrategyShadowEvidenceLedger(
+        root,
+        repo_root=REPO_ROOT,
+        clock=lambda: dt.datetime(2030, 4, 1, 14, 3, tzinfo=UTC),
+    ).assemble(
+        promotion_evidence=promotion,
+        observations=(observation_a,),
+        actor_role="integrity_verifier",
+    )
+
+    orphan_payload = attestation_a.to_dict()
+    orphan_payload["total_fees_usd"] = "0.16"
+    _reidentify_journal_payload(
+        orphan_payload,
+        kind="paper-shadow-attestation",
+        id_field="shadow_attestation_id",
+    )
+    orphan_attestation = module.StrategyShadowAttestation.from_dict(
+        orphan_payload
+    )
+    assert (
+        orphan_attestation.shadow_observation_ids
+        == attestation_a.shadow_observation_ids
+    )
+    assert (
+        orphan_attestation.canonical_json_bytes()
+        != attestation_a.canonical_json_bytes()
+    )
+    crash_store = _CrashShadowStore.make(
+        ImmutableStrategyEvidenceStore,
+        root,
+        clock=lambda: dt.datetime(2030, 4, 1, 14, 3, 30, tzinfo=UTC),
+        seam="object",
+    )
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crash_store.admit_checked(
+            EvidenceCandidate(
+                kind="paper-shadow-attestation",
+                effective_at=orphan_attestation.effective_at,
+                payload=orphan_attestation._evidence_payload(),
+            ),
+            validate=lambda _snapshot, _envelope: None,
+        )
+
+    _, staged_c = _stage_with_times(
+        root,
+        registration,
+        promotion,
+        clock_time=dt.datetime(2030, 4, 2, 14, 0, 5, tzinfo=UTC),
+        effective_at=dt.datetime(2030, 4, 2, 14, 0, tzinfo=UTC),
+        expires_at=dt.datetime(2030, 4, 2, 14, 15, tzinfo=UTC),
+        session_date="2030-04-02",
+    )
+    _, authorization_c = _authorize_once(
+        root,
+        staged_c,
+        paper_account_id="paper-account-unrelated-candidate",
+        clock_time=dt.datetime(2030, 4, 2, 14, 1, 5, tzinfo=UTC),
+        effective_at=dt.datetime(2030, 4, 2, 14, 1, tzinfo=UTC),
+        expires_at=dt.datetime(2030, 4, 2, 14, 14, tzinfo=UTC),
+    )
+    receipt_c, reconciliation_c = _receipt_pair_for_authorization(
+        authorization_c,
+        submitted_at="2030-04-02T14:01:05+00:00",
+        last_seen_at="2030-04-02T14:02:00+00:00",
+        checked_at="2030-04-02T14:02:00+00:00",
+        broker_order_id="paper-broker-order-unrelated-candidate",
+    )
+    observation_c = module.StrategyShadowEvidenceLedger(
+        root,
+        repo_root=REPO_ROOT,
+        clock=lambda: dt.datetime(2030, 4, 2, 14, 2, 5, tzinfo=UTC),
+    ).admit_observation(
+        staged_intent=staged_c,
+        authorization=authorization_c,
+        observed_at=dt.datetime(2030, 4, 2, 14, 2, tzinfo=UTC),
+        paper_order_receipt=receipt_c,
+        reconciliation_receipt=reconciliation_c,
+        actor_role="integrity_verifier",
+    )
+    assert observation_c is not None
+    before = _durable_file_bytes(root)
+
+    with pytest.raises(ValueError, match="tuple collision"):
+        module.StrategyShadowEvidenceLedger(
+            root,
+            repo_root=REPO_ROOT,
+            clock=lambda: dt.datetime(2030, 4, 2, 14, 3, tzinfo=UTC),
+        ).assemble(
+            promotion_evidence=promotion,
+            observations=(observation_c,),
+            actor_role="integrity_verifier",
+        )
+
+    assert _durable_file_bytes(root) == before
+
+
+def test_final_aggregate_malformed_and_unrelated_orphans_are_neutral(
+    tmp_path,
+) -> None:
+    from tradingagents.strategy._immutable_evidence_store import (
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    root, _, promotion, observation = _admitted_buy_case(tmp_path)
+    module = importlib.import_module("tradingagents.strategy.shadow_attestation")
+    ledger = module.StrategyShadowEvidenceLedger(
+        root,
+        repo_root=REPO_ROOT,
+        clock=lambda: dt.datetime(2030, 4, 1, 14, 3, tzinfo=UTC),
+    )
+    attestation = ledger.assemble(
+        promotion_evidence=promotion,
+        observations=(observation,),
+        actor_role="integrity_verifier",
+    )
+    malformed_payload = attestation._evidence_payload()
+    malformed_payload["assembled_by_role"] = "human"
+    orphan_candidates = (
+        EvidenceCandidate(
+            kind="paper-shadow-attestation",
+            effective_at=attestation.effective_at,
+            payload=malformed_payload,
+        ),
+        EvidenceCandidate(
+            kind="paper-shadow-observation",
+            effective_at=attestation.effective_at,
+            payload={"unrelated": True},
+        ),
+    )
+    for offset, candidate in enumerate(orphan_candidates, start=1):
+        crash_store = _CrashShadowStore.make(
+            ImmutableStrategyEvidenceStore,
+            root,
+            clock=lambda value=offset: dt.datetime(
+                2030,
+                4,
+                1,
+                14,
+                3,
+                value,
+                tzinfo=UTC,
+            ),
+            seam="object",
+        )
+        with pytest.raises(RuntimeError, match="object fsync"):
+            crash_store.admit_checked(
+                candidate,
+                validate=lambda _snapshot, _envelope: None,
+            )
+
+    before = _durable_file_bytes(root)
+    retry = module.StrategyShadowEvidenceLedger(
+        root,
+        repo_root=REPO_ROOT,
+        clock=lambda: dt.datetime(2030, 4, 1, 14, 4, tzinfo=UTC),
+    ).assemble(
+        promotion_evidence=promotion,
+        observations=(observation,),
+        actor_role="integrity_verifier",
+    )
+
+    assert retry == attestation
+    assert _durable_file_bytes(root) == before
+
+
 @pytest.mark.parametrize("seam", ("object", "event"))
 def test_attestation_crash_fsync_retry_adopts_exact_recorded_time(
     tmp_path,

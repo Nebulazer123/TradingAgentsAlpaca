@@ -2803,27 +2803,36 @@ def _require_attestation_tuple_unique(
     snapshot: Sequence[EvidenceEnvelope],
     attestation: StrategyShadowAttestation,
     *,
-    tolerate_invalid: bool = False,
+    orphan_snapshot: Sequence[EvidenceEnvelope] = (),
 ) -> None:
-    target = attestation.shadow_observation_ids
+    meanings_by_tuple: dict[tuple[str, ...], bytes] = {}
+
+    def bind(existing: StrategyShadowAttestation) -> None:
+        observation_ids = existing.shadow_observation_ids
+        meaning = existing.canonical_json_bytes()
+        prior_meaning = meanings_by_tuple.get(observation_ids)
+        if prior_meaning is not None and prior_meaning != meaning:
+            raise ValueError("shadow attestation observation tuple collision")
+        meanings_by_tuple[observation_ids] = meaning
+
     for envelope in snapshot:
+        if envelope.kind != PAPER_SHADOW_ATTESTATION_KIND:
+            continue
+        bind(_attestation_from_envelope(envelope))
+
+    for envelope in orphan_snapshot:
         if (
             envelope.kind != PAPER_SHADOW_ATTESTATION_KIND
             or envelope.object_id == attestation.shadow_attestation_id
         ):
             continue
         try:
-            existing = _attestation_from_envelope(envelope)
+            orphan = _attestation_from_envelope(envelope)
         except (TypeError, ValueError):
-            if tolerate_invalid:
-                continue
-            raise
-        if (
-            existing.shadow_observation_ids == target
-            and existing.canonical_json_bytes()
-            != attestation.canonical_json_bytes()
-        ):
-            raise ValueError("shadow attestation observation tuple collision")
+            continue
+        bind(orphan)
+
+    bind(attestation)
 
 
 class StrategyShadowEvidenceLedger:
@@ -3295,23 +3304,23 @@ class StrategyShadowEvidenceLedger:
                 raise ValueError(
                     "shadow attestation does not match locked aggregate"
                 )
-            _require_attestation_tuple_unique(admitted, attestation)
 
-        def validate_orphans(
+        def validate_combined(
+            admitted: tuple[EvidenceEnvelope, ...],
             orphans: tuple[EvidenceEnvelope, ...],
             envelope: EvidenceEnvelope,
         ) -> None:
             attestation = _attestation_from_envelope(envelope)
             _require_attestation_tuple_unique(
-                orphans,
+                admitted,
                 attestation,
-                tolerate_invalid=True,
+                orphan_snapshot=orphans,
             )
 
         admission = self._store.admit_checked(
             candidate,
             validate=validate,
-            validate_orphans=validate_orphans,
+            validate_combined=validate_combined,
         )
         return _attestation_from_envelope(admission.envelope)
 
