@@ -143,6 +143,28 @@ def test_fingerprint_rejects_blank_nonprintable_and_oversized_ids(
         paper_account_fingerprint(paper_account_id)
 
 
+def test_fingerprint_rejects_lone_surrogate_without_identifier_leak():
+    # Break caught: encoding a nonprintable surrogate before validation exposes
+    # its escaped account-identifier material through UnicodeEncodeError text.
+    from tradingagents.strategy.paper_execution_authorization import (
+        paper_account_fingerprint,
+    )
+
+    raw_account_id = "\ud800"
+    escaped_account_id = "\\ud800"
+
+    with pytest.raises(ValueError) as captured:
+        paper_account_fingerprint(raw_account_id)
+
+    assert str(captured.value) == (
+        "paper_account_id must contain only printable text"
+    )
+    assert raw_account_id not in str(captured.value)
+    assert escaped_account_id not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
 @pytest.mark.parametrize("paper_account_id", (b"paper", 1, True, None))
 def test_fingerprint_requires_exact_str_type(paper_account_id):
     # Break caught: bytes, booleans, or other coercible values are persisted
@@ -1099,6 +1121,51 @@ def test_concurrent_changed_authorization_material_admits_exactly_one(
     ) == 1
 
 
+def test_concurrent_identical_authorization_retry_is_event_silent(tmp_path):
+    # Break caught: two byte-identical callers race into duplicate events or
+    # receive different first-seen authorization timestamps.
+    from tradingagents.strategy._immutable_evidence_store import (
+        PAPER_EXECUTION_AUTHORIZATION_KIND,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    root, registration, promotion_evidence = _durable_internal_evidence(
+        tmp_path
+    )
+    _, staged_intent = _stage_once(
+        root,
+        registration,
+        promotion_evidence,
+    )
+    before_events = (root / "events.jsonl").read_bytes()
+    barrier = threading.Barrier(2)
+
+    def authorize():
+        barrier.wait()
+        return _authorize_once(root, staged_intent)[1]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(authorize),
+            executor.submit(authorize),
+        )
+        requests = tuple(future.result() for future in futures)
+
+    assert requests[0].canonical_json_bytes() == (
+        requests[1].canonical_json_bytes()
+    )
+    assert requests[0].authorization_id == requests[1].authorization_id
+    assert requests[0].recorded_at == requests[1].recorded_at
+    assert requests[0].recorded_at == "2030-04-01T14:01:05+00:00"
+    assert (root / "events.jsonl").read_bytes().count(b"\n") == (
+        before_events.count(b"\n") + 1
+    )
+    assert sum(
+        envelope.kind == PAPER_EXECUTION_AUTHORIZATION_KIND
+        for envelope in ImmutableStrategyEvidenceStore(root).verify()
+    ) == 1
+
+
 def _crash_authorization_after_object_fsync(
     root,
     staged_intent,
@@ -1243,6 +1310,138 @@ def test_unrelated_kind_orphan_is_authorization_neutral(tmp_path):
     )
 
     assert request.staged_intent_id == staged_intent.staged_intent_id
+
+
+def test_strict_valid_unrelated_authorization_orphan_is_neutral(tmp_path):
+    # Break caught: the orphan callback rejects any strict-valid authorization
+    # object instead of only a staged, logical-digest, or client-ID conflict.
+    from tradingagents.strategy import (
+        AuthorizedPaperOrderRequest,
+        StagedPaperIntent,
+    )
+    from tradingagents.strategy._immutable_evidence_store import (
+        PAPER_EXECUTION_AUTHORIZATION_KIND,
+        STAGED_PAPER_INTENT_KIND,
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    root, registration, promotion_evidence = _durable_internal_evidence(
+        tmp_path
+    )
+    _, staged_intent = _stage_once(
+        root,
+        registration,
+        promotion_evidence,
+    )
+    alternate_payload = staged_intent.to_dict()
+    alternate_payload.update(
+        {
+            "session_date": "2030-04-02",
+            "recorded_at": "2030-04-01T14:00:06+00:00",
+        }
+    )
+    _reidentify_staged_payload(alternate_payload)
+    alternate_staged = StagedPaperIntent.from_dict(alternate_payload)
+    ImmutableStrategyEvidenceStore(
+        root,
+        clock=lambda: dt.datetime(
+            2030,
+            4,
+            1,
+            14,
+            0,
+            6,
+            tzinfo=UTC,
+        ),
+    ).admit_checked(
+        EvidenceCandidate(
+            kind=STAGED_PAPER_INTENT_KIND,
+            effective_at=alternate_staged.effective_at,
+            payload={
+                key: value
+                for key, value in alternate_staged.to_dict().items()
+                if key
+                not in {
+                    "staged_intent_id",
+                    "effective_at",
+                    "recorded_at",
+                }
+            },
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    )
+    orphan_request = AuthorizedPaperOrderRequest.from_dict(
+        _authorization_payload(alternate_staged)
+    )
+    crashing_store = ImmutableStrategyEvidenceStore(
+        root,
+        clock=lambda: dt.datetime(
+            2030,
+            4,
+            1,
+            14,
+            1,
+            5,
+            tzinfo=UTC,
+        ),
+    )
+
+    def crash(_path):
+        raise RuntimeError("simulated unrelated authorization crash")
+
+    crashing_store._after_object_fsync = crash
+    with pytest.raises(RuntimeError, match="unrelated authorization"):
+        crashing_store.admit_checked(
+            EvidenceCandidate(
+                kind=PAPER_EXECUTION_AUTHORIZATION_KIND,
+                effective_at=orphan_request.effective_at,
+                payload={
+                    key: value
+                    for key, value in orphan_request.to_dict().items()
+                    if key
+                    not in {
+                        "authorization_id",
+                        "effective_at",
+                        "recorded_at",
+                    }
+                },
+            ),
+            validate=lambda _snapshot, _envelope: None,
+        )
+    before_events = (root / "events.jsonl").read_bytes()
+    orphan_path = (
+        root
+        / "objects"
+        / PAPER_EXECUTION_AUTHORIZATION_KIND
+        / f"{orphan_request.authorization_id}.json"
+    )
+    assert orphan_path.is_file()
+
+    ledger, request = _authorize_once(
+        root,
+        staged_intent,
+        clock_time=dt.datetime(
+            2030,
+            4,
+            1,
+            14,
+            1,
+            6,
+            tzinfo=UTC,
+        ),
+    )
+
+    assert request.staged_intent_id != orphan_request.staged_intent_id
+    assert request.logical_order_sha256 != (
+        orphan_request.logical_order_sha256
+    )
+    assert request.client_order_id != orphan_request.client_order_id
+    assert (root / "events.jsonl").read_bytes().count(b"\n") == (
+        before_events.count(b"\n") + 1
+    )
+    assert ledger.verify() == (request,)
+    assert orphan_path.is_file()
 
 
 def test_orphan_staged_intent_never_satisfies_authorization_dependency(

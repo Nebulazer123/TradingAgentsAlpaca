@@ -945,13 +945,13 @@ def paper_account_fingerprint(paper_account_id: str) -> str:
     if type(paper_account_id) is not str:
         raise TypeError("paper_account_id must be an exact string")
     normalized = paper_account_id.strip(_ASCII_WHITESPACE)
-    encoded = normalized.encode("utf-8")
-    if not encoded:
+    if not normalized:
         raise ValueError("paper_account_id must not be blank")
-    if len(encoded) > _PAPER_ACCOUNT_ID_MAX_UTF8_BYTES:
-        raise ValueError("paper_account_id must be at most 256 UTF-8 bytes")
     if not normalized.isprintable():
         raise ValueError("paper_account_id must contain only printable text")
+    encoded = normalized.encode("utf-8")
+    if len(encoded) > _PAPER_ACCOUNT_ID_MAX_UTF8_BYTES:
+        raise ValueError("paper_account_id must be at most 256 UTF-8 bytes")
     return hashlib.sha256(_ACCOUNT_FINGERPRINT_DOMAIN + encoded).hexdigest()
 
 
