@@ -2097,6 +2097,155 @@ def test_process_root_lock_registry_releases_inactive_roots(tmp_path):
     assert before.issubset(evidence_store_module._ROOT_PROCESS_LOCKS)
 
 
+@pytest.mark.parametrize("failing_resource", ["kind", "objects", "root"])
+def test_close_failure_attempts_every_later_release_and_store_recovers(
+    tmp_path,
+    monkeypatch,
+    failing_resource,
+):
+    root = tmp_path / "evidence"
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST))
+    process_lock = store._process_root_lock()
+    real_close = evidence_store_module.os.close
+    real_flock = evidence_store_module.fcntl.flock
+    close_attempts: list[int] = []
+    unlock_attempts: list[int] = []
+    failed = False
+
+    with pytest.raises(
+        OSError,
+        match=f"forced {failing_resource} close failure",
+    ), store._locked(create=True):
+        store._ensure_managed_directories(
+            create=True,
+            recover_staged_pointers=True,
+        )
+        store._ensure_kind_directory(
+            "evaluation-registration",
+            create=True,
+        )
+        transaction = store._transaction()
+        kind_fd = transaction.kind_fds["evaluation-registration"][0]
+        assert transaction.latest_fd is not None
+        assert transaction.objects_fd is not None
+        descriptors = {
+            "kind": kind_fd,
+            "latest": transaction.latest_fd,
+            "objects": transaction.objects_fd,
+            "lock": transaction.lock_fd,
+            "root": transaction.root_fd,
+        }
+        cleanup_order = [
+            descriptors["kind"],
+            descriptors["latest"],
+            descriptors["objects"],
+            descriptors["lock"],
+            descriptors["root"],
+        ]
+        failing_descriptor = descriptors[failing_resource]
+
+        def failing_close(descriptor: int) -> None:
+            nonlocal failed
+            if descriptor in cleanup_order:
+                close_attempts.append(descriptor)
+            real_close(descriptor)
+            if descriptor == failing_descriptor and not failed:
+                failed = True
+                raise OSError(
+                    f"forced {failing_resource} close failure"
+                )
+
+        def recording_flock(descriptor: int, operation: int) -> None:
+            if operation == evidence_store_module.fcntl.LOCK_UN:
+                unlock_attempts.append(descriptor)
+            real_flock(descriptor, operation)
+
+        monkeypatch.setattr(
+            evidence_store_module.os,
+            "close",
+            failing_close,
+        )
+        monkeypatch.setattr(
+            evidence_store_module.fcntl,
+            "flock",
+            recording_flock,
+        )
+
+    assert close_attempts == cleanup_order
+    assert unlock_attempts == [descriptors["lock"], descriptors["root"]]
+    with pytest.raises(
+        EvidenceCorruptionError,
+        match="requires a pinned transaction",
+    ):
+        store._transaction()
+    acquired = process_lock.acquire(blocking=False)
+    assert acquired, "process-root lock remained held after cleanup failure"
+    process_lock.release()
+
+    monkeypatch.setattr(evidence_store_module.os, "close", real_close)
+    monkeypatch.setattr(evidence_store_module.fcntl, "flock", real_flock)
+    admission = store.admit_checked(
+        _candidate(payload={"slot": f"after-{failing_resource}-failure"}),
+        validate=lambda _prior, _new: None,
+    )
+    assert store.verify() == (admission.envelope,)
+
+
+def test_body_exception_precedes_cleanup_error_and_validator_state_clears(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "evidence"
+    store = ImmutableStrategyEvidenceStore(root, clock=_Clock(FIRST, LATER))
+    process_lock = store._process_root_lock()
+    real_close = evidence_store_module.os.close
+    failed = False
+
+    def validate(
+        _prior: tuple[EvidenceEnvelope, ...],
+        _new: EvidenceEnvelope,
+    ) -> None:
+        transaction = store._transaction()
+        assert transaction.latest_fd is not None
+        failing_descriptor = transaction.latest_fd
+
+        def failing_close(descriptor: int) -> None:
+            nonlocal failed
+            real_close(descriptor)
+            if descriptor == failing_descriptor and not failed:
+                failed = True
+                raise OSError("forced cleanup failure")
+
+        monkeypatch.setattr(
+            evidence_store_module.os,
+            "close",
+            failing_close,
+        )
+        raise RuntimeError("validator body failure")
+
+    with pytest.raises(RuntimeError, match="validator body failure") as raised:
+        store.admit_checked(_candidate(), validate=validate)
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert str(raised.value.__cause__) == "forced cleanup failure"
+    assert not hasattr(evidence_store_module._VALIDATOR_ACTIVITY, "depth")
+    with pytest.raises(
+        EvidenceCorruptionError,
+        match="requires a pinned transaction",
+    ):
+        store._transaction()
+    acquired = process_lock.acquire(blocking=False)
+    assert acquired, "process-root lock remained held after body failure"
+    process_lock.release()
+
+    monkeypatch.setattr(evidence_store_module.os, "close", real_close)
+    admission = store.admit_checked(
+        _candidate(payload={"slot": "after-body-and-cleanup-failure"}),
+        validate=lambda _prior, _new: None,
+    )
+    assert store.verify() == (admission.envelope,)
+
+
 @pytest.mark.parametrize(
     "candidate_factory",
     [

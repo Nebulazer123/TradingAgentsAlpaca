@@ -624,12 +624,25 @@ class _OpenTransaction:
     )
 
     def close(self) -> None:
-        for descriptor, _state in self.kind_fds.values():
-            os.close(descriptor)
-        if self.latest_fd is not None:
-            os.close(self.latest_fd)
-        if self.objects_fd is not None:
-            os.close(self.objects_fd)
+        descriptors = [
+            *(descriptor for descriptor, _state in self.kind_fds.values()),
+            *(() if self.latest_fd is None else (self.latest_fd,)),
+            *(() if self.objects_fd is None else (self.objects_fd,)),
+        ]
+        self.kind_fds.clear()
+        self.latest_fd = None
+        self.latest_state = None
+        self.objects_fd = None
+        self.objects_state = None
+        first_error: BaseException | None = None
+        for descriptor in descriptors:
+            try:
+                os.close(descriptor)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
 
 class ImmutableStrategyEvidenceStore:
@@ -913,6 +926,34 @@ class ImmutableStrategyEvidenceStore:
         root_fd: int | None = None
         lock_fd: int | None = None
         transaction: _OpenTransaction | None = None
+
+        def release_resources() -> BaseException | None:
+            self._transaction_state.current = None
+            cleanup_error: BaseException | None = None
+
+            def attempt_cleanup(action: Callable[[], None]) -> None:
+                nonlocal cleanup_error
+                try:
+                    action()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+
+            if transaction is not None:
+                attempt_cleanup(transaction.close)
+            if lock_fd is not None:
+                attempt_cleanup(
+                    lambda: fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                )
+                attempt_cleanup(lambda: os.close(lock_fd))
+            if root_fd is not None:
+                attempt_cleanup(
+                    lambda: fcntl.flock(root_fd, fcntl.LOCK_UN)
+                )
+                attempt_cleanup(lambda: os.close(root_fd))
+            attempt_cleanup(process_lock.release)
+            return cleanup_error
+
         try:
             self._ensure_root(create=create)
             root_fd, root_state = self._open_root_descriptor()
@@ -961,21 +1002,21 @@ class ImmutableStrategyEvidenceStore:
             self._validate_transaction()
             yield
             self._validate_transaction()
-        finally:
-            self._transaction_state.current = None
-            if transaction is not None:
-                transaction.close()
-            if lock_fd is not None:
+        except BaseException as operation_error:
+            cleanup_error = release_resources()
+            if cleanup_error is not None:
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    raise operation_error from cleanup_error
                 finally:
-                    os.close(lock_fd)
-            if root_fd is not None:
-                try:
-                    fcntl.flock(root_fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(root_fd)
-            process_lock.release()
+                    cleanup_error = None
+            raise
+
+        cleanup_error = release_resources()
+        if cleanup_error is not None:
+            try:
+                raise cleanup_error
+            finally:
+                cleanup_error = None
 
     def _ensure_root(self, *, create: bool) -> None:
         parent_fd = self._open_directory_chain(self.root.parent)
