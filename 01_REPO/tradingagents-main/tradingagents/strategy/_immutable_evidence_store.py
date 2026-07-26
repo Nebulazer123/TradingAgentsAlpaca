@@ -859,6 +859,47 @@ class ImmutableStrategyEvidenceStore:
             self._verify_latest(events)
             return envelopes
 
+    def validate_read_only(
+        self,
+        validate: Callable[
+            [
+                tuple[EvidenceEnvelope, ...],
+                tuple[EvidenceEnvelope, ...],
+                str,
+            ],
+            None,
+        ],
+    ) -> None:
+        """Validate one in-memory snapshot under the store lock without writes."""
+        self._reject_callback_reentry()
+        if not callable(validate):
+            raise StrategyEvidenceStoreError("validate must be callable")
+        if self._root_is_absent():
+            raise StrategyEvidenceStoreError("evidence root is absent")
+        with self._locked(create=False):
+            self._ensure_managed_directories(
+                create=False,
+                recover_staged_pointers=False,
+            )
+            events, snapshot = self._replay()
+            self._verify_latest(events)
+            event_by_id = {event.object_id: event for event in events}
+            now, recorded_at = _clock_stamp(self._clock)
+            valid_orphans = self._valid_orphan_envelopes(
+                admitted_object_ids=frozenset(event_by_id)
+            )
+            for existing in (*snapshot, *valid_orphans):
+                if now < _parse_canonical_utc(
+                    existing.recorded_at,
+                    label="recorded_at",
+                ):
+                    raise EvidenceBackdatingError(
+                        "store clock is earlier than durable first-seen evidence"
+                    )
+            with self._validator_active():
+                validate(snapshot, valid_orphans, recorded_at)
+            self._validate_transaction()
+
     def rebuild(self) -> tuple[EvidenceEnvelope, ...]:
         self._reject_callback_reentry()
         if self._root_is_absent():

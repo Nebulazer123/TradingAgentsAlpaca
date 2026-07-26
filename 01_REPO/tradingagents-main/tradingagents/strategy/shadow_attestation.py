@@ -100,6 +100,13 @@ SHADOW_ATTESTATION_ISSUE_BY_GATE = {
 _ASCII_WHITESPACE = " \t\n\r\v\f"
 _SESSION_DATE_PATTERN = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _CANONICAL_MONEY_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)\.[0-9]{2}")
+_LOWER_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_LOWER_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+_CLIENT_ORDER_ID_PATTERN = re.compile(r"ta-p-[0-9a-f]{40}")
+_GENOME_ID_PATTERN = re.compile(
+    r"genome-(?:current-aggressive|pullback-support|"
+    r"catalyst-relative-strength)-[0-9a-f]{64}"
+)
 
 _PAPER_ORDER_RECEIPT_STRING_FIELDS = (
     "authorization_id",
@@ -296,6 +303,118 @@ def _require_optional_exact_string(
     if value is None:
         return None
     return _require_exact_string(value, label=label)
+
+
+def _require_digest(value: object, *, label: str) -> str:
+    if (
+        type(value) is not str
+        or _LOWER_SHA256_PATTERN.fullmatch(value) is None
+    ):
+        raise ValueError(f"{label} must be a full lowercase SHA-256")
+    return value
+
+
+def _require_optional_digest(
+    value: object,
+    *,
+    label: str,
+) -> str | None:
+    if value is None:
+        return None
+    return _require_digest(value, label=label)
+
+
+def _require_object_id(value: object, *, kind: str, label: str) -> str:
+    if (
+        type(value) is not str
+        or re.fullmatch(rf"{re.escape(kind)}-[0-9a-f]{{64}}", value) is None
+    ):
+        raise ValueError(f"{label} must be a full {kind} object ID")
+    return value
+
+
+def _require_optional_object_id(
+    value: object,
+    *,
+    kind: str,
+    label: str,
+) -> str | None:
+    if value is None:
+        return None
+    return _require_object_id(value, kind=kind, label=label)
+
+
+def _require_commit(value: object, *, label: str) -> str:
+    if (
+        type(value) is not str
+        or _LOWER_COMMIT_PATTERN.fullmatch(value) is None
+    ):
+        raise ValueError(f"{label} must be a lowercase 40-hex commit")
+    return value
+
+
+def _require_genome_id(value: object, *, label: str) -> str:
+    if type(value) is not str or _GENOME_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{label} must be a full strategy genome ID")
+    return value
+
+
+def _require_client_order_id(
+    value: object,
+    *,
+    logical_order_sha256: str,
+) -> str:
+    if (
+        type(value) is not str
+        or _CLIENT_ORDER_ID_PATTERN.fullmatch(value) is None
+        or value != f"ta-p-{logical_order_sha256[:40]}"
+    ):
+        raise ValueError("client_order_id does not match logical order digest")
+    return value
+
+
+def _require_symbol(value: object, *, label: str) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{label} must be an exact string")
+    if (
+        value.strip() != value
+        or not 1 <= len(value) <= 15
+        or not "A" <= value[0] <= "Z"
+        or any(
+            not (
+                "A" <= character <= "Z"
+                or "0" <= character <= "9"
+                or character in ".-"
+            )
+            for character in value[1:]
+        )
+    ):
+        raise ValueError(f"{label} must be an uppercase ASCII ticker token")
+    return value
+
+
+def _require_role(value: object, *, expected: str, label: str) -> str:
+    if type(value) is not str or value != expected:
+        raise ValueError(f"{label} must be {expected!r}")
+    return value
+
+
+def _expected_object_id(
+    *,
+    kind: str,
+    effective_at: str,
+    payload: Mapping[str, object],
+) -> str:
+    digest = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "kind": kind,
+                "effective_at": effective_at,
+                "payload": payload,
+            }
+        )
+    ).hexdigest()
+    return f"{kind}-{digest}"
 
 
 def _require_exact_int(value: object, *, label: str) -> int:
@@ -674,7 +793,34 @@ class PaperOrderReceipt:
     def __post_init__(self) -> None:
         for name in _PAPER_ORDER_RECEIPT_STRING_FIELDS:
             _require_exact_string(getattr(self, name), label=name)
+        _require_object_id(
+            self.authorization_id,
+            kind=PAPER_EXECUTION_AUTHORIZATION_KIND,
+            label="authorization_id",
+        )
+        _require_digest(
+            self.authorization_sha256,
+            label="authorization_sha256",
+        )
+        logical_digest = _require_digest(
+            self.logical_order_sha256,
+            label="logical_order_sha256",
+        )
+        _require_client_order_id(
+            self.client_order_id,
+            logical_order_sha256=logical_digest,
+        )
         _require_broker_order_id(self.broker_order_id)
+        _require_digest(
+            self.paper_account_fingerprint,
+            label="paper_account_fingerprint",
+        )
+        _require_symbol(self.symbol, label="symbol")
+        _require_role(
+            self.submitted_by_role,
+            expected="execution_operator",
+            label="submitted_by_role",
+        )
         _require_operand_decimal(
             self.requested_notional_usd,
             label="requested_notional_usd",
@@ -827,7 +973,40 @@ class PaperReconciliationReceipt:
     def __post_init__(self) -> None:
         for name in _PAPER_RECONCILIATION_RECEIPT_STRING_FIELDS:
             _require_exact_string(getattr(self, name), label=name)
+        _require_object_id(
+            self.authorization_id,
+            kind=PAPER_EXECUTION_AUTHORIZATION_KIND,
+            label="authorization_id",
+        )
+        _require_digest(
+            self.authorization_sha256,
+            label="authorization_sha256",
+        )
+        logical_digest = _require_digest(
+            self.logical_order_sha256,
+            label="logical_order_sha256",
+        )
+        _require_client_order_id(
+            self.client_order_id,
+            logical_order_sha256=logical_digest,
+        )
         _require_broker_order_id(self.broker_order_id)
+        _require_digest(
+            self.paper_account_fingerprint,
+            label="paper_account_fingerprint",
+        )
+        _require_symbol(self.observed_symbol, label="observed_symbol")
+        _require_role(
+            self.verified_by_role,
+            expected="integrity_verifier",
+            label="verified_by_role",
+        )
+        if self.observed_side != "buy":
+            raise ValueError("observed_side must be buy")
+        if self.observed_order_type != "limit":
+            raise ValueError("observed_order_type must be limit")
+        if self.observed_tif != "day":
+            raise ValueError("observed_tif must be day")
         _require_operand_decimal(
             self.observed_requested_notional_usd,
             label="observed_requested_notional_usd",
@@ -996,12 +1175,67 @@ class AdmittedPaperShadowObservation:
     def __post_init__(self) -> None:
         for name in _OBSERVATION_STRING_FIELDS:
             _require_exact_string(getattr(self, name), label=name)
+        _require_object_id(
+            self.shadow_observation_id,
+            kind=PAPER_SHADOW_OBSERVATION_KIND,
+            label="shadow_observation_id",
+        )
+        _require_object_id(
+            self.staged_intent_id,
+            kind="staged-paper-intent",
+            label="staged_intent_id",
+        )
+        _require_digest(
+            self.staged_intent_sha256,
+            label="staged_intent_sha256",
+        )
+        _require_object_id(
+            self.promotion_evidence_id,
+            kind="promotion-evidence",
+            label="promotion_evidence_id",
+        )
+        _require_genome_id(self.genome_id, label="genome_id")
+        _require_digest(
+            self.genome_canonical_sha256,
+            label="genome_canonical_sha256",
+        )
+        _require_commit(
+            self.evaluation_code_commit,
+            label="evaluation_code_commit",
+        )
+        _require_digest(
+            self.evaluation_runtime_sha256,
+            label="evaluation_runtime_sha256",
+        )
+        _require_role(
+            self.verified_by_role,
+            expected="integrity_verifier",
+            label="verified_by_role",
+        )
         _require_derived_fraction(
             self.adverse_fill_vs_reference_fraction,
             label="adverse_fill_vs_reference_fraction",
         )
         for name in _OBSERVATION_OPTIONAL_STRING_FIELDS:
             _require_optional_exact_string(getattr(self, name), label=name)
+        _require_optional_object_id(
+            self.authorization_id,
+            kind=PAPER_EXECUTION_AUTHORIZATION_KIND,
+            label="authorization_id",
+        )
+        _require_optional_digest(
+            self.authorization_sha256,
+            label="authorization_sha256",
+        )
+        _require_optional_digest(
+            self.paper_account_fingerprint,
+            label="paper_account_fingerprint",
+        )
+        _require_optional_digest(self.receipt_sha256, label="receipt_sha256")
+        _require_optional_digest(
+            self.reconciliation_sha256,
+            label="reconciliation_sha256",
+        )
         if self.decision_action not in {"hold-cash", "buy"}:
             raise ValueError("decision_action must be hold-cash or buy")
         _require_session_date(self.session_date, label="session_date")
@@ -1073,6 +1307,19 @@ class AdmittedPaperShadowObservation:
                 raise ValueError(
                     "buy receipt broker_order_id values must match"
                 )
+            expected_receipt_digest = hashlib.sha256(
+                self.paper_order_receipt.canonical_json_bytes()
+            ).hexdigest()
+            expected_reconciliation_digest = hashlib.sha256(
+                self.reconciliation_receipt.canonical_json_bytes()
+            ).hexdigest()
+            if self.receipt_sha256 != expected_receipt_digest:
+                raise ValueError("paper receipt digest does not match")
+            if (
+                self.reconciliation_sha256
+                != expected_reconciliation_digest
+            ):
+                raise ValueError("reconciliation receipt digest does not match")
             if gate_map["operationally_reconciled"] is not True:
                 raise ValueError(
                     "buy operationally_reconciled gate is invariant"
@@ -1093,6 +1340,14 @@ class AdmittedPaperShadowObservation:
             False,
             label="can_submit_orders",
         )
+        if self.shadow_observation_id != _expected_object_id(
+            kind=PAPER_SHADOW_OBSERVATION_KIND,
+            effective_at=self.effective_at,
+            payload=self._evidence_payload(),
+        ):
+            raise ValueError(
+                "shadow_observation_id does not match evidence identity"
+            )
 
     @classmethod
     def from_dict(
@@ -1272,6 +1527,43 @@ class StrategyShadowAttestation:
     def __post_init__(self) -> None:
         for name in _ATTESTATION_STRING_FIELDS:
             _require_exact_string(getattr(self, name), label=name)
+        _require_object_id(
+            self.shadow_attestation_id,
+            kind=PAPER_SHADOW_ATTESTATION_KIND,
+            label="shadow_attestation_id",
+        )
+        _require_object_id(
+            self.registration_id,
+            kind="evaluation-registration",
+            label="registration_id",
+        )
+        _require_object_id(
+            self.promotion_evidence_id,
+            kind="promotion-evidence",
+            label="promotion_evidence_id",
+        )
+        _require_digest(
+            self.promotion_evidence_sha256,
+            label="promotion_evidence_sha256",
+        )
+        _require_genome_id(self.genome_id, label="genome_id")
+        _require_digest(
+            self.genome_canonical_sha256,
+            label="genome_canonical_sha256",
+        )
+        _require_commit(
+            self.evaluation_code_commit,
+            label="evaluation_code_commit",
+        )
+        _require_digest(
+            self.evaluation_runtime_sha256,
+            label="evaluation_runtime_sha256",
+        )
+        _require_role(
+            self.assembled_by_role,
+            expected="integrity_verifier",
+            label="assembled_by_role",
+        )
         for name in (
             "total_requested_notional_usd",
             "total_filled_notional_usd",
@@ -1283,6 +1575,10 @@ class StrategyShadowAttestation:
             label="worst_adverse_fill_vs_reference_fraction",
         )
         _require_optional_exact_string(
+            self.paper_account_fingerprint,
+            label="paper_account_fingerprint",
+        )
+        _require_optional_digest(
             self.paper_account_fingerprint,
             label="paper_account_fingerprint",
         )
@@ -1320,6 +1616,14 @@ class StrategyShadowAttestation:
             raise ValueError("too many shadow observations")
         if len(set(ids)) != len(ids):
             raise ValueError("shadow observation IDs must be unique")
+        for object_id in ids:
+            _require_object_id(
+                object_id,
+                kind=PAPER_SHADOW_OBSERVATION_KIND,
+                label="shadow_observation_ids",
+            )
+        for digest in digests:
+            _require_digest(digest, label="shadow_observation_sha256s")
         for name in _ATTESTATION_COUNT_FIELDS:
             _require_exact_int(getattr(self, name), label=name)
         if self.total_intents != self.hold_intents + self.buy_intents:
@@ -1374,6 +1678,14 @@ class StrategyShadowAttestation:
             False,
             label="can_submit_orders",
         )
+        if self.shadow_attestation_id != _expected_object_id(
+            kind=PAPER_SHADOW_ATTESTATION_KIND,
+            effective_at=self.effective_at,
+            payload=self._evidence_payload(),
+        ):
+            raise ValueError(
+                "shadow_attestation_id does not match evidence identity"
+            )
 
     @classmethod
     def from_dict(
@@ -2079,8 +2391,7 @@ def _require_observation_uniqueness(
     )
 
 
-def _require_observation_lineage(
-    observation: AdmittedPaperShadowObservation,
+def _require_full_staged_lineage(
     *,
     staged_intent: StagedPaperIntent,
     registration: object,
@@ -2088,12 +2399,70 @@ def _require_observation_lineage(
 ) -> None:
     registration_id = getattr(registration, "registration_id", None)
     registration_genome = getattr(registration, "genome", None)
+    registration_policy = getattr(registration, "evolution_policy", None)
+    registration_policy_sha256 = getattr(
+        registration,
+        "evolution_policy_sha256",
+        None,
+    )
+    promotion_sha256 = hashlib.sha256(
+        promotion_evidence.canonical_json_bytes()
+    ).hexdigest()
+    if (
+        staged_intent.registration_id != registration_id
+        or staged_intent.promotion_evidence_id != promotion_evidence.evidence_id
+        or staged_intent.promotion_evidence_sha256 != promotion_sha256
+        or promotion_evidence.registration_id != registration_id
+        or getattr(registration_genome, "genome_id", None)
+        != staged_intent.genome.genome_id
+        or staged_intent.genome.canonical_json_bytes()
+        != registration_genome.canonical_json_bytes()
+        or staged_intent.genome.genome_id != promotion_evidence.genome_id
+        or staged_intent.genome_canonical_sha256
+        != getattr(registration, "genome_canonical_sha256", None)
+        or staged_intent.genome_canonical_sha256
+        != promotion_evidence.genome_canonical_sha256
+        or staged_intent.evaluation_code_commit
+        != getattr(registration, "evaluation_code_commit", None)
+        or staged_intent.evaluation_code_commit
+        != promotion_evidence.evaluation_code_commit
+        or staged_intent.evaluation_runtime_sha256
+        != getattr(registration, "evaluation_runtime_sha256", None)
+        or staged_intent.evaluation_runtime_sha256
+        != promotion_evidence.evaluation_runtime_sha256
+        or registration_policy is None
+        or staged_intent.evolution_policy.canonical_json_bytes()
+        != registration_policy.canonical_json_bytes()
+        or staged_intent.evolution_policy_sha256
+        != registration_policy_sha256
+        or staged_intent.evolution_policy_sha256
+        != hashlib.sha256(
+            staged_intent.evolution_policy.canonical_json_bytes()
+        ).hexdigest()
+    ):
+        raise ValueError("full staged lineage does not match")
+    if not promotion_evidence.complete_internal_evidence:
+        raise ValueError("internal promotion evidence is incomplete")
+
+
+def _require_observation_lineage(
+    observation: AdmittedPaperShadowObservation,
+    *,
+    staged_intent: StagedPaperIntent,
+    registration: object,
+    promotion_evidence: StrategyPromotionEvidence,
+) -> None:
+    _require_full_staged_lineage(
+        staged_intent=staged_intent,
+        registration=registration,
+        promotion_evidence=promotion_evidence,
+    )
     expected = (
-        promotion_evidence.evidence_id,
-        promotion_evidence.genome_id,
-        promotion_evidence.genome_canonical_sha256,
-        promotion_evidence.evaluation_code_commit,
-        promotion_evidence.evaluation_runtime_sha256,
+        staged_intent.promotion_evidence_id,
+        staged_intent.genome.genome_id,
+        staged_intent.genome_canonical_sha256,
+        staged_intent.evaluation_code_commit,
+        staged_intent.evaluation_runtime_sha256,
     )
     actual = (
         observation.promotion_evidence_id,
@@ -2102,17 +2471,8 @@ def _require_observation_lineage(
         observation.evaluation_code_commit,
         observation.evaluation_runtime_sha256,
     )
-    if (
-        staged_intent.registration_id != registration_id
-        or staged_intent.promotion_evidence_id != promotion_evidence.evidence_id
-        or promotion_evidence.registration_id != registration_id
-        or getattr(registration_genome, "genome_id", None)
-        != observation.genome_id
-        or expected != actual
-    ):
+    if expected != actual:
         raise ValueError("shadow observation lineage does not match")
-    if not promotion_evidence.complete_internal_evidence:
-        raise ValueError("internal promotion evidence is incomplete")
 
 
 def _validate_observation_from_prefix(
@@ -2510,6 +2870,15 @@ class StrategyShadowEvidenceLedger:
             != durable_staged.canonical_json_bytes()
         ):
             raise ValueError("caller staged intent does not match durable bytes")
+        durable_promotion = _promotion_from_snapshot(
+            snapshot,
+            durable_staged.promotion_evidence_id,
+        )
+        _require_full_staged_lineage(
+            staged_intent=durable_staged,
+            registration=registration,
+            promotion_evidence=durable_promotion,
+        )
         durable_authorization: AuthorizedPaperOrderRequest | None = None
         if durable_staged.decision.action is PaperDecisionAction.BUY:
             if (
@@ -2580,6 +2949,114 @@ class StrategyShadowEvidenceLedger:
                         reconciliation_receipt=reconciliation_receipt,
                     ),
                 )
+        if (
+            durable_staged.decision.action is PaperDecisionAction.BUY
+            and paper_order_receipt is not None
+            and paper_order_receipt.status == "partially_filled"
+        ):
+            assert durable_authorization is not None
+            assert reconciliation_receipt is not None
+
+            def validate_partial(
+                admitted: tuple[EvidenceEnvelope, ...],
+                orphans: tuple[EvidenceEnvelope, ...],
+                recorded_at: str,
+            ) -> None:
+                locked_staged, locked_registration = (
+                    _staged_with_registration_from_snapshot(
+                        admitted,
+                        durable_staged.staged_intent_id,
+                    )
+                )
+                locked_promotion = _promotion_from_snapshot(
+                    admitted,
+                    durable_promotion.evidence_id,
+                )
+                locked_authorization = _authorization_from_prefix(
+                    admitted,
+                    durable_authorization.authorization_id,
+                )
+                if (
+                    locked_staged.canonical_json_bytes()
+                    != durable_staged.canonical_json_bytes()
+                    or locked_registration.canonical_json_bytes()
+                    != registration.canonical_json_bytes()
+                    or locked_promotion.canonical_json_bytes()
+                    != durable_promotion.canonical_json_bytes()
+                    or locked_authorization.canonical_json_bytes()
+                    != durable_authorization.canonical_json_bytes()
+                ):
+                    raise ValueError(
+                        "durable dependency changed during partial validation"
+                    )
+                locked_verify_owner = _required_verify_owner(
+                    verified_by_role
+                )
+                _require_full_staged_lineage(
+                    staged_intent=locked_staged,
+                    registration=locked_registration,
+                    promotion_evidence=locked_promotion,
+                )
+                _require_buy_receipt_structure(
+                    staged_intent=locked_staged,
+                    authorization=locked_authorization,
+                    paper_order_receipt=paper_order_receipt,
+                    reconciliation_receipt=reconciliation_receipt,
+                    observed_at=observed_text,
+                    verified_by_role=locked_verify_owner,
+                )
+                payload = _observation_payload(
+                    staged_intent=locked_staged,
+                    observed_at=observed_text,
+                    verified_by_role=locked_verify_owner,
+                    authorization=locked_authorization,
+                    paper_order_receipt=paper_order_receipt,
+                    reconciliation_receipt=reconciliation_receipt,
+                )
+                object_id = _expected_object_id(
+                    kind=PAPER_SHADOW_OBSERVATION_KIND,
+                    effective_at=observed_text,
+                    payload=payload,
+                )
+                partial_observation = (
+                    AdmittedPaperShadowObservation.from_dict(
+                        {
+                            **payload,
+                            "shadow_observation_id": object_id,
+                            "effective_at": observed_text,
+                            "recorded_at": recorded_at,
+                        }
+                    )
+                )
+                _require_observation_lineage(
+                    partial_observation,
+                    staged_intent=locked_staged,
+                    registration=locked_registration,
+                    promotion_evidence=locked_promotion,
+                )
+                _require_observation_uniqueness(
+                    admitted,
+                    partial_observation,
+                )
+                _require_observation_uniqueness(
+                    orphans,
+                    partial_observation,
+                    tolerate_invalid=True,
+                )
+
+            self._store.validate_read_only(validate_partial)
+            manifest_after = require_active_evaluation_runtime(
+                self._repo_root,
+                registration,
+            )
+            if (
+                manifest_before.canonical_json_bytes()
+                != manifest_after.canonical_json_bytes()
+            ):
+                raise ValueError(
+                    "active evaluation runtime changed during shadow observation"
+                )
+            return None
         manifest_after = require_active_evaluation_runtime(
             self._repo_root,
             registration,
@@ -2591,12 +3068,6 @@ class StrategyShadowEvidenceLedger:
             raise ValueError(
                 "active evaluation runtime changed during shadow observation"
             )
-        if (
-            durable_staged.decision.action is PaperDecisionAction.BUY
-            and paper_order_receipt is not None
-            and paper_order_receipt.status == "partially_filled"
-        ):
-            return None
         if candidate is None:
             raise ValueError("staged decision action is not supported")
 
@@ -2624,12 +3095,30 @@ class StrategyShadowEvidenceLedger:
                 raise ValueError(
                     "durable registration changed during shadow admission"
                 )
+            locked_promotion = _promotion_from_snapshot(
+                admitted,
+                durable_promotion.evidence_id,
+            )
+            if (
+                locked_promotion.canonical_json_bytes()
+                != durable_promotion.canonical_json_bytes()
+            ):
+                raise ValueError(
+                    "durable promotion changed during shadow admission"
+                )
+            locked_verify_owner = _required_verify_owner(verified_by_role)
             observation = _observation_from_envelope(envelope)
+            _require_observation_lineage(
+                observation,
+                staged_intent=locked_staged,
+                registration=locked_registration,
+                promotion_evidence=locked_promotion,
+            )
             if locked_staged.decision.action is PaperDecisionAction.HOLD_CASH:
                 _require_hold_observation_bindings(
                     observation,
                     staged_intent=locked_staged,
-                    verified_by_role=verified_by_role,
+                    verified_by_role=locked_verify_owner,
                 )
             else:
                 if durable_authorization is None:
@@ -2649,7 +3138,7 @@ class StrategyShadowEvidenceLedger:
                     observation,
                     staged_intent=locked_staged,
                     authorization=locked_authorization,
-                    verified_by_role=verified_by_role,
+                    verified_by_role=locked_verify_owner,
                 )
             _require_observation_uniqueness(admitted, observation)
 
@@ -2687,7 +3176,14 @@ class StrategyShadowEvidenceLedger:
             Sequence,
         ):
             raise TypeError("observations must be a sequence")
+        observation_count = len(observations)
+        if observation_count == 0:
+            raise ValueError("at least one shadow observation is required")
+        if observation_count > SHADOW_ATTESTATION_MAX_OBSERVATIONS:
+            raise ValueError("too many shadow observations")
         caller_observations = tuple(observations)
+        if len(caller_observations) != observation_count:
+            raise ValueError("observation sequence changed during snapshot")
         if any(
             type(item) is not AdmittedPaperShadowObservation
             for item in caller_observations
@@ -2695,10 +3191,6 @@ class StrategyShadowEvidenceLedger:
             raise TypeError(
                 "observations must contain admitted shadow observations"
             )
-        if not caller_observations:
-            raise ValueError("at least one shadow observation is required")
-        if len(caller_observations) > SHADOW_ATTESTATION_MAX_OBSERVATIONS:
-            raise ValueError("too many shadow observations")
         if len(
             {item.shadow_observation_id for item in caller_observations}
         ) != len(caller_observations):
@@ -2776,11 +3268,14 @@ class StrategyShadowEvidenceLedger:
                     locked_observations[0].staged_intent_id,
                 )
             )
+            locked_assembled_by_role = _required_verify_owner(
+                assembled_by_role
+            )
             locked_effective, locked_payload = _aggregate_payload(
                 promotion_evidence=locked_promotion,
                 registration=locked_registration,
                 observations=locked_observations,
-                assembled_by_role=assembled_by_role,
+                assembled_by_role=locked_assembled_by_role,
             )
             attestation = _attestation_from_envelope(envelope)
             if (
