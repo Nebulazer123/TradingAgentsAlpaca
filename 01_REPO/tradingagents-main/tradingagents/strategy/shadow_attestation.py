@@ -2226,6 +2226,8 @@ def _require_buy_observation_bindings(
         observed_at=observation.observed_at,
         verified_by_role=verified_by_role,
     )
+    if receipt.status == "partially_filled":
+        raise ValueError("partial shadow evidence cannot be durable")
     expected_payload = _observation_payload(
         staged_intent=staged_intent,
         observed_at=observation.observed_at,
@@ -2268,6 +2270,7 @@ def _require_observation_uniqueness(
     observation: AdmittedPaperShadowObservation,
     *,
     tolerate_invalid: bool = False,
+    orphan_snapshot: Sequence[EvidenceEnvelope] = (),
 ) -> None:
     slot_by_staged: dict[str, str] = {}
     logical_by_value: dict[str, tuple[str, str, str]] = {}
@@ -2285,12 +2288,27 @@ def _require_observation_uniqueness(
         if prior != identity:
             raise ValueError(f"global {label} collision")
 
-    for envelope in snapshot:
-        if envelope.object_id == observation.shadow_observation_id:
-            continue
-        try:
-            if envelope.kind == PAPER_EXECUTION_AUTHORIZATION_KIND:
-                authorization = _authorization_from_envelope(envelope)
+    for source, suppress_domain_errors in (
+        (snapshot, tolerate_invalid),
+        (orphan_snapshot, True),
+    ):
+        for envelope in source:
+            if envelope.object_id == observation.shadow_observation_id:
+                continue
+            authorization: AuthorizedPaperOrderRequest | None = None
+            existing: AdmittedPaperShadowObservation | None = None
+            try:
+                if envelope.kind == PAPER_EXECUTION_AUTHORIZATION_KIND:
+                    authorization = _authorization_from_envelope(envelope)
+                elif envelope.kind == PAPER_SHADOW_OBSERVATION_KIND:
+                    existing = _observation_from_envelope(envelope)
+                else:
+                    continue
+            except (TypeError, ValueError):
+                if suppress_domain_errors:
+                    continue
+                raise
+            if authorization is not None:
                 identity = _order_identity(
                     staged_intent_id=authorization.staged_intent_id,
                     authorization_id=authorization.authorization_id,
@@ -2311,48 +2329,44 @@ def _require_observation_uniqueness(
                     label="client_order_id",
                 )
                 continue
-            if envelope.kind != PAPER_SHADOW_OBSERVATION_KIND:
+            assert existing is not None
+            prior_observation = slot_by_staged.setdefault(
+                existing.staged_intent_id,
+                existing.shadow_observation_id,
+            )
+            if prior_observation != existing.shadow_observation_id:
+                raise ValueError(
+                    "one shadow observation may bind one staged intent"
+                )
+            if (
+                existing.authorization_id is None
+                or existing.paper_account_fingerprint is None
+                or existing.paper_order_receipt is None
+            ):
                 continue
-            existing = _observation_from_envelope(envelope)
-        except (TypeError, ValueError):
-            if tolerate_invalid:
-                continue
-            raise
-        prior_observation = slot_by_staged.setdefault(
-            existing.staged_intent_id,
-            existing.shadow_observation_id,
-        )
-        if prior_observation != existing.shadow_observation_id:
-            raise ValueError("one shadow observation may bind one staged intent")
-        if (
-            existing.authorization_id is None
-            or existing.paper_account_fingerprint is None
-            or existing.paper_order_receipt is None
-        ):
-            continue
-        identity = _order_identity(
-            staged_intent_id=existing.staged_intent_id,
-            authorization_id=existing.authorization_id,
-            paper_account_fingerprint=existing.paper_account_fingerprint,
-        )
-        bind(
-            logical_by_value,
-            existing.paper_order_receipt.logical_order_sha256,
-            identity,
-            label="logical_order_sha256",
-        )
-        bind(
-            client_by_value,
-            existing.paper_order_receipt.client_order_id,
-            identity,
-            label="client_order_id",
-        )
-        bind(
-            broker_by_value,
-            existing.paper_order_receipt.broker_order_id,
-            identity,
-            label="broker_order_id",
-        )
+            identity = _order_identity(
+                staged_intent_id=existing.staged_intent_id,
+                authorization_id=existing.authorization_id,
+                paper_account_fingerprint=existing.paper_account_fingerprint,
+            )
+            bind(
+                logical_by_value,
+                existing.paper_order_receipt.logical_order_sha256,
+                identity,
+                label="logical_order_sha256",
+            )
+            bind(
+                client_by_value,
+                existing.paper_order_receipt.client_order_id,
+                identity,
+                label="client_order_id",
+            )
+            bind(
+                broker_by_value,
+                existing.paper_order_receipt.broker_order_id,
+                identity,
+                label="broker_order_id",
+            )
 
     prior_observation = slot_by_staged.setdefault(
         observation.staged_intent_id,
@@ -3037,11 +3051,7 @@ class StrategyShadowEvidenceLedger:
                 _require_observation_uniqueness(
                     admitted,
                     partial_observation,
-                )
-                _require_observation_uniqueness(
-                    orphans,
-                    partial_observation,
-                    tolerate_invalid=True,
+                    orphan_snapshot=orphans,
                 )
 
             self._store.validate_read_only(validate_partial)
@@ -3140,23 +3150,23 @@ class StrategyShadowEvidenceLedger:
                     authorization=locked_authorization,
                     verified_by_role=locked_verify_owner,
                 )
-            _require_observation_uniqueness(admitted, observation)
 
-        def validate_orphans(
+        def validate_combined(
+            admitted: tuple[EvidenceEnvelope, ...],
             orphans: tuple[EvidenceEnvelope, ...],
             envelope: EvidenceEnvelope,
         ) -> None:
             observation = _observation_from_envelope(envelope)
             _require_observation_uniqueness(
-                orphans,
+                admitted,
                 observation,
-                tolerate_invalid=True,
+                orphan_snapshot=orphans,
             )
 
         admission = self._store.admit_checked(
             candidate,
             validate=validate,
-            validate_orphans=validate_orphans,
+            validate_combined=validate_combined,
         )
         return _observation_from_envelope(admission.envelope)
 

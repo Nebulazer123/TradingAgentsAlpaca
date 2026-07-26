@@ -3404,11 +3404,284 @@ def _change_nested_order_identity(
             ).hexdigest(),
         }
     )
-    _reidentify_journal_payload(
-        payload,
-        kind="paper-shadow-observation",
-        id_field="shadow_observation_id",
+    if "effective_at" in payload:
+        _reidentify_journal_payload(
+            payload,
+            kind="paper-shadow-observation",
+            id_field="shadow_observation_id",
+        )
+
+
+def _rereview_cross_set_collision_case(
+    tmp_path,
+    *,
+    collision: str,
+    candidate_status: str,
+):
+    from tests.test_strategy_paper_execution_authorization import _authorize_once
+    from tests.test_strategy_staged_intent import _stage_with_times
+    from tradingagents.strategy._immutable_evidence_store import (
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
     )
+
+    (
+        root,
+        registration,
+        promotion,
+        first_staged,
+        first_authorization,
+        first_receipt,
+        first_reconciliation,
+    ) = _durable_buy_case(tmp_path)
+    module = importlib.import_module("tradingagents.strategy.shadow_attestation")
+    first_observation = module.StrategyShadowEvidenceLedger(
+        root,
+        repo_root=REPO_ROOT,
+        clock=lambda: dt.datetime(2030, 4, 1, 14, 2, 5, tzinfo=UTC),
+    ).admit_observation(
+        staged_intent=first_staged,
+        authorization=first_authorization,
+        observed_at=dt.datetime(2030, 4, 1, 14, 2, tzinfo=UTC),
+        paper_order_receipt=first_receipt,
+        reconciliation_receipt=first_reconciliation,
+        actor_role="integrity_verifier",
+    )
+    assert first_observation is not None
+
+    _, orphan_staged = _stage_with_times(
+        root,
+        registration,
+        promotion,
+        clock_time=dt.datetime(2030, 4, 2, 14, 0, 5, tzinfo=UTC),
+        effective_at=dt.datetime(2030, 4, 2, 14, 0, tzinfo=UTC),
+        expires_at=dt.datetime(2030, 4, 2, 14, 15, tzinfo=UTC),
+        session_date="2030-04-02",
+    )
+    _, orphan_authorization = _authorize_once(
+        root,
+        orphan_staged,
+        paper_account_id="paper-account-orphan",
+        clock_time=dt.datetime(2030, 4, 2, 14, 1, 5, tzinfo=UTC),
+        effective_at=dt.datetime(2030, 4, 2, 14, 1, tzinfo=UTC),
+        expires_at=dt.datetime(2030, 4, 2, 14, 14, tzinfo=UTC),
+    )
+    orphan_receipt, orphan_reconciliation = _receipt_pair_for_authorization(
+        orphan_authorization,
+        submitted_at="2030-04-02T14:01:05+00:00",
+        last_seen_at="2030-04-02T14:02:00+00:00",
+        checked_at="2030-04-02T14:02:00+00:00",
+        broker_order_id="paper-broker-order-orphan",
+    )
+
+    _, candidate_staged = _stage_with_times(
+        root,
+        registration,
+        promotion,
+        clock_time=dt.datetime(2030, 4, 3, 14, 0, 5, tzinfo=UTC),
+        effective_at=dt.datetime(2030, 4, 3, 14, 0, tzinfo=UTC),
+        expires_at=dt.datetime(2030, 4, 3, 14, 15, tzinfo=UTC),
+        session_date="2030-04-03",
+    )
+    _, candidate_authorization = _authorize_once(
+        root,
+        candidate_staged,
+        paper_account_id="paper-account-candidate",
+        clock_time=dt.datetime(2030, 4, 3, 14, 1, 5, tzinfo=UTC),
+        effective_at=dt.datetime(2030, 4, 3, 14, 1, tzinfo=UTC),
+        expires_at=dt.datetime(2030, 4, 3, 14, 14, tzinfo=UTC),
+    )
+    candidate_receipt, candidate_reconciliation = (
+        _receipt_pair_for_authorization(
+            candidate_authorization,
+            submitted_at="2030-04-03T14:01:05+00:00",
+            last_seen_at="2030-04-03T14:02:00+00:00",
+            checked_at="2030-04-03T14:02:00+00:00",
+            status=candidate_status,
+            broker_order_id="paper-broker-order-candidate",
+        )
+    )
+
+    orphan_payload = module._observation_payload(
+        staged_intent=orphan_staged,
+        observed_at="2030-04-02T14:02:00+00:00",
+        verified_by_role="integrity_verifier",
+        authorization=orphan_authorization,
+        paper_order_receipt=orphan_receipt,
+        reconciliation_receipt=orphan_reconciliation,
+    )
+    orphan_logical = orphan_authorization.logical_order_sha256
+    orphan_client = orphan_authorization.client_order_id
+    orphan_broker = orphan_receipt.broker_order_id
+    if collision == "logical_order_sha256":
+        orphan_logical = first_receipt.logical_order_sha256
+        orphan_client = first_receipt.client_order_id
+    elif collision == "client_order_id":
+        orphan_logical = (
+            first_receipt.logical_order_sha256[:40]
+            + orphan_logical[40:]
+        )
+        orphan_client = first_receipt.client_order_id
+    else:
+        orphan_broker = first_receipt.broker_order_id
+    _change_nested_order_identity(
+        orphan_payload,
+        logical=orphan_logical,
+        client=orphan_client,
+        broker=orphan_broker,
+    )
+    orphan_candidate = EvidenceCandidate(
+        kind="paper-shadow-observation",
+        effective_at="2030-04-02T14:02:00+00:00",
+        payload=orphan_payload,
+    )
+    crash_store = _CrashShadowStore.make(
+        ImmutableStrategyEvidenceStore,
+        root,
+        clock=lambda: dt.datetime(2030, 4, 3, 14, 1, 10, tzinfo=UTC),
+        seam="object",
+    )
+    with pytest.raises(RuntimeError, match="object fsync"):
+        crash_store.admit_checked(
+            orphan_candidate,
+            validate=lambda _snapshot, _envelope: None,
+        )
+
+    return (
+        root,
+        candidate_staged,
+        candidate_authorization,
+        candidate_receipt,
+        candidate_reconciliation,
+    )
+
+
+@pytest.mark.parametrize(
+    "collision",
+    ("logical_order_sha256", "client_order_id", "broker_order_id"),
+)
+@pytest.mark.parametrize("candidate_status", ("partially_filled", "filled"))
+def test_rereview_cross_set_collision_rejects_unrelated_candidate(
+    tmp_path,
+    collision: str,
+    candidate_status: str,
+) -> None:
+    (
+        root,
+        staged,
+        authorization,
+        receipt,
+        reconciliation,
+    ) = _rereview_cross_set_collision_case(
+        tmp_path,
+        collision=collision,
+        candidate_status=candidate_status,
+    )
+    module = importlib.import_module("tradingagents.strategy.shadow_attestation")
+    ledger = module.StrategyShadowEvidenceLedger(
+        root,
+        repo_root=REPO_ROOT,
+        clock=lambda: dt.datetime(2030, 4, 3, 14, 2, 5, tzinfo=UTC),
+    )
+    before = _durable_file_bytes(root)
+
+    with pytest.raises(ValueError, match=collision):
+        ledger.admit_observation(
+            staged_intent=staged,
+            authorization=authorization,
+            observed_at=dt.datetime(2030, 4, 3, 14, 2, tzinfo=UTC),
+            paper_order_receipt=receipt,
+            reconciliation_receipt=reconciliation,
+            actor_role="integrity_verifier",
+        )
+
+    assert _durable_file_bytes(root) == before
+
+
+def _rereview_direct_store_partial_case(tmp_path):
+    from tradingagents.strategy._immutable_evidence_store import (
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    (
+        root,
+        _,
+        promotion,
+        staged,
+        authorization,
+        receipt,
+        reconciliation,
+    ) = _durable_buy_case(tmp_path)
+    module = importlib.import_module("tradingagents.strategy.shadow_attestation")
+    partial_receipt, partial_reconciliation = _partial_pair(
+        module,
+        receipt,
+        reconciliation,
+    )
+    payload = module._observation_payload(
+        staged_intent=staged,
+        observed_at="2030-04-01T14:02:00+00:00",
+        verified_by_role="integrity_verifier",
+        authorization=authorization,
+        paper_order_receipt=partial_receipt,
+        reconciliation_receipt=partial_reconciliation,
+    )
+    admission = ImmutableStrategyEvidenceStore(
+        root,
+        clock=lambda: dt.datetime(2030, 4, 1, 14, 2, 5, tzinfo=UTC),
+    ).admit_checked(
+        EvidenceCandidate(
+            kind="paper-shadow-observation",
+            effective_at="2030-04-01T14:02:00+00:00",
+            payload=payload,
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    )
+    observation = module._observation_from_envelope(admission.envelope)
+    return root, promotion, observation
+
+
+@pytest.mark.parametrize("operation", ("verify", "rebuild"))
+def test_rereview_direct_store_partial_observation_fails_replay(
+    tmp_path,
+    operation: str,
+) -> None:
+    root, _, _ = _rereview_direct_store_partial_case(tmp_path)
+    module = importlib.import_module("tradingagents.strategy.shadow_attestation")
+    ledger = module.StrategyShadowEvidenceLedger(root, repo_root=REPO_ROOT)
+
+    with pytest.raises(
+        ValueError,
+        match="partial shadow evidence cannot be durable",
+    ):
+        getattr(ledger, operation)()
+
+
+def test_rereview_direct_store_partial_observation_fails_assembly(
+    tmp_path,
+) -> None:
+    root, promotion, observation = _rereview_direct_store_partial_case(
+        tmp_path
+    )
+    module = importlib.import_module("tradingagents.strategy.shadow_attestation")
+    before = _durable_file_bytes(root)
+
+    with pytest.raises(
+        ValueError,
+        match="partial shadow evidence cannot be durable",
+    ):
+        module.StrategyShadowEvidenceLedger(
+            root,
+            repo_root=REPO_ROOT,
+            clock=lambda: dt.datetime(2030, 4, 1, 14, 3, tzinfo=UTC),
+        ).assemble(
+            promotion_evidence=promotion,
+            observations=(observation,),
+            actor_role="integrity_verifier",
+        )
+
+    assert _durable_file_bytes(root) == before
 
 
 @pytest.mark.parametrize("source_kind", ("event", "orphan"))

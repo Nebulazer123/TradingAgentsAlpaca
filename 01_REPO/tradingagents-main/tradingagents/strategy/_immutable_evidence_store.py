@@ -688,6 +688,15 @@ class ImmutableStrategyEvidenceStore:
             None,
         ]
         | None = None,
+        validate_combined: Callable[
+            [
+                tuple[EvidenceEnvelope, ...],
+                tuple[EvidenceEnvelope, ...],
+                EvidenceEnvelope,
+            ],
+            None,
+        ]
+        | None = None,
     ) -> EvidenceAdmission:
         self._reject_callback_reentry()
         if not isinstance(candidate, EvidenceCandidate):
@@ -699,6 +708,10 @@ class ImmutableStrategyEvidenceStore:
         if validate_orphans is not None and not callable(validate_orphans):
             raise StrategyEvidenceStoreError(
                 "validate_orphans must be callable or None"
+            )
+        if validate_combined is not None and not callable(validate_combined):
+            raise StrategyEvidenceStoreError(
+                "validate_combined must be callable or None"
             )
         retry_bytes = _retry_material_bytes(
             kind=candidate.kind,
@@ -784,6 +797,8 @@ class ImmutableStrategyEvidenceStore:
                 validate(snapshot, envelope)
                 if validate_orphans is not None:
                     validate_orphans(valid_orphans, envelope)
+                if validate_combined is not None:
+                    validate_combined(snapshot, valid_orphans, envelope)
             self._validate_transaction()
 
             if prior_event is not None:
