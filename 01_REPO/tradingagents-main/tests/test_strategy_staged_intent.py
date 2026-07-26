@@ -2183,26 +2183,7 @@ def _imported_modules(source):
     return imported
 
 
-def test_import_guard_detects_fully_qualified_forbidden_paths():
-    # Break caught: splitting only the first component hides TradingAgents imports.
-    source = """
-import tradingagents.brokers.adapter
-from tradingagents.execution.orders import submit
-from tradingagents.policy.live_gate import require_gate
-"""
-
-    assert _imported_modules(source) == {
-        "tradingagents.brokers.adapter",
-        "tradingagents.execution.orders",
-        "tradingagents.policy.live_gate",
-    }
-
-
-def test_staged_intent_import_and_call_isolation():
-    # Break caught: evidence staging acquires execution, network, or model authority.
-    source_path = REPO_ROOT / "tradingagents" / "strategy" / "staged_intent.py"
-    source = source_path.read_text()
-    tree = ast.parse(source)
+def _forbidden_import_violations(source):
     forbidden_prefixes = {
         "brokers",
         "execution",
@@ -2220,9 +2201,40 @@ def test_staged_intent_import_and_call_isolation():
         "tradingagents.llm_clients",
         "tradingagents.policy.live_control",
         "tradingagents.policy.live_gate",
-        "tradingagents.promotion_sync",
+        "tradingagents.policy.promotion_sync",
     }
     imported = _imported_modules(source)
+    return {
+        imported_module
+        for imported_module in imported
+        for forbidden_prefix in forbidden_prefixes
+        if imported_module == forbidden_prefix
+        or imported_module.startswith(f"{forbidden_prefix}.")
+    }
+
+
+def test_import_guard_detects_fully_qualified_forbidden_paths():
+    # Break caught: splitting only the first component hides TradingAgents imports.
+    source = """
+import tradingagents.brokers.adapter
+from tradingagents.execution.orders import submit
+from tradingagents.policy.live_gate import require_gate
+from tradingagents.policy.promotion_sync import sync_promotion_state
+"""
+
+    assert _forbidden_import_violations(source) == {
+        "tradingagents.brokers.adapter",
+        "tradingagents.execution.orders",
+        "tradingagents.policy.live_gate",
+        "tradingagents.policy.promotion_sync",
+    }
+
+
+def test_staged_intent_import_and_call_isolation():
+    # Break caught: evidence staging acquires execution, network, or model authority.
+    source_path = REPO_ROOT / "tradingagents" / "strategy" / "staged_intent.py"
+    source = source_path.read_text()
+    tree = ast.parse(source)
     called_names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
@@ -2231,14 +2243,7 @@ def test_staged_intent_import_and_call_isolation():
             elif isinstance(node.func, ast.Attribute):
                 called_names.add(node.func.attr)
 
-    violations = {
-        imported_module
-        for imported_module in imported
-        for forbidden_prefix in forbidden_prefixes
-        if imported_module == forbidden_prefix
-        or imported_module.startswith(f"{forbidden_prefix}.")
-    }
-    assert violations == set()
+    assert _forbidden_import_violations(source) == set()
     assert called_names.isdisjoint(
         {"submit_order", "cancel_order", "replace_order"}
     )
