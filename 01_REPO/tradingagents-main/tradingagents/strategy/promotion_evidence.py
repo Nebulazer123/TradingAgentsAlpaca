@@ -904,6 +904,10 @@ def _canonical_repo_root(repo_root: str | Path) -> Path:
         raise StrategyPromotionEvidenceError(
             "Git worktree preflight timed out"
         ) from exc
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise StrategyPromotionEvidenceError(
+            "Git worktree preflight failed"
+        ) from exc
     try:
         lexical.resolve().relative_to(Path(top).resolve())
     except ValueError as exc:

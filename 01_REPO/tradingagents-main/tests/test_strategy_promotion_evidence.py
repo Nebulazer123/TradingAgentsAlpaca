@@ -743,6 +743,71 @@ def test_git_preflight_timeout_fails_closed_before_evidence_or_evaluator(
     assert not evidence_root.exists()
 
 
+@pytest.mark.parametrize(
+    ("failure_path", "failure_type"),
+    (
+        ("inside_oserror", OSError),
+        ("toplevel_oserror", OSError),
+        ("toplevel_called_process", subprocess.CalledProcessError),
+    ),
+)
+def test_repo_root_git_failures_are_normalized_before_evidence_or_evaluator(
+    tmp_path,
+    monkeypatch,
+    failure_path,
+    failure_type,
+):
+    import tradingagents.strategy.promotion_evidence as module
+
+    evidence_root = tmp_path / "evidence"
+    original_run = module.subprocess.run
+    observed_calls = []
+    evaluator_calls = 0
+
+    def controlled_run(command, **kwargs):
+        observed_calls.append((command, kwargs))
+        is_target = (
+            failure_path == "inside_oserror"
+            and command == ("git", "rev-parse", "--is-inside-work-tree")
+        ) or (
+            failure_path != "inside_oserror"
+            and command == ("git", "rev-parse", "--show-toplevel")
+        )
+        if not is_target:
+            return original_run(command, **kwargs)
+        if failure_type is OSError:
+            raise OSError("local Git unavailable")
+        raise subprocess.CalledProcessError(2, command)
+
+    def forbidden_evaluator(*_args, **_kwargs):
+        nonlocal evaluator_calls
+        evaluator_calls += 1
+        raise AssertionError("evaluator ran after repository Git failure")
+
+    monkeypatch.setattr(module.subprocess, "run", controlled_run)
+    monkeypatch.setattr(module, "evaluate_genome_window", forbidden_evaluator)
+
+    with pytest.raises(
+        module.StrategyPromotionEvidenceError,
+        match="Git worktree preflight failed",
+    ) as caught:
+        module.StrategyPromotionEvidenceLedger(
+            evidence_root,
+            repo_root=REPO_ROOT,
+        )
+
+    assert type(caught.value.__cause__) is failure_type
+    assert observed_calls
+    for command, kwargs in observed_calls:
+        assert type(command) is tuple
+        assert command[0] == "git"
+        assert Path(kwargs["cwd"]).resolve() == REPO_ROOT.resolve()
+        assert kwargs["timeout"] == module._LOCAL_GIT_TIMEOUT_SECONDS
+        assert kwargs.get("shell", False) is False
+    assert evaluator_calls == 0
+    assert not evidence_root.exists()
+
+
 def test_registration_rejects_late_first_seen_and_invalid_schedule(tmp_path):
     from tradingagents.strategy.promotion_evidence import (
         EvaluationWindowSpec,
