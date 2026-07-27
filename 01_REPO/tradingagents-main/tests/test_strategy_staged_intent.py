@@ -1058,7 +1058,15 @@ def test_admission_callbacks_do_not_reenter_runtime_or_compiler(
         assert inside_callback is False
         return original_runtime(*args, **kwargs)
 
-    def wrapped_admit(candidate, *, validate, validate_orphans=None):
+    def wrapped_admit(
+        candidate,
+        *,
+        validate,
+        validate_orphans=None,
+        validate_combined=None,
+    ):
+        assert validate_combined is not None
+
         def wrap(callback):
             def guarded(*args):
                 nonlocal inside_callback
@@ -1076,6 +1084,11 @@ def test_admission_callbacks_do_not_reenter_runtime_or_compiler(
             validate_orphans=(
                 wrap(validate_orphans)
                 if validate_orphans is not None
+                else None
+            ),
+            validate_combined=(
+                wrap(validate_combined)
+                if validate_combined is not None
                 else None
             ),
         )
@@ -1674,6 +1687,151 @@ def test_changed_material_same_slot_orphan_blocks_before_any_new_bytes(tmp_path)
     } == before_objects
 
 
+def _durable_file_bytes(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_prerequisite_cross_set_slot_conflict_blocks_unrelated_candidate(
+    tmp_path,
+):
+    # Break caught: admitted A and strict-valid orphan B build separate slot
+    # indexes, so later unrelated candidate C can write over their conflict.
+    from tradingagents.strategy import StagedPaperIntent
+    from tradingagents.strategy._immutable_evidence_store import (
+        STAGED_PAPER_INTENT_KIND,
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    root, registration, evidence = _durable_internal_evidence(tmp_path)
+    _ledger, admitted = _stage_once(root, registration, evidence)
+    orphan_payload = admitted.to_dict()
+    orphan_payload["expires_at"] = "2030-04-01T14:14:59+00:00"
+    _reidentify_staged_payload(orphan_payload)
+    orphan = StagedPaperIntent.from_dict(orphan_payload)
+    orphan_store = ImmutableStrategyEvidenceStore(
+        root,
+        clock=_Clock(dt.datetime(2030, 4, 1, 14, 0, 6, tzinfo=UTC)),
+    )
+
+    def crash(_path):
+        raise RuntimeError("simulated cross-set staged orphan")
+
+    orphan_store._after_object_fsync = crash
+    with pytest.raises(RuntimeError, match="cross-set staged orphan"):
+        orphan_store.admit_checked(
+            EvidenceCandidate(
+                kind=STAGED_PAPER_INTENT_KIND,
+                effective_at=orphan.effective_at,
+                payload=orphan._evidence_payload(),
+            ),
+            validate=lambda _snapshot, _envelope: None,
+        )
+
+    ImmutableStrategyEvidenceStore(
+        root,
+        clock=_Clock(dt.datetime(2030, 4, 1, 14, 0, 7, tzinfo=UTC)),
+    ).admit_checked(
+        EvidenceCandidate(
+            kind="baseline-genome",
+            effective_at="2030-04-01T14:00:07+00:00",
+            payload={"later_unrelated": True},
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    )
+    before = _durable_file_bytes(root)
+
+    with pytest.raises(ValueError, match="logical slot"):
+        _stage_with_times(
+            root,
+            registration,
+            evidence,
+            clock_time=dt.datetime(
+                2030,
+                4,
+                1,
+                14,
+                0,
+                8,
+                tzinfo=UTC,
+            ),
+            effective_at=dt.datetime(
+                2030,
+                4,
+                1,
+                14,
+                0,
+                tzinfo=UTC,
+            ),
+            expires_at=dt.datetime(
+                2030,
+                4,
+                1,
+                14,
+                15,
+                tzinfo=UTC,
+            ),
+            session_date="2030-04-02",
+        )
+
+    assert admitted.staged_intent_id != orphan.staged_intent_id
+    assert _durable_file_bytes(root) == before
+
+
+def test_prerequisite_malformed_staged_orphan_is_neutral(tmp_path):
+    # Break caught: a domain-invalid staged orphan is parsed as durable intent
+    # material and blocks an otherwise valid candidate.
+    from tradingagents.strategy._immutable_evidence_store import (
+        STAGED_PAPER_INTENT_KIND,
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    root, registration, evidence = _durable_internal_evidence(tmp_path)
+    malformed_payload = _staged_model_payload()
+    malformed_payload["session_date"] = "not-a-session-date"
+    malformed_store = ImmutableStrategyEvidenceStore(
+        root,
+        clock=_Clock(dt.datetime(2030, 4, 1, 14, 0, 4, tzinfo=UTC)),
+    )
+
+    def crash(_path):
+        raise RuntimeError("simulated malformed staged orphan")
+
+    malformed_store._after_object_fsync = crash
+    with pytest.raises(RuntimeError, match="malformed staged orphan"):
+        malformed_store.admit_checked(
+            EvidenceCandidate(
+                kind=STAGED_PAPER_INTENT_KIND,
+                effective_at=malformed_payload["effective_at"],
+                payload={
+                    key: value
+                    for key, value in malformed_payload.items()
+                    if key
+                    not in {
+                        "staged_intent_id",
+                        "effective_at",
+                        "recorded_at",
+                    }
+                },
+            ),
+            validate=lambda _snapshot, _envelope: None,
+        )
+
+    _ledger, intent = _stage_once(
+        root,
+        registration,
+        evidence,
+        clock=_Clock(dt.datetime(2030, 4, 1, 14, 0, 5, tzinfo=UTC)),
+    )
+
+    assert intent.session_date == "2030-04-01"
+
+
 def test_unrelated_slot_and_kind_orphans_are_neutral(tmp_path):
     # Break caught: orphan filtering blocks unrelated strategy evidence globally.
     from tradingagents.strategy import StrategyStagedIntentLedger
@@ -1896,6 +2054,93 @@ def test_orphan_registration_never_satisfies_durable_dependency(tmp_path):
         )
 
     assert not (target_root / "events.jsonl").exists()
+
+
+def test_prerequisite_orphan_promotion_never_satisfies_staged_dependency(
+    tmp_path,
+):
+    # Break caught: strict-valid promotion object bytes without a journal event
+    # satisfy the staged intent's durable promotion dependency.
+    from tradingagents.strategy import StrategyStagedIntentLedger
+    from tradingagents.strategy._immutable_evidence_store import (
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    (tmp_path / "source").mkdir()
+    source_root, registration, evidence = _durable_internal_evidence(
+        tmp_path / "source"
+    )
+    source_snapshot = ImmutableStrategyEvidenceStore(source_root).verify()
+    (tmp_path / "target").mkdir()
+    target_root = tmp_path / "target" / "evidence"
+    for envelope in source_snapshot:
+        if envelope.object_id == evidence.evidence_id:
+            continue
+        ImmutableStrategyEvidenceStore(
+            target_root,
+            clock=lambda envelope=envelope: dt.datetime.fromisoformat(
+                envelope.recorded_at
+            ),
+        ).admit_checked(
+            EvidenceCandidate(
+                kind=envelope.kind,
+                effective_at=envelope.effective_at,
+                payload=json.loads(envelope.canonical_json_bytes())["payload"],
+            ),
+            validate=lambda _snapshot, _envelope: None,
+        )
+
+    promotion_envelope = next(
+        envelope
+        for envelope in source_snapshot
+        if envelope.object_id == evidence.evidence_id
+    )
+    promotion_store = ImmutableStrategyEvidenceStore(
+        target_root,
+        clock=_Clock(
+            dt.datetime.fromisoformat(promotion_envelope.recorded_at)
+        ),
+    )
+
+    def crash(_path):
+        raise RuntimeError("simulated orphan promotion dependency")
+
+    promotion_store._after_object_fsync = crash
+    with pytest.raises(RuntimeError, match="orphan promotion dependency"):
+        promotion_store.admit_checked(
+            EvidenceCandidate(
+                kind=promotion_envelope.kind,
+                effective_at=promotion_envelope.effective_at,
+                payload=json.loads(
+                    promotion_envelope.canonical_json_bytes()
+                )["payload"],
+            ),
+            validate=lambda _snapshot, _envelope: None,
+        )
+    before = _durable_file_bytes(target_root)
+    ledger = StrategyStagedIntentLedger(
+        target_root,
+        repo_root=REPO_ROOT,
+        clock=_Clock(dt.datetime(2030, 4, 1, 14, 0, 5, tzinfo=UTC)),
+    )
+
+    with pytest.raises(ValueError, match="promotion evidence"):
+        ledger.stage(
+            registration=registration,
+            promotion_evidence=evidence,
+            observations=_stage_observations(),
+            candidate_state=_stage_candidate_state(),
+            session_date="2030-04-01",
+            market_session="regular",
+            effective_at=dt.datetime(2030, 4, 1, 14, 0, tzinfo=UTC),
+            expires_at=dt.datetime(2030, 4, 1, 14, 15, tzinfo=UTC),
+        )
+
+    assert _durable_file_bytes(target_root) == before
+    assert not tuple(
+        (target_root / "objects" / "staged-paper-intent").glob("*.json")
+    )
 
 
 def test_stage_preserves_caller_sequences_state_and_decimal_context(tmp_path):

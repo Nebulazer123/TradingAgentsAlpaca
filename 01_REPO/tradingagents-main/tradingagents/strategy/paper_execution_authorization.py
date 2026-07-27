@@ -742,38 +742,68 @@ def _require_global_authorization_uniqueness(
     envelopes: Sequence[EvidenceEnvelope],
     candidate: AuthorizedPaperOrderRequest,
     *,
-    tolerate_invalid_orphans: bool = False,
+    orphan_snapshot: Sequence[EvidenceEnvelope] = (),
 ) -> None:
+    meaning_by_staged: dict[str, bytes] = {}
+    logical_by_digest: dict[str, tuple[bytes, bytes]] = {}
+    digest_by_client: dict[str, str] = {}
+
+    def bind(request: AuthorizedPaperOrderRequest) -> None:
+        meaning = request.canonical_json_bytes()
+        prior_meaning = meaning_by_staged.get(request.staged_intent_id)
+        if prior_meaning is not None and prior_meaning != meaning:
+            raise ValueError(
+                "staged intent already has a different authorization"
+            )
+        meaning_by_staged[request.staged_intent_id] = meaning
+
+        logical_bytes = _authorization_logical_bytes(request)
+        prior_logical = logical_by_digest.get(request.logical_order_sha256)
+        if prior_logical is not None:
+            prior_bytes, prior_authorization = prior_logical
+            if prior_bytes != logical_bytes:
+                raise ValueError(
+                    "logical order digest maps to different material"
+                )
+            if prior_authorization != meaning:
+                raise ValueError(
+                    "logical order digest maps to a different authorization"
+                )
+        logical_by_digest[request.logical_order_sha256] = (
+            logical_bytes,
+            meaning,
+        )
+
+        prior_digest = digest_by_client.get(request.client_order_id)
+        if (
+            prior_digest is not None
+            and prior_digest != request.logical_order_sha256
+        ):
+            raise ValueError(
+                "client_order_id maps to a different logical order digest"
+            )
+        digest_by_client[request.client_order_id] = (
+            request.logical_order_sha256
+        )
+
     for envelope in envelopes:
+        if envelope.kind != PAPER_EXECUTION_AUTHORIZATION_KIND:
+            continue
+        bind(_authorization_from_envelope(envelope))
+
+    for envelope in orphan_snapshot:
         if (
             envelope.kind != PAPER_EXECUTION_AUTHORIZATION_KIND
             or envelope.object_id == candidate.authorization_id
         ):
             continue
         try:
-            existing = _authorization_from_envelope(envelope)
+            orphan = _authorization_from_envelope(envelope)
         except (TypeError, ValueError):
-            if tolerate_invalid_orphans:
-                continue
-            raise
-        if existing.staged_intent_id == candidate.staged_intent_id:
-            raise ValueError(
-                "staged intent already has a different authorization"
-            )
-        if existing.logical_order_sha256 == candidate.logical_order_sha256:
-            if _authorization_logical_bytes(
-                existing
-            ) != _authorization_logical_bytes(candidate):
-                raise ValueError(
-                    "logical order digest maps to different material"
-                )
-            raise ValueError(
-                "logical order digest maps to a different authorization"
-            )
-        if existing.client_order_id == candidate.client_order_id:
-            raise ValueError(
-                "client_order_id maps to a different logical order digest"
-            )
+            continue
+        bind(orphan)
+
+    bind(candidate)
 
 
 class StrategyPaperExecutionAuthorizationLedger:
@@ -870,22 +900,22 @@ class StrategyPaperExecutionAuthorizationLedger:
                 registration=locked_registration,
                 owner_role=owner_role,
             )
-            _require_global_authorization_uniqueness(admitted, request)
 
-        def validate_orphans(
+        def validate_combined(
+            admitted: tuple[EvidenceEnvelope, ...],
             orphans: tuple[EvidenceEnvelope, ...],
             envelope: EvidenceEnvelope,
         ) -> None:
             _require_global_authorization_uniqueness(
-                orphans,
+                admitted,
                 _authorization_from_envelope(envelope),
-                tolerate_invalid_orphans=True,
+                orphan_snapshot=orphans,
             )
 
         admission = self._store.admit_checked(
             candidate,
             validate=validate,
-            validate_orphans=validate_orphans,
+            validate_combined=validate_combined,
         )
         return _authorization_from_envelope(admission.envelope)
 

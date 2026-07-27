@@ -869,8 +869,14 @@ def test_evaluation_runtime_brackets_authorization_exactly_twice_outside_callbac
         calls.append((repo_root, durable_registration))
         return original_runtime(repo_root, durable_registration)
 
-    def wrapped_admit(candidate, *, validate, validate_orphans=None):
-        assert validate_orphans is not None
+    def wrapped_admit(
+        candidate,
+        *,
+        validate,
+        validate_orphans=None,
+        validate_combined=None,
+    ):
+        assert validate_combined is not None
 
         def wrap(callback):
             def guarded(*args):
@@ -889,6 +895,11 @@ def test_evaluation_runtime_brackets_authorization_exactly_twice_outside_callbac
             validate_orphans=(
                 wrap(validate_orphans)
                 if validate_orphans is not None
+                else None
+            ),
+            validate_combined=(
+                wrap(validate_combined)
+                if validate_combined is not None
                 else None
             ),
         )
@@ -1986,6 +1997,256 @@ def _append_colliding_authorization_history(
             validate=lambda _snapshot, _envelope: None,
         )
     return alternate_request
+
+
+def _durable_authorization_file_bytes(root):
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _admit_staged_variant(
+    root,
+    source,
+    *,
+    session_date,
+    effective_at,
+    recorded_at,
+):
+    from tradingagents.strategy import StagedPaperIntent
+    from tradingagents.strategy._immutable_evidence_store import (
+        STAGED_PAPER_INTENT_KIND,
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    payload = source.to_dict()
+    payload.update(
+        {
+            "session_date": session_date,
+            "effective_at": effective_at,
+            "recorded_at": recorded_at,
+        }
+    )
+    _reidentify_staged_payload(payload)
+    staged = StagedPaperIntent.from_dict(payload)
+    ImmutableStrategyEvidenceStore(
+        root,
+        clock=lambda: dt.datetime.fromisoformat(recorded_at),
+    ).admit_checked(
+        EvidenceCandidate(
+            kind=STAGED_PAPER_INTENT_KIND,
+            effective_at=staged.effective_at,
+            payload=staged._evidence_payload(),
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    )
+    return staged
+
+
+@pytest.mark.parametrize(
+    ("global_identity", "message"),
+    (
+        ("staged", "staged intent already has"),
+        ("logical", "logical order digest"),
+        ("client", "client_order_id"),
+    ),
+)
+def test_prerequisite_cross_set_authorization_conflict_blocks_unrelated_candidate(
+    tmp_path,
+    monkeypatch,
+    global_identity,
+    message,
+):
+    # Break caught: admitted A and strict-valid orphan B build separate global
+    # indexes, so later unrelated candidate C can write over their conflict.
+    from tradingagents.strategy import AuthorizedPaperOrderRequest
+    from tradingagents.strategy._immutable_evidence_store import (
+        PAPER_EXECUTION_AUTHORIZATION_KIND,
+        STAGED_PAPER_INTENT_KIND,
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+    from tradingagents.strategy.staged_intent import (
+        _staged_intent_from_envelope,
+    )
+
+    ledger, admitted, _changed = _authorization_replay_fixture(tmp_path)
+    snapshot = ledger._store.verify()
+    admitted_staged = _staged_intent_from_envelope(
+        next(
+            envelope
+            for envelope in snapshot
+            if envelope.kind == STAGED_PAPER_INTENT_KIND
+            and envelope.object_id == admitted.staged_intent_id
+        )
+    )
+    if global_identity == "staged":
+        orphan_payload = admitted.to_dict()
+        orphan_payload["paper_account_fingerprint"] = "a" * 64
+        _reidentify_authorization_payload(orphan_payload)
+        orphan = AuthorizedPaperOrderRequest.from_dict(orphan_payload)
+        orphan_store = ImmutableStrategyEvidenceStore(
+            ledger._store.root,
+            clock=lambda: dt.datetime(
+                2030,
+                4,
+                1,
+                14,
+                1,
+                6,
+                tzinfo=UTC,
+            ),
+        )
+
+        def crash(_path):
+            raise RuntimeError("simulated staged-identity orphan")
+
+        orphan_store._after_object_fsync = crash
+        with pytest.raises(RuntimeError, match="staged-identity orphan"):
+            orphan_store.admit_checked(
+                EvidenceCandidate(
+                    kind=PAPER_EXECUTION_AUTHORIZATION_KIND,
+                    effective_at=orphan.effective_at,
+                    payload=orphan._evidence_payload(),
+                ),
+                validate=lambda _snapshot, _envelope: None,
+            )
+    else:
+        orphan = _append_colliding_authorization_history(
+            ledger,
+            admitted,
+            monkeypatch,
+            collision_kind=global_identity,
+            leave_authorization_orphan=True,
+        )
+
+    ImmutableStrategyEvidenceStore(
+        ledger._store.root,
+        clock=lambda: dt.datetime(
+            2030,
+            4,
+            1,
+            14,
+            1,
+            8,
+            tzinfo=UTC,
+        ),
+    ).admit_checked(
+        EvidenceCandidate(
+            kind="baseline-genome",
+            effective_at="2030-04-01T14:01:08+00:00",
+            payload={"later_unrelated": True},
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    )
+    unrelated_staged = _admit_staged_variant(
+        ledger._store.root,
+        admitted_staged,
+        session_date="2030-04-03",
+        effective_at="2030-04-01T14:01:09+00:00",
+        recorded_at="2030-04-01T14:01:09+00:00",
+    )
+    before = _durable_authorization_file_bytes(ledger._store.root)
+    raw_account_id = " \tSensitive Candidate Account α\n "
+
+    with pytest.raises(ValueError, match=message) as exc_info:
+        _authorize_once(
+            ledger._store.root,
+            unrelated_staged,
+            paper_account_id=raw_account_id,
+            clock_time=dt.datetime(
+                2030,
+                4,
+                1,
+                14,
+                1,
+                11,
+                tzinfo=UTC,
+            ),
+            effective_at=dt.datetime(
+                2030,
+                4,
+                1,
+                14,
+                1,
+                10,
+                tzinfo=UTC,
+            ),
+        )
+
+    error_text = str(exc_info.value)
+    assert admitted.authorization_id != orphan.authorization_id
+    assert unrelated_staged.staged_intent_id not in {
+        admitted.staged_intent_id,
+        orphan.staged_intent_id,
+    }
+    assert raw_account_id not in error_text
+    assert raw_account_id.strip() not in error_text
+    assert raw_account_id.encode("unicode_escape").decode() not in error_text
+    assert _durable_authorization_file_bytes(ledger._store.root) == before
+
+
+def test_prerequisite_malformed_authorization_orphan_is_neutral(tmp_path):
+    # Break caught: domain-invalid authorization orphan parsing escapes the
+    # narrow orphan error boundary and blocks a valid unrelated admission.
+    from tradingagents.strategy._immutable_evidence_store import (
+        PAPER_EXECUTION_AUTHORIZATION_KIND,
+        EvidenceCandidate,
+        ImmutableStrategyEvidenceStore,
+    )
+
+    root, registration, promotion_evidence = _durable_internal_evidence(
+        tmp_path
+    )
+    _, staged_intent = _stage_once(
+        root,
+        registration,
+        promotion_evidence,
+    )
+    malformed_payload = _authorization_payload(staged_intent)
+    malformed_payload["client_order_id"] = "not-a-canonical-client-id"
+    malformed_store = ImmutableStrategyEvidenceStore(
+        root,
+        clock=lambda: dt.datetime(
+            2030,
+            4,
+            1,
+            14,
+            1,
+            4,
+            tzinfo=UTC,
+        ),
+    )
+
+    def crash(_path):
+        raise RuntimeError("simulated malformed authorization orphan")
+
+    malformed_store._after_object_fsync = crash
+    with pytest.raises(RuntimeError, match="malformed authorization orphan"):
+        malformed_store.admit_checked(
+            EvidenceCandidate(
+                kind=PAPER_EXECUTION_AUTHORIZATION_KIND,
+                effective_at=malformed_payload["effective_at"],
+                payload={
+                    key: value
+                    for key, value in malformed_payload.items()
+                    if key
+                    not in {
+                        "authorization_id",
+                        "effective_at",
+                        "recorded_at",
+                    }
+                },
+            ),
+            validate=lambda _snapshot, _envelope: None,
+        )
+
+    _ledger, request = _authorize_once(root, staged_intent)
+
+    assert request.staged_intent_id == staged_intent.staged_intent_id
 
 
 @pytest.mark.parametrize("operation", ("verify", "rebuild"))

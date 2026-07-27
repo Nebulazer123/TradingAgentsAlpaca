@@ -952,23 +952,42 @@ def _logical_slot(
     )
 
 
-def _require_logical_slot_available(
+def _require_logical_slot_unique(
     admitted: Sequence[EvidenceEnvelope],
     candidate: StagedPaperIntent,
+    *,
+    orphan_snapshot: Sequence[EvidenceEnvelope] = (),
 ) -> None:
-    candidate_slot = _logical_slot(candidate)
+    meanings_by_slot: dict[tuple[str, str, str], bytes] = {}
+
+    def bind(intent: StagedPaperIntent) -> None:
+        slot = _logical_slot(intent)
+        meaning = intent.canonical_json_bytes()
+        prior = meanings_by_slot.get(slot)
+        if prior is not None and prior != meaning:
+            raise ValueError(
+                "staged intent logical slot already has different material"
+            )
+        meanings_by_slot[slot] = meaning
+
     for envelope in admitted:
+        if envelope.kind != STAGED_PAPER_INTENT_KIND:
+            continue
+        bind(_staged_intent_from_envelope(envelope))
+
+    for envelope in orphan_snapshot:
         if (
             envelope.kind != STAGED_PAPER_INTENT_KIND
             or envelope.object_id == candidate.staged_intent_id
         ):
             continue
-        if _logical_slot(_staged_intent_from_envelope(envelope)) == (
-            candidate_slot
-        ):
-            raise ValueError(
-                "staged intent logical slot already has different material"
-            )
+        try:
+            orphan = _staged_intent_from_envelope(envelope)
+        except (TypeError, ValueError):
+            continue
+        bind(orphan)
+
+    bind(candidate)
 
 
 def _require_intent_bindings(
@@ -1224,21 +1243,22 @@ class StrategyStagedIntentLedger:
                 candidate_state=candidate_snapshot,
                 decision=decision,
             )
-            _require_logical_slot_available(admitted, intent)
 
-        def validate_orphans(
+        def validate_combined(
+            admitted: tuple[EvidenceEnvelope, ...],
             orphans: tuple[EvidenceEnvelope, ...],
             envelope: EvidenceEnvelope,
         ) -> None:
-            _require_logical_slot_available(
-                orphans,
+            _require_logical_slot_unique(
+                admitted,
                 _staged_intent_from_envelope(envelope),
+                orphan_snapshot=orphans,
             )
 
         admission = self._store.admit_checked(
             candidate,
             validate=validate,
-            validate_orphans=validate_orphans,
+            validate_combined=validate_combined,
         )
         return _staged_intent_from_envelope(admission.envelope)
 
