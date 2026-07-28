@@ -1904,6 +1904,16 @@ def _valid_promotion_sleeve_record(
     ):
         return False
     source = record.get("source")
+    # A normal-live activation is repaired only by its proposal-aware local
+    # transaction.  The legacy recovery path has no Task 2 intent or consumed
+    # receipt, so treating this state as a generic promotion record would be an
+    # authorization widening.  Keep it frozen and fail closed here.
+    if (
+        isinstance(source, Mapping)
+        and source.get("kind") == "immutable_strategy_evidence"
+        and live_enabled is True
+    ):
+        return False
     if isinstance(source, Mapping) and source.get("kind") == "immutable_strategy_evidence":
         timestamp = record.get("eligible_at" if stage == "tiny_live_eligible" else "ineligible_at")
         opposite = record.get("ineligible_at" if stage == "tiny_live_eligible" else "eligible_at")

@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from tradingagents.execution.authorized_normal_trade_intent import (
+    AuthorizedNormalTradeIntent,
+)
 from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.promotion import SleevePromotionEvidence, evaluate_sleeve_promotion
@@ -45,6 +48,8 @@ from tradingagents.policy.strategy_promotion import (
     StrategyPromotionProposal as _ImmutableStrategyPromotionProposal,
 )
 from tradingagents.strategy._immutable_evidence_store import (
+    NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+    NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
     STRATEGY_PROMOTION_SYNC_PREPARE_KIND,
     STRATEGY_PROMOTION_SYNC_RECEIPT_KIND,
     EvidenceCandidate,
@@ -112,6 +117,27 @@ class StrategyPromotionSyncResult:
     canonical_after_sha256: str
     created: bool
     summary: str
+    can_submit_orders: bool = field(init=False, default=False)
+    execution_authority: str = field(init=False, default="none")
+
+
+@dataclass(frozen=True, slots=True)
+class NormalLiveActivationReceipt:
+    """Local-only proof that one already-authorized sleeve was made eligible.
+
+    This is deliberately not an execution receipt.  It neither constructs a
+    broker client nor authorizes a CLI route; an order path must separately
+    verify the Task 2 intent at its own boundary.
+    """
+
+    activation_prepare_id: str
+    activation_receipt_id: str
+    intent_full_sha256: str
+    canonical_before_sha256: str
+    canonical_after_sha256: str
+    state: dict[str, object]
+    created: bool
+    status: str
     can_submit_orders: bool = field(init=False, default=False)
     execution_authority: str = field(init=False, default="none")
 
@@ -1587,3 +1613,392 @@ def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo
             state_file=state_file,
         )
         return StrategyPromotionSyncResult(state, promoted, demoted, unchanged, proposal.proposal_id, prepared.sync_prepare_id, recorded.sync_receipt_id, snapshot.sha256, after_sha, prepare_created or receipt.created, "immutable strategy eligibility synchronized")
+
+
+_NORMAL_LIVE_PREPARE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "intent_full_sha256",
+        "logical_order_sha256",
+        "proposal_id",
+        "proposal_sha256",
+        "promotion_sync_receipt_id",
+        "promotion_sync_receipt_sha256",
+        "risk_snapshot_sha256",
+        "risk_envelope_sha256",
+        "evaluation_runtime_sha256",
+        "promotion_runtime_commit",
+        "canonical_before_sha256",
+        "canonical_after_sha256",
+        "state_path",
+        "promoted",
+        "demoted",
+        "unchanged",
+        "live_enabled",
+    }
+)
+_NORMAL_LIVE_RECEIPT_FIELDS = _NORMAL_LIVE_PREPARE_FIELDS | {
+    "activation_prepare_id",
+    "activation_prepare_sha256",
+}
+
+
+def _activation_digest(value: object, label: str) -> str:
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _activation_payload(
+    *,
+    proposal: StrategyPromotionProposal,
+    intent: AuthorizedNormalTradeIntent,
+    intent_full_sha256: str,
+    canonical_before_sha256: str,
+    canonical_after_sha256: str,
+    state_file: Path,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "intent_full_sha256": intent_full_sha256,
+        "logical_order_sha256": intent.logical_order_sha256,
+        "proposal_id": proposal.proposal_id,
+        "proposal_sha256": _digest(proposal.canonical_json_bytes()),
+        "promotion_sync_receipt_id": intent.promotion_sync_receipt_id,
+        "promotion_sync_receipt_sha256": intent.promotion_sync_receipt_sha256,
+        "risk_snapshot_sha256": intent.risk_snapshot_sha256,
+        "risk_envelope_sha256": proposal.risk_attestation.risk_envelope_sha256,
+        "evaluation_runtime_sha256": proposal.evaluation_runtime_sha256,
+        "promotion_runtime_commit": proposal.promotion_runtime_commit,
+        "canonical_before_sha256": canonical_before_sha256,
+        "canonical_after_sha256": canonical_after_sha256,
+        "state_path": str(state_file),
+        "promoted": [proposal.sleeve],
+        "demoted": [],
+        "unchanged": [],
+        "live_enabled": True,
+    }
+
+
+def _require_activation_payload(
+    payload: object,
+    *,
+    expected: Mapping[str, object],
+    receipt: bool,
+) -> dict[str, object]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("normal live activation evidence payload is invalid")
+    expected_fields = (
+        _NORMAL_LIVE_RECEIPT_FIELDS if receipt else _NORMAL_LIVE_PREPARE_FIELDS
+    )
+    if set(payload) != expected_fields:
+        raise ValueError("normal live activation evidence fields are invalid")
+    material = dict(payload)
+    if receipt:
+        prepare_id = material.pop("activation_prepare_id")
+        prepare_sha = material.pop("activation_prepare_sha256")
+        if type(prepare_id) is not str or not prepare_id.startswith(
+            NORMAL_LIVE_ACTIVATION_PREPARE_KIND + "-"
+        ):
+            raise ValueError("normal live activation prepare id is invalid")
+        _activation_digest(prepare_sha, "normal live activation prepare digest")
+    for key, value in expected.items():
+        if material.get(key) != value:
+            raise ValueError("normal live activation evidence does not match intent")
+    for key in (
+        "intent_full_sha256",
+        "logical_order_sha256",
+        "proposal_sha256",
+        "promotion_sync_receipt_sha256",
+        "risk_snapshot_sha256",
+        "risk_envelope_sha256",
+        "evaluation_runtime_sha256",
+        "canonical_before_sha256",
+        "canonical_after_sha256",
+    ):
+        _activation_digest(material.get(key), key)
+    if (
+        material["schema_version"] != 1
+        or material["live_enabled"] is not True
+        or material["promoted"] != expected["promoted"]
+        or material["demoted"] != []
+        or material["unchanged"] != []
+    ):
+        raise ValueError("normal live activation transition is invalid")
+    return dict(payload)
+
+
+def _activation_collision_or_receipt(
+    *,
+    store: ImmutableStrategyEvidenceStore,
+    logical_order_sha256: str,
+    intent_full_sha256: str,
+    canonical_after_sha256: str,
+) -> EvidenceEnvelope | None:
+    receipt: EvidenceEnvelope | None = None
+    for kind in (
+        NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+        NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+    ):
+        for envelope in store.envelopes(kind=kind):
+            payload = _thaw_json(envelope.payload)
+            if not isinstance(payload, Mapping):
+                raise ValueError("normal live activation evidence payload is invalid")
+            if payload.get("logical_order_sha256") != logical_order_sha256:
+                continue
+            if payload.get("intent_full_sha256") != intent_full_sha256:
+                raise ValueError("logical order digest is already bound to different intent")
+            if kind == NORMAL_LIVE_ACTIVATION_RECEIPT_KIND:
+                if payload.get("canonical_after_sha256") != canonical_after_sha256:
+                    raise ValueError("normal live activation receipt state is inconsistent")
+                receipt = envelope
+    return receipt
+
+
+def _require_current_normal_live_sleeve(
+    *, proposal: StrategyPromotionProposal, state: Mapping[str, object]
+) -> Mapping[str, object]:
+    sleeves = state.get("sleeves")
+    if not isinstance(sleeves, Mapping):
+        raise ValueError("promotion state has no eligible sleeve")
+    sleeve = sleeves.get(proposal.sleeve)
+    if not isinstance(sleeve, Mapping):
+        raise ValueError("promotion state has no eligible sleeve")
+    if (
+        sleeve.get("stage") != "tiny_live_eligible"
+        or sleeve.get("live_enabled") is not False
+    ):
+        raise ValueError("promotion state is not an eligible capped sleeve")
+    return sleeve
+
+
+def _activation_state(
+    *, state: Mapping[str, object], sleeve: str
+) -> dict[str, object]:
+    copied = json.loads(_canonical(state))
+    sleeves = copied.get("sleeves")
+    if not isinstance(sleeves, dict) or not isinstance(sleeves.get(sleeve), dict):
+        raise ValueError("promotion state has no eligible sleeve")
+    sleeves[sleeve]["live_enabled"] = True
+    return copied
+
+
+def activate_normal_live_intent(
+    proposal: StrategyPromotionProposal,
+    intent: AuthorizedNormalTradeIntent,
+    *,
+    proposal_ledger_root: str | Path,
+    repo_root: str | Path,
+    state_path: str | Path,
+    clock: Callable[[], datetime.datetime] | None = None,
+    fault_hook: Callable[[str], None] | None = None,
+) -> NormalLiveActivationReceipt:
+    """Atomically enable exactly one already-bound normal-live sleeve locally.
+
+    The operation has no broker dependency and writes only the supplied local
+    promotion state plus immutable analysis-only evidence.  It intentionally
+    creates no order and exposes no live-capable command surface.
+    """
+
+    if type(proposal) is not StrategyPromotionProposal or type(intent) is not AuthorizedNormalTradeIntent:
+        raise ValueError("activation requires exact current intent and proposal")
+    state_anchor = _capture_state_path_anchor(state_path)
+    state_file = state_anchor.path
+    repo = Path(repo_root).resolve()
+    moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
+    activated_at = _time_text(moment, "activated_at")
+    checked_at = _time(activated_at, "activated_at")
+    intent_full_sha256 = _digest(intent.canonical_json_bytes())
+    with promotion_state_lock(state_file):
+        _require_state_path_anchor_current(state_anchor)
+        snapshot = read_promotion_state_snapshot(state_file)
+        store = ImmutableStrategyEvidenceStore(proposal_ledger_root, clock=clock)
+        duplicate = _activation_collision_or_receipt(
+            store=store,
+            logical_order_sha256=intent.logical_order_sha256,
+            intent_full_sha256=intent_full_sha256,
+            canonical_after_sha256=snapshot.sha256,
+        )
+        if duplicate is not None:
+            payload = _thaw_json(duplicate.payload)
+            if not isinstance(payload, Mapping):
+                raise ValueError("normal live activation receipt is invalid")
+            return NormalLiveActivationReceipt(
+                str(payload["activation_prepare_id"]),
+                duplicate.object_id,
+                intent_full_sha256,
+                str(payload["canonical_before_sha256"]),
+                snapshot.sha256,
+                dict(snapshot.state),
+                False,
+                "read_only_retry",
+            )
+        repaired_prepares: list[tuple[EvidenceEnvelope, dict[str, object]]] = []
+        for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND):
+            payload = _thaw_json(envelope.payload)
+            if not isinstance(payload, Mapping) or payload.get("intent_full_sha256") != intent_full_sha256:
+                continue
+            after_sha256 = payload.get("canonical_after_sha256")
+            if after_sha256 != snapshot.sha256:
+                continue
+            expected = _activation_payload(
+                proposal=proposal,
+                intent=intent,
+                intent_full_sha256=intent_full_sha256,
+                canonical_before_sha256=intent.promotion_state_sha256,
+                canonical_after_sha256=after_sha256,
+                state_file=state_file,
+            )
+            _require_activation_payload(payload, expected=expected, receipt=False)
+            repaired_prepares.append((envelope, expected))
+        if len(repaired_prepares) > 1:
+            raise ValueError("multiple normal live activation prepares")
+        if repaired_prepares:
+            prepare, expected_prepare = repaired_prepares[0]
+            expected_receipt = {
+                **expected_prepare,
+                "activation_prepare_id": prepare.object_id,
+                "activation_prepare_sha256": _digest(prepare.canonical_json_bytes()),
+            }
+            repaired = store.admit_checked(
+                EvidenceCandidate(
+                    kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+                    effective_at=prepare.effective_at,
+                    payload=expected_receipt,
+                ),
+                validate=lambda _snapshot, envelope: _require_activation_payload(
+                    _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
+                ),
+            )
+            return NormalLiveActivationReceipt(
+                prepare.object_id,
+                repaired.envelope.object_id,
+                intent_full_sha256,
+                intent.promotion_state_sha256,
+                snapshot.sha256,
+                dict(snapshot.state),
+                repaired.created,
+                "receipt_repaired",
+            )
+        if snapshot.sha256 != intent.promotion_state_sha256:
+            raise ValueError("promotion state preimage does not match exact intent")
+        if not intent.is_active(at=checked_at):
+            raise ValueError("activation requires an active capped intent")
+        durable = StrategyOperationalPromotionLedger(proposal_ledger_root, clock=clock).rebuild()
+        matches = [item for item in durable if item.proposal_id == proposal.proposal_id]
+        if len(matches) != 1 or matches[0].canonical_json_bytes() != proposal.canonical_json_bytes():
+            raise ValueError("activation proposal is not durable and byte-identical")
+        if (
+            intent.promotion_proposal_id != proposal.proposal_id
+            or intent.promotion_proposal_sha256 != _digest(proposal.canonical_json_bytes())
+            or intent.evaluation_runtime_sha256 != proposal.evaluation_runtime_sha256
+            or intent.evaluation_code_commit != proposal.evaluation_code_commit
+            or intent.genome_id != proposal.genome_id
+            or intent.genome_canonical_sha256 != proposal.genome_canonical_sha256
+            or intent.shadow_attestation_sha256 != proposal.shadow_attestation_sha256
+            or intent.risk_snapshot_sha256 != proposal.risk_attestation.risk_envelope_sha256
+        ):
+            raise ValueError("activation requires an active capped intent")
+        _require_current_normal_live_sleeve(proposal=proposal, state=snapshot.state)
+        sync_receipts = [
+            envelope
+            for envelope in store.envelopes(kind=STRATEGY_PROMOTION_SYNC_RECEIPT_KIND)
+            if envelope.object_id == intent.promotion_sync_receipt_id
+        ]
+        if len(sync_receipts) != 1 or _digest(sync_receipts[0].canonical_json_bytes()) != intent.promotion_sync_receipt_sha256:
+            raise ValueError("activation requires the exact Task 6D receipt")
+        sync_receipt = _envelope_object(sync_receipts[0], StrategyPromotionSyncReceipt)
+        if (
+            not isinstance(sync_receipt, StrategyPromotionSyncReceipt)
+            or sync_receipt.proposal_id != proposal.proposal_id
+            or sync_receipt.proposal_sha256 != _digest(proposal.canonical_json_bytes())
+            or sync_receipt.canonical_after_sha256 != snapshot.sha256
+        ):
+            raise ValueError("activation requires the exact Task 6D receipt")
+        _require_clean_runtime_descendant(repo, proposal.promotion_runtime_commit)
+        risk_path, _ = _safe_repo_file(
+            repo, proposal.risk_attestation.risk_envelope_ref, "risk envelope"
+        )
+        risk_bytes = risk_path.read_bytes()
+        if _digest(risk_bytes) != proposal.risk_attestation.risk_envelope_sha256:
+            raise ValueError("activation risk envelope changed")
+        _require_current_risk_envelope(
+            risk_path, proposal=proposal, anchored_bytes=risk_bytes
+        )
+        after_state = _activation_state(state=snapshot.state, sleeve=proposal.sleeve)
+        after = _canonical(after_state)
+        after_sha256 = _digest(after)
+        expected_prepare = _activation_payload(
+            proposal=proposal,
+            intent=intent,
+            intent_full_sha256=intent_full_sha256,
+            canonical_before_sha256=snapshot.sha256,
+            canonical_after_sha256=after_sha256,
+            state_file=state_file,
+        )
+        prepares = []
+        for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND):
+            payload = _thaw_json(envelope.payload)
+            if isinstance(payload, Mapping) and payload.get("intent_full_sha256") == intent_full_sha256:
+                _require_activation_payload(payload, expected=expected_prepare, receipt=False)
+                prepares.append(envelope)
+        if len(prepares) > 1:
+            raise ValueError("multiple normal live activation prepares")
+        if prepares:
+            prepare = prepares[0]
+            prepare_created = False
+        else:
+            prepare_admission = store.admit_checked(
+                EvidenceCandidate(
+                    kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+                    effective_at=activated_at,
+                    payload=expected_prepare,
+                ),
+                validate=lambda _snapshot, envelope: _require_activation_payload(
+                    _thaw_json(envelope.payload), expected=expected_prepare, receipt=False
+                ),
+            )
+            prepare = prepare_admission.envelope
+            prepare_created = prepare_admission.created
+        if fault_hook is not None:
+            fault_hook("after_prepare")
+        _require_state_path_anchor_current(state_anchor)
+        _require_snapshot_current(snapshot)
+        staged = _stage_state_replacement(state_file, after)
+        try:
+            replaced = _replace_state_after_final_guard(
+                state_file=state_file,
+                snapshot=snapshot,
+                staged=staged,
+                after=after,
+                after_sha256=after_sha256,
+            )
+        finally:
+            staged.unlink(missing_ok=True)
+        if fault_hook is not None:
+            fault_hook("after_replace")
+        expected_receipt = {
+            **expected_prepare,
+            "activation_prepare_id": prepare.object_id,
+            "activation_prepare_sha256": _digest(prepare.canonical_json_bytes()),
+        }
+        receipt_admission = store.admit_checked(
+            EvidenceCandidate(
+                kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+                effective_at=prepare.effective_at,
+                payload=expected_receipt,
+            ),
+            validate=lambda _snapshot, envelope: _require_activation_payload(
+                _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
+            ),
+        )
+        return NormalLiveActivationReceipt(
+            prepare.object_id,
+            receipt_admission.envelope.object_id,
+            intent_full_sha256,
+            snapshot.sha256,
+            replaced.sha256,
+            after_state,
+            prepare_created or receipt_admission.created,
+            "activated",
+        )

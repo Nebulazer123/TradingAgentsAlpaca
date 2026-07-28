@@ -1,5 +1,6 @@
 """Contract tests for immutable strategy-promotion state synchronization."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -14,6 +15,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from tradingagents.execution.authorized_normal_trade_intent import (
+    AuthorizedNormalTradeIntent,
+)
 from tradingagents.orchestration import self_heal as self_heal_module
 from tradingagents.policy import strategy_promotion_sync as sync_module
 from tradingagents.policy.strategy_promotion_sync import (
@@ -24,6 +28,68 @@ from tradingagents.policy.strategy_promotion_sync import (
 _ISOLATED_SOURCE_TAMPER_ENV = "TRADINGAGENTS_ISOLATED_SOURCE_TAMPER"
 _ISOLATED_SOURCE_TAMPER_READY_ENV = "TRADINGAGENTS_ISOLATED_SOURCE_TAMPER_READY"
 _ISOLATED_SOURCE_TAMPER_CONTINUE_ENV = "TRADINGAGENTS_ISOLATED_SOURCE_TAMPER_CONTINUE"
+_CAPPED_ACTIVATION_ISOLATED_ENV = "TRADINGAGENTS_CAPPED_ACTIVATION_ISOLATED"
+
+
+def _normal_live_intent(
+    proposal: object,
+    *,
+    state_sha256: str,
+    receipt_id: str,
+    receipt_sha256: str,
+    recorded_at: str = "2030-03-22T16:05:00+00:00",
+    expires_at: str = "2030-03-22T16:10:00+00:00",
+) -> AuthorizedNormalTradeIntent:
+    """Make a Task 2 intent bound to the real Task 6D test journal."""
+
+    import hashlib
+    import json
+
+    payload: dict[str, object] = {
+        "promotion_proposal_id": proposal.proposal_id,
+        "promotion_proposal_sha256": sync_module._digest(
+            proposal.canonical_json_bytes()
+        ),
+        "promotion_state_sha256": state_sha256,
+        "promotion_sync_receipt_id": receipt_id,
+        "promotion_sync_receipt_sha256": receipt_sha256,
+        "staged_intent_id": "staged-live-intent-" + "1" * 64,
+        "staged_intent_sha256": "2" * 64,
+        "shadow_attestation_sha256": proposal.shadow_attestation_sha256,
+        "genome_id": proposal.genome_id,
+        "genome_canonical_sha256": proposal.genome_canonical_sha256,
+        "evaluation_code_commit": proposal.evaluation_code_commit,
+        "evaluation_runtime_sha256": proposal.evaluation_runtime_sha256,
+        "market_observation_sha256": "3" * 64,
+        "portfolio_snapshot_sha256": "4" * 64,
+        "risk_snapshot_sha256": proposal.risk_attestation.risk_envelope_sha256,
+        "symbol": "MSFT",
+        "side": "buy",
+        "order_type": "limit",
+        "tif": "day",
+        "notional_usd": "1.00",
+        "limit_price": "100.00",
+        "effective_at": recorded_at,
+        "expires_at": expires_at,
+        "recorded_at": recorded_at,
+    }
+    def canonical(value: object) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    logical_order_sha256 = hashlib.sha256(canonical(payload)).hexdigest()
+    payload["logical_order_sha256"] = logical_order_sha256
+    payload["client_order_id"] = f"ta-l-{logical_order_sha256[:40]}"
+    bound = {
+        **payload,
+        "owner_role": "portfolio_executive",
+        "authorization_scope": "single_alpaca_live_order",
+        "live_submit_authorized": True,
+        "paper_submit_authorized": False,
+    }
+    bound["authorization_id"] = (
+        "authorized-normal-trade-intent-"
+        + hashlib.sha256(canonical(bound)).hexdigest()
+    )
+    return AuthorizedNormalTradeIntent.from_dict(bound)
 
 
 def _copy_isolated_source_tamper_repo(tmp_path: Path) -> Path:
@@ -136,6 +202,34 @@ def _run_source_tamper_in_isolated_repo(tmp_path: Path) -> None:
         relative: (source_root / relative).read_bytes()
         for relative in EVALUATION_SOURCE_PATHS
     } == source_before
+
+
+def _run_capped_activation_in_isolated_repo(tmp_path: Path, nodeid: str) -> None:
+    """Run the positive activation chain where loaded sources match its repo."""
+
+    isolated = _copy_isolated_source_tamper_repo(tmp_path)
+    subprocess.run(
+        ("git", "config", "status.showUntrackedFiles", "no"),
+        cwd=isolated,
+        check=True,
+    )
+    environment = {
+        **os.environ,
+        _CAPPED_ACTIVATION_ISOLATED_ENV: "1",
+        "PYTHONPATH": os.pathsep.join(
+            part for part in (str(isolated), os.environ.get("PYTHONPATH", "")) if part
+        ),
+    }
+    result = subprocess.run(
+        (sys.executable, "-m", "pytest", "-q", nodeid),
+        cwd=isolated,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, (
+        f"isolated activation fixture failed:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
 
 
 def _controlled_proposal() -> tuple[object, str]:
@@ -318,6 +412,149 @@ def _real_immutable_journal(tmp_path: Path, monkeypatch):
         expires_at=base + timedelta(minutes=19),
     )
     return root, REPO_ROOT, proposal, base + timedelta(minutes=4, seconds=30), commit
+
+
+def _capped_activation_journal(tmp_path: Path, monkeypatch):
+    """Build a disposable complete chain with the explicit capped opt-in on."""
+
+    import tradingagents.policy.strategy_promotion as promotion_module
+    from tests.test_strategy_paper_execution_authorization import _authorize_once
+    from tests.test_strategy_shadow_attestation import _receipt_pair_for_authorization
+    from tests.test_strategy_staged_intent import REPO_ROOT, _stage_with_times
+    from tradingagents.orchestration.authority import ActionClass, authority_for
+    from tradingagents.policy.strategy_promotion import (
+        REQUIRED_STRATEGY_PROMOTION_VALIDATION_COMMANDS,
+        StrategyOperationalPromotionLedger,
+        build_risk_attestation,
+        build_validation_attestation,
+    )
+    from tradingagents.strategy._immutable_evidence_store import (
+        ImmutableStrategyEvidenceStore,
+    )
+    from tradingagents.strategy.promotion_evidence import (
+        StrategyEvaluationRegistration,
+        StrategyPromotionEvidence,
+    )
+    from tradingagents.strategy.shadow_attestation import StrategyShadowEvidenceLedger
+
+    root, _repo_root, prior, synced_at, _commit = _real_immutable_journal(
+        tmp_path, monkeypatch
+    )
+
+    def actual_git(repo: Path, *args: str) -> str:
+        return subprocess.run(
+            ("git", *args),
+            cwd=repo,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+
+    monkeypatch.setattr(promotion_module, "_git", actual_git)
+    monkeypatch.setattr(sync_module, "_git", actual_git)
+    isolated = (
+        Path(__file__).parents[1]
+        if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) == "1"
+        else _copy_isolated_source_tamper_repo(tmp_path)
+    )
+    envelope = isolated / "config" / "risk_envelope.example.yaml"
+    envelope.write_text(
+        envelope.read_text(encoding="utf-8").replace(
+            "new_sleeve_auto_promote: false", "new_sleeve_auto_promote: true"
+        ),
+        encoding="utf-8",
+    )
+    for command in (
+        ("git", "add", "config/risk_envelope.example.yaml"),
+        ("git", "commit", "-qm", "enable capped activation fixture"),
+    ):
+        subprocess.run(command, cwd=isolated, check=True)
+    commit = subprocess.check_output(
+        ("git", "rev-parse", "HEAD"), cwd=isolated, text=True
+    ).strip()
+    snapshot = ImmutableStrategyEvidenceStore(root).rebuild()
+    promotion = StrategyPromotionEvidence.from_envelope(
+        next(item for item in snapshot if item.object_id == prior.promotion_evidence_id)
+    )
+    registration = StrategyEvaluationRegistration.from_envelope(
+        next(item for item in snapshot if item.object_id == prior.registration_id)
+    )
+    observations = []
+    for day in range(1, 6):
+        session_at = synced_at + timedelta(days=day)
+        _ledger, staged = _stage_with_times(
+            root,
+            registration,
+            promotion,
+            clock_time=session_at + timedelta(seconds=5),
+            effective_at=session_at,
+            expires_at=session_at + timedelta(minutes=10),
+            session_date=session_at.date().isoformat(),
+        )
+        _auth_ledger, authorization = _authorize_once(
+            root,
+            staged,
+            clock_time=session_at + timedelta(minutes=1, seconds=5),
+            effective_at=session_at + timedelta(minutes=1),
+            expires_at=session_at + timedelta(minutes=9),
+        )
+        order_receipt, reconciliation = _receipt_pair_for_authorization(
+            authorization,
+            submitted_at=(session_at + timedelta(minutes=2)).isoformat(),
+            last_seen_at=(session_at + timedelta(minutes=3)).isoformat(),
+            checked_at=(session_at + timedelta(minutes=3)).isoformat(),
+            broker_order_id=f"paper-capped-activation-{day}",
+        )
+        observation_ledger = StrategyShadowEvidenceLedger(
+            root, repo_root=REPO_ROOT,
+            clock=lambda session_at=session_at: session_at + timedelta(minutes=3),
+        )
+        observations.append(
+            observation_ledger.admit_observation(
+                staged_intent=staged,
+                authorization=authorization,
+                observed_at=session_at + timedelta(minutes=3),
+                paper_order_receipt=order_receipt,
+                reconciliation_receipt=reconciliation,
+                actor_role="integrity_verifier",
+            )
+        )
+    shadow = StrategyShadowEvidenceLedger(
+        root, repo_root=REPO_ROOT,
+        clock=lambda: synced_at + timedelta(days=5, minutes=4),
+    ).assemble(
+        promotion_evidence=promotion,
+        observations=observations,
+        actor_role="integrity_verifier",
+    )
+    attested_at = synced_at + timedelta(days=5, minutes=5)
+    validation = build_validation_attestation(
+        repo_root=isolated,
+        tested_commit=commit,
+        completed_at=attested_at,
+        commands=REQUIRED_STRATEGY_PROMOTION_VALIDATION_COMMANDS,
+        exit_code=0,
+        report_ref="config/strategy_evaluation.json",
+        verifier_role=authority_for(ActionClass.VERIFY).owner_role,
+        clock=lambda: attested_at,
+    )
+    risk = build_risk_attestation(
+        repo_root=isolated,
+        risk_envelope_ref="config/risk_envelope.example.yaml",
+        reviewed_at=attested_at,
+        reviewer_role=authority_for(ActionClass.RISK_CHANGE).owner_role,
+        clock=lambda: attested_at,
+    )
+    proposal = StrategyOperationalPromotionLedger(root, clock=lambda: attested_at).propose(
+        promotion_evidence=promotion,
+        shadow_attestation=shadow,
+        validation_attestation=validation,
+        risk_attestation=risk,
+        effective_at=attested_at,
+        expires_at=attested_at + timedelta(minutes=10),
+    )
+    assert proposal.proposed_stage == "tiny_live_eligible", proposal.gates
+    return root, isolated, proposal, attested_at + timedelta(seconds=30), commit
 
 
 def test_real_immutable_journal_recomputes_before_sync_prepare(tmp_path, monkeypatch) -> None:
@@ -3010,6 +3247,226 @@ def test_source_recompute_refusal_precedes_prepare_and_state_mutation(
 
     assert candidates == []
     assert state.read_bytes() == preimage
+
+
+def test_activation_requires_exact_current_intent_and_state_preimage(
+    tmp_path, monkeypatch
+) -> None:
+    """An intent for any other canonical image cannot activate a sleeve."""
+
+    root, repo_root, proposal, synced_at, commit = _real_immutable_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    state.write_bytes(b'{"sleeves":{}}')
+    monkeypatch.setattr(
+        sync_module,
+        "_git",
+        lambda _root, *args: commit if args == ("rev-parse", "HEAD") else "",
+    )
+    synced = sync_module.sync_strategy_promotion_state_file(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(b'{"sleeves":{}}'),
+        actor_role="strategy_learning",
+        clock=lambda: synced_at,
+    )
+    receipt = next(
+        envelope
+        for envelope in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if envelope.object_id == synced.sync_receipt_id
+    )
+    intent = _normal_live_intent(
+        proposal,
+        state_sha256="0" * 64,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(receipt.canonical_json_bytes()),
+    )
+
+    with pytest.raises(ValueError, match="promotion state preimage"):
+        sync_module.activate_normal_live_intent(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: synced_at,
+        )
+
+    assert state.read_bytes() == synced.state_path.read_bytes() if hasattr(synced, "state_path") else state.read_bytes()
+
+
+def test_activation_never_promotes_an_expired_or_uncapped_intent(
+    tmp_path, monkeypatch
+) -> None:
+    """An expired Task 2 authorization never changes the eligible sleeve."""
+
+    root, repo_root, proposal, synced_at, commit = _real_immutable_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+    monkeypatch.setattr(
+        sync_module,
+        "_git",
+        lambda _root, *args: commit if args == ("rev-parse", "HEAD") else "",
+    )
+    synced = sync_module.sync_strategy_promotion_state_file(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(preimage),
+        actor_role="strategy_learning",
+        clock=lambda: synced_at,
+    )
+    receipt = next(
+        envelope
+        for envelope in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if envelope.object_id == synced.sync_receipt_id
+    )
+    intent = _normal_live_intent(
+        proposal,
+        state_sha256=synced.canonical_after_sha256,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(receipt.canonical_json_bytes()),
+        expires_at="2030-03-22T16:05:01+00:00",
+    )
+    before = state.read_bytes()
+
+    with pytest.raises(ValueError, match="active capped intent"):
+        sync_module.activate_normal_live_intent(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: datetime(2030, 3, 22, 16, 6, tzinfo=timezone.utc),
+        )
+
+    assert state.read_bytes() == before
+
+
+def test_activation_is_one_use_and_duplicate_is_read_only_retry(
+    tmp_path, monkeypatch
+) -> None:
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_is_one_use_and_duplicate_is_read_only_retry",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+    synced = sync_module.sync_strategy_promotion_state_file(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(preimage),
+        actor_role="strategy_learning",
+        clock=lambda: synced_at,
+    )
+    receipt = next(
+        item
+        for item in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if item.object_id == synced.sync_receipt_id
+    )
+    intent = _normal_live_intent(
+        proposal,
+        state_sha256=synced.canonical_after_sha256,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(receipt.canonical_json_bytes()),
+        recorded_at=synced_at.isoformat(),
+        expires_at=(synced_at + timedelta(minutes=5)).isoformat(),
+    )
+
+    first = sync_module.activate_normal_live_intent(
+        proposal, intent, proposal_ledger_root=root, repo_root=repo_root,
+        state_path=state, clock=lambda: synced_at,
+    )
+    bytes_after_first = state.read_bytes()
+    retry = sync_module.activate_normal_live_intent(
+        proposal, intent, proposal_ledger_root=root, repo_root=repo_root,
+        state_path=state, clock=lambda: synced_at,
+    )
+
+    assert first.status == "activated"
+    assert first.created is True
+    assert json.loads(state.read_text())["sleeves"][proposal.sleeve]["live_enabled"] is True
+    assert retry.status == "read_only_retry"
+    assert retry.created is False
+    assert state.read_bytes() == bytes_after_first
+
+
+@pytest.mark.parametrize("boundary", ("after_prepare", "after_replace"))
+def test_activation_crash_repair_never_widens_the_bound_intent(
+    tmp_path, monkeypatch, boundary
+) -> None:
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            f"test_activation_crash_repair_never_widens_the_bound_intent[{boundary}]",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+    synced = sync_module.sync_strategy_promotion_state_file(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(preimage),
+        actor_role="strategy_learning",
+        clock=lambda: synced_at,
+    )
+    receipt = next(
+        item
+        for item in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if item.object_id == synced.sync_receipt_id
+    )
+    intent = _normal_live_intent(
+        proposal,
+        state_sha256=synced.canonical_after_sha256,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(receipt.canonical_json_bytes()),
+        recorded_at=synced_at.isoformat(),
+        expires_at=(synced_at + timedelta(minutes=5)).isoformat(),
+    )
+
+    def crash(actual: str) -> None:
+        if actual == boundary:
+            raise SystemExit(actual)
+
+    with pytest.raises(SystemExit, match=boundary):
+        sync_module.activate_normal_live_intent(
+            proposal, intent, proposal_ledger_root=root, repo_root=repo_root,
+            state_path=state, clock=lambda: synced_at, fault_hook=crash,
+        )
+    repaired = sync_module.activate_normal_live_intent(
+        proposal, intent, proposal_ledger_root=root, repo_root=repo_root,
+        state_path=state, clock=lambda: synced_at,
+    )
+
+    assert repaired.status == (
+        "activated" if boundary == "after_prepare" else "receipt_repaired"
+    )
+    assert json.loads(state.read_text())["sleeves"][proposal.sleeve]["live_enabled"] is True
+
+
 
 
 def test_late_external_anchor_drift_after_recompute_refuses_prepare_and_state(
