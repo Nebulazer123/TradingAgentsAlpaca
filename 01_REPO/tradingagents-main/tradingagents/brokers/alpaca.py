@@ -11,7 +11,7 @@ import datetime
 import hashlib
 import json
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 
@@ -20,7 +20,7 @@ import requests
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
 from tradingagents.policy.strategy_promotion_sync import (
     NormalLiveActivationReceipt,
-    admit_normal_live_broker_submit,
+    execute_normal_live_broker_submit,
 )
 from tradingagents.schemas.trading import TradeIntent
 
@@ -629,10 +629,14 @@ def build_tiny_live_order_payload(intent: TradeIntent) -> dict:
     }
 
 
-def _normal_live_submit_time(
-    clock: Callable[[], datetime.datetime],
-) -> datetime.datetime:
-    checked_at = clock()
+def _normal_live_utc_now() -> datetime.datetime:
+    """Private production clock for the normal-live broker boundary."""
+
+    return datetime.datetime.now(UTC).replace(microsecond=0)
+
+
+def _normal_live_submit_time() -> datetime.datetime:
+    checked_at = _normal_live_utc_now()
     if (
         type(checked_at) is not datetime.datetime
         or checked_at.tzinfo is None
@@ -720,15 +724,11 @@ class AlpacaRestClient:
         *,
         normal_live_evidence_root=None,
         normal_live_repo_root=None,
-        normal_live_clock: Callable[[], datetime.datetime] | None = None,
     ):
         self.settings = settings
         self.session = session or requests.Session()
         self.normal_live_evidence_root = normal_live_evidence_root
         self.normal_live_repo_root = normal_live_repo_root
-        self._normal_live_clock = normal_live_clock or (
-            lambda: datetime.datetime.now(UTC).replace(microsecond=0)
-        )
 
     def assert_expected_mode(self, *, paper: bool) -> None:
         base_url = self.settings.base_url.lower()
@@ -791,7 +791,7 @@ class AlpacaRestClient:
         intent = _require_normal_live_intent(authorized_normal_trade_intent)
         if type(activation_receipt) is not NormalLiveActivationReceipt:
             raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
-        checked_at = _normal_live_submit_time(self._normal_live_clock)
+        checked_at = _normal_live_submit_time()
         if (
             self.normal_live_evidence_root is None
             or self.normal_live_repo_root is None
@@ -808,27 +808,18 @@ class AlpacaRestClient:
             separators=(",", ":"),
             ensure_ascii=False,
         ).encode("utf-8")
-        admission = admit_normal_live_broker_submit(
+        broker_result = execute_normal_live_broker_submit(
             intent,
             receipt,
             proposal_ledger_root=self.normal_live_evidence_root,
             repo_root=self.normal_live_repo_root,
             immutable_order_sha256=hashlib.sha256(facts_bytes).hexdigest(),
-            clock=self._normal_live_clock,
+            checked_at=checked_at,
+            lookup=lambda: self._lookup_live_order_by_client_order_id(client_order_id),
+            post=lambda: self._request("POST", "/v2/orders", json=payload),
         )
-
-        # The broker-submit prepare is immutable and created before the first
-        # possible POST. A retry sees an existing prepare, performs only this
-        # lookup, and cannot create a second order after a crash or timeout.
-        found = self._lookup_live_order_by_client_order_id(client_order_id)
-        if found is not None:
-            _require_matching_broker_order(found, immutable_facts)
-            return found
-        if not admission.created:
-            raise ValueError("live retry lookup found no order; refusing second POST")
-        submitted = self._request("POST", "/v2/orders", json=payload)
-        _require_matching_broker_order(submitted, immutable_facts)
-        return submitted
+        _require_matching_broker_order(broker_result, immutable_facts)
+        return broker_result
 
     def _lookup_live_order_by_client_order_id(self, client_order_id: str) -> dict | None:
         try:

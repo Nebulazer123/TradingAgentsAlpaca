@@ -157,6 +157,32 @@ class NormalLiveBrokerSubmitAdmission:
     execution_authority: str = field(init=False, default="none")
 
 
+# This is deliberately an in-process capability, not durable authorization.
+# A normal-live activation transaction issues it only to the exact receipt
+# object it returns.  Persisted records survive a restart for safe broker
+# lookup, but cannot recreate the capability needed for a first POST.
+_NORMAL_LIVE_BROKER_POST_CAPABILITIES: dict[
+    int, tuple[NormalLiveActivationReceipt, object]
+] = {}
+
+
+def _issue_normal_live_broker_post_capability(
+    receipt: NormalLiveActivationReceipt,
+) -> NormalLiveActivationReceipt:
+    _NORMAL_LIVE_BROKER_POST_CAPABILITIES[id(receipt)] = (receipt, object())
+    return receipt
+
+
+def _claim_normal_live_broker_post_capability(
+    receipt: NormalLiveActivationReceipt,
+) -> bool:
+    entry = _NORMAL_LIVE_BROKER_POST_CAPABILITIES.get(id(receipt))
+    if entry is None or entry[0] is not receipt:
+        return False
+    del _NORMAL_LIVE_BROKER_POST_CAPABILITIES[id(receipt)]
+    return True
+
+
 def _sync_keys(prefix: str) -> set[str]:
     base = {
         f"{prefix}_id",
@@ -1956,7 +1982,15 @@ def _verify_normal_live_activation_receipt(
     repo_root: str | Path,
     checked_at: datetime.datetime | None = None,
     clock: Callable[[], datetime.datetime] | None = None,
-    _accept: Callable[[ImmutableStrategyEvidenceStore, PromotionStateSnapshot, str], object]
+    _accept: Callable[
+        [
+            ImmutableStrategyEvidenceStore,
+            PromotionStateSnapshot,
+            str,
+            Callable[[], None],
+        ],
+        object,
+    ]
     | None = None,
 ) -> object | None:
     """Read-only Task 3 provenance check for the broker-write boundary.
@@ -2086,12 +2120,40 @@ def _verify_normal_live_activation_receipt(
         )
         if dict(receipt_payload) != expected_receipt:
             raise ValueError("activation receipt does not match the activation transaction")
-        _require_snapshot_current(snapshot)
-        _require_state_path_anchor_current(state_anchor)
+        def recheck_before_broker_post() -> None:
+            _require_snapshot_current(snapshot)
+            _require_state_path_anchor_current(state_anchor)
+            current_marker = _activation_state_marker(
+                state=snapshot.state,
+                intent_full_sha256=_digest(intent.canonical_json_bytes()),
+                proposal_id=proposal.proposal_id,
+                sleeve=proposal.sleeve,
+            )
+            if current_marker != activation_state_marker:
+                raise ValueError("activation receipt Task 3 state marker changed")
+            current_sleeves = snapshot.state.get("sleeves")
+            current_sleeve = (
+                current_sleeves.get(proposal.sleeve)
+                if isinstance(current_sleeves, Mapping)
+                else None
+            )
+            if (
+                not isinstance(current_sleeve, Mapping)
+                or current_sleeve.get("stage") != "tiny_live_eligible"
+                or current_sleeve.get("live_enabled") is not True
+            ):
+                raise ValueError("activation receipt has no current live-eligible sleeve")
+
+        recheck_before_broker_post()
         return (
             None
             if _accept is None
-            else _accept(store, snapshot, activation_state_marker)
+            else _accept(
+                store,
+                snapshot,
+                activation_state_marker,
+                recheck_before_broker_post,
+            )
         )
 
 
@@ -2116,14 +2178,14 @@ def _normal_live_broker_submit_payload(
     }
 
 
-def _require_unique_normal_live_broker_submit(snapshot, envelope) -> None:
-    payload = envelope.payload
-    if not isinstance(payload, Mapping):
-        raise ValueError("durable live submit record is invalid")
+def _matching_normal_live_broker_submits(
+    snapshot: tuple[EvidenceEnvelope, ...], payload: Mapping[str, object]
+) -> tuple[EvidenceEnvelope, ...]:
     logical = payload.get("logical_order_sha256")
     client_order_id = payload.get("client_order_id")
     if type(logical) is not str or type(client_order_id) is not str:
         raise ValueError("durable live submit record is invalid")
+    matching: list[EvidenceEnvelope] = []
     for prior in snapshot:
         if prior.kind != NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND:
             continue
@@ -2133,32 +2195,54 @@ def _require_unique_normal_live_broker_submit(snapshot, envelope) -> None:
         if (
             prior_payload.get("logical_order_sha256") == logical
             or prior_payload.get("client_order_id") == client_order_id
-        ) and prior.payload != payload:
-            raise ValueError("logical/client order ID is already consumed by different receipt")
+        ):
+            if prior.payload != payload:
+                raise ValueError(
+                    "logical/client order ID is already consumed by different receipt"
+                )
+            matching.append(prior)
+    return tuple(matching)
 
 
-def admit_normal_live_broker_submit(
+def _require_unique_normal_live_broker_submit(snapshot, envelope) -> None:
+    if not isinstance(envelope.payload, Mapping):
+        raise ValueError("durable live submit record is invalid")
+    _matching_normal_live_broker_submits(snapshot, envelope.payload)
+
+
+def execute_normal_live_broker_submit(
     intent: AuthorizedNormalTradeIntent,
     receipt: NormalLiveActivationReceipt,
     *,
     proposal_ledger_root: str | Path,
     repo_root: str | Path,
     immutable_order_sha256: str,
-    clock: Callable[[], datetime.datetime],
-) -> NormalLiveBrokerSubmitAdmission:
-    """Atomically verify Task 3 state and persist a broker-submit handoff.
+    checked_at: datetime.datetime,
+    lookup: Callable[[], object | None],
+    post: Callable[[], object],
+) -> object:
+    """Run one normal-live broker handoff under Task 3's state coordination.
 
-    No network operation is performed while the promotion-state lock is held.
-    The returned object is solely a durable, state-bound admission for Alpaca's
-    subsequent read-first broker interaction.
+    A Task 3-issued, in-process receipt capability is required to create the
+    durable pre-submit record and reach a first POST.  A restarted process can
+    only use an exact existing record for a read-first lookup, never a POST.
+    The promotion-state lock remains held through lookup and the final POST so
+    a cooperating demotion cannot make the sleeve non-live in that interval.
+    The durable prepare remains if broker I/O fails, making every later attempt
+    lookup-only and recoverable rather than a duplicate write.
     """
 
     if (
         type(intent) is not AuthorizedNormalTradeIntent
         or type(receipt) is not NormalLiveActivationReceipt
-        or not callable(clock)
+        or type(checked_at) is not datetime.datetime
+        or checked_at.tzinfo is None
+        or checked_at.utcoffset() is None
+        or checked_at.microsecond
         or type(immutable_order_sha256) is not str
         or re.fullmatch(r"[0-9a-f]{64}", immutable_order_sha256) is None
+        or not callable(lookup)
+        or not callable(post)
     ):
         raise ValueError("normal live broker admission requires exact typed values")
 
@@ -2166,7 +2250,8 @@ def admit_normal_live_broker_submit(
         store: ImmutableStrategyEvidenceStore,
         snapshot: PromotionStateSnapshot,
         activation_state_marker: str,
-    ) -> NormalLiveBrokerSubmitAdmission:
+        recheck_before_broker_post: Callable[[], None],
+    ) -> object:
         candidate = EvidenceCandidate(
             kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
             effective_at=intent.recorded_at,
@@ -2178,28 +2263,52 @@ def admit_normal_live_broker_submit(
                 activation_state_marker=activation_state_marker,
             ),
         )
-        admission = store.admit_checked(
-            candidate,
-            validate=_require_unique_normal_live_broker_submit,
+        matching = _matching_normal_live_broker_submits(
+            store.envelopes(kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND),
+            candidate.payload,
         )
-        return NormalLiveBrokerSubmitAdmission(
-            created=admission.created,
-            client_order_id=intent.client_order_id,
-            canonical_state_sha256=snapshot.sha256,
-            activation_state_marker=activation_state_marker,
-        )
+        may_create_first_post = _claim_normal_live_broker_post_capability(receipt)
+        if may_create_first_post:
+            admission = store.admit_checked(
+                candidate,
+                validate=_require_unique_normal_live_broker_submit,
+            )
+            recorded = NormalLiveBrokerSubmitAdmission(
+                created=admission.created,
+                client_order_id=intent.client_order_id,
+                canonical_state_sha256=snapshot.sha256,
+                activation_state_marker=activation_state_marker,
+            )
+        else:
+            if not matching:
+                raise ValueError(
+                    "live submit requires an in-process Task 3 issuance capability"
+                )
+            recorded = NormalLiveBrokerSubmitAdmission(
+                created=False,
+                client_order_id=intent.client_order_id,
+                canonical_state_sha256=snapshot.sha256,
+                activation_state_marker=activation_state_marker,
+            )
 
-    admitted = _verify_normal_live_activation_receipt(
+        existing = lookup()
+        if existing is not None:
+            return existing
+        if not recorded.created:
+            raise ValueError("live retry lookup found no order; refusing second POST")
+        # This is immediately before the only possible broker POST and remains
+        # inside the promotion-state lock acquired by the Task 3 verifier.
+        recheck_before_broker_post()
+        return post()
+
+    return _verify_normal_live_activation_receipt(
         intent,
         receipt,
         proposal_ledger_root=proposal_ledger_root,
         repo_root=repo_root,
-        clock=clock,
+        checked_at=checked_at.astimezone(datetime.timezone.utc),
         _accept=admit,
     )
-    if type(admitted) is not NormalLiveBrokerSubmitAdmission:
-        raise ValueError("normal live broker admission was not recorded")
-    return admitted
 
 
 def verify_normal_live_activation_receipt(
@@ -2320,15 +2429,17 @@ def activate_normal_live_intent(
                     _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
                 ),
             )
-            return NormalLiveActivationReceipt(
-                prepare.object_id,
-                repaired.envelope.object_id,
-                intent_full_sha256,
-                intent.promotion_state_sha256,
-                snapshot.sha256,
-                dict(snapshot.state),
-                repaired.created,
-                "receipt_repaired",
+            return _issue_normal_live_broker_post_capability(
+                NormalLiveActivationReceipt(
+                    prepare.object_id,
+                    repaired.envelope.object_id,
+                    intent_full_sha256,
+                    intent.promotion_state_sha256,
+                    snapshot.sha256,
+                    dict(snapshot.state),
+                    repaired.created,
+                    "receipt_repaired",
+                )
             )
         if snapshot.sha256 != intent.promotion_state_sha256:
             raise ValueError("promotion state preimage does not match exact intent")
@@ -2385,7 +2496,27 @@ def activate_normal_live_intent(
             or sync_receipt.canonical_after_sha256 != snapshot.sha256
         ):
             raise ValueError("activation requires the exact Task 6D receipt")
-        activation_state_marker = secrets.token_hex(32)
+        matching_prepare_payloads = []
+        for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND):
+            payload = _thaw_json(envelope.payload)
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("intent_full_sha256") == intent_full_sha256
+            ):
+                matching_prepare_payloads.append(payload)
+        if len(matching_prepare_payloads) > 1:
+            raise ValueError("multiple normal live activation prepares")
+        if matching_prepare_payloads:
+            activation_state_marker = matching_prepare_payloads[0].get(
+                "activation_state_marker"
+            )
+            if (
+                type(activation_state_marker) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", activation_state_marker) is None
+            ):
+                raise ValueError("normal live activation evidence marker is invalid")
+        else:
+            activation_state_marker = secrets.token_hex(32)
         after_state = _activation_state(
             state=snapshot.state,
             sleeve=proposal.sleeve,
@@ -2472,15 +2603,17 @@ def activate_normal_live_intent(
                     _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
                 ),
             )
-            return NormalLiveActivationReceipt(
-                prepare.object_id,
-                receipt_admission.envelope.object_id,
-                intent_full_sha256,
-                snapshot.sha256,
-                replaced.sha256,
-                after_state,
-                prepare_created or receipt_admission.created,
-                "activated",
+            return _issue_normal_live_broker_post_capability(
+                NormalLiveActivationReceipt(
+                    prepare.object_id,
+                    receipt_admission.envelope.object_id,
+                    intent_full_sha256,
+                    snapshot.sha256,
+                    replaced.sha256,
+                    after_state,
+                    prepare_created or receipt_admission.created,
+                    "activated",
+                )
             )
         finally:
             staged.unlink(missing_ok=True)
