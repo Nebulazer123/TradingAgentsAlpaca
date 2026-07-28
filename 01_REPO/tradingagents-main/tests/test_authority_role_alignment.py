@@ -236,7 +236,7 @@ def _call_name(node: ast.expr) -> str:
     return "<dynamic>"
 
 
-def _is_raw_http_transport_call(name: str) -> bool:
+def _is_raw_http_transport_call(node: ast.expr, name: str) -> bool:
     """Identify direct HTTP transport methods outside named application APIs.
 
     The inventory must see a potentially order-writing request before trying to
@@ -250,10 +250,24 @@ def _is_raw_http_transport_call(name: str) -> bool:
     if method not in {"delete", "patch", "post", "put", "request", "send"}:
         return False
     receiver_parts = name.rsplit(".", 1)[0].split(".")
+    receiver = node.value if isinstance(node, ast.Attribute) else None
+    fluent_constructor = (
+        _call_name(receiver.func)
+        if isinstance(receiver, ast.Call)
+        else None
+    )
     return (
         name.startswith(("requests.", "httpx.", "urllib3.", "aiohttp."))
         or any(part.endswith("session") for part in receiver_parts)
         or any(part.endswith("transport") for part in receiver_parts)
+        or fluent_constructor
+        in {
+            "requests.Session",
+            "httpx.AsyncClient",
+            "httpx.Client",
+            "urllib3.PoolManager",
+            "aiohttp.ClientSession",
+        }
     )
 
 
@@ -296,7 +310,7 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                 and keyword.value.value is False
                 for keyword in node.keywords
             )
-            is_raw_http_transport_call = _is_raw_http_transport_call(name)
+            is_raw_http_transport_call = _is_raw_http_transport_call(node.func, name)
             is_raw_transport_helper = name.endswith(".post_order_json")
             has_order_endpoint_primitive = (
                 not is_raw_http_transport_call
@@ -430,6 +444,16 @@ def test_live_write_inventory_rejects_an_unclassified_raw_post_caller(tmp_path):
         "    return requests.patch('https://api.alpaca.markets/v2/orders/example', json={})\n",
         "def bypass():\n"
         "    return requests.delete('https://api.alpaca.markets/v2/orders/example')\n",
+        "def bypass():\n"
+        "    return requests.Session().post('https://api.alpaca.markets/v2/orders', json={})\n",
+        "LIVE_BASE_URL = 'https://api.alpaca.markets'\n"
+        "def bypass():\n"
+        "    return requests.Session().request('POST', f'{LIVE_BASE_URL}/v2/orders', json={})\n",
+        "def bypass():\n"
+        "    return requests.Session().delete('https://api.alpaca.markets/v2/orders/example')\n",
+        "LIVE_BASE_URL = 'https://api.alpaca.markets'\n"
+        "def bypass():\n"
+        "    return httpx.Client().post(f'{LIVE_BASE_URL}/v2/orders', json={})\n",
         "LIVE_BASE_URL = 'https://api.alpaca.markets'\n"
         "def bypass(client):\n"
         "    return client._request('POST', f'{LIVE_BASE_URL}/v2/orders', json={})\n",
