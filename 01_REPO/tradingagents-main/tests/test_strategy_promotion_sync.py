@@ -3508,6 +3508,57 @@ def test_activation_rechecks_expiry_after_waiting_for_state_lock(
     assert state.read_bytes() == before
 
 
+def test_activation_rechecks_expiry_after_revalidation_before_prepare(
+    tmp_path, monkeypatch
+) -> None:
+    """A slow source replay cannot leave an expired intent eligible to write."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_rechecks_expiry_after_revalidation_before_prepare",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    intent = _sync_capped_activation_state(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state=state,
+        synced_at=synced_at,
+    )
+    before_state = state.read_bytes()
+    events = root / "events.jsonl"
+    before_events = events.read_bytes()
+    moment = {"value": synced_at}
+    original_revalidation = sync_module._require_complete_normal_live_intent_chain
+
+    def expire_after_revalidation(**kwargs) -> None:
+        original_revalidation(**kwargs)
+        moment["value"] = datetime.fromisoformat(intent.expires_at)
+
+    monkeypatch.setattr(
+        sync_module, "_require_complete_normal_live_intent_chain", expire_after_revalidation
+    )
+
+    with pytest.raises(ValueError, match="active capped intent"):
+        sync_module.activate_normal_live_intent(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: moment["value"],
+        )
+
+    assert state.read_bytes() == before_state
+    assert events.read_bytes() == before_events
+
+
 def test_activation_rechecks_stale_6d_attestations_under_lock(
     tmp_path, monkeypatch
 ) -> None:

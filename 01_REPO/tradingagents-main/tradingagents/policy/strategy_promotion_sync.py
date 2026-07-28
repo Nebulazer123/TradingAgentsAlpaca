@@ -2017,6 +2017,14 @@ def activate_normal_live_intent(
             proposal_ledger_root=proposal_ledger_root,
             repo=repo,
         )
+        # Durable source and staged-intent replay can take long enough for the
+        # bounded Task 2 authorization to expire.  Refresh time under the same
+        # state lock immediately before any prepare or replacement write.
+        moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
+        activated_at = _time_text(moment, "activated_at")
+        checked_at = _time(activated_at, "activated_at")
+        if not intent.is_active(at=checked_at):
+            raise ValueError("activation requires an active capped intent")
         _require_current_normal_live_sleeve(proposal=proposal, state=snapshot.state)
         sync_receipts = [
             envelope
