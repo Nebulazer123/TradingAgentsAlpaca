@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -99,14 +99,16 @@ from tradingagents.execution.authorized_normal_trade_intent import (
     AuthorizedNormalTradeIntent,
 )
 from tradingagents.execution.reconcile import (
-    ReconciliationResult,
     _claim_normal_live_submit_reconciliation,
+    _refresh_normal_live_submit_reconciliation,
     _release_normal_live_submit_reconciliation,
     _revalidate_normal_live_submit_reconciliation,
+    reconcile_normal_live_submit,
 )
 from tradingagents.policy.live_control import load_live_control_state
 from tradingagents.policy.live_gate import evaluate_go_live_guard
 from tradingagents.policy.order_rate_limit import (
+    evaluate_order_rate_limit,
     record_live_order_submission,
     release_live_order_reservation,
     reserve_live_order_submission,
@@ -192,13 +194,9 @@ class _NormalLiveAdmissionContext:
     promotion_state_path: Path
     control_state_path: Path
     order_rate_state_path: Path
-    current_live_exposure: Decimal
     current_daily_loss_usd: Decimal | None
     current_drawdown_pct: Decimal | None
-    live_account: dict[str, object]
-    live_positions: tuple[dict[str, object], ...]
     decision_evidence: dict[str, object]
-    reconciliation: ReconciliationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,31 +301,17 @@ def _issue_normal_live_submit_admission(
     promotion_state_path: str | Path,
     control_state_path: str | Path,
     order_rate_state_path: str | Path,
-    current_live_exposure: Decimal,
     current_daily_loss_usd: Decimal | None,
     current_drawdown_pct: Decimal | None,
-    live_account: Mapping,
-    live_positions: Sequence[Mapping],
     decision_evidence: Mapping,
-    reconciliation: ReconciliationResult,
 ) -> NormalLiveSubmitAdmission:
     """Issue a local capability; gates are re-evaluated under the policy lock."""
     if type(intent) is not AuthorizedNormalTradeIntent:
         raise ValueError("normal live admission requires an exact AuthorizedNormalTradeIntent")
-    if type(current_live_exposure) is not Decimal:
-        raise ValueError("normal live admission exposure must be an exact Decimal")
     if current_daily_loss_usd is not None and type(current_daily_loss_usd) is not Decimal:
         raise ValueError("normal live admission daily loss must be an exact Decimal")
     if current_drawdown_pct is not None and type(current_drawdown_pct) is not Decimal:
         raise ValueError("normal live admission drawdown must be an exact Decimal")
-    if (
-        type(reconciliation) is not ReconciliationResult
-        or reconciliation.matched is not True
-        or reconciliation.issues
-        or not all(type(item) is str for item in reconciliation.checked_client_order_ids)
-    ):
-        raise ValueError("normal live admission requires clean exact reconciliation")
-
     issued_at = _normal_live_admission_moment()
     admission = NormalLiveSubmitAdmission(
         intent_full_sha256=_normal_live_intent_sha256(intent),
@@ -352,17 +336,11 @@ def _issue_normal_live_submit_admission(
             order_rate_state_path=_normal_live_admission_path(
                 order_rate_state_path, label="rate state"
             ),
-            current_live_exposure=current_live_exposure,
             current_daily_loss_usd=current_daily_loss_usd,
             current_drawdown_pct=current_drawdown_pct,
-            live_account=_normal_live_admission_mapping(
-                live_account, label="live account"
-            ),
-            live_positions=_normal_live_admission_positions(live_positions),
             decision_evidence=_normal_live_admission_mapping(
                 decision_evidence, label="decision evidence"
             ),
-            reconciliation=reconciliation,
         ),
     )
     return admission
@@ -372,8 +350,9 @@ def _claim_normal_live_submit_admission(
     admission: object,
     *,
     intent: AuthorizedNormalTradeIntent,
-    order_payload_sha256: str,
+    order_payload: Mapping[str, str],
     promotion_state_path: Path,
+    broker_read_adapter: object,
 ) -> _NormalLiveAdmissionClaim:
     if type(admission) is not NormalLiveSubmitAdmission:
         raise ValueError("live submit requires an exact supervisor admission artifact")
@@ -389,8 +368,18 @@ def _claim_normal_live_submit_admission(
         issued_at=admission.issued_at, expires_at=admission.expires_at
     )
     del _NORMAL_LIVE_ADMISSION_CAPABILITIES[id(admission)]
+    order_payload_sha256 = hashlib.sha256(
+        json.dumps(
+            dict(order_payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    reconciliation = reconcile_normal_live_submit(
+        intent=intent,
+        order_payload=order_payload,
+        broker_read_adapter=broker_read_adapter,
+    )
     reconciliation_claim = _claim_normal_live_submit_reconciliation(
-        context.reconciliation,
+        reconciliation,
         intent=intent,
         order_payload_sha256=order_payload_sha256,
         claimed_at=_normal_live_admission_moment(),
@@ -404,6 +393,63 @@ def _claim_normal_live_submit_admission(
     )
     _NORMAL_LIVE_ADMISSION_CLAIMS[id(claim)] = (claim, context)
     return claim
+
+
+def _require_normal_live_submit_admission_available(admission: object) -> None:
+    """Reject a missing/generic capability before any other final handoff work."""
+
+    if type(admission) is not NormalLiveSubmitAdmission:
+        raise ValueError("live submit requires an exact supervisor admission artifact")
+    entry = _NORMAL_LIVE_ADMISSION_CAPABILITIES.get(id(admission))
+    if entry is None or entry[0] is not admission:
+        raise ValueError("live submit requires an unconsumed supervisor admission artifact")
+
+
+def _preflight_normal_live_submit_before_broker_reads(
+    admission: object,
+    *,
+    payload: Mapping[str, str],
+) -> None:
+    """Deny obvious frozen/cap/rate failures before even read-only broker I/O.
+
+    This deliberately never grants authority.  The full gate is re-run later
+    against an owned broker snapshot under the short control transaction.
+    """
+
+    if type(admission) is not NormalLiveSubmitAdmission:
+        raise ValueError("live submit requires an exact supervisor admission artifact")
+    entry = _NORMAL_LIVE_ADMISSION_CAPABILITIES.get(id(admission))
+    if entry is None or entry[0] is not admission:
+        raise ValueError("live submit requires an unconsumed supervisor admission artifact")
+    context = entry[1]
+    current = _normal_live_admission_moment()
+    _state, control_issues = load_live_control_state(
+        context.control_state_path, now=current
+    )
+    if control_issues:
+        raise ValueError("normal live submit final gates rejected admission")
+    envelope, envelope_issues = load_risk_envelope(context.risk_envelope_path)
+    if envelope_issues or envelope is None:
+        raise ValueError("normal live submit final gates rejected admission")
+    try:
+        notional = Decimal(payload["notional"])
+    except (KeyError, InvalidOperation, ValueError) as exc:
+        raise ValueError("normal live submit final gates rejected admission") from exc
+    if notional > envelope.per_name_cap_usd:
+        raise ValueError("normal live submit final gates rejected admission")
+    if (
+        envelope.max_live_orders_per_window is None
+        or envelope.live_order_window_minutes is None
+        or evaluate_order_rate_limit(
+            path=context.order_rate_state_path,
+            now=current,
+            window_minutes=envelope.live_order_window_minutes,
+            max_orders=envelope.max_live_orders_per_window,
+            new_order_count=1,
+            exclude_client_order_id=payload["client_order_id"],
+        )
+    ):
+        raise ValueError("normal live submit final gates rejected admission")
 
 
 def _normal_live_action_from_payload(
@@ -428,6 +474,8 @@ def _revalidate_normal_live_submit_claim(
     *,
     payload: Mapping[str, str],
     sleeve: str,
+    live_account: Mapping[str, object],
+    live_positions: Sequence[Mapping[str, object]],
     rate_limit_exclude_client_order_id: str | None = None,
 ) -> None:
     if type(claim) is not _NormalLiveAdmissionClaim:
@@ -453,11 +501,11 @@ def _revalidate_normal_live_submit_claim(
         promotion_state_path=context.promotion_state_path,
         control_state_path=context.control_state_path,
         order_rate_state_path=context.order_rate_state_path,
-        current_live_exposure=context.current_live_exposure,
+        current_live_exposure=live_exposure_from_positions(live_positions),
         current_daily_loss_usd=context.current_daily_loss_usd,
         current_drawdown_pct=context.current_drawdown_pct,
-        live_account=context.live_account,
-        live_positions=context.live_positions,
+        live_account=live_account,
+        live_positions=live_positions,
         decision_evidence=context.decision_evidence,
         now=current,
         rate_limit_exclude_client_order_id=rate_limit_exclude_client_order_id,
@@ -474,12 +522,31 @@ def _revalidate_normal_live_submit_claim(
         raise ValueError("normal live submit live-control recheck rejected admission")
 
 
+def _refresh_normal_live_submit_claim_broker_state(
+    claim: object,
+    *,
+    intent: AuthorizedNormalTradeIntent,
+    payload: Mapping[str, str],
+) -> tuple[dict[str, object], tuple[dict[str, object], ...], dict[str, object] | None]:
+    """Refresh the trusted complete broker snapshot before the commit point."""
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    return _refresh_normal_live_submit_reconciliation(
+        claim.reconciliation_claim,
+        intent=intent,
+        order_payload=payload,
+    )
+
+
 def _revalidate_normal_live_submit_reconciliation_after_lookup(
     claim: object,
     *,
     intent: AuthorizedNormalTradeIntent,
     order_payload_sha256: str,
-    broker_order: Mapping | None,
 ) -> None:
     """Bind the policy's final read-only lookup to the issued reconciliation."""
 
@@ -492,8 +559,6 @@ def _revalidate_normal_live_submit_reconciliation_after_lookup(
         claim.reconciliation_claim,
         intent=intent,
         order_payload_sha256=order_payload_sha256,
-        broker_order=broker_order,
-        checked_at=_normal_live_admission_moment(),
     )
 
 
@@ -567,6 +632,7 @@ def _record_normal_live_submit_claim(
     claim: object,
     *,
     client_order_id: str,
+    accepted_at: datetime.datetime,
 ) -> None:
     if type(claim) is not _NormalLiveAdmissionClaim:
         raise ValueError("live submit requires a trusted supervisor admission claim")
@@ -576,7 +642,7 @@ def _record_normal_live_submit_claim(
     record_live_order_submission(
         entry[1].order_rate_state_path,
         client_order_id=client_order_id,
-        now=_normal_live_admission_moment(),
+        now=accepted_at,
     )
     _release_normal_live_submit_reconciliation(claim.reconciliation_claim)
 
@@ -1140,13 +1206,9 @@ def submit_authorized_normal_live_order(
     promotion_state_path: str | Path,
     control_state_path: str | Path,
     order_rate_state_path: str | Path,
-    current_live_exposure: Decimal,
     current_daily_loss_usd: Decimal | None,
     current_drawdown_pct: Decimal | None,
-    live_account: Mapping,
-    live_positions: Sequence[Mapping],
     decision_evidence: Mapping,
-    reconciliation: ReconciliationResult,
 ) -> dict:
     """Forward one already-issued intent through the locked final gate.
 
@@ -1169,13 +1231,9 @@ def submit_authorized_normal_live_order(
         promotion_state_path=promotion_state_path,
         control_state_path=control_state_path,
         order_rate_state_path=order_rate_state_path,
-        current_live_exposure=current_live_exposure,
         current_daily_loss_usd=current_daily_loss_usd,
         current_drawdown_pct=current_drawdown_pct,
-        live_account=live_account,
-        live_positions=live_positions,
         decision_evidence=decision_evidence,
-        reconciliation=reconciliation,
     )
     order = {
         "symbol": intent.symbol,

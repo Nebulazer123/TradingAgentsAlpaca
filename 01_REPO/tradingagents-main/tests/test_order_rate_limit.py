@@ -80,3 +80,50 @@ def test_evaluate_allows_when_under_max(tmp_path):
     )
 
     assert issues == []
+
+
+def test_reservation_does_not_truncate_more_than_five_hundred_active_orders(tmp_path):
+    """Break caught: a 500-record tail silently reopened rate capacity."""
+    path = tmp_path / "rate.json"
+    for index in range(501):
+        record_live_order_submission(
+            path, client_order_id=f"active-{index}", now=NOW
+        )
+
+    issues = evaluate_order_rate_limit(
+        path=path,
+        now=NOW,
+        window_minutes=60,
+        max_orders=501,
+        new_order_count=1,
+    )
+
+    assert len(issues) == 1
+    assert "501 live order(s)" in issues[0]
+
+
+def test_confirmed_submission_replaces_reservation_time_with_broker_acceptance_time(
+    tmp_path,
+):
+    """Break caught: slow broker I/O shortened the real rolling window."""
+    from tradingagents.policy.order_rate_limit import reserve_live_order_submission
+
+    path = tmp_path / "rate.json"
+    reserved_at = NOW
+    accepted_at = NOW + datetime.timedelta(minutes=5)
+    reserve_live_order_submission(
+        path,
+        client_order_id="slow-live-order",
+        now=reserved_at,
+        window_minutes=60,
+        max_orders=2,
+    )
+    record_live_order_submission(
+        path, client_order_id="slow-live-order", now=accepted_at
+    )
+
+    assert count_live_submissions_in_window(
+        path,
+        now=accepted_at + datetime.timedelta(minutes=56),
+        window_minutes=60,
+    ) == 1

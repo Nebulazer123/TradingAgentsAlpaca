@@ -15,6 +15,7 @@ from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
+_NORMAL_LIVE_COMMITMENTS_FIELD = "normal_live_submission_commitments"
 
 
 def _expected_rearm_authority() -> dict[str, str] | None:
@@ -62,6 +63,148 @@ def live_control_lock(state_path: str | Path):
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+def _read_normal_live_commitments(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return durable commitments without allowing a malformed list to vanish."""
+
+    raw = state.get(_NORMAL_LIVE_COMMITMENTS_FIELD, [])
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+        raise ValueError("normal live submission commitments are invalid")
+    return [dict(item) for item in raw]
+
+
+def _commitment_id(
+    *,
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+    control_preimage_sha256: str,
+) -> str:
+    payload = {
+        "intent_full_sha256": intent_full_sha256,
+        "order_payload_sha256": order_payload_sha256,
+        "client_order_id": client_order_id,
+        "control_preimage_sha256": control_preimage_sha256,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def commit_normal_live_submission_locked(
+    path: str | Path,
+    *,
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+    now: datetime.datetime,
+) -> dict[str, str]:
+    """Durably pre-commit one exact live POST while the control lock is held.
+
+    The caller must hold :func:`live_control_lock`.  This is the irrevocable
+    decision point: a freeze that wins before it is written prevents all
+    broker I/O; a freeze that follows it preserves the exact in-flight record
+    and cannot turn the already-committed action into an unrecorded POST.
+    Network I/O is intentionally outside the control lock.
+    """
+
+    control_path = Path(path)
+    try:
+        raw = control_path.read_bytes()
+        state = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("normal live submission control preimage is unavailable") from exc
+    if not isinstance(state, dict):
+        raise ValueError("normal live submission control preimage is invalid")
+    current, issues = load_live_control_state(control_path, now=now)
+    if current is None or issues or current.get("frozen") is not False:
+        raise ValueError("normal live submission control is not open")
+    if not all(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+        for value in (intent_full_sha256, order_payload_sha256)
+    ) or not isinstance(client_order_id, str) or not client_order_id:
+        raise ValueError("normal live submission commitment is invalid")
+    moment = now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    if moment.microsecond:
+        raise ValueError("normal live submission commitment requires whole-second time")
+    control_preimage_sha256 = hashlib.sha256(raw).hexdigest()
+    commitment_id = _commitment_id(
+        intent_full_sha256=intent_full_sha256,
+        order_payload_sha256=order_payload_sha256,
+        client_order_id=client_order_id,
+        control_preimage_sha256=control_preimage_sha256,
+    )
+    commitments = _read_normal_live_commitments(state)
+    active = [item for item in commitments if item.get("outcome") is None]
+    if active:
+        if len(active) != 1 or any(
+            active[0].get(field) != expected
+            for field, expected in (
+                ("intent_full_sha256", intent_full_sha256),
+                ("order_payload_sha256", order_payload_sha256),
+                ("client_order_id", client_order_id),
+            )
+        ):
+            raise ValueError("normal live submission already has an unresolved commitment")
+        return dict(active[0])
+    commitment = {
+        "commitment_id": commitment_id,
+        "intent_full_sha256": intent_full_sha256,
+        "order_payload_sha256": order_payload_sha256,
+        "client_order_id": client_order_id,
+        "control_preimage_sha256": control_preimage_sha256,
+        "committed_at": moment.isoformat(timespec="seconds"),
+    }
+    commitments.append(commitment)
+    state[_NORMAL_LIVE_COMMITMENTS_FIELD] = commitments
+    atomic_write_text(control_path, json.dumps(state, indent=2))
+    return commitment
+
+
+def resolve_normal_live_submission_commitment(
+    path: str | Path,
+    *,
+    commitment_id: str,
+    outcome: str,
+    now: datetime.datetime,
+) -> None:
+    """Durably resolve one precommit after a matching lookup/post outcome."""
+
+    if outcome not in {"submitted", "lookup_matched", "missing_refused"}:
+        raise ValueError("normal live submission outcome is invalid")
+    with live_control_lock(path):
+        control_path = Path(path)
+        try:
+            state = json.loads(control_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("normal live submission control outcome is unavailable") from exc
+        if not isinstance(state, dict):
+            raise ValueError("normal live submission control outcome is invalid")
+        commitments = _read_normal_live_commitments(state)
+        matched = [
+            item
+            for item in commitments
+            if item.get("commitment_id") == commitment_id
+        ]
+        if len(matched) != 1:
+            raise ValueError("normal live submission commitment is unavailable")
+        commitment = matched[0]
+        if commitment.get("outcome") is not None:
+            if commitment.get("outcome") != outcome:
+                raise ValueError("normal live submission commitment outcome conflicts")
+            return
+        moment = now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        commitment["outcome"] = outcome
+        commitment["resolved_at"] = moment.replace(microsecond=0).isoformat(
+            timespec="seconds"
+        )
+        state[_NORMAL_LIVE_COMMITMENTS_FIELD] = commitments
+        atomic_write_text(control_path, json.dumps(state, indent=2))
 
 
 def parse_control_time(value: str) -> datetime.datetime | None:
@@ -370,6 +513,13 @@ def _write_live_control_state_locked(
 
     control_path = Path(path)
     control_path.parent.mkdir(parents=True, exist_ok=True)
+    prior_state: dict[str, Any] = {}
+    try:
+        prior = json.loads(control_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        prior = None
+    if isinstance(prior, dict):
+        prior_state = prior
     if expected_preimage_sha256 is not None:
         if (
             len(expected_preimage_sha256) != 64
@@ -404,6 +554,22 @@ def _write_live_control_state_locked(
         "dead_man_expires_at": expires_at.astimezone(UTC).isoformat(timespec="seconds"),
         "updated_at": updated_at.isoformat(timespec="seconds"),
     }
+    # A freeze/re-arm writer must never erase a committed in-flight normal-live
+    # action.  Preserving this durable record lets the writer observe the exact
+    # committed client order without waiting for network I/O held by another
+    # process.
+    if _NORMAL_LIVE_COMMITMENTS_FIELD in prior_state:
+        payload[_NORMAL_LIVE_COMMITMENTS_FIELD] = prior_state[
+            _NORMAL_LIVE_COMMITMENTS_FIELD
+        ]
+        if frozen is True:
+            raw_commitments = prior_state[_NORMAL_LIVE_COMMITMENTS_FIELD]
+            if isinstance(raw_commitments, list):
+                payload["normal_live_freeze_observed_committed_client_order_ids"] = [
+                    item.get("client_order_id")
+                    for item in raw_commitments
+                    if isinstance(item, dict) and item.get("outcome") is None
+                ]
     if recovery_receipt_path is not None or recovery_receipt_sha256 is not None:
         if not isinstance(recovery_receipt_path, str) or not recovery_receipt_path.strip():
             raise ValueError("recovery_receipt_path must be a nonblank string")

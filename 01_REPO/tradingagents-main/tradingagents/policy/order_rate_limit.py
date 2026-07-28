@@ -20,9 +20,6 @@ from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
 
-_MAX_RETAINED_RECORDS = 500
-
-
 def _rate_lock_path(path: str | Path) -> Path:
     state_path = Path(path)
     return state_path.with_name(f".{state_path.name}.rate.lock")
@@ -161,7 +158,10 @@ def reserve_live_order_submission(
                 "submitted_at": _as_utc(now).isoformat(timespec="seconds"),
             }
         )
-        _write_records(path, records[-_MAX_RETAINED_RECORDS:])
+        # Do not truncate a blind tail here.  The configured rolling window is
+        # evaluated at read time, and dropping a still-active record would
+        # silently reopen live capacity after the 500th order.
+        _write_records(path, records)
 
 
 def record_live_order_submission(
@@ -176,10 +176,12 @@ def record_live_order_submission(
         for record in records:
             if str(record.get("client_order_id", "")) != normalized_client_order_id:
                 continue
-            # Preserve the original reservation timestamp, but turn the
-            # ambiguous pre-submit state into the legacy submitted form.
+            # A reservation exists before broker I/O.  Once the broker confirms
+            # acceptance, its acceptance moment—not the earlier reservation—is
+            # the only correct rolling-window timestamp.
             record.pop("state", None)
-            _write_records(path, records[-_MAX_RETAINED_RECORDS:])
+            record["submitted_at"] = _as_utc(now).isoformat(timespec="seconds")
+            _write_records(path, records)
             return
         records.append(
             {
@@ -187,7 +189,7 @@ def record_live_order_submission(
                 "submitted_at": _as_utc(now).isoformat(timespec="seconds"),
             }
         )
-        _write_records(path, records[-_MAX_RETAINED_RECORDS:])
+        _write_records(path, records)
 
 
 def release_live_order_reservation(path: str | Path, *, client_order_id: str) -> None:

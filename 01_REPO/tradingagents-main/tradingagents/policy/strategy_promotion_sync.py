@@ -28,7 +28,11 @@ from tradingagents.execution.authorized_normal_trade_intent import (
 )
 from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.policy.io import atomic_write_text
-from tradingagents.policy.live_control import live_control_lock
+from tradingagents.policy.live_control import (
+    commit_normal_live_submission_locked,
+    live_control_lock,
+    resolve_normal_live_submission_commitment,
+)
 from tradingagents.policy.promotion import SleevePromotionEvidence, evaluate_sleeve_promotion
 from tradingagents.policy.promotion_sync import promotion_state_lock
 from tradingagents.policy.risk_envelope import load_risk_envelope
@@ -2233,6 +2237,23 @@ def _require_matching_normal_live_broker_order(
         raise ValueError("live broker result does not match authorized intent")
 
 
+def _normal_live_broker_acceptance_time(result: object) -> datetime.datetime:
+    """Require the broker's own accepted-order timestamp for the rate ledger."""
+
+    if type(result) is not dict or not isinstance(result.get("submitted_at"), str):
+        raise ValueError("live broker result is missing an acceptance timestamp")
+    raw = str(result["submitted_at"])
+    if raw.endswith("Z"):
+        raw = f"{raw[:-1]}+00:00"
+    try:
+        accepted = datetime.datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError("live broker result has an invalid acceptance timestamp") from exc
+    if accepted.tzinfo is None or accepted.utcoffset() is None:
+        raise ValueError("live broker result has an invalid acceptance timestamp")
+    return accepted.astimezone(datetime.timezone.utc).replace(microsecond=0)
+
+
 def _matching_normal_live_broker_submits(
     snapshot: tuple[EvidenceEnvelope, ...], payload: Mapping[str, object]
 ) -> tuple[EvidenceEnvelope, ...]:
@@ -2290,8 +2311,7 @@ def execute_normal_live_broker_submit(
     proposal_ledger_root: str | Path,
     repo_root: str | Path,
     supervisor_admission: object,
-    lookup: Callable[[str], object | None],
-    post: Callable[[Mapping[str, str]], object],
+    broker_read_adapter: object,
 ) -> object:
     """Run one normal-live broker handoff under Task 3's state coordination.
 
@@ -2307,8 +2327,6 @@ def execute_normal_live_broker_submit(
     if (
         type(intent) is not AuthorizedNormalTradeIntent
         or type(receipt) is not NormalLiveActivationReceipt
-        or not callable(lookup)
-        or not callable(post)
     ):
         raise ValueError("normal live broker admission requires exact typed values")
 
@@ -2332,21 +2350,25 @@ def execute_normal_live_broker_submit(
             _claim_normal_live_submit_admission,
             _discard_normal_live_submit_claim,
             _normal_live_submit_claim_control_path,
+            _preflight_normal_live_submit_before_broker_reads,
             _record_normal_live_submit_claim,
+            _refresh_normal_live_submit_claim_broker_state,
             _release_normal_live_submit_claim_reservation,
+            _require_normal_live_submit_admission_available,
             _reserve_normal_live_submit_claim,
             _revalidate_normal_live_submit_claim,
             _revalidate_normal_live_submit_reconciliation_after_lookup,
         )
-
-        supervisor_claim = _claim_normal_live_submit_admission(
-            supervisor_admission,
-            intent=intent,
-            order_payload_sha256=order_payload_sha256,
-            promotion_state_path=snapshot.path,
+        from tradingagents.execution.reconcile import (
+            _owned_normal_live_broker_lookup,
+            _owned_normal_live_broker_post,
         )
-        try:
-            candidate = EvidenceCandidate(
+
+        _require_normal_live_submit_admission_available(supervisor_admission)
+        _preflight_normal_live_submit_before_broker_reads(
+            supervisor_admission, payload=frozen_order
+        )
+        candidate = EvidenceCandidate(
                 kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
                 effective_at=intent.recorded_at,
                 payload=_normal_live_broker_submit_payload(
@@ -2357,11 +2379,24 @@ def execute_normal_live_broker_submit(
                     activation_state_marker=activation_state_marker,
                 ),
             )
-            matching = _matching_normal_live_broker_submits(
-                store.envelopes(kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND),
-                candidate.payload,
+        matching = _matching_normal_live_broker_submits(
+            store.envelopes(kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND),
+            candidate.payload,
+        )
+        may_create_first_post = _claim_normal_live_broker_post_capability(receipt)
+        if not may_create_first_post and not matching:
+            raise ValueError(
+                "live submit requires an in-process Task 3 issuance capability"
             )
-            may_create_first_post = _claim_normal_live_broker_post_capability(receipt)
+        supervisor_claim = _claim_normal_live_submit_admission(
+            supervisor_admission,
+            intent=intent,
+            order_payload=frozen_order,
+            promotion_state_path=snapshot.path,
+            broker_read_adapter=broker_read_adapter,
+        )
+        control_state_path = _normal_live_submit_claim_control_path(supervisor_claim)
+        try:
             if may_create_first_post:
                 admission = store.admit_checked(
                     candidate,
@@ -2374,10 +2409,6 @@ def execute_normal_live_broker_submit(
                     activation_state_marker=activation_state_marker,
                 )
             else:
-                if not matching:
-                    raise ValueError(
-                        "live submit requires an in-process Task 3 issuance capability"
-                    )
                 recorded = NormalLiveBrokerSubmitAdmission(
                     created=False,
                     client_order_id=intent.client_order_id,
@@ -2385,14 +2416,27 @@ def execute_normal_live_broker_submit(
                     activation_state_marker=activation_state_marker,
                 )
 
-            def accept_broker_result(result: object) -> object:
+            def accept_broker_result(
+                result: object,
+                *,
+                commitment: Mapping[str, str],
+                outcome: str,
+            ) -> object:
                 _require_matching_normal_live_broker_order(result, frozen_order)
+                accepted_at = _normal_live_broker_acceptance_time(result)
                 # An actual matching order is the only point at which the rolling
                 # limit is recorded.  The durable receipt is then written from the
                 # policy-owned payload, not caller data or an arbitrary result.
                 _record_normal_live_submit_claim(
                     supervisor_claim,
                     client_order_id=intent.client_order_id,
+                    accepted_at=accepted_at,
+                )
+                resolve_normal_live_submission_commitment(
+                    control_state_path,
+                    commitment_id=commitment["commitment_id"],
+                    outcome=outcome,
+                    now=accepted_at,
                 )
                 prepare = next(
                     envelope
@@ -2415,58 +2459,88 @@ def execute_normal_live_broker_submit(
                 return result
 
             # Normal-live lock order is promotion state -> live control -> rate
-            # ledger.  The Task 3 verifier already owns promotion state here;
-            # holding the control writer lock across final validation, I/O, and
-            # durable outcome handling prevents a cooperating freeze/re-arm from
-            # completing in the read-to-POST gap.
+            # ledger.  The Task 3 verifier owns promotion state here.  Broker
+            # reads happen before the short control-held transaction; that
+            # transaction validates the fresh snapshot, reserves capacity, and
+            # atomically records the exact irrevocable commitment.  The lock is
+            # released before every GET/POST, so a freeze is never blocked by
+            # network I/O: it either wins before the commitment (zero I/O), or
+            # records the one already-committed in-flight client order.
+            recheck_before_broker_io()
+            live_account, live_positions, _existing_snapshot = (
+                _refresh_normal_live_submit_claim_broker_state(
+                    supervisor_claim,
+                    intent=intent,
+                    payload=frozen_order,
+                )
+            )
             with live_control_lock(
-                _normal_live_submit_claim_control_path(supervisor_claim)
+                control_state_path
             ):
-                # The durable write above can take time, so recheck immediately
-                # before the first possible broker I/O as well as before POST.
                 recheck_before_broker_io()
                 _revalidate_normal_live_submit_claim(
                     supervisor_claim,
                     payload=frozen_order,
                     sleeve=sleeve,
+                    live_account=live_account,
+                    live_positions=live_positions,
                     rate_limit_exclude_client_order_id=intent.client_order_id,
                 )
                 _reserve_normal_live_submit_claim(
                     supervisor_claim, client_order_id=intent.client_order_id
                 )
-                # Reservation is durable local work.  Recheck all authority
-                # inputs immediately before lookup, excluding only this exact
-                # already-reserved idempotency key from the rolling count.
-                recheck_before_broker_io()
-                _revalidate_normal_live_submit_claim(
-                    supervisor_claim,
-                    payload=frozen_order,
-                    sleeve=sleeve,
-                    rate_limit_exclude_client_order_id=intent.client_order_id,
-                )
-                existing = lookup(intent.client_order_id)
-                _revalidate_normal_live_submit_reconciliation_after_lookup(
-                    supervisor_claim,
-                    intent=intent,
+                commitment = commit_normal_live_submission_locked(
+                    control_state_path,
+                    intent_full_sha256=_digest(intent.canonical_json_bytes()),
                     order_payload_sha256=order_payload_sha256,
-                    broker_order=existing if isinstance(existing, Mapping) else None,
+                    client_order_id=intent.client_order_id,
+                    now=_normal_live_policy_moment(),
                 )
-                if existing is not None:
-                    return accept_broker_result(existing)
-                if not recorded.created:
-                    _release_normal_live_submit_claim_reservation(
-                        supervisor_claim, client_order_id=intent.client_order_id
-                    )
-                    raise ValueError("live retry lookup found no order; refusing second POST")
-                # This is immediately before the only possible broker POST.
-                recheck_before_broker_io()
-                _revalidate_normal_live_submit_claim(
-                    supervisor_claim,
-                    payload=frozen_order,
-                    sleeve=sleeve,
-                    rate_limit_exclude_client_order_id=intent.client_order_id,
+            # The commitment makes the exact order the only action permitted
+            # after a concurrent freeze.  We still revalidate Task 3 provenance
+            # and the 30-second owned reconciliation lease before each I/O.
+            recheck_before_broker_io()
+            _revalidate_normal_live_submit_reconciliation_after_lookup(
+                supervisor_claim,
+                intent=intent,
+                order_payload_sha256=order_payload_sha256,
+            )
+            existing = _owned_normal_live_broker_lookup(
+                broker_read_adapter, client_order_id=intent.client_order_id
+            )
+            _revalidate_normal_live_submit_reconciliation_after_lookup(
+                supervisor_claim,
+                intent=intent,
+                order_payload_sha256=order_payload_sha256,
+            )
+            if existing is not None:
+                return accept_broker_result(
+                    existing, commitment=commitment, outcome="lookup_matched"
                 )
-                return accept_broker_result(post(frozen_order))
+            if not recorded.created:
+                _release_normal_live_submit_claim_reservation(
+                    supervisor_claim, client_order_id=intent.client_order_id
+                )
+                resolve_normal_live_submission_commitment(
+                    control_state_path,
+                    commitment_id=commitment["commitment_id"],
+                    outcome="missing_refused",
+                    now=_normal_live_policy_moment(),
+                )
+                raise ValueError("live retry lookup found no order; refusing second POST")
+            recheck_before_broker_io()
+            _revalidate_normal_live_submit_reconciliation_after_lookup(
+                supervisor_claim,
+                intent=intent,
+                order_payload_sha256=order_payload_sha256,
+            )
+            return accept_broker_result(
+                _owned_normal_live_broker_post(
+                    broker_read_adapter, order_payload=frozen_order
+                ),
+                commitment=commitment,
+                outcome="submitted",
+            )
         except BaseException:
             _discard_normal_live_submit_claim(supervisor_claim)
             raise

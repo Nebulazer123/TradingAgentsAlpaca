@@ -60,7 +60,6 @@ from tradingagents.brokers.supervisor import session as supervisor_session
 from tradingagents.brokers.supervisor import sizing as supervisor_sizing
 from tradingagents.brokers.supervisor import types as supervisor_types
 from tradingagents.evals.email_clarity import evaluate_email_clarity
-from tradingagents.execution.reconcile import ReconciliationResult
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 
@@ -142,15 +141,9 @@ def test_supervisor_forwards_the_identical_normal_intent_receipt_and_admission_t
         promotion_state_path=(tmp_path / "promotion.json").resolve(),
         control_state_path=(tmp_path / "control.json").resolve(),
         order_rate_state_path=(tmp_path / "rate.json").resolve(),
-        current_live_exposure=Decimal("0.00"),
         current_daily_loss_usd=Decimal("0.00"),
         current_drawdown_pct=Decimal("0.00"),
-        live_account={"buying_power": "500.00"},
-        live_positions=(),
         decision_evidence={},
-        reconciliation=ReconciliationResult(
-            matched=True, issues=[], checked_client_order_ids=[]
-        ),
     ) == {"id": "live-order"}
     order, kwargs = live_client.call
     assert order == {

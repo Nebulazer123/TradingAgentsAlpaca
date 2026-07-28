@@ -18,6 +18,10 @@ from decimal import ROUND_DOWN, Decimal
 import requests
 
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
+from tradingagents.execution.reconcile import (
+    _register_normal_live_broker_read_adapter,
+    reconcile_normal_live_submit,
+)
 from tradingagents.policy.strategy_promotion_sync import (
     NormalLiveActivationReceipt,
     execute_normal_live_broker_submit,
@@ -739,6 +743,9 @@ class AlpacaRestClient:
         self.session = session or requests.Session()
         self.normal_live_evidence_root = normal_live_evidence_root
         self.normal_live_repo_root = normal_live_repo_root
+        self._normal_live_broker_read_adapter = _register_normal_live_broker_read_adapter(
+            self
+        )
 
     def assert_expected_mode(self, *, paper: bool) -> None:
         base_url = self.settings.base_url.lower()
@@ -787,6 +794,52 @@ class AlpacaRestClient:
             params={"client_order_id": client_order_id},
         )
 
+    def _collect_normal_live_reconciliation_reads(
+        self, *, client_order_id: str
+    ) -> tuple[
+        dict[str, object],
+        tuple[dict[str, object], ...],
+        tuple[dict[str, object], ...],
+        dict[str, object] | None,
+        datetime.datetime,
+    ]:
+        """Perform the owned complete read-only snapshot for normal-live gates."""
+
+        self.assert_expected_mode(paper=False)
+        account = self.get_account()
+        positions = self.list_positions()
+        open_orders = self.list_orders(status="open")
+        existing = self._lookup_live_order_by_client_order_id(client_order_id)
+        if (
+            type(account) is not dict
+            or type(positions) is not list
+            or type(open_orders) is not list
+            or any(type(item) is not dict for item in positions)
+            or any(type(item) is not dict for item in open_orders)
+            or (existing is not None and type(existing) is not dict)
+        ):
+            raise ValueError("live reconciliation received an ambiguous broker snapshot")
+        return (
+            dict(account),
+            tuple(dict(item) for item in positions),
+            tuple(dict(item) for item in open_orders),
+            None if existing is None else dict(existing),
+            _normal_live_submit_time(),
+        )
+
+    def collect_normal_live_submit_reconciliation(
+        self,
+        intent: AuthorizedNormalTradeIntent,
+        order_payload: Mapping[str, object],
+    ):
+        """Collect and bind the only admissible normal-live reconciliation."""
+
+        return reconcile_normal_live_submit(
+            intent=intent,
+            order_payload=order_payload,
+            broker_read_adapter=self._normal_live_broker_read_adapter,
+        )
+
     def submit_order(
         self,
         order: Mapping,
@@ -818,12 +871,7 @@ class AlpacaRestClient:
             proposal_ledger_root=self.normal_live_evidence_root,
             repo_root=self.normal_live_repo_root,
             supervisor_admission=supervisor_admission,
-            lookup=lambda bound_client_order_id: self._lookup_live_order_by_client_order_id(
-                bound_client_order_id
-            ),
-            post=lambda bound_payload: self._request(
-                "POST", "/v2/orders", json=dict(bound_payload)
-            ),
+            broker_read_adapter=self._normal_live_broker_read_adapter,
         )
         _require_matching_broker_order(broker_result, immutable_facts)
         return broker_result
@@ -838,6 +886,11 @@ class AlpacaRestClient:
         if type(result) is not dict:
             raise ValueError("live retry lookup is ambiguous; refusing POST")
         return result
+
+    def _post_normal_live_order_payload(self, order_payload: Mapping[str, str]) -> dict:
+        """Private owned POST adapter; policy never accepts a caller callback."""
+
+        return self._request("POST", "/v2/orders", json=dict(order_payload))
 
     def _request(self, method: str, path: str, **kwargs):
         url = f"{self.settings.base_url.rstrip('/')}{path}"
