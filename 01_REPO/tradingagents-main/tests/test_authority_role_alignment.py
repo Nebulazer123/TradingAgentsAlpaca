@@ -1,3 +1,4 @@
+import ast
 import json
 from pathlib import Path
 
@@ -164,13 +165,97 @@ def test_role_contract_does_not_cross_the_chain_of_command(role, forbidden):
 
 
 def test_execution_requires_bounded_paper_and_separate_normal_trade_inputs():
+    portfolio = _registry()["roles"]["portfolio_executive"]
     execution = _registry()["roles"]["execution_operator"]
 
+    assert portfolio["required_outputs"] == ["authorized_normal_trade_intent"]
     assert execution["allowed_actions"] == ["order_submit"]
     assert execution["required_inputs"] == [
         "authorized_paper_order_request",
         "authorized_normal_trade_intent",
+        "normal_live_activation_receipt",
     ]
+
+
+def test_production_live_write_inventory_has_no_unclassified_caller():
+    """Every production live-write-shaped call is explicitly fail-closed."""
+
+    expected = {
+        ("cli/main.py", "_alpaca_clients", "AlpacaSettings.from_env"): "hard-disabled",
+        ("cli/main.py", "_alpaca_clients", "live_client.assert_expected_mode"): "hard-disabled",
+        ("cli/main.py", "_alpaca_live_client", "AlpacaSettings.from_env"): "hard-disabled",
+        ("cli/main.py", "_alpaca_live_client", "live_client.assert_expected_mode"): "hard-disabled",
+        ("cli/main.py", "alpaca_reconcile_orcl_incident", "_alpaca_live_client"): "hard-disabled",
+        ("cli/main.py", "alpaca_reconcile_symbol_incident", "_alpaca_live_client"): "hard-disabled",
+        ("cli/main.py", "alpaca_paper_tournament_run", "paper_client.submit_order"): "paper-only",
+        ("cli/main.py", "alpaca_supervise_hourly", "paper_client.submit_order"): "paper-only",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "definition"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.assert_expected_mode"): "hard-disabled",
+        ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "paper_client.submit_order"): "hard-disabled",
+        ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.submit_order"): "hard-disabled",
+        ("tradingagents/brokers/alpaca.py", "execute_paper_orders", "paper_client.submit_order"): "paper-only",
+        ("tradingagents/brokers/alpaca_supervisor.py", "submit_authorized_normal_live_order", "live_client.submit_order"): "exact-intent-boundary",
+    }
+
+    inventory: set[tuple[str, str, str]] = set()
+
+    def call_name(node: ast.expr) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return f"{call_name(node.value)}.{node.attr}"
+        return "<dynamic>"
+
+    class _InventoryVisitor(ast.NodeVisitor):
+        def __init__(self, relative_path: str):
+            self.relative_path = relative_path
+            self.scope: list[str] = []
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            qualified = ".".join([*self.scope, node.name])
+            if node.name == "submit_order":
+                inventory.add((self.relative_path, qualified, "definition"))
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+
+        def visit_Call(self, node: ast.Call) -> None:
+            name = call_name(node.func)
+            has_paper_false = any(
+                keyword.arg == "paper"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is False
+                for keyword in node.keywords
+            )
+            if (
+                name.endswith(".submit_order")
+                or name in {"execute_order_pairs", "_alpaca_live_client"}
+                or has_paper_false
+            ):
+                inventory.add(
+                    (self.relative_path, ".".join(self.scope), name)
+                )
+            self.generic_visit(node)
+
+    for relative_path in (
+        "cli/main.py",
+        "tradingagents/brokers/alpaca.py",
+        "tradingagents/brokers/alpaca_supervisor.py",
+    ):
+        visitor = _InventoryVisitor(relative_path)
+        visitor.visit(ast.parse((ROOT / relative_path).read_text(encoding="utf-8")))
+
+    assert inventory == set(expected)
+    assert set(expected.values()) == {
+        "paper-only",
+        "hard-disabled",
+        "exact-intent-boundary",
+    }
 
 
 def test_strategy_tournament_command_is_intent_only_and_cannot_write_orders():

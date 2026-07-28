@@ -39,6 +39,7 @@ from tradingagents.brokers.alpaca_supervisor import (
     render_premarket_brief_markdown,
     serialize_hourly_decision,
     should_notify_supervisor,
+    submit_authorized_normal_live_order,
     supervisor_issue_category,
     supervisor_live_client_order_id,
     validate_hourly_supervisor_actions,
@@ -59,6 +60,10 @@ from tradingagents.brokers.supervisor import session as supervisor_session
 from tradingagents.brokers.supervisor import sizing as supervisor_sizing
 from tradingagents.brokers.supervisor import types as supervisor_types
 from tradingagents.evals.email_clarity import evaluate_email_clarity
+from tradingagents.execution.authorized_normal_trade_intent import (
+    AuthorizedNormalTradeIntent,
+)
+from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 
 def test_candidate_helpers_are_extracted_but_legacy_facade_stays_compatible():
@@ -103,6 +108,57 @@ def test_candidate_helpers_are_extracted_but_legacy_facade_stays_compatible():
         supervisor_overnight.validate_overnight_plan_against_candidates
         is validate_overnight_plan_against_candidates
     )
+
+
+def test_supervisor_forwards_the_identical_normal_intent_and_receipt_to_live_client():
+    class _LiveClient:
+        def __init__(self):
+            self.call = None
+
+        def submit_order(self, order, **kwargs):
+            self.call = (order, kwargs)
+            return {"id": "live-order"}
+
+    intent = object.__new__(AuthorizedNormalTradeIntent)
+    for field, value in {
+        "symbol": "MSFT",
+        "side": "buy",
+        "order_type": "limit",
+        "tif": "day",
+        "notional_usd": "25.00",
+        "limit_price": "100.00",
+        "client_order_id": "ta-l-exact-intent",
+    }.items():
+        object.__setattr__(intent, field, value)
+    receipt = NormalLiveActivationReceipt(
+        activation_prepare_id="prepare",
+        activation_receipt_id="receipt",
+        intent_full_sha256="a" * 64,
+        canonical_before_sha256="b" * 64,
+        canonical_after_sha256="c" * 64,
+        state={},
+        created=True,
+        status="activated",
+    )
+    live_client = _LiveClient()
+
+    assert submit_authorized_normal_live_order(
+        live_client=live_client,
+        authorized_normal_trade_intent=intent,
+        activation_receipt=receipt,
+    ) == {"id": "live-order"}
+    order, kwargs = live_client.call
+    assert order == {
+        "symbol": "MSFT",
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "notional": "25.00",
+        "limit_price": "100.00",
+        "client_order_id": "ta-l-exact-intent",
+    }
+    assert kwargs["authorized_normal_trade_intent"] is intent
+    assert kwargs["activation_receipt"] is receipt
 
 
 def test_extracted_hourly_packet_io_accepts_injected_facade_callbacks(tmp_path):

@@ -898,10 +898,10 @@ def test_alpaca_submit_refuses_when_execution_flags_are_disabled(monkeypatch, tm
     )
 
     assert result.exit_code != 0
-    assert "TRADINGAGENTS_ALPACA_PAPER_ENABLED=true" in result.stdout
+    assert "authorized normal live intent" in result.stdout.lower()
     packet = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
     assert packet["status"] == "refused"
-    assert packet["estimated_spent_this_run_by_account"] == {"paper": "0.00", "live": "0.00"}
+    assert packet["account_scope"] == ["live"]
 
 
 def test_ticket_orders_auto_adds_ranked_third_candidate(monkeypatch):
@@ -1251,7 +1251,7 @@ def test_rank_overnight_results_keeps_fallback_reason_visible():
     ]
 
 
-def test_alpaca_submit_live_mirror_requires_unified_live_gate(monkeypatch, tmp_path):
+def test_alpaca_submit_live_mirror_is_hard_disabled_before_any_broker_client(monkeypatch, tmp_path):
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     monkeypatch.setattr(
@@ -1290,15 +1290,55 @@ def test_alpaca_submit_live_mirror_requires_unified_live_gate(monkeypatch, tmp_p
     assert result.exit_code != 0
     assert paper_client.submitted == []
     assert live_client.submitted == []
-    assert "live action must use tiny_live execution_mode" in result.stdout
+    assert "authorized normal live intent" in result.stdout.lower()
     packet = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
-    assert packet["status"] == "blocked"
-    assert packet["reason"] == "unified live-submit gate blocked the legacy live mirror path"
+    assert packet["status"] == "refused"
+    assert "authorized normal live intent" in packet["reason"]
     assert packet["submitted_count"] == 0
-    assert packet["account_scope"] == ["paper", "live"]
+    assert packet["account_scope"] == ["live"]
 
 
-def test_alpaca_submit_blocks_live_buys_after_tuesday_window(monkeypatch):
+def test_alpaca_submit_live_refuses_without_constructing_a_live_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_execution_config",
+        lambda: AlpacaExecutionConfig(
+            paper_enabled=True,
+            live_mirror_enabled=True,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_clients",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("manual live submit must not construct a live client")
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "submit",
+            "--run-id",
+            "20260526-tuesday",
+            "--third-symbol",
+            "MSFT",
+            "--third-limit-price",
+            "500",
+            "--log-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "authorized normal live intent" in result.stdout.lower()
+    packet = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    assert packet["status"] == "refused"
+    assert packet["submitted_count"] == 0
+
+
+def test_alpaca_submit_live_path_is_disabled_even_after_legacy_window(monkeypatch):
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     monkeypatch.setattr(
@@ -1333,7 +1373,7 @@ def test_alpaca_submit_blocks_live_buys_after_tuesday_window(monkeypatch):
     )
 
     assert result.exit_code != 0
-    assert "live entry window is closed" in result.stdout
+    assert "authorized normal live intent" in result.stdout.lower()
     assert paper_client.submitted == []
     assert live_client.submitted == []
 
@@ -1610,14 +1650,13 @@ def test_alpaca_supervise_hourly_tiny_live_guard_blocks_reconciliation_mismatch(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
-    assert payload["reason"] == "hourly supervisor tiny-live operational guard blocked submit"
-    assert "unexpected live position for AAPL" in payload["issues"][0]["reason"]
+    assert "authorized normal live intent" in payload["reason"]
     assert live_client.submitted == []
     assert paper_client.submitted == []
     assert not (tmp_path / "tiny-live-submit.lock").exists()
 
 
-def test_alpaca_supervise_hourly_live_submit_uses_tiny_live_idempotency_key(monkeypatch, tmp_path):
+def test_alpaca_supervise_hourly_live_submit_refuses_without_issued_intent(monkeypatch, tmp_path):
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     live_client.positions = []
@@ -1660,13 +1699,10 @@ def test_alpaca_supervise_hourly_live_submit_uses_tiny_live_idempotency_key(monk
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["decision"] == "buy"
-    assert len(live_client.submitted) == 1
+    assert payload["decision"] == "blocked"
+    assert "authorized normal live intent" in payload["reason"]
+    assert live_client.submitted == []
     assert paper_client.submitted == []
-    client_order_id = live_client.submitted[0]["client_order_id"]
-    assert client_order_id.startswith("ta-tiny-")
-    assert len(client_order_id) <= 48
-    assert payload["actions"][0]["idempotency_key"] == client_order_id
 
 
 def test_alpaca_supervise_hourly_honors_board_underperformer_review_for_new_live_buys(
@@ -1815,41 +1851,12 @@ def test_alpaca_supervise_hourly_duplicate_tiny_live_id_blocks_for_reconcile(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
-    assert payload["reason"] == "hourly supervisor submit failed; see issues for broker response"
+    assert "authorized normal live intent" in payload["reason"]
     assert paper_client.submitted == []
-    assert len(live_client.submitted) == 1
-    attempted_client_order_id = live_client.submitted[0]["client_order_id"]
-    assert attempted_client_order_id.startswith("ta-tiny-")
-    assert payload["actions"][0]["idempotency_key"] == attempted_client_order_id
-    assert live_client.lookup_client_order_ids == [attempted_client_order_id]
-    issue_text = payload["issues"][0]["reason"]
-    assert "duplicate client_order_id" in issue_text
-    assert "do not create a replacement order id" in issue_text
-    assert "Reconcile broker open/recent orders" in issue_text
-    assert (
-        "Existing broker order found with status=new id=alpaca-existing-order and it "
-        "matches the intended action"
-    ) in issue_text
+    assert live_client.submitted == []
+    assert live_client.lookup_client_order_ids == []
     assert payload["submitted"] == []
-    assert payload["reconciled_orders"] == [
-        {
-            "account": "live",
-            "client_order_id": attempted_client_order_id,
-            "lookup": "found",
-            "intent_match": True,
-            "comparison_issues": [],
-            "order": {
-                "id": "alpaca-existing-order",
-                "client_order_id": attempted_client_order_id,
-                "symbol": "AMZN",
-                "side": "buy",
-                "type": "limit",
-                "notional": live_client.submitted[0]["notional"],
-                "limit_price": live_client.submitted[0]["limit_price"],
-                "status": "new",
-            },
-        }
-    ]
+    assert payload["reconciled_orders"] == []
 
 
 def test_alpaca_supervise_hourly_blocks_when_latest_live_packet_order_is_missing(
@@ -2050,25 +2057,15 @@ def test_alpaca_supervise_hourly_suppresses_duplicate_alert_email(monkeypatch, t
     assert "alert_email" not in saved
 
 
-def test_live_submit_call_sites_stay_behind_unified_gate():
+def test_live_submit_call_sites_are_hard_disabled_or_exact_intent_boundaries():
     submit_source = inspect.getsource(cli_main.alpaca_submit)
-    submit_gate_index = submit_source.index("validate_supervisor_live_submit_allowed")
-    submit_execute_index = submit_source.index("execute_order_pairs(")
-    assert submit_gate_index < submit_execute_index
-    submit_guard_window = submit_source[submit_gate_index:submit_execute_index]
-    assert "if live_submit_issues" in submit_guard_window
-    assert "live_guard_approved=True" in submit_source[submit_execute_index:]
+    assert "execute_order_pairs(" not in submit_source
+    assert "authorized normal live intent" in submit_source.lower()
+    assert "_alpaca_clients(" not in submit_source
 
     supervisor_source = inspect.getsource(cli_main.alpaca_supervise_hourly)
-    supervisor_gate_index = supervisor_source.index(
-        "validate_supervisor_live_submit_allowed"
-    )
-    supervisor_live_submit_index = supervisor_source.index("live_client.submit_order")
-    guard_window = supervisor_source[supervisor_gate_index:supervisor_live_submit_index]
-    assert supervisor_gate_index < supervisor_live_submit_index
-    assert "if live_submit_issues" in guard_window
-    assert "decision = replace(" in guard_window
-    assert "not decision.issues" in guard_window
+    assert "live_client.submit_order" not in supervisor_source
+    assert "authorized normal live intent" in supervisor_source.lower()
 
 
 def test_alpaca_supervise_hourly_records_submit_failure_packet(monkeypatch, tmp_path):
@@ -4373,9 +4370,10 @@ def test_preopen_submit_allows_clean_preopen_validation(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["decision"] == "buy"
+    assert payload["decision"] == "blocked"
+    assert "authorized normal live intent" in payload["reason"]
     assert payload["evidence"]["preopen_validation"]["status"] == "pass"
-    assert len(live_client.submitted) == 1
+    assert live_client.submitted == []
     assert paper_client.submitted == []
 
 

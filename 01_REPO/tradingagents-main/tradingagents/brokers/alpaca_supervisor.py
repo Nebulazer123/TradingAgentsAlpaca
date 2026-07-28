@@ -94,7 +94,11 @@ from tradingagents.brokers.supervisor.types import (
     HourlySupervisorConfig,
     HourlySupervisorDecision,
 )
+from tradingagents.execution.authorized_normal_trade_intent import (
+    AuthorizedNormalTradeIntent,
+)
 from tradingagents.policy.live_gate import evaluate_go_live_guard
+from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 __all__ = [
     "AGGRESSIVE_CANDIDATE_UNIVERSE",
@@ -143,6 +147,7 @@ __all__ = [
     "render_overnight_plan_markdown",
     "render_premarket_brief_markdown",
     "should_notify_supervisor",
+    "submit_authorized_normal_live_order",
     "supervisor_issue_category",
     "total_unrealized_pl",
     "validate_overnight_plan_against_candidates",
@@ -691,6 +696,44 @@ def validate_supervisor_live_submit_allowed(
         now=now,
     )
     return result.issues
+
+
+def submit_authorized_normal_live_order(
+    *,
+    live_client,
+    authorized_normal_trade_intent: AuthorizedNormalTradeIntent,
+    activation_receipt: NormalLiveActivationReceipt,
+) -> dict:
+    """Forward one already-issued normal-live authorization without rebuilding it.
+
+    This helper is deliberately not a decision path: its payload comes only
+    from the immutable intent, and the Alpaca boundary still re-verifies both
+    exact objects before any broker request.  CLI entry points do not accept
+    either object and therefore must fail closed before reaching this helper.
+    """
+    if type(authorized_normal_trade_intent) is not AuthorizedNormalTradeIntent:
+        raise ValueError(
+            "live supervisor submit requires an exact AuthorizedNormalTradeIntent"
+        )
+    if type(activation_receipt) is not NormalLiveActivationReceipt:
+        raise ValueError(
+            "live supervisor submit requires an exact NormalLiveActivationReceipt"
+        )
+    intent = authorized_normal_trade_intent
+    order = {
+        "symbol": intent.symbol,
+        "side": intent.side,
+        "type": intent.order_type,
+        "time_in_force": intent.tif,
+        "notional": intent.notional_usd,
+        "limit_price": intent.limit_price,
+        "client_order_id": intent.client_order_id,
+    }
+    return live_client.submit_order(
+        order,
+        authorized_normal_trade_intent=intent,
+        activation_receipt=activation_receipt,
+    )
 
 
 def build_hourly_decision(

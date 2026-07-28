@@ -62,10 +62,8 @@ from tradingagents.brokers.alpaca import (
     build_paper_orders,
     classify_alpaca_submit_error,
     compare_alpaca_order_to_intent,
-    execute_order_pairs,
     execute_paper_orders,
     find_order_by_client_order_id,
-    validate_live_entry_allowed,
 )
 from tradingagents.brokers.alpaca_reconciliation import (
     reconcile_orcl_sell_state,
@@ -78,7 +76,6 @@ from tradingagents.brokers.alpaca_supervisor import (
     DEEP_RESEARCH_EVENT_SENSITIVE_SYMBOLS,
     DEEP_RESEARCH_POSITIVE_RELATIVE_SYMBOLS,
     CandidateSignal,
-    HourlySupervisorAction,
     HourlySupervisorConfig,
     build_candidate_signals,
     build_hourly_decision,
@@ -95,7 +92,6 @@ from tradingagents.brokers.alpaca_supervisor import (
     find_latest_hourly_packet,
     is_expected_hourly_safety_lock,
     is_order_action,
-    live_exposure_from_positions,
     load_latest_overnight_plan,
     load_latest_premarket_brief,
     market_session_label,
@@ -252,7 +248,6 @@ from tradingagents.policy.live_control import (
     parse_control_time,
     write_live_control_state,
 )
-from tradingagents.policy.order_rate_limit import record_live_order_submission
 from tradingagents.policy.packets import write_research_packet, write_shadow_run_packet
 from tradingagents.policy.preregistration import (
     append_preregistration,
@@ -9461,163 +9456,24 @@ def alpaca_submit(
             raise typer.Exit(1)
         return
 
-    if not config.paper_enabled or not config.live_mirror_enabled:
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="refused",
-            reason=(
-                "TRADINGAGENTS_ALPACA_PAPER_ENABLED and "
-                "TRADINGAGENTS_ALPACA_LIVE_MIRROR_ENABLED are not both true"
-            ),
-            planned_orders={"requested": [order.__dict__ for order in orders]},
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(
-            "[red]Refusing to submit. Set "
-            "TRADINGAGENTS_ALPACA_PAPER_ENABLED=true and "
-            "TRADINGAGENTS_ALPACA_LIVE_MIRROR_ENABLED=true first.[/red]"
-        )
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    policy_issues = validate_live_entry_allowed(
-        run_id=run_id,
-        now=_alpaca_policy_now(),
-    )
-    if policy_issues:
-        for issue in policy_issues:
-            console.print(f"[red]Blocked {issue.ticket_id}: {issue.reason}[/red]")
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="blocked",
-            reason="legacy one-time live entry policy blocked the run",
-            planned_orders={"requested": [order.__dict__ for order in orders]},
-            issues=_issue_dicts(policy_issues),
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    paper_client, live_client = _alpaca_clients()
-    live_account = live_client.get_account()
-    live_positions_snapshot = live_client.list_positions()
-    current_daily_loss_usd, current_drawdown_pct = _account_circuit_breaker_values(
-        live_account
-    )
-    existing_ids = (
-        paper_client.list_open_client_order_ids()
-        | live_client.list_open_client_order_ids()
-    )
-    result = build_order_pairs(
-        orders,
-        config=config,
-        run_id=run_id,
-        existing_open_client_order_ids=existing_ids,
-    )
-    if not result.accepted:
-        _print_pair_result(result)
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="blocked",
-            reason="paper/live mirror planning produced no accepted orders",
-            planned_orders=_serialize_pair_result(result),
-            issues=[*_issue_dicts(result.rejected), *_issue_dicts(result.skipped)],
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    live_submit_issues = validate_supervisor_live_submit_allowed(
-        actions=[
-            HourlySupervisorAction(
-                action="buy",
-                symbol=pair.live.order.get("symbol", ""),
-                side=pair.live.order.get("side", "buy"),
-                notional=Decimal(str(pair.live.order.get("notional", "0"))),
-                limit_price=Decimal(str(pair.live.order.get("limit_price", "0"))),
-                order_type=pair.live.order.get("type", "limit"),
-                reason="legacy alpaca submit live mirror path",
-                account="live",
-                execution_mode="live_now",
-                sleeve="legacy-live-mirror",
-            )
-            for pair in result.accepted
-        ],
-        current_live_exposure=live_exposure_from_positions(live_positions_snapshot),
-        current_daily_loss_usd=current_daily_loss_usd,
-        current_drawdown_pct=current_drawdown_pct,
-        live_account=live_account,
-        live_positions=live_positions_snapshot,
-    )
-    if live_submit_issues:
-        _print_pair_result(result)
-        for issue in live_submit_issues:
-            console.print(f"[red]Blocked {issue.ticket_id}: {issue.reason}[/red]")
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="blocked",
-            reason="unified live-submit gate blocked the legacy live mirror path",
-            planned_orders=_serialize_pair_result(result),
-            issues=_issue_dicts(live_submit_issues),
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    report = execute_order_pairs(
-        result.accepted,
-        paper_client=paper_client,
-        live_client=live_client,
-        live_guard_approved=True,
-    )
-    _print_pair_result(result)
-    for submitted in report.submitted:
-        console.print(
-            "[green]Submitted pair "
-            f"{submitted.pair.paper.ticket_id}: "
-            f"paper={submitted.paper_response.get('id')} "
-            f"live={submitted.live_response.get('id')}[/green]"
-        )
-    for issue in report.failed:
-        console.print(f"[red]Failed {issue.ticket_id}: {issue.reason}[/red]")
-    status = "partial_failure" if report.failed else "submitted"
     packet = _manual_submit_packet_base(
         run_id=run_id,
-        account_mode="paper_live_mirror",
-        account_scope=["paper", "live"],
-        status=status,
+        account_mode="live_submit_disabled",
+        account_scope=["live"],
+        status="refused",
         reason=(
-            "paper/live mirror submit had broker failures"
-            if report.failed
-            else "paper/live mirror orders submitted"
+            "manual live submission is disabled: an authorized normal live intent "
+            "and its activation receipt must be issued outside this CLI path"
         ),
-        planned_orders=_serialize_pair_result(result),
-        submitted=[
-            {
-                "ticket_id": submitted.pair.paper.ticket_id,
-                "paper_response": submitted.paper_response,
-                "live_response": submitted.live_response,
-            }
-            for submitted in report.submitted
-        ],
-        failed=_issue_dicts(report.failed),
-        estimated_spent_this_run_by_account=_pair_submit_spend_summary(
-            result.accepted,
-            report.failed,
-        ),
+        planned_orders={"requested": [order.__dict__ for order in orders]},
     )
     packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
+    console.print(
+        "[red]Refusing to submit: an authorized normal live intent and activation "
+        "receipt must be independently issued outside this CLI path.[/red]"
+    )
     console.print(f"Packet: {packet_path}")
-    if report.failed:
-        raise typer.Exit(1)
+    raise typer.Exit(1)
 
 
 @alpaca_app.command("pullback-support-paper")
@@ -11472,6 +11328,28 @@ def alpaca_supervise_hourly(
                         )
             if decision.issues:
                 live_actions = []
+            if live_actions:
+                decision = replace(
+                    decision,
+                    decision="blocked",
+                    material=True,
+                    reason=(
+                        "hourly supervisor live submission requires an independently "
+                        "issued authorized normal live intent and activation receipt"
+                    ),
+                    issues=[
+                        *decision.issues,
+                        OrderIssue(
+                            "normal-live-intent",
+                            (
+                                "live actions are no-submit until the exact authorized "
+                                "normal live intent and activation receipt are supplied "
+                                "outside this CLI path"
+                            ),
+                        ),
+                    ],
+                )
+                live_actions = []
             tiny_live_guard = acquire_tiny_live_operational_guard(
                 live_actions=live_actions,
                 live_client=live_client,
@@ -11492,14 +11370,6 @@ def alpaca_supervise_hourly(
                 tiny_live_guard.lock.path
                 if tiny_live_guard.lock and tiny_live_guard.lock.acquired
                 else None
-            )
-            rate_envelope, _rate_envelope_issues = load_risk_envelope(
-                "config/risk_envelope.yaml"
-            )
-            rate_limit_enabled = (
-                rate_envelope is not None
-                and rate_envelope.max_live_orders_per_window is not None
-                and rate_envelope.live_order_window_minutes is not None
             )
             submit_issues = []
             reconciled_orders = []
@@ -11529,13 +11399,10 @@ def alpaca_supervise_hourly(
                             if action.account.lower() == "paper":
                                 submitted.append(paper_client.submit_order(payload))
                             else:
-                                submitted.append(live_client.submit_order(payload))
-                                if rate_limit_enabled:
-                                    record_live_order_submission(
-                                        "results/policy/live_order_rate_state.json",
-                                        client_order_id=client_order_id,
-                                        now=decision.generated_at,
-                                    )
+                                raise RuntimeError(
+                                    "hourly CLI live submission is hard-disabled without "
+                                    "an independently issued normal live intent"
+                                )
                         except Exception as exc:  # noqa: BLE001 - preserve packet evidence for broker failures.
                             classification = classify_alpaca_submit_error(
                                 exc,

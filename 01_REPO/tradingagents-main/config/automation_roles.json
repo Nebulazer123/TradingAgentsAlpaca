@@ -51,6 +51,9 @@
       ],
       "command_family": [
         "research execution-board-review --json-output"
+      ],
+      "required_outputs": [
+        "authorized_normal_trade_intent"
       ]
     },
     "reliability_controller": {
@@ -127,7 +130,8 @@
       ],
       "required_inputs": [
         "authorized_paper_order_request",
-        "authorized_normal_trade_intent"
+        "authorized_normal_trade_intent",
+        "normal_live_activation_receipt"
       ],
       "command_family": [
         "scripts/mac/ta_job.sh hourly"
