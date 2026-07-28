@@ -1,5 +1,6 @@
 import ast
 import json
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -177,12 +178,19 @@ def test_execution_requires_bounded_paper_and_separate_normal_trade_inputs():
     ]
 
 
-def test_production_live_write_inventory_has_no_unclassified_caller():
-    """Every production live-write-shaped call is explicitly fail-closed."""
-
-    expected = {
+_EXCLUDED_PRODUCTION_PATH_PARTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "generated",
+    "node_modules",
+}
+_LIVE_WRITE_CALLER_CLASSIFICATIONS = {
         ("cli/main.py", "_alpaca_clients", "AlpacaSettings.from_env"): "hard-disabled",
         ("cli/main.py", "_alpaca_clients", "live_client.assert_expected_mode"): "hard-disabled",
+        ("cli/main.py", "_alpaca_live_client", "definition"): "hard-disabled",
         ("cli/main.py", "_alpaca_live_client", "AlpacaSettings.from_env"): "hard-disabled",
         ("cli/main.py", "_alpaca_live_client", "live_client.assert_expected_mode"): "hard-disabled",
         ("cli/main.py", "alpaca_reconcile_orcl_incident", "_alpaca_live_client"): "hard-disabled",
@@ -190,6 +198,7 @@ def test_production_live_write_inventory_has_no_unclassified_caller():
         ("cli/main.py", "alpaca_paper_tournament_run", "paper_client.submit_order"): "paper-only",
         ("cli/main.py", "alpaca_supervise_hourly", "paper_client.submit_order"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "definition"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "definition"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.assert_expected_mode"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "paper_client.submit_order"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.submit_order"): "hard-disabled",
@@ -197,14 +206,28 @@ def test_production_live_write_inventory_has_no_unclassified_caller():
         ("tradingagents/brokers/alpaca_supervisor.py", "submit_authorized_normal_live_order", "live_client.submit_order"): "exact-intent-boundary",
     }
 
-    inventory: set[tuple[str, str, str]] = set()
 
-    def call_name(node: ast.expr) -> str:
-        if isinstance(node, ast.Name):
-            return node.id
-        if isinstance(node, ast.Attribute):
-            return f"{call_name(node.value)}.{node.attr}"
-        return "<dynamic>"
+def _production_python_paths(root: Path = ROOT) -> list[Path]:
+    paths = []
+    for directory in (root / "tradingagents", root / "cli"):
+        if not directory.exists():
+            continue
+        for path in directory.rglob("*.py"):
+            if _EXCLUDED_PRODUCTION_PATH_PARTS.isdisjoint(path.parts):
+                paths.append(path)
+    return sorted(paths)
+
+
+def _call_name(node: ast.expr) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return f"{_call_name(node.value)}.{node.attr}"
+    return "<dynamic>"
+
+
+def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]]:
+    occurrences = []
 
     class _InventoryVisitor(ast.NodeVisitor):
         def __init__(self, relative_path: str):
@@ -218,14 +241,17 @@ def test_production_live_write_inventory_has_no_unclassified_caller():
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
             qualified = ".".join([*self.scope, node.name])
-            if node.name == "submit_order":
-                inventory.add((self.relative_path, qualified, "definition"))
+            if node.name in {"submit_order", "execute_order_pairs", "_alpaca_live_client"}:
+                occurrences.append((self.relative_path, node.lineno, qualified, "definition"))
             self.scope.append(node.name)
             self.generic_visit(node)
             self.scope.pop()
 
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.visit_FunctionDef(node)
+
         def visit_Call(self, node: ast.Call) -> None:
-            name = call_name(node.func)
+            name = _call_name(node.func)
             has_paper_false = any(
                 keyword.arg == "paper"
                 and isinstance(keyword.value, ast.Constant)
@@ -233,29 +259,70 @@ def test_production_live_write_inventory_has_no_unclassified_caller():
                 for keyword in node.keywords
             )
             if (
-                name.endswith(".submit_order")
+                name == "submit_order"
+                or name.endswith(".submit_order")
                 or name in {"execute_order_pairs", "_alpaca_live_client"}
                 or has_paper_false
             ):
-                inventory.add(
-                    (self.relative_path, ".".join(self.scope), name)
+                occurrences.append(
+                    (self.relative_path, node.lineno, ".".join(self.scope), name)
                 )
             self.generic_visit(node)
 
-    for relative_path in (
-        "cli/main.py",
-        "tradingagents/brokers/alpaca.py",
-        "tradingagents/brokers/alpaca_supervisor.py",
-    ):
+    for path in _production_python_paths(root):
+        relative_path = path.relative_to(root).as_posix()
         visitor = _InventoryVisitor(relative_path)
-        visitor.visit(ast.parse((ROOT / relative_path).read_text(encoding="utf-8")))
+        visitor.visit(ast.parse(path.read_text(encoding="utf-8")))
+    return occurrences
 
-    assert inventory == set(expected)
-    assert set(expected.values()) == {
+
+def _assert_all_live_write_occurrences_classified(
+    occurrences: list[tuple[str, int, str, str]],
+    classifications: dict[tuple[str, str, str], str],
+) -> None:
+    observed = Counter((path, scope, name) for path, _line, scope, name in occurrences)
+    expected = Counter(classifications.keys())
+    unknown = [
+        f"{path}:{line}: {scope or '<module>'} -> {name}"
+        for path, line, scope, name in occurrences
+        if (path, scope, name) not in classifications
+    ]
+    missing = list((expected - observed).elements())
+    duplicates = list((observed - expected).elements())
+    assert not unknown and not missing and not duplicates, (
+        "unclassified live-write occurrence(s): "
+        f"{unknown}; missing expected occurrences: {missing}; "
+        f"duplicate occurrences: {duplicates}"
+    )
+
+
+def test_production_live_write_inventory_has_no_unclassified_caller():
+    """Every production live-write-shaped occurrence is explicitly fail-closed."""
+
+    _assert_all_live_write_occurrences_classified(
+        _live_write_occurrences(),
+        _LIVE_WRITE_CALLER_CLASSIFICATIONS,
+    )
+    assert set(_LIVE_WRITE_CALLER_CLASSIFICATIONS.values()) == {
         "paper-only",
         "hard-disabled",
         "exact-intent-boundary",
     }
+
+
+def test_live_write_inventory_rejects_an_unclassified_new_production_path(tmp_path):
+    source = tmp_path / "tradingagents" / "new_live_caller.py"
+    source.parent.mkdir()
+    source.write_text(
+        "def bypass(client):\n    return client.submit_order({})\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match=r"tradingagents/new_live_caller.py:2"):
+        _assert_all_live_write_occurrences_classified(
+            _live_write_occurrences(tmp_path),
+            {},
+        )
 
 
 def test_strategy_tournament_command_is_intent_only_and_cannot_write_orders():
