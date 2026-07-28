@@ -66,6 +66,7 @@ from tradingagents.strategy.shadow_attestation import (
     StrategyShadowAttestation,
     _attestation_from_envelope,
 )
+from tradingagents.strategy.staged_intent import StrategyStagedIntentLedger
 
 PROMOTION_STATE_SCHEMA_VERSION = "1.2.0"
 
@@ -1772,6 +1773,108 @@ def _require_current_normal_live_sleeve(
     return sleeve
 
 
+def _require_current_normal_live_sources(
+    *,
+    store: ImmutableStrategyEvidenceStore,
+    proposal: StrategyPromotionProposal,
+    repo: Path,
+    checked_at: datetime.datetime,
+) -> None:
+    """Revalidate the complete 6D source chain while the state lock is held."""
+
+    _require_current_attestation(
+        checked_at=checked_at,
+        attested_at=proposal.validation_attestation.completed_at,
+        max_age_seconds=VALIDATION_ATTESTATION_MAX_AGE_SECONDS,
+        label="validation attestation",
+    )
+    _require_current_attestation(
+        checked_at=checked_at,
+        attested_at=proposal.risk_attestation.reviewed_at,
+        max_age_seconds=RISK_ATTESTATION_MAX_AGE_SECONDS,
+        label="risk attestation",
+    )
+    _require_risk_gate_projection(proposal)
+    _require_clean_runtime_descendant(repo, proposal.promotion_runtime_commit)
+    report, _ = _safe_repo_file(
+        repo, proposal.validation_attestation.report_ref, "validation report"
+    )
+    risk, _ = _safe_repo_file(
+        repo, proposal.risk_attestation.risk_envelope_ref, "risk envelope"
+    )
+    report_bytes = report.read_bytes()
+    risk_bytes = risk.read_bytes()
+    if (
+        _digest(report_bytes) != proposal.validation_attestation.report_sha256
+        or _digest(risk_bytes) != proposal.risk_attestation.risk_envelope_sha256
+    ):
+        raise ValueError("external promotion anchor changed")
+    if type(proposal) is _ImmutableStrategyPromotionProposal:
+        _require_current_risk_envelope(
+            risk, proposal=proposal, anchored_bytes=risk_bytes
+        )
+        if report.read_bytes() != report_bytes:
+            raise ValueError("validation report changed during sync anchoring")
+    _require_durable_source_recomputation(
+        store=store,
+        proposal=proposal,
+        repo_root=repo,
+        checked_at=checked_at,
+    )
+    _require_external_promotion_anchors_unchanged(
+        report=report,
+        risk=risk,
+        report_bytes=report_bytes,
+        risk_bytes=risk_bytes,
+    )
+    if type(proposal) is _ImmutableStrategyPromotionProposal:
+        _require_current_risk_envelope(
+            risk, proposal=proposal, anchored_bytes=risk_bytes
+        )
+
+
+def _require_complete_normal_live_intent_chain(
+    *,
+    intent: AuthorizedNormalTradeIntent,
+    proposal: StrategyPromotionProposal,
+    proposal_ledger_root: str | Path,
+    repo: Path,
+) -> None:
+    """Bind all Task 2 material to the durable staged-paper decision."""
+
+    candidates = [
+        staged
+        for staged in StrategyStagedIntentLedger(
+            proposal_ledger_root, repo_root=repo
+        ).rebuild()
+        if staged.staged_intent_id == intent.staged_intent_id
+    ]
+    if len(candidates) != 1:
+        raise ValueError("activation requires the exact durable staged intent")
+    staged = candidates[0]
+    decision = staged.decision
+    if (
+        _digest(staged.canonical_json_bytes()) != intent.staged_intent_sha256
+        or staged.promotion_evidence_id != proposal.promotion_evidence_id
+        or staged.promotion_evidence_sha256 != proposal.promotion_evidence_sha256
+        or staged.genome.genome_id != proposal.genome_id
+        or staged.genome_canonical_sha256 != proposal.genome_canonical_sha256
+        or staged.evaluation_code_commit != proposal.evaluation_code_commit
+        or staged.evaluation_runtime_sha256 != proposal.evaluation_runtime_sha256
+        or intent.market_observation_sha256 != staged.observations_sha256
+        or intent.portfolio_snapshot_sha256 != staged.candidate_state_sha256
+        or decision.action.value != "buy"
+        or decision.symbol is None
+        or decision.notional_usd is None
+        or decision.limit_price is None
+        or intent.symbol != decision.symbol
+        or intent.notional_usd != decision.notional_usd
+        or intent.limit_price != decision.limit_price
+        or (intent.side, intent.order_type, intent.tif) != ("buy", "limit", "day")
+    ):
+        raise ValueError("activation Task 2 evidence chain is not current")
+
+
 def _activation_state(
     *, state: Mapping[str, object], sleeve: str
 ) -> dict[str, object]:
@@ -1805,12 +1908,15 @@ def activate_normal_live_intent(
     state_anchor = _capture_state_path_anchor(state_path)
     state_file = state_anchor.path
     repo = Path(repo_root).resolve()
-    moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
-    activated_at = _time_text(moment, "activated_at")
-    checked_at = _time(activated_at, "activated_at")
     intent_full_sha256 = _digest(intent.canonical_json_bytes())
     with promotion_state_lock(state_file):
         _require_state_path_anchor_current(state_anchor)
+        # The caller can have waited on this lock for most or all of Task 2's
+        # 900-second TTL.  Capture and canonicalize time only after acquiring
+        # the lock, before any prepare or state mutation is possible.
+        moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
+        activated_at = _time_text(moment, "activated_at")
+        checked_at = _time(activated_at, "activated_at")
         snapshot = read_promotion_state_snapshot(state_file)
         store = ImmutableStrategyEvidenceStore(proposal_ledger_root, clock=clock)
         duplicate = _activation_collision_or_receipt(
@@ -1899,6 +2005,18 @@ def activate_normal_live_intent(
             or intent.risk_snapshot_sha256 != proposal.risk_attestation.risk_envelope_sha256
         ):
             raise ValueError("activation requires an active capped intent")
+        _require_current_normal_live_sources(
+            store=store,
+            proposal=proposal,
+            repo=repo,
+            checked_at=checked_at,
+        )
+        _require_complete_normal_live_intent_chain(
+            intent=intent,
+            proposal=proposal,
+            proposal_ledger_root=proposal_ledger_root,
+            repo=repo,
+        )
         _require_current_normal_live_sleeve(proposal=proposal, state=snapshot.state)
         sync_receipts = [
             envelope
@@ -1915,16 +2033,6 @@ def activate_normal_live_intent(
             or sync_receipt.canonical_after_sha256 != snapshot.sha256
         ):
             raise ValueError("activation requires the exact Task 6D receipt")
-        _require_clean_runtime_descendant(repo, proposal.promotion_runtime_commit)
-        risk_path, _ = _safe_repo_file(
-            repo, proposal.risk_attestation.risk_envelope_ref, "risk envelope"
-        )
-        risk_bytes = risk_path.read_bytes()
-        if _digest(risk_bytes) != proposal.risk_attestation.risk_envelope_sha256:
-            raise ValueError("activation risk envelope changed")
-        _require_current_risk_envelope(
-            risk_path, proposal=proposal, anchored_bytes=risk_bytes
-        )
         after_state = _activation_state(state=snapshot.state, sleeve=proposal.sleeve)
         after = _canonical(after_state)
         after_sha256 = _digest(after)

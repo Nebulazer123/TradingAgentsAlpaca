@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +39,8 @@ def _normal_live_intent(
     receipt_sha256: str,
     recorded_at: str = "2030-03-22T16:05:00+00:00",
     expires_at: str = "2030-03-22T16:10:00+00:00",
+    staged_intent: object | None = None,
+    overrides: dict[str, object] | None = None,
 ) -> AuthorizedNormalTradeIntent:
     """Make a Task 2 intent bound to the real Task 6D test journal."""
 
@@ -75,6 +77,27 @@ def _normal_live_intent(
     }
     def canonical(value: object) -> bytes:
         return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    if staged_intent is not None:
+        decision = staged_intent.decision
+        assert decision.action.value == "buy"
+        assert decision.symbol is not None
+        assert decision.notional_usd is not None
+        assert decision.limit_price is not None
+        payload.update(
+            {
+                "staged_intent_id": staged_intent.staged_intent_id,
+                "staged_intent_sha256": sync_module._digest(
+                    staged_intent.canonical_json_bytes()
+                ),
+                "market_observation_sha256": staged_intent.observations_sha256,
+                "portfolio_snapshot_sha256": staged_intent.candidate_state_sha256,
+                "symbol": decision.symbol,
+                "notional_usd": decision.notional_usd,
+                "limit_price": decision.limit_price,
+            }
+        )
+    if overrides is not None:
+        payload.update(overrides)
     logical_order_sha256 = hashlib.sha256(canonical(payload)).hexdigest()
     payload["logical_order_sha256"] = logical_order_sha256
     payload["client_order_id"] = f"ta-l-{logical_order_sha256[:40]}"
@@ -90,6 +113,45 @@ def _normal_live_intent(
         + hashlib.sha256(canonical(bound)).hexdigest()
     )
     return AuthorizedNormalTradeIntent.from_dict(bound)
+
+
+def _complete_normal_live_intent(
+    *,
+    root: Path,
+    repo_root: Path,
+    proposal: object,
+    state_sha256: str,
+    receipt_id: str,
+    receipt_sha256: str,
+    recorded_at: str,
+    expires_at: str,
+    overrides: dict[str, object] | None = None,
+) -> AuthorizedNormalTradeIntent:
+    """Bind Task 2 material to a durable staged paper decision."""
+
+    from tradingagents.strategy.staged_intent import StrategyStagedIntentLedger
+
+    candidates = [
+        staged
+        for staged in StrategyStagedIntentLedger(root, repo_root=repo_root).rebuild()
+        if (
+            staged.promotion_evidence_id == proposal.promotion_evidence_id
+            and staged.genome.genome_id == proposal.genome_id
+            and staged.decision.action.value == "buy"
+        )
+    ]
+    assert candidates
+    staged = max(candidates, key=lambda item: item.effective_at)
+    return _normal_live_intent(
+        proposal,
+        state_sha256=state_sha256,
+        receipt_id=receipt_id,
+        receipt_sha256=receipt_sha256,
+        recorded_at=recorded_at,
+        expires_at=expires_at,
+        staged_intent=staged,
+        overrides=overrides,
+    )
 
 
 def _copy_isolated_source_tamper_repo(tmp_path: Path) -> Path:
@@ -3298,10 +3360,10 @@ def test_activation_requires_exact_current_intent_and_state_preimage(
     assert state.read_bytes() == synced.state_path.read_bytes() if hasattr(synced, "state_path") else state.read_bytes()
 
 
-def test_activation_never_promotes_an_expired_or_uncapped_intent(
+def test_activation_never_promotes_an_expired_intent(
     tmp_path, monkeypatch
 ) -> None:
-    """An expired Task 2 authorization never changes the eligible sleeve."""
+    """An expired Task 2 authorization never changes the promotion state."""
 
     root, repo_root, proposal, synced_at, commit = _real_immutable_journal(
         tmp_path, monkeypatch
@@ -3350,6 +3412,287 @@ def test_activation_never_promotes_an_expired_or_uncapped_intent(
     assert state.read_bytes() == before
 
 
+def _sync_capped_activation_state(
+    *,
+    root: Path,
+    repo_root: Path,
+    proposal: object,
+    state: Path,
+    synced_at: datetime,
+    intent_recorded_at: datetime | None = None,
+    intent_expires_at: datetime | None = None,
+    overrides: dict[str, object] | None = None,
+) -> AuthorizedNormalTradeIntent:
+    state.write_bytes(b'{"sleeves":{}}')
+    synced = sync_module.sync_strategy_promotion_state_file(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(b'{"sleeves":{}}'),
+        actor_role="strategy_learning",
+        clock=lambda: synced_at,
+    )
+    receipt = next(
+        item
+        for item in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if item.object_id == synced.sync_receipt_id
+    )
+    recorded = intent_recorded_at or synced_at
+    expires = intent_expires_at or (recorded + timedelta(minutes=5))
+    return _complete_normal_live_intent(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_sha256=synced.canonical_after_sha256,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(receipt.canonical_json_bytes()),
+        recorded_at=recorded.isoformat(),
+        expires_at=expires.isoformat(),
+        overrides=overrides,
+    )
+
+
+def test_activation_rechecks_expiry_after_waiting_for_state_lock(
+    tmp_path, monkeypatch
+) -> None:
+    """A lock wait cannot preserve the active timestamp captured before it."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_rechecks_expiry_after_waiting_for_state_lock",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    intent = _sync_capped_activation_state(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state=state,
+        synced_at=synced_at,
+    )
+    before = state.read_bytes()
+    entered = Event()
+    release = Event()
+    moment = {"value": synced_at}
+    original_lock = sync_module.promotion_state_lock
+
+    @contextmanager
+    def delayed_lock(path: Path):
+        with original_lock(path):
+            entered.set()
+            assert release.wait(timeout=5)
+            yield
+
+    monkeypatch.setattr(sync_module, "promotion_state_lock", delayed_lock)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        result = executor.submit(
+            sync_module.activate_normal_live_intent,
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: moment["value"],
+        )
+        assert entered.wait(timeout=5)
+        moment["value"] = datetime.fromisoformat(intent.expires_at)
+        release.set()
+        with pytest.raises(ValueError, match="active capped intent"):
+            result.result(timeout=10)
+    assert state.read_bytes() == before
+
+
+def test_activation_rechecks_stale_6d_attestations_under_lock(
+    tmp_path, monkeypatch
+) -> None:
+    """An active Task 2 intent cannot outlive the current 6D risk attestation."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_rechecks_stale_6d_attestations_under_lock",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    stale_at = datetime.fromisoformat(proposal.risk_attestation.reviewed_at) + timedelta(
+        seconds=901
+    )
+    intent = _sync_capped_activation_state(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state=state,
+        synced_at=synced_at,
+        intent_recorded_at=stale_at,
+        intent_expires_at=stale_at + timedelta(minutes=5),
+    )
+    before = state.read_bytes()
+
+    with pytest.raises(ValueError, match="risk attestation is stale"):
+        sync_module.activate_normal_live_intent(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: stale_at,
+        )
+
+    assert state.read_bytes() == before
+
+
+def test_activation_rechecks_changed_6d_validation_report_under_lock(
+    tmp_path, monkeypatch
+) -> None:
+    """A changed 6D validation source is rejected before a live-state write."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_rechecks_changed_6d_validation_report_under_lock",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    intent = _sync_capped_activation_state(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state=state,
+        synced_at=synced_at,
+    )
+    before = state.read_bytes()
+    report = repo_root / proposal.validation_attestation.report_ref
+    report.write_text(report.read_text(encoding="utf-8") + "\nchanged", encoding="utf-8")
+    monkeypatch.setattr(
+        sync_module, "_require_clean_runtime_descendant", lambda *_args: None
+    )
+
+    with pytest.raises(ValueError, match="external promotion anchor changed"):
+        sync_module.activate_normal_live_intent(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: synced_at,
+        )
+
+    assert state.read_bytes() == before
+
+
+def test_activation_rejects_each_tampered_task2_evidence_binding(
+    tmp_path, monkeypatch
+) -> None:
+    """Every Task 2 digest/value binding is checked against durable sources."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_rejects_each_tampered_task2_evidence_binding",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    replacements = {
+        "promotion_proposal_id": "strategy-promotion-proposal-" + "0" * 64,
+        "promotion_proposal_sha256": "0" * 64,
+        "promotion_state_sha256": "0" * 64,
+        "promotion_sync_receipt_id": "strategy-promotion-sync-receipt-" + "0" * 64,
+        "promotion_sync_receipt_sha256": "0" * 64,
+        "staged_intent_id": "staged-paper-intent-" + "0" * 64,
+        "staged_intent_sha256": "0" * 64,
+        "shadow_attestation_sha256": "0" * 64,
+        "genome_id": "strategy-genome-" + "0" * 64,
+        "genome_canonical_sha256": "0" * 64,
+        "evaluation_code_commit": "0" * 40,
+        "evaluation_runtime_sha256": "0" * 64,
+        "market_observation_sha256": "0" * 64,
+        "portfolio_snapshot_sha256": "0" * 64,
+        "risk_snapshot_sha256": "0" * 64,
+        "symbol": "AAPL",
+        "notional_usd": "2.00",
+        "limit_price": "101.00",
+    }
+    for field, replacement in replacements.items():
+        state = tmp_path / f"{field}.json"
+        intent = _sync_capped_activation_state(
+            root=root,
+            repo_root=repo_root,
+            proposal=proposal,
+            state=state,
+            synced_at=synced_at,
+            overrides={field: replacement},
+        )
+        before = state.read_bytes()
+        with pytest.raises(ValueError):
+            sync_module.activate_normal_live_intent(
+                proposal,
+                intent,
+                proposal_ledger_root=root,
+                repo_root=repo_root,
+                state_path=state,
+                clock=lambda: synced_at,
+            )
+        assert state.read_bytes() == before, field
+
+
+def test_activation_rejects_active_intent_with_uncapped_risk_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    """Uncapped risk evidence is rejected independently of intent expiry."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_rejects_active_intent_with_uncapped_risk_evidence",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    uncapped = tmp_path / "uncapped-risk-envelope.yaml"
+    uncapped.write_text("new_sleeve_auto_promote: false\n", encoding="utf-8")
+    state = tmp_path / "promotion.json"
+    intent = _sync_capped_activation_state(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state=state,
+        synced_at=synced_at,
+        overrides={"risk_snapshot_sha256": sync_module._digest(uncapped.read_bytes())},
+    )
+    before = state.read_bytes()
+
+    with pytest.raises(ValueError, match="active capped intent"):
+        sync_module.activate_normal_live_intent(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: synced_at,
+        )
+
+    assert state.read_bytes() == before
+
+
 def test_activation_is_one_use_and_duplicate_is_read_only_retry(
     tmp_path, monkeypatch
 ) -> None:
@@ -3380,8 +3723,10 @@ def test_activation_is_one_use_and_duplicate_is_read_only_retry(
         for item in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
         if item.object_id == synced.sync_receipt_id
     )
-    intent = _normal_live_intent(
-        proposal,
+    intent = _complete_normal_live_intent(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
         state_sha256=synced.canonical_after_sha256,
         receipt_id=synced.sync_receipt_id,
         receipt_sha256=sync_module._digest(receipt.canonical_json_bytes()),
@@ -3438,8 +3783,10 @@ def test_activation_crash_repair_never_widens_the_bound_intent(
         for item in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
         if item.object_id == synced.sync_receipt_id
     )
-    intent = _normal_live_intent(
-        proposal,
+    intent = _complete_normal_live_intent(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
         state_sha256=synced.canonical_after_sha256,
         receipt_id=synced.sync_receipt_id,
         receipt_sha256=sync_module._digest(receipt.canonical_json_bytes()),
