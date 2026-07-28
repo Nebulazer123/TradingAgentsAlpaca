@@ -2064,6 +2064,14 @@ def activate_normal_live_intent(
             prepare = prepares[0]
             prepare_created = False
         else:
+            # The receipt/prepare scans above are durable I/O too.  Do not
+            # admit a fresh prepare using a Task 2 timestamp sampled before
+            # they completed.
+            moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
+            activated_at = _time_text(moment, "activated_at")
+            checked_at = _time(activated_at, "activated_at")
+            if not intent.is_active(at=checked_at):
+                raise ValueError("activation requires an active capped intent")
             prepare_admission = store.admit_checked(
                 EvidenceCandidate(
                     kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
@@ -2080,6 +2088,13 @@ def activate_normal_live_intent(
             fault_hook("after_prepare")
         _require_state_path_anchor_current(state_anchor)
         _require_snapshot_current(snapshot)
+        # A recovered prepare still cannot enable a sleeve after the bound
+        # authorization has expired while final file guards were running.
+        moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
+        activated_at = _time_text(moment, "activated_at")
+        checked_at = _time(activated_at, "activated_at")
+        if not intent.is_active(at=checked_at):
+            raise ValueError("activation requires an active capped intent")
         staged = _stage_state_replacement(state_file, after)
         try:
             replaced = _replace_state_after_final_guard(
