@@ -2413,6 +2413,7 @@ def execute_normal_live_broker_submit(
             _record_normal_live_submit_claim,
             _release_normal_live_submit_claim_reservation,
             _require_normal_live_submit_admission_available,
+            _require_normal_live_submit_claim_leases_current,
             _reserve_normal_live_submit_claim,
             _revalidate_normal_live_submit_claim,
             _revalidate_normal_live_submit_reconciliation_after_lookup,
@@ -2602,6 +2603,9 @@ def execute_normal_live_broker_submit(
                 supervisor_claim,
                 intent=intent,
                 order_payload_sha256=order_payload_sha256,
+            )
+            _require_normal_live_submit_claim_leases_current(
+                supervisor_claim, order_payload=frozen_order
             )
             if existing is not None:
                 return accept_broker_result(

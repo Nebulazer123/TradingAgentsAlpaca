@@ -1456,6 +1456,131 @@ def test_live_client_raw_post_requires_a_policy_owned_capability():
     assert client.session.requests == []
 
 
+def test_live_client_generic_transport_rejects_direct_live_order_post_without_token():
+    """Break caught: a generic transport call could bypass the post capability."""
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+
+    with pytest.raises(ValueError, match="policy post capability"):
+        client._request("POST", "/v2/orders", json=_bound_normal_live_order(intent))
+
+    assert client.session.requests == []
+
+
+@pytest.mark.parametrize("baseline_state", ("missing", "corrupt"))
+def test_supervisor_rejects_unready_daily_baseline_before_owned_metrics_reads(
+    tmp_path, monkeypatch, baseline_state
+):
+    """Break caught: baseline failure used to follow owned account/order reads."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+    from tradingagents.brokers.alpaca_supervisor import (
+        submit_authorized_normal_live_order,
+    )
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    _normal_live_admission(
+        tmp_path,
+        monkeypatch,
+        root=root,
+        intent=intent,
+        receipt=receipt,
+        activated_at=activated_at,
+    )
+    control_path = (tmp_path / "normal-live-control.json").resolve()
+    baseline_path = supervisor_module._normal_live_risk_metrics_state_path(control_path)
+    if baseline_state == "missing":
+        baseline_path.unlink()
+    else:
+        baseline_path.write_text("{not-json", encoding="utf-8")
+    (tmp_path / "normal-live-rate.json").write_text(
+        '{"submissions": []}', encoding="utf-8"
+    )
+    session = _FakeLiveSession()
+    session.account["equity"] = "500.00"
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+
+    with pytest.raises(ValueError, match="risk metrics baseline"):
+        submit_authorized_normal_live_order(
+            live_client=client,
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            risk_envelope_path=(tmp_path / "normal-live-risk.yaml").resolve(),
+            promotion_state_path=_activation_state_path(root, receipt).resolve(),
+            control_state_path=control_path,
+            order_rate_state_path=(tmp_path / "normal-live-rate.json").resolve(),
+            decision_evidence={},
+        )
+
+    assert session.requests == []
+
+
+@pytest.mark.parametrize(
+    ("local_failure", "message"),
+    (
+        ("frozen_control", "final gates rejected"),
+        ("corrupt_risk_config", "local gate config is unavailable"),
+        ("missing_rate_ledger", "rate ledger is unavailable"),
+        ("corrupt_rate_ledger", "rate ledger"),
+    ),
+)
+def test_supervisor_rejects_local_gate_failures_before_owned_metrics_reads(
+    tmp_path, monkeypatch, local_failure, message
+):
+    """Break caught: local frozen/rate failures used to follow owned metric I/O."""
+    from tradingagents.brokers.alpaca_supervisor import (
+        submit_authorized_normal_live_order,
+    )
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    _normal_live_admission(
+        tmp_path,
+        monkeypatch,
+        root=root,
+        intent=intent,
+        receipt=receipt,
+        activated_at=activated_at,
+    )
+    control_path = (tmp_path / "normal-live-control.json").resolve()
+    rate_path = (tmp_path / "normal-live-rate.json").resolve()
+    if local_failure == "frozen_control":
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        control["frozen"] = True
+        control_path.write_text(json.dumps(control), encoding="utf-8")
+        rate_path.write_text('{"submissions": []}', encoding="utf-8")
+    elif local_failure == "corrupt_risk_config":
+        (tmp_path / "normal-live-risk.yaml").write_text(
+            "live_budget_mode: unsupported", encoding="utf-8"
+        )
+        rate_path.write_text('{"submissions": []}', encoding="utf-8")
+    elif local_failure == "corrupt_rate_ledger":
+        rate_path.write_text("{not-json", encoding="utf-8")
+    session = _FakeLiveSession()
+    session.account["equity"] = "500.00"
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+
+    with pytest.raises(ValueError, match=message):
+        submit_authorized_normal_live_order(
+            live_client=client,
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            risk_envelope_path=(tmp_path / "normal-live-risk.yaml").resolve(),
+            promotion_state_path=_activation_state_path(root, receipt).resolve(),
+            control_state_path=control_path,
+            order_rate_state_path=rate_path,
+            decision_evidence={},
+        )
+
+    assert session.requests == []
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
@@ -1839,6 +1964,65 @@ def test_resolved_normal_live_commitment_cannot_consume_raw_post_capability(
                 receipt=receipt,
                 activated_at=activated_at,
             ),
+        )
+
+    assert session.post_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("elapsed_seconds", "message"),
+    ((31, "risk metrics are stale"), (61, "supervisor admission is stale")),
+)
+def test_live_client_rechecks_claim_leases_after_final_lookup_before_raw_post(
+    tmp_path, monkeypatch, elapsed_seconds, message
+):
+    """Break caught: a slow final lookup could outlive a claimed local lease."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    supervisor_now = [activated_at]
+    admission = _normal_live_admission(
+        tmp_path,
+        monkeypatch,
+        root=root,
+        intent=intent,
+        receipt=receipt,
+        activated_at=activated_at,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_normal_live_admission_utc_now",
+        lambda: supervisor_now[0],
+    )
+
+    class _ExpireLeaseAfterFinalLookupSession(_FakeLiveSession):
+        def __init__(self):
+            super().__init__()
+            self.exact_lookup_count = 0
+
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if method == "GET" and url.endswith("/v2/orders:by_client_order_id"):
+                self.exact_lookup_count += 1
+                if self.exact_lookup_count == 3:
+                    supervisor_now[0] = activated_at + datetime.timedelta(
+                        seconds=elapsed_seconds
+                    )
+            return response
+
+    session = _ExpireLeaseAfterFinalLookupSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+
+    with pytest.raises(ValueError, match=message):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
         )
 
     assert session.post_calls == 0

@@ -239,7 +239,7 @@ _NORMAL_LIVE_ADMISSION_CLAIMS: dict[
 _NORMAL_LIVE_ADMISSION_RECONCILIATIONS: dict[int, object] = {}
 _NORMAL_LIVE_RISK_METRICS_CAPABILITIES: dict[int, NormalLiveRiskMetrics] = {}
 _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES: dict[
-    int, tuple[object, object, str, str, Path, dict[str, str]]
+    int, tuple[object, object, str, str, Path, dict[str, str], _NormalLiveAdmissionClaim]
 ] = {}
 
 
@@ -358,6 +358,66 @@ def _normal_live_metrics_account_sha256(account: Mapping[str, object]) -> str:
     ).hexdigest()
 
 
+def _read_normal_live_risk_metrics_baseline_state(path: Path) -> dict[str, object]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+        state = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("normal live risk metrics baseline is unavailable") from exc
+    if type(state) is not dict:
+        raise ValueError("normal live risk metrics baseline is invalid")
+    return state
+
+
+def _validate_normal_live_risk_metrics_baseline_state(
+    state: Mapping[str, object],
+    *,
+    trade_date: str,
+    observed_at: datetime.datetime,
+) -> tuple[Decimal, Decimal]:
+    required = {
+        "schema_version",
+        "trade_date",
+        "day_start_equity",
+        "high_water_equity",
+        "updated_at",
+    }
+    if set(state) != required or state["schema_version"] != 1:
+        raise ValueError("normal live risk metrics baseline is invalid")
+    if type(state["trade_date"]) is not str or state["trade_date"] != trade_date:
+        raise ValueError("normal live risk metrics baseline is not current")
+    day_start = _normal_live_metrics_decimal(
+        state["day_start_equity"], label="day_start_equity"
+    )
+    high_water = _normal_live_metrics_decimal(
+        state["high_water_equity"], label="high_water_equity"
+    )
+    updated_at = _normal_live_metrics_time(state["updated_at"], label="updated_at")
+    if updated_at > observed_at or high_water < day_start:
+        raise ValueError("normal live risk metrics baseline is invalid")
+    return day_start, high_water
+
+
+def _preflight_normal_live_risk_metrics_baseline(
+    path: Path,
+    *,
+    current: datetime.datetime,
+) -> None:
+    """Require observer-owned day evidence before any owned broker read.
+
+    This is intentionally read-only.  The submit path must not create or
+    repair a day baseline, because that could erase an earlier intraday loss.
+    """
+
+    with live_control_lock(path):
+        state = _read_normal_live_risk_metrics_baseline_state(path)
+        _validate_normal_live_risk_metrics_baseline_state(
+            state,
+            trade_date=current.astimezone(CENTRAL).date().isoformat(),
+            observed_at=current,
+        )
+
+
 def _load_normal_live_risk_metrics_baseline(
     path: Path,
     *,
@@ -373,37 +433,86 @@ def _load_normal_live_risk_metrics_baseline(
     """
 
     with live_control_lock(path):
-        try:
-            raw = path.read_text(encoding="utf-8")
-            state = json.loads(raw)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("normal live risk metrics baseline is unavailable") from exc
-        required = {
-            "schema_version",
-            "trade_date",
-            "day_start_equity",
-            "high_water_equity",
-            "updated_at",
-        }
-        if type(state) is not dict or set(state) != required or state["schema_version"] != 1:
-            raise ValueError("normal live risk metrics baseline is invalid")
-        if type(state["trade_date"]) is not str or state["trade_date"] != trade_date:
-            raise ValueError("normal live risk metrics baseline is not current")
-        day_start = _normal_live_metrics_decimal(
-            state["day_start_equity"], label="day_start_equity"
+        state = _read_normal_live_risk_metrics_baseline_state(path)
+        day_start, high_water = _validate_normal_live_risk_metrics_baseline_state(
+            state, trade_date=trade_date, observed_at=observed_at
         )
-        high_water = _normal_live_metrics_decimal(
-            state["high_water_equity"], label="high_water_equity"
-        )
-        updated_at = _normal_live_metrics_time(state["updated_at"], label="updated_at")
-        if updated_at > observed_at or high_water < day_start:
-            raise ValueError("normal live risk metrics baseline is invalid")
         if equity > high_water:
             state["high_water_equity"] = str(equity)
             state["updated_at"] = observed_at.isoformat(timespec="seconds")
             atomic_write_text(path, json.dumps(state, indent=2))
             high_water = equity
         return day_start, high_water
+
+
+def _preflight_normal_live_submit_local_prerequisites(
+    intent: AuthorizedNormalTradeIntent,
+    *,
+    order_payload: Mapping[str, object],
+    risk_envelope_path: str | Path,
+    control_state_path: str | Path,
+    order_rate_state_path: str | Path,
+) -> None:
+    """Reject local normal-live failures before the first owned broker GET.
+
+    This preflight deliberately establishes no admission and never receives
+    caller-provided account metrics.  It validates the locally durable gates
+    and the observer-owned daily baseline first; only a clean result permits
+    creation of a fresh owned broker snapshot for risk metrics.
+    """
+
+    if type(intent) is not AuthorizedNormalTradeIntent:
+        raise ValueError("normal live local preflight requires an exact live intent")
+    payload = _normal_live_admission_mapping(order_payload, label="normal live order")
+    expected_payload = {
+        "symbol": intent.symbol,
+        "side": intent.side,
+        "type": intent.order_type,
+        "time_in_force": intent.tif,
+        "notional": intent.notional_usd,
+        "limit_price": intent.limit_price,
+        "client_order_id": intent.client_order_id,
+    }
+    if _normal_live_metrics_payload_sha256(payload) != _normal_live_metrics_payload_sha256(
+        expected_payload
+    ):
+        raise ValueError("normal live local preflight does not bind the exact order")
+    risk_path = _normal_live_admission_path(risk_envelope_path, label="risk envelope")
+    control_path = _normal_live_admission_path(control_state_path, label="live control")
+    rate_path = _normal_live_admission_path(order_rate_state_path, label="rate state")
+    current = _normal_live_admission_moment()
+    _state, control_issues = load_live_control_state(control_path, now=current)
+    if control_issues:
+        raise ValueError("normal live submit final gates rejected admission")
+    envelope, envelope_issues = load_risk_envelope(risk_path)
+    if envelope_issues or envelope is None:
+        raise ValueError("normal live submit local gate config is unavailable")
+    if (
+        envelope.max_live_orders_per_window is None
+        or envelope.live_order_window_minutes is None
+    ):
+        raise ValueError("normal live submit local gate config is unavailable")
+    try:
+        notional = Decimal(payload["notional"])
+    except (KeyError, InvalidOperation, ValueError) as exc:
+        raise ValueError("normal live submit local gate config is unavailable") from exc
+    if notional > envelope.per_name_cap_usd:
+        raise ValueError("normal live submit final gates rejected admission")
+    if not rate_path.exists():
+        raise ValueError("normal live submit rate ledger is unavailable")
+    rate_issues = evaluate_order_rate_limit(
+        path=rate_path,
+        now=current,
+        window_minutes=envelope.live_order_window_minutes,
+        max_orders=envelope.max_live_orders_per_window,
+        new_order_count=1,
+        exclude_client_order_id=payload["client_order_id"],
+    )
+    if rate_issues:
+        raise ValueError("normal live submit final gates rejected admission")
+    _preflight_normal_live_risk_metrics_baseline(
+        _normal_live_risk_metrics_state_path(control_path), current=current
+    )
 
 
 def _issue_normal_live_submit_risk_metrics(
@@ -774,20 +883,8 @@ def _revalidate_normal_live_submit_claim(
     if entry is None or entry[0] is not claim:
         raise ValueError("live submit supervisor admission claim is unavailable")
     context = entry[1]
-    _require_normal_live_admission_lease_current(
-        issued_at=claim.issued_at, expires_at=claim.expires_at
-    )
-    digest = hashlib.sha256(
-        json.dumps(
-            dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
-    ).hexdigest()
-    if digest != claim.order_payload_sha256:
-        raise ValueError("supervisor admission does not bind the exact live order")
-    _require_normal_live_submit_risk_metrics_current(
-        context.risk_metrics,
-        intent_full_sha256=claim.intent_full_sha256,
-        order_payload_sha256=claim.order_payload_sha256,
+    _require_normal_live_submit_claim_leases_current(
+        claim, order_payload=payload
     )
     current = _normal_live_admission_moment()
     issues = validate_supervisor_live_submit_allowed(
@@ -884,6 +981,32 @@ def _normal_live_submit_claim_context(
     return entry[1]
 
 
+def _require_normal_live_submit_claim_leases_current(
+    claim: object,
+    *,
+    order_payload: Mapping[str, str],
+) -> None:
+    """Recheck the typed admission and metrics leases at a broker-I/O edge."""
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    payload = dict(order_payload)
+    payload_sha256 = _normal_live_metrics_payload_sha256(payload)
+    if payload_sha256 != claim.order_payload_sha256:
+        raise ValueError("supervisor admission does not bind the exact live order")
+    _require_normal_live_admission_lease_current(
+        issued_at=claim.issued_at, expires_at=claim.expires_at
+    )
+    _require_normal_live_submit_risk_metrics_current(
+        entry[1].risk_metrics,
+        intent_full_sha256=claim.intent_full_sha256,
+        order_payload_sha256=payload_sha256,
+    )
+
+
 def _reserve_normal_live_submit_claim(
     claim: object,
     *,
@@ -968,6 +1091,9 @@ def _issue_normal_live_submit_post_capability(
     entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
     if entry is None or entry[0] is not claim:
         raise ValueError("live submit supervisor admission claim is unavailable")
+    _require_normal_live_submit_claim_leases_current(
+        claim, order_payload=order_payload
+    )
     if _normal_live_submit_claim_reconciliation(claim) is None:
         raise ValueError("live submit reconciliation is unavailable before raw post")
     payload = dict(order_payload)
@@ -1007,6 +1133,7 @@ def _issue_normal_live_submit_post_capability(
         client_order_id,
         _normal_live_submit_claim_control_path(claim),
         bound_commitment,
+        claim,
     )
     return capability
 
@@ -1029,6 +1156,7 @@ def _consume_normal_live_submit_post_capability(
         client_order_id,
         control_state_path,
         commitment,
+        claim,
     ) = entry
     payload = dict(order_payload)
     if (
@@ -1050,6 +1178,12 @@ def _consume_normal_live_submit_post_capability(
     )
 
     with live_control_lock(control_state_path):
+        # A blocked control lock can itself consume the bounded local leases.
+        # Recheck the real registry-owned artifacts at the final raw transport
+        # point, not through a caller callback or copied values.
+        _require_normal_live_submit_claim_leases_current(
+            claim, order_payload=payload
+        )
         _verify_pending_normal_live_submission_commitment_locked(
             control_state_path,
             commitment=commitment,
@@ -1650,6 +1784,13 @@ def submit_authorized_normal_live_order(
         "limit_price": intent.limit_price,
         "client_order_id": intent.client_order_id,
     }
+    _preflight_normal_live_submit_local_prerequisites(
+        intent,
+        order_payload=order,
+        risk_envelope_path=risk_envelope_path,
+        control_state_path=control_state_path,
+        order_rate_state_path=order_rate_state_path,
+    )
     risk_metrics = _issue_normal_live_submit_risk_metrics(
         intent,
         order_payload=order,

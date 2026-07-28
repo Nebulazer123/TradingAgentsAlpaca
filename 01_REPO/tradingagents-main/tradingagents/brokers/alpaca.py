@@ -44,6 +44,26 @@ class AlpacaExecutionError(RuntimeError):
     """Raised when Alpaca rejects or fails an HTTP request."""
 
 
+class _AlpacaSessionView:
+    """Expose test/session state without exposing the raw request primitive."""
+
+    def __init__(self, raw_session: object):
+        object.__setattr__(self, "_raw_session", raw_session)
+
+    def __getattr__(self, name: str):
+        if name == "request":
+            raise AttributeError(
+                "raw Alpaca session.request is internal; use the classified client boundary"
+            )
+        return getattr(self._raw_session, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_raw_session":
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._raw_session, name, value)
+
+
 @dataclass(frozen=True)
 class AlpacaSubmitErrorClassification:
     category: str
@@ -740,7 +760,8 @@ class AlpacaRestClient:
         normal_live_repo_root=None,
     ):
         self.settings = settings
-        self.session = session or requests.Session()
+        self._session = session or requests.Session()
+        self.session = _AlpacaSessionView(self._session)
         self.normal_live_evidence_root = normal_live_evidence_root
         self.normal_live_repo_root = normal_live_repo_root
         self._normal_live_broker_read_adapter = _register_normal_live_broker_read_adapter(
@@ -896,24 +917,42 @@ class AlpacaRestClient:
         """Perform exactly one policy-capability-bound normal-live POST."""
 
         payload = _snapshot_normal_live_order(order_payload)
-        # Deferred to avoid the supervisor's normal import cycle.  The
-        # supervisor alone can mint this one-use capability from a registered
-        # exact admission claim; reconciliation by itself cannot mint POST
-        # authority.
-        from tradingagents.brokers.alpaca_supervisor import (
-            _consume_normal_live_submit_post_capability,
+        return self._request(
+            "POST",
+            "/v2/orders",
+            json=payload,
+            policy_post_capability=policy_post_capability,
         )
 
-        _consume_normal_live_submit_post_capability(
-            self._normal_live_broker_read_adapter,
-            policy_post_capability,
-            order_payload=payload,
-        )
-        return self._request("POST", "/v2/orders", json=payload)
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        policy_post_capability: object | None = None,
+        **kwargs,
+    ):
+        if (
+            method.upper() == "POST"
+            and path == "/v2/orders"
+            and self.settings.paper is False
+        ):
+            payload = _snapshot_normal_live_order(kwargs.get("json"))
+            # The sole live order transport is capability-bound at this lowest
+            # layer.  A generic client._request call cannot reach the raw
+            # session even if it names the broker order endpoint directly.
+            from tradingagents.brokers.alpaca_supervisor import (
+                _consume_normal_live_submit_post_capability,
+            )
 
-    def _request(self, method: str, path: str, **kwargs):
+            _consume_normal_live_submit_post_capability(
+                self._normal_live_broker_read_adapter,
+                policy_post_capability,
+                order_payload=payload,
+            )
+            kwargs["json"] = payload
         url = f"{self.settings.base_url.rstrip('/')}{path}"
-        response = self.session.request(
+        response = self._session.request(
             method,
             url,
             headers={

@@ -163,6 +163,11 @@ def test_supervisor_forwards_the_identical_normal_intent_receipt_and_admission_t
     )
     monkeypatch.setattr(
         supervisor_module,
+        "_preflight_normal_live_submit_local_prerequisites",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
         "_issue_normal_live_submit_admission",
         lambda *_args, **_kwargs: sentinel_admission,
     )

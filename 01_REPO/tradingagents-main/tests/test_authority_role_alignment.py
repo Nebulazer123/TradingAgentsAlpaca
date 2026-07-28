@@ -198,8 +198,12 @@ _LIVE_WRITE_CALLER_CLASSIFICATIONS = {
         ("cli/main.py", "alpaca_paper_tournament_run", "paper_client.submit_order"): "paper-only",
         ("cli/main.py", "alpaca_supervise_hourly", "paper_client.submit_order"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "definition"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._request", "definition"): "exact-intent-boundary",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._collect_normal_live_reconciliation_reads", "self.assert_expected_mode"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "self._request"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "definition"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "self._request"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._request", "self._session.request"): "exact-intent-boundary",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "definition"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.assert_expected_mode"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "paper_client.submit_order"): "hard-disabled",
@@ -249,6 +253,7 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                 "execute_order_pairs",
                 "_alpaca_live_client",
                 "_post_normal_live_order_payload",
+                "_request",
             }:
                 occurrences.append((self.relative_path, node.lineno, qualified, "definition"))
             self.scope.append(node.name)
@@ -266,8 +271,28 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                 and keyword.value.value is False
                 for keyword in node.keywords
             )
+            is_raw_order_request = (
+                name.endswith("._request")
+                and len(node.args) >= 2
+                and all(
+                    isinstance(node.args[index], ast.Constant)
+                    and node.args[index].value == expected
+                    for index, expected in enumerate(("POST", "/v2/orders"))
+                )
+            )
+            is_raw_session_request = name.endswith((".session.request", "._session.request"))
+            has_order_endpoint_primitive = (
+                not name.endswith("._request")
+                and not is_raw_session_request
+                and any(
+                isinstance(argument, ast.Constant) and argument.value == "/v2/orders"
+                for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+                )
+            )
             if (
-                name == "submit_order"
+                is_raw_order_request
+                or is_raw_session_request
+                or name == "submit_order"
                 or name.endswith(".submit_order")
                 or name.endswith("._post_normal_live_order_payload")
                 or name in {"execute_order_pairs", "_alpaca_live_client"}
@@ -288,6 +313,15 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                         node.lineno,
                         ".".join(self.scope),
                         "_post_normal_live_order_payload",
+                    )
+                )
+            elif has_order_endpoint_primitive:
+                occurrences.append(
+                    (
+                        self.relative_path,
+                        node.lineno,
+                        ".".join(self.scope),
+                        "order-endpoint-primitive",
                     )
                 )
             self.generic_visit(node)
@@ -357,6 +391,28 @@ def test_live_write_inventory_rejects_an_unclassified_raw_post_caller(tmp_path):
     )
 
     with pytest.raises(AssertionError, match=r"tradingagents/new_raw_live_caller.py:2"):
+        _assert_all_live_write_occurrences_classified(
+            _live_write_occurrences(tmp_path),
+            {},
+        )
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    (
+        'def bypass(client):\n    return client._request("POST", "/v2/orders", json={})\n',
+        'def bypass(client):\n    return client.session.request("POST", "/v2/orders", json={})\n',
+        'def bypass(client):\n    return requests.post("/v2/orders", json={})\n',
+    ),
+)
+def test_live_write_inventory_rejects_unclassified_generic_transport_bypass(
+    tmp_path, source_text
+):
+    source = tmp_path / "tradingagents" / "new_transport_bypass.py"
+    source.parent.mkdir()
+    source.write_text(source_text, encoding="utf-8")
+
+    with pytest.raises(AssertionError, match=r"tradingagents/new_transport_bypass.py:2"):
         _assert_all_live_write_occurrences_classified(
             _live_write_occurrences(tmp_path),
             {},
