@@ -550,6 +550,7 @@ def evaluate_go_live_guard(
     live_positions: Sequence[Mapping[str, Any]] = (),
     decision_evidence: Mapping[str, Any] | None = None,
     now: datetime.datetime | None = None,
+    rate_limit_exclude_client_order_id: str | None = None,
 ) -> LiveGateResult:
     live_actions = [action for action in actions if _is_live_order_action(action)]
     if not live_actions:
@@ -715,6 +716,7 @@ def evaluate_go_live_guard(
             window_minutes=envelope.live_order_window_minutes,
             max_orders=envelope.max_live_orders_per_window,
             new_order_count=len(live_actions),
+            exclude_client_order_id=rate_limit_exclude_client_order_id,
         )
         if rate_issues:
             checks["order_rate_limit"] = False

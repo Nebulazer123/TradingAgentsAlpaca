@@ -9,7 +9,10 @@ real money movement across runs, not just intent within a single decision cycle.
 from __future__ import annotations
 
 import datetime
+import fcntl
 import json
+import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +21,26 @@ from tradingagents.policy.io import atomic_write_text
 UTC = datetime.timezone.utc
 
 _MAX_RETAINED_RECORDS = 500
+
+
+def _rate_lock_path(path: str | Path) -> Path:
+    state_path = Path(path)
+    return state_path.with_name(f".{state_path.name}.rate.lock")
+
+
+@contextmanager
+def _rate_limit_lock(path: str | Path):
+    """Serialize rate reservation/record transitions for one ledger."""
+
+    lock_path = _rate_lock_path(path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _as_utc(value: datetime.datetime) -> datetime.datetime:
@@ -54,19 +77,91 @@ def _load_records(path: str | Path) -> list[dict[str, Any]]:
     return [record for record in data if isinstance(record, dict)]
 
 
+def _write_records(path: str | Path, records: list[dict[str, Any]]) -> None:
+    state_path = Path(path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(state_path, json.dumps({"submissions": records}, indent=2))
+
+
+def _records_in_window(
+    records: list[dict[str, Any]],
+    *,
+    now: datetime.datetime,
+    window_minutes: int,
+) -> list[dict[str, Any]]:
+    cutoff = _as_utc(now) - datetime.timedelta(minutes=window_minutes)
+    return [
+        record
+        for record in records
+        if (submitted_at := _parse_ts(str(record.get("submitted_at", ""))))
+        is not None
+        and submitted_at > cutoff
+    ]
+
+
 def count_live_submissions_in_window(
     path: str | Path,
     *,
     now: datetime.datetime,
     window_minutes: int,
+    exclude_client_order_id: str | None = None,
 ) -> int:
-    cutoff = _as_utc(now) - datetime.timedelta(minutes=window_minutes)
-    count = 0
-    for record in _load_records(path):
-        submitted_at = _parse_ts(str(record.get("submitted_at", "")))
-        if submitted_at is not None and submitted_at > cutoff:
-            count += 1
-    return count
+    records = _records_in_window(
+        _load_records(path), now=now, window_minutes=window_minutes
+    )
+    if exclude_client_order_id is not None:
+        records = [
+            record
+            for record in records
+            if str(record.get("client_order_id", "")) != exclude_client_order_id
+        ]
+    return len(records)
+
+
+def reserve_live_order_submission(
+    path: str | Path,
+    *,
+    client_order_id: str,
+    now: datetime.datetime,
+    window_minutes: int,
+    max_orders: int,
+) -> None:
+    """Durably reserve one live-order slot before broker I/O.
+
+    A reservation is deliberately counted like a real submission.  It remains
+    fail-closed across a crash until a read-only lookup resolves the exact
+    idempotency key, when it is either promoted to a submission or released.
+    """
+
+    if type(window_minutes) is not int or window_minutes <= 0:
+        raise ValueError("live order reservation requires a positive window")
+    if type(max_orders) is not int or max_orders <= 0:
+        raise ValueError("live order reservation requires a positive maximum")
+    normalized_client_order_id = str(client_order_id)
+    with _rate_limit_lock(path):
+        records = _load_records(path)
+        if any(
+            str(record.get("client_order_id", "")) == normalized_client_order_id
+            for record in records
+        ):
+            return
+        existing = len(
+            _records_in_window(records, now=now, window_minutes=window_minutes)
+        )
+        if existing + 1 > max_orders:
+            raise ValueError(
+                "order rate limit blocked submit: "
+                f"{existing} live order(s) in the last {window_minutes} minute(s) "
+                f"+ 1 new would exceed max_live_orders_per_window {max_orders}"
+            )
+        records.append(
+            {
+                "client_order_id": normalized_client_order_id,
+                "state": "reserved",
+                "submitted_at": _as_utc(now).isoformat(timespec="seconds"),
+            }
+        )
+        _write_records(path, records[-_MAX_RETAINED_RECORDS:])
 
 
 def record_live_order_submission(
@@ -75,23 +170,42 @@ def record_live_order_submission(
     client_order_id: str,
     now: datetime.datetime,
 ) -> None:
-    records = _load_records(path)
     normalized_client_order_id = str(client_order_id)
-    if any(
-        str(record.get("client_order_id", "")) == normalized_client_order_id
-        for record in records
-    ):
-        return
-    records.append(
-        {
-            "client_order_id": normalized_client_order_id,
-            "submitted_at": _as_utc(now).isoformat(timespec="seconds"),
-        }
-    )
-    records = records[-_MAX_RETAINED_RECORDS:]
-    state_path = Path(path)
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(state_path, json.dumps({"submissions": records}, indent=2))
+    with _rate_limit_lock(path):
+        records = _load_records(path)
+        for record in records:
+            if str(record.get("client_order_id", "")) != normalized_client_order_id:
+                continue
+            # Preserve the original reservation timestamp, but turn the
+            # ambiguous pre-submit state into the legacy submitted form.
+            record.pop("state", None)
+            _write_records(path, records[-_MAX_RETAINED_RECORDS:])
+            return
+        records.append(
+            {
+                "client_order_id": normalized_client_order_id,
+                "submitted_at": _as_utc(now).isoformat(timespec="seconds"),
+            }
+        )
+        _write_records(path, records[-_MAX_RETAINED_RECORDS:])
+
+
+def release_live_order_reservation(path: str | Path, *, client_order_id: str) -> None:
+    """Release only an unresolved reservation after read-only absence proof."""
+
+    normalized_client_order_id = str(client_order_id)
+    with _rate_limit_lock(path):
+        records = _load_records(path)
+        retained = [
+            record
+            for record in records
+            if not (
+                str(record.get("client_order_id", "")) == normalized_client_order_id
+                and record.get("state") == "reserved"
+            )
+        ]
+        if len(retained) != len(records):
+            _write_records(path, retained)
 
 
 def evaluate_order_rate_limit(
@@ -101,9 +215,13 @@ def evaluate_order_rate_limit(
     window_minutes: int,
     max_orders: int,
     new_order_count: int,
+    exclude_client_order_id: str | None = None,
 ) -> list[str]:
     existing = count_live_submissions_in_window(
-        path, now=now, window_minutes=window_minutes
+        path,
+        now=now,
+        window_minutes=window_minutes,
+        exclude_client_order_id=exclude_client_order_id,
     )
     if existing + new_order_count > max_orders:
         return [

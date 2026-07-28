@@ -98,10 +98,20 @@ from tradingagents.brokers.supervisor.types import (
 from tradingagents.execution.authorized_normal_trade_intent import (
     AuthorizedNormalTradeIntent,
 )
-from tradingagents.execution.reconcile import ReconciliationResult
+from tradingagents.execution.reconcile import (
+    ReconciliationResult,
+    _claim_normal_live_submit_reconciliation,
+    _release_normal_live_submit_reconciliation,
+    _revalidate_normal_live_submit_reconciliation,
+)
 from tradingagents.policy.live_control import load_live_control_state
 from tradingagents.policy.live_gate import evaluate_go_live_guard
-from tradingagents.policy.order_rate_limit import record_live_order_submission
+from tradingagents.policy.order_rate_limit import (
+    record_live_order_submission,
+    release_live_order_reservation,
+    reserve_live_order_submission,
+)
+from tradingagents.policy.risk_envelope import load_risk_envelope
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 __all__ = [
@@ -173,6 +183,7 @@ class NormalLiveSubmitAdmission:
 
     intent_full_sha256: str
     issued_at: str
+    expires_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,7 +198,7 @@ class _NormalLiveAdmissionContext:
     live_account: dict[str, object]
     live_positions: tuple[dict[str, object], ...]
     decision_evidence: dict[str, object]
-    reconciliation_checked_client_order_ids: tuple[str, ...]
+    reconciliation: ReconciliationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +207,9 @@ class _NormalLiveAdmissionClaim:
 
     intent_full_sha256: str
     order_payload_sha256: str
+    issued_at: str
+    expires_at: str
+    reconciliation_claim: object
 
 
 _NORMAL_LIVE_ADMISSION_CAPABILITIES: dict[
@@ -220,6 +234,32 @@ def _normal_live_admission_moment() -> datetime.datetime:
     ):
         raise ValueError("normal live admission requires an aware whole-second clock")
     return current.astimezone(UTC)
+
+
+def _normal_live_admission_lease_time(value: str, *, label: str) -> datetime.datetime:
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"normal live admission {label} is invalid") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.microsecond
+    ):
+        raise ValueError(f"normal live admission {label} is invalid")
+    return parsed.astimezone(UTC)
+
+
+def _require_normal_live_admission_lease_current(
+    *, issued_at: str, expires_at: str
+) -> None:
+    issued = _normal_live_admission_lease_time(issued_at, label="issued_at")
+    expires = _normal_live_admission_lease_time(expires_at, label="expires_at")
+    if expires - issued != datetime.timedelta(seconds=_NORMAL_LIVE_ADMISSION_MAX_AGE_SECONDS):
+        raise ValueError("normal live admission lease is invalid")
+    current = _normal_live_admission_moment()
+    if current < issued or current >= expires:
+        raise ValueError("supervisor admission is stale")
 
 
 def _normal_live_admission_path(value: str | Path, *, label: str) -> Path:
@@ -292,6 +332,10 @@ def _issue_normal_live_submit_admission(
     admission = NormalLiveSubmitAdmission(
         intent_full_sha256=_normal_live_intent_sha256(intent),
         issued_at=issued_at.isoformat(timespec="seconds"),
+        expires_at=(
+            issued_at
+            + datetime.timedelta(seconds=_NORMAL_LIVE_ADMISSION_MAX_AGE_SECONDS)
+        ).isoformat(timespec="seconds"),
     )
     _NORMAL_LIVE_ADMISSION_CAPABILITIES[id(admission)] = (
         admission,
@@ -318,9 +362,7 @@ def _issue_normal_live_submit_admission(
             decision_evidence=_normal_live_admission_mapping(
                 decision_evidence, label="decision evidence"
             ),
-            reconciliation_checked_client_order_ids=tuple(
-                reconciliation.checked_client_order_ids
-            ),
+            reconciliation=reconciliation,
         ),
     )
     return admission
@@ -343,15 +385,22 @@ def _claim_normal_live_submit_admission(
         raise ValueError("supervisor admission does not bind the exact live intent")
     if context.promotion_state_path != promotion_state_path.resolve():
         raise ValueError("supervisor admission does not bind the active promotion state")
-    issued_at = datetime.datetime.fromisoformat(admission.issued_at)
-    current = _normal_live_admission_moment()
-    age = (current - issued_at).total_seconds()
-    if age < 0 or age > _NORMAL_LIVE_ADMISSION_MAX_AGE_SECONDS:
-        raise ValueError("supervisor admission is stale")
+    _require_normal_live_admission_lease_current(
+        issued_at=admission.issued_at, expires_at=admission.expires_at
+    )
     del _NORMAL_LIVE_ADMISSION_CAPABILITIES[id(admission)]
+    reconciliation_claim = _claim_normal_live_submit_reconciliation(
+        context.reconciliation,
+        intent=intent,
+        order_payload_sha256=order_payload_sha256,
+        claimed_at=_normal_live_admission_moment(),
+    )
     claim = _NormalLiveAdmissionClaim(
         intent_full_sha256=admission.intent_full_sha256,
         order_payload_sha256=order_payload_sha256,
+        issued_at=admission.issued_at,
+        expires_at=admission.expires_at,
+        reconciliation_claim=reconciliation_claim,
     )
     _NORMAL_LIVE_ADMISSION_CLAIMS[id(claim)] = (claim, context)
     return claim
@@ -379,6 +428,7 @@ def _revalidate_normal_live_submit_claim(
     *,
     payload: Mapping[str, str],
     sleeve: str,
+    rate_limit_exclude_client_order_id: str | None = None,
 ) -> None:
     if type(claim) is not _NormalLiveAdmissionClaim:
         raise ValueError("live submit requires a trusted supervisor admission claim")
@@ -386,6 +436,9 @@ def _revalidate_normal_live_submit_claim(
     if entry is None or entry[0] is not claim:
         raise ValueError("live submit supervisor admission claim is unavailable")
     context = entry[1]
+    _require_normal_live_admission_lease_current(
+        issued_at=claim.issued_at, expires_at=claim.expires_at
+    )
     digest = hashlib.sha256(
         json.dumps(
             dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -407,6 +460,7 @@ def _revalidate_normal_live_submit_claim(
         live_positions=context.live_positions,
         decision_evidence=context.decision_evidence,
         now=current,
+        rate_limit_exclude_client_order_id=rate_limit_exclude_client_order_id,
     )
     if issues:
         raise ValueError(
@@ -418,6 +472,95 @@ def _revalidate_normal_live_submit_claim(
     )
     if control_issues:
         raise ValueError("normal live submit live-control recheck rejected admission")
+
+
+def _revalidate_normal_live_submit_reconciliation_after_lookup(
+    claim: object,
+    *,
+    intent: AuthorizedNormalTradeIntent,
+    order_payload_sha256: str,
+    broker_order: Mapping | None,
+) -> None:
+    """Bind the policy's final read-only lookup to the issued reconciliation."""
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    _revalidate_normal_live_submit_reconciliation(
+        claim.reconciliation_claim,
+        intent=intent,
+        order_payload_sha256=order_payload_sha256,
+        broker_order=broker_order,
+        checked_at=_normal_live_admission_moment(),
+    )
+
+
+def _normal_live_submit_claim_control_path(claim: object) -> Path:
+    """Return the lock path bound to one trusted normal-live claim.
+
+    Lock order for the normal-live boundary is always promotion state, then
+    live control, then the rate ledger.  Control writers take only their
+    control lock, so they cannot deadlock a policy handoff that already owns
+    the promotion-state lock.
+    """
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    return entry[1].control_state_path
+
+
+def _normal_live_submit_claim_context(
+    claim: object,
+) -> _NormalLiveAdmissionContext:
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    return entry[1]
+
+
+def _reserve_normal_live_submit_claim(
+    claim: object,
+    *,
+    client_order_id: str,
+) -> None:
+    """Reserve rate capacity under the final control-held broker handoff."""
+
+    context = _normal_live_submit_claim_context(claim)
+    envelope, issues = load_risk_envelope(context.risk_envelope_path)
+    if (
+        issues
+        or envelope is None
+        or envelope.max_live_orders_per_window is None
+        or envelope.live_order_window_minutes is None
+    ):
+        raise ValueError("normal live submit rate reservation is unavailable")
+    reserve_live_order_submission(
+        context.order_rate_state_path,
+        client_order_id=client_order_id,
+        now=_normal_live_admission_moment(),
+        window_minutes=envelope.live_order_window_minutes,
+        max_orders=envelope.max_live_orders_per_window,
+    )
+
+
+def _release_normal_live_submit_claim_reservation(
+    claim: object,
+    *,
+    client_order_id: str,
+) -> None:
+    """Release only after an exact read-only retry proves the order absent."""
+
+    context = _normal_live_submit_claim_context(claim)
+    release_live_order_reservation(
+        context.order_rate_state_path, client_order_id=client_order_id
+    )
 
 
 def _record_normal_live_submit_claim(
@@ -435,6 +578,17 @@ def _record_normal_live_submit_claim(
         client_order_id=client_order_id,
         now=_normal_live_admission_moment(),
     )
+    _release_normal_live_submit_reconciliation(claim.reconciliation_claim)
+
+
+def _discard_normal_live_submit_claim(claim: object) -> None:
+    """Release a one-use claim after an error before its durable outcome."""
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        return
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.pop(id(claim), None)
+    if entry is not None and entry[0] is claim:
+        _release_normal_live_submit_reconciliation(claim.reconciliation_claim)
 
 
 def resolve_live_sleeve(
@@ -951,6 +1105,7 @@ def validate_supervisor_live_submit_allowed(
     live_positions: Sequence[Mapping] = (),
     decision_evidence: Mapping | None = None,
     now: datetime.datetime | None = None,
+    rate_limit_exclude_client_order_id: str | None = None,
 ) -> list[OrderIssue]:
     live_buying_power = None
     if isinstance(live_account, Mapping):
@@ -971,6 +1126,7 @@ def validate_supervisor_live_submit_allowed(
         live_positions=live_positions,
         decision_evidence=decision_evidence,
         now=now,
+        rate_limit_exclude_client_order_id=rate_limit_exclude_client_order_id,
     )
     return result.issues
 

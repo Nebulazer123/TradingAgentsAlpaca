@@ -28,7 +28,10 @@ from tradingagents.brokers.alpaca import (
     validate_live_management_action,
 )
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
-from tradingagents.execution.reconcile import ReconciliationResult
+from tradingagents.execution.reconcile import (
+    ReconciliationResult,
+    reconcile_normal_live_submit,
+)
 from tradingagents.policy import strategy_promotion_sync as promotion_sync_module
 from tradingagents.policy.promotion_sync import promotion_state_lock
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
@@ -674,6 +677,17 @@ def _normal_live_admission(
                 client_order_id=f"prior-live-order-{index}",
                 now=activated_at,
             )
+    if reconciliation is None:
+        reconciliation = reconcile_normal_live_submit(
+            intent=intent,
+            order_payload=_bound_normal_live_order(intent),
+            expected_positions={},
+            broker_positions=(),
+            expected_open_client_order_ids=set(),
+            broker_open_orders=(),
+            order_lookup=lambda _client_order_id: None,
+            checked_at=activated_at,
+        )
     return supervisor_module._issue_normal_live_submit_admission(
         intent,
         risk_envelope_path=risk_path.resolve(),
@@ -686,8 +700,7 @@ def _normal_live_admission(
         live_account={"buying_power": "500.00"},
         live_positions=(),
         decision_evidence={},
-        reconciliation=reconciliation
-        or ReconciliationResult(matched=True, issues=[], checked_client_order_ids=[]),
+        reconciliation=reconciliation,
     )
 
 
@@ -1039,6 +1052,100 @@ def test_live_client_refuses_unclean_reconciliation_before_request(tmp_path, mon
     assert client.session.requests == []
 
 
+def test_live_client_rejects_manual_empty_reconciliation_before_lookup_or_post(
+    tmp_path, monkeypatch
+):
+    """Break caught: public clean fields must not impersonate broker evidence."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+
+    with pytest.raises(ValueError, match="trusted.*reconciliation|reconciliation.*bound"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+                reconciliation=ReconciliationResult(
+                    matched=True, issues=[], checked_client_order_ids=[]
+                ),
+            ),
+        )
+
+    assert client.session.requests == []
+    assert client.session.post_calls == 0
+
+
+@pytest.mark.parametrize("binding_kind", ("stale", "tampered_client_order"))
+def test_live_client_rejects_stale_or_mismatched_bound_reconciliation_before_io(
+    tmp_path, monkeypatch, binding_kind
+):
+    """Bound evidence cannot be replayed for an old or different order."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+    if binding_kind == "stale":
+        reconciliation = reconcile_normal_live_submit(
+            intent=intent,
+            order_payload=_bound_normal_live_order(intent),
+            expected_positions={},
+            broker_positions=(),
+            expected_open_client_order_ids=set(),
+            broker_open_orders=(),
+            order_lookup=lambda _client_order_id: None,
+            checked_at=activated_at,
+        )
+    else:
+        reconciliation = reconcile_normal_live_submit(
+            intent=intent,
+            order_payload=_bound_normal_live_order(intent),
+            expected_positions={},
+            broker_positions=(),
+            expected_open_client_order_ids=set(),
+            broker_open_orders=(),
+            order_lookup=lambda _client_order_id: None,
+            checked_at=activated_at,
+        )
+        reconciliation.checked_client_order_ids[:] = ["other-client-order-id"]
+
+    admission = _normal_live_admission(
+        tmp_path,
+        monkeypatch,
+        root=root,
+        intent=intent,
+        receipt=receipt,
+        activated_at=activated_at,
+        reconciliation=reconciliation,
+    )
+    if binding_kind == "stale":
+        from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+        monkeypatch.setattr(
+            supervisor_module,
+            "_normal_live_admission_utc_now",
+            lambda: activated_at + datetime.timedelta(seconds=31),
+        )
+
+    with pytest.raises(ValueError, match="reconciliation.*(bound|exact order)"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert client.session.requests == []
+    assert client.session.post_calls == 0
+
+
 def test_live_client_consumes_each_supervisor_admission_once(tmp_path, monkeypatch):
     """Break caught: a successful artifact could be replayed for another POST."""
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
@@ -1162,6 +1269,68 @@ def test_live_client_rechecks_control_immediately_before_post(tmp_path, monkeypa
     assert session.post_calls == 0
 
 
+def test_cooperating_freeze_cannot_complete_between_final_gate_and_post(
+    tmp_path, monkeypatch
+):
+    """Break caught: freeze could finish after the last read but before POST."""
+    from tradingagents.policy.live_control import write_live_control_state
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    control_path = tmp_path / "normal-live-control.json"
+    freeze_started = threading.Event()
+    freeze_completed = threading.Event()
+    freeze_completed_before_post: list[bool] = []
+    worker: list[threading.Thread] = []
+
+    def freeze_writer() -> None:
+        freeze_started.set()
+        write_live_control_state(
+            control_path,
+            frozen=True,
+            reason="interleaved test freeze",
+            dead_man_expires_at=activated_at + datetime.timedelta(minutes=2),
+            now=activated_at,
+        )
+        freeze_completed.set()
+
+    class _FreezeInFinalGapSession(_FakeLiveSession):
+        def request(self, method, url, **kwargs):
+            if method == "POST":
+                thread = threading.Thread(target=freeze_writer)
+                worker.append(thread)
+                thread.start()
+                assert freeze_started.wait(timeout=1)
+                freeze_completed_before_post.append(
+                    freeze_completed.wait(timeout=0.05)
+                )
+            return super().request(method, url, **kwargs)
+
+    session = _FreezeInFinalGapSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+    response = client.submit_order(
+        _bound_normal_live_order(intent),
+        authorized_normal_trade_intent=intent,
+        activation_receipt=receipt,
+        supervisor_admission=_normal_live_admission(
+            tmp_path,
+            monkeypatch,
+            root=root,
+            intent=intent,
+            receipt=receipt,
+            activated_at=activated_at,
+        ),
+    )
+    worker[0].join(timeout=1)
+
+    assert response["client_order_id"] == intent.client_order_id
+    assert freeze_completed_before_post == [False]
+    assert freeze_completed.is_set()
+
+
 def test_stale_receipt_direct_policy_call_fails_before_lookup_or_post(
     tmp_path, monkeypatch
 ):
@@ -1263,6 +1432,61 @@ def test_policy_expiry_during_durable_prepare_prevents_broker_io(
                 tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
                 activated_at=activated_at,
             ),
+            lookup=lambda _client_order_id: callbacks.append("lookup"),
+            post=lambda _payload: callbacks.append("post"),
+        )
+
+    assert callbacks == []
+
+
+def test_supervisor_admission_expiry_during_durable_prepare_blocks_lookup_and_post(
+    tmp_path, monkeypatch
+):
+    """Break caught: a claimed 60-second gate lease could outlive slow local work."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(
+        promotion_sync_module,
+        "_normal_live_policy_utc_now",
+        lambda: activated_at,
+    )
+    supervisor_now = [activated_at]
+    admission = _normal_live_admission(
+        tmp_path,
+        monkeypatch,
+        root=root,
+        intent=intent,
+        receipt=receipt,
+        activated_at=activated_at,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_normal_live_admission_utc_now",
+        lambda: supervisor_now[0],
+    )
+    original_admit = ImmutableStrategyEvidenceStore.admit_checked
+
+    def expire_supervisor_lease(self, candidate, *, validate):
+        stored = original_admit(self, candidate, validate=validate)
+        if candidate.kind == NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND:
+            supervisor_now[0] = activated_at + datetime.timedelta(seconds=61)
+        return stored
+
+    monkeypatch.setattr(
+        ImmutableStrategyEvidenceStore, "admit_checked", expire_supervisor_lease
+    )
+    callbacks: list[str] = []
+
+    with pytest.raises(ValueError, match="supervisor admission is stale"):
+        promotion_sync_module.execute_normal_live_broker_submit(
+            intent,
+            receipt,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            supervisor_admission=admission,
             lookup=lambda _client_order_id: callbacks.append("lookup"),
             post=lambda _payload: callbacks.append("post"),
         )
@@ -1391,7 +1615,7 @@ def test_live_client_blocks_mismatched_real_retry_lookup_without_post(tmp_path, 
     order = _bound_normal_live_order(intent)
     client.session.add_existing_order({**order, "symbol": "AAPL"})
 
-    with pytest.raises(ValueError, match="does not match authorized intent"):
+    with pytest.raises(ValueError, match="does not match.*intent"):
         client.submit_order(
             order,
             authorized_normal_trade_intent=intent,
@@ -1476,6 +1700,112 @@ def test_fresh_live_client_after_uncertain_post_only_performs_lookup(tmp_path, m
     assert failed_session.post_calls == 1
     assert retry_session.post_calls == 0
     assert [request[0] for request in retry_session.requests] == ["GET"]
+
+
+def test_unresolved_accepted_post_reservation_blocks_new_cap_until_reconciliation(
+    tmp_path, monkeypatch
+):
+    """Break caught: crash after broker acceptance could evade the rolling cap."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    (tmp_path / "first").mkdir()
+    (tmp_path / "second").mkdir()
+    first_root, first_repo, first_intent, first_receipt, activated_at = (
+        _real_normal_live_activation(tmp_path / "first", monkeypatch)
+    )
+    second_root, second_repo, second_intent, second_receipt, _ = (
+        _real_normal_live_activation(tmp_path / "second", monkeypatch)
+    )
+    first_session = _FakeLiveSession()
+    first_client = _fake_live_client(
+        first_root,
+        repo_root=first_repo,
+        session=first_session,
+        clock=lambda: activated_at,
+    )
+    original_record = supervisor_module._record_normal_live_submit_claim
+
+    def crash_before_rate_record(*_args, **_kwargs):
+        raise SystemExit("crash-before-rate-record")
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "_record_normal_live_submit_claim",
+        crash_before_rate_record,
+    )
+    with pytest.raises(SystemExit, match="crash-before-rate-record"):
+        first_client.submit_order(
+            _bound_normal_live_order(first_intent),
+            authorized_normal_trade_intent=first_intent,
+            activation_receipt=first_receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=first_root,
+                intent=first_intent,
+                receipt=first_receipt,
+                activated_at=activated_at,
+                max_live_orders_per_window=1,
+            ),
+        )
+
+    rate_state = json.loads(
+        (tmp_path / "normal-live-rate.json").read_text(encoding="utf-8")
+    )
+    assert rate_state["submissions"] == [
+        {
+            "client_order_id": first_intent.client_order_id,
+            "state": "reserved",
+            "submitted_at": activated_at.isoformat(timespec="seconds"),
+        }
+    ]
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "_record_normal_live_submit_claim",
+        original_record,
+    )
+    replay = first_client.submit_order(
+        _bound_normal_live_order(first_intent),
+        authorized_normal_trade_intent=first_intent,
+        activation_receipt=first_receipt,
+        supervisor_admission=_normal_live_admission(
+            tmp_path,
+            monkeypatch,
+            root=first_root,
+            intent=first_intent,
+            receipt=first_receipt,
+            activated_at=activated_at,
+            max_live_orders_per_window=1,
+        ),
+    )
+    assert replay["client_order_id"] == first_intent.client_order_id
+    assert first_session.post_calls == 1
+
+    second_session = _FakeLiveSession()
+    second_client = _fake_live_client(
+        second_root,
+        repo_root=second_repo,
+        session=second_session,
+        clock=lambda: activated_at,
+    )
+    with pytest.raises(ValueError, match="final gates rejected"):
+        second_client.submit_order(
+            _bound_normal_live_order(second_intent),
+            authorized_normal_trade_intent=second_intent,
+            activation_receipt=second_receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=second_root,
+                intent=second_intent,
+                receipt=second_receipt,
+                activated_at=activated_at,
+                max_live_orders_per_window=1,
+            ),
+        )
+
+    assert second_session.requests == []
 
 
 def test_live_client_rejects_different_receipt_for_consumed_logical_order_before_lookup(
