@@ -1694,6 +1694,180 @@ def _valid_promotion_phase_packet(
     )
 
 
+def _valid_immutable_strategy_promotion_sleeve_record(
+    record: Mapping[str, Any],
+) -> bool:
+    """Validate the inert 6D immutable-evidence sleeve shape exactly."""
+    source = record.get("source")
+    metrics = record.get("metrics")
+    evidence = record.get("evidence_metrics")
+    if not isinstance(source, Mapping) or not isinstance(metrics, Mapping) or not isinstance(evidence, Mapping):
+        return False
+    source_keys = {
+        "kind", "proposal_id", "proposal_sha256", "registration_id",
+        "promotion_evidence_id", "promotion_evidence_sha256",
+        "shadow_attestation_id", "shadow_attestation_sha256",
+        "validation_attestation_sha256", "risk_attestation_sha256",
+        "genome_id", "genome_canonical_sha256", "evaluation_code_commit",
+        "evaluation_runtime_sha256", "promotion_runtime_commit",
+        "risk_budget_mode", "account_hard_ceiling_usd",
+        "new_sleeve_auto_promote", "proposal_effective_at",
+        "proposal_recorded_at", "proposal_expires_at",
+    }
+    metric_keys = {
+        "benchmark_excess_return", "cost_adjusted_alpha", "recent_alpha",
+        "capacity_usd", "requested_tiny_live_tranche_usd",
+    }
+    evidence_decimal_keys = {
+        "pooled_net_return_fraction", "pooled_benchmark_return_fraction",
+        "pooled_benchmark_excess_fraction", "latest_window_net_return_fraction",
+        "latest_window_benchmark_excess_fraction", "worst_max_drawdown_fraction",
+    }
+    evidence_count_keys = {
+        "total_tracked_sessions", "total_closed_trades",
+        "shadow_tracked_sessions", "shadow_reconciled_buy_intents",
+    }
+    effective = _parse_aware_recovery_time(source.get("proposal_effective_at"))
+    recorded = _parse_aware_recovery_time(source.get("proposal_recorded_at"))
+    expires = _parse_aware_recovery_time(source.get("proposal_expires_at"))
+    transition_at = _parse_aware_recovery_time(
+        record.get(
+            "eligible_at"
+            if record.get("stage") == "tiny_live_eligible"
+            else "ineligible_at"
+        )
+    )
+    if (
+        set(source) != source_keys
+        or set(metrics) != metric_keys
+        or set(evidence) != evidence_decimal_keys | evidence_count_keys
+        or source.get("kind") != "immutable_strategy_evidence"
+        or record.get("live_enabled") is not False
+        or source.get("risk_budget_mode") not in {"fixed_tranche", "autonomous_with_caps"}
+        or type(source.get("new_sleeve_auto_promote")) is not bool
+        or source.get("account_hard_ceiling_usd") is not None
+        and _finite_recovery_decimal(source.get("account_hard_ceiling_usd"), positive=True) is None
+        or effective is None
+        or recorded is None
+        or expires is None
+        or transition_at is None
+        or not effective <= recorded < expires
+        or not recorded <= transition_at < expires
+        or any(_finite_recovery_decimal(metrics.get(name)) is None for name in metric_keys)
+        or any(_finite_recovery_decimal(evidence.get(name)) is None for name in evidence_decimal_keys)
+        or any(type(evidence.get(name)) is not int or evidence.get(name) < 0 for name in evidence_count_keys)
+    ):
+        return False
+    digest_keys = {
+        "proposal_sha256", "promotion_evidence_sha256",
+        "shadow_attestation_sha256", "validation_attestation_sha256",
+        "risk_attestation_sha256", "genome_canonical_sha256",
+        "evaluation_runtime_sha256",
+    }
+    if any(not _valid_recovery_digest(source.get(name)) for name in digest_keys):
+        return False
+    object_bindings = (
+        ("proposal_id", "strategy-promotion-proposal-", "proposal_sha256"),
+        ("registration_id", "evaluation-registration-", None),
+        ("promotion_evidence_id", "promotion-evidence-", "promotion_evidence_sha256"),
+        ("shadow_attestation_id", "paper-shadow-attestation-", "shadow_attestation_sha256"),
+    )
+    if any(
+        type(source.get(name)) is not str
+        or not source[name].startswith(prefix)
+        or not _valid_recovery_digest(source[name].removeprefix(prefix))
+        for name, prefix, _digest_name in object_bindings
+    ) or (
+        not _nonempty_recovery_string(source.get("genome_id"))
+        or not str(source["genome_id"]).startswith("genome-")
+        or not isinstance(source.get("evaluation_code_commit"), str)
+        or not isinstance(source.get("promotion_runtime_commit"), str)
+        or re.fullmatch(r"[0-9a-f]{40}", source["evaluation_code_commit"]) is None
+        or re.fullmatch(r"[0-9a-f]{40}", source["promotion_runtime_commit"]) is None
+    ):
+        return False
+    benchmark_excess_return = _finite_recovery_decimal(
+        metrics.get("benchmark_excess_return")
+    )
+    cost_adjusted_alpha = _finite_recovery_decimal(
+        metrics.get("cost_adjusted_alpha")
+    )
+    recent_alpha = _finite_recovery_decimal(metrics.get("recent_alpha"))
+    pooled_benchmark_excess = _finite_recovery_decimal(
+        evidence.get("pooled_benchmark_excess_fraction")
+    )
+    latest_window_benchmark_excess = _finite_recovery_decimal(
+        evidence.get("latest_window_benchmark_excess_fraction")
+    )
+    capacity_usd = _finite_recovery_decimal(metrics.get("capacity_usd"))
+    requested_tranche_usd = _finite_recovery_decimal(
+        metrics.get("requested_tiny_live_tranche_usd")
+    )
+    capacity_gate_passed = record.get("capacity_gate_passed")
+    if (
+        not all(
+            record.get(name) is True
+            for name in (
+                "preregistered",
+                "benchmark_gate_passed",
+                "cost_gate_passed",
+                "recent_alpha_gate_passed",
+            )
+        )
+        or benchmark_excess_return != pooled_benchmark_excess
+        or cost_adjusted_alpha != pooled_benchmark_excess
+        or recent_alpha != latest_window_benchmark_excess
+        or capacity_gate_passed is not (capacity_usd >= requested_tranche_usd)
+    ):
+        return False
+    raw_shadow = record.get("shadow_sessions_sufficient")
+    raw_reconciliation = record.get("reconciliation_confirmed")
+    gate_projection = (
+        ("ci_green", record.get("ci_green")),
+        ("shadow_sessions_sufficient", raw_shadow),
+        ("reconciliation_confirmed", raw_reconciliation),
+        ("capacity_gate_passed", capacity_gate_passed),
+        (
+            "risk_budget_mode_capped",
+            source.get("risk_budget_mode")
+            in {"fixed_tranche", "autonomous_with_caps"},
+        ),
+        (
+            "risk_auto_promotion_allowed",
+            source.get("new_sleeve_auto_promote"),
+        ),
+    )
+    expected_issues = [
+        (
+            "risk_budget_mode_not_capped"
+            if name == "risk_budget_mode_capped"
+            else "risk_auto_promotion_disabled"
+            if name == "risk_auto_promotion_allowed"
+            else name
+        )
+        for name, passed in gate_projection
+        if passed is False
+    ]
+    return (
+        type(raw_shadow) is bool
+        and type(raw_reconciliation) is bool
+        and record.get("shadow_confirmed") is (raw_shadow and raw_reconciliation)
+        and source["proposal_id"].startswith("strategy-promotion-proposal-")
+        and _valid_recovery_digest(
+            source["proposal_id"].removeprefix("strategy-promotion-proposal-")
+        )
+        and record.get("issues") == expected_issues
+        and (
+            record.get("stage") != "paper_only"
+            or not all(passed for _name, passed in gate_projection)
+        )
+        and (
+            record.get("stage") != "tiny_live_eligible"
+            or source.get("new_sleeve_auto_promote") is True
+        )
+    )
+
+
 def _valid_promotion_sleeve_record(
     record: Mapping[str, Any], *, symbol: str
 ) -> bool:
@@ -1729,11 +1903,17 @@ def _valid_promotion_sleeve_record(
         or issues not in (None, [])
     ):
         return False
+    source = record.get("source")
+    if isinstance(source, Mapping) and source.get("kind") == "immutable_strategy_evidence":
+        timestamp = record.get("eligible_at" if stage == "tiny_live_eligible" else "ineligible_at")
+        opposite = record.get("ineligible_at" if stage == "tiny_live_eligible" else "eligible_at")
+        if _parse_aware_recovery_time(timestamp) is None or opposite is not None:
+            return False
+        return _valid_immutable_strategy_promotion_sleeve_record(record)
     for timestamp_name in ("promoted_at", "demoted_at"):
         timestamp = record.get(timestamp_name)
         if timestamp is not None and _parse_aware_recovery_time(timestamp) is None:
             return False
-    source = record.get("source")
     if source is not None and (
         not isinstance(source, Mapping)
         or source.get("kind") != "paper_tournament"
@@ -2577,6 +2757,32 @@ def build_production_recovery_request(
             dict[str, str],
             dict[str, Any],
         ]:
+            # A legacy tournament transaction must never accept or replace an
+            # immutable-strategy state.  Read and classify the canonical bytes
+            # under the existing state lock so an old prepare cannot resume over
+            # newer immutable provenance.
+            with promotion_state_lock(canonical_state):
+                canonical_preimage = canonical_state.read_bytes()
+                canonical_preimage_sha256 = hashlib.sha256(
+                    canonical_preimage
+                ).hexdigest()
+                canonical_payload = json.loads(canonical_preimage)
+                canonical_source = (
+                    canonical_payload.get("source")
+                    if isinstance(canonical_payload, Mapping)
+                    else None
+                )
+                if (
+                    isinstance(canonical_source, Mapping)
+                    and canonical_source.get("kind")
+                    == "immutable_strategy_evidence_sync"
+                ):
+                    # Keep the captured digest local to this critical section:
+                    # the refusal is tied to exactly the bytes inspected.
+                    _ = canonical_preimage_sha256
+                    raise ValueError(
+                        "immutable strategy promotion requires proposal-aware recovery"
+                    )
             if prepare_path.exists():
                 prepare = json.loads(prepare_path.read_text(encoding="utf-8"))
                 record = _phase_record(prepare_path)

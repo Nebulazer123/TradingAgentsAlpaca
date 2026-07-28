@@ -4204,3 +4204,323 @@ def test_hourly_board_review_without_symbol_uses_canonical_evidence_and_complete
         command_runner=runner,
     )
     assert conflict["ready"] is False
+
+
+def test_immutable_strategy_promotion_sleeve_record_is_accepted() -> None:
+    digest = "a" * 64
+    record = {
+        "stage": "tiny_live_eligible",
+        "live_enabled": False,
+        "preregistered": True,
+        "ci_green": True,
+        "shadow_sessions_sufficient": True,
+        "reconciliation_confirmed": True,
+        "shadow_confirmed": True,
+        "benchmark_gate_passed": True,
+        "cost_gate_passed": True,
+        "recent_alpha_gate_passed": True,
+        "capacity_gate_passed": True,
+        "validation_report_ref": "artifacts/validation.json",
+        "risk_envelope_ref": "config/risk_envelope.yaml",
+        "eligible_at": "2026-07-28T12:00:00+00:00",
+        "metrics": {
+            "benchmark_excess_return": "0.01",
+            "cost_adjusted_alpha": "0.01",
+            "recent_alpha": "0.01",
+            "capacity_usd": "300",
+            "requested_tiny_live_tranche_usd": "100",
+        },
+        "source": {
+            "kind": "immutable_strategy_evidence",
+            "proposal_id": "strategy-promotion-proposal-" + digest,
+            "proposal_sha256": digest,
+            "registration_id": "evaluation-registration-" + digest,
+            "promotion_evidence_id": "promotion-evidence-" + digest,
+            "promotion_evidence_sha256": digest,
+            "shadow_attestation_id": "paper-shadow-attestation-" + digest,
+            "shadow_attestation_sha256": digest,
+            "validation_attestation_sha256": digest,
+            "risk_attestation_sha256": digest,
+            "genome_id": "genome-current-aggressive-" + "b" * 32,
+            "genome_canonical_sha256": digest,
+            "evaluation_code_commit": "c" * 40,
+            "evaluation_runtime_sha256": digest,
+            "promotion_runtime_commit": "d" * 40,
+            "risk_budget_mode": "fixed_tranche",
+            "account_hard_ceiling_usd": None,
+            "new_sleeve_auto_promote": True,
+            "proposal_effective_at": "2026-07-28T11:59:00+00:00",
+            "proposal_recorded_at": "2026-07-28T12:00:00+00:00",
+            "proposal_expires_at": "2026-07-28T12:05:00+00:00",
+        },
+        "evidence_metrics": {
+            "pooled_net_return_fraction": "0.02",
+            "pooled_benchmark_return_fraction": "0.01",
+            "pooled_benchmark_excess_fraction": "0.01",
+            "latest_window_net_return_fraction": "0.01",
+            "latest_window_benchmark_excess_fraction": "0.01",
+            "worst_max_drawdown_fraction": "-0.05",
+            "total_tracked_sessions": 10,
+            "total_closed_trades": 2,
+            "shadow_tracked_sessions": 6,
+            "shadow_reconciled_buy_intents": 1,
+        },
+        "issues": [],
+    }
+    assert self_heal_module._valid_promotion_sleeve_record(
+        record, symbol="NFLX"
+    )
+
+    # These are direct, fully-shaped corruption checks.  A recovery adapter
+    # must reject them before treating a tiny eligibility record as safe.
+    corruptions = (
+        ("live_enabled", True),
+        ("source.proposal_id", "strategy-promotion-proposal-" + "B" * 64),
+        ("source.promotion_evidence_id", "promotion-evidence-" + "B" * 64),
+        ("source.shadow_attestation_id", "paper-shadow-attestation-" + "B" * 64),
+        ("source.evaluation_code_commit", "C" * 40),
+        ("source.promotion_runtime_commit", "D" * 40),
+        ("source.proposal_recorded_at", "2026-07-28T11:58:59+00:00"),
+        ("source.proposal_expires_at", "2026-07-28T12:00:00+00:00"),
+    )
+    for dotted_name, corrupted_value in corruptions:
+        candidate = json.loads(json.dumps(record))
+        target = candidate
+        *parents, leaf = dotted_name.split(".")
+        for parent in parents:
+            target = target[parent]
+        target[leaf] = corrupted_value
+        assert not self_heal_module._valid_promotion_sleeve_record(
+            candidate, symbol="NFLX"
+        ), dotted_name
+
+
+def test_immutable_strategy_promotion_sleeve_record_rejects_unbound_projections() -> None:
+    """Catch a recovery validator that accepts altered evidence projections."""
+    digest = "a" * 64
+    record = {
+        "stage": "tiny_live_eligible",
+        "live_enabled": False,
+        "preregistered": True,
+        "ci_green": True,
+        "shadow_sessions_sufficient": True,
+        "reconciliation_confirmed": True,
+        "shadow_confirmed": True,
+        "benchmark_gate_passed": True,
+        "cost_gate_passed": True,
+        "recent_alpha_gate_passed": True,
+        "capacity_gate_passed": True,
+        "validation_report_ref": "artifacts/validation.json",
+        "risk_envelope_ref": "config/risk_envelope.yaml",
+        "eligible_at": "2026-07-28T12:00:00+00:00",
+        "metrics": {
+            "benchmark_excess_return": "0.01",
+            "cost_adjusted_alpha": "0.01",
+            "recent_alpha": "0.01",
+            "capacity_usd": "300",
+            "requested_tiny_live_tranche_usd": "100",
+        },
+        "source": {
+            "kind": "immutable_strategy_evidence",
+            "proposal_id": "strategy-promotion-proposal-" + digest,
+            "proposal_sha256": digest,
+            "registration_id": "evaluation-registration-" + digest,
+            "promotion_evidence_id": "promotion-evidence-" + digest,
+            "promotion_evidence_sha256": digest,
+            "shadow_attestation_id": "paper-shadow-attestation-" + digest,
+            "shadow_attestation_sha256": digest,
+            "validation_attestation_sha256": digest,
+            "risk_attestation_sha256": digest,
+            "genome_id": "genome-current-aggressive-" + "b" * 32,
+            "genome_canonical_sha256": digest,
+            "evaluation_code_commit": "c" * 40,
+            "evaluation_runtime_sha256": digest,
+            "promotion_runtime_commit": "d" * 40,
+            "risk_budget_mode": "fixed_tranche",
+            "account_hard_ceiling_usd": None,
+            "new_sleeve_auto_promote": True,
+            "proposal_effective_at": "2026-07-28T11:59:00+00:00",
+            "proposal_recorded_at": "2026-07-28T12:00:00+00:00",
+            "proposal_expires_at": "2026-07-28T12:05:00+00:00",
+        },
+        "evidence_metrics": {
+            "pooled_net_return_fraction": "0.02",
+            "pooled_benchmark_return_fraction": "0.01",
+            "pooled_benchmark_excess_fraction": "0.01",
+            "latest_window_net_return_fraction": "0.01",
+            "latest_window_benchmark_excess_fraction": "0.01",
+            "worst_max_drawdown_fraction": "-0.05",
+            "total_tracked_sessions": 10,
+            "total_closed_trades": 2,
+            "shadow_tracked_sessions": 6,
+            "shadow_reconciled_buy_intents": 1,
+        },
+        "issues": [],
+    }
+    assert self_heal_module._valid_promotion_sleeve_record(record, symbol="NFLX")
+
+    corruptions = (
+        ("metrics.benchmark_excess_return", "0.02"),
+        ("metrics.cost_adjusted_alpha", "0.02"),
+        ("metrics.recent_alpha", "0.02"),
+        ("evidence_metrics.pooled_benchmark_excess_fraction", "0.02"),
+        ("evidence_metrics.latest_window_benchmark_excess_fraction", "0.02"),
+        ("metrics.capacity_usd", "99"),
+        ("capacity_gate_passed", False),
+    )
+    for dotted_name, corrupted_value in corruptions:
+        candidate = json.loads(json.dumps(record))
+        target = candidate
+        *parents, leaf = dotted_name.split(".")
+        for parent in parents:
+            target = target[parent]
+        target[leaf] = corrupted_value
+        assert not self_heal_module._valid_promotion_sleeve_record(
+            candidate, symbol="NFLX"
+        ), dotted_name
+
+
+def test_immutable_strategy_promotion_paper_record_rejects_structural_gate_failures() -> None:
+    """Catch paper-only records that pretend immutable evidence was incomplete."""
+    digest = "a" * 64
+    record = {
+        "stage": "paper_only",
+        "live_enabled": False,
+        "preregistered": True,
+        "ci_green": True,
+        "shadow_sessions_sufficient": False,
+        "reconciliation_confirmed": True,
+        "shadow_confirmed": False,
+        "benchmark_gate_passed": True,
+        "cost_gate_passed": True,
+        "recent_alpha_gate_passed": True,
+        "capacity_gate_passed": True,
+        "validation_report_ref": "artifacts/validation.json",
+        "risk_envelope_ref": "config/risk_envelope.yaml",
+        "ineligible_at": "2026-07-28T12:00:00+00:00",
+        "metrics": {
+            "benchmark_excess_return": "0.01",
+            "cost_adjusted_alpha": "0.01",
+            "recent_alpha": "0.01",
+            "capacity_usd": "300",
+            "requested_tiny_live_tranche_usd": "100",
+        },
+        "source": {
+            "kind": "immutable_strategy_evidence",
+            "proposal_id": "strategy-promotion-proposal-" + digest,
+            "proposal_sha256": digest,
+            "registration_id": "evaluation-registration-" + digest,
+            "promotion_evidence_id": "promotion-evidence-" + digest,
+            "promotion_evidence_sha256": digest,
+            "shadow_attestation_id": "paper-shadow-attestation-" + digest,
+            "shadow_attestation_sha256": digest,
+            "validation_attestation_sha256": digest,
+            "risk_attestation_sha256": digest,
+            "genome_id": "genome-current-aggressive-" + "b" * 32,
+            "genome_canonical_sha256": digest,
+            "evaluation_code_commit": "c" * 40,
+            "evaluation_runtime_sha256": digest,
+            "promotion_runtime_commit": "d" * 40,
+            "risk_budget_mode": "fixed_tranche",
+            "account_hard_ceiling_usd": None,
+            "new_sleeve_auto_promote": True,
+            "proposal_effective_at": "2026-07-28T11:59:00+00:00",
+            "proposal_recorded_at": "2026-07-28T12:00:00+00:00",
+            "proposal_expires_at": "2026-07-28T12:05:00+00:00",
+        },
+        "evidence_metrics": {
+            "pooled_net_return_fraction": "0.02",
+            "pooled_benchmark_return_fraction": "0.01",
+            "pooled_benchmark_excess_fraction": "0.01",
+            "latest_window_net_return_fraction": "0.01",
+            "latest_window_benchmark_excess_fraction": "0.01",
+            "worst_max_drawdown_fraction": "-0.05",
+            "total_tracked_sessions": 10,
+            "total_closed_trades": 2,
+            "shadow_tracked_sessions": 6,
+            "shadow_reconciled_buy_intents": 1,
+        },
+        "issues": ["shadow_sessions_sufficient"],
+    }
+    assert self_heal_module._valid_promotion_sleeve_record(record, symbol="NFLX")
+
+    for gate in (
+        "preregistered",
+        "benchmark_gate_passed",
+        "cost_gate_passed",
+        "recent_alpha_gate_passed",
+    ):
+        candidate = json.loads(json.dumps(record))
+        candidate[gate] = False
+        assert not self_heal_module._valid_promotion_sleeve_record(
+            candidate, symbol="NFLX"
+        ), gate
+
+
+def test_legacy_recovery_refuses_immutable_strategy_canonical_preimage(
+    tmp_path,
+) -> None:
+    request, state_path, _invocations, _broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    canonical = json.loads(state_path.read_text(encoding="utf-8"))
+    canonical["source"] = {"kind": "immutable_strategy_evidence_sync"}
+    state_path.write_text(json.dumps(canonical), encoding="utf-8")
+    immutable_preimage = state_path.read_bytes()
+
+    result = coordinate_verified_recovery(
+        **{key: value for key, value in request.items() if key != "ready"},
+        control_path=_control(tmp_path / "immutable-source-control"),
+        receipt_dir=tmp_path / "immutable-source-receipts",
+        recovery_root=tmp_path / "immutable-source-recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "frozen"
+    assert (
+        "immutable strategy promotion requires proposal-aware recovery"
+        in result["failure"]["detail"]
+    )
+    assert state_path.read_bytes() == immutable_preimage
+
+
+def test_legacy_prepared_transaction_cannot_resume_over_immutable_strategy_state(
+    tmp_path,
+) -> None:
+    request, state_path, invocations, _broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    coordinator_args = {key: value for key, value in request.items() if key != "ready"}
+    recovery_root = tmp_path / "prepared-immutable-recovery"
+
+    def crash_after_prepare(event) -> None:
+        if event["boundary"] == "after_promotion_prepare_fsync":
+            raise SystemExit("prepared tournament transaction")
+
+    with pytest.raises(SystemExit, match="prepared tournament transaction"):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path / "prepared-immutable-control"),
+            receipt_dir=tmp_path / "prepared-immutable-receipts",
+            recovery_root=recovery_root,
+            now=NOW,
+            fault_hook=crash_after_prepare,
+        )
+
+    canonical = json.loads(state_path.read_text(encoding="utf-8"))
+    canonical["source"] = {"kind": "immutable_strategy_evidence_sync"}
+    state_path.write_text(json.dumps(canonical), encoding="utf-8")
+    immutable_preimage = state_path.read_bytes()
+    resumed = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path / "prepared-immutable-control"),
+        receipt_dir=tmp_path / "prepared-immutable-receipts",
+        recovery_root=recovery_root,
+        now=NOW,
+    )
+
+    assert resumed["status"] == "frozen"
+    assert resumed["phase"] == "sync_promotion"
+    assert "immutable strategy promotion requires proposal-aware recovery" in resumed["failure"]["detail"]
+    assert state_path.read_bytes() == immutable_preimage
+    assert sum("sync-promotion" in argv for argv in invocations) == 0

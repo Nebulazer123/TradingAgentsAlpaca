@@ -23,6 +23,9 @@ STAGED_PAPER_INTENT_KIND = "staged-paper-intent"
 PAPER_EXECUTION_AUTHORIZATION_KIND = "paper-execution-authorization"
 PAPER_SHADOW_OBSERVATION_KIND = "paper-shadow-observation"
 PAPER_SHADOW_ATTESTATION_KIND = "paper-shadow-attestation"
+STRATEGY_PROMOTION_PROPOSAL_KIND = "strategy-promotion-proposal"
+STRATEGY_PROMOTION_SYNC_PREPARE_KIND = "strategy-promotion-sync-prepare"
+STRATEGY_PROMOTION_SYNC_RECEIPT_KIND = "strategy-promotion-sync-receipt"
 
 _UTC = dt.timezone.utc
 _ZERO_HASH = "0" * 64
@@ -38,6 +41,9 @@ _ALLOWED_KINDS = frozenset(
         PAPER_EXECUTION_AUTHORIZATION_KIND,
         PAPER_SHADOW_OBSERVATION_KIND,
         PAPER_SHADOW_ATTESTATION_KIND,
+        STRATEGY_PROMOTION_PROPOSAL_KIND,
+        STRATEGY_PROMOTION_SYNC_PREPARE_KIND,
+        STRATEGY_PROMOTION_SYNC_RECEIPT_KIND,
     }
 )
 _STAGED_POINTER_NAME = re.compile(
