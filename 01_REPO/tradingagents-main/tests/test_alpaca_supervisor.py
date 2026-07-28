@@ -118,6 +118,7 @@ def test_supervisor_forwards_the_identical_normal_intent_receipt_and_admission_t
     monkeypatch,
 ):
     from tests.test_alpaca_execution import _normal_live_intent
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
 
     intent = _normal_live_intent()
     receipt = NormalLiveActivationReceipt(
@@ -150,6 +151,21 @@ def test_supervisor_forwards_the_identical_normal_intent_receipt_and_admission_t
         return {"id": "live-order"}
 
     monkeypatch.setattr(AlpacaRestClient, "submit_order", capture_submit)
+    sentinel_admission = supervisor_module.NormalLiveSubmitAdmission(
+        intent_full_sha256="a" * 64,
+        issued_at="2026-07-28T12:00:00+00:00",
+        expires_at="2026-07-28T12:01:00+00:00",
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_issue_normal_live_submit_risk_metrics",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_issue_normal_live_submit_admission",
+        lambda *_args, **_kwargs: sentinel_admission,
+    )
 
     assert submit_authorized_normal_live_order(
         live_client=live_client,
@@ -159,8 +175,6 @@ def test_supervisor_forwards_the_identical_normal_intent_receipt_and_admission_t
         promotion_state_path=(tmp_path / "promotion.json").resolve(),
         control_state_path=(tmp_path / "control.json").resolve(),
         order_rate_state_path=(tmp_path / "rate.json").resolve(),
-        current_daily_loss_usd=Decimal("0.00"),
-        current_drawdown_pct=Decimal("0.00"),
         decision_evidence={},
     ) == {"id": "live-order"}
     order, kwargs = call
@@ -213,9 +227,7 @@ def test_supervisor_rejects_an_arbitrary_live_writer_before_issuing_admission(tm
             promotion_state_path=(tmp_path / "promotion.json").resolve(),
             control_state_path=(tmp_path / "control.json").resolve(),
             order_rate_state_path=(tmp_path / "rate.json").resolve(),
-            current_daily_loss_usd=Decimal("0.00"),
-            current_drawdown_pct=Decimal("0.00"),
-            decision_evidence={},
+        decision_evidence={},
         )
 
     assert writer.called is False

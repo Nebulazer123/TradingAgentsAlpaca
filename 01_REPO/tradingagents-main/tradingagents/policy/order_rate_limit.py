@@ -20,6 +20,16 @@ from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
 
+
+class LiveOrderRateLedgerError(ValueError):
+    """The durable live-order rate ledger is unavailable or corrupt.
+
+    A missing ledger is the sole safe initialization condition.  Any existing
+    ledger that cannot be proved complete is retained untouched and blocks the
+    submission path rather than silently reopening order capacity.
+    """
+
+
 def _rate_lock_path(path: str | Path) -> Path:
     state_path = Path(path)
     return state_path.with_name(f".{state_path.name}.rate.lock")
@@ -46,17 +56,37 @@ def _as_utc(value: datetime.datetime) -> datetime.datetime:
     return value.astimezone(UTC)
 
 
-def _parse_ts(value: str) -> datetime.datetime | None:
-    raw = str(value or "").strip()
+def _parse_ts(value: object, *, label: str) -> datetime.datetime:
+    if type(value) is not str:
+        raise LiveOrderRateLedgerError(f"live order rate ledger {label} is invalid")
+    raw = value.strip()
     if not raw:
-        return None
+        raise LiveOrderRateLedgerError(f"live order rate ledger {label} is invalid")
     if raw.endswith("Z"):
         raw = f"{raw[:-1]}+00:00"
     try:
         parsed = datetime.datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    return _as_utc(parsed)
+    except ValueError as exc:
+        raise LiveOrderRateLedgerError(
+            f"live order rate ledger {label} is invalid"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.microsecond:
+        raise LiveOrderRateLedgerError(f"live order rate ledger {label} is invalid")
+    return parsed.astimezone(UTC)
+
+
+def _validate_record(record: object) -> dict[str, Any]:
+    if type(record) is not dict:
+        raise LiveOrderRateLedgerError("live order rate ledger record is invalid")
+    allowed = {"client_order_id", "state", "submitted_at"}
+    if set(record) - allowed or {"client_order_id", "submitted_at"} - set(record):
+        raise LiveOrderRateLedgerError("live order rate ledger record is invalid")
+    if type(record["client_order_id"]) is not str or not record["client_order_id"]:
+        raise LiveOrderRateLedgerError("live order rate ledger record is invalid")
+    if "state" in record and record["state"] != "reserved":
+        raise LiveOrderRateLedgerError("live order rate ledger record is invalid")
+    _parse_ts(record["submitted_at"], label="submitted_at")
+    return dict(record)
 
 
 def _load_records(path: str | Path) -> list[dict[str, Any]]:
@@ -65,13 +95,15 @@ def _load_records(path: str | Path) -> list[dict[str, Any]]:
         return []
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return []
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LiveOrderRateLedgerError("live order rate ledger is unreadable") from exc
     if isinstance(data, dict):
-        data = data.get("submissions", [])
-    if not isinstance(data, list):
-        return []
-    return [record for record in data if isinstance(record, dict)]
+        if set(data) != {"submissions"}:
+            raise LiveOrderRateLedgerError("live order rate ledger schema is invalid")
+        data = data["submissions"]
+    if type(data) is not list:
+        raise LiveOrderRateLedgerError("live order rate ledger submissions are invalid")
+    return [_validate_record(record) for record in data]
 
 
 def _write_records(path: str | Path, records: list[dict[str, Any]]) -> None:
@@ -90,9 +122,7 @@ def _records_in_window(
     return [
         record
         for record in records
-        if (submitted_at := _parse_ts(str(record.get("submitted_at", ""))))
-        is not None
-        and submitted_at > cutoff
+        if _parse_ts(record.get("submitted_at"), label="submitted_at") > cutoff
     ]
 
 
@@ -179,14 +209,28 @@ def record_live_order_submission(
             # A reservation exists before broker I/O.  Once the broker confirms
             # acceptance, its acceptance moment—not the earlier reservation—is
             # the only correct rolling-window timestamp.
+            confirmed_at = _as_utc(now)
+            if confirmed_at.microsecond:
+                raise ValueError("live order acceptance time must be whole-second UTC")
+            reserved_at = _parse_ts(record["submitted_at"], label="submitted_at")
+            if confirmed_at < reserved_at:
+                # A proven idempotent recovery can find an order that predates
+                # this process's fresh reservation.  Keep the newer durable
+                # reservation timestamp instead of backdating this ledger and
+                # reopening capacity.  A newly submitted POST is rejected
+                # earlier, against its exact control commitment.
+                confirmed_at = reserved_at
             record.pop("state", None)
-            record["submitted_at"] = _as_utc(now).isoformat(timespec="seconds")
+            record["submitted_at"] = confirmed_at.isoformat(timespec="seconds")
             _write_records(path, records)
             return
+        confirmed_at = _as_utc(now)
+        if confirmed_at.microsecond:
+            raise ValueError("live order acceptance time must be whole-second UTC")
         records.append(
             {
                 "client_order_id": normalized_client_order_id,
-                "submitted_at": _as_utc(now).isoformat(timespec="seconds"),
+                "submitted_at": confirmed_at.isoformat(timespec="seconds"),
             }
         )
         _write_records(path, records)

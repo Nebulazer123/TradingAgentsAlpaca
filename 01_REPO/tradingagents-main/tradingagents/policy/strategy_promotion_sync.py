@@ -2247,9 +2247,6 @@ _NORMAL_LIVE_SAFE_BROKER_STATUSES = frozenset(
 _NORMAL_LIVE_TERMINAL_BROKER_STATUSES = frozenset(
     {"rejected", "canceled", "cancelled", "expired", "suspended", "stopped"}
 )
-_NORMAL_LIVE_POST_ACCEPTANCE_SKEW = datetime.timedelta(seconds=60)
-
-
 def _normal_live_broker_status(result: object) -> str:
     if type(result) is not dict or type(result.get("status")) is not str:
         raise ValueError("live broker result is missing a safe submitted status")
@@ -2280,9 +2277,13 @@ def _normal_live_broker_acceptance_time(
         accepted = datetime.datetime.fromisoformat(raw)
     except ValueError as exc:
         raise ValueError("live broker result has an invalid acceptance timestamp") from exc
-    if accepted.tzinfo is None or accepted.utcoffset() is None:
+    if (
+        accepted.tzinfo is None
+        or accepted.utcoffset() is None
+        or accepted.microsecond
+    ):
         raise ValueError("live broker result has an invalid acceptance timestamp")
-    accepted = accepted.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    accepted = accepted.astimezone(datetime.timezone.utc)
     if not require_near_commitment:
         return accepted
     raw_committed_at = commitment.get("committed_at")
@@ -2296,8 +2297,14 @@ def _normal_live_broker_acceptance_time(
         raise ValueError("normal live submission commitment has an invalid committed time")
     committed_at = committed_at.astimezone(datetime.timezone.utc).replace(microsecond=0)
     policy_now = _normal_live_policy_moment()
-    lower = committed_at - _NORMAL_LIVE_POST_ACCEPTANCE_SKEW
-    upper = max(committed_at, policy_now) + _NORMAL_LIVE_POST_ACCEPTANCE_SKEW
+    if policy_now < committed_at:
+        raise ValueError("live broker acceptance timestamp has no current submit window")
+    # The broker timestamp must be no earlier than the durable reservation /
+    # control commitment, and never later than the local trusted policy clock
+    # after the response.  Allowing a pre-commit time would let a one-minute
+    # rate cap age out before one actual minute of accepted order time passed.
+    lower = committed_at
+    upper = policy_now
     if accepted < lower or accepted > upper:
         raise ValueError("live broker acceptance timestamp is outside the committed submit interval")
     return accepted
@@ -2624,7 +2631,7 @@ def execute_normal_live_broker_submit(
                     policy_post_capability=_issue_normal_live_submit_post_capability(
                         supervisor_claim,
                         order_payload=frozen_order,
-                        commitment_id=commitment["commitment_id"],
+                        commitment=commitment,
                     ),
                 ),
                 commitment=commitment,

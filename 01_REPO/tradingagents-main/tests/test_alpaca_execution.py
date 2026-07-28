@@ -36,6 +36,7 @@ from tradingagents.policy.live_control import (
     _write_live_control_state_locked,
     commit_normal_live_submission_locked,
     live_control_lock,
+    resolve_normal_live_submission_commitment,
     write_live_control_state,
 )
 from tradingagents.policy.promotion_sync import promotion_state_lock
@@ -723,16 +724,215 @@ def _normal_live_admission(
                 client_order_id=f"prior-live-order-{index}",
                 now=activated_at,
             )
+    metric_client = _fake_live_client(
+        root, repo_root=_activation_state_path(root, receipt).parent, clock=lambda: activated_at
+    )
+    metric_client.session.account["equity"] = "500.00"
+    _write_normal_live_risk_metrics_baseline(
+        control_path.resolve(), observed_at=activated_at, equity="500.00"
+    )
+    risk_metrics = supervisor_module._issue_normal_live_submit_risk_metrics(
+        intent,
+        order_payload=_bound_normal_live_order(intent),
+        control_state_path=control_path.resolve(),
+        broker_read_adapter=metric_client._normal_live_broker_read_adapter,
+    )
     return supervisor_module._issue_normal_live_submit_admission(
         intent,
+        order_payload=_bound_normal_live_order(intent),
         risk_envelope_path=risk_path.resolve(),
         promotion_state_path=_activation_state_path(root, receipt).resolve(),
         control_state_path=control_path.resolve(),
         order_rate_state_path=rate_path,
-        current_daily_loss_usd=Decimal("0.00"),
-        current_drawdown_pct=Decimal("0.00"),
+        risk_metrics=risk_metrics,
         decision_evidence={},
     )
+
+
+def _write_normal_live_risk_metrics_baseline(
+    control_path: Path,
+    *,
+    observed_at: datetime.datetime,
+    equity: str = "500.00",
+) -> Path:
+    """Pre-provision the durable observer-owned metric baseline for a test."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    path = supervisor_module._normal_live_risk_metrics_state_path(control_path)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "trade_date": observed_at.date().isoformat(),
+                "day_start_equity": equity,
+                "high_water_equity": equity,
+                "updated_at": observed_at.isoformat(timespec="seconds"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_owned_account_metrics_issue_an_exact_short_lived_capability(
+    tmp_path, monkeypatch
+):
+    """Only a concrete Alpaca client's owned account snapshot can mint metrics."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+    client.session.account["equity"] = "495.00"
+    control_path = tmp_path / "normal-live-control.json"
+    _write_normal_live_risk_metrics_baseline(
+        control_path, observed_at=activated_at, equity="500.00"
+    )
+    monkeypatch.setattr(
+        supervisor_module, "_normal_live_admission_utc_now", lambda: activated_at
+    )
+
+    metrics = supervisor_module._issue_normal_live_submit_risk_metrics(
+        intent,
+        order_payload=_bound_normal_live_order(intent),
+        control_state_path=control_path.resolve(),
+        broker_read_adapter=client._normal_live_broker_read_adapter,
+    )
+
+    assert metrics.intent_full_sha256 == hashlib.sha256(
+        intent.canonical_json_bytes()
+    ).hexdigest()
+    assert metrics.daily_loss_usd == Decimal("5.00")
+    assert metrics.drawdown_pct == Decimal("0.01")
+    assert metrics.account_snapshot_sha256
+    assert [request[0] for request in client.session.requests] == ["GET"] * 4
+
+
+def test_owned_account_metrics_reject_a_stale_snapshot(tmp_path, monkeypatch):
+    """A process-local capability cannot launder a delayed account read."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+    control_path = tmp_path / "normal-live-control.json"
+    _write_normal_live_risk_metrics_baseline(
+        control_path, observed_at=activated_at, equity="500.00"
+    )
+    monkeypatch.setattr(
+        supervisor_module, "_normal_live_admission_utc_now", lambda: activated_at
+    )
+    owned_read = supervisor_module._owned_normal_live_broker_read
+
+    def stale_owned_read(adapter, *, client_order_id):
+        account, positions, orders, existing, _observed_at = owned_read(
+            adapter, client_order_id=client_order_id
+        )
+        return (
+            account,
+            positions,
+            orders,
+            existing,
+            activated_at - datetime.timedelta(seconds=31),
+        )
+
+    monkeypatch.setattr(supervisor_module, "_owned_normal_live_broker_read", stale_owned_read)
+
+    with pytest.raises(ValueError, match="owned account snapshot is stale"):
+        supervisor_module._issue_normal_live_submit_risk_metrics(
+            intent,
+            order_payload=_bound_normal_live_order(intent),
+            control_state_path=control_path.resolve(),
+            broker_read_adapter=client._normal_live_broker_read_adapter,
+        )
+
+
+@pytest.mark.parametrize("metrics", (None, object()))
+def test_generic_or_missing_risk_metrics_cannot_issue_admission_before_broker_io(
+    tmp_path, monkeypatch, metrics
+):
+    """None/scalars/forgeries must not disable the daily-loss circuit breaker."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+    monkeypatch.setattr(
+        supervisor_module, "_normal_live_admission_utc_now", lambda: activated_at
+    )
+
+    with pytest.raises(ValueError, match="risk metrics"):
+        supervisor_module._issue_normal_live_submit_admission(
+            intent,
+            order_payload=_bound_normal_live_order(intent),
+            risk_envelope_path=(tmp_path / "risk.yaml").resolve(),
+            promotion_state_path=_activation_state_path(root, receipt).resolve(),
+            control_state_path=(tmp_path / "normal-live-control.json").resolve(),
+            order_rate_state_path=(tmp_path / "normal-live-rate.json").resolve(),
+            risk_metrics=metrics,
+            decision_evidence={},
+        )
+
+    assert client.session.requests == []
+    assert client.session.post_calls == 0
+
+
+@pytest.mark.parametrize("failure", ("forged", "stale", "mismatched"))
+def test_owned_risk_metrics_reject_forgery_staleness_and_payload_mismatch_before_io(
+    tmp_path, monkeypatch, failure
+):
+    """Metrics evidence is an exact capability, not a pair of caller scalars."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+    client.session.account["equity"] = "500.00"
+    control_path = tmp_path / "normal-live-control.json"
+    _write_normal_live_risk_metrics_baseline(
+        control_path, observed_at=activated_at, equity="500.00"
+    )
+    supervisor_now = [activated_at]
+    monkeypatch.setattr(
+        supervisor_module,
+        "_normal_live_admission_utc_now",
+        lambda: supervisor_now[0],
+    )
+    order = _bound_normal_live_order(intent)
+    metrics = supervisor_module._issue_normal_live_submit_risk_metrics(
+        intent,
+        order_payload=order,
+        control_state_path=control_path.resolve(),
+        broker_read_adapter=client._normal_live_broker_read_adapter,
+    )
+    client.session.requests.clear()
+    if failure == "forged":
+        metrics = supervisor_module.NormalLiveRiskMetrics(
+            **{field: getattr(metrics, field) for field in metrics.__dataclass_fields__}
+        )
+    elif failure == "stale":
+        supervisor_now[0] = activated_at + datetime.timedelta(seconds=31)
+    else:
+        order = {**order, "symbol": "AAPL"}
+
+    with pytest.raises(ValueError, match="risk metrics"):
+        supervisor_module._issue_normal_live_submit_admission(
+            intent,
+            order_payload=order,
+            risk_envelope_path=(tmp_path / "risk.yaml").resolve(),
+            promotion_state_path=_activation_state_path(root, receipt).resolve(),
+            control_state_path=control_path.resolve(),
+            order_rate_state_path=(tmp_path / "rate.json").resolve(),
+            risk_metrics=metrics,
+            decision_evidence={},
+        )
+
+    assert client.session.requests == []
+    assert client.session.post_calls == 0
 
 
 def _reconstructed_activation_receipt(
@@ -1011,6 +1211,12 @@ def test_live_client_records_the_broker_acceptance_time_not_reservation_time(
         tmp_path, monkeypatch
     )
     accepted_at = activated_at + datetime.timedelta(seconds=30)
+    policy_now = [activated_at]
+    monkeypatch.setattr(
+        promotion_sync_module,
+        "_normal_live_policy_utc_now",
+        lambda: policy_now[0],
+    )
 
     class _SlowAcceptanceSession(_FakeLiveSession):
         def request(self, method, url, **kwargs):
@@ -1018,6 +1224,7 @@ def test_live_client_records_the_broker_acceptance_time_not_reservation_time(
             if method == "POST":
                 accepted = dict(response.json())
                 accepted["submitted_at"] = accepted_at.isoformat(timespec="seconds")
+                policy_now[0] = accepted_at
                 return _FakeResponse(200, accepted)
             return response
 
@@ -1093,7 +1300,9 @@ def test_live_client_rejects_old_post_acceptance_time_without_reopening_rate_cap
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
         tmp_path, monkeypatch
     )
-    old_at = activated_at - datetime.timedelta(minutes=2)
+    # One second is enough: acceptance must never predate the durable commit,
+    # not merely fall inside a generous clock-skew window.
+    old_at = activated_at - datetime.timedelta(seconds=1)
 
     class _OldAcceptanceSession(_FakeLiveSession):
         def request(self, method, url, **kwargs):
@@ -1578,6 +1787,61 @@ def test_live_client_preserves_a_prior_control_commitment_after_freeze(
     assert frozen_state[
         "normal_live_freeze_observed_committed_client_order_ids"
     ] == [intent.client_order_id]
+
+
+def test_resolved_normal_live_commitment_cannot_consume_raw_post_capability(
+    tmp_path, monkeypatch
+):
+    """Break caught: a resolved commitment still allowed the raw Alpaca POST."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    control_path = tmp_path / "normal-live-control.json"
+
+    class _ResolveAfterFinalLookupSession(_FakeLiveSession):
+        def __init__(self):
+            super().__init__()
+            self.exact_lookup_count = 0
+
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if method == "GET" and url.endswith("/v2/orders:by_client_order_id"):
+                self.exact_lookup_count += 1
+                # Two exact lookups belong to the owned reconciliation and
+                # its fresh snapshot. Resolve only after the policy's final
+                # idempotency read, immediately before raw POST consumption.
+                if self.exact_lookup_count == 3:
+                    control = json.loads(control_path.read_text(encoding="utf-8"))
+                    commitment = control["normal_live_submission_commitments"][0]
+                    resolve_normal_live_submission_commitment(
+                        control_path,
+                        commitment_id=commitment["commitment_id"],
+                        outcome="admission_refused",
+                        now=activated_at,
+                    )
+            return response
+
+    session = _ResolveAfterFinalLookupSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+
+    with pytest.raises(ValueError, match="commitment is unavailable"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    assert session.post_calls == 0
 
 
 def test_committed_live_order_allows_prompt_freeze_between_commit_and_post(

@@ -1,4 +1,7 @@
 import datetime
+import json
+
+import pytest
 
 from tradingagents.policy.order_rate_limit import (
     count_live_submissions_in_window,
@@ -127,3 +130,70 @@ def test_confirmed_submission_replaces_reservation_time_with_broker_acceptance_t
         now=accepted_at + datetime.timedelta(minutes=56),
         window_minutes=60,
     ) == 1
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "{not-json",
+        json.dumps({"submissions": {}}),
+        json.dumps({"submissions": [{"client_order_id": "missing-time"}]}),
+        json.dumps(
+            {
+                "submissions": [
+                    {
+                        "client_order_id": "bad-time",
+                        "submitted_at": "not-a-timestamp",
+                    }
+                ]
+            }
+        ),
+    ),
+)
+def test_corrupt_ledger_fails_closed_without_rewriting_history(tmp_path, raw):
+    """Break caught: corrupt rate state was silently reset to empty capacity."""
+    from tradingagents.policy.order_rate_limit import LiveOrderRateLedgerError
+
+    path = tmp_path / "rate.json"
+    path.write_text(raw, encoding="utf-8")
+
+    with pytest.raises(LiveOrderRateLedgerError):
+        evaluate_order_rate_limit(
+            path=path,
+            now=NOW,
+            window_minutes=60,
+            max_orders=1,
+            new_order_count=1,
+        )
+
+    assert path.read_text(encoding="utf-8") == raw
+
+
+def test_one_minute_limit_keeps_reservation_time_for_precommit_recovery(tmp_path):
+    """A broker time before durable reservation must never age capacity early."""
+    from tradingagents.policy.order_rate_limit import reserve_live_order_submission
+
+    path = tmp_path / "rate.json"
+    committed_at = NOW
+    reserve_live_order_submission(
+        path,
+        client_order_id="exact-boundary",
+        now=committed_at,
+        window_minutes=1,
+        max_orders=1,
+    )
+    # A prior idempotent broker order cannot backdate this fresh reservation
+    # and reopen a one-minute cap. New POSTs are rejected at the policy edge.
+    record_live_order_submission(
+        path,
+        client_order_id="exact-boundary",
+        now=committed_at - datetime.timedelta(seconds=1),
+    )
+
+    assert evaluate_order_rate_limit(
+        path=path,
+        now=committed_at + datetime.timedelta(seconds=59),
+        window_minutes=1,
+        max_orders=1,
+        new_order_count=1,
+    )

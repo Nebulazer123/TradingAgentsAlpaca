@@ -322,6 +322,26 @@ def verify_pending_normal_live_submission_commitment(
     validates every commitment record while holding the shared control lock.
     """
 
+    with live_control_lock(path):
+        _verify_pending_normal_live_submission_commitment_locked(
+            path,
+            commitment=commitment,
+            intent_full_sha256=intent_full_sha256,
+            order_payload_sha256=order_payload_sha256,
+            client_order_id=client_order_id,
+        )
+
+
+def _verify_pending_normal_live_submission_commitment_locked(
+    path: str | Path,
+    *,
+    commitment: Mapping[str, object],
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+) -> None:
+    """Verify an exact pending record while the caller already owns control lock."""
+
     if not isinstance(commitment, Mapping):
         raise ValueError("normal live submission commitment is invalid")
     required = {
@@ -329,35 +349,37 @@ def verify_pending_normal_live_submission_commitment(
         "intent_full_sha256",
         "order_payload_sha256",
         "client_order_id",
+        "control_preimage_sha256",
     }
     if any(commitment.get(field) != expected for field, expected in (
         ("intent_full_sha256", intent_full_sha256),
         ("order_payload_sha256", order_payload_sha256),
         ("client_order_id", client_order_id),
-    )) or type(commitment.get("commitment_id")) is not str:
+    )) or not all(
+        type(commitment.get(field)) is str for field in required
+    ):
         raise ValueError("normal live submission commitment does not bind the exact order")
-    with live_control_lock(path):
-        control_path = Path(path)
-        try:
-            state = json.loads(control_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("normal live submission commitment is unavailable") from exc
-        if not isinstance(state, dict):
-            raise ValueError("normal live submission commitment is unavailable")
-        commitments = _read_normal_live_commitments(state)
-        matches = [
-            item
-            for item in commitments
-            if item["commitment_id"] == commitment["commitment_id"]
-        ]
-        if len(matches) != 1:
-            raise ValueError("normal live submission commitment is unavailable")
-        matched = matches[0]
-        if matched["state"] != _NORMAL_LIVE_COMMITMENT_PENDING or any(
-            matched[field] != commitment.get(field)
-            for field in required
-        ):
-            raise ValueError("normal live submission commitment is unavailable")
+    control_path = Path(path)
+    try:
+        state = json.loads(control_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("normal live submission commitment is unavailable") from exc
+    if not isinstance(state, dict):
+        raise ValueError("normal live submission commitment is unavailable")
+    commitments = _read_normal_live_commitments(state)
+    matches = [
+        item
+        for item in commitments
+        if item["commitment_id"] == commitment["commitment_id"]
+    ]
+    if len(matches) != 1:
+        raise ValueError("normal live submission commitment is unavailable")
+    matched = matches[0]
+    if matched["state"] != _NORMAL_LIVE_COMMITMENT_PENDING or any(
+        matched[field] != commitment.get(field)
+        for field in required
+    ):
+        raise ValueError("normal live submission commitment is unavailable")
 
 
 def parse_control_time(value: str) -> datetime.datetime | None:
