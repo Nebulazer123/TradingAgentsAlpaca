@@ -814,7 +814,6 @@ class AlpacaRestClient:
             proposal_ledger_root=self.normal_live_evidence_root,
             repo_root=self.normal_live_repo_root,
             immutable_order_sha256=hashlib.sha256(facts_bytes).hexdigest(),
-            checked_at=checked_at,
             lookup=lambda: self._lookup_live_order_by_client_order_id(client_order_id),
             post=lambda: self._request("POST", "/v2/orders", json=payload),
         )

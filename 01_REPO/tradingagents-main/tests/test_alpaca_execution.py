@@ -27,6 +27,7 @@ from tradingagents.brokers.alpaca import (
     validate_live_management_action,
 )
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
+from tradingagents.policy import strategy_promotion_sync as promotion_sync_module
 from tradingagents.policy.promotion_sync import promotion_state_lock
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 from tradingagents.schemas.trading import TradeIntent
@@ -55,6 +56,12 @@ def _fixed_normal_live_utc_now(monkeypatch):
         alpaca_module,
         "_normal_live_utc_now",
         lambda: _NORMAL_LIVE_TEST_NOW,
+    )
+    monkeypatch.setattr(
+        promotion_sync_module,
+        "_normal_live_policy_utc_now",
+        lambda: _NORMAL_LIVE_TEST_NOW,
+        raising=False,
     )
 
 
@@ -724,6 +731,67 @@ def test_live_client_rejects_expired_intent_from_its_trusted_clock_before_reques
             now=activated_at,
         )
     assert client.session.requests == []
+
+
+def test_policy_executor_rejects_a_caller_controlled_backdate(
+    tmp_path, monkeypatch
+):
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    order = _bound_normal_live_order(intent)
+    order_facts = alpaca_module._normal_live_order_facts(order)
+    immutable_order_sha256 = hashlib.sha256(
+        json.dumps(
+            order_facts, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+
+    with pytest.raises(TypeError, match="checked_at"):
+        promotion_sync_module.execute_normal_live_broker_submit(
+            intent,
+            receipt,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            immutable_order_sha256=immutable_order_sha256,
+            checked_at=activated_at,
+            lookup=lambda: {"id": "only-for-red"},
+            post=lambda: pytest.fail("backdated policy call must not POST"),
+        )
+
+
+def test_stale_receipt_direct_policy_call_fails_before_lookup_or_post(
+    tmp_path, monkeypatch
+):
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    expired_at = activated_at + datetime.timedelta(minutes=6)
+    monkeypatch.setattr(
+        promotion_sync_module, "_normal_live_policy_utc_now", lambda: expired_at,
+        raising=False,
+    )
+    order = _bound_normal_live_order(intent)
+    order_facts = alpaca_module._normal_live_order_facts(order)
+    immutable_order_sha256 = hashlib.sha256(
+        json.dumps(
+            order_facts, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    callbacks: list[str] = []
+
+    with pytest.raises(ValueError, match="not active"):
+        promotion_sync_module.execute_normal_live_broker_submit(
+            intent,
+            receipt,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            immutable_order_sha256=immutable_order_sha256,
+            lookup=lambda: callbacks.append("lookup"),
+            post=lambda: callbacks.append("post"),
+        )
+
+    assert callbacks == []
 
 
 def test_task3_admission_holds_state_lock_until_durable_prepare(tmp_path, monkeypatch):

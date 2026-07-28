@@ -1974,14 +1974,18 @@ def _activation_state_marker(
     return marker
 
 
+def _normal_live_policy_utc_now() -> datetime.datetime:
+    """Private authority clock for the policy-owned broker handoff."""
+
+    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+
+
 def _verify_normal_live_activation_receipt(
     intent: AuthorizedNormalTradeIntent,
     receipt: NormalLiveActivationReceipt,
     *,
     proposal_ledger_root: str | Path,
     repo_root: str | Path,
-    checked_at: datetime.datetime | None = None,
-    clock: Callable[[], datetime.datetime] | None = None,
     _accept: Callable[
         [
             ImmutableStrategyEvidenceStore,
@@ -2002,7 +2006,6 @@ def _verify_normal_live_activation_receipt(
     if (
         type(intent) is not AuthorizedNormalTradeIntent
         or type(receipt) is not NormalLiveActivationReceipt
-        or (checked_at is None) == (clock is None)
     ):
         raise ValueError("activation receipt verification requires exact typed values")
     root = Path(proposal_ledger_root)
@@ -2027,7 +2030,7 @@ def _verify_normal_live_activation_receipt(
     state_anchor = _capture_state_path_anchor(state_path_value)
     state_file = state_anchor.path
     with promotion_state_lock(state_file):
-        raw_moment = checked_at if clock is None else clock()
+        raw_moment = _normal_live_policy_utc_now()
         if (
             type(raw_moment) is not datetime.datetime
             or raw_moment.tzinfo is None
@@ -2217,7 +2220,6 @@ def execute_normal_live_broker_submit(
     proposal_ledger_root: str | Path,
     repo_root: str | Path,
     immutable_order_sha256: str,
-    checked_at: datetime.datetime,
     lookup: Callable[[], object | None],
     post: Callable[[], object],
 ) -> object:
@@ -2235,10 +2237,6 @@ def execute_normal_live_broker_submit(
     if (
         type(intent) is not AuthorizedNormalTradeIntent
         or type(receipt) is not NormalLiveActivationReceipt
-        or type(checked_at) is not datetime.datetime
-        or checked_at.tzinfo is None
-        or checked_at.utcoffset() is None
-        or checked_at.microsecond
         or type(immutable_order_sha256) is not str
         or re.fullmatch(r"[0-9a-f]{64}", immutable_order_sha256) is None
         or not callable(lookup)
@@ -2306,7 +2304,6 @@ def execute_normal_live_broker_submit(
         receipt,
         proposal_ledger_root=proposal_ledger_root,
         repo_root=repo_root,
-        checked_at=checked_at.astimezone(datetime.timezone.utc),
         _accept=admit,
     )
 
@@ -2317,7 +2314,6 @@ def verify_normal_live_activation_receipt(
     *,
     proposal_ledger_root: str | Path,
     repo_root: str | Path,
-    checked_at: datetime.datetime,
 ) -> None:
     """Read-only Task 3 provenance check for a normal-live receipt."""
 
@@ -2326,7 +2322,6 @@ def verify_normal_live_activation_receipt(
         receipt,
         proposal_ledger_root=proposal_ledger_root,
         repo_root=repo_root,
-        checked_at=checked_at,
     )
 
 
