@@ -18,15 +18,15 @@ from decimal import ROUND_DOWN, Decimal
 import requests
 
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
-from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
+from tradingagents.policy.strategy_promotion_sync import (
+    NormalLiveActivationReceipt,
+    verify_normal_live_activation_receipt,
+)
 from tradingagents.schemas.trading import TradeIntent
 from tradingagents.strategy._immutable_evidence_store import (
-    NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
-    NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
     NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
     EvidenceCandidate,
     ImmutableStrategyEvidenceStore,
-    _thaw_json,
 )
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
@@ -671,7 +671,9 @@ def _require_normal_live_receipt(
     intent: AuthorizedNormalTradeIntent,
     value: object,
     *,
-    store: ImmutableStrategyEvidenceStore,
+    proposal_ledger_root,
+    repo_root,
+    checked_at: datetime.datetime,
 ) -> NormalLiveActivationReceipt:
     if type(value) is not NormalLiveActivationReceipt:
         raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
@@ -691,99 +693,14 @@ def _require_normal_live_receipt(
         or value.execution_authority != "none"
     ):
         raise ValueError("normal live activation receipt does not link to exact intent")
-    _require_durable_normal_live_activation(intent, value, store=store)
+    verify_normal_live_activation_receipt(
+        intent,
+        value,
+        proposal_ledger_root=proposal_ledger_root,
+        repo_root=repo_root,
+        checked_at=checked_at,
+    )
     return value
-
-
-def _durable_activation_payload(value: object) -> dict[str, object]:
-    thawed = _thaw_json(value)
-    if not isinstance(thawed, dict):
-        raise ValueError("durable activation evidence payload is invalid")
-    return thawed
-
-
-def _require_durable_normal_live_activation(
-    intent: AuthorizedNormalTradeIntent,
-    receipt: NormalLiveActivationReceipt,
-    *,
-    store: ImmutableStrategyEvidenceStore,
-) -> None:
-    try:
-        prepares = [
-            envelope
-            for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND)
-            if envelope.object_id == receipt.activation_prepare_id
-        ]
-        receipts = [
-            envelope
-            for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND)
-            if envelope.object_id == receipt.activation_receipt_id
-        ]
-    except ValueError as exc:
-        raise ValueError("durable activation evidence is unavailable") from exc
-    if len(prepares) != 1 or len(receipts) != 1:
-        raise ValueError("durable activation receipt is missing")
-    prepare = prepares[0]
-    durable_receipt = receipts[0]
-    prepare_payload = _durable_activation_payload(prepare.payload)
-    receipt_payload = _durable_activation_payload(durable_receipt.payload)
-    receipt_fields = set(prepare_payload) | {
-        "activation_prepare_id",
-        "activation_prepare_sha256",
-    }
-    if set(receipt_payload) != receipt_fields:
-        raise ValueError("durable activation receipt fields are invalid")
-    if (
-        receipt_payload.get("activation_prepare_id") != prepare.object_id
-        or receipt_payload.get("activation_prepare_sha256")
-        != hashlib.sha256(prepare.canonical_json_bytes()).hexdigest()
-    ):
-        raise ValueError("durable activation receipt does not bind its prepare")
-    receipt_material = dict(receipt_payload)
-    receipt_material.pop("activation_prepare_id")
-    receipt_material.pop("activation_prepare_sha256")
-    if receipt_material != prepare_payload:
-        raise ValueError("durable activation receipt payload is inconsistent")
-    intent_full_sha256 = hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
-    expected = {
-        "schema_version": 1,
-        "intent_full_sha256": intent_full_sha256,
-        "logical_order_sha256": intent.logical_order_sha256,
-        "proposal_id": intent.promotion_proposal_id,
-        "proposal_sha256": intent.promotion_proposal_sha256,
-        "promotion_sync_receipt_id": intent.promotion_sync_receipt_id,
-        "promotion_sync_receipt_sha256": intent.promotion_sync_receipt_sha256,
-        "risk_snapshot_sha256": intent.risk_snapshot_sha256,
-        "risk_envelope_sha256": intent.risk_snapshot_sha256,
-        "evaluation_runtime_sha256": intent.evaluation_runtime_sha256,
-        "promotion_runtime_commit": intent.evaluation_code_commit,
-        "canonical_before_sha256": intent.promotion_state_sha256,
-        "canonical_after_sha256": receipt.canonical_after_sha256,
-        "demoted": [],
-        "unchanged": [],
-        "live_enabled": True,
-    }
-    expected_fields = set(expected) | {"state_path", "promoted"}
-    if (
-        set(prepare_payload) != expected_fields
-        or any(prepare_payload.get(field) != value for field, value in expected.items())
-    ):
-        raise ValueError("durable activation evidence does not match exact intent")
-    state_path = prepare_payload.get("state_path")
-    promoted = prepare_payload.get("promoted")
-    sleeves = receipt.state.get("sleeves")
-    if (
-        type(state_path) is not str
-        or not state_path
-        or type(promoted) is not list
-        or len(promoted) != 1
-        or type(promoted[0]) is not str
-        or not isinstance(sleeves, Mapping)
-        or not isinstance(sleeves.get(promoted[0]), Mapping)
-        or sleeves[promoted[0]].get("stage") != "tiny_live_eligible"
-        or sleeves[promoted[0]].get("live_enabled") is not True
-    ):
-        raise ValueError("durable activation receipt has no bound live-eligible sleeve")
 
 
 def _normal_live_broker_submit_candidate(
@@ -809,6 +726,27 @@ def _normal_live_broker_submit_candidate(
         effective_at=intent.recorded_at,
         payload=payload,
     )
+
+
+def _require_unique_live_submit_record(snapshot, envelope) -> None:
+    payload = envelope.payload
+    if not isinstance(payload, Mapping):
+        raise ValueError("durable live submit record is invalid")
+    logical = payload.get("logical_order_sha256")
+    client_order_id = payload.get("client_order_id")
+    if type(logical) is not str or type(client_order_id) is not str:
+        raise ValueError("durable live submit record is invalid")
+    for prior in snapshot:
+        if prior.kind != NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND:
+            continue
+        prior_payload = prior.payload
+        if not isinstance(prior_payload, Mapping):
+            raise ValueError("durable live submit record is invalid")
+        if (
+            prior_payload.get("logical_order_sha256") == logical
+            or prior_payload.get("client_order_id") == client_order_id
+        ) and prior.payload != payload:
+            raise ValueError("logical/client order ID is already consumed by different receipt")
 
 
 def _normal_live_order_facts(order: Mapping[str, object]) -> dict[str, object]:
@@ -837,10 +775,18 @@ def _require_matching_broker_order(
 
 
 class AlpacaRestClient:
-    def __init__(self, settings: AlpacaSettings, session=None, *, normal_live_evidence_root=None):
+    def __init__(
+        self,
+        settings: AlpacaSettings,
+        session=None,
+        *,
+        normal_live_evidence_root=None,
+        normal_live_repo_root=None,
+    ):
         self.settings = settings
         self.session = session or requests.Session()
         self.normal_live_evidence_root = normal_live_evidence_root
+        self.normal_live_repo_root = normal_live_repo_root
 
     def assert_expected_mode(self, *, paper: bool) -> None:
         base_url = self.settings.base_url.lower()
@@ -905,14 +851,21 @@ class AlpacaRestClient:
         if type(activation_receipt) is not NormalLiveActivationReceipt:
             raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
         checked_at = _normal_live_submit_time(now)
-        if self.normal_live_evidence_root is None:
-            raise ValueError("live submit requires a durable normal-live evidence root")
+        if (
+            self.normal_live_evidence_root is None
+            or self.normal_live_repo_root is None
+        ):
+            raise ValueError("live submit requires durable normal-live evidence roots")
+        receipt = _require_normal_live_receipt(
+            intent,
+            activation_receipt,
+            proposal_ledger_root=self.normal_live_evidence_root,
+            repo_root=self.normal_live_repo_root,
+            checked_at=checked_at,
+        )
         store = ImmutableStrategyEvidenceStore(
             self.normal_live_evidence_root,
             clock=lambda: checked_at,
-        )
-        receipt = _require_normal_live_receipt(
-            intent, activation_receipt, store=store
         )
         intent.verify_order_payload(order, at=checked_at)
         payload = dict(order)
@@ -926,7 +879,9 @@ class AlpacaRestClient:
         try:
             admission = store.admit_checked(
                 candidate,
-                validate=lambda _snapshot, _envelope: None,
+                validate=lambda snapshot, envelope: _require_unique_live_submit_record(
+                    snapshot, envelope
+                ),
             )
         except ValueError as exc:
             raise ValueError("durable live submit prepare could not be recorded") from exc

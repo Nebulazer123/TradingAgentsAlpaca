@@ -1886,6 +1886,126 @@ def _activation_state(
     return copied
 
 
+def verify_normal_live_activation_receipt(
+    intent: AuthorizedNormalTradeIntent,
+    receipt: NormalLiveActivationReceipt,
+    *,
+    proposal_ledger_root: str | Path,
+    repo_root: str | Path,
+    checked_at: datetime.datetime,
+) -> None:
+    """Read-only Task 3 provenance check for the broker-write boundary.
+
+    This deliberately reuses the activation transaction's exact envelope and
+    state validators. It creates no evidence and never enables a sleeve.
+    """
+
+    if (
+        type(intent) is not AuthorizedNormalTradeIntent
+        or type(receipt) is not NormalLiveActivationReceipt
+        or type(checked_at) is not datetime.datetime
+        or checked_at.tzinfo is None
+        or checked_at.utcoffset() is None
+        or checked_at.microsecond
+    ):
+        raise ValueError("activation receipt verification requires exact typed values")
+    moment = checked_at.astimezone(datetime.timezone.utc)
+    if not intent.is_active(at=moment):
+        raise ValueError("activation receipt intent is not active")
+    root = Path(proposal_ledger_root)
+    repo = Path(repo_root).resolve()
+    store = ImmutableStrategyEvidenceStore(root, clock=lambda: moment)
+    try:
+        durable_receipts = [
+            envelope
+            for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND)
+            if envelope.object_id == receipt.activation_receipt_id
+        ]
+    except ValueError as exc:
+        raise ValueError("activation receipt evidence is unavailable") from exc
+    if len(durable_receipts) != 1:
+        raise ValueError("activation receipt is not durable")
+    receipt_payload = _thaw_json(durable_receipts[0].payload)
+    if not isinstance(receipt_payload, Mapping):
+        raise ValueError("activation receipt payload is invalid")
+    state_path_value = receipt_payload.get("state_path")
+    if type(state_path_value) is not str or not Path(state_path_value).is_absolute():
+        raise ValueError("activation receipt state path is not canonical")
+    state_anchor = _capture_state_path_anchor(state_path_value)
+    state_file = state_anchor.path
+    with promotion_state_lock(state_file):
+        _require_state_path_anchor_current(state_anchor)
+        snapshot = read_promotion_state_snapshot(state_file)
+        _require_snapshot_current(snapshot)
+        if (
+            snapshot.sha256 != receipt.canonical_after_sha256
+            or receipt.state != dict(snapshot.state)
+            or receipt.intent_full_sha256 != _digest(intent.canonical_json_bytes())
+            or receipt.canonical_before_sha256 != intent.promotion_state_sha256
+        ):
+            raise ValueError("activation receipt state provenance is inconsistent")
+        durable = StrategyOperationalPromotionLedger(root, clock=lambda: moment).rebuild()
+        proposals = [item for item in durable if item.proposal_id == intent.promotion_proposal_id]
+        if len(proposals) != 1:
+            raise ValueError("activation proposal is not durable")
+        proposal = proposals[0]
+        if (
+            _digest(proposal.canonical_json_bytes()) != intent.promotion_proposal_sha256
+            or intent.evaluation_runtime_sha256 != proposal.evaluation_runtime_sha256
+            or intent.evaluation_code_commit != proposal.evaluation_code_commit
+            or intent.genome_id != proposal.genome_id
+            or intent.genome_canonical_sha256 != proposal.genome_canonical_sha256
+            or intent.shadow_attestation_sha256 != proposal.shadow_attestation_sha256
+            or intent.risk_snapshot_sha256 != proposal.risk_attestation.risk_envelope_sha256
+        ):
+            raise ValueError("activation receipt does not bind the durable proposal")
+        _require_current_normal_live_sources(
+            store=store, proposal=proposal, repo=repo, checked_at=moment
+        )
+        _require_complete_normal_live_intent_chain(
+            intent=intent, proposal=proposal, proposal_ledger_root=root, repo=repo
+        )
+        sleeves = snapshot.state.get("sleeves")
+        sleeve = sleeves.get(proposal.sleeve) if isinstance(sleeves, Mapping) else None
+        if (
+            not isinstance(sleeve, Mapping)
+            or sleeve.get("stage") != "tiny_live_eligible"
+            or sleeve.get("live_enabled") is not True
+        ):
+            raise ValueError("activation receipt has no current live-eligible sleeve")
+        expected_prepare = _activation_payload(
+            proposal=proposal,
+            intent=intent,
+            intent_full_sha256=_digest(intent.canonical_json_bytes()),
+            canonical_before_sha256=intent.promotion_state_sha256,
+            canonical_after_sha256=snapshot.sha256,
+            state_file=state_file,
+        )
+        prepares = [
+            envelope
+            for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND)
+            if envelope.object_id == receipt.activation_prepare_id
+        ]
+        if len(prepares) != 1:
+            raise ValueError("activation prepare is not durable")
+        prepare = prepares[0]
+        _require_activation_payload(
+            _thaw_json(prepare.payload), expected=expected_prepare, receipt=False
+        )
+        expected_receipt = {
+            **expected_prepare,
+            "activation_prepare_id": prepare.object_id,
+            "activation_prepare_sha256": _digest(prepare.canonical_json_bytes()),
+        }
+        _require_activation_payload(
+            receipt_payload, expected=expected_prepare, receipt=True
+        )
+        if dict(receipt_payload) != expected_receipt:
+            raise ValueError("activation receipt does not match the activation transaction")
+        _require_snapshot_current(snapshot)
+        _require_state_path_anchor_current(state_anchor)
+
+
 def activate_normal_live_intent(
     proposal: StrategyPromotionProposal,
     intent: AuthorizedNormalTradeIntent,
