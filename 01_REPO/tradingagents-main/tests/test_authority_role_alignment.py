@@ -287,8 +287,13 @@ def _is_potentially_mutating_urllib_request(node: ast.Call, name: str) -> bool:
     if name != "urllib.request.Request":
         return False
     method = next((keyword.value for keyword in node.keywords if keyword.arg == "method"), None)
+    if method is None and len(node.args) >= 6:
+        method = node.args[5]
     if method is None:
-        data = next((keyword.value for keyword in node.keywords if keyword.arg == "data"), None)
+        data = next(
+            (keyword.value for keyword in node.keywords if keyword.arg == "data"),
+            node.args[1] if len(node.args) >= 2 else None,
+        )
         return data is not None and not (
             isinstance(data, ast.Constant) and data.value is None
         )
@@ -314,8 +319,11 @@ def _production_http_mutation_occurrences(
         def __init__(self, relative_path: str):
             self.relative_path = relative_path
             self.scope: list[str] = []
+            self.scope_kinds: list[str] = ["module"]
             self.import_aliases: dict[str, str] = {}
             self.urllib_requests: list[set[str]] = [set()]
+            self.raw_http_aliases: list[dict[str, str]] = [{}]
+            self.urllib_dispatch_aliases: list[set[str]] = [set()]
 
         def _scope_name(self) -> str:
             return ".".join(self.scope)
@@ -326,18 +334,24 @@ def _production_http_mutation_occurrences(
         def _resolved_call_name(self, node: ast.expr) -> str:
             return _resolve_import_alias(_call_name(node), self.import_aliases)
 
-        def _push_scope(self, name: str, node: ast.AST) -> None:
+        def _push_scope(self, name: str, kind: str, node: ast.AST) -> None:
             self.scope.append(name)
+            self.scope_kinds.append(kind)
             self.urllib_requests.append(set())
+            self.raw_http_aliases.append({})
+            self.urllib_dispatch_aliases.append(set())
             self.generic_visit(node)
+            self.urllib_dispatch_aliases.pop()
+            self.raw_http_aliases.pop()
             self.urllib_requests.pop()
+            self.scope_kinds.pop()
             self.scope.pop()
 
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            self._push_scope(node.name, node)
+            self._push_scope(node.name, "class", node)
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            self._push_scope(node.name, node)
+            self._push_scope(node.name, "function", node)
 
         def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
             self.visit_FunctionDef(node)
@@ -361,26 +375,117 @@ def _production_http_mutation_occurrences(
                 binding = imported.asname or imported.name
                 self.import_aliases[binding] = f"{module}.{imported.name}".strip(".")
 
-        def visit_Assign(self, node: ast.Assign) -> None:
-            self._remember_urllib_request(node.value, node.targets)
-            self.generic_visit(node)
-
         def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
             self._remember_urllib_request(node.value, [node.target])
+            self._remember_raw_http_alias(node.value, [node.target])
+            self._remember_urllib_dispatch_alias(node.value, [node.target])
             self.generic_visit(node)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self._remember_urllib_request(node.value, node.targets)
+            self._remember_raw_http_alias(node.value, node.targets)
+            self._remember_urllib_dispatch_alias(node.value, node.targets)
+            self.generic_visit(node)
+
+        def _binding_scope_index(self, target: ast.expr) -> int:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+            ):
+                for index in range(len(self.scope_kinds) - 1, -1, -1):
+                    if self.scope_kinds[index] == "class":
+                        return index
+            return -1
+
+        def _bind_names(
+            self, bindings: list[set[str]], targets: list[ast.expr]
+        ) -> None:
+            for target in targets:
+                if isinstance(target, (ast.Name, ast.Attribute)):
+                    bindings[self._binding_scope_index(target)].add(_call_name(target))
+
+        def _bind_raw_http_aliases(
+            self, method: str, targets: list[ast.expr]
+        ) -> None:
+            for target in targets:
+                if isinstance(target, (ast.Name, ast.Attribute)):
+                    self.raw_http_aliases[self._binding_scope_index(target)][
+                        _call_name(target)
+                    ] = method
+
+        def _lookup_raw_http_alias(self, name: str) -> str | None:
+            for frame in reversed(self.raw_http_aliases):
+                if name in frame:
+                    return frame[name]
+            return None
+
+        def _raw_http_mutation_method(self, node: ast.expr) -> str | None:
+            name = _call_name(node)
+            bound_method = self._lookup_raw_http_alias(name)
+            if bound_method is not None:
+                return bound_method
+            resolved_name = self._resolved_call_name(node)
+            method = resolved_name.rsplit(".", 1)[-1]
+            if method not in _HTTP_MUTATION_METHODS:
+                return None
+            if isinstance(node, ast.Attribute):
+                return method
+            if isinstance(node, ast.Name) and resolved_name.startswith(
+                ("requests.", "httpx.", "urllib3.", "aiohttp.")
+            ):
+                return method
+            return None
+
+        def _is_urllib_dispatch_callable(self, node: ast.expr) -> bool:
+            name = _call_name(node)
+            if any(name in names for names in reversed(self.urllib_dispatch_aliases)):
+                return True
+            resolved_name = self._resolved_call_name(node)
+            return (
+                resolved_name
+                in {"urllib.request.urlopen", "urllib.request.OpenerDirector.open"}
+                or (isinstance(node, ast.Attribute) and node.attr == "open")
+            )
+
+        @staticmethod
+        def _urllib_dispatch_request_arguments(node: ast.Call) -> list[ast.expr]:
+            return [
+                *node.args[:1],
+                *(
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg in {"url", "fullurl"}
+                ),
+            ]
 
         def _remember_urllib_request(
             self, value: ast.expr | None, targets: list[ast.expr]
         ) -> None:
-            if not isinstance(value, ast.Call):
+            is_request = (
+                isinstance(value, ast.Call)
+                and _is_potentially_mutating_urllib_request(
+                    value, self._resolved_call_name(value.func)
+                )
+            ) or self._is_tracked_urllib_request(value)
+            if not is_request:
                 return
-            if not _is_potentially_mutating_urllib_request(
-                value, self._resolved_call_name(value.func)
-            ):
+            self._bind_names(self.urllib_requests, targets)
+
+        def _remember_raw_http_alias(
+            self, value: ast.expr | None, targets: list[ast.expr]
+        ) -> None:
+            if value is None:
                 return
-            for target in targets:
-                if isinstance(target, (ast.Name, ast.Attribute)):
-                    self.urllib_requests[-1].add(_call_name(target))
+            method = self._raw_http_mutation_method(value)
+            if method is not None:
+                self._bind_raw_http_aliases(method, targets)
+
+        def _remember_urllib_dispatch_alias(
+            self, value: ast.expr | None, targets: list[ast.expr]
+        ) -> None:
+            if value is not None and self._is_urllib_dispatch_callable(value):
+                self._bind_names(self.urllib_dispatch_aliases, targets)
 
         def _is_tracked_urllib_request(self, node: ast.expr | None) -> bool:
             if isinstance(node, ast.Call):
@@ -393,22 +498,16 @@ def _production_http_mutation_occurrences(
             return any(name in names for names in reversed(self.urllib_requests))
 
         def visit_Call(self, node: ast.Call) -> None:
-            name = self._resolved_call_name(node.func)
-            method = name.rsplit(".", 1)[-1]
-            is_direct_imported_http_mutation = (
-                isinstance(node.func, ast.Name)
-                and method in _HTTP_MUTATION_METHODS
-                and name.startswith(("requests.", "httpx.", "urllib3.", "aiohttp."))
-            )
-            if (
-                isinstance(node.func, ast.Attribute)
-                and method in _HTTP_MUTATION_METHODS
-            ) or is_direct_imported_http_mutation:
-                self._record(node, f"raw-http-{method}")
+            raw_http_method = self._raw_http_mutation_method(node.func)
+            if raw_http_method is not None:
+                self._record(node, f"raw-http-{raw_http_method}")
             elif (
-                name in {"urllib.request.urlopen", "urllib.request.OpenerDirector.open"}
-                or (isinstance(node.func, ast.Attribute) and method == "open")
-            ) and node.args and self._is_tracked_urllib_request(node.args[0]):
+                self._is_urllib_dispatch_callable(node.func)
+                and any(
+                    self._is_tracked_urllib_request(argument)
+                    for argument in self._urllib_dispatch_request_arguments(node)
+                )
+            ):
                 self._record(node, "raw-urllib-mutation-dispatch")
             self.generic_visit(node)
 
@@ -438,7 +537,7 @@ _HTTP_MUTATION_CLASSIFICATIONS: dict[tuple[str, int, str, str], str] = {
         "non-trading-external-official-research-post"
     ),
     ("tradingagents/orchestration/n8n_api_sync.py", 171, "N8NDataTableApiClient.request", "raw-urllib-mutation-dispatch"): (
-        "non-trading-external-n8n-data-table-transport"
+        "non-trading-external-n8n-data-table-generic-method-transport"
     ),
     ("tradingagents/orchestration/n8n_api_sync.py", 189, "N8NDataTableApiClient.list_data_tables", "raw-http-request"): (
         "non-trading-external-n8n-data-table-read"
@@ -462,16 +561,16 @@ _HTTP_MUTATION_CLASSIFICATIONS: dict[tuple[str, int, str, str], str] = {
         "non-trading-external-n8n-data-table-insert"
     ),
     ("tradingagents/orchestration/n8n_evaluation_run_probe.py", 74, "N8NEvaluationRunProbeClient.request", "raw-urllib-mutation-dispatch"): (
-        "non-trading-external-n8n-evaluation-read-transport"
+        "non-trading-external-n8n-evaluation-generic-method-transport"
     ),
     ("tradingagents/orchestration/n8n_evaluation_run_probe.py", 91, "N8NEvaluationRunProbeClient.list_workflows", "raw-http-request"): (
         "non-trading-external-n8n-evaluation-read"
     ),
     ("tradingagents/orchestration/n8n_evaluation_run_probe.py", 106, "N8NEvaluationRunProbeClient.probe", "raw-urllib-mutation-dispatch"): (
-        "non-trading-external-n8n-evaluation-probe"
+        "non-trading-external-n8n-evaluation-generic-method-probe"
     ),
     ("tradingagents/orchestration/n8n_workflow_sync.py", 63, "N8NWorkflowApiClient.request", "raw-urllib-mutation-dispatch"): (
-        "non-trading-external-n8n-workflow-transport"
+        "non-trading-external-n8n-workflow-generic-method-transport"
     ),
     ("tradingagents/orchestration/n8n_workflow_sync.py", 80, "N8NWorkflowApiClient.list_workflows", "raw-http-request"): (
         "non-trading-external-n8n-workflow-read"
@@ -805,6 +904,86 @@ def test_live_write_inventory_rejects_aliased_and_urllib_raw_http_bypasses(
             _production_http_mutation_occurrences(tmp_path),
             {},
         )
+
+
+@pytest.mark.parametrize(
+    ("source_text", "expected"),
+    (
+        (
+            "def bypass(client):\n"
+            "    send_order = client.post\n"
+            "    return send_order('https://api.alpaca.markets/v2/orders', json={})\n",
+            ("bypass", 3, "raw-http-post"),
+        ),
+        (
+            "from requests import post as raw_post\n"
+            "def bypass():\n"
+            "    send_order = raw_post\n"
+            "    return send_order('https://api.alpaca.markets/v2/orders', json={})\n",
+            ("bypass", 4, "raw-http-post"),
+        ),
+        (
+            "from urllib.request import Request, urlopen as wire_open\n"
+            "def bypass():\n"
+            "    request = Request('https://api.alpaca.markets/v2/orders', method='POST')\n"
+            "    dispatch = wire_open\n"
+            "    return dispatch(request)\n",
+            ("bypass", 5, "raw-urllib-mutation-dispatch"),
+        ),
+        (
+            "class Writer:\n"
+            "    def __init__(self, client):\n"
+            "        self.send_order = client.post\n"
+            "    def submit(self):\n"
+            "        return self.send_order('https://api.alpaca.markets/v2/orders', json={})\n",
+            ("Writer.submit", 5, "raw-http-post"),
+        ),
+        (
+            "from urllib.request import Request, urlopen\n"
+            "class Writer:\n"
+            "    def __init__(self):\n"
+            "        self.request = Request('https://api.alpaca.markets/v2/orders', method='POST')\n"
+            "    def submit(self):\n"
+            "        return urlopen(url=self.request)\n",
+            ("Writer.submit", 6, "raw-urllib-mutation-dispatch"),
+        ),
+        (
+            "from urllib.request import Request, build_opener\n"
+            "class Writer:\n"
+            "    def __init__(self):\n"
+            "        self.request = Request('https://api.alpaca.markets/v2/orders', None, {}, None, False, 'POST')\n"
+            "        self.opener = build_opener()\n"
+            "    def submit(self):\n"
+            "        return self.opener.open(fullurl=self.request)\n",
+            ("Writer.submit", 7, "raw-urllib-mutation-dispatch"),
+        ),
+        (
+            "from urllib.request import Request, urlopen\n"
+            "def bypass():\n"
+            "    request = Request('https://api.alpaca.markets/v2/orders', data=None, method='POST')\n"
+            "    return urlopen(url=request)\n",
+            ("bypass", 4, "raw-urllib-mutation-dispatch"),
+        ),
+    ),
+)
+def test_raw_http_mutation_inventory_tracks_callable_and_request_provenance(
+    tmp_path, source_text, expected
+):
+    """Bound aliases cannot hide a raw HTTP mutation from exact-source review."""
+
+    source = tmp_path / "tradingagents" / "new_bound_transport_bypass.py"
+    source.parent.mkdir()
+    source.write_text(source_text, encoding="utf-8")
+
+    occurrences = _production_http_mutation_occurrences(tmp_path)
+
+    scope, line, name = expected
+    assert (
+        "tradingagents/new_bound_transport_bypass.py",
+        line,
+        scope,
+        name,
+    ) in occurrences
 
 
 def test_strategy_tournament_command_is_intent_only_and_cannot_write_orders():
