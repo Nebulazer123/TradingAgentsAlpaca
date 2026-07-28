@@ -132,6 +132,30 @@ def test_confirmed_submission_replaces_reservation_time_with_broker_acceptance_t
     ) == 1
 
 
+def test_normal_live_reservation_requires_an_existing_ledger_without_recreating_it(
+    tmp_path,
+):
+    """Break caught: final live reservation bootstrapped missing rate state."""
+    from tradingagents.policy.order_rate_limit import (
+        LiveOrderRateLedgerError,
+        reserve_live_order_submission,
+    )
+
+    path = tmp_path / "rate.json"
+
+    with pytest.raises(LiveOrderRateLedgerError, match="unavailable"):
+        reserve_live_order_submission(
+            path,
+            client_order_id="must-not-bootstrap",
+            now=NOW,
+            window_minutes=60,
+            max_orders=1,
+            require_existing_ledger=True,
+        )
+
+    assert not path.exists()
+
+
 @pytest.mark.parametrize(
     "raw",
     (

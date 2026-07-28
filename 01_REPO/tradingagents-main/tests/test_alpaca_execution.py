@@ -715,6 +715,11 @@ def _normal_live_admission(
         encoding="utf-8",
     )
     rate_path = (tmp_path / "normal-live-rate.json").resolve()
+    # A valid normal-live admission always has an observer-owned ledger before
+    # policy work starts. The final reservation must only use this existing
+    # ledger, never bootstrap a new one after the policy handoff.
+    if not rate_path.exists():
+        rate_path.write_text('{"submissions": []}', encoding="utf-8")
     if rate_records:
         from tradingagents.policy.order_rate_limit import record_live_order_submission
 
@@ -1456,15 +1461,103 @@ def test_live_client_raw_post_requires_a_policy_owned_capability():
     assert client.session.requests == []
 
 
-def test_live_client_generic_transport_rejects_direct_live_order_post_without_token():
+@pytest.mark.parametrize(
+    ("method", "path"),
+    (
+        ("POST", "/v2/orders"),
+        ("post", "/v2/orders?retry=1"),
+        ("POST", "/v2/orders/"),
+        ("POST", "/v2/orders#submit"),
+    ),
+)
+def test_live_client_generic_transport_rejects_every_live_order_path_without_token(
+    method, path
+):
     """Break caught: a generic transport call could bypass the post capability."""
     client = _fake_live_client()
     intent = _normal_live_intent()
 
     with pytest.raises(ValueError, match="policy post capability"):
-        client._request("POST", "/v2/orders", json=_bound_normal_live_order(intent))
+        client._request(method, path, json=_bound_normal_live_order(intent))
 
     assert client.session.requests == []
+
+
+def test_live_client_session_view_has_no_raw_transport_escape_hatch():
+    """Break caught: a public client/session attribute reached raw broker I/O."""
+    client = _fake_live_client()
+
+    assert not hasattr(client, "_session")
+    assert not hasattr(client.session, "_raw_session")
+    assert not hasattr(client.session, "request")
+    assert client.session.requests == []
+
+
+@pytest.mark.parametrize("paper", (0, 1, "false", None))
+def test_live_client_rejects_non_boolean_paper_setting_before_transport(paper):
+    """Break caught: truthy/falsy mode values could bypass the live transport branch."""
+    session = _FakeLiveSession()
+
+    with pytest.raises(AlpacaModeError, match="exact bool"):
+        AlpacaRestClient(
+            settings=AlpacaSettings(
+                api_key="test-key",
+                secret_key="test-secret",
+                paper=paper,
+                base_url="https://api.alpaca.markets",
+            ),
+            session=session,
+        )
+
+    assert session.requests == []
+
+
+def test_rate_ledger_deletion_before_final_reservation_blocks_all_broker_io(
+    tmp_path, monkeypatch
+):
+    """Break caught: a missing final ledger was recreated after the outer preflight."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    rate_path = tmp_path / "normal-live-rate.json"
+    # The outer preflight already observed this valid ledger. The race deletes
+    # it only immediately before the final reservation under the handoff lock.
+    rate_path.write_text('{"submissions": []}', encoding="utf-8")
+    session = _FakeLiveSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+    original_reserve = supervisor_module.reserve_live_order_submission
+
+    def delete_ledger_before_final_reservation(path, **kwargs):
+        Path(path).unlink()
+        return original_reserve(path, **kwargs)
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "reserve_live_order_submission",
+        delete_ledger_before_final_reservation,
+    )
+
+    with pytest.raises(ValueError, match="rate ledger"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    assert session.requests == []
+    assert not rate_path.exists()
 
 
 @pytest.mark.parametrize("baseline_state", ("missing", "corrupt"))
@@ -1558,6 +1651,8 @@ def test_supervisor_rejects_local_gate_failures_before_owned_metrics_reads(
             "live_budget_mode: unsupported", encoding="utf-8"
         )
         rate_path.write_text('{"submissions": []}', encoding="utf-8")
+    elif local_failure == "missing_rate_ledger":
+        rate_path.unlink()
     elif local_failure == "corrupt_rate_ledger":
         rate_path.write_text("{not-json", encoding="utf-8")
     session = _FakeLiveSession()

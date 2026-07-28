@@ -1029,6 +1029,7 @@ def _reserve_normal_live_submit_claim(
         now=_normal_live_admission_moment(),
         window_minutes=envelope.live_order_window_minutes,
         max_orders=envelope.max_live_orders_per_window,
+        require_existing_ledger=True,
     )
 
 

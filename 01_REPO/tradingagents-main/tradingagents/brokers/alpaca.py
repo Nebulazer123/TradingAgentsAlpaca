@@ -11,9 +11,11 @@ import datetime
 import hashlib
 import json
 import os
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
+from urllib.parse import urlsplit
 
 import requests
 
@@ -44,24 +46,66 @@ class AlpacaExecutionError(RuntimeError):
     """Raised when Alpaca rejects or fails an HTTP request."""
 
 
+_ALPACA_CLIENT_SESSIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_ALPACA_SESSION_VIEW_SESSIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _raw_alpaca_session_for_client(client: object) -> object:
+    """Return a raw session only to this module's classified transport path."""
+
+    try:
+        return _ALPACA_CLIENT_SESSIONS[client]
+    except KeyError as exc:
+        raise RuntimeError("Alpaca client transport is unavailable") from exc
+
+
+def _raw_alpaca_session_for_view(view: object) -> object:
+    """Return a raw session only for the non-transport session observer view."""
+
+    try:
+        return _ALPACA_SESSION_VIEW_SESSIONS[view]
+    except KeyError as exc:
+        raise RuntimeError("Alpaca session observer is unavailable") from exc
+
+
 class _AlpacaSessionView:
-    """Expose test/session state without exposing the raw request primitive."""
+    """Expose non-transport session state without exposing raw broker I/O."""
 
     def __init__(self, raw_session: object):
-        object.__setattr__(self, "_raw_session", raw_session)
+        _ALPACA_SESSION_VIEW_SESSIONS[self] = raw_session
 
     def __getattr__(self, name: str):
-        if name == "request":
+        if name in {"request", "_raw_session"}:
             raise AttributeError(
                 "raw Alpaca session.request is internal; use the classified client boundary"
             )
-        return getattr(self._raw_session, name)
+        return getattr(_raw_alpaca_session_for_view(self), name)
 
     def __setattr__(self, name: str, value: object) -> None:
-        if name == "_raw_session":
-            object.__setattr__(self, name, value)
-            return
-        setattr(self._raw_session, name, value)
+        if name in {"request", "_raw_session"}:
+            raise AttributeError(
+                "raw Alpaca session.request is internal; use the classified client boundary"
+            )
+        setattr(_raw_alpaca_session_for_view(self), name, value)
+
+
+def _require_exact_paper_setting(settings: object) -> None:
+    """Reject truthy/falsy impostors before they choose a broker mode."""
+
+    if type(getattr(settings, "paper", None)) is not bool:
+        raise AlpacaModeError("Alpaca settings.paper must be an exact bool")
+
+
+def _normalized_alpaca_route(path: object) -> str:
+    """Normalize a path for the lowest broker-write transport guard."""
+
+    if type(path) is not str:
+        raise ValueError("Alpaca request path must be an exact string")
+    try:
+        route = urlsplit(path).path
+    except ValueError as exc:
+        raise ValueError("Alpaca request path is invalid") from exc
+    return route.rstrip("/") or "/"
 
 
 @dataclass(frozen=True)
@@ -759,16 +803,23 @@ class AlpacaRestClient:
         normal_live_evidence_root=None,
         normal_live_repo_root=None,
     ):
+        _require_exact_paper_setting(settings)
         self.settings = settings
-        self._session = session or requests.Session()
-        self.session = _AlpacaSessionView(self._session)
+        _ALPACA_CLIENT_SESSIONS[self] = session or requests.Session()
         self.normal_live_evidence_root = normal_live_evidence_root
         self.normal_live_repo_root = normal_live_repo_root
         self._normal_live_broker_read_adapter = _register_normal_live_broker_read_adapter(
             self
         )
 
+    @property
+    def session(self) -> _AlpacaSessionView:
+        """Return a read/fixture observer that cannot issue broker requests."""
+
+        return _AlpacaSessionView(_raw_alpaca_session_for_client(self))
+
     def assert_expected_mode(self, *, paper: bool) -> None:
+        _require_exact_paper_setting(self.settings)
         base_url = self.settings.base_url.lower()
         points_to_paper = "paper-api.alpaca.markets" in base_url
         if paper and (not self.settings.paper or not points_to_paper):
@@ -932,9 +983,11 @@ class AlpacaRestClient:
         policy_post_capability: object | None = None,
         **kwargs,
     ):
+        _require_exact_paper_setting(self.settings)
+        normalized_route = _normalized_alpaca_route(path)
         if (
             method.upper() == "POST"
-            and path == "/v2/orders"
+            and normalized_route == "/v2/orders"
             and self.settings.paper is False
         ):
             payload = _snapshot_normal_live_order(kwargs.get("json"))
@@ -952,7 +1005,8 @@ class AlpacaRestClient:
             )
             kwargs["json"] = payload
         url = f"{self.settings.base_url.rstrip('/')}{path}"
-        response = self._session.request(
+        raw_session = _raw_alpaca_session_for_client(self)
+        response = raw_session.request(
             method,
             url,
             headers={

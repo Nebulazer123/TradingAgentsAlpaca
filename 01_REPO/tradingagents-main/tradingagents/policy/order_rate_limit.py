@@ -152,6 +152,7 @@ def reserve_live_order_submission(
     now: datetime.datetime,
     window_minutes: int,
     max_orders: int,
+    require_existing_ledger: bool = False,
 ) -> None:
     """Durably reserve one live-order slot before broker I/O.
 
@@ -164,8 +165,16 @@ def reserve_live_order_submission(
         raise ValueError("live order reservation requires a positive window")
     if type(max_orders) is not int or max_orders <= 0:
         raise ValueError("live order reservation requires a positive maximum")
+    if type(require_existing_ledger) is not bool:
+        raise ValueError("live order reservation requires an exact existing-ledger flag")
     normalized_client_order_id = str(client_order_id)
     with _rate_limit_lock(path):
+        # Paper/bootstrap paths may create their first ledger, but a normal-live
+        # handoff has already completed its full policy work.  It must prove the
+        # same ledger still exists while holding the reservation lock; otherwise
+        # a deletion race would silently recreate fresh live-order capacity.
+        if require_existing_ledger and not Path(path).is_file():
+            raise LiveOrderRateLedgerError("live order rate ledger is unavailable")
         records = _load_records(path)
         if any(
             str(record.get("client_order_id", "")) == normalized_client_order_id

@@ -2,6 +2,7 @@ import ast
 import json
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -203,7 +204,7 @@ _LIVE_WRITE_CALLER_CLASSIFICATIONS = {
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "self._request"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "definition"): "exact-intent-boundary",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "self._request"): "exact-intent-boundary",
-        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._request", "self._session.request"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._request", "raw_session.request"): "exact-intent-boundary",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "definition"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.assert_expected_mode"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "paper_client.submit_order"): "hard-disabled",
@@ -271,16 +272,27 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                 and keyword.value.value is False
                 for keyword in node.keywords
             )
+            normalized_order_route = (
+                urlsplit(node.args[1].value).path.rstrip("/")
+                if len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and type(node.args[1].value) is str
+                else None
+            )
             is_raw_order_request = (
                 name.endswith("._request")
                 and len(node.args) >= 2
                 and all(
                     isinstance(node.args[index], ast.Constant)
-                    and node.args[index].value == expected
-                    for index, expected in enumerate(("POST", "/v2/orders"))
+                    for index in range(2)
                 )
+                and type(node.args[0].value) is str
+                and node.args[0].value.upper() == "POST"
+                and normalized_order_route == "/v2/orders"
             )
-            is_raw_session_request = name.endswith((".session.request", "._session.request"))
+            is_raw_session_request = name.endswith(
+                (".session.request", "._session.request", "._raw_session.request")
+            ) or name == "raw_session.request"
             has_order_endpoint_primitive = (
                 not name.endswith("._request")
                 and not is_raw_session_request
@@ -401,7 +413,12 @@ def test_live_write_inventory_rejects_an_unclassified_raw_post_caller(tmp_path):
     "source_text",
     (
         'def bypass(client):\n    return client._request("POST", "/v2/orders", json={})\n',
+        'def bypass(client):\n    return client._request("POST", "/v2/orders?retry=1", json={})\n',
+        'def bypass(client):\n    return client._request("POST", "/v2/orders/", json={})\n',
+        'def bypass(client):\n    return client._request("POST", "/v2/orders#submit", json={})\n',
         'def bypass(client):\n    return client.session.request("POST", "/v2/orders", json={})\n',
+        'def bypass(client):\n    return client._session.request("POST", "/v2/orders", json={})\n',
+        'def bypass(client):\n    return client.session._raw_session.request("POST", "/v2/orders", json={})\n',
         'def bypass(client):\n    return requests.post("/v2/orders", json={})\n',
     ),
 )
