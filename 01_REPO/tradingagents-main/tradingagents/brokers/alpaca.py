@@ -20,6 +20,14 @@ import requests
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 from tradingagents.schemas.trading import TradeIntent
+from tradingagents.strategy._immutable_evidence_store import (
+    NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+    NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+    NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
+    EvidenceCandidate,
+    ImmutableStrategyEvidenceStore,
+    _thaw_json,
+)
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 LIVE_BASE_URL = "https://api.alpaca.markets"
@@ -660,7 +668,10 @@ def _canonical_live_state(state: object) -> bytes:
 
 
 def _require_normal_live_receipt(
-    intent: AuthorizedNormalTradeIntent, value: object
+    intent: AuthorizedNormalTradeIntent,
+    value: object,
+    *,
+    store: ImmutableStrategyEvidenceStore,
 ) -> NormalLiveActivationReceipt:
     if type(value) is not NormalLiveActivationReceipt:
         raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
@@ -680,7 +691,124 @@ def _require_normal_live_receipt(
         or value.execution_authority != "none"
     ):
         raise ValueError("normal live activation receipt does not link to exact intent")
+    _require_durable_normal_live_activation(intent, value, store=store)
     return value
+
+
+def _durable_activation_payload(value: object) -> dict[str, object]:
+    thawed = _thaw_json(value)
+    if not isinstance(thawed, dict):
+        raise ValueError("durable activation evidence payload is invalid")
+    return thawed
+
+
+def _require_durable_normal_live_activation(
+    intent: AuthorizedNormalTradeIntent,
+    receipt: NormalLiveActivationReceipt,
+    *,
+    store: ImmutableStrategyEvidenceStore,
+) -> None:
+    try:
+        prepares = [
+            envelope
+            for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND)
+            if envelope.object_id == receipt.activation_prepare_id
+        ]
+        receipts = [
+            envelope
+            for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND)
+            if envelope.object_id == receipt.activation_receipt_id
+        ]
+    except ValueError as exc:
+        raise ValueError("durable activation evidence is unavailable") from exc
+    if len(prepares) != 1 or len(receipts) != 1:
+        raise ValueError("durable activation receipt is missing")
+    prepare = prepares[0]
+    durable_receipt = receipts[0]
+    prepare_payload = _durable_activation_payload(prepare.payload)
+    receipt_payload = _durable_activation_payload(durable_receipt.payload)
+    receipt_fields = set(prepare_payload) | {
+        "activation_prepare_id",
+        "activation_prepare_sha256",
+    }
+    if set(receipt_payload) != receipt_fields:
+        raise ValueError("durable activation receipt fields are invalid")
+    if (
+        receipt_payload.get("activation_prepare_id") != prepare.object_id
+        or receipt_payload.get("activation_prepare_sha256")
+        != hashlib.sha256(prepare.canonical_json_bytes()).hexdigest()
+    ):
+        raise ValueError("durable activation receipt does not bind its prepare")
+    receipt_material = dict(receipt_payload)
+    receipt_material.pop("activation_prepare_id")
+    receipt_material.pop("activation_prepare_sha256")
+    if receipt_material != prepare_payload:
+        raise ValueError("durable activation receipt payload is inconsistent")
+    intent_full_sha256 = hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
+    expected = {
+        "schema_version": 1,
+        "intent_full_sha256": intent_full_sha256,
+        "logical_order_sha256": intent.logical_order_sha256,
+        "proposal_id": intent.promotion_proposal_id,
+        "proposal_sha256": intent.promotion_proposal_sha256,
+        "promotion_sync_receipt_id": intent.promotion_sync_receipt_id,
+        "promotion_sync_receipt_sha256": intent.promotion_sync_receipt_sha256,
+        "risk_snapshot_sha256": intent.risk_snapshot_sha256,
+        "risk_envelope_sha256": intent.risk_snapshot_sha256,
+        "evaluation_runtime_sha256": intent.evaluation_runtime_sha256,
+        "promotion_runtime_commit": intent.evaluation_code_commit,
+        "canonical_before_sha256": intent.promotion_state_sha256,
+        "canonical_after_sha256": receipt.canonical_after_sha256,
+        "demoted": [],
+        "unchanged": [],
+        "live_enabled": True,
+    }
+    expected_fields = set(expected) | {"state_path", "promoted"}
+    if (
+        set(prepare_payload) != expected_fields
+        or any(prepare_payload.get(field) != value for field, value in expected.items())
+    ):
+        raise ValueError("durable activation evidence does not match exact intent")
+    state_path = prepare_payload.get("state_path")
+    promoted = prepare_payload.get("promoted")
+    sleeves = receipt.state.get("sleeves")
+    if (
+        type(state_path) is not str
+        or not state_path
+        or type(promoted) is not list
+        or len(promoted) != 1
+        or type(promoted[0]) is not str
+        or not isinstance(sleeves, Mapping)
+        or not isinstance(sleeves.get(promoted[0]), Mapping)
+        or sleeves[promoted[0]].get("stage") != "tiny_live_eligible"
+        or sleeves[promoted[0]].get("live_enabled") is not True
+    ):
+        raise ValueError("durable activation receipt has no bound live-eligible sleeve")
+
+
+def _normal_live_broker_submit_candidate(
+    *,
+    intent: AuthorizedNormalTradeIntent,
+    receipt: NormalLiveActivationReceipt,
+    immutable_facts: Mapping[str, object],
+) -> EvidenceCandidate:
+    facts_bytes = json.dumps(
+        dict(immutable_facts), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    payload = {
+        "schema_version": 1,
+        "intent_full_sha256": hashlib.sha256(intent.canonical_json_bytes()).hexdigest(),
+        "logical_order_sha256": intent.logical_order_sha256,
+        "client_order_id": intent.client_order_id,
+        "activation_prepare_id": receipt.activation_prepare_id,
+        "activation_receipt_id": receipt.activation_receipt_id,
+        "immutable_order_sha256": hashlib.sha256(facts_bytes).hexdigest(),
+    }
+    return EvidenceCandidate(
+        kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
+        effective_at=intent.recorded_at,
+        payload=payload,
+    )
 
 
 def _normal_live_order_facts(order: Mapping[str, object]) -> dict[str, object]:
@@ -709,13 +837,10 @@ def _require_matching_broker_order(
 
 
 class AlpacaRestClient:
-    def __init__(self, settings: AlpacaSettings, session=None):
+    def __init__(self, settings: AlpacaSettings, session=None, *, normal_live_evidence_root=None):
         self.settings = settings
         self.session = session or requests.Session()
-        # An activation receipt already carries a durable prepare record.  This
-        # in-memory view only prevents this client instance from turning a
-        # retry or an uncertain response into a second live POST.
-        self._live_submit_records: dict[str, dict[str, object]] = {}
+        self.normal_live_evidence_root = normal_live_evidence_root
 
     def assert_expected_mode(self, *, paper: bool) -> None:
         base_url = self.settings.base_url.lower()
@@ -777,43 +902,44 @@ class AlpacaRestClient:
             return self._request("POST", "/v2/orders", json=dict(order))
 
         intent = _require_normal_live_intent(authorized_normal_trade_intent)
-        receipt = _require_normal_live_receipt(intent, activation_receipt)
+        if type(activation_receipt) is not NormalLiveActivationReceipt:
+            raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
         checked_at = _normal_live_submit_time(now)
+        if self.normal_live_evidence_root is None:
+            raise ValueError("live submit requires a durable normal-live evidence root")
+        store = ImmutableStrategyEvidenceStore(
+            self.normal_live_evidence_root,
+            clock=lambda: checked_at,
+        )
+        receipt = _require_normal_live_receipt(
+            intent, activation_receipt, store=store
+        )
         intent.verify_order_payload(order, at=checked_at)
         payload = dict(order)
         client_order_id = intent.client_order_id
-        receipt_id = receipt.activation_receipt_id
         immutable_facts = _normal_live_order_facts(payload)
-        existing = self._live_submit_records.get(client_order_id)
-        if existing is not None:
-            if (
-                existing["receipt_id"] != receipt_id
-                or existing["intent_full_sha256"]
-                != hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
-                or existing["immutable_facts"] != immutable_facts
-            ):
-                raise ValueError("live submit record does not match exact authorization")
-        else:
-            self._live_submit_records[client_order_id] = {
-                "receipt_id": receipt_id,
-                "intent_full_sha256": hashlib.sha256(
-                    intent.canonical_json_bytes()
-                ).hexdigest(),
-                "immutable_facts": immutable_facts,
-                "post_attempted": False,
-            }
-            existing = self._live_submit_records[client_order_id]
+        candidate = _normal_live_broker_submit_candidate(
+            intent=intent,
+            receipt=receipt,
+            immutable_facts=immutable_facts,
+        )
+        try:
+            admission = store.admit_checked(
+                candidate,
+                validate=lambda _snapshot, _envelope: None,
+            )
+        except ValueError as exc:
+            raise ValueError("durable live submit prepare could not be recorded") from exc
 
-        # The receipt's durable prepare makes this an idempotent lookup before
-        # its one allowed POST.  A retry is read-only first and never creates a
-        # replacement client ID.
+        # The broker-submit prepare is immutable and created before the first
+        # possible POST. A retry sees an existing prepare, performs only this
+        # lookup, and cannot create a second order after a crash or timeout.
         found = self._lookup_live_order_by_client_order_id(client_order_id)
         if found is not None:
             _require_matching_broker_order(found, immutable_facts)
             return found
-        if existing["post_attempted"] is True:
+        if not admission.created:
             raise ValueError("live retry lookup found no order; refusing second POST")
-        existing["post_attempted"] = True
         submitted = self._request("POST", "/v2/orders", json=payload)
         _require_matching_broker_order(submitted, immutable_facts)
         return submitted

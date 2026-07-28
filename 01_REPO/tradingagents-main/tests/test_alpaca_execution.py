@@ -27,6 +27,13 @@ from tradingagents.brokers.alpaca import (
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 from tradingagents.schemas.trading import TradeIntent
+from tradingagents.strategy._immutable_evidence_store import (
+    NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+    NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+    NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
+    EvidenceCandidate,
+    ImmutableStrategyEvidenceStore,
+)
 
 
 def _strategy_order(
@@ -390,6 +397,77 @@ def _activation_receipt(
     )
 
 
+def _durable_activation_receipt(
+    evidence_root, intent: AuthorizedNormalTradeIntent, *, sleeve="normal"
+) -> NormalLiveActivationReceipt:
+    state = {
+        "sleeves": {
+            sleeve: {"stage": "tiny_live_eligible", "live_enabled": True}
+        }
+    }
+    state_bytes = json.dumps(
+        state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    after_sha256 = hashlib.sha256(state_bytes).hexdigest()
+    intent_full_sha256 = hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
+    store = ImmutableStrategyEvidenceStore(
+        evidence_root,
+        clock=lambda: datetime.datetime(2026, 7, 28, 12, 0, tzinfo=datetime.timezone.utc),
+    )
+    prepare_payload = {
+        "schema_version": 1,
+        "intent_full_sha256": intent_full_sha256,
+        "logical_order_sha256": intent.logical_order_sha256,
+        "proposal_id": intent.promotion_proposal_id,
+        "proposal_sha256": intent.promotion_proposal_sha256,
+        "promotion_sync_receipt_id": intent.promotion_sync_receipt_id,
+        "promotion_sync_receipt_sha256": intent.promotion_sync_receipt_sha256,
+        "risk_snapshot_sha256": intent.risk_snapshot_sha256,
+        "risk_envelope_sha256": intent.risk_snapshot_sha256,
+        "evaluation_runtime_sha256": intent.evaluation_runtime_sha256,
+        "promotion_runtime_commit": intent.evaluation_code_commit,
+        "canonical_before_sha256": intent.promotion_state_sha256,
+        "canonical_after_sha256": after_sha256,
+        "state_path": "promotion-state.json",
+        "promoted": [sleeve],
+        "demoted": [],
+        "unchanged": [],
+        "live_enabled": True,
+    }
+    prepare = store.admit_checked(
+        EvidenceCandidate(
+            kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+            effective_at="2026-07-28T12:00:00+00:00",
+            payload=prepare_payload,
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    ).envelope
+    receipt = store.admit_checked(
+        EvidenceCandidate(
+            kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+            effective_at="2026-07-28T12:00:00+00:00",
+            payload={
+                **prepare_payload,
+                "activation_prepare_id": prepare.object_id,
+                "activation_prepare_sha256": hashlib.sha256(
+                    prepare.canonical_json_bytes()
+                ).hexdigest(),
+            },
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    ).envelope
+    return NormalLiveActivationReceipt(
+        activation_prepare_id=prepare.object_id,
+        activation_receipt_id=receipt.object_id,
+        intent_full_sha256=intent_full_sha256,
+        canonical_before_sha256=intent.promotion_state_sha256,
+        canonical_after_sha256=after_sha256,
+        state=state,
+        created=True,
+        status="activated",
+    )
+
+
 class _FakeResponse:
     def __init__(self, status_code: int, payload: object):
         self.status_code = status_code
@@ -401,10 +479,11 @@ class _FakeResponse:
 
 
 class _FakeLiveSession:
-    def __init__(self):
+    def __init__(self, *, fail_post=False):
         self.requests = []
         self.existing = {}
         self.post_calls = 0
+        self.fail_post = fail_post
 
     def add_existing_order(self, order: dict[str, object]) -> None:
         self.existing[str(order["client_order_id"])] = dict(order)
@@ -417,13 +496,15 @@ class _FakeLiveSession:
             return _FakeResponse(200, existing) if existing else _FakeResponse(404, {"message": "not found"})
         if method == "POST":
             self.post_calls += 1
+            if self.fail_post:
+                return _FakeResponse(500, {"message": "interrupted"})
             order = dict(kwargs["json"])
             self.existing[str(order["client_order_id"])] = order
             return _FakeResponse(200, order)
         raise AssertionError(f"unexpected method: {method}")
 
 
-def _fake_live_client() -> AlpacaRestClient:
+def _fake_live_client(evidence_root=None, *, session=None) -> AlpacaRestClient:
     return AlpacaRestClient(
         settings=AlpacaSettings(
             api_key="test-key",
@@ -431,7 +512,8 @@ def _fake_live_client() -> AlpacaRestClient:
             paper=False,
             base_url="https://api.alpaca.markets",
         ),
-        session=_FakeLiveSession(),
+        session=session or _FakeLiveSession(),
+        normal_live_evidence_root=evidence_root,
     )
 
 
@@ -444,8 +526,8 @@ def test_live_client_rejects_mapping_without_intent_before_request():
     assert client.session.requests == []
 
 
-def test_live_client_retries_by_client_order_id_without_second_post():
-    client = _fake_live_client()
+def test_live_client_retries_by_client_order_id_without_second_post(tmp_path):
+    client = _fake_live_client(tmp_path)
     intent = _normal_live_intent()
     order = _bound_normal_live_order(intent)
     client.session.add_existing_order(order)
@@ -453,7 +535,7 @@ def test_live_client_retries_by_client_order_id_without_second_post():
     response = client.submit_order(
         order,
         authorized_normal_trade_intent=intent,
-        activation_receipt=_activation_receipt(intent),
+        activation_receipt=_durable_activation_receipt(tmp_path, intent),
         now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
     )
 
@@ -462,8 +544,8 @@ def test_live_client_retries_by_client_order_id_without_second_post():
     assert [request[0] for request in client.session.requests] == ["GET"]
 
 
-def test_live_client_accepts_receipt_state_with_canonical_unicode():
-    client = _fake_live_client()
+def test_live_client_accepts_receipt_state_with_canonical_unicode(tmp_path):
+    client = _fake_live_client(tmp_path)
     intent = _normal_live_intent()
     order = _bound_normal_live_order(intent)
     client.session.add_existing_order(order)
@@ -471,8 +553,8 @@ def test_live_client_accepts_receipt_state_with_canonical_unicode():
     response = client.submit_order(
         order,
         authorized_normal_trade_intent=intent,
-        activation_receipt=_activation_receipt(
-            intent, {"sleeves": {"normal-é": {"live_enabled": True}}}
+        activation_receipt=_durable_activation_receipt(
+            tmp_path, intent, sleeve="normal-é"
         ),
         now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
     )
@@ -496,8 +578,8 @@ def test_live_client_rejects_untyped_receipt_before_request():
     assert client.session.requests == []
 
 
-def test_live_client_blocks_mismatched_retry_lookup_without_post():
-    client = _fake_live_client()
+def test_live_client_blocks_mismatched_retry_lookup_without_post(tmp_path):
+    client = _fake_live_client(tmp_path)
     intent = _normal_live_intent()
     order = _bound_normal_live_order(intent)
     client.session.add_existing_order({**order, "symbol": "AAPL"})
@@ -506,15 +588,15 @@ def test_live_client_blocks_mismatched_retry_lookup_without_post():
         client.submit_order(
             order,
             authorized_normal_trade_intent=intent,
-            activation_receipt=_activation_receipt(intent),
+            activation_receipt=_durable_activation_receipt(tmp_path, intent),
             now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
         )
 
     assert client.session.post_calls == 0
 
 
-def test_live_client_blocks_ambiguous_retry_lookup_without_post():
-    client = _fake_live_client()
+def test_live_client_blocks_ambiguous_retry_lookup_without_post(tmp_path):
+    client = _fake_live_client(tmp_path)
     intent = _normal_live_intent()
     client.session.add_existing_order({"client_order_id": intent.client_order_id})
 
@@ -522,20 +604,20 @@ def test_live_client_blocks_ambiguous_retry_lookup_without_post():
         client.submit_order(
             _bound_normal_live_order(intent),
             authorized_normal_trade_intent=intent,
-            activation_receipt=_activation_receipt(intent),
+            activation_receipt=_durable_activation_receipt(tmp_path, intent),
             now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
         )
 
     assert client.session.post_calls == 0
 
 
-def test_live_client_never_posts_twice_after_missing_retry_lookup():
-    client = _fake_live_client()
+def test_live_client_never_posts_twice_after_missing_retry_lookup(tmp_path):
+    client = _fake_live_client(tmp_path)
     intent = _normal_live_intent()
     order = _bound_normal_live_order(intent)
     kwargs = {
         "authorized_normal_trade_intent": intent,
-        "activation_receipt": _activation_receipt(intent),
+        "activation_receipt": _durable_activation_receipt(tmp_path, intent),
         "now": datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
     }
 
@@ -545,6 +627,50 @@ def test_live_client_never_posts_twice_after_missing_retry_lookup():
         client.submit_order(order, **kwargs)
 
     assert client.session.post_calls == 1
+
+
+def test_live_client_rejects_forged_direct_receipt_before_broker_request(tmp_path):
+    client = _fake_live_client(tmp_path)
+    intent = _normal_live_intent()
+
+    with pytest.raises(ValueError, match="durable activation"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=_activation_receipt(intent),
+            now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+        )
+
+    assert client.session.requests == []
+
+
+def test_fresh_live_client_after_uncertain_post_only_performs_lookup(tmp_path):
+    intent = _normal_live_intent()
+    receipt = _durable_activation_receipt(tmp_path, intent)
+    failed_session = _FakeLiveSession(fail_post=True)
+    initial = _fake_live_client(tmp_path, session=failed_session)
+    order = _bound_normal_live_order(intent)
+    kwargs = {
+        "authorized_normal_trade_intent": intent,
+        "activation_receipt": receipt,
+        "now": datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+    }
+
+    with pytest.raises(AlpacaExecutionError):
+        initial.submit_order(order, **kwargs)
+    assert len(
+        ImmutableStrategyEvidenceStore(tmp_path).envelopes(
+            kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND
+        )
+    ) == 1
+    retry_session = _FakeLiveSession()
+    retry = _fake_live_client(tmp_path, session=retry_session)
+    with pytest.raises(ValueError, match="retry lookup found no order"):
+        retry.submit_order(order, **kwargs)
+
+    assert failed_session.post_calls == 1
+    assert retry_session.post_calls == 0
+    assert [request[0] for request in retry_session.requests] == ["GET"]
 
 
 def test_execute_order_pairs_is_disabled_without_legacy_approval():

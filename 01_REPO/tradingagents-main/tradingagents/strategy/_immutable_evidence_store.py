@@ -28,6 +28,7 @@ STRATEGY_PROMOTION_SYNC_PREPARE_KIND = "strategy-promotion-sync-prepare"
 STRATEGY_PROMOTION_SYNC_RECEIPT_KIND = "strategy-promotion-sync-receipt"
 NORMAL_LIVE_ACTIVATION_PREPARE_KIND = "normal-live-activation-prepare"
 NORMAL_LIVE_ACTIVATION_RECEIPT_KIND = "normal-live-activation-receipt"
+NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND = "normal-live-broker-submit-prepare"
 
 _UTC = dt.timezone.utc
 _ZERO_HASH = "0" * 64
@@ -48,6 +49,7 @@ _ALLOWED_KINDS = frozenset(
         STRATEGY_PROMOTION_SYNC_RECEIPT_KIND,
         NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
         NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+        NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
     }
 )
 _STAGED_POINTER_NAME = re.compile(
