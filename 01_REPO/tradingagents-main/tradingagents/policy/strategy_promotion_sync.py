@@ -2060,43 +2060,42 @@ def activate_normal_live_intent(
                 prepares.append(envelope)
         if len(prepares) > 1:
             raise ValueError("multiple normal live activation prepares")
-        if prepares:
-            prepare = prepares[0]
-            prepare_created = False
-        else:
-            # The receipt/prepare scans above are durable I/O too.  Do not
-            # admit a fresh prepare using a Task 2 timestamp sampled before
-            # they completed.
+        staged = _stage_state_replacement(state_file, after)
+        try:
+            # Staging validates and durably writes a replacement image.  If
+            # Task 2 expires there, do not consume it with a prepare record.
             moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
             activated_at = _time_text(moment, "activated_at")
             checked_at = _time(activated_at, "activated_at")
             if not intent.is_active(at=checked_at):
                 raise ValueError("activation requires an active capped intent")
-            prepare_admission = store.admit_checked(
-                EvidenceCandidate(
-                    kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
-                    effective_at=activated_at,
-                    payload=expected_prepare,
-                ),
-                validate=lambda _snapshot, envelope: _require_activation_payload(
-                    _thaw_json(envelope.payload), expected=expected_prepare, receipt=False
-                ),
-            )
-            prepare = prepare_admission.envelope
-            prepare_created = prepare_admission.created
-        if fault_hook is not None:
-            fault_hook("after_prepare")
-        _require_state_path_anchor_current(state_anchor)
-        _require_snapshot_current(snapshot)
-        # A recovered prepare still cannot enable a sleeve after the bound
-        # authorization has expired while final file guards were running.
-        moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
-        activated_at = _time_text(moment, "activated_at")
-        checked_at = _time(activated_at, "activated_at")
-        if not intent.is_active(at=checked_at):
-            raise ValueError("activation requires an active capped intent")
-        staged = _stage_state_replacement(state_file, after)
-        try:
+            if prepares:
+                prepare = prepares[0]
+                prepare_created = False
+            else:
+                prepare_admission = store.admit_checked(
+                    EvidenceCandidate(
+                        kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+                        effective_at=activated_at,
+                        payload=expected_prepare,
+                    ),
+                    validate=lambda _snapshot, envelope: _require_activation_payload(
+                        _thaw_json(envelope.payload), expected=expected_prepare, receipt=False
+                    ),
+                )
+                prepare = prepare_admission.envelope
+                prepare_created = prepare_admission.created
+            if fault_hook is not None:
+                fault_hook("after_prepare")
+            _require_state_path_anchor_current(state_anchor)
+            _require_snapshot_current(snapshot)
+            # A recovered prepare still cannot enable a sleeve after the bound
+            # authorization has expired while final file guards were running.
+            moment = datetime.datetime.now(datetime.timezone.utc) if clock is None else clock()
+            activated_at = _time_text(moment, "activated_at")
+            checked_at = _time(activated_at, "activated_at")
+            if not intent.is_active(at=checked_at):
+                raise ValueError("activation requires an active capped intent")
             replaced = _replace_state_after_final_guard(
                 state_file=state_file,
                 snapshot=snapshot,
@@ -2104,32 +2103,32 @@ def activate_normal_live_intent(
                 after=after,
                 after_sha256=after_sha256,
             )
+            if fault_hook is not None:
+                fault_hook("after_replace")
+            expected_receipt = {
+                **expected_prepare,
+                "activation_prepare_id": prepare.object_id,
+                "activation_prepare_sha256": _digest(prepare.canonical_json_bytes()),
+            }
+            receipt_admission = store.admit_checked(
+                EvidenceCandidate(
+                    kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+                    effective_at=prepare.effective_at,
+                    payload=expected_receipt,
+                ),
+                validate=lambda _snapshot, envelope: _require_activation_payload(
+                    _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
+                ),
+            )
+            return NormalLiveActivationReceipt(
+                prepare.object_id,
+                receipt_admission.envelope.object_id,
+                intent_full_sha256,
+                snapshot.sha256,
+                replaced.sha256,
+                after_state,
+                prepare_created or receipt_admission.created,
+                "activated",
+            )
         finally:
             staged.unlink(missing_ok=True)
-        if fault_hook is not None:
-            fault_hook("after_replace")
-        expected_receipt = {
-            **expected_prepare,
-            "activation_prepare_id": prepare.object_id,
-            "activation_prepare_sha256": _digest(prepare.canonical_json_bytes()),
-        }
-        receipt_admission = store.admit_checked(
-            EvidenceCandidate(
-                kind=NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
-                effective_at=prepare.effective_at,
-                payload=expected_receipt,
-            ),
-            validate=lambda _snapshot, envelope: _require_activation_payload(
-                _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
-            ),
-        )
-        return NormalLiveActivationReceipt(
-            prepare.object_id,
-            receipt_admission.envelope.object_id,
-            intent_full_sha256,
-            snapshot.sha256,
-            replaced.sha256,
-            after_state,
-            prepare_created or receipt_admission.created,
-            "activated",
-        )

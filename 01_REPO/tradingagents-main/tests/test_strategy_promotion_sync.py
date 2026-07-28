@@ -3622,6 +3622,76 @@ def test_activation_rechecks_expiry_after_receipt_and_prepare_lookup(
     assert events.read_bytes() == before_events
 
 
+def test_activation_rechecks_expiry_after_staging_before_durable_artifacts(
+    tmp_path, monkeypatch
+) -> None:
+    """Expiry while staging cannot consume the intent or replace its state."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_activation_rechecks_expiry_after_staging_before_durable_artifacts",
+        )
+        return
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    state = tmp_path / "promotion.json"
+    intent = _sync_capped_activation_state(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state=state,
+        synced_at=synced_at,
+    )
+    before_state = state.read_bytes()
+    events = root / "events.jsonl"
+    before_events = events.read_bytes()
+    activation_kinds = (
+        sync_module.NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
+        sync_module.NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+    )
+    latest_paths = {
+        kind: root / "latest" / f"{kind}.json" for kind in activation_kinds
+    }
+    before_latest = {
+        kind: path.read_bytes() if path.exists() else None
+        for kind, path in latest_paths.items()
+    }
+    moment = {"value": synced_at}
+    original_stage = sync_module._stage_state_replacement
+
+    def expire_during_staging(state_file: Path, after: bytes) -> Path:
+        staged = original_stage(state_file, after)
+        moment["value"] = datetime.fromisoformat(intent.expires_at)
+        return staged
+
+    monkeypatch.setattr(
+        sync_module, "_stage_state_replacement", expire_during_staging
+    )
+
+    with pytest.raises(ValueError, match="active capped intent"):
+        sync_module.activate_normal_live_intent(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: moment["value"],
+        )
+
+    store = sync_module.ImmutableStrategyEvidenceStore(root)
+    assert state.read_bytes() == before_state
+    assert events.read_bytes() == before_events
+    assert store.envelopes(kind=activation_kinds[0]) == ()
+    assert store.envelopes(kind=activation_kinds[1]) == ()
+    assert {
+        kind: path.read_bytes() if path.exists() else None
+        for kind, path in latest_paths.items()
+    } == before_latest
+
+
 def test_activation_rechecks_stale_6d_attestations_under_lock(
     tmp_path, monkeypatch
 ) -> None:
