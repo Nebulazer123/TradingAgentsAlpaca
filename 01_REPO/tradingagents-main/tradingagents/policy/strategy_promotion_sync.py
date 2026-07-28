@@ -2237,7 +2237,38 @@ def _require_matching_normal_live_broker_order(
         raise ValueError("live broker result does not match authorized intent")
 
 
-def _normal_live_broker_acceptance_time(result: object) -> datetime.datetime:
+class _NormalLiveBrokerTerminalStatus(ValueError):
+    """The broker explicitly says the bound order cannot represent acceptance."""
+
+
+_NORMAL_LIVE_SAFE_BROKER_STATUSES = frozenset(
+    {"accepted", "new", "pending_new", "partially_filled", "filled"}
+)
+_NORMAL_LIVE_TERMINAL_BROKER_STATUSES = frozenset(
+    {"rejected", "canceled", "cancelled", "expired", "suspended", "stopped"}
+)
+_NORMAL_LIVE_POST_ACCEPTANCE_SKEW = datetime.timedelta(seconds=60)
+
+
+def _normal_live_broker_status(result: object) -> str:
+    if type(result) is not dict or type(result.get("status")) is not str:
+        raise ValueError("live broker result is missing a safe submitted status")
+    status = result["status"].lower()
+    if status in _NORMAL_LIVE_TERMINAL_BROKER_STATUSES:
+        raise _NormalLiveBrokerTerminalStatus(
+            f"live broker result has terminal status {status}"
+        )
+    if status not in _NORMAL_LIVE_SAFE_BROKER_STATUSES:
+        raise ValueError("live broker result has an unsafe submitted status")
+    return status
+
+
+def _normal_live_broker_acceptance_time(
+    result: object,
+    *,
+    commitment: Mapping[str, str],
+    require_near_commitment: bool,
+) -> datetime.datetime:
     """Require the broker's own accepted-order timestamp for the rate ledger."""
 
     if type(result) is not dict or not isinstance(result.get("submitted_at"), str):
@@ -2251,7 +2282,25 @@ def _normal_live_broker_acceptance_time(result: object) -> datetime.datetime:
         raise ValueError("live broker result has an invalid acceptance timestamp") from exc
     if accepted.tzinfo is None or accepted.utcoffset() is None:
         raise ValueError("live broker result has an invalid acceptance timestamp")
-    return accepted.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    accepted = accepted.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    if not require_near_commitment:
+        return accepted
+    raw_committed_at = commitment.get("committed_at")
+    if type(raw_committed_at) is not str:
+        raise ValueError("normal live submission commitment has no committed time")
+    try:
+        committed_at = datetime.datetime.fromisoformat(raw_committed_at)
+    except ValueError as exc:
+        raise ValueError("normal live submission commitment has an invalid committed time") from exc
+    if committed_at.tzinfo is None or committed_at.utcoffset() is None:
+        raise ValueError("normal live submission commitment has an invalid committed time")
+    committed_at = committed_at.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    policy_now = _normal_live_policy_moment()
+    lower = committed_at - _NORMAL_LIVE_POST_ACCEPTANCE_SKEW
+    upper = max(committed_at, policy_now) + _NORMAL_LIVE_POST_ACCEPTANCE_SKEW
+    if accepted < lower or accepted > upper:
+        raise ValueError("live broker acceptance timestamp is outside the committed submit interval")
+    return accepted
 
 
 def _matching_normal_live_broker_submits(
@@ -2347,12 +2396,14 @@ def execute_normal_live_broker_submit(
         # forming a module cycle.  The returned claim is an exact local
         # capability, not a caller-provided approving callback.
         from tradingagents.brokers.alpaca_supervisor import (
+            _bind_normal_live_submit_claim_reconciliation,
             _claim_normal_live_submit_admission,
             _discard_normal_live_submit_claim,
+            _issue_normal_live_submit_post_capability,
+            _normal_live_submit_admission_control_path,
             _normal_live_submit_claim_control_path,
             _preflight_normal_live_submit_before_broker_reads,
             _record_normal_live_submit_claim,
-            _refresh_normal_live_submit_claim_broker_state,
             _release_normal_live_submit_claim_reservation,
             _require_normal_live_submit_admission_available,
             _reserve_normal_live_submit_claim,
@@ -2365,9 +2416,6 @@ def execute_normal_live_broker_submit(
         )
 
         _require_normal_live_submit_admission_available(supervisor_admission)
-        _preflight_normal_live_submit_before_broker_reads(
-            supervisor_admission, payload=frozen_order
-        )
         candidate = EvidenceCandidate(
                 kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
                 effective_at=intent.recorded_at,
@@ -2388,14 +2436,11 @@ def execute_normal_live_broker_submit(
             raise ValueError(
                 "live submit requires an in-process Task 3 issuance capability"
             )
-        supervisor_claim = _claim_normal_live_submit_admission(
-            supervisor_admission,
-            intent=intent,
-            order_payload=frozen_order,
-            promotion_state_path=snapshot.path,
-            broker_read_adapter=broker_read_adapter,
+        control_state_path = _normal_live_submit_admission_control_path(
+            supervisor_admission
         )
-        control_state_path = _normal_live_submit_claim_control_path(supervisor_claim)
+        supervisor_claim = None
+        commitment = None
         try:
             if may_create_first_post:
                 admission = store.admit_checked(
@@ -2423,7 +2468,27 @@ def execute_normal_live_broker_submit(
                 outcome: str,
             ) -> object:
                 _require_matching_normal_live_broker_order(result, frozen_order)
-                accepted_at = _normal_live_broker_acceptance_time(result)
+                try:
+                    _normal_live_broker_status(result)
+                    accepted_at = _normal_live_broker_acceptance_time(
+                        result,
+                        commitment=commitment,
+                        require_near_commitment=outcome == "submitted",
+                    )
+                except _NormalLiveBrokerTerminalStatus:
+                    # An explicit rejected/canceled answer is not an ambiguous
+                    # transport failure. Resolve it and release its provisional
+                    # capacity so recovery can inspect a clean terminal record.
+                    _release_normal_live_submit_claim_reservation(
+                        supervisor_claim, client_order_id=intent.client_order_id
+                    )
+                    resolve_normal_live_submission_commitment(
+                        control_state_path,
+                        commitment_id=commitment["commitment_id"],
+                        outcome="broker_terminal",
+                        now=_normal_live_policy_moment(),
+                    )
+                    raise
                 # An actual matching order is the only point at which the rolling
                 # limit is recorded.  The durable receipt is then written from the
                 # policy-owned payload, not caller data or an arbitrary result.
@@ -2436,7 +2501,11 @@ def execute_normal_live_broker_submit(
                     control_state_path,
                     commitment_id=commitment["commitment_id"],
                     outcome=outcome,
-                    now=accepted_at,
+                    now=(
+                        accepted_at
+                        if outcome == "submitted"
+                        else _normal_live_policy_moment()
+                    ),
                 )
                 prepare = next(
                     envelope
@@ -2458,33 +2527,26 @@ def execute_normal_live_broker_submit(
                 )
                 return result
 
-            # Normal-live lock order is promotion state -> live control -> rate
-            # ledger.  The Task 3 verifier owns promotion state here.  Broker
-            # reads happen before the short control-held transaction; that
-            # transaction validates the fresh snapshot, reserves capacity, and
-            # atomically records the exact irrevocable commitment.  The lock is
-            # released before every GET/POST, so a freeze is never blocked by
-            # network I/O: it either wins before the commitment (zero I/O), or
-            # records the one already-committed in-flight client order.
-            recheck_before_broker_io()
-            live_account, live_positions, _existing_snapshot = (
-                _refresh_normal_live_submit_claim_broker_state(
-                    supervisor_claim,
-                    intent=intent,
-                    payload=frozen_order,
-                )
-            )
-            with live_control_lock(
-                control_state_path
-            ):
+            # Lock order is promotion state -> live control -> rate ledger.
+            # The control decision and exact durable commitment happen before
+            # *any* owned broker request. A freeze that obtains this lock first
+            # therefore causes zero I/O. Once a commitment wins, the lock is
+            # released before every network operation so a later freeze sees the
+            # sole committed client ID promptly instead of waiting on a GET/POST.
+            with live_control_lock(control_state_path):
                 recheck_before_broker_io()
-                _revalidate_normal_live_submit_claim(
-                    supervisor_claim,
-                    payload=frozen_order,
-                    sleeve=sleeve,
-                    live_account=live_account,
-                    live_positions=live_positions,
-                    rate_limit_exclude_client_order_id=intent.client_order_id,
+                _preflight_normal_live_submit_before_broker_reads(
+                    supervisor_admission, payload=frozen_order
+                )
+                supervisor_claim = _claim_normal_live_submit_admission(
+                    supervisor_admission,
+                    intent=intent,
+                    order_payload=frozen_order,
+                    promotion_state_path=snapshot.path,
+                    broker_read_adapter=broker_read_adapter,
+                )
+                control_state_path = _normal_live_submit_claim_control_path(
+                    supervisor_claim
                 )
                 _reserve_normal_live_submit_claim(
                     supervisor_claim, client_order_id=intent.client_order_id
@@ -2496,6 +2558,27 @@ def execute_normal_live_broker_submit(
                     client_order_id=intent.client_order_id,
                     now=_normal_live_policy_moment(),
                 )
+
+            # Only a prior durable commitment can reach owned broker reads.
+            # Its exact control decision survives a later freeze; all remaining
+            # risk, provenance, reconciliation, and rate checks remain strict.
+            recheck_before_broker_io()
+            live_account, live_positions, _existing_snapshot = (
+                _bind_normal_live_submit_claim_reconciliation(
+                    supervisor_claim,
+                    intent=intent,
+                    order_payload=frozen_order,
+                )
+            )
+            _revalidate_normal_live_submit_claim(
+                supervisor_claim,
+                payload=frozen_order,
+                sleeve=sleeve,
+                live_account=live_account,
+                live_positions=live_positions,
+                rate_limit_exclude_client_order_id=intent.client_order_id,
+                normal_live_commitment=commitment,
+            )
             # The commitment makes the exact order the only action permitted
             # after a concurrent freeze.  We still revalidate Task 3 provenance
             # and the 30-second owned reconciliation lease before each I/O.
@@ -2536,13 +2619,20 @@ def execute_normal_live_broker_submit(
             )
             return accept_broker_result(
                 _owned_normal_live_broker_post(
-                    broker_read_adapter, order_payload=frozen_order
+                    broker_read_adapter,
+                    order_payload=frozen_order,
+                    policy_post_capability=_issue_normal_live_submit_post_capability(
+                        supervisor_claim,
+                        order_payload=frozen_order,
+                        commitment_id=commitment["commitment_id"],
+                    ),
                 ),
                 commitment=commitment,
                 outcome="submitted",
             )
         except BaseException:
-            _discard_normal_live_submit_claim(supervisor_claim)
+            if supervisor_claim is not None:
+                _discard_normal_live_submit_claim(supervisor_claim)
             raise
 
     return _verify_normal_live_activation_receipt(

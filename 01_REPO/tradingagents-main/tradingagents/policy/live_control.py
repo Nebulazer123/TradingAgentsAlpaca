@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -16,6 +17,18 @@ from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
 _NORMAL_LIVE_COMMITMENTS_FIELD = "normal_live_submission_commitments"
+_NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION = 1
+_NORMAL_LIVE_COMMITMENT_PENDING = "pending"
+_NORMAL_LIVE_COMMITMENT_RESOLVED = "resolved"
+_NORMAL_LIVE_COMMITMENT_OUTCOMES = frozenset(
+    {
+        "submitted",
+        "lookup_matched",
+        "missing_refused",
+        "admission_refused",
+        "broker_terminal",
+    }
+)
 
 
 def _expected_rearm_authority() -> dict[str, str] | None:
@@ -65,15 +78,98 @@ def live_control_lock(state_path: str | Path):
         os.close(descriptor)
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _commitment_time(value: object, *, label: str) -> datetime.datetime:
+    if type(value) is not str:
+        raise ValueError(f"normal live submission commitment {label} is invalid")
+    parsed = parse_control_time(value)
+    if parsed is None or parsed.microsecond:
+        raise ValueError(f"normal live submission commitment {label} is invalid")
+    return parsed
+
+
+def _validate_normal_live_commitment(item: dict[str, Any]) -> dict[str, Any]:
+    """Require a complete, self-derived, one-order commitment record."""
+
+    required = {
+        "schema_version",
+        "commitment_id",
+        "intent_full_sha256",
+        "order_payload_sha256",
+        "client_order_id",
+        "control_preimage_sha256",
+        "committed_at",
+        "state",
+        "outcome",
+    }
+    allowed = {*required, "resolved_at"}
+    if set(item) - allowed or not required.issubset(item):
+        raise ValueError("normal live submission commitment is invalid")
+    if item["schema_version"] != _NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION:
+        raise ValueError("normal live submission commitment is invalid")
+    if not all(
+        _is_sha256(item[field])
+        for field in (
+            "commitment_id",
+            "intent_full_sha256",
+            "order_payload_sha256",
+            "control_preimage_sha256",
+        )
+    ) or type(item["client_order_id"]) is not str or not item["client_order_id"]:
+        raise ValueError("normal live submission commitment is invalid")
+    expected_id = _commitment_id(
+        intent_full_sha256=item["intent_full_sha256"],
+        order_payload_sha256=item["order_payload_sha256"],
+        client_order_id=item["client_order_id"],
+        control_preimage_sha256=item["control_preimage_sha256"],
+    )
+    if item["commitment_id"] != expected_id:
+        raise ValueError("normal live submission commitment identity is invalid")
+    committed_at = _commitment_time(item["committed_at"], label="committed_at")
+    state = item["state"]
+    outcome = item["outcome"]
+    if state == _NORMAL_LIVE_COMMITMENT_PENDING:
+        if outcome is not None or "resolved_at" in item:
+            raise ValueError("normal live submission commitment state is invalid")
+    elif state == _NORMAL_LIVE_COMMITMENT_RESOLVED:
+        if outcome not in _NORMAL_LIVE_COMMITMENT_OUTCOMES:
+            raise ValueError("normal live submission commitment outcome is invalid")
+        resolved_at = _commitment_time(item.get("resolved_at"), label="resolved_at")
+        if resolved_at < committed_at:
+            raise ValueError("normal live submission commitment time order is invalid")
+    else:
+        raise ValueError("normal live submission commitment state is invalid")
+    return dict(item)
+
+
 def _read_normal_live_commitments(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return durable commitments without allowing a malformed list to vanish."""
+    """Return only complete valid commitments; corrupted state always fails closed."""
 
     raw = state.get(_NORMAL_LIVE_COMMITMENTS_FIELD, [])
     if raw is None:
         return []
-    if not isinstance(raw, list) or any(not isinstance(item, dict) for item in raw):
+    if not isinstance(raw, list) or any(type(item) is not dict for item in raw):
         raise ValueError("normal live submission commitments are invalid")
-    return [dict(item) for item in raw]
+    commitments = [_validate_normal_live_commitment(dict(item)) for item in raw]
+    identities = [
+        (
+            item["commitment_id"],
+            item["intent_full_sha256"],
+            item["order_payload_sha256"],
+            item["client_order_id"],
+        )
+        for item in commitments
+    ]
+    if len(set(identities)) != len(identities):
+        raise ValueError("normal live submission commitments contain a duplicate identity")
+    return commitments
 
 
 def _commitment_id(
@@ -122,12 +218,9 @@ def commit_normal_live_submission_locked(
     current, issues = load_live_control_state(control_path, now=now)
     if current is None or issues or current.get("frozen") is not False:
         raise ValueError("normal live submission control is not open")
-    if not all(
-        isinstance(value, str)
-        and len(value) == 64
-        and all(char in "0123456789abcdef" for char in value)
-        for value in (intent_full_sha256, order_payload_sha256)
-    ) or not isinstance(client_order_id, str) or not client_order_id:
+    if not all(_is_sha256(value) for value in (intent_full_sha256, order_payload_sha256)) or (
+        type(client_order_id) is not str or not client_order_id
+    ):
         raise ValueError("normal live submission commitment is invalid")
     moment = now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
     if moment.microsecond:
@@ -140,7 +233,7 @@ def commit_normal_live_submission_locked(
         control_preimage_sha256=control_preimage_sha256,
     )
     commitments = _read_normal_live_commitments(state)
-    active = [item for item in commitments if item.get("outcome") is None]
+    active = [item for item in commitments if item["state"] == _NORMAL_LIVE_COMMITMENT_PENDING]
     if active:
         if len(active) != 1 or any(
             active[0].get(field) != expected
@@ -153,12 +246,15 @@ def commit_normal_live_submission_locked(
             raise ValueError("normal live submission already has an unresolved commitment")
         return dict(active[0])
     commitment = {
+        "schema_version": _NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION,
         "commitment_id": commitment_id,
         "intent_full_sha256": intent_full_sha256,
         "order_payload_sha256": order_payload_sha256,
         "client_order_id": client_order_id,
         "control_preimage_sha256": control_preimage_sha256,
         "committed_at": moment.isoformat(timespec="seconds"),
+        "state": _NORMAL_LIVE_COMMITMENT_PENDING,
+        "outcome": None,
     }
     commitments.append(commitment)
     state[_NORMAL_LIVE_COMMITMENTS_FIELD] = commitments
@@ -175,7 +271,7 @@ def resolve_normal_live_submission_commitment(
 ) -> None:
     """Durably resolve one precommit after a matching lookup/post outcome."""
 
-    if outcome not in {"submitted", "lookup_matched", "missing_refused"}:
+    if outcome not in _NORMAL_LIVE_COMMITMENT_OUTCOMES:
         raise ValueError("normal live submission outcome is invalid")
     with live_control_lock(path):
         control_path = Path(path)
@@ -194,17 +290,74 @@ def resolve_normal_live_submission_commitment(
         if len(matched) != 1:
             raise ValueError("normal live submission commitment is unavailable")
         commitment = matched[0]
-        if commitment.get("outcome") is not None:
-            if commitment.get("outcome") != outcome:
+        if commitment["state"] == _NORMAL_LIVE_COMMITMENT_RESOLVED:
+            if commitment["outcome"] != outcome:
                 raise ValueError("normal live submission commitment outcome conflicts")
             return
         moment = now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
+        if moment < _commitment_time(commitment["committed_at"], label="committed_at"):
+            raise ValueError("normal live submission commitment time order is invalid")
+        commitment["state"] = _NORMAL_LIVE_COMMITMENT_RESOLVED
         commitment["outcome"] = outcome
         commitment["resolved_at"] = moment.replace(microsecond=0).isoformat(
             timespec="seconds"
         )
         state[_NORMAL_LIVE_COMMITMENTS_FIELD] = commitments
         atomic_write_text(control_path, json.dumps(state, indent=2))
+
+
+def verify_pending_normal_live_submission_commitment(
+    path: str | Path,
+    *,
+    commitment: Mapping[str, object],
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+) -> None:
+    """Prove a specific pending commitment still survives in control state.
+
+    This does not grant authority.  It is the narrow post-commit continuity
+    check that lets the final gate distinguish a later *fresh freeze* from a
+    missing, malformed, substituted, or already-resolved commitment.  It
+    validates every commitment record while holding the shared control lock.
+    """
+
+    if not isinstance(commitment, Mapping):
+        raise ValueError("normal live submission commitment is invalid")
+    required = {
+        "commitment_id",
+        "intent_full_sha256",
+        "order_payload_sha256",
+        "client_order_id",
+    }
+    if any(commitment.get(field) != expected for field, expected in (
+        ("intent_full_sha256", intent_full_sha256),
+        ("order_payload_sha256", order_payload_sha256),
+        ("client_order_id", client_order_id),
+    )) or type(commitment.get("commitment_id")) is not str:
+        raise ValueError("normal live submission commitment does not bind the exact order")
+    with live_control_lock(path):
+        control_path = Path(path)
+        try:
+            state = json.loads(control_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("normal live submission commitment is unavailable") from exc
+        if not isinstance(state, dict):
+            raise ValueError("normal live submission commitment is unavailable")
+        commitments = _read_normal_live_commitments(state)
+        matches = [
+            item
+            for item in commitments
+            if item["commitment_id"] == commitment["commitment_id"]
+        ]
+        if len(matches) != 1:
+            raise ValueError("normal live submission commitment is unavailable")
+        matched = matches[0]
+        if matched["state"] != _NORMAL_LIVE_COMMITMENT_PENDING or any(
+            matched[field] != commitment.get(field)
+            for field in required
+        ):
+            raise ValueError("normal live submission commitment is unavailable")
 
 
 def parse_control_time(value: str) -> datetime.datetime | None:

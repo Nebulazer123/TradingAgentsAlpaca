@@ -32,6 +32,12 @@ from tradingagents.execution.reconcile import (
     reconcile_normal_live_submit,
 )
 from tradingagents.policy import strategy_promotion_sync as promotion_sync_module
+from tradingagents.policy.live_control import (
+    _write_live_control_state_locked,
+    commit_normal_live_submission_locked,
+    live_control_lock,
+    write_live_control_state,
+)
 from tradingagents.policy.promotion_sync import promotion_state_lock
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 from tradingagents.schemas.trading import TradeIntent
@@ -535,6 +541,7 @@ class _FakeLiveSession:
 
     def add_existing_order(self, order: dict[str, object]) -> None:
         snapshot = dict(order)
+        snapshot.setdefault("status", "accepted")
         snapshot.setdefault(
             "submitted_at", _NORMAL_LIVE_TEST_NOW.isoformat(timespec="seconds")
         )
@@ -557,6 +564,7 @@ class _FakeLiveSession:
             if self.fail_post:
                 return _FakeResponse(500, {"message": "interrupted"})
             order = dict(kwargs["json"])
+            order.setdefault("status", "accepted")
             order["submitted_at"] = _NORMAL_LIVE_TEST_NOW.isoformat(
                 timespec="seconds"
             )
@@ -1002,7 +1010,7 @@ def test_live_client_records_the_broker_acceptance_time_not_reservation_time(
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
         tmp_path, monkeypatch
     )
-    accepted_at = activated_at + datetime.timedelta(minutes=5)
+    accepted_at = activated_at + datetime.timedelta(seconds=30)
 
     class _SlowAcceptanceSession(_FakeLiveSession):
         def request(self, method, url, **kwargs):
@@ -1035,6 +1043,291 @@ def test_live_client_records_the_broker_acceptance_time_not_reservation_time(
     assert rate_state["submissions"][0]["submitted_at"] == accepted_at.isoformat(
         timespec="seconds"
     )
+
+
+def test_live_client_rejects_terminal_broker_status_and_keeps_rate_reservation(
+    tmp_path, monkeypatch
+):
+    """A matching rejected broker body is not evidence of a live submission."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+
+    class _RejectedSession(_FakeLiveSession):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if method == "POST":
+                rejected = dict(response.json())
+                rejected["status"] = "rejected"
+                return _FakeResponse(200, rejected)
+            return response
+
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=_RejectedSession(), clock=lambda: activated_at
+    )
+    with pytest.raises(ValueError, match="status"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    rate_state = json.loads(
+        (tmp_path / "normal-live-rate.json").read_text(encoding="utf-8")
+    )
+    assert rate_state["submissions"] == []
+    control = json.loads(
+        (tmp_path / "normal-live-control.json").read_text(encoding="utf-8")
+    )
+    assert control["normal_live_submission_commitments"][0]["outcome"] == "broker_terminal"
+
+
+def test_live_client_rejects_old_post_acceptance_time_without_reopening_rate_cap(
+    tmp_path, monkeypatch
+):
+    """A stale POST timestamp cannot make a just-accepted order age out early."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    old_at = activated_at - datetime.timedelta(minutes=2)
+
+    class _OldAcceptanceSession(_FakeLiveSession):
+        def request(self, method, url, **kwargs):
+            response = super().request(method, url, **kwargs)
+            if method == "POST":
+                stale = dict(response.json())
+                stale["submitted_at"] = old_at.isoformat(timespec="seconds")
+                return _FakeResponse(200, stale)
+            return response
+
+    client = _fake_live_client(
+        root,
+        repo_root=repo_root,
+        session=_OldAcceptanceSession(),
+        clock=lambda: activated_at,
+    )
+    with pytest.raises(ValueError, match="acceptance timestamp"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    rate_state = json.loads(
+        (tmp_path / "normal-live-rate.json").read_text(encoding="utf-8")
+    )
+    assert rate_state["submissions"] == [
+        {
+            "client_order_id": intent.client_order_id,
+            "state": "reserved",
+            "submitted_at": activated_at.isoformat(timespec="seconds"),
+        }
+    ]
+
+
+def test_freeze_winning_the_control_lock_prevents_all_owned_broker_io(
+    tmp_path, monkeypatch
+):
+    """Control must decide/commit before the handoff can start any GET."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+    control_path = tmp_path / "normal-live-control.json"
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+    errors: list[BaseException] = []
+
+    def submit() -> None:
+        try:
+            client.submit_order(
+                _bound_normal_live_order(intent),
+                authorized_normal_trade_intent=intent,
+                activation_receipt=receipt,
+                supervisor_admission=admission,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    with live_control_lock(control_path):
+        worker = threading.Thread(target=submit)
+        worker.start()
+        _write_live_control_state_locked(
+            control_path,
+            frozen=True,
+            reason="freeze wins normal live handoff race",
+            dead_man_expires_at=activated_at + datetime.timedelta(minutes=2),
+            now=activated_at,
+        )
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValueError)
+    assert client.session.requests == []
+
+
+def test_committed_order_survives_later_freeze_without_holding_control_lock_for_io(
+    tmp_path, monkeypatch
+):
+    """A freeze after commitment observes it promptly; only that order may finish."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    control_path = tmp_path / "normal-live-control.json"
+    freeze_complete = threading.Event()
+
+    class _FreezeAfterCommitSession(_FakeLiveSession):
+        def request(self, method, url, **kwargs):
+            if method == "GET" and not freeze_complete.is_set():
+                control = json.loads(control_path.read_text(encoding="utf-8"))
+                commitments = control["normal_live_submission_commitments"]
+                assert commitments[0]["client_order_id"] == intent.client_order_id
+
+                def freeze() -> None:
+                    write_live_control_state(
+                        control_path,
+                        frozen=True,
+                        reason="freeze after exact commitment",
+                        dead_man_expires_at=activated_at + datetime.timedelta(minutes=2),
+                        now=activated_at,
+                    )
+                    freeze_complete.set()
+
+                worker = threading.Thread(target=freeze)
+                worker.start()
+                worker.join(timeout=1)
+                assert freeze_complete.is_set()
+            return super().request(method, url, **kwargs)
+
+    session = _FreezeAfterCommitSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+    response = client.submit_order(
+        _bound_normal_live_order(intent),
+        authorized_normal_trade_intent=intent,
+        activation_receipt=receipt,
+        supervisor_admission=_normal_live_admission(
+            tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+            activated_at=activated_at,
+        ),
+    )
+
+    assert response["client_order_id"] == intent.client_order_id
+    assert session.post_calls == 1
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    assert control["frozen"] is True
+    assert control["normal_live_freeze_observed_committed_client_order_ids"] == [
+        intent.client_order_id
+    ]
+
+
+def test_live_client_raw_post_requires_a_policy_owned_capability():
+    import tradingagents.execution.reconcile as reconcile_module
+
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+
+    # Reconciliation owns reads only; it cannot mint a raw-live-POST token.
+    assert not hasattr(reconcile_module, "_issue_normal_live_broker_post_capability")
+    with pytest.raises(ValueError, match="policy post capability"):
+        client._post_normal_live_order_payload(_bound_normal_live_order(intent))
+
+    assert client.session.requests == []
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda record: record.pop("schema_version"), "invalid"),
+        (lambda record: record.__setitem__("client_order_id", ""), "invalid"),
+        (lambda record: record.__setitem__("committed_at", "not-a-time"), "invalid"),
+        (lambda record: record.__setitem__("control_preimage_sha256", "a" * 63), "invalid"),
+        (lambda record: record.__setitem__("state", "unknown"), "state is invalid"),
+        (lambda record: record.__setitem__("outcome", "submitted"), "state is invalid"),
+    ],
+)
+def test_malformed_normal_live_commitment_blocks_before_owned_broker_io(
+    tmp_path, monkeypatch, mutate, message
+):
+    """Every active commitment must be schema-valid before the first GET."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+    control_path = tmp_path / "normal-live-control.json"
+    with live_control_lock(control_path):
+        commit_normal_live_submission_locked(
+            control_path,
+            intent_full_sha256="a" * 64,
+            order_payload_sha256="b" * 64,
+            client_order_id="prior-normal-live-order",
+            now=activated_at,
+        )
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        mutate(control["normal_live_submission_commitments"][0])
+        control_path.write_text(json.dumps(control), encoding="utf-8")
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+
+    with pytest.raises(ValueError, match=message):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert client.session.requests == []
+
+
+def test_corrupt_duplicate_normal_live_commitment_blocks_before_owned_broker_io(
+    tmp_path, monkeypatch
+):
+    """A duplicate durable identity cannot be ignored before the first GET."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+    control_path = tmp_path / "normal-live-control.json"
+    with live_control_lock(control_path):
+        commitment = commit_normal_live_submission_locked(
+            control_path,
+            intent_full_sha256="a" * 64,
+            order_payload_sha256="b" * 64,
+            client_order_id="prior-normal-live-order",
+            now=activated_at,
+        )
+        control = json.loads(control_path.read_text(encoding="utf-8"))
+        control["normal_live_submission_commitments"].append(dict(commitment))
+        control_path.write_text(json.dumps(control), encoding="utf-8")
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+
+    with pytest.raises(ValueError, match="duplicate identity"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert client.session.requests == []
 
 
 def test_live_client_rejects_missing_or_generic_supervisor_admission_before_request(
@@ -1234,8 +1527,10 @@ def test_live_client_get_only_retry_does_not_record_the_same_order_twice(
     assert [request[0] for request in client.session.requests].count("GET") >= 3
 
 
-def test_live_client_rechecks_control_immediately_before_post(tmp_path, monkeypatch):
-    """Break caught: control could freeze after lookup but before the POST."""
+def test_live_client_preserves_a_prior_control_commitment_after_freeze(
+    tmp_path, monkeypatch
+):
+    """A later freeze cannot erase an exact order committed before broker I/O."""
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
         tmp_path, monkeypatch
     )
@@ -1245,17 +1540,14 @@ def test_live_client_rechecks_control_immediately_before_post(tmp_path, monkeypa
         def request(self, method, url, **kwargs):
             response = super().request(method, url, **kwargs)
             if method == "GET":
-                control_path.write_text(
-                    json.dumps(
-                        {
-                            "frozen": True,
-                            "reason": "post-lookup test freeze",
-                            "dead_man_expires_at": (
-                                activated_at + datetime.timedelta(minutes=2)
-                            ).isoformat(timespec="seconds"),
-                        }
-                    ),
-                    encoding="utf-8",
+                # A real freeze writer must preserve the durable commitment
+                # rather than emulate control-file corruption by replacing it.
+                write_live_control_state(
+                    control_path,
+                    frozen=True,
+                    reason="post-lookup test freeze",
+                    dead_man_expires_at=activated_at + datetime.timedelta(minutes=2),
+                    now=activated_at,
                 )
             return response
 
@@ -1264,24 +1556,28 @@ def test_live_client_rechecks_control_immediately_before_post(tmp_path, monkeypa
         root, repo_root=repo_root, session=session, clock=lambda: activated_at
     )
 
-    with pytest.raises(ValueError, match="final gates rejected"):
-        client.submit_order(
-            _bound_normal_live_order(intent),
-            authorized_normal_trade_intent=intent,
-            activation_receipt=receipt,
-            supervisor_admission=_normal_live_admission(
-                tmp_path,
-                monkeypatch,
-                root=root,
-                intent=intent,
-                receipt=receipt,
-                activated_at=activated_at,
-            ),
-        )
+    response = client.submit_order(
+        _bound_normal_live_order(intent),
+        authorized_normal_trade_intent=intent,
+        activation_receipt=receipt,
+        supervisor_admission=_normal_live_admission(
+            tmp_path,
+            monkeypatch,
+            root=root,
+            intent=intent,
+            receipt=receipt,
+            activated_at=activated_at,
+        ),
+    )
 
-    assert session.post_calls == 0
+    assert response["client_order_id"] == intent.client_order_id
     assert [request[0] for request in session.requests].count("GET") >= 1
-    assert session.post_calls == 0
+    assert session.post_calls == 1
+    frozen_state = json.loads(control_path.read_text(encoding="utf-8"))
+    assert frozen_state["frozen"] is True
+    assert frozen_state[
+        "normal_live_freeze_observed_committed_client_order_ids"
+    ] == [intent.client_order_id]
 
 
 def test_committed_live_order_allows_prompt_freeze_between_commit_and_post(

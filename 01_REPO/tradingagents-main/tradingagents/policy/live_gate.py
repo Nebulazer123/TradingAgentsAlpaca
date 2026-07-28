@@ -15,7 +15,10 @@ from tradingagents.policy.decision_authority import (
     POLICY_EXIT_RULE_IDS,
     resolve_exit_authority,
 )
-from tradingagents.policy.live_control import load_live_control_state
+from tradingagents.policy.live_control import (
+    load_live_control_state,
+    verify_pending_normal_live_submission_commitment,
+)
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
 
@@ -551,6 +554,10 @@ def evaluate_go_live_guard(
     decision_evidence: Mapping[str, Any] | None = None,
     now: datetime.datetime | None = None,
     rate_limit_exclude_client_order_id: str | None = None,
+    normal_live_commitment: Mapping[str, object] | None = None,
+    normal_live_intent_full_sha256: str | None = None,
+    normal_live_order_payload_sha256: str | None = None,
+    normal_live_client_order_id: str | None = None,
 ) -> LiveGateResult:
     live_actions = [action for action in actions if _is_live_order_action(action)]
     if not live_actions:
@@ -596,6 +603,26 @@ def evaluate_go_live_guard(
         checks["promotion_state_loaded"] = True
 
     control_state, control_issues = load_live_control_state(control_state_path, now=now)
+    if normal_live_commitment is not None:
+        try:
+            verify_pending_normal_live_submission_commitment(
+                control_state_path,
+                commitment=normal_live_commitment,
+                intent_full_sha256=str(normal_live_intent_full_sha256 or ""),
+                order_payload_sha256=str(normal_live_order_payload_sha256 or ""),
+                client_order_id=str(normal_live_client_order_id or ""),
+            )
+        except ValueError as exc:
+            control_issues = [*control_issues, str(exc)]
+        else:
+            # A new freeze after the exact durable commitment may stop future
+            # work, but cannot silently erase this committed handoff.  All
+            # other control faults, including dead-man expiry, still fail shut.
+            control_issues = [
+                issue
+                for issue in control_issues
+                if not issue.startswith("live control state is frozen:")
+            ]
     if control_issues:
         checks["control_state_loaded"] = control_state is not None
         checks["live_not_frozen"] = not any("frozen" in issue for issue in control_issues)

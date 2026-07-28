@@ -114,7 +114,10 @@ def _owned_normal_live_broker_lookup(
 
 
 def _owned_normal_live_broker_post(
-    adapter: object, *, order_payload: Mapping[str, str]
+    adapter: object,
+    *,
+    order_payload: Mapping[str, str],
+    policy_post_capability: object,
 ) -> dict[str, object]:
     """Use the exact registered client for the one bound normal-live POST."""
 
@@ -124,7 +127,7 @@ def _owned_normal_live_broker_post(
     post = getattr(entry[1], "_post_normal_live_order_payload", None)
     if not callable(post):
         raise ValueError("normal live broker adapter is unavailable")
-    result = post(order_payload)
+    result = post(order_payload, policy_post_capability=policy_post_capability)
     if type(result) is not dict:
         raise ValueError("normal live broker result is ambiguous")
     return result

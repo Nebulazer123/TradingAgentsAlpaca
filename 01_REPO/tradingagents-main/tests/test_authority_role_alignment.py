@@ -198,12 +198,15 @@ _LIVE_WRITE_CALLER_CLASSIFICATIONS = {
         ("cli/main.py", "alpaca_paper_tournament_run", "paper_client.submit_order"): "paper-only",
         ("cli/main.py", "alpaca_supervise_hourly", "paper_client.submit_order"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "definition"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._collect_normal_live_reconciliation_reads", "self.assert_expected_mode"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "definition"): "exact-intent-boundary",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "definition"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.assert_expected_mode"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "paper_client.submit_order"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.submit_order"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_paper_orders", "paper_client.submit_order"): "paper-only",
         ("tradingagents/brokers/alpaca_supervisor.py", "submit_authorized_normal_live_order", "live_client.submit_order"): "exact-intent-boundary",
+        ("tradingagents/execution/reconcile.py", "_owned_normal_live_broker_post", "_post_normal_live_order_payload"): "exact-intent-boundary",
     }
 
 
@@ -241,7 +244,12 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
             qualified = ".".join([*self.scope, node.name])
-            if node.name in {"submit_order", "execute_order_pairs", "_alpaca_live_client"}:
+            if node.name in {
+                "submit_order",
+                "execute_order_pairs",
+                "_alpaca_live_client",
+                "_post_normal_live_order_payload",
+            }:
                 occurrences.append((self.relative_path, node.lineno, qualified, "definition"))
             self.scope.append(node.name)
             self.generic_visit(node)
@@ -261,11 +269,26 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
             if (
                 name == "submit_order"
                 or name.endswith(".submit_order")
+                or name.endswith("._post_normal_live_order_payload")
                 or name in {"execute_order_pairs", "_alpaca_live_client"}
                 or has_paper_false
             ):
                 occurrences.append(
                     (self.relative_path, node.lineno, ".".join(self.scope), name)
+                )
+            if (
+                name == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "_post_normal_live_order_payload"
+            ):
+                occurrences.append(
+                    (
+                        self.relative_path,
+                        node.lineno,
+                        ".".join(self.scope),
+                        "_post_normal_live_order_payload",
+                    )
                 )
             self.generic_visit(node)
 
@@ -319,6 +342,21 @@ def test_live_write_inventory_rejects_an_unclassified_new_production_path(tmp_pa
     )
 
     with pytest.raises(AssertionError, match=r"tradingagents/new_live_caller.py:2"):
+        _assert_all_live_write_occurrences_classified(
+            _live_write_occurrences(tmp_path),
+            {},
+        )
+
+
+def test_live_write_inventory_rejects_an_unclassified_raw_post_caller(tmp_path):
+    source = tmp_path / "tradingagents" / "new_raw_live_caller.py"
+    source.parent.mkdir()
+    source.write_text(
+        "def bypass(client):\n    return client._post_normal_live_order_payload({})\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AssertionError, match=r"tradingagents/new_raw_live_caller.py:2"):
         _assert_all_live_write_occurrences_classified(
             _live_write_occurrences(tmp_path),
             {},

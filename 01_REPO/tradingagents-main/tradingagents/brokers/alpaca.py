@@ -887,10 +887,29 @@ class AlpacaRestClient:
             raise ValueError("live retry lookup is ambiguous; refusing POST")
         return result
 
-    def _post_normal_live_order_payload(self, order_payload: Mapping[str, str]) -> dict:
-        """Private owned POST adapter; policy never accepts a caller callback."""
+    def _post_normal_live_order_payload(
+        self,
+        order_payload: Mapping[str, str],
+        *,
+        policy_post_capability: object | None = None,
+    ) -> dict:
+        """Perform exactly one policy-capability-bound normal-live POST."""
 
-        return self._request("POST", "/v2/orders", json=dict(order_payload))
+        payload = _snapshot_normal_live_order(order_payload)
+        # Deferred to avoid the supervisor's normal import cycle.  The
+        # supervisor alone can mint this one-use capability from a registered
+        # exact admission claim; reconciliation by itself cannot mint POST
+        # authority.
+        from tradingagents.brokers.alpaca_supervisor import (
+            _consume_normal_live_submit_post_capability,
+        )
+
+        _consume_normal_live_submit_post_capability(
+            self._normal_live_broker_read_adapter,
+            policy_post_capability,
+            order_payload=payload,
+        )
+        return self._request("POST", "/v2/orders", json=payload)
 
     def _request(self, method: str, path: str, **kwargs):
         url = f"{self.settings.base_url.rstrip('/')}{path}"

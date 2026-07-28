@@ -207,7 +207,7 @@ class _NormalLiveAdmissionClaim:
     order_payload_sha256: str
     issued_at: str
     expires_at: str
-    reconciliation_claim: object
+    broker_read_adapter: object
 
 
 _NORMAL_LIVE_ADMISSION_CAPABILITIES: dict[
@@ -215,6 +215,10 @@ _NORMAL_LIVE_ADMISSION_CAPABILITIES: dict[
 ] = {}
 _NORMAL_LIVE_ADMISSION_CLAIMS: dict[
     int, tuple[_NormalLiveAdmissionClaim, _NormalLiveAdmissionContext]
+] = {}
+_NORMAL_LIVE_ADMISSION_RECONCILIATIONS: dict[int, object] = {}
+_NORMAL_LIVE_SUBMIT_POST_CAPABILITIES: dict[
+    int, tuple[object, object, str, str, str]
 ] = {}
 
 
@@ -373,26 +377,65 @@ def _claim_normal_live_submit_admission(
             dict(order_payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")
     ).hexdigest()
-    reconciliation = reconcile_normal_live_submit(
-        intent=intent,
-        order_payload=order_payload,
-        broker_read_adapter=broker_read_adapter,
-    )
-    reconciliation_claim = _claim_normal_live_submit_reconciliation(
-        reconciliation,
-        intent=intent,
-        order_payload_sha256=order_payload_sha256,
-        claimed_at=_normal_live_admission_moment(),
-    )
     claim = _NormalLiveAdmissionClaim(
         intent_full_sha256=admission.intent_full_sha256,
         order_payload_sha256=order_payload_sha256,
         issued_at=admission.issued_at,
         expires_at=admission.expires_at,
-        reconciliation_claim=reconciliation_claim,
+        broker_read_adapter=broker_read_adapter,
     )
     _NORMAL_LIVE_ADMISSION_CLAIMS[id(claim)] = (claim, context)
     return claim
+
+
+def _bind_normal_live_submit_claim_reconciliation(
+    claim: object,
+    *,
+    intent: AuthorizedNormalTradeIntent,
+    order_payload: Mapping[str, str],
+) -> tuple[dict[str, object], tuple[dict[str, object], ...], dict[str, object] | None]:
+    """Perform the first owned broker read only after a durable control commit."""
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    reconciliation = reconcile_normal_live_submit(
+        intent=intent,
+        order_payload=order_payload,
+        broker_read_adapter=claim.broker_read_adapter,
+    )
+    reconciliation_claim = _claim_normal_live_submit_reconciliation(
+        reconciliation,
+        intent=intent,
+        order_payload_sha256=claim.order_payload_sha256,
+        claimed_at=_normal_live_admission_moment(),
+    )
+    _NORMAL_LIVE_ADMISSION_RECONCILIATIONS[id(claim)] = reconciliation_claim
+    return _refresh_normal_live_submit_reconciliation(
+        reconciliation_claim,
+        intent=intent,
+        order_payload=order_payload,
+    )
+
+
+def _normal_live_submit_claim_reconciliation(claim: _NormalLiveAdmissionClaim) -> object:
+    reconciliation = _NORMAL_LIVE_ADMISSION_RECONCILIATIONS.get(id(claim))
+    if reconciliation is None:
+        raise ValueError("live submit reconciliation is unavailable before owned broker reads")
+    return reconciliation
+
+
+def _normal_live_submit_admission_control_path(admission: object) -> Path:
+    """Read the control path from an unconsumed exact admission only."""
+
+    if type(admission) is not NormalLiveSubmitAdmission:
+        raise ValueError("live submit requires an exact supervisor admission artifact")
+    entry = _NORMAL_LIVE_ADMISSION_CAPABILITIES.get(id(admission))
+    if entry is None or entry[0] is not admission:
+        raise ValueError("live submit requires an unconsumed supervisor admission artifact")
+    return entry[1].control_state_path
 
 
 def _require_normal_live_submit_admission_available(admission: object) -> None:
@@ -477,6 +520,7 @@ def _revalidate_normal_live_submit_claim(
     live_account: Mapping[str, object],
     live_positions: Sequence[Mapping[str, object]],
     rate_limit_exclude_client_order_id: str | None = None,
+    normal_live_commitment: Mapping[str, object] | None = None,
 ) -> None:
     if type(claim) is not _NormalLiveAdmissionClaim:
         raise ValueError("live submit requires a trusted supervisor admission claim")
@@ -509,17 +553,16 @@ def _revalidate_normal_live_submit_claim(
         decision_evidence=context.decision_evidence,
         now=current,
         rate_limit_exclude_client_order_id=rate_limit_exclude_client_order_id,
+        normal_live_commitment=normal_live_commitment,
+        normal_live_intent_full_sha256=claim.intent_full_sha256,
+        normal_live_order_payload_sha256=claim.order_payload_sha256,
+        normal_live_client_order_id=str(payload.get("client_order_id", "")),
     )
     if issues:
         raise ValueError(
             "normal live submit final gates rejected admission: "
             + "; ".join(issue.reason for issue in issues)
         )
-    _state, control_issues = load_live_control_state(
-        context.control_state_path, now=current
-    )
-    if control_issues:
-        raise ValueError("normal live submit live-control recheck rejected admission")
 
 
 def _refresh_normal_live_submit_claim_broker_state(
@@ -536,7 +579,7 @@ def _refresh_normal_live_submit_claim_broker_state(
     if entry is None or entry[0] is not claim:
         raise ValueError("live submit supervisor admission claim is unavailable")
     return _refresh_normal_live_submit_reconciliation(
-        claim.reconciliation_claim,
+        _normal_live_submit_claim_reconciliation(claim),
         intent=intent,
         order_payload=payload,
     )
@@ -556,7 +599,7 @@ def _revalidate_normal_live_submit_reconciliation_after_lookup(
     if entry is None or entry[0] is not claim:
         raise ValueError("live submit supervisor admission claim is unavailable")
     _revalidate_normal_live_submit_reconciliation(
-        claim.reconciliation_claim,
+        _normal_live_submit_claim_reconciliation(claim),
         intent=intent,
         order_payload_sha256=order_payload_sha256,
     )
@@ -644,7 +687,9 @@ def _record_normal_live_submit_claim(
         client_order_id=client_order_id,
         now=accepted_at,
     )
-    _release_normal_live_submit_reconciliation(claim.reconciliation_claim)
+    reconciliation = _NORMAL_LIVE_ADMISSION_RECONCILIATIONS.pop(id(claim), None)
+    if reconciliation is not None:
+        _release_normal_live_submit_reconciliation(reconciliation)
 
 
 def _discard_normal_live_submit_claim(claim: object) -> None:
@@ -654,7 +699,74 @@ def _discard_normal_live_submit_claim(claim: object) -> None:
         return
     entry = _NORMAL_LIVE_ADMISSION_CLAIMS.pop(id(claim), None)
     if entry is not None and entry[0] is claim:
-        _release_normal_live_submit_reconciliation(claim.reconciliation_claim)
+        reconciliation = _NORMAL_LIVE_ADMISSION_RECONCILIATIONS.pop(id(claim), None)
+        if reconciliation is not None:
+            _release_normal_live_submit_reconciliation(reconciliation)
+
+
+def _issue_normal_live_submit_post_capability(
+    claim: object,
+    *,
+    order_payload: Mapping[str, str],
+    commitment_id: str,
+) -> object:
+    """Mint the sole raw-POST capability from a verified policy admission claim."""
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    if _normal_live_submit_claim_reconciliation(claim) is None:
+        raise ValueError("live submit reconciliation is unavailable before raw post")
+    payload = dict(order_payload)
+    client_order_id = payload.get("client_order_id")
+    if (
+        type(client_order_id) is not str
+        or not client_order_id
+        or type(commitment_id) is not str
+        or not commitment_id
+    ):
+        raise ValueError("normal live broker post capability is invalid")
+    capability = object()
+    _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES[id(capability)] = (
+        capability,
+        claim.broker_read_adapter,
+        hashlib.sha256(
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest(),
+        client_order_id,
+        commitment_id,
+    )
+    return capability
+
+
+def _consume_normal_live_submit_post_capability(
+    broker_read_adapter: object,
+    capability: object,
+    *,
+    order_payload: Mapping[str, str],
+) -> None:
+    """Consume a supervisor-minted token at Alpaca's raw POST primitive."""
+
+    entry = _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES.pop(id(capability), None)
+    if entry is None or entry[0] is not capability:
+        raise ValueError("live raw post requires a policy post capability")
+    _token, expected_adapter, payload_sha256, client_order_id, _commitment_id = entry
+    payload = dict(order_payload)
+    if (
+        expected_adapter is not broker_read_adapter
+        or payload.get("client_order_id") != client_order_id
+        or hashlib.sha256(
+            json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()
+        != payload_sha256
+    ):
+        raise ValueError("live raw post capability does not bind the exact order")
 
 
 def resolve_live_sleeve(
@@ -1172,6 +1284,10 @@ def validate_supervisor_live_submit_allowed(
     decision_evidence: Mapping | None = None,
     now: datetime.datetime | None = None,
     rate_limit_exclude_client_order_id: str | None = None,
+    normal_live_commitment: Mapping[str, object] | None = None,
+    normal_live_intent_full_sha256: str | None = None,
+    normal_live_order_payload_sha256: str | None = None,
+    normal_live_client_order_id: str | None = None,
 ) -> list[OrderIssue]:
     live_buying_power = None
     if isinstance(live_account, Mapping):
@@ -1193,6 +1309,10 @@ def validate_supervisor_live_submit_allowed(
         decision_evidence=decision_evidence,
         now=now,
         rate_limit_exclude_client_order_id=rate_limit_exclude_client_order_id,
+        normal_live_commitment=normal_live_commitment,
+        normal_live_intent_full_sha256=normal_live_intent_full_sha256,
+        normal_live_order_payload_sha256=normal_live_order_payload_sha256,
+        normal_live_client_order_id=normal_live_client_order_id,
     )
     return result.issues
 
@@ -1216,6 +1336,13 @@ def submit_authorized_normal_live_order(
     under the Task 3 promotion-state lock by the Alpaca boundary.  It carries
     explicit final-gate inputs rather than a caller-provided approval boolean.
     """
+    # The supervisor must never delegate the final capability to a duck-typed
+    # writer.  The owned Alpaca client provides the registered read/post adapter
+    # consumed by the policy handoff below.
+    from tradingagents.brokers.alpaca import AlpacaRestClient
+
+    if type(live_client) is not AlpacaRestClient:
+        raise ValueError("live supervisor submit requires an owned AlpacaRestClient")
     if type(authorized_normal_trade_intent) is not AuthorizedNormalTradeIntent:
         raise ValueError(
             "live supervisor submit requires an exact AuthorizedNormalTradeIntent"
