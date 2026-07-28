@@ -156,6 +156,36 @@ def test_normal_live_reservation_requires_an_existing_ledger_without_recreating_
     assert not path.exists()
 
 
+def test_normal_live_reservation_returns_an_exact_ledger_binding(tmp_path):
+    """Break caught: a reservation was not tied to its written ledger state."""
+    from tradingagents.policy.order_rate_limit import (
+        release_live_order_reservation,
+        reserve_live_order_submission,
+    )
+
+    path = tmp_path / "rate.json"
+    reserve_live_order_submission(
+        path,
+        client_order_id="observer-bootstrap",
+        now=NOW,
+        window_minutes=60,
+        max_orders=2,
+    )
+    release_live_order_reservation(path, client_order_id="observer-bootstrap")
+
+    reservation = reserve_live_order_submission(
+        path,
+        client_order_id="bound-reservation",
+        now=NOW,
+        window_minutes=60,
+        max_orders=1,
+        require_existing_ledger=True,
+    )
+
+    assert reservation is not None
+    assert len(reservation.binding_sha256) == 64
+
+
 @pytest.mark.parametrize(
     "raw",
     (

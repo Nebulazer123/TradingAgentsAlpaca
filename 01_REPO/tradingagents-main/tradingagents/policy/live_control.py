@@ -17,7 +17,7 @@ from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
 _NORMAL_LIVE_COMMITMENTS_FIELD = "normal_live_submission_commitments"
-_NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION = 1
+_NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION = 2
 _NORMAL_LIVE_COMMITMENT_PENDING = "pending"
 _NORMAL_LIVE_COMMITMENT_RESOLVED = "resolved"
 _NORMAL_LIVE_COMMITMENT_OUTCOMES = frozenset(
@@ -105,6 +105,7 @@ def _validate_normal_live_commitment(item: dict[str, Any]) -> dict[str, Any]:
         "order_payload_sha256",
         "client_order_id",
         "control_preimage_sha256",
+        "rate_reservation_sha256",
         "committed_at",
         "state",
         "outcome",
@@ -121,6 +122,7 @@ def _validate_normal_live_commitment(item: dict[str, Any]) -> dict[str, Any]:
             "intent_full_sha256",
             "order_payload_sha256",
             "control_preimage_sha256",
+            "rate_reservation_sha256",
         )
     ) or type(item["client_order_id"]) is not str or not item["client_order_id"]:
         raise ValueError("normal live submission commitment is invalid")
@@ -129,6 +131,7 @@ def _validate_normal_live_commitment(item: dict[str, Any]) -> dict[str, Any]:
         order_payload_sha256=item["order_payload_sha256"],
         client_order_id=item["client_order_id"],
         control_preimage_sha256=item["control_preimage_sha256"],
+        rate_reservation_sha256=item["rate_reservation_sha256"],
     )
     if item["commitment_id"] != expected_id:
         raise ValueError("normal live submission commitment identity is invalid")
@@ -178,12 +181,14 @@ def _commitment_id(
     order_payload_sha256: str,
     client_order_id: str,
     control_preimage_sha256: str,
+    rate_reservation_sha256: str,
 ) -> str:
     payload = {
         "intent_full_sha256": intent_full_sha256,
         "order_payload_sha256": order_payload_sha256,
         "client_order_id": client_order_id,
         "control_preimage_sha256": control_preimage_sha256,
+        "rate_reservation_sha256": rate_reservation_sha256,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -196,6 +201,7 @@ def commit_normal_live_submission_locked(
     intent_full_sha256: str,
     order_payload_sha256: str,
     client_order_id: str,
+    rate_reservation_sha256: str,
     now: datetime.datetime,
 ) -> dict[str, str]:
     """Durably pre-commit one exact live POST while the control lock is held.
@@ -218,7 +224,14 @@ def commit_normal_live_submission_locked(
     current, issues = load_live_control_state(control_path, now=now)
     if current is None or issues or current.get("frozen") is not False:
         raise ValueError("normal live submission control is not open")
-    if not all(_is_sha256(value) for value in (intent_full_sha256, order_payload_sha256)) or (
+    if not all(
+        _is_sha256(value)
+        for value in (
+            intent_full_sha256,
+            order_payload_sha256,
+            rate_reservation_sha256,
+        )
+    ) or (
         type(client_order_id) is not str or not client_order_id
     ):
         raise ValueError("normal live submission commitment is invalid")
@@ -231,6 +244,7 @@ def commit_normal_live_submission_locked(
         order_payload_sha256=order_payload_sha256,
         client_order_id=client_order_id,
         control_preimage_sha256=control_preimage_sha256,
+        rate_reservation_sha256=rate_reservation_sha256,
     )
     commitments = _read_normal_live_commitments(state)
     active = [item for item in commitments if item["state"] == _NORMAL_LIVE_COMMITMENT_PENDING]
@@ -241,6 +255,7 @@ def commit_normal_live_submission_locked(
                 ("intent_full_sha256", intent_full_sha256),
                 ("order_payload_sha256", order_payload_sha256),
                 ("client_order_id", client_order_id),
+                ("rate_reservation_sha256", rate_reservation_sha256),
             )
         ):
             raise ValueError("normal live submission already has an unresolved commitment")
@@ -252,6 +267,7 @@ def commit_normal_live_submission_locked(
         "order_payload_sha256": order_payload_sha256,
         "client_order_id": client_order_id,
         "control_preimage_sha256": control_preimage_sha256,
+        "rate_reservation_sha256": rate_reservation_sha256,
         "committed_at": moment.isoformat(timespec="seconds"),
         "state": _NORMAL_LIVE_COMMITMENT_PENDING,
         "outcome": None,
@@ -313,6 +329,7 @@ def verify_pending_normal_live_submission_commitment(
     intent_full_sha256: str,
     order_payload_sha256: str,
     client_order_id: str,
+    rate_reservation_sha256: str,
 ) -> None:
     """Prove a specific pending commitment still survives in control state.
 
@@ -329,6 +346,7 @@ def verify_pending_normal_live_submission_commitment(
             intent_full_sha256=intent_full_sha256,
             order_payload_sha256=order_payload_sha256,
             client_order_id=client_order_id,
+            rate_reservation_sha256=rate_reservation_sha256,
         )
 
 
@@ -339,6 +357,7 @@ def _verify_pending_normal_live_submission_commitment_locked(
     intent_full_sha256: str,
     order_payload_sha256: str,
     client_order_id: str,
+    rate_reservation_sha256: str,
 ) -> None:
     """Verify an exact pending record while the caller already owns control lock."""
 
@@ -350,11 +369,13 @@ def _verify_pending_normal_live_submission_commitment_locked(
         "order_payload_sha256",
         "client_order_id",
         "control_preimage_sha256",
+        "rate_reservation_sha256",
     }
     if any(commitment.get(field) != expected for field, expected in (
         ("intent_full_sha256", intent_full_sha256),
         ("order_payload_sha256", order_payload_sha256),
         ("client_order_id", client_order_id),
+        ("rate_reservation_sha256", rate_reservation_sha256),
     )) or not all(
         type(commitment.get(field)) is str for field in required
     ):

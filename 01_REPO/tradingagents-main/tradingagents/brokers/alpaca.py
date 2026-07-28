@@ -11,7 +11,6 @@ import datetime
 import hashlib
 import json
 import os
-import weakref
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
@@ -46,54 +45,145 @@ class AlpacaExecutionError(RuntimeError):
     """Raised when Alpaca rejects or fails an HTTP request."""
 
 
-_ALPACA_CLIENT_SESSIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-_ALPACA_SESSION_VIEW_SESSIONS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+class _AlpacaTransport:
+    """Private, narrow adapter around the injected HTTP session.
+
+    This object intentionally exposes only the two Alpaca operations used by
+    this module: read JSON and submit an order.  The raw session is never
+    returned to a client or observer.  Python reflection is not an authority
+    boundary; the point is to keep raw transport out of supported APIs.
+    """
+
+    __slots__ = ("__session",)
+
+    def __init__(self, session: object):
+        self.__session = session
+
+    def get_json(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: int,
+        params: Mapping[str, object] | None = None,
+    ) -> object:
+        response = self.__session.request(
+            "GET", url, headers=dict(headers), timeout=timeout, params=params
+        )
+        return _alpaca_response_json(response, method="GET", url=url)
+
+    def post_order_json(
+        self,
+        *,
+        url: str,
+        headers: Mapping[str, str],
+        timeout: int,
+        payload: Mapping[str, str],
+    ) -> object:
+        response = self.__session.request(
+            "POST", url, headers=dict(headers), timeout=timeout, json=dict(payload)
+        )
+        return _alpaca_response_json(response, method="POST", url=url)
+
+    def fixture_value(self, name: str) -> object:
+        if name not in {"requests", "post_calls", "account", "positions"}:
+            raise AttributeError("Alpaca session observer attribute is not available")
+        return getattr(self.__session, name)
+
+    def set_fixture_value(self, name: str, value: object) -> None:
+        if name not in {"account", "positions"}:
+            raise AttributeError("Alpaca session observer attribute is not available")
+        setattr(self.__session, name, value)
+
+    def add_fixture_existing_order(self, order: Mapping[str, object]) -> None:
+        callback = getattr(self.__session, "add_existing_order", None)
+        if not callable(callback):
+            raise AttributeError("Alpaca session observer cannot add an order")
+        callback(dict(order))
 
 
-def _raw_alpaca_session_for_client(client: object) -> object:
-    """Return a raw session only to this module's classified transport path."""
-
-    try:
-        return _ALPACA_CLIENT_SESSIONS[client]
-    except KeyError as exc:
-        raise RuntimeError("Alpaca client transport is unavailable") from exc
-
-
-def _raw_alpaca_session_for_view(view: object) -> object:
-    """Return a raw session only for the non-transport session observer view."""
-
-    try:
-        return _ALPACA_SESSION_VIEW_SESSIONS[view]
-    except KeyError as exc:
-        raise RuntimeError("Alpaca session observer is unavailable") from exc
+def _alpaca_response_json(response: object, *, method: str, url: str) -> object:
+    status_code = getattr(response, "status_code", None)
+    if type(status_code) is not int:
+        raise AlpacaExecutionError(f"Alpaca {method} {url} returned an invalid response")
+    if status_code >= 400:
+        raise AlpacaExecutionError(
+            f"Alpaca {method} {url} failed with {status_code}: {getattr(response, 'text', '')}"
+        )
+    result = getattr(response, "json", None)
+    if not callable(result):
+        raise AlpacaExecutionError(f"Alpaca {method} {url} returned invalid JSON")
+    return result()
 
 
 class _AlpacaSessionView:
-    """Expose non-transport session state without exposing raw broker I/O."""
+    """Explicit fixture/diagnostic view that cannot issue broker requests."""
 
-    def __init__(self, raw_session: object):
-        _ALPACA_SESSION_VIEW_SESSIONS[self] = raw_session
+    __slots__ = ("__transport",)
 
-    def __getattr__(self, name: str):
-        if name in {"request", "_raw_session"}:
-            raise AttributeError(
-                "raw Alpaca session.request is internal; use the classified client boundary"
-            )
-        return getattr(_raw_alpaca_session_for_view(self), name)
+    def __init__(self, transport: _AlpacaTransport):
+        self.__transport = transport
 
-    def __setattr__(self, name: str, value: object) -> None:
-        if name in {"request", "_raw_session"}:
-            raise AttributeError(
-                "raw Alpaca session.request is internal; use the classified client boundary"
-            )
-        setattr(_raw_alpaca_session_for_view(self), name, value)
+    @property
+    def requests(self) -> object:
+        return self.__transport.fixture_value("requests")
+
+    @property
+    def post_calls(self) -> object:
+        return self.__transport.fixture_value("post_calls")
+
+    @property
+    def account(self) -> object:
+        return self.__transport.fixture_value("account")
+
+    @account.setter
+    def account(self, value: object) -> None:
+        self.__transport.set_fixture_value("account", value)
+
+    @property
+    def positions(self) -> object:
+        return self.__transport.fixture_value("positions")
+
+    @positions.setter
+    def positions(self, value: object) -> None:
+        self.__transport.set_fixture_value("positions", value)
+
+    def add_existing_order(self, order: Mapping[str, object]) -> None:
+        self.__transport.add_fixture_existing_order(order)
 
 
-def _require_exact_paper_setting(settings: object) -> None:
-    """Reject truthy/falsy impostors before they choose a broker mode."""
+def _validated_alpaca_base_url(settings: object) -> str:
+    """Return the one valid broker base URL for the exact configured mode."""
 
     if type(getattr(settings, "paper", None)) is not bool:
         raise AlpacaModeError("Alpaca settings.paper must be an exact bool")
+    raw_base_url = getattr(settings, "base_url", None)
+    if type(raw_base_url) is not str or not raw_base_url.strip():
+        raise AlpacaModeError("Alpaca base URL must be an exact non-empty string")
+    base_url = _normalize_base_url(raw_base_url.strip())
+    parsed = urlsplit(base_url)
+    expected = PAPER_BASE_URL if settings.paper else LIVE_BASE_URL
+    expected_parsed = urlsplit(expected)
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.port is not None
+        or parsed.hostname is None
+        or parsed.hostname.lower() != expected_parsed.hostname
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        mode = "paper" if settings.paper else "live"
+        raise AlpacaModeError(f"Alpaca base URL does not match exact {mode} mode")
+    return expected
+
+
+def _require_validated_alpaca_settings(settings: object) -> str:
+    """Reject impostor mode/base combinations before transport is constructed."""
+
+    return _validated_alpaca_base_url(settings)
 
 
 def _normalized_alpaca_route(path: object) -> str:
@@ -391,6 +481,12 @@ class AlpacaSettings:
     paper: bool
     base_url: str
     timeout: int = 15
+
+    def __post_init__(self) -> None:
+        # Normalize only after proving the host is the exact endpoint for the
+        # exact boolean mode.  A paper/live URL disagreement must never make it
+        # as far as a client or network transport.
+        object.__setattr__(self, "base_url", _require_validated_alpaca_settings(self))
 
     @classmethod
     def from_env(
@@ -795,6 +891,14 @@ def _require_matching_broker_order(
 
 
 class AlpacaRestClient:
+    __slots__ = (
+        "settings",
+        "normal_live_evidence_root",
+        "normal_live_repo_root",
+        "_normal_live_broker_read_adapter",
+        "__transport",
+    )
+
     def __init__(
         self,
         settings: AlpacaSettings,
@@ -803,9 +907,9 @@ class AlpacaRestClient:
         normal_live_evidence_root=None,
         normal_live_repo_root=None,
     ):
-        _require_exact_paper_setting(settings)
+        _require_validated_alpaca_settings(settings)
         self.settings = settings
-        _ALPACA_CLIENT_SESSIONS[self] = session or requests.Session()
+        self.__transport = _AlpacaTransport(session or requests.Session())
         self.normal_live_evidence_root = normal_live_evidence_root
         self.normal_live_repo_root = normal_live_repo_root
         self._normal_live_broker_read_adapter = _register_normal_live_broker_read_adapter(
@@ -816,40 +920,95 @@ class AlpacaRestClient:
     def session(self) -> _AlpacaSessionView:
         """Return a read/fixture observer that cannot issue broker requests."""
 
-        return _AlpacaSessionView(_raw_alpaca_session_for_client(self))
+        return _AlpacaSessionView(self.__transport)
 
     def assert_expected_mode(self, *, paper: bool) -> None:
-        _require_exact_paper_setting(self.settings)
-        base_url = self.settings.base_url.lower()
-        points_to_paper = "paper-api.alpaca.markets" in base_url
-        if paper and (not self.settings.paper or not points_to_paper):
-            raise AlpacaModeError("paper order client is not configured for paper trading")
-        if not paper and (self.settings.paper or points_to_paper):
-            raise AlpacaModeError("live order client is not configured for live trading")
+        if type(paper) is not bool:
+            raise AlpacaModeError("expected Alpaca mode must be an exact bool")
+        _require_validated_alpaca_settings(self.settings)
+        if paper is not self.settings.paper:
+            expected = "paper" if paper else "live"
+            raise AlpacaModeError(f"client is not configured for {expected} trading")
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "APCA-API-KEY-ID": self.settings.api_key,
+            "APCA-API-SECRET-KEY": self.settings.secret_key,
+            "Content-Type": "application/json",
+        }
+
+    def _read_json(
+        self, path: str, *, params: Mapping[str, object] | None = None
+    ) -> object:
+        """Issue one classified read; no caller can choose an HTTP verb."""
+
+        _require_validated_alpaca_settings(self.settings)
+        route = _normalized_alpaca_route(path)
+        if not route.startswith("/v2/"):
+            raise ValueError("Alpaca read path is invalid")
+        return self.__transport.get_json(
+            url=f"{self.settings.base_url}{route}",
+            headers=self._headers(),
+            timeout=self.settings.timeout,
+            params=params,
+        )
+
+    def _post_paper_order_payload(self, order: Mapping[str, object]) -> dict:
+        """Submit a paper order through the narrow paper-only transport."""
+
+        self.assert_expected_mode(paper=True)
+        payload = dict(order)
+        result = self.__transport.post_order_json(
+            url=f"{self.settings.base_url}/v2/orders",
+            headers=self._headers(),
+            timeout=self.settings.timeout,
+            payload=payload,
+        )
+        if type(result) is not dict:
+            raise AlpacaExecutionError("Alpaca paper order returned invalid JSON")
+        return result
 
     def get_account(self) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request("GET", "/v2/account")
+        result = self._read_json("/v2/account")
+        if type(result) is not dict:
+            raise AlpacaExecutionError("Alpaca account response is invalid")
+        return result
 
     def list_orders(self, status: str = "open") -> list[dict]:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request("GET", "/v2/orders", params={"status": status})
+        result = self._read_json("/v2/orders", params={"status": status})
+        if type(result) is not list:
+            raise AlpacaExecutionError("Alpaca orders response is invalid")
+        return result
 
     def list_positions(self) -> list[dict]:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request("GET", "/v2/positions")
+        result = self._read_json("/v2/positions")
+        if type(result) is not list:
+            raise AlpacaExecutionError("Alpaca positions response is invalid")
+        return result
 
     def get_asset(self, symbol: str) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request("GET", f"/v2/assets/{symbol.upper()}")
+        result = self._read_json(f"/v2/assets/{symbol.upper()}")
+        if type(result) is not dict:
+            raise AlpacaExecutionError("Alpaca asset response is invalid")
+        return result
 
     def get_clock(self) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request("GET", "/v2/clock")
+        result = self._read_json("/v2/clock")
+        if type(result) is not dict:
+            raise AlpacaExecutionError("Alpaca clock response is invalid")
+        return result
 
     def list_calendar(self, *, start: str, end: str) -> list[dict]:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request("GET", "/v2/calendar", params={"start": start, "end": end})
+        result = self._read_json("/v2/calendar", params={"start": start, "end": end})
+        if type(result) is not list:
+            raise AlpacaExecutionError("Alpaca calendar response is invalid")
+        return result
 
     def list_open_client_order_ids(self) -> set[str]:
         return {
@@ -860,11 +1019,13 @@ class AlpacaRestClient:
 
     def get_order_by_client_order_id(self, client_order_id: str) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request(
-            "GET",
+        result = self._read_json(
             "/v2/orders:by_client_order_id",
             params={"client_order_id": client_order_id},
         )
+        if type(result) is not dict:
+            raise AlpacaExecutionError("Alpaca order response is invalid")
+        return result
 
     def _collect_normal_live_reconciliation_reads(
         self, *, client_order_id: str
@@ -922,7 +1083,7 @@ class AlpacaRestClient:
     ) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
         if self.settings.paper is True:
-            return self._request("POST", "/v2/orders", json=dict(order))
+            return self._post_paper_order_payload(order)
 
         intent = _require_normal_live_intent(authorized_normal_trade_intent)
         if type(activation_receipt) is not NormalLiveActivationReceipt:
@@ -967,61 +1128,26 @@ class AlpacaRestClient:
     ) -> dict:
         """Perform exactly one policy-capability-bound normal-live POST."""
 
+        self.assert_expected_mode(paper=False)
         payload = _snapshot_normal_live_order(order_payload)
-        return self._request(
-            "POST",
-            "/v2/orders",
-            json=payload,
-            policy_post_capability=policy_post_capability,
+        from tradingagents.brokers.alpaca_supervisor import (
+            _consume_normal_live_submit_post_capability,
         )
 
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        policy_post_capability: object | None = None,
-        **kwargs,
-    ):
-        _require_exact_paper_setting(self.settings)
-        normalized_route = _normalized_alpaca_route(path)
-        if (
-            method.upper() == "POST"
-            and normalized_route == "/v2/orders"
-            and self.settings.paper is False
-        ):
-            payload = _snapshot_normal_live_order(kwargs.get("json"))
-            # The sole live order transport is capability-bound at this lowest
-            # layer.  A generic client._request call cannot reach the raw
-            # session even if it names the broker order endpoint directly.
-            from tradingagents.brokers.alpaca_supervisor import (
-                _consume_normal_live_submit_post_capability,
-            )
-
-            _consume_normal_live_submit_post_capability(
-                self._normal_live_broker_read_adapter,
-                policy_post_capability,
-                order_payload=payload,
-            )
-            kwargs["json"] = payload
-        url = f"{self.settings.base_url.rstrip('/')}{path}"
-        raw_session = _raw_alpaca_session_for_client(self)
-        response = raw_session.request(
-            method,
-            url,
-            headers={
-                "APCA-API-KEY-ID": self.settings.api_key,
-                "APCA-API-SECRET-KEY": self.settings.secret_key,
-                "Content-Type": "application/json",
-            },
-            timeout=self.settings.timeout,
-            **kwargs,
+        result = _consume_normal_live_submit_post_capability(
+            self._normal_live_broker_read_adapter,
+            policy_post_capability,
+            order_payload=payload,
+            send=lambda: self.__transport.post_order_json(
+                url=f"{self.settings.base_url}/v2/orders",
+                headers=self._headers(),
+                timeout=self.settings.timeout,
+                payload=payload,
+            ),
         )
-        if response.status_code >= 400:
-            raise AlpacaExecutionError(
-                f"Alpaca {method} {path} failed with {response.status_code}: {response.text}"
-            )
-        return response.json()
+        if type(result) is not dict:
+            raise AlpacaExecutionError("Alpaca live order returned invalid JSON")
+        return result
 
 
 def _rollback_paper_leg(

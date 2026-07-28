@@ -199,12 +199,15 @@ _LIVE_WRITE_CALLER_CLASSIFICATIONS = {
         ("cli/main.py", "alpaca_paper_tournament_run", "paper_client.submit_order"): "paper-only",
         ("cli/main.py", "alpaca_supervise_hourly", "paper_client.submit_order"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "definition"): "exact-intent-boundary",
-        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._request", "definition"): "exact-intent-boundary",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._collect_normal_live_reconciliation_reads", "self.assert_expected_mode"): "exact-intent-boundary",
-        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "self._request"): "paper-only",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.list_orders", "order-endpoint-primitive"): "read-only",
+        ("tradingagents/brokers/alpaca.py", "_AlpacaTransport.get_json", "self.__session.request"): "read-only",
+        ("tradingagents/brokers/alpaca.py", "_AlpacaTransport.post_order_json", "definition"): "internal-transport",
+        ("tradingagents/brokers/alpaca.py", "_AlpacaTransport.post_order_json", "self.__session.request"): "internal-transport",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "definition"): "exact-intent-boundary",
-        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "self._request"): "exact-intent-boundary",
-        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._request", "raw_session.request"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "self.assert_expected_mode"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_normal_live_order_payload", "self.__transport.post_order_json"): "exact-intent-boundary",
+        ("tradingagents/brokers/alpaca.py", "AlpacaRestClient._post_paper_order_payload", "self.__transport.post_order_json"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "definition"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "live_client.assert_expected_mode"): "hard-disabled",
         ("tradingagents/brokers/alpaca.py", "execute_order_pairs", "paper_client.submit_order"): "hard-disabled",
@@ -255,6 +258,7 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                 "_alpaca_live_client",
                 "_post_normal_live_order_payload",
                 "_request",
+                "post_order_json",
             }:
                 occurrences.append((self.relative_path, node.lineno, qualified, "definition"))
             self.scope.append(node.name)
@@ -291,8 +295,26 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                 and normalized_order_route == "/v2/orders"
             )
             is_raw_session_request = name.endswith(
-                (".session.request", "._session.request", "._raw_session.request")
-            ) or name == "raw_session.request"
+                (
+                    ".session.request",
+                    ".session.post",
+                    ".session.send",
+                    "._session.request",
+                    "._session.post",
+                    "._session.send",
+                    ".__session.request",
+                    ".__session.post",
+                    ".__session.send",
+                    "._raw_session.request",
+                    "._raw_session.post",
+                    "._raw_session.send",
+                )
+            ) or name in {
+                "raw_session.request",
+                "raw_session.post",
+                "raw_session.send",
+            }
+            is_raw_transport_helper = name.endswith(".post_order_json")
             has_order_endpoint_primitive = (
                 not name.endswith("._request")
                 and not is_raw_session_request
@@ -304,6 +326,7 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
             if (
                 is_raw_order_request
                 or is_raw_session_request
+                or is_raw_transport_helper
                 or name == "submit_order"
                 or name.endswith(".submit_order")
                 or name.endswith("._post_normal_live_order_payload")
@@ -376,6 +399,8 @@ def test_production_live_write_inventory_has_no_unclassified_caller():
         "paper-only",
         "hard-disabled",
         "exact-intent-boundary",
+        "read-only",
+        "internal-transport",
     }
 
 
@@ -417,8 +442,11 @@ def test_live_write_inventory_rejects_an_unclassified_raw_post_caller(tmp_path):
         'def bypass(client):\n    return client._request("POST", "/v2/orders/", json={})\n',
         'def bypass(client):\n    return client._request("POST", "/v2/orders#submit", json={})\n',
         'def bypass(client):\n    return client.session.request("POST", "/v2/orders", json={})\n',
+        'def bypass(client):\n    return client.session.post("/v2/orders", json={})\n',
+        'def bypass(client):\n    return client.session.send("/v2/orders")\n',
         'def bypass(client):\n    return client._session.request("POST", "/v2/orders", json={})\n',
         'def bypass(client):\n    return client.session._raw_session.request("POST", "/v2/orders", json={})\n',
+        'def bypass(client):\n    return client._transport.post_order_json(url="/v2/orders", payload={})\n',
         'def bypass(client):\n    return requests.post("/v2/orders", json={})\n',
     ),
 )

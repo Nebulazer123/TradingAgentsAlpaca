@@ -110,7 +110,9 @@ from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.live_control import live_control_lock, load_live_control_state
 from tradingagents.policy.live_gate import evaluate_go_live_guard
 from tradingagents.policy.order_rate_limit import (
+    LiveOrderRateReservation,
     evaluate_order_rate_limit,
+    normal_live_order_rate_reservation_lock,
     record_live_order_submission,
     release_live_order_reservation,
     reserve_live_order_submission,
@@ -234,12 +236,27 @@ _NORMAL_LIVE_ADMISSION_CAPABILITIES: dict[
     int, tuple[NormalLiveSubmitAdmission, _NormalLiveAdmissionContext]
 ] = {}
 _NORMAL_LIVE_ADMISSION_CLAIMS: dict[
-    int, tuple[_NormalLiveAdmissionClaim, _NormalLiveAdmissionContext]
+    int,
+    tuple[
+        _NormalLiveAdmissionClaim,
+        _NormalLiveAdmissionContext,
+        LiveOrderRateReservation | None,
+    ],
 ] = {}
 _NORMAL_LIVE_ADMISSION_RECONCILIATIONS: dict[int, object] = {}
 _NORMAL_LIVE_RISK_METRICS_CAPABILITIES: dict[int, NormalLiveRiskMetrics] = {}
 _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES: dict[
-    int, tuple[object, object, str, str, Path, dict[str, str], _NormalLiveAdmissionClaim]
+    int,
+    tuple[
+        object,
+        object,
+        str,
+        str,
+        Path,
+        dict[str, str],
+        _NormalLiveAdmissionClaim,
+        LiveOrderRateReservation,
+    ],
 ] = {}
 
 
@@ -731,7 +748,7 @@ def _claim_normal_live_submit_admission(
         expires_at=admission.expires_at,
         broker_read_adapter=broker_read_adapter,
     )
-    _NORMAL_LIVE_ADMISSION_CLAIMS[id(claim)] = (claim, context)
+    _NORMAL_LIVE_ADMISSION_CLAIMS[id(claim)] = (claim, context, None)
     return claim
 
 
@@ -1011,7 +1028,7 @@ def _reserve_normal_live_submit_claim(
     claim: object,
     *,
     client_order_id: str,
-) -> None:
+) -> LiveOrderRateReservation:
     """Reserve rate capacity under the final control-held broker handoff."""
 
     context = _normal_live_submit_claim_context(claim)
@@ -1023,7 +1040,7 @@ def _reserve_normal_live_submit_claim(
         or envelope.live_order_window_minutes is None
     ):
         raise ValueError("normal live submit rate reservation is unavailable")
-    reserve_live_order_submission(
+    reservation = reserve_live_order_submission(
         context.order_rate_state_path,
         client_order_id=client_order_id,
         now=_normal_live_admission_moment(),
@@ -1031,6 +1048,26 @@ def _reserve_normal_live_submit_claim(
         max_orders=envelope.max_live_orders_per_window,
         require_existing_ledger=True,
     )
+    if type(reservation) is not LiveOrderRateReservation:
+        raise ValueError("normal live submit rate reservation is unavailable")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    _NORMAL_LIVE_ADMISSION_CLAIMS[id(claim)] = (entry[0], entry[1], reservation)
+    return reservation
+
+
+def _normal_live_submit_claim_reservation(
+    claim: object,
+) -> LiveOrderRateReservation:
+    """Return the one durable rate binding reserved for the exact claim."""
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim or type(entry[2]) is not LiveOrderRateReservation:
+        raise ValueError("normal live submit rate reservation is unavailable")
+    return entry[2]
 
 
 def _release_normal_live_submit_claim_reservation(
@@ -1041,8 +1078,11 @@ def _release_normal_live_submit_claim_reservation(
     """Release only after an exact read-only retry proves the order absent."""
 
     context = _normal_live_submit_claim_context(claim)
+    reservation = _normal_live_submit_claim_reservation(claim)
     release_live_order_reservation(
-        context.order_rate_state_path, client_order_id=client_order_id
+        context.order_rate_state_path,
+        client_order_id=client_order_id,
+        reservation=reservation,
     )
 
 
@@ -1054,14 +1094,17 @@ def _record_normal_live_submit_claim(
 ) -> None:
     if type(claim) is not _NormalLiveAdmissionClaim:
         raise ValueError("live submit requires a trusted supervisor admission claim")
-    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.pop(id(claim), None)
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
     if entry is None or entry[0] is not claim:
         raise ValueError("live submit supervisor admission claim is unavailable")
+    reservation = _normal_live_submit_claim_reservation(claim)
     record_live_order_submission(
         entry[1].order_rate_state_path,
         client_order_id=client_order_id,
         now=accepted_at,
+        reservation=reservation,
     )
+    _NORMAL_LIVE_ADMISSION_CLAIMS.pop(id(claim), None)
     reconciliation = _NORMAL_LIVE_ADMISSION_RECONCILIATIONS.pop(id(claim), None)
     if reconciliation is not None:
         _release_normal_live_submit_reconciliation(reconciliation)
@@ -1097,6 +1140,7 @@ def _issue_normal_live_submit_post_capability(
     )
     if _normal_live_submit_claim_reconciliation(claim) is None:
         raise ValueError("live submit reconciliation is unavailable before raw post")
+    reservation = _normal_live_submit_claim_reservation(claim)
     payload = dict(order_payload)
     client_order_id = payload.get("client_order_id")
     intent_full_sha256 = claim.intent_full_sha256
@@ -1111,6 +1155,7 @@ def _issue_normal_live_submit_post_capability(
         "order_payload_sha256",
         "client_order_id",
         "control_preimage_sha256",
+        "rate_reservation_sha256",
     }
     if (
         type(client_order_id) is not str
@@ -1121,6 +1166,7 @@ def _issue_normal_live_submit_post_capability(
         or commitment.get("intent_full_sha256") != intent_full_sha256
         or commitment.get("order_payload_sha256") != payload_sha256
         or commitment.get("client_order_id") != client_order_id
+        or commitment.get("rate_reservation_sha256") != reservation.binding_sha256
     ):
         raise ValueError("normal live broker post capability is invalid")
     bound_commitment = {
@@ -1135,6 +1181,7 @@ def _issue_normal_live_submit_post_capability(
         _normal_live_submit_claim_control_path(claim),
         bound_commitment,
         claim,
+        reservation,
     )
     return capability
 
@@ -1144,7 +1191,8 @@ def _consume_normal_live_submit_post_capability(
     capability: object,
     *,
     order_payload: Mapping[str, str],
-) -> None:
+    send,
+) -> object:
     """Consume a supervisor-minted token at Alpaca's raw POST primitive."""
 
     entry = _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES.get(id(capability))
@@ -1158,6 +1206,7 @@ def _consume_normal_live_submit_post_capability(
         control_state_path,
         commitment,
         claim,
+        reservation,
     ) = entry
     payload = dict(order_payload)
     if (
@@ -1191,8 +1240,17 @@ def _consume_normal_live_submit_post_capability(
             intent_full_sha256=commitment["intent_full_sha256"],
             order_payload_sha256=payload_sha256,
             client_order_id=client_order_id,
+            rate_reservation_sha256=reservation.binding_sha256,
         )
         _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES.pop(id(capability), None)
+    # Never hold the control lock around broker I/O: a later safety freeze must
+    # record promptly.  The rate lock instead covers the immediate proof and
+    # the raw POST itself, so the reserved ledger cannot be deleted, corrupted,
+    # or replaced between the final check and transport.
+    if not callable(send):
+        raise ValueError("live raw post requires a classified transport sender")
+    with normal_live_order_rate_reservation_lock(reservation):
+        return send()
 
 
 def resolve_live_sleeve(

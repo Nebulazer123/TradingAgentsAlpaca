@@ -611,6 +611,9 @@ def evaluate_go_live_guard(
                 intent_full_sha256=str(normal_live_intent_full_sha256 or ""),
                 order_payload_sha256=str(normal_live_order_payload_sha256 or ""),
                 client_order_id=str(normal_live_client_order_id or ""),
+                rate_reservation_sha256=str(
+                    normal_live_commitment.get("rate_reservation_sha256") or ""
+                ),
             )
         except ValueError as exc:
             control_issues = [*control_issues, str(exc)]

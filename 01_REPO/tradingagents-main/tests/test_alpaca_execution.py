@@ -243,16 +243,13 @@ def test_build_paper_orders_never_builds_live_child_orders():
 
 
 def test_alpaca_rest_client_rejects_paper_mode_on_live_base_url():
-    settings = AlpacaSettings(
-        api_key="key",
-        secret_key="secret",
-        paper=True,
-        base_url="https://api.alpaca.markets",
-    )
-    client = AlpacaRestClient(settings=settings)
-
     with pytest.raises(AlpacaModeError):
-        client.assert_expected_mode(paper=True)
+        AlpacaSettings(
+            api_key="key",
+            secret_key="secret",
+            paper=True,
+            base_url="https://api.alpaca.markets",
+        )
 
 
 def test_alpaca_settings_reads_user_endpoint_env_names():
@@ -261,11 +258,11 @@ def test_alpaca_settings_reads_user_endpoint_env_names():
         environ={
             "ALPACA_PAPER_API_KEY": "paper-key",
             "ALPACA_PAPER_SECRET_KEY": "paper-secret",
-            "ALPACA_PAPER_API_ENDPOINT": "https://paper-api.alpaca.markets/custom",
+            "ALPACA_PAPER_API_ENDPOINT": "https://paper-api.alpaca.markets/v2",
         },
     )
 
-    assert settings.base_url == "https://paper-api.alpaca.markets/custom"
+    assert settings.base_url == "https://paper-api.alpaca.markets"
 
 
 def test_alpaca_settings_strips_trailing_v2_from_endpoint():
@@ -285,7 +282,7 @@ def test_alpaca_settings_falls_back_to_windows_user_env(monkeypatch):
     values = {
         "ALPACA_PAPER_API_KEY": "paper-key",
         "ALPACA_PAPER_SECRET_KEY": "paper-secret",
-        "ALPACA_PAPER_API_ENDPOINT": "https://paper-api.alpaca.markets/custom",
+        "ALPACA_PAPER_API_ENDPOINT": "https://paper-api.alpaca.markets/v2",
     }
     monkeypatch.setattr(alpaca_module, "_read_windows_user_env", values.get)
 
@@ -293,7 +290,7 @@ def test_alpaca_settings_falls_back_to_windows_user_env(monkeypatch):
 
     assert settings.api_key == "paper-key"
     assert settings.secret_key == "paper-secret"
-    assert settings.base_url == "https://paper-api.alpaca.markets/custom"
+    assert settings.base_url == "https://paper-api.alpaca.markets"
 
 
 def test_alpaca_execution_config_falls_back_to_windows_user_env(monkeypatch):
@@ -718,8 +715,25 @@ def _normal_live_admission(
     # A valid normal-live admission always has an observer-owned ledger before
     # policy work starts. The final reservation must only use this existing
     # ledger, never bootstrap a new one after the policy handoff.
-    if not rate_path.exists():
-        rate_path.write_text('{"submissions": []}', encoding="utf-8")
+    if (
+        not rate_path.exists()
+        or rate_path.read_text(encoding="utf-8") == '{"submissions": []}'
+    ):
+        from tradingagents.policy.order_rate_limit import (
+            release_live_order_reservation,
+            reserve_live_order_submission,
+        )
+
+        reserve_live_order_submission(
+            rate_path,
+            client_order_id="observer-bootstrap",
+            now=activated_at,
+            window_minutes=60,
+            max_orders=2,
+        )
+        release_live_order_reservation(
+            rate_path, client_order_id="observer-bootstrap"
+        )
     if rate_records:
         from tradingagents.policy.order_rate_limit import record_live_order_submission
 
@@ -1461,25 +1475,11 @@ def test_live_client_raw_post_requires_a_policy_owned_capability():
     assert client.session.requests == []
 
 
-@pytest.mark.parametrize(
-    ("method", "path"),
-    (
-        ("POST", "/v2/orders"),
-        ("post", "/v2/orders?retry=1"),
-        ("POST", "/v2/orders/"),
-        ("POST", "/v2/orders#submit"),
-    ),
-)
-def test_live_client_generic_transport_rejects_every_live_order_path_without_token(
-    method, path
-):
-    """Break caught: a generic transport call could bypass the post capability."""
+def test_live_client_has_no_generic_transport_for_order_endpoint_variants():
+    """Break caught: a generic path/method helper could bypass policy tokens."""
     client = _fake_live_client()
-    intent = _normal_live_intent()
 
-    with pytest.raises(ValueError, match="policy post capability"):
-        client._request(method, path, json=_bound_normal_live_order(intent))
-
+    assert not hasattr(client, "_request")
     assert client.session.requests == []
 
 
@@ -1491,6 +1491,52 @@ def test_live_client_session_view_has_no_raw_transport_escape_hatch():
     assert not hasattr(client.session, "_raw_session")
     assert not hasattr(client.session, "request")
     assert client.session.requests == []
+
+
+def test_live_client_exposes_no_generic_or_raw_session_transport_surface():
+    """Break caught: a supported client/view API could bypass the policy handoff.
+
+    This deliberately inventories the production module as well as the runtime
+    object.  It is not a claim that Python reflection is a security boundary;
+    it prevents accidentally reintroducing a supported generic request path or
+    a raw-session registry while the live boundary is frozen.
+    """
+    client = _fake_live_client()
+    source = Path(alpaca_module.__file__).read_text(encoding="utf-8")
+
+    assert "_ALPACA_CLIENT_SESSIONS" not in source
+    assert "_raw_alpaca_session_for_client" not in source
+    assert "def _request(" not in source
+    assert not hasattr(client, "_request")
+    for name in ("request", "post", "send", "_raw_session"):
+        assert not hasattr(client.session, name)
+
+
+@pytest.mark.parametrize(
+    ("paper", "base_url"),
+    (
+        (True, "https://api.alpaca.markets"),
+        (False, "https://paper-api.alpaca.markets"),
+    ),
+)
+def test_alpaca_settings_rejects_mode_url_mismatch_before_client_transport(
+    paper, base_url
+):
+    """Break caught: a mode flag could disagree with its broker endpoint."""
+    session = _FakeLiveSession()
+
+    with pytest.raises(AlpacaModeError, match="base URL"):
+        AlpacaRestClient(
+            settings=AlpacaSettings(
+                api_key="test-key",
+                secret_key="test-secret",
+                paper=paper,
+                base_url=base_url,
+            ),
+            session=session,
+        )
+
+    assert session.requests == []
 
 
 @pytest.mark.parametrize("paper", (0, 1, "false", None))
@@ -1557,6 +1603,92 @@ def test_rate_ledger_deletion_before_final_reservation_blocks_all_broker_io(
         )
 
     assert session.requests == []
+    assert not rate_path.exists()
+
+
+def test_rate_ledger_replacement_after_reservation_blocks_before_raw_post(
+    tmp_path, monkeypatch
+):
+    """Break caught: replacing a reserved ledger reopened the raw POST path."""
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    rate_path = tmp_path / "normal-live-rate.json"
+    rate_path.write_text('{"submissions": []}', encoding="utf-8")
+    session = _FakeLiveSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+    original_issue = supervisor_module._issue_normal_live_submit_post_capability
+
+    def replace_ledger_after_reservation(*args, **kwargs):
+        capability = original_issue(*args, **kwargs)
+        rate_path.write_text('{"submissions": []}', encoding="utf-8")
+        return capability
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "_issue_normal_live_submit_post_capability",
+        replace_ledger_after_reservation,
+    )
+
+    with pytest.raises(ValueError, match="rate ledger"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    assert session.post_calls == 0
+
+
+def test_accepted_post_with_deleted_rate_ledger_never_recreates_empty_capacity(
+    tmp_path, monkeypatch
+):
+    """Break caught: post-outcome recording rebuilt an empty rate ledger."""
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    rate_path = tmp_path / "normal-live-rate.json"
+    rate_path.write_text('{"submissions": []}', encoding="utf-8")
+
+    class _DeleteLedgerOnPostSession(_FakeLiveSession):
+        def request(self, method, url, **kwargs):
+            if method == "POST":
+                rate_path.unlink()
+            return super().request(method, url, **kwargs)
+
+    session = _DeleteLedgerOnPostSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+
+    with pytest.raises(ValueError, match="rate ledger"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    assert session.post_calls == 1
     assert not rate_path.exists()
 
 
@@ -1705,6 +1837,7 @@ def test_malformed_normal_live_commitment_blocks_before_owned_broker_io(
             intent_full_sha256="a" * 64,
             order_payload_sha256="b" * 64,
             client_order_id="prior-normal-live-order",
+            rate_reservation_sha256="c" * 64,
             now=activated_at,
         )
         control = json.loads(control_path.read_text(encoding="utf-8"))
@@ -1741,6 +1874,7 @@ def test_corrupt_duplicate_normal_live_commitment_blocks_before_owned_broker_io(
             intent_full_sha256="a" * 64,
             order_payload_sha256="b" * 64,
             client_order_id="prior-normal-live-order",
+            rate_reservation_sha256="c" * 64,
             now=activated_at,
         )
         control = json.loads(control_path.read_text(encoding="utf-8"))

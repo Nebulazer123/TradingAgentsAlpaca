@@ -2556,7 +2556,7 @@ def execute_normal_live_broker_submit(
                 control_state_path = _normal_live_submit_claim_control_path(
                     supervisor_claim
                 )
-                _reserve_normal_live_submit_claim(
+                rate_reservation = _reserve_normal_live_submit_claim(
                     supervisor_claim, client_order_id=intent.client_order_id
                 )
                 commitment = commit_normal_live_submission_locked(
@@ -2564,6 +2564,7 @@ def execute_normal_live_broker_submit(
                     intent_full_sha256=_digest(intent.canonical_json_bytes()),
                     order_payload_sha256=order_payload_sha256,
                     client_order_id=intent.client_order_id,
+                    rate_reservation_sha256=rate_reservation.binding_sha256,
                     now=_normal_live_policy_moment(),
                 )
 
