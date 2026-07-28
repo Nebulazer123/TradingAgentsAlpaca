@@ -140,6 +140,9 @@ class AuthorizedNormalTradeIntent:
             raise ValueError("evaluation_code_commit must be lowercase 40-hex")
         if type(self.symbol) is not str or _SYMBOL.fullmatch(self.symbol) is None:
             raise ValueError("symbol must be an uppercase ticker token")
+        for name in ("side", "order_type", "tif"):
+            if type(getattr(self, name)) is not str:
+                raise ValueError(f"{name} must be an exact string")
         if (self.side, self.order_type, self.tif) != ("buy", "limit", "day"):
             raise ValueError("only buy limit day orders are eligible")
         _money(self.notional_usd, "notional_usd")

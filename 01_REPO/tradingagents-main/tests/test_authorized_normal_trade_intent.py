@@ -10,6 +10,9 @@ from tradingagents.execution.authorized_normal_trade_intent import (
     AuthorizedNormalTradeIntent,
 )
 from tradingagents.schemas.trading import TradeIntent
+from tradingagents.strategy.paper_execution_authorization import (
+    AuthorizedPaperOrderRequest,
+)
 
 
 def _at(value: str) -> dt.datetime:
@@ -57,6 +60,30 @@ def _make_intent() -> AuthorizedNormalTradeIntent:
 
 def _bound_order(intent: AuthorizedNormalTradeIntent) -> dict[str, object]:
     return {"symbol": intent.symbol, "side": intent.side, "type": intent.order_type, "time_in_force": intent.tif, "notional": intent.notional_usd, "limit_price": intent.limit_price, "client_order_id": intent.client_order_id}
+
+
+def _recompute_bindings(payload: dict[str, object]) -> dict[str, object]:
+    logical_material = dict(payload)
+    for field in (
+        "authorization_id",
+        "logical_order_sha256",
+        "client_order_id",
+        "owner_role",
+        "authorization_scope",
+        "live_submit_authorized",
+        "paper_submit_authorized",
+    ):
+        logical_material.pop(field, None)
+    logical_order_sha256 = hashlib.sha256(_canonical(logical_material)).hexdigest()
+    payload["logical_order_sha256"] = logical_order_sha256
+    payload["client_order_id"] = f"ta-l-{logical_order_sha256[:40]}"
+    authorization_material = dict(payload)
+    authorization_material.pop("authorization_id", None)
+    payload["authorization_id"] = (
+        "authorized-normal-trade-intent-"
+        + hashlib.sha256(_canonical(authorization_material)).hexdigest()
+    )
+    return payload
 
 
 def _wrong_owner(payload: dict[str, object]) -> dict[str, object]:
@@ -118,3 +145,36 @@ def test_rejects_trade_intent_paper_mapping_future_effective_and_expiry() -> Non
     payload["effective_at"] = "2026-07-28T12:00:01+00:00"
     with pytest.raises(ValueError):
         AuthorizedNormalTradeIntent.from_dict(payload)
+
+
+def test_rejects_string_subclasses_for_order_fields() -> None:
+    class SpoofedBuy(str):
+        pass
+
+    payload = _make_intent().to_dict()
+    payload["side"] = SpoofedBuy("buy")
+    with pytest.raises(ValueError):
+        AuthorizedNormalTradeIntent.from_dict(_recompute_bindings(payload))
+
+
+def test_rejects_boolean_forged_fixed_authorization_field() -> None:
+    payload = _make_intent().to_dict()
+    payload["live_submit_authorized"] = 1
+    with pytest.raises(ValueError):
+        AuthorizedNormalTradeIntent.from_dict(payload)
+
+
+def test_verifier_rejects_actual_paper_authorization_object() -> None:
+    paper_request = object.__new__(AuthorizedPaperOrderRequest)
+    with pytest.raises(ValueError):
+        _make_intent().verify_order_payload(
+            paper_request,
+            at=_at("2026-07-28T12:00:01Z"),
+        )
+
+
+def test_rejects_future_effective_intent_after_recomputing_bindings() -> None:
+    payload = _make_intent().to_dict()
+    payload["effective_at"] = "2026-07-28T12:00:01+00:00"
+    with pytest.raises(ValueError, match="timestamps"):
+        AuthorizedNormalTradeIntent.from_dict(_recompute_bindings(payload))
