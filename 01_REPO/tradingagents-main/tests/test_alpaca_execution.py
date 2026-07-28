@@ -794,6 +794,45 @@ def test_stale_receipt_direct_policy_call_fails_before_lookup_or_post(
     assert callbacks == []
 
 
+def test_policy_expiry_during_lookup_prevents_post(tmp_path, monkeypatch):
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    expired_at = activated_at + datetime.timedelta(minutes=6)
+    policy_now = [activated_at]
+    monkeypatch.setattr(
+        promotion_sync_module,
+        "_normal_live_policy_utc_now",
+        lambda: policy_now[0],
+    )
+    order = _bound_normal_live_order(intent)
+    order_facts = alpaca_module._normal_live_order_facts(order)
+    immutable_order_sha256 = hashlib.sha256(
+        json.dumps(
+            order_facts, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    callbacks: list[str] = []
+
+    def lookup():
+        callbacks.append("lookup")
+        policy_now[0] = expired_at
+        return None
+
+    with pytest.raises(ValueError, match="not active"):
+        promotion_sync_module.execute_normal_live_broker_submit(
+            intent,
+            receipt,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            immutable_order_sha256=immutable_order_sha256,
+            lookup=lookup,
+            post=lambda: callbacks.append("post"),
+        )
+
+    assert callbacks == ["lookup"]
+
+
 def test_task3_admission_holds_state_lock_until_durable_prepare(tmp_path, monkeypatch):
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
         tmp_path, monkeypatch

@@ -1980,6 +1980,20 @@ def _normal_live_policy_utc_now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
 
 
+def _normal_live_policy_moment() -> datetime.datetime:
+    """Read one exact current UTC moment from the policy-owned clock."""
+
+    raw_moment = _normal_live_policy_utc_now()
+    if (
+        type(raw_moment) is not datetime.datetime
+        or raw_moment.tzinfo is None
+        or raw_moment.utcoffset() is None
+        or raw_moment.microsecond
+    ):
+        raise ValueError("activation receipt verification requires exact typed values")
+    return raw_moment.astimezone(datetime.timezone.utc)
+
+
 def _verify_normal_live_activation_receipt(
     intent: AuthorizedNormalTradeIntent,
     receipt: NormalLiveActivationReceipt,
@@ -2030,15 +2044,7 @@ def _verify_normal_live_activation_receipt(
     state_anchor = _capture_state_path_anchor(state_path_value)
     state_file = state_anchor.path
     with promotion_state_lock(state_file):
-        raw_moment = _normal_live_policy_utc_now()
-        if (
-            type(raw_moment) is not datetime.datetime
-            or raw_moment.tzinfo is None
-            or raw_moment.utcoffset() is None
-            or raw_moment.microsecond
-        ):
-            raise ValueError("activation receipt verification requires exact typed values")
-        moment = raw_moment.astimezone(datetime.timezone.utc)
+        moment = _normal_live_policy_moment()
         if not intent.is_active(at=moment):
             raise ValueError("activation receipt intent is not active")
         store = ImmutableStrategyEvidenceStore(root, clock=lambda: moment)
@@ -2123,7 +2129,7 @@ def _verify_normal_live_activation_receipt(
         )
         if dict(receipt_payload) != expected_receipt:
             raise ValueError("activation receipt does not match the activation transaction")
-        def recheck_before_broker_post() -> None:
+        def recheck_before_broker_io() -> None:
             _require_snapshot_current(snapshot)
             _require_state_path_anchor_current(state_anchor)
             current_marker = _activation_state_marker(
@@ -2146,8 +2152,10 @@ def _verify_normal_live_activation_receipt(
                 or current_sleeve.get("live_enabled") is not True
             ):
                 raise ValueError("activation receipt has no current live-eligible sleeve")
+            if not intent.is_active(at=_normal_live_policy_moment()):
+                raise ValueError("activation receipt intent is not active")
 
-        recheck_before_broker_post()
+        recheck_before_broker_io()
         return (
             None
             if _accept is None
@@ -2155,7 +2163,7 @@ def _verify_normal_live_activation_receipt(
                 store,
                 snapshot,
                 activation_state_marker,
-                recheck_before_broker_post,
+                recheck_before_broker_io,
             )
         )
 
@@ -2248,7 +2256,7 @@ def execute_normal_live_broker_submit(
         store: ImmutableStrategyEvidenceStore,
         snapshot: PromotionStateSnapshot,
         activation_state_marker: str,
-        recheck_before_broker_post: Callable[[], None],
+        recheck_before_broker_io: Callable[[], None],
     ) -> object:
         candidate = EvidenceCandidate(
             kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
@@ -2296,7 +2304,7 @@ def execute_normal_live_broker_submit(
             raise ValueError("live retry lookup found no order; refusing second POST")
         # This is immediately before the only possible broker POST and remains
         # inside the promotion-state lock acquired by the Task 3 verifier.
-        recheck_before_broker_post()
+        recheck_before_broker_io()
         return post()
 
     return _verify_normal_live_activation_receipt(
