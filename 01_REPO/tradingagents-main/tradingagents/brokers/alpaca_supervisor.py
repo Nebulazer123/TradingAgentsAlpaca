@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -97,7 +98,10 @@ from tradingagents.brokers.supervisor.types import (
 from tradingagents.execution.authorized_normal_trade_intent import (
     AuthorizedNormalTradeIntent,
 )
+from tradingagents.execution.reconcile import ReconciliationResult
+from tradingagents.policy.live_control import load_live_control_state
 from tradingagents.policy.live_gate import evaluate_go_live_guard
+from tradingagents.policy.order_rate_limit import record_live_order_submission
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 __all__ = [
@@ -160,6 +164,277 @@ UTC = datetime.timezone.utc
 CENTRAL = ZoneInfo("America/Chicago")
 LIVE_AGGRESSIVE_SLEEVE = "current-aggressive"
 DEFAULT_ALERT_THROTTLE_WINDOW = datetime.timedelta(hours=4)
+_NORMAL_LIVE_ADMISSION_MAX_AGE_SECONDS = 60
+
+
+@dataclass(frozen=True, slots=True)
+class NormalLiveSubmitAdmission:
+    """Opaque, process-local request to run the final normal-live checks."""
+
+    intent_full_sha256: str
+    issued_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalLiveAdmissionContext:
+    risk_envelope_path: Path
+    promotion_state_path: Path
+    control_state_path: Path
+    order_rate_state_path: Path
+    current_live_exposure: Decimal
+    current_daily_loss_usd: Decimal | None
+    current_drawdown_pct: Decimal | None
+    live_account: dict[str, object]
+    live_positions: tuple[dict[str, object], ...]
+    decision_evidence: dict[str, object]
+    reconciliation_checked_client_order_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalLiveAdmissionClaim:
+    """Private lease retained only while the policy lock is held."""
+
+    intent_full_sha256: str
+    order_payload_sha256: str
+
+
+_NORMAL_LIVE_ADMISSION_CAPABILITIES: dict[
+    int, tuple[NormalLiveSubmitAdmission, _NormalLiveAdmissionContext]
+] = {}
+_NORMAL_LIVE_ADMISSION_CLAIMS: dict[
+    int, tuple[_NormalLiveAdmissionClaim, _NormalLiveAdmissionContext]
+] = {}
+
+
+def _normal_live_admission_utc_now() -> datetime.datetime:
+    return datetime.datetime.now(tz=UTC).replace(microsecond=0)
+
+
+def _normal_live_admission_moment() -> datetime.datetime:
+    current = _normal_live_admission_utc_now()
+    if (
+        type(current) is not datetime.datetime
+        or current.tzinfo is None
+        or current.utcoffset() is None
+        or current.microsecond
+    ):
+        raise ValueError("normal live admission requires an aware whole-second clock")
+    return current.astimezone(UTC)
+
+
+def _normal_live_admission_path(value: str | Path, *, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or path.resolve() != path:
+        raise ValueError(f"normal live admission {label} path must be absolute")
+    return path
+
+
+def _normal_live_admission_mapping(value: object, *, label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"normal live admission {label} must be a mapping")
+    try:
+        frozen = json.loads(
+            json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"normal live admission {label} must be JSON-safe") from exc
+    if type(frozen) is not dict:
+        raise ValueError(f"normal live admission {label} must be an object")
+    return frozen
+
+
+def _normal_live_admission_positions(value: object) -> tuple[dict[str, object], ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("normal live admission positions must be a sequence")
+    return tuple(
+        _normal_live_admission_mapping(position, label="position")
+        for position in value
+    )
+
+
+def _normal_live_intent_sha256(intent: AuthorizedNormalTradeIntent) -> str:
+    return hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
+
+
+def _issue_normal_live_submit_admission(
+    intent: AuthorizedNormalTradeIntent,
+    *,
+    risk_envelope_path: str | Path,
+    promotion_state_path: str | Path,
+    control_state_path: str | Path,
+    order_rate_state_path: str | Path,
+    current_live_exposure: Decimal,
+    current_daily_loss_usd: Decimal | None,
+    current_drawdown_pct: Decimal | None,
+    live_account: Mapping,
+    live_positions: Sequence[Mapping],
+    decision_evidence: Mapping,
+    reconciliation: ReconciliationResult,
+) -> NormalLiveSubmitAdmission:
+    """Issue a local capability; gates are re-evaluated under the policy lock."""
+    if type(intent) is not AuthorizedNormalTradeIntent:
+        raise ValueError("normal live admission requires an exact AuthorizedNormalTradeIntent")
+    if type(current_live_exposure) is not Decimal:
+        raise ValueError("normal live admission exposure must be an exact Decimal")
+    if current_daily_loss_usd is not None and type(current_daily_loss_usd) is not Decimal:
+        raise ValueError("normal live admission daily loss must be an exact Decimal")
+    if current_drawdown_pct is not None and type(current_drawdown_pct) is not Decimal:
+        raise ValueError("normal live admission drawdown must be an exact Decimal")
+    if (
+        type(reconciliation) is not ReconciliationResult
+        or reconciliation.matched is not True
+        or reconciliation.issues
+        or not all(type(item) is str for item in reconciliation.checked_client_order_ids)
+    ):
+        raise ValueError("normal live admission requires clean exact reconciliation")
+
+    issued_at = _normal_live_admission_moment()
+    admission = NormalLiveSubmitAdmission(
+        intent_full_sha256=_normal_live_intent_sha256(intent),
+        issued_at=issued_at.isoformat(timespec="seconds"),
+    )
+    _NORMAL_LIVE_ADMISSION_CAPABILITIES[id(admission)] = (
+        admission,
+        _NormalLiveAdmissionContext(
+            risk_envelope_path=_normal_live_admission_path(
+                risk_envelope_path, label="risk envelope"
+            ),
+            promotion_state_path=_normal_live_admission_path(
+                promotion_state_path, label="promotion state"
+            ),
+            control_state_path=_normal_live_admission_path(
+                control_state_path, label="live control"
+            ),
+            order_rate_state_path=_normal_live_admission_path(
+                order_rate_state_path, label="rate state"
+            ),
+            current_live_exposure=current_live_exposure,
+            current_daily_loss_usd=current_daily_loss_usd,
+            current_drawdown_pct=current_drawdown_pct,
+            live_account=_normal_live_admission_mapping(
+                live_account, label="live account"
+            ),
+            live_positions=_normal_live_admission_positions(live_positions),
+            decision_evidence=_normal_live_admission_mapping(
+                decision_evidence, label="decision evidence"
+            ),
+            reconciliation_checked_client_order_ids=tuple(
+                reconciliation.checked_client_order_ids
+            ),
+        ),
+    )
+    return admission
+
+
+def _claim_normal_live_submit_admission(
+    admission: object,
+    *,
+    intent: AuthorizedNormalTradeIntent,
+    order_payload_sha256: str,
+    promotion_state_path: Path,
+) -> _NormalLiveAdmissionClaim:
+    if type(admission) is not NormalLiveSubmitAdmission:
+        raise ValueError("live submit requires an exact supervisor admission artifact")
+    entry = _NORMAL_LIVE_ADMISSION_CAPABILITIES.get(id(admission))
+    if entry is None or entry[0] is not admission:
+        raise ValueError("live submit requires an unconsumed supervisor admission artifact")
+    context = entry[1]
+    if admission.intent_full_sha256 != _normal_live_intent_sha256(intent):
+        raise ValueError("supervisor admission does not bind the exact live intent")
+    if context.promotion_state_path != promotion_state_path.resolve():
+        raise ValueError("supervisor admission does not bind the active promotion state")
+    issued_at = datetime.datetime.fromisoformat(admission.issued_at)
+    current = _normal_live_admission_moment()
+    age = (current - issued_at).total_seconds()
+    if age < 0 or age > _NORMAL_LIVE_ADMISSION_MAX_AGE_SECONDS:
+        raise ValueError("supervisor admission is stale")
+    del _NORMAL_LIVE_ADMISSION_CAPABILITIES[id(admission)]
+    claim = _NormalLiveAdmissionClaim(
+        intent_full_sha256=admission.intent_full_sha256,
+        order_payload_sha256=order_payload_sha256,
+    )
+    _NORMAL_LIVE_ADMISSION_CLAIMS[id(claim)] = (claim, context)
+    return claim
+
+
+def _normal_live_action_from_payload(
+    payload: Mapping[str, str], *, sleeve: str
+) -> HourlySupervisorAction:
+    return HourlySupervisorAction(
+        action="buy",
+        symbol=payload["symbol"],
+        notional=Decimal(payload["notional"]),
+        limit_price=Decimal(payload["limit_price"]),
+        side=payload["side"],
+        order_type=payload["type"],
+        reason="exact authorized normal-live order",
+        account="live",
+        execution_mode="tiny_live",
+        sleeve=sleeve,
+    )
+
+
+def _revalidate_normal_live_submit_claim(
+    claim: object,
+    *,
+    payload: Mapping[str, str],
+    sleeve: str,
+) -> None:
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    context = entry[1]
+    digest = hashlib.sha256(
+        json.dumps(
+            dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    if digest != claim.order_payload_sha256:
+        raise ValueError("supervisor admission does not bind the exact live order")
+    current = _normal_live_admission_moment()
+    issues = validate_supervisor_live_submit_allowed(
+        actions=[_normal_live_action_from_payload(payload, sleeve=sleeve)],
+        risk_envelope_path=context.risk_envelope_path,
+        promotion_state_path=context.promotion_state_path,
+        control_state_path=context.control_state_path,
+        order_rate_state_path=context.order_rate_state_path,
+        current_live_exposure=context.current_live_exposure,
+        current_daily_loss_usd=context.current_daily_loss_usd,
+        current_drawdown_pct=context.current_drawdown_pct,
+        live_account=context.live_account,
+        live_positions=context.live_positions,
+        decision_evidence=context.decision_evidence,
+        now=current,
+    )
+    if issues:
+        raise ValueError(
+            "normal live submit final gates rejected admission: "
+            + "; ".join(issue.reason for issue in issues)
+        )
+    _state, control_issues = load_live_control_state(
+        context.control_state_path, now=current
+    )
+    if control_issues:
+        raise ValueError("normal live submit live-control recheck rejected admission")
+
+
+def _record_normal_live_submit_claim(
+    claim: object,
+    *,
+    client_order_id: str,
+) -> None:
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.pop(id(claim), None)
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    record_live_order_submission(
+        entry[1].order_rate_state_path,
+        client_order_id=client_order_id,
+        now=_normal_live_admission_moment(),
+    )
 
 
 def resolve_live_sleeve(
@@ -668,6 +943,7 @@ def validate_supervisor_live_submit_allowed(
     risk_envelope_path: str | Path = "config/risk_envelope.yaml",
     promotion_state_path: str | Path = "results/policy/promotion_state.json",
     control_state_path: str | Path = "results/policy/live_control.json",
+    order_rate_state_path: str | Path = "results/policy/live_order_rate_state.json",
     current_live_exposure: Decimal = Decimal("0"),
     current_daily_loss_usd: Decimal | None = None,
     current_drawdown_pct: Decimal | None = None,
@@ -687,6 +963,7 @@ def validate_supervisor_live_submit_allowed(
         risk_envelope_path=risk_envelope_path,
         promotion_state_path=promotion_state_path,
         control_state_path=control_state_path,
+        order_rate_state_path=order_rate_state_path,
         current_live_exposure=current_live_exposure,
         current_daily_loss_usd=current_daily_loss_usd,
         current_drawdown_pct=current_drawdown_pct,
@@ -703,13 +980,23 @@ def submit_authorized_normal_live_order(
     live_client,
     authorized_normal_trade_intent: AuthorizedNormalTradeIntent,
     activation_receipt: NormalLiveActivationReceipt,
+    risk_envelope_path: str | Path,
+    promotion_state_path: str | Path,
+    control_state_path: str | Path,
+    order_rate_state_path: str | Path,
+    current_live_exposure: Decimal,
+    current_daily_loss_usd: Decimal | None,
+    current_drawdown_pct: Decimal | None,
+    live_account: Mapping,
+    live_positions: Sequence[Mapping],
+    decision_evidence: Mapping,
+    reconciliation: ReconciliationResult,
 ) -> dict:
-    """Forward one already-issued normal-live authorization without rebuilding it.
+    """Forward one already-issued intent through the locked final gate.
 
-    This helper is deliberately not a decision path: its payload comes only
-    from the immutable intent, and the Alpaca boundary still re-verifies both
-    exact objects before any broker request.  CLI entry points do not accept
-    either object and therefore must fail closed before reaching this helper.
+    The local admission artifact is bound to one exact intent and is consumed
+    under the Task 3 promotion-state lock by the Alpaca boundary.  It carries
+    explicit final-gate inputs rather than a caller-provided approval boolean.
     """
     if type(authorized_normal_trade_intent) is not AuthorizedNormalTradeIntent:
         raise ValueError(
@@ -720,6 +1007,20 @@ def submit_authorized_normal_live_order(
             "live supervisor submit requires an exact NormalLiveActivationReceipt"
         )
     intent = authorized_normal_trade_intent
+    admission = _issue_normal_live_submit_admission(
+        intent,
+        risk_envelope_path=risk_envelope_path,
+        promotion_state_path=promotion_state_path,
+        control_state_path=control_state_path,
+        order_rate_state_path=order_rate_state_path,
+        current_live_exposure=current_live_exposure,
+        current_daily_loss_usd=current_daily_loss_usd,
+        current_drawdown_pct=current_drawdown_pct,
+        live_account=live_account,
+        live_positions=live_positions,
+        decision_evidence=decision_evidence,
+        reconciliation=reconciliation,
+    )
     order = {
         "symbol": intent.symbol,
         "side": intent.side,
@@ -733,6 +1034,7 @@ def submit_authorized_normal_live_order(
         order,
         authorized_normal_trade_intent=intent,
         activation_receipt=activation_receipt,
+        supervisor_admission=admission,
     )
 
 

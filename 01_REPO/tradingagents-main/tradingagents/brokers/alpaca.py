@@ -706,6 +706,16 @@ def _normal_live_order_facts(order: Mapping[str, object]) -> dict[str, object]:
     return {field: order[field] for field in fields}
 
 
+def _snapshot_normal_live_order(order: object) -> dict[str, str]:
+    """Copy one untrusted order mapping exactly once before live validation."""
+    if not isinstance(order, Mapping):
+        raise ValueError("live order must be an exact mapping")
+    payload = dict(order)
+    if not all(type(key) is str and type(value) is str for key, value in payload.items()):
+        raise ValueError("live order fields must be exact strings")
+    return payload
+
+
 def _require_matching_broker_order(
     broker_order: object, expected: Mapping[str, object]
 ) -> None:
@@ -783,6 +793,7 @@ class AlpacaRestClient:
         *,
         authorized_normal_trade_intent=None,
         activation_receipt=None,
+        supervisor_admission=None,
     ) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
         if self.settings.paper is True:
@@ -798,24 +809,21 @@ class AlpacaRestClient:
         ):
             raise ValueError("live submit requires durable normal-live evidence roots")
         receipt = _require_normal_live_receipt(intent, activation_receipt)
-        intent.verify_order_payload(order, at=checked_at)
-        payload = dict(order)
-        client_order_id = intent.client_order_id
+        payload = _snapshot_normal_live_order(order)
+        intent.verify_order_payload(payload, at=checked_at)
         immutable_facts = _normal_live_order_facts(payload)
-        facts_bytes = json.dumps(
-            dict(immutable_facts),
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        ).encode("utf-8")
         broker_result = execute_normal_live_broker_submit(
             intent,
             receipt,
             proposal_ledger_root=self.normal_live_evidence_root,
             repo_root=self.normal_live_repo_root,
-            immutable_order_sha256=hashlib.sha256(facts_bytes).hexdigest(),
-            lookup=lambda: self._lookup_live_order_by_client_order_id(client_order_id),
-            post=lambda: self._request("POST", "/v2/orders", json=payload),
+            supervisor_admission=supervisor_admission,
+            lookup=lambda bound_client_order_id: self._lookup_live_order_by_client_order_id(
+                bound_client_order_id
+            ),
+            post=lambda bound_payload: self._request(
+                "POST", "/v2/orders", json=dict(bound_payload)
+            ),
         )
         _require_matching_broker_order(broker_result, immutable_facts)
         return broker_result

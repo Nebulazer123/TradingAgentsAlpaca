@@ -25,6 +25,19 @@ def test_records_and_counts_within_window(tmp_path):
     assert count_live_submissions_in_window(path, now=NOW, window_minutes=60) == 2
 
 
+def test_recording_the_same_client_order_id_is_idempotent(tmp_path):
+    """Break caught: a GET-only retry could consume the live-order budget twice."""
+    path = tmp_path / "rate.json"
+    record_live_order_submission(path, client_order_id="ta-once", now=NOW)
+    record_live_order_submission(
+        path,
+        client_order_id="ta-once",
+        now=NOW + datetime.timedelta(seconds=30),
+    )
+
+    assert count_live_submissions_in_window(path, now=NOW, window_minutes=60) == 1
+
+
 def test_counts_exclude_submissions_outside_window(tmp_path):
     path = tmp_path / "rate.json"
     record_live_order_submission(

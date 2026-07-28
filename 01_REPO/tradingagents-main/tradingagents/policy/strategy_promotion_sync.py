@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from types import MappingProxyType
 
 from tradingagents.execution.authorized_normal_trade_intent import (
     AuthorizedNormalTradeIntent,
@@ -52,6 +53,7 @@ from tradingagents.strategy._immutable_evidence_store import (
     NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
     NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
     NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
+    NORMAL_LIVE_BROKER_SUBMIT_RECEIPT_KIND,
     STRATEGY_PROMOTION_SYNC_PREPARE_KIND,
     STRATEGY_PROMOTION_SYNC_RECEIPT_KIND,
     EvidenceCandidate,
@@ -2172,7 +2174,7 @@ def _normal_live_broker_submit_payload(
     *,
     intent: AuthorizedNormalTradeIntent,
     receipt: NormalLiveActivationReceipt,
-    immutable_order_sha256: str,
+    order_payload_sha256: str,
     canonical_state_sha256: str,
     activation_state_marker: str,
 ) -> dict[str, object]:
@@ -2183,10 +2185,51 @@ def _normal_live_broker_submit_payload(
         "client_order_id": intent.client_order_id,
         "activation_prepare_id": receipt.activation_prepare_id,
         "activation_receipt_id": receipt.activation_receipt_id,
-        "immutable_order_sha256": immutable_order_sha256,
+        "immutable_order_sha256": order_payload_sha256,
         "canonical_state_sha256": canonical_state_sha256,
         "activation_state_marker": activation_state_marker,
     }
+
+
+def _normal_live_broker_order_payload(
+    intent: AuthorizedNormalTradeIntent,
+) -> dict[str, str]:
+    """Construct the only broker-order representation bound to an intent."""
+    return {
+        "symbol": intent.symbol,
+        "side": intent.side,
+        "type": intent.order_type,
+        "time_in_force": intent.tif,
+        "notional": intent.notional_usd,
+        "limit_price": intent.limit_price,
+        "client_order_id": intent.client_order_id,
+    }
+
+
+def _normal_live_broker_submit_receipt_payload(
+    *,
+    prepare: EvidenceEnvelope,
+    order_payload_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "broker_submit_prepare_id": prepare.object_id,
+        "broker_submit_prepare_sha256": _digest(prepare.canonical_json_bytes()),
+        "order_payload_sha256": order_payload_sha256,
+    }
+
+
+def _require_matching_normal_live_broker_order(
+    broker_order: object,
+    expected: Mapping[str, str],
+) -> None:
+    if type(broker_order) is not dict:
+        raise ValueError("live broker result does not match authorized intent")
+    fields = tuple(expected)
+    if any(field not in broker_order for field in fields):
+        raise ValueError("live broker result does not match authorized intent")
+    if {field: broker_order[field] for field in fields} != dict(expected):
+        raise ValueError("live broker result does not match authorized intent")
 
 
 def _matching_normal_live_broker_submits(
@@ -2221,15 +2264,33 @@ def _require_unique_normal_live_broker_submit(snapshot, envelope) -> None:
     _matching_normal_live_broker_submits(snapshot, envelope.payload)
 
 
+def _require_unique_normal_live_broker_submit_receipt(snapshot, envelope) -> None:
+    if not isinstance(envelope.payload, Mapping):
+        raise ValueError("durable live submit receipt is invalid")
+    prepare_id = envelope.payload.get("broker_submit_prepare_id")
+    if type(prepare_id) is not str:
+        raise ValueError("durable live submit receipt is invalid")
+    for prior in snapshot:
+        if prior.kind != NORMAL_LIVE_BROKER_SUBMIT_RECEIPT_KIND:
+            continue
+        if not isinstance(prior.payload, Mapping):
+            raise ValueError("durable live submit receipt is invalid")
+        if (
+            prior.payload.get("broker_submit_prepare_id") == prepare_id
+            and prior.payload != envelope.payload
+        ):
+            raise ValueError("durable live submit receipt conflicts with prior result")
+
+
 def execute_normal_live_broker_submit(
     intent: AuthorizedNormalTradeIntent,
     receipt: NormalLiveActivationReceipt,
     *,
     proposal_ledger_root: str | Path,
     repo_root: str | Path,
-    immutable_order_sha256: str,
-    lookup: Callable[[], object | None],
-    post: Callable[[], object],
+    supervisor_admission: object,
+    lookup: Callable[[str], object | None],
+    post: Callable[[Mapping[str, str]], object],
 ) -> object:
     """Run one normal-live broker handoff under Task 3's state coordination.
 
@@ -2245,8 +2306,6 @@ def execute_normal_live_broker_submit(
     if (
         type(intent) is not AuthorizedNormalTradeIntent
         or type(receipt) is not NormalLiveActivationReceipt
-        or type(immutable_order_sha256) is not str
-        or re.fullmatch(r"[0-9a-f]{64}", immutable_order_sha256) is None
         or not callable(lookup)
         or not callable(post)
     ):
@@ -2258,13 +2317,35 @@ def execute_normal_live_broker_submit(
         activation_state_marker: str,
         recheck_before_broker_io: Callable[[], None],
     ) -> object:
+        expected_order = _normal_live_broker_order_payload(intent)
+        frozen_order = MappingProxyType(expected_order)
+        order_payload_sha256 = _digest(_canonical(expected_order))
+        activation = snapshot.state.get("normal_live_activation")
+        sleeve = activation.get("sleeve") if isinstance(activation, Mapping) else None
+        if type(sleeve) is not str or not sleeve:
+            raise ValueError("activation receipt has no current live-eligible sleeve")
+        # Delayed import prevents the broker supervisor's data-only imports from
+        # forming a module cycle.  The returned claim is an exact local
+        # capability, not a caller-provided approving callback.
+        from tradingagents.brokers.alpaca_supervisor import (
+            _claim_normal_live_submit_admission,
+            _record_normal_live_submit_claim,
+            _revalidate_normal_live_submit_claim,
+        )
+
+        supervisor_claim = _claim_normal_live_submit_admission(
+            supervisor_admission,
+            intent=intent,
+            order_payload_sha256=order_payload_sha256,
+            promotion_state_path=snapshot.path,
+        )
         candidate = EvidenceCandidate(
             kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
             effective_at=intent.recorded_at,
             payload=_normal_live_broker_submit_payload(
                 intent=intent,
                 receipt=receipt,
-                immutable_order_sha256=immutable_order_sha256,
+                order_payload_sha256=order_payload_sha256,
                 canonical_state_sha256=snapshot.sha256,
                 activation_state_marker=activation_state_marker,
             ),
@@ -2297,18 +2378,53 @@ def execute_normal_live_broker_submit(
                 activation_state_marker=activation_state_marker,
             )
 
+        def accept_broker_result(result: object) -> object:
+            _require_matching_normal_live_broker_order(result, frozen_order)
+            # An actual matching order is the only point at which the rolling
+            # limit is recorded.  The durable receipt is then written from the
+            # policy-owned payload, not caller data or an arbitrary result.
+            _record_normal_live_submit_claim(
+                supervisor_claim,
+                client_order_id=intent.client_order_id,
+            )
+            prepare = next(
+                envelope
+                for envelope in store.envelopes(
+                    kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND
+                )
+                if envelope.payload == candidate.payload
+            )
+            store.admit_checked(
+                EvidenceCandidate(
+                    kind=NORMAL_LIVE_BROKER_SUBMIT_RECEIPT_KIND,
+                    effective_at=intent.recorded_at,
+                    payload=_normal_live_broker_submit_receipt_payload(
+                        prepare=prepare,
+                        order_payload_sha256=order_payload_sha256,
+                    ),
+                ),
+                validate=_require_unique_normal_live_broker_submit_receipt,
+            )
+            return result
+
         # The durable write above can take time, so recheck immediately before
         # the first possible broker I/O as well as before a possible POST.
         recheck_before_broker_io()
-        existing = lookup()
+        _revalidate_normal_live_submit_claim(
+            supervisor_claim, payload=frozen_order, sleeve=sleeve
+        )
+        existing = lookup(intent.client_order_id)
         if existing is not None:
-            return existing
+            return accept_broker_result(existing)
         if not recorded.created:
             raise ValueError("live retry lookup found no order; refusing second POST")
         # This is immediately before the only possible broker POST and remains
         # inside the promotion-state lock acquired by the Task 3 verifier.
         recheck_before_broker_io()
-        return post()
+        _revalidate_normal_live_submit_claim(
+            supervisor_claim, payload=frozen_order, sleeve=sleeve
+        )
+        return accept_broker_result(post(frozen_order))
 
     return _verify_normal_live_activation_receipt(
         intent,

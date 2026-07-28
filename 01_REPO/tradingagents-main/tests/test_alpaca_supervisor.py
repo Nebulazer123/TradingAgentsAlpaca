@@ -60,9 +60,7 @@ from tradingagents.brokers.supervisor import session as supervisor_session
 from tradingagents.brokers.supervisor import sizing as supervisor_sizing
 from tradingagents.brokers.supervisor import types as supervisor_types
 from tradingagents.evals.email_clarity import evaluate_email_clarity
-from tradingagents.execution.authorized_normal_trade_intent import (
-    AuthorizedNormalTradeIntent,
-)
+from tradingagents.execution.reconcile import ReconciliationResult
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 
@@ -110,7 +108,9 @@ def test_candidate_helpers_are_extracted_but_legacy_facade_stays_compatible():
     )
 
 
-def test_supervisor_forwards_the_identical_normal_intent_and_receipt_to_live_client():
+def test_supervisor_forwards_the_identical_normal_intent_receipt_and_admission_to_live_client(
+    tmp_path,
+):
     class _LiveClient:
         def __init__(self):
             self.call = None
@@ -119,17 +119,9 @@ def test_supervisor_forwards_the_identical_normal_intent_and_receipt_to_live_cli
             self.call = (order, kwargs)
             return {"id": "live-order"}
 
-    intent = object.__new__(AuthorizedNormalTradeIntent)
-    for field, value in {
-        "symbol": "MSFT",
-        "side": "buy",
-        "order_type": "limit",
-        "tif": "day",
-        "notional_usd": "25.00",
-        "limit_price": "100.00",
-        "client_order_id": "ta-l-exact-intent",
-    }.items():
-        object.__setattr__(intent, field, value)
+    from tests.test_alpaca_execution import _normal_live_intent
+
+    intent = _normal_live_intent()
     receipt = NormalLiveActivationReceipt(
         activation_prepare_id="prepare",
         activation_receipt_id="receipt",
@@ -146,19 +138,33 @@ def test_supervisor_forwards_the_identical_normal_intent_and_receipt_to_live_cli
         live_client=live_client,
         authorized_normal_trade_intent=intent,
         activation_receipt=receipt,
+        risk_envelope_path=(tmp_path / "risk.yaml").resolve(),
+        promotion_state_path=(tmp_path / "promotion.json").resolve(),
+        control_state_path=(tmp_path / "control.json").resolve(),
+        order_rate_state_path=(tmp_path / "rate.json").resolve(),
+        current_live_exposure=Decimal("0.00"),
+        current_daily_loss_usd=Decimal("0.00"),
+        current_drawdown_pct=Decimal("0.00"),
+        live_account={"buying_power": "500.00"},
+        live_positions=(),
+        decision_evidence={},
+        reconciliation=ReconciliationResult(
+            matched=True, issues=[], checked_client_order_ids=[]
+        ),
     ) == {"id": "live-order"}
     order, kwargs = live_client.call
     assert order == {
-        "symbol": "MSFT",
-        "side": "buy",
+        "symbol": intent.symbol,
+        "side": intent.side,
         "type": "limit",
         "time_in_force": "day",
-        "notional": "25.00",
-        "limit_price": "100.00",
-        "client_order_id": "ta-l-exact-intent",
+        "notional": intent.notional_usd,
+        "limit_price": intent.limit_price,
+        "client_order_id": intent.client_order_id,
     }
     assert kwargs["authorized_normal_trade_intent"] is intent
     assert kwargs["activation_receipt"] is receipt
+    assert kwargs["supervisor_admission"].intent_full_sha256
 
 
 def test_extracted_hourly_packet_io_accepts_injected_facade_callbacks(tmp_path):

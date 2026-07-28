@@ -76,9 +76,15 @@ def record_live_order_submission(
     now: datetime.datetime,
 ) -> None:
     records = _load_records(path)
+    normalized_client_order_id = str(client_order_id)
+    if any(
+        str(record.get("client_order_id", "")) == normalized_client_order_id
+        for record in records
+    ):
+        return
     records.append(
         {
-            "client_order_id": str(client_order_id),
+            "client_order_id": normalized_client_order_id,
             "submitted_at": _as_utc(now).isoformat(timespec="seconds"),
         }
     )
