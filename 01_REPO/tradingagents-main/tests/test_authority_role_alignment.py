@@ -2,7 +2,6 @@ import ast
 import json
 from collections import Counter
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import pytest
 
@@ -237,6 +236,27 @@ def _call_name(node: ast.expr) -> str:
     return "<dynamic>"
 
 
+def _is_raw_http_transport_call(name: str) -> bool:
+    """Identify direct HTTP transport methods outside named application APIs.
+
+    The inventory must see a potentially order-writing request before trying to
+    prove its URL is safe: a formatted or concatenated URL must not evade the
+    source gate merely because it is not an ``ast.Constant``.
+    """
+
+    if name.endswith("._request"):
+        return True
+    method = name.rsplit(".", 1)[-1]
+    if method not in {"request", "post", "send"}:
+        return False
+    receiver_parts = name.rsplit(".", 1)[0].split(".")
+    return (
+        name.startswith(("requests.", "httpx.", "urllib3.", "aiohttp."))
+        or any(part.endswith("session") for part in receiver_parts)
+        or any(part.endswith("transport") for part in receiver_parts)
+    )
+
+
 def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]]:
     occurrences = []
 
@@ -276,56 +296,17 @@ def _live_write_occurrences(root: Path = ROOT) -> list[tuple[str, int, str, str]
                 and keyword.value.value is False
                 for keyword in node.keywords
             )
-            normalized_order_route = (
-                urlsplit(node.args[1].value).path.rstrip("/")
-                if len(node.args) >= 2
-                and isinstance(node.args[1], ast.Constant)
-                and type(node.args[1].value) is str
-                else None
-            )
-            is_raw_order_request = (
-                name.endswith("._request")
-                and len(node.args) >= 2
-                and all(
-                    isinstance(node.args[index], ast.Constant)
-                    for index in range(2)
-                )
-                and type(node.args[0].value) is str
-                and node.args[0].value.upper() == "POST"
-                and normalized_order_route == "/v2/orders"
-            )
-            is_raw_session_request = name.endswith(
-                (
-                    ".session.request",
-                    ".session.post",
-                    ".session.send",
-                    "._session.request",
-                    "._session.post",
-                    "._session.send",
-                    ".__session.request",
-                    ".__session.post",
-                    ".__session.send",
-                    "._raw_session.request",
-                    "._raw_session.post",
-                    "._raw_session.send",
-                )
-            ) or name in {
-                "raw_session.request",
-                "raw_session.post",
-                "raw_session.send",
-            }
+            is_raw_http_transport_call = _is_raw_http_transport_call(name)
             is_raw_transport_helper = name.endswith(".post_order_json")
             has_order_endpoint_primitive = (
-                not name.endswith("._request")
-                and not is_raw_session_request
+                not is_raw_http_transport_call
                 and any(
                 isinstance(argument, ast.Constant) and argument.value == "/v2/orders"
                 for argument in (*node.args, *(keyword.value for keyword in node.keywords))
                 )
             )
             if (
-                is_raw_order_request
-                or is_raw_session_request
+                is_raw_http_transport_call
                 or is_raw_transport_helper
                 or name == "submit_order"
                 or name.endswith(".submit_order")
@@ -428,6 +409,44 @@ def test_live_write_inventory_rejects_an_unclassified_raw_post_caller(tmp_path):
     )
 
     with pytest.raises(AssertionError, match=r"tradingagents/new_raw_live_caller.py:2"):
+        _assert_all_live_write_occurrences_classified(
+            _live_write_occurrences(tmp_path),
+            {},
+        )
+
+
+@pytest.mark.parametrize(
+    "source_text",
+    (
+        "def bypass():\n"
+        "    return requests.post('https://api.alpaca.markets/v2/orders', json={})\n",
+        "def bypass():\n"
+        "    return requests.request('POST', 'https://api.alpaca.markets/v2/orders', json={})\n",
+        "def bypass():\n"
+        "    return requests.send('https://api.alpaca.markets/v2/orders')\n",
+        "LIVE_BASE_URL = 'https://api.alpaca.markets'\n"
+        "def bypass(client):\n"
+        "    return client._request('POST', f'{LIVE_BASE_URL}/v2/orders', json={})\n",
+        "LIVE_BASE_URL = 'https://api.alpaca.markets'\n"
+        "def bypass(client):\n"
+        "    return client._request('POST', '{}/v2/orders'.format(LIVE_BASE_URL), json={})\n",
+        "LIVE_BASE_URL = 'https://api.alpaca.markets'\n"
+        "def bypass(client):\n"
+        "    return client._request('POST', LIVE_BASE_URL + '/v2/orders', json={})\n",
+        "def bypass(client):\n"
+        "    return client._raw_session.post('https://api.alpaca.markets/v2/orders', json={})\n",
+    ),
+)
+def test_live_write_inventory_rejects_absolute_and_constructed_raw_http_bypasses(
+    tmp_path, source_text
+):
+    source = tmp_path / "tradingagents" / "new_constructed_transport_bypass.py"
+    source.parent.mkdir()
+    source.write_text(source_text, encoding="utf-8")
+
+    with pytest.raises(
+        AssertionError, match=r"tradingagents/new_constructed_transport_bypass.py"
+    ):
         _assert_all_live_write_occurrences_classified(
             _live_write_occurrences(tmp_path),
             {},
