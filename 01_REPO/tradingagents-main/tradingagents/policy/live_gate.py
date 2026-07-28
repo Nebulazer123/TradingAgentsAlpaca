@@ -468,8 +468,6 @@ def _final_submit_loss_gate_issues(
 def _risk_cap_issues(action: Any, envelope: RiskEnvelope) -> list[str]:
     notional = _decimal_action_value(action, "notional")
     issues: list[str] = []
-    if envelope.live_budget_mode == "autonomous_uncapped":
-        return issues
     if (
         envelope.live_budget_mode != "autonomous_with_caps"
         and notional > envelope.tiny_live_tranche_usd
@@ -570,7 +568,6 @@ def evaluate_go_live_guard(
         "order_rate_limit": True,
         "portfolio_circuit_breakers": True,
         "autonomous_live_budget": False,
-        "autonomous_live_budget_uncapped": False,
         "promotion": True,
         "loss_exit_review": True,
         "broker_buying_power": True,
@@ -586,12 +583,8 @@ def evaluate_go_live_guard(
         issues.extend(OrderIssue(_action_symbol(action), issue) for action in live_actions for issue in envelope_issues)
     else:
         checks["risk_envelope_loaded"] = True
-        checks["autonomous_live_budget"] = envelope.live_budget_mode in {
-            "autonomous_with_caps",
-            "autonomous_uncapped",
-        }
-        checks["autonomous_live_budget_uncapped"] = (
-            envelope.live_budget_mode == "autonomous_uncapped"
+        checks["autonomous_live_budget"] = (
+            envelope.live_budget_mode == "autonomous_with_caps"
         )
 
     promotion_state, state_issues = _read_promotion_state(Path(promotion_state_path))
@@ -681,7 +674,6 @@ def evaluate_go_live_guard(
 
     if (
         envelope is not None
-        and envelope.live_budget_mode != "autonomous_uncapped"
         and current_live_exposure + total_buy_notional > envelope.account_max_capital_at_risk_usd
     ):
         checks["risk_caps"] = False
@@ -694,8 +686,7 @@ def evaluate_go_live_guard(
             )
         )
 
-    # Hard account-exposure ceiling applies in EVERY live_budget_mode (including
-    # autonomous_uncapped). Inert unless account_hard_ceiling_usd is configured.
+    # Hard account-exposure ceiling is inert unless configured.
     if (
         envelope is not None
         and envelope.account_hard_ceiling_usd is not None

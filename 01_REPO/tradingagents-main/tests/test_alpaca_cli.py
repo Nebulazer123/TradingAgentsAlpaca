@@ -1128,7 +1128,7 @@ class _FakeCliClient:
         }
 
 
-def test_uncapped_live_budget_uses_broker_buying_power_even_after_prior_issue(tmp_path):
+def test_retired_live_budget_mode_is_reported_as_invalid(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     envelope_path.write_text(
         "\n".join(
@@ -1157,9 +1157,11 @@ def test_uncapped_live_budget_uses_broker_buying_power_even_after_prior_issue(tm
         risk_envelope_path=envelope_path,
     )
 
-    assert mode == "autonomous_uncapped"
-    assert issues == []
-    assert dynamic_cap == Decimal("197.44")
+    assert mode == "invalid_or_retired"
+    assert issues == [
+        "live_budget_mode must be one of: autonomous_with_caps, fixed_tranche"
+    ]
+    assert dynamic_cap == Decimal("100.00")
 
 
 def test_mirofish_market_priors_tag_bot_attention_and_crowded_ai_beta():
@@ -3575,7 +3577,7 @@ def test_compact_hourly_supervisor_payload_points_to_raw_packet():
             "alert": {"severity": "NOTABLE", "notify": False, "email_suppressed": True},
             "evidence": {
                 "live_budget": {
-                    "mode": "autonomous_uncapped",
+                    "mode": "invalid_or_retired",
                     "repo_dollar_cap_active": False,
                     "plain_english": "broker gates apply",
                 },
@@ -3639,7 +3641,7 @@ def test_compact_hourly_supervisor_payload_points_to_raw_packet():
     assert compact["portfolio_summary"]["paper"]["open_order_count"] == 1
     assert compact["top_candidate"]["symbol"] == "NVDA"
     assert compact["context_summary"]["overnight_plan"]["status"] == "confirmed"
-    assert compact["live_budget"]["mode"] == "autonomous_uncapped"
+    assert compact["live_budget"]["mode"] == "invalid_or_retired"
     assert "portfolio" not in compact
     assert "evidence" not in compact
     assert "portfolio" in compact["raw_field_groups"]
@@ -3739,7 +3741,7 @@ def test_compact_output_audit_measures_packet_families(tmp_path):
                 "alert": {"severity": "ROUTINE", "notify": False},
                 "alert_email": bulky_text,
                 "evidence": {
-                    "live_budget": {"mode": "autonomous_uncapped"},
+                    "live_budget": {"mode": "invalid_or_retired"},
                     "risk_posture": {"name": "balanced"},
                 },
                 "portfolio": {

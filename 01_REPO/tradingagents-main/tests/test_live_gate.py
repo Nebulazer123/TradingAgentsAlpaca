@@ -60,6 +60,29 @@ def _write_live_control(path, *, frozen=False, expires_at="2026-06-01T16:00:00+0
     )
 
 
+def test_risk_loader_rejects_retired_uncapped_mode(tmp_path):
+    path = tmp_path / "risk.yaml"
+    _write_envelope(path, live_budget_mode="autonomous_uncapped")
+    envelope, issues = load_risk_envelope(path)
+
+    assert envelope is None
+    assert issues == [
+        "live_budget_mode must be one of: autonomous_with_caps, fixed_tranche"
+    ]
+
+
+def test_live_gate_never_treats_uncapped_as_live_budget(tmp_path):
+    envelope_path = tmp_path / "risk.yaml"
+    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+
+    result = evaluate_go_live_guard(
+        [_tiny_live_action()], risk_envelope_path=envelope_path
+    )
+
+    assert result.allowed is False
+    assert any("live_budget_mode" in issue.reason for issue in result.issues)
+
+
 def _promotion_record(**overrides):
     record = {
         "stage": "tiny_live_eligible",
@@ -312,11 +335,11 @@ def test_live_gate_autonomous_budget_counts_existing_live_exposure_for_new_buys(
     assert any("projected live exposure" in issue.reason for issue in result.issues)
 
 
-def test_live_gate_uncapped_budget_removes_repo_dollar_caps(tmp_path):
+def test_live_gate_autonomous_budget_enforces_repo_dollar_caps(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -332,16 +355,17 @@ def test_live_gate_uncapped_budget_removes_repo_dollar_caps(tmp_path):
         now=datetime.datetime(2026, 6, 1, 15, 0, tzinfo=datetime.timezone.utc),
     )
 
-    assert result.allowed is True
+    assert result.allowed is False
     assert result.checks["autonomous_live_budget"] is True
-    assert result.checks["autonomous_live_budget_uncapped"] is True
+    assert result.checks["risk_caps"] is False
+    assert any("per_name_cap_usd" in issue.reason for issue in result.issues)
 
 
-def test_live_gate_blocks_live_buy_when_broker_buying_power_missing_even_uncapped(tmp_path):
+def test_live_gate_blocks_live_buy_when_broker_buying_power_missing(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -349,7 +373,7 @@ def test_live_gate_blocks_live_buy_when_broker_buying_power_missing_even_uncappe
     )
 
     result = evaluate_go_live_guard(
-        actions=[_tiny_live_action(notional=Decimal("275.00"))],
+        actions=[_tiny_live_action(notional=Decimal("20.00"))],
         risk_envelope_path=envelope_path,
         promotion_state_path=promotion_path,
         control_state_path=control_path,
@@ -365,7 +389,7 @@ def test_live_gate_blocks_live_buy_above_broker_buying_power(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -390,7 +414,7 @@ def test_supervisor_submit_guard_uses_live_account_buying_power(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -409,11 +433,11 @@ def test_supervisor_submit_guard_uses_live_account_buying_power(tmp_path):
     assert any("exceeds broker buying_power" in issue.reason for issue in issues)
 
 
-def test_live_gate_circuit_breaker_blocks_new_buys_even_when_uncapped(tmp_path):
+def test_live_gate_circuit_breaker_blocks_new_buys_under_capped_mode(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -431,7 +455,7 @@ def test_live_gate_circuit_breaker_blocks_new_buys_even_when_uncapped(tmp_path):
     )
 
     assert result.allowed is False
-    assert result.checks["autonomous_live_budget_uncapped"] is True
+    assert result.checks["autonomous_live_budget"] is True
     assert result.checks["portfolio_circuit_breakers"] is False
     assert result.checks["daily_loss_considered"] is True
     assert result.checks["drawdown_considered"] is True
@@ -444,7 +468,7 @@ def test_live_gate_circuit_breaker_allows_profit_taking_sells(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -518,7 +542,7 @@ def test_live_gate_blocks_sell_when_avg_entry_is_nonpositive_without_review(tmp_
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -560,7 +584,7 @@ def test_live_gate_blocks_loss_sell_without_structured_loss_exit_review(tmp_path
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -596,7 +620,7 @@ def test_live_gate_blocks_sell_when_position_snapshot_missing(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(
         control_path,
         expires_at="2026-06-03T16:00:00+00:00",
@@ -636,7 +660,7 @@ def test_live_gate_blocks_stale_loss_exit_review_decision_id(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -672,7 +696,7 @@ def test_live_gate_blocks_loss_exit_review_allowed_false(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -711,7 +735,7 @@ def test_live_gate_allows_strict_current_approved_loss_exit_review(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -744,7 +768,7 @@ def test_live_gate_allows_current_pre_registered_policy_stop_review(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -836,7 +860,7 @@ def _policy_exit_gate_result(
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -1109,7 +1133,7 @@ def test_live_gate_does_not_require_loss_review_for_profit_taking_sell(tmp_path)
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
@@ -1233,13 +1257,13 @@ def test_live_gate_rejects_incomplete_promotion_record(tmp_path):
     assert "validation_report_ref" in reasons
 
 
-def test_live_gate_account_hard_ceiling_blocks_even_uncapped(tmp_path):
+def test_live_gate_account_hard_ceiling_blocks_capped_mode(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
     _write_envelope(
         envelope_path,
-        live_budget_mode="autonomous_uncapped",
+        live_budget_mode="autonomous_with_caps",
         account_hard_ceiling_usd="50.00",
     )
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
@@ -1269,7 +1293,7 @@ def test_live_gate_account_hard_ceiling_allows_when_projected_under(tmp_path):
     control_path = tmp_path / "live_control.json"
     _write_envelope(
         envelope_path,
-        live_budget_mode="autonomous_uncapped",
+        live_budget_mode="autonomous_with_caps",
         account_hard_ceiling_usd="100.00",
     )
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
@@ -1299,7 +1323,7 @@ def test_live_gate_order_rate_limit_blocks_when_window_exceeded(tmp_path):
     rate_path = tmp_path / "rate.json"
     _write_envelope(
         envelope_path,
-        live_budget_mode="autonomous_uncapped",
+        live_budget_mode="autonomous_with_caps",
         max_live_orders_per_window=2,
         live_order_window_minutes=60,
     )
@@ -1332,7 +1356,7 @@ def test_live_gate_order_rate_limit_inert_when_unconfigured(tmp_path):
     promotion_path = tmp_path / "promotion.json"
     control_path = tmp_path / "live_control.json"
     rate_path = tmp_path / "rate.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_uncapped")
+    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
     _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
     promotion_path.write_text(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),

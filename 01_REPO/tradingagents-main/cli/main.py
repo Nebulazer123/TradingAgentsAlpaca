@@ -13,7 +13,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, replace
-from decimal import ROUND_DOWN, Decimal
+from decimal import Decimal
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
@@ -465,25 +465,16 @@ def _dynamic_live_cap_for_budget_mode(
     risk_envelope_path: str | Path = "config/risk_envelope.yaml",
 ) -> tuple[Decimal, str, list[str], Any]:
     envelope, envelope_issues = load_risk_envelope(risk_envelope_path)
-    budget_mode = (
-        envelope.live_budget_mode
-        if envelope is not None
-        else "blocked_until_risk_envelope_exists"
-    )
+    if envelope is not None:
+        budget_mode = envelope.live_budget_mode
+    elif any(issue.startswith("live_budget_mode") for issue in envelope_issues):
+        budget_mode = "invalid_or_retired"
+    else:
+        budget_mode = "blocked_until_risk_envelope_exists"
     max_cap = None
     base_cap = config.live_exposure_limit
     if envelope is not None and budget_mode == "autonomous_with_caps":
         max_cap = envelope.account_max_capital_at_risk_usd
-    elif envelope is not None and budget_mode == "autonomous_uncapped":
-        try:
-            buying_power = Decimal(str(live_account.get("buying_power") or "0"))
-        except Exception:
-            buying_power = Decimal("0")
-        base_cap = (live_exposure_from_positions(live_positions) + buying_power).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_DOWN,
-        )
-        max_cap = base_cap
     dynamic_cap = calculate_dynamic_live_cap(
         live_positions=live_positions,
         recent_packets=recent_packets,
@@ -11703,8 +11694,8 @@ def alpaca_supervise_hourly(
             "The bot may choose live order size inside the risk envelope caps."
             if live_budget_mode == "autonomous_with_caps"
             else (
-                "The bot may choose live order size without a repo dollar cap; broker buying power and live safety gates still apply."
-                if live_budget_mode == "autonomous_uncapped"
+                "Live budget is blocked because the configured mode is invalid or retired."
+                if live_budget_mode == "invalid_or_retired"
                 else "Live budget is not autonomous until config/risk_envelope.yaml opts in."
             )
         ),

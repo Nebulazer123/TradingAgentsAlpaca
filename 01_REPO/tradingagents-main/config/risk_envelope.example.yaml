@@ -5,7 +5,6 @@
 # - autonomous_with_caps: bots may size above tiny_live_tranche_usd, but only
 #   inside per_name_cap_usd, account_max_capital_at_risk_usd, sector, beta,
 #   broker buying-power, live-control, rate-limit, and pre-submit checks.
-# - autonomous_uncapped is retired and rejected by the loader.
 live_budget_mode: autonomous_with_caps
 account_max_capital_at_risk_usd: 250.00
 per_name_cap_usd: 50.00
