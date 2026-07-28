@@ -247,7 +247,7 @@ def _is_raw_http_transport_call(name: str) -> bool:
     if name.endswith("._request"):
         return True
     method = name.rsplit(".", 1)[-1]
-    if method not in {"request", "post", "send"}:
+    if method not in {"delete", "patch", "post", "put", "request", "send"}:
         return False
     receiver_parts = name.rsplit(".", 1)[0].split(".")
     return (
@@ -424,6 +424,12 @@ def test_live_write_inventory_rejects_an_unclassified_raw_post_caller(tmp_path):
         "    return requests.request('POST', 'https://api.alpaca.markets/v2/orders', json={})\n",
         "def bypass():\n"
         "    return requests.send('https://api.alpaca.markets/v2/orders')\n",
+        "def bypass():\n"
+        "    return requests.put('https://api.alpaca.markets/v2/orders/example', json={})\n",
+        "def bypass():\n"
+        "    return requests.patch('https://api.alpaca.markets/v2/orders/example', json={})\n",
+        "def bypass():\n"
+        "    return requests.delete('https://api.alpaca.markets/v2/orders/example')\n",
         "LIVE_BASE_URL = 'https://api.alpaca.markets'\n"
         "def bypass(client):\n"
         "    return client._request('POST', f'{LIVE_BASE_URL}/v2/orders', json={})\n",
