@@ -833,6 +833,53 @@ def test_policy_expiry_during_lookup_prevents_post(tmp_path, monkeypatch):
     assert callbacks == ["lookup"]
 
 
+def test_policy_expiry_during_durable_prepare_prevents_broker_io(
+    tmp_path, monkeypatch
+):
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    expired_at = activated_at + datetime.timedelta(minutes=6)
+    policy_now = [activated_at]
+    monkeypatch.setattr(
+        promotion_sync_module,
+        "_normal_live_policy_utc_now",
+        lambda: policy_now[0],
+    )
+    original_admit = ImmutableStrategyEvidenceStore.admit_checked
+
+    def expire_after_durable_prepare(self, candidate, *, validate):
+        admission = original_admit(self, candidate, validate=validate)
+        if candidate.kind == NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND:
+            policy_now[0] = expired_at
+        return admission
+
+    monkeypatch.setattr(
+        ImmutableStrategyEvidenceStore, "admit_checked", expire_after_durable_prepare
+    )
+    order = _bound_normal_live_order(intent)
+    order_facts = alpaca_module._normal_live_order_facts(order)
+    immutable_order_sha256 = hashlib.sha256(
+        json.dumps(
+            order_facts, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    callbacks: list[str] = []
+
+    with pytest.raises(ValueError, match="not active"):
+        promotion_sync_module.execute_normal_live_broker_submit(
+            intent,
+            receipt,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            immutable_order_sha256=immutable_order_sha256,
+            lookup=lambda: callbacks.append("lookup"),
+            post=lambda: callbacks.append("post"),
+        )
+
+    assert callbacks == []
+
+
 def test_task3_admission_holds_state_lock_until_durable_prepare(tmp_path, monkeypatch):
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
         tmp_path, monkeypatch

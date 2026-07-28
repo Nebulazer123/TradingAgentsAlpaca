@@ -2297,6 +2297,9 @@ def execute_normal_live_broker_submit(
                 activation_state_marker=activation_state_marker,
             )
 
+        # The durable write above can take time, so recheck immediately before
+        # the first possible broker I/O as well as before a possible POST.
+        recheck_before_broker_io()
         existing = lookup()
         if existing is not None:
             return existing
