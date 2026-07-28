@@ -86,6 +86,77 @@ def _recompute_bindings(payload: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+def _make_valid_paper_authorization() -> AuthorizedPaperOrderRequest:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "authorization_id": "",
+        "staged_intent_id": "staged-paper-intent-" + _sha("a"),
+        "staged_intent_sha256": _sha("b"),
+        "promotion_evidence_id": "promotion-evidence-" + _sha("c"),
+        "genome_id": "genome-current-aggressive-" + _sha("d"),
+        "genome_canonical_sha256": _sha("e"),
+        "evaluation_code_commit": "f" * 40,
+        "evaluation_runtime_sha256": _sha("1"),
+        "paper_account_fingerprint": _sha("2"),
+        "session_date": "2026-07-28",
+        "symbol": "MSFT",
+        "side": "buy",
+        "order_type": "limit",
+        "tif": "day",
+        "requested_notional_usd": "25.00",
+        "requested_limit_price": "100.00",
+        "logical_order_sha256": "",
+        "client_order_id": "",
+        "expires_at": "2026-07-28T12:15:00+00:00",
+        "effective_at": "2026-07-28T12:00:00+00:00",
+        "recorded_at": "2026-07-28T12:00:01+00:00",
+        "owner_role": "execution_operator",
+        "authorization_scope": "single_alpaca_paper_order",
+        "paper_submit_authorized": True,
+        "live_submit_authorized": False,
+        "analysis_only": True,
+        "paper_only": True,
+        "execution_authority": "paper_order_request_only",
+        "can_submit_orders": False,
+    }
+    logical_material = {
+        field: payload[field]
+        for field in (
+            "staged_intent_id",
+            "staged_intent_sha256",
+            "paper_account_fingerprint",
+            "session_date",
+            "symbol",
+            "side",
+            "order_type",
+            "tif",
+            "requested_notional_usd",
+            "requested_limit_price",
+        )
+    }
+    logical_order_sha256 = hashlib.sha256(_canonical(logical_material)).hexdigest()
+    payload["logical_order_sha256"] = logical_order_sha256
+    payload["client_order_id"] = f"ta-p-{logical_order_sha256[:40]}"
+    evidence_payload = {
+        field: value
+        for field, value in payload.items()
+        if field not in {"authorization_id", "effective_at", "recorded_at"}
+    }
+    payload["authorization_id"] = (
+        "paper-execution-authorization-"
+        + hashlib.sha256(
+            _canonical(
+                {
+                    "kind": "paper-execution-authorization",
+                    "effective_at": payload["effective_at"],
+                    "payload": evidence_payload,
+                }
+            )
+        ).hexdigest()
+    )
+    return AuthorizedPaperOrderRequest.from_dict(payload)
+
+
 def _wrong_owner(payload: dict[str, object]) -> dict[str, object]:
     return {**payload, "owner_role": "execution_operator"}
 
@@ -165,7 +236,9 @@ def test_rejects_boolean_forged_fixed_authorization_field() -> None:
 
 
 def test_verifier_rejects_actual_paper_authorization_object() -> None:
-    paper_request = object.__new__(AuthorizedPaperOrderRequest)
+    paper_request = _make_valid_paper_authorization()
+    assert paper_request.paper_submit_authorized is True
+    assert paper_request.live_submit_authorized is False
     with pytest.raises(ValueError):
         _make_intent().verify_order_payload(
             paper_request,
