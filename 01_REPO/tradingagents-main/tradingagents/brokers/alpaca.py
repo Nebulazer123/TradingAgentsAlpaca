@@ -8,6 +8,8 @@ represented as a deterministic child order of the paper strategy order.
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -15,6 +17,8 @@ from decimal import ROUND_DOWN, Decimal
 
 import requests
 
+from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
+from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 from tradingagents.schemas.trading import TradeIntent
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
@@ -622,10 +626,96 @@ def build_tiny_live_order_payload(intent: TradeIntent) -> dict:
     }
 
 
+def _normal_live_submit_time(now: datetime.datetime | None) -> datetime.datetime:
+    checked_at = (
+        datetime.datetime.now(UTC).replace(microsecond=0) if now is None else now
+    )
+    if (
+        type(checked_at) is not datetime.datetime
+        or checked_at.tzinfo is None
+        or checked_at.utcoffset() is None
+        or checked_at.microsecond
+    ):
+        raise ValueError("live submit requires a timezone-aware whole-second time")
+    return checked_at.astimezone(UTC)
+
+
+def _require_normal_live_intent(value: object) -> AuthorizedNormalTradeIntent:
+    if type(value) is not AuthorizedNormalTradeIntent:
+        raise ValueError("live submit requires an exact AuthorizedNormalTradeIntent")
+    if value.live_submit_authorized is not True or value.paper_submit_authorized is not False:
+        raise ValueError("normal live intent authorization flags are invalid")
+    return value
+
+
+def _canonical_live_state(state: object) -> bytes:
+    if type(state) is not dict:
+        raise ValueError("normal live activation receipt state is invalid")
+    try:
+        return json.dumps(
+            state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("normal live activation receipt state is invalid") from exc
+
+
+def _require_normal_live_receipt(
+    intent: AuthorizedNormalTradeIntent, value: object
+) -> NormalLiveActivationReceipt:
+    if type(value) is not NormalLiveActivationReceipt:
+        raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
+    intent_full_sha256 = hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
+    if (
+        type(value.activation_prepare_id) is not str
+        or not value.activation_prepare_id
+        or type(value.activation_receipt_id) is not str
+        or not value.activation_receipt_id
+        or value.intent_full_sha256 != intent_full_sha256
+        or value.canonical_before_sha256 != intent.promotion_state_sha256
+        or value.canonical_after_sha256
+        != hashlib.sha256(_canonical_live_state(value.state)).hexdigest()
+        or type(value.created) is not bool
+        or value.status not in {"activated", "receipt_repaired", "read_only_retry"}
+        or value.can_submit_orders is not False
+        or value.execution_authority != "none"
+    ):
+        raise ValueError("normal live activation receipt does not link to exact intent")
+    return value
+
+
+def _normal_live_order_facts(order: Mapping[str, object]) -> dict[str, object]:
+    fields = (
+        "symbol",
+        "side",
+        "type",
+        "time_in_force",
+        "notional",
+        "limit_price",
+        "client_order_id",
+    )
+    if any(field not in order for field in fields):
+        raise ValueError("live broker response is ambiguous; refusing retry")
+    return {field: order[field] for field in fields}
+
+
+def _require_matching_broker_order(
+    broker_order: object, expected: Mapping[str, object]
+) -> None:
+    if type(broker_order) is not dict:
+        raise ValueError("live broker response is ambiguous; refusing retry")
+    actual = _normal_live_order_facts(broker_order)
+    if actual != dict(expected):
+        raise ValueError("live broker order does not match authorized intent")
+
+
 class AlpacaRestClient:
     def __init__(self, settings: AlpacaSettings, session=None):
         self.settings = settings
         self.session = session or requests.Session()
+        # An activation receipt already carries a durable prepare record.  This
+        # in-memory view only prevents this client instance from turning a
+        # retry or an uncertain response into a second live POST.
+        self._live_submit_records: dict[str, dict[str, object]] = {}
 
     def assert_expected_mode(self, *, paper: bool) -> None:
         base_url = self.settings.base_url.lower()
@@ -674,9 +764,70 @@ class AlpacaRestClient:
             params={"client_order_id": client_order_id},
         )
 
-    def submit_order(self, order: Mapping) -> dict:
+    def submit_order(
+        self,
+        order: Mapping,
+        *,
+        authorized_normal_trade_intent=None,
+        activation_receipt=None,
+        now: datetime.datetime | None = None,
+    ) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
-        return self._request("POST", "/v2/orders", json=dict(order))
+        if self.settings.paper is True:
+            return self._request("POST", "/v2/orders", json=dict(order))
+
+        intent = _require_normal_live_intent(authorized_normal_trade_intent)
+        receipt = _require_normal_live_receipt(intent, activation_receipt)
+        checked_at = _normal_live_submit_time(now)
+        intent.verify_order_payload(order, at=checked_at)
+        payload = dict(order)
+        client_order_id = intent.client_order_id
+        receipt_id = receipt.activation_receipt_id
+        immutable_facts = _normal_live_order_facts(payload)
+        existing = self._live_submit_records.get(client_order_id)
+        if existing is not None:
+            if (
+                existing["receipt_id"] != receipt_id
+                or existing["intent_full_sha256"]
+                != hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
+                or existing["immutable_facts"] != immutable_facts
+            ):
+                raise ValueError("live submit record does not match exact authorization")
+        else:
+            self._live_submit_records[client_order_id] = {
+                "receipt_id": receipt_id,
+                "intent_full_sha256": hashlib.sha256(
+                    intent.canonical_json_bytes()
+                ).hexdigest(),
+                "immutable_facts": immutable_facts,
+                "post_attempted": False,
+            }
+            existing = self._live_submit_records[client_order_id]
+
+        # The receipt's durable prepare makes this an idempotent lookup before
+        # its one allowed POST.  A retry is read-only first and never creates a
+        # replacement client ID.
+        found = self._lookup_live_order_by_client_order_id(client_order_id)
+        if found is not None:
+            _require_matching_broker_order(found, immutable_facts)
+            return found
+        if existing["post_attempted"] is True:
+            raise ValueError("live retry lookup found no order; refusing second POST")
+        existing["post_attempted"] = True
+        submitted = self._request("POST", "/v2/orders", json=payload)
+        _require_matching_broker_order(submitted, immutable_facts)
+        return submitted
+
+    def _lookup_live_order_by_client_order_id(self, client_order_id: str) -> dict | None:
+        try:
+            result = self.get_order_by_client_order_id(client_order_id)
+        except AlpacaExecutionError as exc:
+            if " 404:" in str(exc):
+                return None
+            raise ValueError("live retry lookup is ambiguous; refusing POST") from exc
+        if type(result) is not dict:
+            raise ValueError("live retry lookup is ambiguous; refusing POST")
+        return result
 
     def _request(self, method: str, path: str, **kwargs):
         url = f"{self.settings.base_url.rstrip('/')}{path}"
@@ -740,21 +891,21 @@ def execute_order_pairs(
     live_guard_approved: bool = False,
 ) -> ExecutionReport:
     report = ExecutionReport()
-    paper_client.assert_expected_mode(paper=True)
-    live_client.assert_expected_mode(paper=False)
-
-    if pairs and not live_guard_approved:
+    if pairs:
         for pair in pairs:
             report.failed.append(
                 OrderIssue(
                     pair.live.ticket_id,
                     (
-                        "execute_order_pairs requires prior unified live-submit "
-                        "gate approval before live mirror orders can submit"
+                        "execute_order_pairs is permanently disabled for nonempty "
+                        "paper/live mirror pairs; neither leg was submitted"
                     ),
                 )
             )
         return report
+
+    paper_client.assert_expected_mode(paper=True)
+    live_client.assert_expected_mode(paper=False)
 
     for pair in pairs:
         live_side = str(pair.live.order.get("side", "")).lower()

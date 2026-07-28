@@ -1,4 +1,6 @@
 import datetime
+import hashlib
+import json
 from decimal import Decimal
 
 import pytest
@@ -22,6 +24,8 @@ from tradingagents.brokers.alpaca import (
     validate_live_entry_allowed,
     validate_live_management_action,
 )
+from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
+from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 from tradingagents.schemas.trading import TradeIntent
 
 
@@ -270,7 +274,7 @@ class _FakeClient:
         return {"id": f"{'paper' if self.paper else 'live'}-order", **order}
 
 
-def test_execute_order_pairs_submits_paper_and_live_pair():
+def test_execute_order_pairs_is_hard_disabled_even_with_legacy_approval():
     config = AlpacaExecutionConfig()
     pairs = build_order_pairs(
         [_strategy_order(ticket_id="googl-starter", notional="400")],
@@ -287,15 +291,263 @@ def test_execute_order_pairs_submits_paper_and_live_pair():
         live_guard_approved=True,
     )
 
-    assert len(paper_client.submitted) == 1
-    assert len(live_client.submitted) == 1
-    assert paper_client.submitted[0]["notional"] == "400.00"
-    assert live_client.submitted[0]["notional"] == "40.00"
-    assert report.submitted[0].paper_response["id"] == "paper-order"
-    assert report.submitted[0].live_response["id"] == "live-order"
+    assert paper_client.submitted == []
+    assert live_client.submitted == []
+    assert report.submitted == []
+    assert len(report.failed) == 1
+    assert "permanently disabled" in report.failed[0].reason
 
 
-def test_execute_order_pairs_requires_prior_live_guard_approval():
+def _normal_live_intent() -> AuthorizedNormalTradeIntent:
+    digests = {
+        name: hashlib.sha256(name.encode("utf-8")).hexdigest()
+        for name in (
+            "promotion_proposal",
+            "promotion_state",
+            "promotion_sync_receipt",
+            "staged_intent",
+            "shadow_attestation",
+            "genome",
+            "runtime",
+            "observation",
+            "portfolio",
+            "risk",
+        )
+    }
+    payload = {
+        "promotion_proposal_id": "proposal-" + digests["promotion_proposal"],
+        "promotion_proposal_sha256": digests["promotion_proposal"],
+        "promotion_state_sha256": digests["promotion_state"],
+        "promotion_sync_receipt_id": "receipt-" + digests["promotion_sync_receipt"],
+        "promotion_sync_receipt_sha256": digests["promotion_sync_receipt"],
+        "staged_intent_id": "staged-" + digests["staged_intent"],
+        "staged_intent_sha256": digests["staged_intent"],
+        "shadow_attestation_sha256": digests["shadow_attestation"],
+        "genome_id": "genome-" + digests["genome"],
+        "genome_canonical_sha256": digests["genome"],
+        "evaluation_code_commit": "a" * 40,
+        "evaluation_runtime_sha256": digests["runtime"],
+        "market_observation_sha256": digests["observation"],
+        "portfolio_snapshot_sha256": digests["portfolio"],
+        "risk_snapshot_sha256": digests["risk"],
+        "symbol": "MSFT",
+        "side": "buy",
+        "order_type": "limit",
+        "tif": "day",
+        "notional_usd": "25.00",
+        "limit_price": "100.00",
+        "effective_at": "2026-07-28T12:00:00+00:00",
+        "expires_at": "2026-07-28T12:15:00+00:00",
+        "recorded_at": "2026-07-28T12:00:00+00:00",
+    }
+    logical_material = dict(payload)
+    logical = hashlib.sha256(
+        json.dumps(logical_material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload["logical_order_sha256"] = logical
+    payload["client_order_id"] = f"ta-l-{logical[:40]}"
+    authorization_material = {
+        **payload,
+        "owner_role": "portfolio_executive",
+        "authorization_scope": "single_alpaca_live_order",
+        "live_submit_authorized": True,
+        "paper_submit_authorized": False,
+    }
+    authorization_material["authorization_id"] = "authorized-normal-trade-intent-" + hashlib.sha256(
+        json.dumps(authorization_material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return AuthorizedNormalTradeIntent.from_dict(authorization_material)
+
+
+def _bound_normal_live_order(intent: AuthorizedNormalTradeIntent) -> dict[str, object]:
+    return {
+        "symbol": intent.symbol,
+        "side": intent.side,
+        "type": intent.order_type,
+        "time_in_force": intent.tif,
+        "notional": intent.notional_usd,
+        "limit_price": intent.limit_price,
+        "client_order_id": intent.client_order_id,
+    }
+
+
+def _activation_receipt(
+    intent: AuthorizedNormalTradeIntent, state: dict[str, object] | None = None
+) -> NormalLiveActivationReceipt:
+    state = state or {"sleeves": {"normal": {"live_enabled": True}}}
+    state_bytes = json.dumps(
+        state, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return NormalLiveActivationReceipt(
+        activation_prepare_id="normal_live_activation_prepare-" + "a" * 64,
+        activation_receipt_id="normal_live_activation_receipt-" + "b" * 64,
+        intent_full_sha256=hashlib.sha256(intent.canonical_json_bytes()).hexdigest(),
+        canonical_before_sha256=intent.promotion_state_sha256,
+        canonical_after_sha256=hashlib.sha256(state_bytes).hexdigest(),
+        state=state,
+        created=True,
+        status="activated",
+    )
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: object):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeLiveSession:
+    def __init__(self):
+        self.requests = []
+        self.existing = {}
+        self.post_calls = 0
+
+    def add_existing_order(self, order: dict[str, object]) -> None:
+        self.existing[str(order["client_order_id"])] = dict(order)
+
+    def request(self, method, url, **kwargs):
+        self.requests.append((method, url, kwargs))
+        if method == "GET":
+            client_order_id = kwargs["params"]["client_order_id"]
+            existing = self.existing.get(client_order_id)
+            return _FakeResponse(200, existing) if existing else _FakeResponse(404, {"message": "not found"})
+        if method == "POST":
+            self.post_calls += 1
+            order = dict(kwargs["json"])
+            self.existing[str(order["client_order_id"])] = order
+            return _FakeResponse(200, order)
+        raise AssertionError(f"unexpected method: {method}")
+
+
+def _fake_live_client() -> AlpacaRestClient:
+    return AlpacaRestClient(
+        settings=AlpacaSettings(
+            api_key="test-key",
+            secret_key="test-secret",
+            paper=False,
+            base_url="https://api.alpaca.markets",
+        ),
+        session=_FakeLiveSession(),
+    )
+
+
+def test_live_client_rejects_mapping_without_intent_before_request():
+    client = _fake_live_client()
+
+    with pytest.raises(ValueError, match="AuthorizedNormalTradeIntent"):
+        client.submit_order(_bound_normal_live_order(_normal_live_intent()))
+
+    assert client.session.requests == []
+
+
+def test_live_client_retries_by_client_order_id_without_second_post():
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+    order = _bound_normal_live_order(intent)
+    client.session.add_existing_order(order)
+
+    response = client.submit_order(
+        order,
+        authorized_normal_trade_intent=intent,
+        activation_receipt=_activation_receipt(intent),
+        now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+    )
+
+    assert response["client_order_id"] == intent.client_order_id
+    assert client.session.post_calls == 0
+    assert [request[0] for request in client.session.requests] == ["GET"]
+
+
+def test_live_client_accepts_receipt_state_with_canonical_unicode():
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+    order = _bound_normal_live_order(intent)
+    client.session.add_existing_order(order)
+
+    response = client.submit_order(
+        order,
+        authorized_normal_trade_intent=intent,
+        activation_receipt=_activation_receipt(
+            intent, {"sleeves": {"normal-é": {"live_enabled": True}}}
+        ),
+        now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+    )
+
+    assert response["client_order_id"] == intent.client_order_id
+    assert client.session.post_calls == 0
+
+
+def test_live_client_rejects_untyped_receipt_before_request():
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+
+    with pytest.raises(ValueError, match="NormalLiveActivationReceipt"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt={"intent_full_sha256": hashlib.sha256(intent.canonical_json_bytes()).hexdigest()},
+            now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+        )
+
+    assert client.session.requests == []
+
+
+def test_live_client_blocks_mismatched_retry_lookup_without_post():
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+    order = _bound_normal_live_order(intent)
+    client.session.add_existing_order({**order, "symbol": "AAPL"})
+
+    with pytest.raises(ValueError, match="does not match authorized intent"):
+        client.submit_order(
+            order,
+            authorized_normal_trade_intent=intent,
+            activation_receipt=_activation_receipt(intent),
+            now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+        )
+
+    assert client.session.post_calls == 0
+
+
+def test_live_client_blocks_ambiguous_retry_lookup_without_post():
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+    client.session.add_existing_order({"client_order_id": intent.client_order_id})
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=_activation_receipt(intent),
+            now=datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+        )
+
+    assert client.session.post_calls == 0
+
+
+def test_live_client_never_posts_twice_after_missing_retry_lookup():
+    client = _fake_live_client()
+    intent = _normal_live_intent()
+    order = _bound_normal_live_order(intent)
+    kwargs = {
+        "authorized_normal_trade_intent": intent,
+        "activation_receipt": _activation_receipt(intent),
+        "now": datetime.datetime(2026, 7, 28, 12, 0, 1, tzinfo=datetime.timezone.utc),
+    }
+
+    client.submit_order(order, **kwargs)
+    client.session.existing.clear()
+    with pytest.raises(ValueError, match="retry lookup found no order"):
+        client.submit_order(order, **kwargs)
+
+    assert client.session.post_calls == 1
+
+
+def test_execute_order_pairs_is_disabled_without_legacy_approval():
     config = AlpacaExecutionConfig()
     pairs = build_order_pairs(
         [_strategy_order(ticket_id="googl-starter", notional="400")],
@@ -315,10 +567,10 @@ def test_execute_order_pairs_requires_prior_live_guard_approval():
     assert live_client.submitted == []
     assert report.submitted == []
     assert len(report.failed) == 1
-    assert "unified live-submit gate approval" in report.failed[0].reason
+    assert "permanently disabled" in report.failed[0].reason
 
 
-def test_execute_order_pairs_refuses_live_sell_before_submit():
+def test_execute_order_pairs_disables_live_sell_before_either_leg_submits():
     config = AlpacaExecutionConfig()
     pairs = build_order_pairs(
         [_strategy_order(ticket_id="googl-exit", notional="400")],
@@ -340,7 +592,7 @@ def test_execute_order_pairs_refuses_live_sell_before_submit():
     assert live_client.submitted == []
     assert report.submitted == []
     assert len(report.failed) == 1
-    assert "live sells must use the supervisor submit path" in report.failed[0].reason
+    assert "permanently disabled" in report.failed[0].reason
 
 
 class _CancelTrackingPaperClient(_FakeClient):
@@ -360,7 +612,7 @@ class _FailingLiveClient(_FakeClient):
         raise RuntimeError("insufficient buying power")
 
 
-def test_execute_order_pairs_rolls_back_paper_when_live_fails():
+def test_execute_order_pairs_does_not_submit_or_roll_back_when_live_would_fail():
     config = AlpacaExecutionConfig()
     pairs = build_order_pairs(
         [_strategy_order(ticket_id="googl-starter", notional="400")],
@@ -377,15 +629,14 @@ def test_execute_order_pairs_rolls_back_paper_when_live_fails():
         live_guard_approved=True,
     )
 
-    assert len(paper_client.submitted) == 1
+    assert paper_client.submitted == []
     assert report.submitted == []
     assert len(report.failed) == 1
-    assert "live submit failed AFTER paper submit succeeded" in report.failed[0].reason
-    assert paper_client.canceled == ["paper-order"]
-    assert "canceled" in report.failed[0].reason
+    assert "permanently disabled" in report.failed[0].reason
+    assert paper_client.canceled == []
 
 
-def test_execute_order_pairs_flags_manual_reconciliation_when_rollback_unavailable():
+def test_execute_order_pairs_does_not_submit_paper_without_rollback_capability():
     config = AlpacaExecutionConfig()
     pairs = build_order_pairs(
         [_strategy_order(ticket_id="googl-starter", notional="400")],
@@ -402,13 +653,13 @@ def test_execute_order_pairs_flags_manual_reconciliation_when_rollback_unavailab
         live_guard_approved=True,
     )
 
-    assert len(paper_client.submitted) == 1
+    assert paper_client.submitted == []
     assert report.submitted == []
     assert len(report.failed) == 1
-    assert "manual reconciliation required" in report.failed[0].reason
+    assert "permanently disabled" in report.failed[0].reason
 
 
-def test_execute_order_pairs_paper_failure_does_not_attempt_live():
+def test_execute_order_pairs_never_invokes_paper_failure_path():
     config = AlpacaExecutionConfig()
     pairs = build_order_pairs(
         [_strategy_order(ticket_id="googl-starter", notional="400")],
@@ -436,7 +687,7 @@ def test_execute_order_pairs_paper_failure_does_not_attempt_live():
     assert live_client.submitted == []
     assert report.submitted == []
     assert len(report.failed) == 1
-    assert "no live order attempted" in report.failed[0].reason
+    assert "permanently disabled" in report.failed[0].reason
 
 
 def test_tiny_live_payload_uses_intent_idempotency_key():
