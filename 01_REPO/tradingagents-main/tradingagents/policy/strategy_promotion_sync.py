@@ -14,6 +14,7 @@ import errno
 import json
 import os
 import re
+import secrets
 import stat
 import time
 from collections.abc import Callable, Mapping
@@ -50,6 +51,7 @@ from tradingagents.policy.strategy_promotion import (
 from tradingagents.strategy._immutable_evidence_store import (
     NORMAL_LIVE_ACTIVATION_PREPARE_KIND,
     NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
+    NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
     STRATEGY_PROMOTION_SYNC_PREPARE_KIND,
     STRATEGY_PROMOTION_SYNC_RECEIPT_KIND,
     EvidenceCandidate,
@@ -139,6 +141,18 @@ class NormalLiveActivationReceipt:
     state: dict[str, object]
     created: bool
     status: str
+    can_submit_orders: bool = field(init=False, default=False)
+    execution_authority: str = field(init=False, default="none")
+
+
+@dataclass(frozen=True, slots=True)
+class NormalLiveBrokerSubmitAdmission:
+    """Task 3's durable handoff to the broker boundary, never an order."""
+
+    created: bool
+    client_order_id: str
+    canonical_state_sha256: str
+    activation_state_marker: str
     can_submit_orders: bool = field(init=False, default=False)
     execution_authority: str = field(init=False, default="none")
 
@@ -1631,6 +1645,7 @@ _NORMAL_LIVE_PREPARE_FIELDS = frozenset(
         "promotion_runtime_commit",
         "canonical_before_sha256",
         "canonical_after_sha256",
+        "activation_state_marker",
         "state_path",
         "promoted",
         "demoted",
@@ -1657,6 +1672,7 @@ def _activation_payload(
     intent_full_sha256: str,
     canonical_before_sha256: str,
     canonical_after_sha256: str,
+    activation_state_marker: str,
     state_file: Path,
 ) -> dict[str, object]:
     return {
@@ -1673,6 +1689,7 @@ def _activation_payload(
         "promotion_runtime_commit": proposal.promotion_runtime_commit,
         "canonical_before_sha256": canonical_before_sha256,
         "canonical_after_sha256": canonical_after_sha256,
+        "activation_state_marker": activation_state_marker,
         "state_path": str(state_file),
         "promoted": [proposal.sleeve],
         "demoted": [],
@@ -1876,24 +1893,72 @@ def _require_complete_normal_live_intent_chain(
 
 
 def _activation_state(
-    *, state: Mapping[str, object], sleeve: str
+    *,
+    state: Mapping[str, object],
+    sleeve: str,
+    intent_full_sha256: str,
+    proposal_id: str,
+    activation_state_marker: str,
 ) -> dict[str, object]:
     copied = json.loads(_canonical(state))
     sleeves = copied.get("sleeves")
     if not isinstance(sleeves, dict) or not isinstance(sleeves.get(sleeve), dict):
         raise ValueError("promotion state has no eligible sleeve")
     sleeves[sleeve]["live_enabled"] = True
+    copied["normal_live_activation"] = {
+        "schema_version": 1,
+        "issuer": "strategy_promotion_sync",
+        "marker": activation_state_marker,
+        "intent_full_sha256": intent_full_sha256,
+        "proposal_id": proposal_id,
+        "sleeve": sleeve,
+    }
     return copied
 
 
-def verify_normal_live_activation_receipt(
+def _activation_state_marker(
+    *,
+    state: Mapping[str, object],
+    intent_full_sha256: str,
+    proposal_id: str,
+    sleeve: str | None = None,
+) -> str:
+    link = state.get("normal_live_activation")
+    if not isinstance(link, Mapping) or set(link) != {
+        "schema_version",
+        "issuer",
+        "marker",
+        "intent_full_sha256",
+        "proposal_id",
+        "sleeve",
+    }:
+        raise ValueError("activation receipt has no Task 3 state marker")
+    marker = link.get("marker")
+    if (
+        link.get("schema_version") != 1
+        or link.get("issuer") != "strategy_promotion_sync"
+        or type(marker) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", marker) is None
+        or link.get("intent_full_sha256") != intent_full_sha256
+        or link.get("proposal_id") != proposal_id
+        or type(link.get("sleeve")) is not str
+        or (sleeve is not None and link.get("sleeve") != sleeve)
+    ):
+        raise ValueError("activation receipt Task 3 state marker is invalid")
+    return marker
+
+
+def _verify_normal_live_activation_receipt(
     intent: AuthorizedNormalTradeIntent,
     receipt: NormalLiveActivationReceipt,
     *,
     proposal_ledger_root: str | Path,
     repo_root: str | Path,
-    checked_at: datetime.datetime,
-) -> None:
+    checked_at: datetime.datetime | None = None,
+    clock: Callable[[], datetime.datetime] | None = None,
+    _accept: Callable[[ImmutableStrategyEvidenceStore, PromotionStateSnapshot, str], object]
+    | None = None,
+) -> object | None:
     """Read-only Task 3 provenance check for the broker-write boundary.
 
     This deliberately reuses the activation transaction's exact envelope and
@@ -1903,18 +1968,12 @@ def verify_normal_live_activation_receipt(
     if (
         type(intent) is not AuthorizedNormalTradeIntent
         or type(receipt) is not NormalLiveActivationReceipt
-        or type(checked_at) is not datetime.datetime
-        or checked_at.tzinfo is None
-        or checked_at.utcoffset() is None
-        or checked_at.microsecond
+        or (checked_at is None) == (clock is None)
     ):
         raise ValueError("activation receipt verification requires exact typed values")
-    moment = checked_at.astimezone(datetime.timezone.utc)
-    if not intent.is_active(at=moment):
-        raise ValueError("activation receipt intent is not active")
     root = Path(proposal_ledger_root)
     repo = Path(repo_root).resolve()
-    store = ImmutableStrategyEvidenceStore(root, clock=lambda: moment)
+    store = ImmutableStrategyEvidenceStore(root)
     try:
         durable_receipts = [
             envelope
@@ -1934,6 +1993,18 @@ def verify_normal_live_activation_receipt(
     state_anchor = _capture_state_path_anchor(state_path_value)
     state_file = state_anchor.path
     with promotion_state_lock(state_file):
+        raw_moment = checked_at if clock is None else clock()
+        if (
+            type(raw_moment) is not datetime.datetime
+            or raw_moment.tzinfo is None
+            or raw_moment.utcoffset() is None
+            or raw_moment.microsecond
+        ):
+            raise ValueError("activation receipt verification requires exact typed values")
+        moment = raw_moment.astimezone(datetime.timezone.utc)
+        if not intent.is_active(at=moment):
+            raise ValueError("activation receipt intent is not active")
+        store = ImmutableStrategyEvidenceStore(root, clock=lambda: moment)
         _require_state_path_anchor_current(state_anchor)
         snapshot = read_promotion_state_snapshot(state_file)
         _require_snapshot_current(snapshot)
@@ -1944,6 +2015,11 @@ def verify_normal_live_activation_receipt(
             or receipt.canonical_before_sha256 != intent.promotion_state_sha256
         ):
             raise ValueError("activation receipt state provenance is inconsistent")
+        activation_state_marker = _activation_state_marker(
+            state=snapshot.state,
+            intent_full_sha256=_digest(intent.canonical_json_bytes()),
+            proposal_id=intent.promotion_proposal_id,
+        )
         durable = StrategyOperationalPromotionLedger(root, clock=lambda: moment).rebuild()
         proposals = [item for item in durable if item.proposal_id == intent.promotion_proposal_id]
         if len(proposals) != 1:
@@ -1959,6 +2035,13 @@ def verify_normal_live_activation_receipt(
             or intent.risk_snapshot_sha256 != proposal.risk_attestation.risk_envelope_sha256
         ):
             raise ValueError("activation receipt does not bind the durable proposal")
+        if activation_state_marker != _activation_state_marker(
+            state=snapshot.state,
+            intent_full_sha256=_digest(intent.canonical_json_bytes()),
+            proposal_id=proposal.proposal_id,
+            sleeve=proposal.sleeve,
+        ):
+            raise ValueError("activation receipt Task 3 state marker changed")
         _require_current_normal_live_sources(
             store=store, proposal=proposal, repo=repo, checked_at=moment
         )
@@ -1979,6 +2062,7 @@ def verify_normal_live_activation_receipt(
             intent_full_sha256=_digest(intent.canonical_json_bytes()),
             canonical_before_sha256=intent.promotion_state_sha256,
             canonical_after_sha256=snapshot.sha256,
+            activation_state_marker=activation_state_marker,
             state_file=state_file,
         )
         prepares = [
@@ -2004,6 +2088,137 @@ def verify_normal_live_activation_receipt(
             raise ValueError("activation receipt does not match the activation transaction")
         _require_snapshot_current(snapshot)
         _require_state_path_anchor_current(state_anchor)
+        return (
+            None
+            if _accept is None
+            else _accept(store, snapshot, activation_state_marker)
+        )
+
+
+def _normal_live_broker_submit_payload(
+    *,
+    intent: AuthorizedNormalTradeIntent,
+    receipt: NormalLiveActivationReceipt,
+    immutable_order_sha256: str,
+    canonical_state_sha256: str,
+    activation_state_marker: str,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "intent_full_sha256": _digest(intent.canonical_json_bytes()),
+        "logical_order_sha256": intent.logical_order_sha256,
+        "client_order_id": intent.client_order_id,
+        "activation_prepare_id": receipt.activation_prepare_id,
+        "activation_receipt_id": receipt.activation_receipt_id,
+        "immutable_order_sha256": immutable_order_sha256,
+        "canonical_state_sha256": canonical_state_sha256,
+        "activation_state_marker": activation_state_marker,
+    }
+
+
+def _require_unique_normal_live_broker_submit(snapshot, envelope) -> None:
+    payload = envelope.payload
+    if not isinstance(payload, Mapping):
+        raise ValueError("durable live submit record is invalid")
+    logical = payload.get("logical_order_sha256")
+    client_order_id = payload.get("client_order_id")
+    if type(logical) is not str or type(client_order_id) is not str:
+        raise ValueError("durable live submit record is invalid")
+    for prior in snapshot:
+        if prior.kind != NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND:
+            continue
+        prior_payload = prior.payload
+        if not isinstance(prior_payload, Mapping):
+            raise ValueError("durable live submit record is invalid")
+        if (
+            prior_payload.get("logical_order_sha256") == logical
+            or prior_payload.get("client_order_id") == client_order_id
+        ) and prior.payload != payload:
+            raise ValueError("logical/client order ID is already consumed by different receipt")
+
+
+def admit_normal_live_broker_submit(
+    intent: AuthorizedNormalTradeIntent,
+    receipt: NormalLiveActivationReceipt,
+    *,
+    proposal_ledger_root: str | Path,
+    repo_root: str | Path,
+    immutable_order_sha256: str,
+    clock: Callable[[], datetime.datetime],
+) -> NormalLiveBrokerSubmitAdmission:
+    """Atomically verify Task 3 state and persist a broker-submit handoff.
+
+    No network operation is performed while the promotion-state lock is held.
+    The returned object is solely a durable, state-bound admission for Alpaca's
+    subsequent read-first broker interaction.
+    """
+
+    if (
+        type(intent) is not AuthorizedNormalTradeIntent
+        or type(receipt) is not NormalLiveActivationReceipt
+        or not callable(clock)
+        or type(immutable_order_sha256) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", immutable_order_sha256) is None
+    ):
+        raise ValueError("normal live broker admission requires exact typed values")
+
+    def admit(
+        store: ImmutableStrategyEvidenceStore,
+        snapshot: PromotionStateSnapshot,
+        activation_state_marker: str,
+    ) -> NormalLiveBrokerSubmitAdmission:
+        candidate = EvidenceCandidate(
+            kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
+            effective_at=intent.recorded_at,
+            payload=_normal_live_broker_submit_payload(
+                intent=intent,
+                receipt=receipt,
+                immutable_order_sha256=immutable_order_sha256,
+                canonical_state_sha256=snapshot.sha256,
+                activation_state_marker=activation_state_marker,
+            ),
+        )
+        admission = store.admit_checked(
+            candidate,
+            validate=_require_unique_normal_live_broker_submit,
+        )
+        return NormalLiveBrokerSubmitAdmission(
+            created=admission.created,
+            client_order_id=intent.client_order_id,
+            canonical_state_sha256=snapshot.sha256,
+            activation_state_marker=activation_state_marker,
+        )
+
+    admitted = _verify_normal_live_activation_receipt(
+        intent,
+        receipt,
+        proposal_ledger_root=proposal_ledger_root,
+        repo_root=repo_root,
+        clock=clock,
+        _accept=admit,
+    )
+    if type(admitted) is not NormalLiveBrokerSubmitAdmission:
+        raise ValueError("normal live broker admission was not recorded")
+    return admitted
+
+
+def verify_normal_live_activation_receipt(
+    intent: AuthorizedNormalTradeIntent,
+    receipt: NormalLiveActivationReceipt,
+    *,
+    proposal_ledger_root: str | Path,
+    repo_root: str | Path,
+    checked_at: datetime.datetime,
+) -> None:
+    """Read-only Task 3 provenance check for a normal-live receipt."""
+
+    _verify_normal_live_activation_receipt(
+        intent,
+        receipt,
+        proposal_ledger_root=proposal_ledger_root,
+        repo_root=repo_root,
+        checked_at=checked_at,
+    )
 
 
 def activate_normal_live_intent(
@@ -2059,6 +2274,7 @@ def activate_normal_live_intent(
                 False,
                 "read_only_retry",
             )
+        repaired_activation_state_marker: str | None = None
         repaired_prepares: list[tuple[EvidenceEnvelope, dict[str, object]]] = []
         for envelope in store.envelopes(kind=NORMAL_LIVE_ACTIVATION_PREPARE_KIND):
             payload = _thaw_json(envelope.payload)
@@ -2067,12 +2283,20 @@ def activate_normal_live_intent(
             after_sha256 = payload.get("canonical_after_sha256")
             if after_sha256 != snapshot.sha256:
                 continue
+            if repaired_activation_state_marker is None:
+                repaired_activation_state_marker = _activation_state_marker(
+                    state=snapshot.state,
+                    intent_full_sha256=intent_full_sha256,
+                    proposal_id=proposal.proposal_id,
+                    sleeve=proposal.sleeve,
+                )
             expected = _activation_payload(
                 proposal=proposal,
                 intent=intent,
                 intent_full_sha256=intent_full_sha256,
                 canonical_before_sha256=intent.promotion_state_sha256,
                 canonical_after_sha256=after_sha256,
+                activation_state_marker=repaired_activation_state_marker,
                 state_file=state_file,
             )
             _require_activation_payload(payload, expected=expected, receipt=False)
@@ -2161,7 +2385,14 @@ def activate_normal_live_intent(
             or sync_receipt.canonical_after_sha256 != snapshot.sha256
         ):
             raise ValueError("activation requires the exact Task 6D receipt")
-        after_state = _activation_state(state=snapshot.state, sleeve=proposal.sleeve)
+        activation_state_marker = secrets.token_hex(32)
+        after_state = _activation_state(
+            state=snapshot.state,
+            sleeve=proposal.sleeve,
+            intent_full_sha256=intent_full_sha256,
+            proposal_id=proposal.proposal_id,
+            activation_state_marker=activation_state_marker,
+        )
         after = _canonical(after_state)
         after_sha256 = _digest(after)
         expected_prepare = _activation_payload(
@@ -2170,6 +2401,7 @@ def activate_normal_live_intent(
             intent_full_sha256=intent_full_sha256,
             canonical_before_sha256=snapshot.sha256,
             canonical_after_sha256=after_sha256,
+            activation_state_marker=activation_state_marker,
             state_file=state_file,
         )
         prepares = []

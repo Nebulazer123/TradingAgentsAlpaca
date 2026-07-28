@@ -11,7 +11,7 @@ import datetime
 import hashlib
 import json
 import os
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 
@@ -20,14 +20,9 @@ import requests
 from tradingagents.execution.authorized_normal_trade_intent import AuthorizedNormalTradeIntent
 from tradingagents.policy.strategy_promotion_sync import (
     NormalLiveActivationReceipt,
-    verify_normal_live_activation_receipt,
+    admit_normal_live_broker_submit,
 )
 from tradingagents.schemas.trading import TradeIntent
-from tradingagents.strategy._immutable_evidence_store import (
-    NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
-    EvidenceCandidate,
-    ImmutableStrategyEvidenceStore,
-)
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 LIVE_BASE_URL = "https://api.alpaca.markets"
@@ -634,10 +629,10 @@ def build_tiny_live_order_payload(intent: TradeIntent) -> dict:
     }
 
 
-def _normal_live_submit_time(now: datetime.datetime | None) -> datetime.datetime:
-    checked_at = (
-        datetime.datetime.now(UTC).replace(microsecond=0) if now is None else now
-    )
+def _normal_live_submit_time(
+    clock: Callable[[], datetime.datetime],
+) -> datetime.datetime:
+    checked_at = clock()
     if (
         type(checked_at) is not datetime.datetime
         or checked_at.tzinfo is None
@@ -670,10 +665,6 @@ def _canonical_live_state(state: object) -> bytes:
 def _require_normal_live_receipt(
     intent: AuthorizedNormalTradeIntent,
     value: object,
-    *,
-    proposal_ledger_root,
-    repo_root,
-    checked_at: datetime.datetime,
 ) -> NormalLiveActivationReceipt:
     if type(value) is not NormalLiveActivationReceipt:
         raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
@@ -693,60 +684,7 @@ def _require_normal_live_receipt(
         or value.execution_authority != "none"
     ):
         raise ValueError("normal live activation receipt does not link to exact intent")
-    verify_normal_live_activation_receipt(
-        intent,
-        value,
-        proposal_ledger_root=proposal_ledger_root,
-        repo_root=repo_root,
-        checked_at=checked_at,
-    )
     return value
-
-
-def _normal_live_broker_submit_candidate(
-    *,
-    intent: AuthorizedNormalTradeIntent,
-    receipt: NormalLiveActivationReceipt,
-    immutable_facts: Mapping[str, object],
-) -> EvidenceCandidate:
-    facts_bytes = json.dumps(
-        dict(immutable_facts), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-    payload = {
-        "schema_version": 1,
-        "intent_full_sha256": hashlib.sha256(intent.canonical_json_bytes()).hexdigest(),
-        "logical_order_sha256": intent.logical_order_sha256,
-        "client_order_id": intent.client_order_id,
-        "activation_prepare_id": receipt.activation_prepare_id,
-        "activation_receipt_id": receipt.activation_receipt_id,
-        "immutable_order_sha256": hashlib.sha256(facts_bytes).hexdigest(),
-    }
-    return EvidenceCandidate(
-        kind=NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
-        effective_at=intent.recorded_at,
-        payload=payload,
-    )
-
-
-def _require_unique_live_submit_record(snapshot, envelope) -> None:
-    payload = envelope.payload
-    if not isinstance(payload, Mapping):
-        raise ValueError("durable live submit record is invalid")
-    logical = payload.get("logical_order_sha256")
-    client_order_id = payload.get("client_order_id")
-    if type(logical) is not str or type(client_order_id) is not str:
-        raise ValueError("durable live submit record is invalid")
-    for prior in snapshot:
-        if prior.kind != NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND:
-            continue
-        prior_payload = prior.payload
-        if not isinstance(prior_payload, Mapping):
-            raise ValueError("durable live submit record is invalid")
-        if (
-            prior_payload.get("logical_order_sha256") == logical
-            or prior_payload.get("client_order_id") == client_order_id
-        ) and prior.payload != payload:
-            raise ValueError("logical/client order ID is already consumed by different receipt")
 
 
 def _normal_live_order_facts(order: Mapping[str, object]) -> dict[str, object]:
@@ -782,11 +720,15 @@ class AlpacaRestClient:
         *,
         normal_live_evidence_root=None,
         normal_live_repo_root=None,
+        normal_live_clock: Callable[[], datetime.datetime] | None = None,
     ):
         self.settings = settings
         self.session = session or requests.Session()
         self.normal_live_evidence_root = normal_live_evidence_root
         self.normal_live_repo_root = normal_live_repo_root
+        self._normal_live_clock = normal_live_clock or (
+            lambda: datetime.datetime.now(UTC).replace(microsecond=0)
+        )
 
     def assert_expected_mode(self, *, paper: bool) -> None:
         base_url = self.settings.base_url.lower()
@@ -841,7 +783,6 @@ class AlpacaRestClient:
         *,
         authorized_normal_trade_intent=None,
         activation_receipt=None,
-        now: datetime.datetime | None = None,
     ) -> dict:
         self.assert_expected_mode(paper=self.settings.paper)
         if self.settings.paper is True:
@@ -850,41 +791,31 @@ class AlpacaRestClient:
         intent = _require_normal_live_intent(authorized_normal_trade_intent)
         if type(activation_receipt) is not NormalLiveActivationReceipt:
             raise ValueError("live submit requires an exact NormalLiveActivationReceipt")
-        checked_at = _normal_live_submit_time(now)
+        checked_at = _normal_live_submit_time(self._normal_live_clock)
         if (
             self.normal_live_evidence_root is None
             or self.normal_live_repo_root is None
         ):
             raise ValueError("live submit requires durable normal-live evidence roots")
-        receipt = _require_normal_live_receipt(
-            intent,
-            activation_receipt,
-            proposal_ledger_root=self.normal_live_evidence_root,
-            repo_root=self.normal_live_repo_root,
-            checked_at=checked_at,
-        )
-        store = ImmutableStrategyEvidenceStore(
-            self.normal_live_evidence_root,
-            clock=lambda: checked_at,
-        )
+        receipt = _require_normal_live_receipt(intent, activation_receipt)
         intent.verify_order_payload(order, at=checked_at)
         payload = dict(order)
         client_order_id = intent.client_order_id
         immutable_facts = _normal_live_order_facts(payload)
-        candidate = _normal_live_broker_submit_candidate(
-            intent=intent,
-            receipt=receipt,
-            immutable_facts=immutable_facts,
+        facts_bytes = json.dumps(
+            dict(immutable_facts),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        admission = admit_normal_live_broker_submit(
+            intent,
+            receipt,
+            proposal_ledger_root=self.normal_live_evidence_root,
+            repo_root=self.normal_live_repo_root,
+            immutable_order_sha256=hashlib.sha256(facts_bytes).hexdigest(),
+            clock=self._normal_live_clock,
         )
-        try:
-            admission = store.admit_checked(
-                candidate,
-                validate=lambda snapshot, envelope: _require_unique_live_submit_record(
-                    snapshot, envelope
-                ),
-            )
-        except ValueError as exc:
-            raise ValueError("durable live submit prepare could not be recorded") from exc
 
         # The broker-submit prepare is immutable and created before the first
         # possible POST. A retry sees an existing prepare, performs only this
