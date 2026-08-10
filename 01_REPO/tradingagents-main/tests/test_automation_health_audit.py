@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 
+import tradingagents.evals.automation_health_audit as automation_health_audit
 from tradingagents.evals.automation_health_audit import (
     _collect_run_ids,
     _run_id_for_path,
@@ -12,6 +13,14 @@ from tradingagents.evals.automation_health_audit import (
 )
 
 UTC = dt.timezone.utc
+
+
+def test_default_automation_root_uses_codex_home(tmp_path, monkeypatch):
+    codex_home = tmp_path / ".codex"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert hasattr(automation_health_audit, "default_automation_root")
+    assert automation_health_audit.default_automation_root() == codex_home / "automations"
 
 
 def _write_automation(
@@ -82,6 +91,59 @@ def test_automation_health_run_id_inference_preserves_microsecond_packets():
         "20260601-010550-999999",
         "explicit-packet-id",
     ]
+
+
+def test_automation_health_discovers_current_codex_automation_and_prefers_session_run(tmp_path):
+    automation_root = tmp_path / ".codex" / "automations"
+    repo = tmp_path / "repo"
+    now = dt.datetime(2026, 7, 15, 15, 0, tzinfo=UTC)
+    automation_id = "tradingagents-autonomous-safety-sentinel"
+    automation_dir = automation_root / automation_id
+    automation_dir.mkdir(parents=True)
+    (automation_dir / "automation.toml").write_text(
+        "\n".join(
+            [
+                "version = 1",
+                f'id = "{automation_id}"',
+                'kind = "cron"',
+                'name = "TradingAgents autonomous safety sentinel"',
+                'prompt = "TradingAgents test automation"',
+                'status = "ACTIVE"',
+                'rrule = "RRULE:FREQ=WEEKLY;BYHOUR=9,10,11,12,13,14,15;BYMINUTE=25;BYDAY=MO,TU,WE,TH,FR"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (automation_dir / "memory.md").write_text(
+        "Future policy date mentioned in prose: 2026-07-17T17:58:45+00:00\n",
+        encoding="utf-8",
+    )
+    session_index = automation_root.parent / "session_index.jsonl"
+    session_index.write_text(
+        json.dumps(
+            {
+                "id": "sentinel-thread",
+                "thread_name": "TradingAgents autonomous safety sentinel",
+                "updated_at": "2026-07-15T14:27:14.756058Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    audit = build_automation_health_audit(
+        repo_root=repo,
+        automation_root=automation_root,
+        now=now,
+        window_hours=24,
+    )
+
+    assert audit["automation_count"] == 1
+    row = audit["automations"][0]
+    assert row["automation_id"] == automation_id
+    assert row["status"] == "ok"
+    assert row["latest_memory_at"] == "2026-07-15T14:27:14+00:00"
+    assert row["run_evidence_source"] == "codex_session_index"
 
 
 def test_automation_health_audit_flags_missing_partial_duplicate_and_stale_runs(tmp_path):

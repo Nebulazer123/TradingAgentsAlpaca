@@ -4,6 +4,8 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from cli.main import app
+from tradingagents.evals import automation_memory_rollup
+from tradingagents.evals.automation_health_audit import default_automation_root
 from tradingagents.evals.automation_memory_rollup import (
     apply_automation_memory_rollup_plan,
     build_automation_memory_rollup_plan,
@@ -11,6 +13,10 @@ from tradingagents.evals.automation_memory_rollup import (
 )
 
 runner = CliRunner()
+
+
+def test_automation_memory_rollup_default_uses_platform_codex_home():
+    assert default_automation_root() == automation_memory_rollup.DEFAULT_AUTOMATION_ROOT
 
 
 def _write_memory(root, automation_id, text):

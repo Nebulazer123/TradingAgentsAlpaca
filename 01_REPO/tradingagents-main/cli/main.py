@@ -95,6 +95,7 @@ from tradingagents.brokers.alpaca_supervisor import (
     load_latest_overnight_plan,
     load_latest_premarket_brief,
     market_session_label,
+    resolve_live_sleeve,
     serialize_hourly_decision,
     should_notify_supervisor,
     supervisor_live_client_order_id,
@@ -102,7 +103,6 @@ from tradingagents.brokers.alpaca_supervisor import (
     validate_hourly_supervisor_actions,
     validate_overnight_plan_against_candidates,
     validate_premarket_brief_against_candidates,
-    resolve_live_sleeve,
     validate_supervisor_live_submit_allowed,
     write_hourly_decision_packet,
     write_overnight_plan_packet,
@@ -158,6 +158,7 @@ from tradingagents.evals.agent_intelligence_ledger import (
 from tradingagents.evals.automation_health_audit import (
     build_automation_health_audit,
     build_compact_automation_health_audit,
+    default_automation_root,
     write_automation_health_audit,
 )
 from tradingagents.evals.automation_memory_rollup import (
@@ -2750,7 +2751,7 @@ def research_process_review(
 @research_app.command("automation-memory-rollup")
 def research_automation_memory_rollup(
     automation_root: Path = typer.Option(
-        Path(r"C:\cm\automations"),
+        default_automation_root(),
         "--automation-root",
         help="Codex automation root to inspect.",
     ),
@@ -2823,7 +2824,7 @@ def _build_compact_automation_health_audit(packet: Mapping[str, Any]) -> dict[st
 @research_app.command("automation-health-audit")
 def research_automation_health_audit(
     automation_root: Path = typer.Option(
-        Path(r"C:\cm\automations"),
+        default_automation_root(),
         "--automation-root",
         help="Codex automation root to inspect.",
     ),
@@ -2895,7 +2896,7 @@ def research_controller_patrol(
         help="Controller automation id to record evidence for.",
     ),
     automation_root: Path = typer.Option(
-        Path(r"C:\cm\automations"),
+        default_automation_root(),
         "--automation-root",
         help="Codex automation root to summarize.",
     ),

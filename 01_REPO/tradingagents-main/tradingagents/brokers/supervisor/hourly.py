@@ -27,12 +27,12 @@ from tradingagents.brokers.supervisor.candidates import (
     is_buy_entry_candidate,
 )
 from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
-from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.brokers.supervisor.types import (
     HourlySupervisorAction,
     HourlySupervisorConfig,
     HourlySupervisorDecision,
 )
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.io import atomic_write_text, unique_packet_path
 
 DEFAULT_ALERT_THROTTLE_WINDOW = datetime.timedelta(hours=4)

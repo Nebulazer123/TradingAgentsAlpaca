@@ -146,7 +146,8 @@ def test_execution_board_flags_paired_live_sell_and_buy_and_chase_buy(tmp_path):
     assert review["recommendation"] == "pause_new_buys_and_review"
     assert "paired_live_sell_and_buy" in violation_types
     assert "chase_buy" in violation_types
-    assert "loss_exit" in warning_types
+    assert "loss_exit_without_approval_evidence" in violation_types
+    assert "loss_exit" not in warning_types
     assert "negative_live_unrealized_pl" in warning_types
 
 
@@ -219,6 +220,156 @@ def test_execution_board_accepts_approved_loss_exit_review_evidence(tmp_path):
     assert "loss_exit" in warning_types
 
 
+def test_execution_board_does_not_count_unsubmitted_loss_exit_intent_as_execution(tmp_path):
+    hourly = tmp_path / "hourly"
+    _write_packet(
+        hourly,
+        "hourly-supervisor-20260715-163554.json",
+        {
+            "generated_at": "2026-07-15T16:35:54+00:00",
+            "decision": "blocked",
+            "actions": [
+                {
+                    "action": "close",
+                    "side": "sell",
+                    "symbol": "NFLX",
+                    "account": "live",
+                    "reason": "Exit approved loss: NFLX crossed loss review",
+                }
+            ],
+            "submitted": [],
+            "evidence": {
+                "loss_exit_review": {
+                    "symbol": "NFLX",
+                    "allowed": True,
+                    "normalized_reason": "hard_stop_defined_before_entry",
+                    "blocked_reasons": [],
+                }
+            },
+            "portfolio": {"live": {"unrealized_pl": "-3.08"}},
+        },
+    )
+
+    review = build_execution_board_review(hourly)
+
+    assert review["metrics"]["submitted_order_count"] == 0
+    assert review["metrics"]["live_sell_count"] == 0
+    assert review["metrics"]["loss_exit_count"] == 0
+    assert "loss_exit" not in {item["type"] for item in review["warnings"]}
+
+
+def test_execution_board_does_not_count_rejected_loss_exit_order(tmp_path):
+    hourly = tmp_path / "hourly"
+    _write_packet(
+        hourly,
+        "hourly-supervisor-20260715-163600.json",
+        {
+            "generated_at": "2026-07-15T16:36:00+00:00",
+            "decision": "blocked",
+            "actions": [
+                {
+                    "action": "close",
+                    "side": "sell",
+                    "symbol": "NFLX",
+                    "account": "live",
+                    "reason": "Exit approved loss: NFLX crossed loss review",
+                    "idempotency_key": "ta-tiny-nflx-sell-expected",
+                }
+            ],
+            "submitted": [
+                {
+                    "symbol": "NFLX",
+                    "side": "sell",
+                    "status": "rejected",
+                    "client_order_id": "ta-tiny-nflx-sell-expected",
+                }
+            ],
+            "evidence": {"loss_exit_review": {"symbol": "NFLX", "allowed": True}},
+            "portfolio": {"live": {"unrealized_pl": "-3.08"}},
+        },
+    )
+
+    review = build_execution_board_review(hourly)
+
+    assert review["metrics"]["live_sell_count"] == 0
+    assert review["metrics"]["loss_exit_count"] == 0
+    assert "unsafe_order_status" in {item["type"] for item in review["violations"]}
+
+
+def test_execution_board_does_not_attribute_ambiguous_legacy_submission(tmp_path):
+    hourly = tmp_path / "hourly"
+    _write_packet(
+        hourly,
+        "hourly-supervisor-20260715-163700.json",
+        {
+            "generated_at": "2026-07-15T16:37:00+00:00",
+            "decision": "close",
+            "actions": [
+                {
+                    "action": "close",
+                    "side": "sell",
+                    "symbol": "NFLX",
+                    "account": "live",
+                    "reason": "Exit approved loss: first intent",
+                },
+                {
+                    "action": "close",
+                    "side": "sell",
+                    "symbol": "NFLX",
+                    "account": "live",
+                    "reason": "Exit approved loss: duplicate intent",
+                },
+            ],
+            "submitted": [{"symbol": "NFLX", "side": "sell", "status": "filled"}],
+            "evidence": {"loss_exit_review": {"symbol": "NFLX", "allowed": True}},
+            "portfolio": {"live": {"unrealized_pl": "-3.08"}},
+        },
+    )
+
+    review = build_execution_board_review(hourly)
+
+    assert review["metrics"]["live_sell_count"] == 0
+    assert review["metrics"]["loss_exit_count"] == 0
+
+
+def test_execution_board_does_not_match_paper_submission_to_live_intent(tmp_path):
+    hourly = tmp_path / "hourly"
+    _write_packet(
+        hourly,
+        "hourly-supervisor-20260715-163800.json",
+        {
+            "generated_at": "2026-07-15T16:38:00+00:00",
+            "decision": "blocked",
+            "actions": [
+                {
+                    "action": "close",
+                    "side": "sell",
+                    "symbol": "NFLX",
+                    "account": "live",
+                    "reason": "Exit approved loss: NFLX crossed loss review",
+                    "idempotency_key": "ta-tiny-nflx-sell-live",
+                }
+            ],
+            "submitted": [
+                {
+                    "symbol": "NFLX",
+                    "side": "sell",
+                    "status": "filled",
+                    "account": "paper",
+                    "client_order_id": "ta-hourly-paper-nflx-sell",
+                }
+            ],
+            "evidence": {"loss_exit_review": {"symbol": "NFLX", "allowed": True}},
+            "portfolio": {"live": {"unrealized_pl": "-3.08"}},
+        },
+    )
+
+    review = build_execution_board_review(hourly)
+
+    assert review["metrics"]["live_sell_count"] == 0
+    assert review["metrics"]["loss_exit_count"] == 0
+
+
 def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
     hourly = tmp_path / "hourly"
     evidence_dir = tmp_path / "loss_review_evidence"
@@ -285,6 +436,55 @@ def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
     assert review["packet_reviews"][0]["loss_review_evidence_remaining_blocker_count"] == 2
     assert "loss-review evidence" in review["new_buy_policy"]["plain_english"].lower()
     assert "loss-review evidence" in review["board_roles"][0]["view"].lower()
+
+
+def test_execution_board_uses_refreshed_advisory_approval_over_supervisor_snapshot(tmp_path):
+    hourly = tmp_path / "hourly"
+    evidence_dir = tmp_path / "loss_review_evidence"
+    hourly_packet = _write_packet(
+        hourly,
+        "hourly-supervisor-20260715-173629.json",
+        {
+            "generated_at": "2026-07-15T17:36:29+00:00",
+            "decision": "blocked",
+            "actions": [],
+            "submitted": [],
+            "portfolio": {"live": {"unrealized_pl": "-3.02"}},
+        },
+    )
+    _write_packet(
+        evidence_dir,
+        "latest-compact.json",
+        {
+            "schema": "compact_loss_review_evidence_v1",
+            "payload": {
+                "symbol": "NFLX",
+                "hourly_packet_path": str(hourly_packet),
+                "review_allowed": True,
+                "remaining_blockers": [],
+                "resolved_blockers_by_refresh": [],
+                "advisory_summary": {
+                    "review_allowed_after_refresh": False,
+                    "loss_exit_candidate": {
+                        "approval_effect": "board_review_input_not_loss_exit_approval",
+                    },
+                },
+            },
+        },
+    )
+
+    review = build_execution_board_review(
+        hourly,
+        loss_review_evidence_dir=evidence_dir,
+    )
+
+    evidence = review["loss_review_evidence"]
+    assert evidence["supervisor_review_allowed"] is True
+    assert evidence["review_allowed_after_refresh"] is False
+    assert evidence["review_allowed"] is False
+    assert "loss_review_evidence_pending" in {
+        item["type"] for item in review["warnings"]
+    }
 
 
 def test_execution_board_names_tradeable_session_when_loss_exit_candidate_ready(tmp_path):

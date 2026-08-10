@@ -5667,6 +5667,20 @@ def test_research_controller_patrol_writes_analysis_only_packet(tmp_path):
     assert json.loads(packet_path.read_text(encoding="utf-8"))["kind"] == payload["kind"]
 
 
+def test_automation_control_commands_default_to_platform_codex_home():
+    expected_root = cli_main.default_automation_root()
+
+    controller_default = inspect.signature(
+        cli_main.research_controller_patrol
+    ).parameters["automation_root"].default.default
+    memory_rollup_default = inspect.signature(
+        cli_main.research_automation_memory_rollup
+    ).parameters["automation_root"].default.default
+
+    assert controller_default == expected_root
+    assert memory_rollup_default == expected_root
+
+
 def test_research_controller_patrol_supports_wake_verification_packet(tmp_path):
     output_dir = tmp_path / "control_plane_patrol"
     automation_root = tmp_path / "automations"

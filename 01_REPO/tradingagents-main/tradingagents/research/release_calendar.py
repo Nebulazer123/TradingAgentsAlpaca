@@ -49,7 +49,10 @@ def _iso(value: datetime.datetime) -> str:
 
 
 def load_release_calendar_config(path: str | Path = DEFAULT_RELEASE_CALENDAR_PATH) -> dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    config: object = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("Release calendar config must contain a JSON object")
+    return config
 
 
 def _window_for_event(
@@ -82,7 +85,7 @@ def _normalize_event(
     default_pre_hours: float,
     default_post_hours: float,
 ) -> dict[str, Any]:
-    event = {
+    event: dict[str, Any] = {
         "event_id": str(item["event_id"]),
         "source_name": str(item["source_name"]),
         "title": str(item["title"]),

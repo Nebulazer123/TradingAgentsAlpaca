@@ -139,9 +139,10 @@ def evaluate_email_clarity(
 
     if not any("spent today" in line.lower() for line in lines):
         issues.append("missing spent-today money line")
-    if normalized_report_type != "urgent":
-        if not any("holdings" in line.lower() for line in lines):
-            issues.append("missing holdings summary line")
+    if normalized_report_type != "urgent" and not any(
+        "holdings" in line.lower() for line in lines
+    ):
+        issues.append("missing holdings summary line")
 
     forbidden_found = [phrase for phrase in FORBIDDEN_PHRASES if phrase in lowered]
     if forbidden_found:

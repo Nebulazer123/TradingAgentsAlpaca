@@ -10,6 +10,7 @@ import argparse
 import datetime as dt
 import json
 import math
+import os
 import re
 from contextlib import suppress
 from pathlib import Path
@@ -21,7 +22,20 @@ import tomllib
 from tradingagents.storage.json_cache import JsonFileCache
 
 ROOT = Path(__file__).resolve().parents[1]
-AUTOMATION_ROOT = Path(r"C:\cm\automations")
+
+
+def _default_automation_root() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home) / "automations"
+    user_root = Path.home() / ".codex" / "automations"
+    if user_root.exists():
+        return user_root
+    legacy_windows_root = Path(r"C:\cm\automations")
+    return legacy_windows_root if legacy_windows_root.exists() else user_root
+
+
+AUTOMATION_ROOT = _default_automation_root()
 CONTEXT_DIR = ROOT / "results" / "_context"
 RESEARCH_EVIDENCE_DIR = ROOT / "results" / "research_evidence"
 AUTOMATION_MEMORY_ROLLUP_LATEST = (
@@ -1265,6 +1279,12 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
             and set(skipped) <= {"premarket_quotes_and_spreads"}
         )
         fail_closed_only_warning = set(warned) <= {"live_sizing_room_and_buying_power"}
+        fail_closed_live_control_warning_only = (
+            not failed
+            and not skipped
+            and bool(warned)
+            and fail_closed_only_warning
+        )
         deferred_for_closed_market = (
             not failed
             and bool(skipped)
@@ -1312,7 +1332,7 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
                 "latest_overnight_generated_at": latest_overnight_generated_at,
                 "latest_premarket_generated_at": latest_premarket_generated_at,
                 "fail_closed_live_control_warning_only": (
-                    bool(warned) and fail_closed_only_warning
+                    fail_closed_live_control_warning_only
                 ),
                 "raw_packet_path": data.get("raw_packet_path"),
                 "live_position_count": live.get("position_count"),
@@ -1331,7 +1351,11 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
             flag("blocker")
         if stale_after_latest_context:
             flag("stale")
-        if (warned or skipped) and not deferred_for_closed_market:
+        if (
+            (warned or skipped)
+            and not deferred_for_closed_market
+            and not fail_closed_live_control_warning_only
+        ):
             flag("stale")
     elif label == "overnight_verification":
         is_compact_verification = (
@@ -2952,13 +2976,14 @@ def discover_automation_ids() -> list[str]:
     for path in sorted(AUTOMATION_ROOT.glob("*/automation.toml")):
         data = read_toml(path)
         automation_id = str(data.get("id") or path.parent.name)
-        if automation_id:
+        if automation_id and classify_automation(automation_id, data) != "other":
             ids.append(automation_id)
     return ids
 
 
 def classify_automation(automation_id: str, data: dict[str, Any] | None = None) -> str:
     data = data or {}
+    automation_id_lower = automation_id.lower()
     prompt = str(data.get("prompt") or "").lower()
     cwd_text = " ".join(str(item) for item in data.get("cwds") or []).lower()
     is_tradingagents = (
@@ -2972,6 +2997,22 @@ def classify_automation(automation_id: str, data: dict[str, Any] | None = None) 
         return "one_off_followup"
     if automation_id in KNOWN_OBSERVER_AUTOMATION_IDS:
         return "n8n_or_hook"
+    if "execution-board" in automation_id_lower:
+        return "execution_board"
+    if "safety-sentinel" in automation_id_lower:
+        return "safety_sentinel"
+    if "self-heal" in automation_id_lower:
+        return "self_heal"
+    if "daily-report" in automation_id_lower:
+        return "daily_report"
+    if "market-supervisor" in automation_id_lower:
+        return "market_supervisor"
+    if "overnight-research" in automation_id_lower:
+        return "overnight_research"
+    if "paper-tournament" in automation_id_lower:
+        return "paper_tournament"
+    if "preopen-validation" in automation_id_lower:
+        return "preopen_validation"
     if automation_id == "tradingagents-overnight-planning":
         return "overnight_research"
     if automation_id == "tradingagents-daily-market-report":
@@ -3032,7 +3073,7 @@ def collect_metrics(*, refresh: bool = True) -> dict[str, Any]:
     if refresh:
         refresh_generated_context_files()
     guidance = [file_metric(path) for path in GUIDANCE_FILES if path.exists()]
-    automations = [summarize_automation(item) for item in AUTOMATION_IDS]
+    automations = [summarize_automation(item) for item in discover_automation_ids()]
     latest_metrics = []
     for label, directory in LATEST_PACKETS:
         path = latest_snapshot_json(label, directory)
@@ -3233,11 +3274,7 @@ def build_field_provenance(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 def collect_automation_index() -> dict[str, Any]:
     discovered_ids = discover_automation_ids()
-    ordered_ids = list(
-        dict.fromkeys(
-            [*AUTOMATION_IDS, *KNOWN_FOLLOW_UP_AUTOMATION_IDS, *KNOWN_OBSERVER_AUTOMATION_IDS, *discovered_ids]
-        )
-    )
+    ordered_ids = discovered_ids
     automations = [summarize_automation(item) for item in ordered_ids]
     prompt_tokens = sum(item.get("prompt_approx_tokens", 0) for item in automations)
     target_tokens = sum(item.get("prompt_compaction_target_tokens", 0) for item in automations)
@@ -3245,7 +3282,12 @@ def collect_automation_index() -> dict[str, Any]:
     for item in automations:
         classification = str(item.get("classification") or "unknown")
         by_classification[classification] = by_classification.get(classification, 0) + 1
-    known_ids = set(AUTOMATION_IDS) | set(KNOWN_FOLLOW_UP_AUTOMATION_IDS) | set(KNOWN_OBSERVER_AUTOMATION_IDS)
+    known_follow_up_ids = [item for item in discovered_ids if item in KNOWN_FOLLOW_UP_AUTOMATION_IDS]
+    known_observer_ids = [item for item in discovered_ids if item in KNOWN_OBSERVER_AUTOMATION_IDS]
+    known_managed_ids = [
+        item for item in discovered_ids if item not in {*known_follow_up_ids, *known_observer_ids}
+    ]
+    known_ids = set(discovered_ids)
     unknown_tradingagents = [
         item["id"]
         for item in automations
@@ -3261,9 +3303,9 @@ def collect_automation_index() -> dict[str, Any]:
         "source_root": str(AUTOMATION_ROOT),
         "automations": automations,
         "automation_count": len([item for item in automations if not item.get("missing")]),
-        "known_managed_ids": AUTOMATION_IDS,
-        "known_follow_up_ids": KNOWN_FOLLOW_UP_AUTOMATION_IDS,
-        "known_observer_ids": KNOWN_OBSERVER_AUTOMATION_IDS,
+        "known_managed_ids": known_managed_ids,
+        "known_follow_up_ids": known_follow_up_ids,
+        "known_observer_ids": known_observer_ids,
         "classification_counts": by_classification,
         "unknown_tradingagents_ids": unknown_tradingagents,
         "discovered_unmanaged_tradingagents_ids": discovered_unmanaged,

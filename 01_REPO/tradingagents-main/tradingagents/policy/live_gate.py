@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.brokers.alpaca import OrderIssue
+from tradingagents.policy.exit_policy import POLICY_REASON_CODES
 from tradingagents.policy.live_control import load_live_control_state
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
@@ -24,7 +25,7 @@ STRICT_ALLOWED_LOSS_EXIT_REASONS = frozenset(
         "portfolio_exposure_limit",
         "user_manual_override",
     }
-)
+) | POLICY_REASON_CODES
 
 LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
     "symbol",
@@ -49,6 +50,24 @@ LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
     "confidence",
     "evidence_generated_at",
     "source_packet_ids",
+    "allowed",
+    "blocked_reasons",
+)
+
+POLICY_RULE_LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
+    "symbol",
+    "side",
+    "decision_id",
+    "current_price",
+    "average_entry_price",
+    "estimated_realized_loss",
+    "unrealized_pnl_percent",
+    "allowed_exit_reason",
+    "allowed_exit_reason_source",
+    "policy_rule_exit",
+    "exit_policy_rule",
+    "exit_policy_rationale",
+    "evidence_generated_at",
     "allowed",
     "blocked_reasons",
 )
@@ -179,7 +198,16 @@ def _review_from_action_or_decision(
 
 def _missing_review_fields(review: Mapping[str, Any]) -> list[str]:
     missing = []
-    for review_field in LOSS_EXIT_REVIEW_REQUIRED_FIELDS:
+    reason = str(review.get("allowed_exit_reason") or "")
+    policy_rule_review = (
+        review.get("policy_rule_exit") is True and reason in POLICY_REASON_CODES
+    )
+    required_fields = (
+        POLICY_RULE_LOSS_EXIT_REVIEW_REQUIRED_FIELDS
+        if policy_rule_review
+        else LOSS_EXIT_REVIEW_REQUIRED_FIELDS
+    )
+    for review_field in required_fields:
         value = review.get(review_field)
         if review_field == "blocked_reasons":
             if value is None:
@@ -187,12 +215,13 @@ def _missing_review_fields(review: Mapping[str, Any]) -> list[str]:
             continue
         if value in (None, "", []):
             missing.append(review_field)
-    source_packet_ids = review.get("source_packet_ids")
-    if (
-        (not isinstance(source_packet_ids, list) or not source_packet_ids)
-        and "source_packet_ids" not in missing
-    ):
-        missing.append("source_packet_ids")
+    if not policy_rule_review:
+        source_packet_ids = review.get("source_packet_ids")
+        if (
+            (not isinstance(source_packet_ids, list) or not source_packet_ids)
+            and "source_packet_ids" not in missing
+        ):
+            missing.append("source_packet_ids")
     return missing
 
 

@@ -73,9 +73,10 @@ def _read_windows_user_env(name: str) -> str | None:
         return None
     try:
         import winreg
+        registry: Any = winreg
 
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
-            value, _ = winreg.QueryValueEx(key, name)
+        with registry.OpenKey(registry.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = registry.QueryValueEx(key, name)
             return str(value)
     except OSError:
         return None

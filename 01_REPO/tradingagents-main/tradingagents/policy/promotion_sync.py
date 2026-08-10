@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import datetime
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.promotion import (

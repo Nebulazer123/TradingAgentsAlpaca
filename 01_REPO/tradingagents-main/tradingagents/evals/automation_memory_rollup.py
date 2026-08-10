@@ -8,9 +8,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from tradingagents.evals.automation_health_audit import default_automation_root
+
 UTC = datetime.timezone.utc
 
-DEFAULT_AUTOMATION_ROOT = Path(r"C:\cm\automations")
+DEFAULT_AUTOMATION_ROOT = default_automation_root()
 DEFAULT_OUTPUT_DIR = Path("results/token_efficiency")
 DEFAULT_ARCHIVE_DIR = DEFAULT_OUTPUT_DIR / "automation_memory_archives"
 

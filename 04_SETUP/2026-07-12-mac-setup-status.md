@@ -8,7 +8,7 @@ Completed: 2026-07-12
 - Local workspace: `/Users/corbinfloyd/Documents/TradingAgents`
 - Transfer copied with `rsync`.
 - The supplied SHA-256 manifest contains Windows backslashes and CRLF line endings. After normalizing those two transport details for verification, all `13,122` manifest entries passed (`hash_exit=0`).
-- No project `.env`, private key, or certificate credential files were found. The only `.pem` files are generated CA bundles inside the new virtual environments (`certifi`).
+- The transfer contained no credential-bearing `.env` files. During the later setup pass, local `.env` files appeared in both app roots; their values were not printed. The only `.pem` files found are generated CA bundles inside the new virtual environments (`certifi`).
 
 ## Repository Layout
 
@@ -42,9 +42,25 @@ Completed: 2026-07-12
 ## Explicitly Disabled Operations
 
 - No `.env` or API credentials were created or restored.
+- Presence-only checks now find local TradingAgents and MiroFish `.env` files. TradingAgents contains local Alpaca variable names; MiroFish currently contains only a management-key variable. Values were not printed, copied, or used by the Docker/n8n setup. No broker command was run.
 - No Alpaca check, preview, submit, or live/paper order command was run.
 - No n8n runner, scheduler, background service, Docker Compose stack, email delivery, or autonomous research/simulation was started.
 - The handoff pause receipt records `14/14` Codex automations paused and zero orders/email invoked.
+
+## Docker and n8n
+
+- Docker Desktop installed at `/Applications/Docker.app` (4.81.0).
+- Docker daemon verified healthy: Engine 29.6.1, Compose v5.2.0, context `desktop-linux`.
+- User-local CLI links are available through `~/.local/bin/docker` and the Docker credential helpers; the privileged `/usr/local/bin` symlink step was not needed.
+- n8n is running from the pinned `n8nio/n8n:2.29.10` image at `http://localhost:5678`.
+- Persistent n8n volume: `tradingagents-main_n8n_data`.
+- Twelve source-controlled observer/evaluation workflows are imported and remain inactive/manual.
+- Duplicate dashboard tags in the source JSON caused n8n 2.29.10's bulk importer to reject the batch, so temporary tagless copies were used for import; source workflow files were not modified.
+- The allowlisted runner is persistent through `~/Library/LaunchAgents/com.tradingagents.n8n-runner.plist`, bound to `127.0.0.1:8765`, with a clean child environment. It reports 24 jobs and zero submit-capable jobs.
+- n8n reaches the runner through `host.docker.internal:8765` and both host and container health probes pass.
+- First-run n8n owner account setup remains a one-time browser action at `http://localhost:5678`; no account password or API key was created by setup.
+- Browser verification on 2026-07-12: the signed-in n8n Usage and plan page reports `Community Edition — Registered`. The activation token was not copied, printed, or saved in the workspace.
+- Docker Desktop's n8n image logs a Python task-runner warning because the image lacks Python; the JavaScript observer workflows work and no deprecated runner variable remains in the compose file.
 
 ## Required Human Decisions Before Any Trading
 
@@ -53,6 +69,8 @@ Completed: 2026-07-12
 3. Resolve or consciously accept the existing Ruff findings and npm audit findings.
 4. Keep the preserved automation snapshots paused until each Mac-side job is independently reviewed and recreated.
 5. Choose whether to initialize separate Git histories for the two imported repositories; the transfer root remains uncommitted on local `master`.
+
+6. Open `http://localhost:5678` once and create the local n8n owner account. This is local-only; it is not an n8n Cloud account.
 
 ## Next Inspection Point
 

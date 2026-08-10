@@ -133,7 +133,12 @@ def get_indicator(
         elif indicator == "vwma":
             # Alpha Vantage doesn't have direct VWMA, so we'll return an informative message
             # In a real implementation, this would need to be calculated from OHLCV data
-            return f"## VWMA (Volume Weighted Moving Average) for {symbol}:\n\nVWMA calculation requires OHLCV data and is not directly available from Alpha Vantage API.\nThis indicator would need to be calculated from the raw stock data using volume-weighted price averaging.\n\n{indicator_descriptions.get('vwma', 'No description available.')}"
+            return (
+                f"## VWMA (Volume Weighted Moving Average) for {symbol}:\n\n"
+                "VWMA calculation requires OHLCV data and is not directly available from Alpha Vantage API.\n"
+                "This indicator would need to be calculated from the raw stock data using volume-weighted price averaging.\n\n"
+                f"{indicator_descriptions.get('vwma', 'No description available.')}"
+            )
         else:
             return f"Error: Indicator {indicator} not implemented yet."
 

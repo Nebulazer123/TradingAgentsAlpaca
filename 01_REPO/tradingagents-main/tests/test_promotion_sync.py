@@ -6,8 +6,8 @@ from tradingagents.brokers.alpaca_supervisor import (
     resolve_live_sleeve,
 )
 from tradingagents.policy.promotion_sync import (
-    sync_promotion_state_from_tournament,
     sync_promotion_state_file,
+    sync_promotion_state_from_tournament,
 )
 
 

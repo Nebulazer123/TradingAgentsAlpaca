@@ -15,7 +15,7 @@ Do not paste secret values into Codex chat, this document, Git, or the USB trans
 - [x] MiroFish backend tests passed (40/40).
 - [x] MiroFish frontend production build passed.
 - [x] Docker was checked and is not installed; Docker is optional.
-- [x] No real `.env` files or user credentials exist in the workspace.
+- [x] No credential-bearing `.env` files were present in the original transfer. Local `.env` files now exist; values are not included in this checklist.
 
 ## 2. Minimum choices to run research
 
@@ -147,6 +147,15 @@ These are deliberately not prepared or enabled:
 - Tailscale/remote Ollama: provide the remote host URL and a tested network path if a second Mac is used as a research mule.
 - Docker: install Docker Desktop only if the container deployment path is desired; it is not needed for the source setup already completed.
 
+### n8n local account and runtime
+
+- Docker Desktop and n8n are now installed and running.
+- Open `http://localhost:5678` once and create an owner email/password in the local n8n UI. Do not send that password to Codex.
+- Owner login and license activation are now complete; the Usage and plan page reports `Community Edition — Registered`. The activation token remains only in n8n's local state.
+- The 12 observer/evaluation workflows are already imported and inactive.
+- `N8N_API_KEY` is optional and only needed for the repository's Data Table/workflow sync commands; it was intentionally not created.
+- The persistent bridge is managed by `~/Library/LaunchAgents/com.tradingagents.n8n-runner.plist` and can be stopped with `launchctl bootout gui/$(id -u)/com.tradingagents.n8n-runner`.
+
 ## 7. Safe local file placement when values are ready
 
 ### TradingAgents
@@ -186,7 +195,8 @@ Once those choices are known, Codex can write the local `.env` files from your s
 
 ## 9. Current blockers and findings
 
-- No selected provider or model has been supplied yet, so external LLM calls cannot be tested.
+- No selected provider or model has been supplied yet, so external LLM calls cannot be tested. The current MiroFish `.env` does not contain its four required runtime values.
+- A local TradingAgents `.env` contains Alpaca variable names. Those values have not been used, and paper/live execution remains disabled and untested.
 - No Zep key has been supplied, so MiroFish simulation/memory cannot be tested.
 - No broker keys or risk envelope have been supplied; broker operations remain disabled.
 - Docker is not installed.

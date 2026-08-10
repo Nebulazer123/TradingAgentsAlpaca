@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -137,6 +138,15 @@ CATCH_UP_POLICY_BY_STATUS: dict[str, str] = {
 TIMESTAMP_RUN_ID_RE = re.compile(r"(?<!\d)(\d{8}-\d{6}(?:-\d{1,6})?)(?!\d)")
 
 
+def default_automation_root() -> Path:
+    codex_home = os.environ.get("CODEX_HOME")
+    if codex_home:
+        return Path(codex_home).expanduser() / "automations"
+    if os.name == "nt":
+        return Path(r"C:\cm\automations")
+    return Path.home() / ".codex" / "automations"
+
+
 def _coerce_count(value: Any, *, fallback: Any | None = None) -> int:
     if isinstance(value, (list, tuple, set)):
         return len(value)
@@ -180,6 +190,65 @@ def _read_toml(path: Path) -> dict[str, Any]:
         return cast(dict[str, Any], tomllib.loads(path.read_text(encoding="utf-8")))
     except (OSError, tomllib.TOMLDecodeError):
         return {}
+
+
+def _managed_automation_ids(automation_root: Path) -> tuple[str, ...]:
+    current_configs = sorted(automation_root.glob("tradingagents-*/automation.toml"))
+    current_ids = tuple(path.parent.name for path in current_configs)
+    if any(
+        automation_id in current_ids
+        for automation_id in (
+            "tradingagents-autonomous-safety-sentinel",
+            "tradingagents-autonomous-self-healer",
+        )
+    ):
+        return current_ids
+    return MANAGED_AUTOMATION_IDS
+
+
+def _session_index_latest_times(
+    automation_root: Path,
+    *,
+    automation_ids: Sequence[str],
+) -> dict[str, dt.datetime]:
+    names_by_id: dict[str, str] = {}
+    for automation_id in automation_ids:
+        config = _read_toml(automation_root / automation_id / "automation.toml")
+        name = str(config.get("name") or "").strip()
+        if name:
+            names_by_id[automation_id] = name
+    if not names_by_id:
+        return {}
+
+    session_index = automation_root.parent / "session_index.jsonl"
+    try:
+        lines = session_index.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return {}
+
+    ids_by_name = {name: automation_id for automation_id, name in names_by_id.items()}
+    latest: dict[str, dt.datetime] = {}
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        automation_id = ids_by_name.get(str(payload.get("thread_name") or ""))
+        updated_at = payload.get("updated_at")
+        if automation_id is None or not updated_at:
+            continue
+        try:
+            parsed = dt.datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        parsed = parsed.astimezone(UTC)
+        if automation_id not in latest or parsed > latest[automation_id]:
+            latest[automation_id] = parsed
+    return latest
 
 
 def _is_paused_config(config: dict[str, Any]) -> bool:
@@ -1169,13 +1238,18 @@ def build_automation_health_audit(
     window_start = current - dt.timedelta(hours=window_hours)
     repo = Path(repo_root)
     auto_root = Path(automation_root)
+    managed_automation_ids = _managed_automation_ids(auto_root)
+    session_index_times = _session_index_latest_times(
+        auto_root,
+        automation_ids=managed_automation_ids,
+    )
     observer_paths = _real_simulation_observer_paths(
         repo,
         window_start=window_start,
         now=current,
     )
     schedule_due_times: dict[str, list[dt.datetime]] = {}
-    for automation_id in MANAGED_AUTOMATION_IDS:
+    for automation_id in managed_automation_ids:
         config = _read_toml(auto_root / automation_id / "automation.toml")
         rrule = str(config.get("rrule") or "")
         schedule_due_times[automation_id] = (
@@ -1201,7 +1275,7 @@ def build_automation_health_audit(
     rows: list[dict[str, Any]] = []
     unique_submitted_by_path: dict[str, int] = {}
     unique_issues_by_path: dict[str, int] = {}
-    for automation_id in MANAGED_AUTOMATION_IDS:
+    for automation_id in managed_automation_ids:
         config_path = auto_root / automation_id / "automation.toml"
         memory_path = auto_root / automation_id / "memory.md"
         config = _read_toml(config_path)
@@ -1294,6 +1368,11 @@ def build_automation_health_audit(
                 due_times=due_times,
             )
         memory_time = _memory_latest_time(memory_path)
+        session_index_time = session_index_times.get(automation_id)
+        run_evidence_source = "memory_md" if memory_time is not None else None
+        if session_index_time is not None:
+            memory_time = session_index_time
+            run_evidence_source = "codex_session_index"
         submitted_count = sum(int(item.get("submitted_count") or 0) for item in artifacts)
         issue_count = sum(int(item.get("issue_count") or 0) for item in artifacts)
         for artifact in artifacts:
@@ -1493,6 +1572,7 @@ def build_automation_health_audit(
             "status_reason": status_reason,
             "history_gap_count": history_gap_count,
             "latest_memory_at": memory_time.isoformat(timespec="seconds") if memory_time else None,
+            "run_evidence_source": run_evidence_source,
             "submitted_order_count": submitted_count,
             "issue_count": issue_count,
             "packet_paths": [item["path"] for item in artifacts[-5:]],

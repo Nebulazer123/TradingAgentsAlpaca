@@ -16,13 +16,19 @@ note() { printf 'NOTE %s\n' "$1"; warn=$((warn + 1)); }
 
 printf 'Read-only setup readiness for %s\n' "$ROOT"
 
-for command_name in uv node npm git; do
+for command_name in uv node npm git docker; do
   if command -v "$command_name" >/dev/null 2>&1; then
     ok "$command_name is installed"
   else
     note "$command_name is missing"
   fi
 done
+
+if docker info >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  ok "Docker daemon and Compose are ready"
+else
+  note "Docker daemon or Compose is not ready"
+fi
 
 if [[ -x "$TA/.venv/bin/python" ]]; then
   ok "TradingAgents Python environment exists"
@@ -54,6 +60,18 @@ if [[ -f "$MF/.env" ]]; then
   note "MiroFish .env exists; values were not inspected or printed"
 else
   note "MiroFish .env is not configured yet"
+fi
+
+if curl -fsS --max-time 3 http://127.0.0.1:5678/healthz >/dev/null 2>&1; then
+  ok "n8n health endpoint is reachable on localhost:5678"
+else
+  note "n8n is not reachable on localhost:5678"
+fi
+
+if curl -fsS --max-time 3 http://127.0.0.1:8765/health >/dev/null 2>&1; then
+  ok "TradingAgents n8n runner is reachable on localhost:8765"
+else
+  note "TradingAgents n8n runner is not reachable on localhost:8765"
 fi
 
 presence_in_file() {

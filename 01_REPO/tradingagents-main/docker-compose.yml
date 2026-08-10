@@ -38,7 +38,7 @@ services:
   #   docker compose --profile n8n up -d n8n
   # then open http://localhost:5678 and create your own local owner account.
   n8n:
-    image: n8nio/n8n:latest
+    image: n8nio/n8n:2.29.10
     ports:
       - "5678:5678"
     environment:
@@ -46,7 +46,6 @@ services:
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
       - N8N_SECURE_COOKIE=false
-      - N8N_RUNNERS_ENABLED=true
       - WEBHOOK_URL=http://localhost:5678/
       - GENERIC_TIMEZONE=America/Chicago
       - TZ=America/Chicago

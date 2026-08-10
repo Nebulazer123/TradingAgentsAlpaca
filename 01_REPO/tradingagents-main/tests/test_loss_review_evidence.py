@@ -103,6 +103,23 @@ def test_find_latest_loss_review_packet_selects_newest_review(tmp_path):
     assert review["symbol"] == "TSM"
 
 
+def test_find_latest_loss_review_packet_accepts_newer_blocked_exit_evidence(tmp_path):
+    old_path = tmp_path / "hourly-supervisor-20260715-011255.json"
+    old_path.write_text(json.dumps(_hourly_packet()), encoding="utf-8")
+    latest_packet = _hourly_packet()
+    latest_packet["generated_at"] = "2026-07-15T16:35:54+00:00"
+    latest_packet["decision"] = "blocked"
+    latest_packet["evidence"]["loss_exit_review"]["market_session"] = "regular"
+    latest_path = tmp_path / "hourly-supervisor-20260715-163554.json"
+    latest_path.write_text(json.dumps(latest_packet), encoding="utf-8")
+
+    path, packet, review = find_latest_loss_review_packet(tmp_path)
+
+    assert path == latest_path
+    assert packet["decision"] == "blocked"
+    assert review["market_session"] == "regular"
+
+
 def test_build_loss_review_evidence_packet_preserves_hold_and_attaches_sources():
     packet = build_loss_review_evidence_packet(
         hourly_packet_path=Path("results/hourly_supervisor/hourly-supervisor-test.json"),

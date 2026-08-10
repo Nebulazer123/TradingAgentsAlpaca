@@ -15,6 +15,8 @@ from pathlib import Path
 
 from tradingagents.brokers.supervisor.formatting import (
     email_reason_text as _email_reason_text,
+)
+from tradingagents.brokers.supervisor.formatting import (
     plain_language_reason,
     strategy_display_name,
 )

@@ -89,6 +89,57 @@ def _is_order_action(action: Mapping[str, Any]) -> bool:
     return _action_side(action) in {"buy", "sell"}
 
 
+def _submitted_action_indexes(
+    actions: Sequence[Mapping[str, Any]],
+    submitted: Sequence[Mapping[str, Any]],
+) -> set[int]:
+    safe_order_indexes = {
+        index
+        for index, order in enumerate(submitted)
+        if str(order.get("status") or "submitted").lower() not in UNSAFE_STATUSES
+    }
+    matched_actions: set[int] = set()
+
+    for action_index, action in enumerate(actions):
+        idempotency_key = str(action.get("idempotency_key") or "").strip()
+        if not idempotency_key:
+            continue
+        for order_index in list(safe_order_indexes):
+            client_order_id = str(submitted[order_index].get("client_order_id") or "").strip()
+            if client_order_id == idempotency_key:
+                matched_actions.add(action_index)
+                safe_order_indexes.remove(order_index)
+                break
+
+    for order_index in list(safe_order_indexes):
+        order = submitted[order_index]
+        order_symbol = str(order.get("symbol") or "").upper()
+        order_side = str(order.get("side") or "").lower()
+        order_account = str(order.get("account") or "").lower()
+        client_order_id = str(order.get("client_order_id") or "").lower()
+        candidates = []
+        for action_index, action in enumerate(actions):
+            if action_index in matched_actions or action.get("idempotency_key"):
+                continue
+            if str(action.get("symbol") or "").upper() != order_symbol:
+                continue
+            if _action_side(action) != order_side:
+                continue
+            action_account = _action_account(action)
+            if order_account and order_account != action_account:
+                continue
+            if client_order_id.startswith("ta-tiny-") and action_account != "live":
+                continue
+            if client_order_id.startswith("ta-hourly-") and action_account != "paper":
+                continue
+            candidates.append(action_index)
+        if len(candidates) == 1:
+            matched_actions.add(candidates[0])
+            safe_order_indexes.remove(order_index)
+
+    return matched_actions
+
+
 def _action_account(action: Mapping[str, Any]) -> str:
     return str(action.get("account") or "live").lower()
 
@@ -179,19 +230,29 @@ def _latest_loss_review_evidence_summary(
     loss_exit_candidate = advisory_summary.get("loss_exit_candidate")
     if not isinstance(loss_exit_candidate, Mapping):
         loss_exit_candidate = {}
+    supervisor_review_allowed = payload.get("review_allowed")
+    review_allowed_after_refresh = advisory_summary.get("review_allowed_after_refresh")
+    effective_review_allowed = supervisor_review_allowed
+    if isinstance(review_allowed_after_refresh, bool):
+        effective_review_allowed = (
+            supervisor_review_allowed is True and review_allowed_after_refresh is True
+        )
     summary = {
         "evidence_path": str(evidence_path),
         "raw_packet_path": str(packet.get("raw_packet_path") or evidence_path),
         "hourly_packet_path": hourly_packet_path,
         "matches_review_window": _normalized_packet_ref(hourly_packet_path) in packet_paths,
         "symbol": str(payload.get("symbol") or "").upper(),
-        "review_allowed": payload.get("review_allowed"),
+        "review_allowed": effective_review_allowed,
         "next_action": payload.get("next_action"),
         "remaining_blocker_count": len(remaining_blockers),
         "remaining_blockers": remaining_blockers[:8],
         "resolved_blocker_count": len(resolved_blockers),
         "resolved_blockers_by_refresh": resolved_blockers[:8],
     }
+    if isinstance(review_allowed_after_refresh, bool):
+        summary["supervisor_review_allowed"] = supervisor_review_allowed
+        summary["review_allowed_after_refresh"] = review_allowed_after_refresh
     if loss_exit_candidate:
         summary["loss_exit_candidate"] = dict(loss_exit_candidate)
     return summary
@@ -327,9 +388,13 @@ def build_execution_board_review(
         paper_buys = [
             action for action in actions if _action_side(action) == "buy" and _action_account(action) == "paper"
         ]
-        live_buy_count += len(live_buys)
-        live_sell_count += len(live_sells)
-        paper_buy_count += len(paper_buys)
+        submitted_action_indexes = _submitted_action_indexes(actions, submitted)
+        submitted_action_ids = {
+            id(action) for index, action in enumerate(actions) if index in submitted_action_indexes
+        }
+        live_buy_count += sum(id(action) in submitted_action_ids for action in live_buys)
+        live_sell_count += sum(id(action) in submitted_action_ids for action in live_sells)
+        paper_buy_count += sum(id(action) in submitted_action_ids for action in paper_buys)
 
         if live_buys and live_sells:
             violations.append(
@@ -365,10 +430,10 @@ def build_execution_board_review(
         for action in live_sells:
             reason = _action_reason(action)
             symbol = str(action.get("symbol") or "").upper()
-            if _contains_any(reason, PROFIT_TERMS):
+            submitted_match = id(action) in submitted_action_ids
+            if submitted_match and _contains_any(reason, PROFIT_TERMS):
                 profit_sell_count += 1
             if _contains_any(reason, LOSS_TERMS):
-                loss_exit_count += 1
                 loss_review = _loss_exit_review_for_symbol(packet, symbol)
                 if loss_review is None:
                     violations.append(
@@ -388,14 +453,16 @@ def build_execution_board_review(
                             "message": "Live loss sell has loss_exit_review evidence but allowed is not true.",
                         }
                     )
-                warnings.append(
-                    {
-                        "type": "loss_exit",
-                        "packet": packet_key,
-                        "symbol": symbol,
-                        "message": "A loss exit occurred; freed cash should wait for a separate clean entry.",
-                    }
-                )
+                if submitted_match:
+                    loss_exit_count += 1
+                    warnings.append(
+                        {
+                            "type": "loss_exit",
+                            "packet": packet_key,
+                            "symbol": symbol,
+                            "message": "A loss exit occurred; freed cash should wait for a separate clean entry.",
+                        }
+                    )
 
         for order in submitted:
             status = str(order.get("status") or "submitted").lower()

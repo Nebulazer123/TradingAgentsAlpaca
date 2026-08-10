@@ -12,14 +12,12 @@ def test_autouse_api_key_placeholders_do_not_copy_host_secrets():
 
 
 def test_external_socket_connections_are_blocked_by_default():
-    with socket.socket() as sock:
-        with pytest.raises(RuntimeError, match="External network access is blocked"):
-            sock.connect(("93.184.216.34", 80))
+    with socket.socket() as sock, pytest.raises(RuntimeError, match="External network access is blocked"):
+        sock.connect(("93.184.216.34", 80))
 
 
 def test_localhost_socket_connections_are_not_blocked_by_guard():
-    with socket.socket() as sock:
-        with pytest.raises(OSError) as excinfo:
-            sock.connect(("127.0.0.1", 9))
+    with socket.socket() as sock, pytest.raises(OSError) as excinfo:
+        sock.connect(("127.0.0.1", 9))
 
     assert not isinstance(excinfo.value, RuntimeError)

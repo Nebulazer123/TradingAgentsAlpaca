@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from tradingagents.dataflows._official_common import OfficialDataError
 from tradingagents.dataflows import decision_vendor_adapters as adapters
+from tradingagents.dataflows._official_common import OfficialDataError
 from tradingagents.schemas.research import SourceEvidencePacket
 
 
