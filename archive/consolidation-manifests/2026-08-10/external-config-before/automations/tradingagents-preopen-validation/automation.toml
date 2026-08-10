@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-preopen-validation"
+kind = "cron"
+name = "TradingAgents preopen validation"
+prompt = "Run the deterministic pre-open TradingAgents routine from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. Do not edit code/config or submit orders. From the production repo run `TA_LIVE_SUBMIT=0 /bin/zsh scripts/mac/ta_job.sh preopen`. Read the newest preopen-validation and hourly packets and report pass/warn/fail status, stale inputs, account/order issues, and packet paths. The hourly part must remain dry-run only; do not add `--submit-actions`."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=9;BYMINUTE=15;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784078225853
+updated_at = 1785434384363

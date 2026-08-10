@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-market-supervisor"
+kind = "cron"
+name = "TradingAgents market supervisor"
+prompt = "Operate the production TradingAgents market-hours supervisor from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. This is an operational run, not a coding task: do not edit files, change strategy/config, refresh or extend the dead-man timer, or bypass any guard. First verify the repo path and read results/policy/live_control.json. Then run `TA_LIVE_SUBMIT=1 /bin/zsh scripts/mac/ta_job.sh hourly` from the production repo. The wrapper must remain the only order trigger for this run; do not run a second supervisor command concurrently. Read the newest hourly packet and report the decision, any submitted/reconciled order, any issue, and the packet path. If the live control is frozen or expired, allow the command to fail closed and report that state. If an NFLX close is submitted, explicitly report broker order status and do not submit a duplicate."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=9,10,11,12,13,14,15;BYMINUTE=35;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-terra"
+reasoning_effort = "high"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784078171226
+updated_at = 1785434374821

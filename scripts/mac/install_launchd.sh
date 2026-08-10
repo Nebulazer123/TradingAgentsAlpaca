@@ -33,7 +33,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
-TA_REPO="${TA_REPO:-/Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main}"
+TA_REPO="${TA_REPO:-/Users/corbinfloyd/Documents/TradingAgents}"
 JOB_RUNNER="$TA_REPO/scripts/mac/ta_job.sh"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 UID_TARGET="gui/$(id -u)"

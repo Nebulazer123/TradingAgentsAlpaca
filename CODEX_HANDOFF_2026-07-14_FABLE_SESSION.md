@@ -43,7 +43,7 @@ exit before earnings is still wanted, **Codex needs to either:**
 1. Stand up its own scheduler that calls, at minimum once during regular
    market hours before Thu 2026-07-16 close:
    ```
-   cd /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main
+   cd /Users/corbinfloyd/Documents/TradingAgents
    .venv/bin/python -m cli.main alpaca supervise-hourly --submit-actions \
      --json-output --log-dir results/hourly_supervisor \
      --overnight-log-dir results/overnight_plans \
@@ -321,7 +321,7 @@ that.
 ## 7. How to verify anything in this document
 
 ```
-cd /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main
+cd /Users/corbinfloyd/Documents/TradingAgents
 .venv/bin/python -m pytest tests/ -q                     # 1089 passed, 1 skipped
 .venv/bin/python -m cli.main alpaca check                 # live/paper connectivity + balances
 cat results/policy/live_control.json                      # dead-man state

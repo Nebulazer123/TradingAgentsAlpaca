@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-autonomous-execution-board"
+kind = "cron"
+name = "TradingAgents autonomous execution BOARD"
+prompt = "Act as the autonomous TradingAgents Execution BOARD from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. Independently assess intraday execution quality after the market supervisor cycle. You have Sol high-reasoning authority for analysis, diagnosis, and clear operator-facing recommendations; you do not have trading authority.\n\nNever submit, cancel, amend, or duplicate orders. Never change strategy/risk/promotion settings and never refresh/re-arm/unfreeze live control. Run `.venv/bin/python -m cli.main alpaca check`, then `.venv/bin/python -m cli.main research loss-review-evidence --json-output`, `.venv/bin/python -m cli.main research execution-board-review --json-output`, and `.venv/bin/python scripts/automation_context_snapshot.py --write`. Read the newest hourly supervisor, loss-evidence, and BOARD packets; assess execution quality, losses, stale evidence, duplicate/reconciliation risk, and whether new buys should pause.\n\nIf there is hard evidence that broker state, open-order reconciliation, scheduler integrity, or live-control integrity is unknowable or corrupted, immediately freeze live trading with `.venv/bin/python -m cli.main policy freeze-live --reason \"<specific evidence-backed BOARD integrity failure>\" --json-output`. Otherwise remain analysis-only: write the BOARD result and report recommendation, risks, and exact packet paths. If infrastructure needs repair, describe the evidence so the resilience task can act."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=9,10,11,12,13,14,15;BYMINUTE=50;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784100798207
+updated_at = 1785434376207

@@ -17,7 +17,7 @@
 set -euo pipefail
 
 JOB="${1:?job name required}"
-TA_REPO="${TA_REPO:-/Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main}"
+TA_REPO="${TA_REPO:-/Users/corbinfloyd/Documents/TradingAgents}"
 TA_LIVE_SUBMIT="${TA_LIVE_SUBMIT:-0}"
 PY="$TA_REPO/.venv/bin/python"
 LOG_DIR="$TA_REPO/results/mac_automation/logs"

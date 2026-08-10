@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-overnight-research"
+kind = "cron"
+name = "TradingAgents overnight research"
+prompt = "Run the deterministic overnight research routine from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. This is analysis-only: do not edit code, change strategy/config, refresh live control, or submit orders. From the production repo run `TA_LIVE_SUBMIT=0 /bin/zsh scripts/mac/ta_job.sh overnight`. Read the newest overnight packet and report completion status, graph successes/failures, model route, top symbols, stale warnings, and packet path. If it fails, report the exact failing stage and log path; do not silently skip it. use whtvr sklill u got tatll help if applicible"
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=4;BYMINUTE=30;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-sol"
+reasoning_effort = "ultra"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784078225790
+updated_at = 1784372193097

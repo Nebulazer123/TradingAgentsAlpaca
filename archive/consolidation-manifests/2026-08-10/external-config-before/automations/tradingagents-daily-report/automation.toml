@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-daily-report"
+kind = "cron"
+name = "TradingAgents daily report"
+prompt = "Run the TradingAgents end-of-day owner report from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. Do not edit code/config or submit orders. Run `/bin/zsh scripts/mac/ta_job.sh daily-report`, then `/bin/zsh scripts/mac/ta_job.sh deliver-outbox` from the production repo. Read the newest report/outbox results and report account context, material actions/issues, email delivery status, and packet/log paths. If delivery fails, keep the outbox item queued and report the exact error without exposing secrets."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=16;BYMINUTE=30;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-luna"
+reasoning_effort = "xhigh"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784078225930
+updated_at = 1785434377909

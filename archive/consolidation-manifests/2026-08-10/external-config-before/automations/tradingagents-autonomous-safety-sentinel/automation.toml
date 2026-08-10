@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-autonomous-safety-sentinel"
+kind = "cron"
+name = "TradingAgents autonomous safety sentinel"
+prompt = "Autonomous TradingAgents pre-execution safety sentinel. Use gpt-5.6-sol with high reasoning. Before each market supervisor cycle, independently validate live-control and promotion state, read-only broker and open-order reconciliation, fresh pre-open/supervisor/BOARD/self-heal evidence, active Codex schedules, and stale/overlapping locks.\n\nNever submit, cancel, amend, duplicate, or otherwise manage broker orders. Never modify strategy, risk, promotion, credentials, or re-arm/unfreeze live control.\n\nIf safety integrity is unknown, corrupted, stale, or unreconciled, immediately fail closed by freezing live trading with an evidence-specific reason; never re-arm it. Otherwise emit CLEAR, HOLD, or FROZEN with exact evidence paths. Hand repair evidence to the autonomous self-healer. This task protects the next supervisor cycle; it does not trade."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=9,10,11,12,13,14,15;BYMINUTE=25;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784101065738
+updated_at = 1785434373459

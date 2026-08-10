@@ -56,7 +56,7 @@ The plans are separate because each subsystem can be implemented, tested, review
 ### Task 1: Preserve The Existing Checkout And Establish A Clean Baseline
 
 **Files:**
-- Inspect: `/Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main`
+- Inspect: `/Users/corbinfloyd/Documents/TradingAgents`
 - Create at execution time: `/Users/corbinfloyd/.codex/worktrees/tradingagents-autonomous-firm`
 - Preserve without editing: all files shown by `git status --short` in the original checkout
 
@@ -65,7 +65,7 @@ The plans are separate because each subsystem can be implemented, tested, review
 Run:
 
 ```bash
-cd /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main
+cd /Users/corbinfloyd/Documents/TradingAgents
 git status --short
 git diff --stat
 git diff --binary > /tmp/tradingagents-preexisting-20260718.patch

@@ -1,0 +1,143 @@
+ M .gitignore
+ M 01_REPO/tradingagents-main/Dockerfile
+ M 01_REPO/tradingagents-main/cli/main.py
+ M 01_REPO/tradingagents-main/docker-compose.yml
+ M 01_REPO/tradingagents-main/pyproject.toml
+ M 01_REPO/tradingagents-main/scripts/automation_context_snapshot.py
+ M 01_REPO/tradingagents-main/scripts/mac/deliver_outbox.py
+ M 01_REPO/tradingagents-main/tests/test_alpaca_cli.py
+ M 01_REPO/tradingagents-main/tests/test_automation_context_snapshot.py
+ M 01_REPO/tradingagents-main/tests/test_automation_health_audit.py
+ M 01_REPO/tradingagents-main/tests/test_automation_memory_rollup.py
+ M 01_REPO/tradingagents-main/tests/test_decision_vendor_adapters.py
+ M 01_REPO/tradingagents-main/tests/test_execution_board.py
+ M 01_REPO/tradingagents-main/tests/test_live_gate.py
+ M 01_REPO/tradingagents-main/tests/test_loss_review_evidence.py
+ M 01_REPO/tradingagents-main/tests/test_promotion_sync.py
+ M 01_REPO/tradingagents-main/tests/test_test_isolation.py
+ M 01_REPO/tradingagents-main/tradingagents/brokers/supervisor/daily_report.py
+ M 01_REPO/tradingagents-main/tradingagents/brokers/supervisor/hourly.py
+ M 01_REPO/tradingagents-main/tradingagents/dataflows/alpha_vantage_indicator.py
+ M 01_REPO/tradingagents-main/tradingagents/dataflows/decision_vendor_adapters.py
+ M 01_REPO/tradingagents-main/tradingagents/dataflows/interface.py
+ M 01_REPO/tradingagents-main/tradingagents/default_config.py
+ M 01_REPO/tradingagents-main/tradingagents/evals/agent_intelligence_brain.py
+ M 01_REPO/tradingagents-main/tradingagents/evals/automation_health_audit.py
+ M 01_REPO/tradingagents-main/tradingagents/evals/automation_memory_rollup.py
+ M 01_REPO/tradingagents-main/tradingagents/evals/email_clarity.py
+ M 01_REPO/tradingagents-main/tradingagents/evals/execution_board.py
+ M 01_REPO/tradingagents-main/tradingagents/orchestration/n8n_policy.py
+ M 01_REPO/tradingagents-main/tradingagents/orchestration/n8n_runner.py
+ M 01_REPO/tradingagents-main/tradingagents/policy/exit_policy.py
+ M 01_REPO/tradingagents-main/tradingagents/policy/live_gate.py
+ M 01_REPO/tradingagents-main/tradingagents/policy/promotion_sync.py
+ M 01_REPO/tradingagents-main/tradingagents/research/loss_review_evidence.py
+ M 01_REPO/tradingagents-main/tradingagents/research/release_calendar.py
+ M 04_SETUP/2026-07-12-mac-setup-status.md
+ M 04_SETUP/USER_INPUTS_AND_DEPENDENCIES.md
+ M 04_SETUP/check_setup_readiness.sh
+?? 01_REPO/tradingagents-main/docs/policy/manual-alpaca-nflx-sale-attestation-2026-07-27.md
+?? 01_REPO/tradingagents-main/docs/superpowers/plans/2026-07-18-agent-communication-and-strategy-learning.md
+?? 01_REPO/tradingagents-main/docs/superpowers/plans/2026-07-18-autonomous-control-and-recovery.md
+?? 01_REPO/tradingagents-main/docs/superpowers/plans/2026-07-18-autonomous-trading-firm-program.md
+?? 01_REPO/tradingagents-main/docs/superpowers/plans/2026-07-18-production-autonomous-firm-rollout.md
+?? 01_REPO/tradingagents-main/docs/superpowers/plans/2026-07-18-upstream-intelligence-hardening-sync.md
+?? 01_REPO/tradingagents-main/tests/test_policy_rule_approval_contract.py
+?? 01_REPO/tradingagents-main/tests/test_release_calendar.py
+?? TradingAgents_Autonomy_Catch_Up_2026-07-26.docx
+?? TradingAgents_Autonomy_Catch_Up_2026-07-26.pdf
+?? archive/
+!! .superpowers/
+!! 01_REPO/mirofish-main/.claude/
+!! 01_REPO/mirofish-main/.dev-server.err.log
+!! 01_REPO/mirofish-main/.dev-server.log
+!! 01_REPO/mirofish-main/.env
+!! 01_REPO/mirofish-main/backend/.pytest_cache/
+!! 01_REPO/mirofish-main/backend/.venv/
+!! 01_REPO/mirofish-main/backend/app/__pycache__/
+!! 01_REPO/mirofish-main/backend/app/api/__pycache__/
+!! 01_REPO/mirofish-main/backend/app/models/__pycache__/
+!! 01_REPO/mirofish-main/backend/app/services/__pycache__/
+!! 01_REPO/mirofish-main/backend/app/utils/__pycache__/
+!! 01_REPO/mirofish-main/backend/log/
+!! 01_REPO/mirofish-main/backend/logs/
+!! 01_REPO/mirofish-main/backend/scripts/__pycache__/
+!! 01_REPO/mirofish-main/backend/tests/__pycache__/
+!! 01_REPO/mirofish-main/backend/uploads/
+!! 01_REPO/mirofish-main/deliverables/tunnel/
+!! 01_REPO/mirofish-main/docs/mirror_fish/__pycache__/
+!! 01_REPO/mirofish-main/frontend/dist/
+!! 01_REPO/mirofish-main/frontend/node_modules/
+!! 01_REPO/mirofish-main/log/
+!! 01_REPO/mirofish-main/node_modules/
+!! 01_REPO/mirofish-main/runtime-logs/
+!! 01_REPO/tradingagents-fable/
+!! 01_REPO/tradingagents-main/.claude/
+!! 01_REPO/tradingagents-main/.codex/hooks/__pycache__/
+!! 01_REPO/tradingagents-main/.env
+!! 01_REPO/tradingagents-main/.mypy_cache/
+!! 01_REPO/tradingagents-main/.pytest_cache/
+!! 01_REPO/tradingagents-main/.ruff_cache/
+!! 01_REPO/tradingagents-main/.venv/
+!! 01_REPO/tradingagents-main/analysis_mypy.txt
+!! 01_REPO/tradingagents-main/cli/__pycache__/
+!! 01_REPO/tradingagents-main/config/n8n/
+!! 01_REPO/tradingagents-main/config/risk_envelope.yaml
+!! 01_REPO/tradingagents-main/reports/
+!! 01_REPO/tradingagents-main/results/
+!! 01_REPO/tradingagents-main/scripts/__pycache__/
+!! 01_REPO/tradingagents-main/setup_n8n.py
+!! 01_REPO/tradingagents-main/tests/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents.egg-info/
+!! 01_REPO/tradingagents-main/tradingagents/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/agents/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/agents/analysts/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/agents/managers/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/agents/researchers/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/agents/risk_mgmt/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/agents/trader/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/agents/utils/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/brokers/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/brokers/supervisor/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/dataflows/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/evals/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/execution/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/graph/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/llm_clients/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/notifications/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/orchestration/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/policy/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/research/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/schemas/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/sleeves/__pycache__/
+!! 01_REPO/tradingagents-main/tradingagents/storage/__pycache__/
+commit 21ccb286907b30d0e7f7d596b6361d04cb5015b5 (HEAD -> master)
+Author:     Corbin Floyd <nebulazer2003@gmail.com>
+AuthorDate: 2026-08-10 16:45:17 -0400
+Commit:     Corbin Floyd <nebulazer2003@gmail.com>
+CommitDate: 2026-08-10 16:45:17 -0400
+
+    docs: plan flat TradingAgents repository consolidation
++ codex/autonomous-trading-firm 6f8fa28 (/Users/corbinfloyd/.codex/worktrees/tradingagents-autonomous-firm) test: track bound raw HTTP mutation provenance
++ fable                         44074fe (/Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-fable) docs: document survivability/opsec/edge layer + commands in CLAUDE.md
+* master                        21ccb28 docs: plan flat TradingAgents repository consolidation
+worktree /Users/corbinfloyd/Documents/TradingAgents
+HEAD 21ccb286907b30d0e7f7d596b6361d04cb5015b5
+branch refs/heads/master
+
+worktree /Users/corbinfloyd/.codex/worktrees/tradingagents-autonomous-firm
+HEAD 6f8fa28025843fb87423c56716e8f77f741f0c67
+branch refs/heads/codex/autonomous-trading-firm
+
+worktree /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-fable
+HEAD 44074fee2eca65780d27e9e8a7fbf8d8251337bb
+branch refs/heads/fable
+
+96e18bffb92f19aeb967c1e13aa16fdbaea4509d refs/codex/turn-diffs/captures/1785219267129/5bda438d-9e7d-4f85-abc8-78f49ff2dae3/base
+96e18bffb92f19aeb967c1e13aa16fdbaea4509d refs/codex/turn-diffs/checkpoints/01c1e10eedb29a1458ec426bc2d5bedcbf840338def55cf3d763fd6ea786bb9a/b3c448d81c8fe06336cf13be6b7a0aac6fa8b1f67c23895d971705bb2b4d7453/1785217349554/b9572500-1e83-4c61-8141-4c91dc27ac6a
+96e18bffb92f19aeb967c1e13aa16fdbaea4509d refs/codex/turn-diffs/checkpoints/286a05265ee01fb64c930fc1be62f10e1ff010ef8c6ae10458c69b35610d3fbe/f1e856f8ce6c8b4783c93d27d03e40f7415f624be9432498186dc1e27df59048/1785289836088/76f716a4-3db4-44e3-81c4-26ddd9ca2dc2
+6f8fa28025843fb87423c56716e8f77f741f0c67 refs/heads/codex/autonomous-trading-firm
+44074fee2eca65780d27e9e8a7fbf8d8251337bb refs/heads/fable
+21ccb286907b30d0e7f7d596b6361d04cb5015b5 refs/heads/master
+2	128
+2	10

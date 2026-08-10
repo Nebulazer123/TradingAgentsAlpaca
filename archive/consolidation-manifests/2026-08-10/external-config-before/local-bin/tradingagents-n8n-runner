@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep unrelated shell/Codex credentials out of the local observer bridge.
+exec env -i \
+  HOME=/Users/corbinfloyd \
+  PATH=/Users/corbinfloyd/.local/bin:/opt/homebrew/bin:/usr/bin:/bin \
+  LANG=en_US.UTF-8 \
+  LC_ALL=en_US.UTF-8 \
+  PYTHONUNBUFFERED=1 \
+  /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main/.venv/bin/python \
+  -m tradingagents.orchestration.n8n_runner \
+  --serve \
+  --host 127.0.0.1 \
+  --port 8765

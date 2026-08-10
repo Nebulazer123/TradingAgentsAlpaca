@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-automation-wake-controller"
+kind = "cron"
+name = "TradingAgents automation wake controller"
+prompt = "Manage TradingAgents automation statuses before the market-day jobs begin. This is a low-cost status controller, not a trading or repair task.\n\nWork from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. Inspect /Users/corbinfloyd/.codex/automations/tradingagents-*/automation.toml first. Use the Codex automation update capability for status changes when available; if it is unavailable, make only the equivalent minimal status-line edit and verify every changed TOML by rereading it.\n\nProtected controllers that must remain ACTIVE and must never modify each other:\n- tradingagents-automation-wake-controller\n- tradingagents-automation-sleep-controller\n\nMarket-day group managed by this controller:\n- tradingagents-autonomous-execution-board\n- tradingagents-autonomous-safety-sentinel\n- tradingagents-autonomous-self-healer\n- tradingagents-daily-report\n- tradingagents-market-supervisor\n- tradingagents-paper-tournament\n- tradingagents-preopen-validation\n\nOvernight group:\n- tradingagents-overnight-research\n\nDecision process:\n1. Determine whether today in America/Chicago is a regular U.S. equities trading day. Prefer the read-only Alpaca market calendar/clock; a weekday check is only a fallback if calendar access is unavailable.\n2. On a trading day, set every existing market-day automation ACTIVE and set overnight research PAUSED after its overnight window.\n3. On a non-trading day, set every existing market-day automation PAUSED and keep overnight research PAUSED.\n4. Preserve every managed automation's prompt, schedule, model, reasoning effort, target, execution environment, and cwd. Change status only.\n5. Report unknown TradingAgents automation IDs but do not change them.\n6. Run `.venv/bin/python -m cli.main research controller-patrol --automation-id tradingagents-automation-wake-controller --json-output` after status work when the command is available.\n\nHard boundaries: never submit, cancel, amend, reconcile, or duplicate orders; never run an order-capable supervisor command; never change strategy, risk, promotion, credentials, repo code, or results/policy/live_control.json; never re-arm or unfreeze trading. End with one concise note containing the calendar decision, statuses changed, unchanged count, unknown IDs, blockers, and patrol packet path."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=7;BYMINUTE=45;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784218322000
+updated_at = 1785434381175

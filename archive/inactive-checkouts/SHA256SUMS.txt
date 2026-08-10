@@ -1,0 +1,4 @@
+9aebb758743bc4f491fedf23329ac3a783dff595fff6c5e36408e2c4a602775b  tradingagents-autonomous-firm-2026-08-10.tar.gz
+e2617ff08ca233ed390fe93712434f58703075adb955fa741312839c8444187b  tradingagents-fable-2026-08-10.tar.gz
+dc6f73c0d924760a72d5522d611744c62d46d90c2c7bd820fd1501c1c233b360  TradingAgentsAlpaca-public-2026-08-10.tar.gz
+5e6ae259308bc01e1d03909dbd517168ad1a49b040eccf574bcc33e8031f09bb  TradingAgentsAlpaca-public-2026-08-10.bundle

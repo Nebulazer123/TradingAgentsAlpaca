@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-paper-tournament"
+kind = "cron"
+name = "TradingAgents paper tournament"
+prompt = "Run the paper-only strategy tournament from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. Do not edit code/config, promote a strategy, arm live trading, or submit live orders. Run `/bin/zsh scripts/mac/ta_job.sh tournament` from the production repo. Read the newest tournament packet and report leader, rankings, candidate status, tracked window, submissions to paper only, issues, and packet path."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=10;BYMINUTE=5;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-luna"
+reasoning_effort = "high"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "project", project_id = "local-ff251fa82e4af49ee0cc0bfe9a35ec11" }
+cwds = ["/Users/corbinfloyd/Documents/TradingAgents"]
+created_at = 1784078225891
+updated_at = 1785434387338

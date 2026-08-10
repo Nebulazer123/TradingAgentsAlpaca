@@ -1,0 +1,15 @@
+version = 1
+id = "tradingagents-autonomous-self-healer"
+kind = "cron"
+name = "TradingAgents autonomous self-healer"
+prompt = "Own the autonomous TradingAgents resilience and recovery plane from /Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main. This is a 24/7 doomsday-capable operational task. Use gpt-5.6-sol reasoning to investigate failures independently; do not wait for a person when a safe repair can be verified.\n\nSafety authority:\n- Never submit, cancel, amend, or duplicate broker orders.\n- Never refresh/re-arm/unfreeze results/policy/live_control.json, change strategy/risk/promotion settings, expose credentials, or bypass live guards.\n- If broker state, open-order reconciliation, scheduler integrity, or the live-control file is missing/corrupt/unverifiable, immediately fail closed with `.venv/bin/python -m cli.main policy freeze-live --reason \"<specific evidence-backed integrity failure>\" --json-output`, then report the freeze and evidence.\n- Otherwise, safe repair authority covers local observer infrastructure and non-trading code/config only: diagnose, restart failed local services, clear a demonstrably stale lock only after proving no owner process exists, repair a verified defect, and run proportionate tests before relying on a repair. Preserve fail-closed behavior.\n\nEvery run:\n1. Inspect every TradingAgents Codex automation TOML in /Users/corbinfloyd/.codex/automations/tradingagents-*/automation.toml; confirm ACTIVE state and intended roles. Do not treat legacy Windows scheduler identifiers as the current authority.\n2. Read live_control.json; run `.venv/bin/python -m cli.main alpaca check`; check the localhost n8n runner and n8n health endpoints; inspect current job locks and latest supervisor/BOARD/self-heal packets.\n3. Run `.venv/bin/python -m cli.main research self-heal-handoff --json-output` and `.venv/bin/python -m cli.main research self-heal-plan --execute-safe --json-output`, then `.venv/bin/python scripts/automation_context_snapshot.py --write`.\n4. When a safe repair is possible, execute it, verify it, and record exact evidence. If escalation is required, freeze live only if the defined safety-integrity condition applies; otherwise leave trading gates untouched and report the escalation.\n5. End with a concise status: healthy/repaired/escalated/frozen, actions taken, services verified, and packet/log paths.\n\nDo not do routine product work or broaden trading behavior. This task is the autonomous reliability owner."
+status = "PAUSED"
+rrule = "RRULE:FREQ=WEEKLY;BYHOUR=8,10,12,14,16;BYMINUTE=03;BYDAY=MO,TU,WE,TH,FR"
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
+notification_policy = "failed_runs_only"
+execution_environment = "local"
+target = { type = "projectless" }
+cwds = ["~"]
+created_at = 1784100798078
+updated_at = 1785434371670

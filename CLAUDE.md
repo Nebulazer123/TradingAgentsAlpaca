@@ -73,7 +73,7 @@ guardrail validation → go-live guard → (only then) limit orders.
 
 ## 3. Operating model on this Mac
 
-- Repo: `/Users/corbinfloyd/Documents/TradingAgents/01_REPO/tradingagents-main`
+- Repo: `/Users/corbinfloyd/Documents/TradingAgents`
   (branch `master`; dev worktree `../tradingagents-fable`, branch `fable`).
 - Python: `.venv` (3.13, uv-managed). Tests: `.venv/bin/python -m pytest tests/ -q`.
 - Credentials: `.env` (owner-only, gitignored) — Alpaca paper+live and OpenRouter.
