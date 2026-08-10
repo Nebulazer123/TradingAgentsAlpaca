@@ -1,75 +1,120 @@
-# TradingAgents Codex Start Here
+# TradingAgents Agent Guide
 
-This repo is a recurring TradingAgents/Alpaca automation workspace. Future Codex
-sessions should avoid rediscovering the whole repo.
+## Canonical Workspace
 
-## Fast Orientation
+The canonical repository and working directory is:
 
-1. Read `CONTEXT_ROUTER.md` first.
-2. Run `python scripts/automation_context_snapshot.py --write` to refresh
-   `results/_context/`, then read `results/_context/latest-summary.json` and
-   `results/_context/latest-flags.json`.
-3. Inspect only the source files named by the relevant automation route.
-4. Prefer the repo executable on Windows:
-   `.\.venv\Scripts\tradingagents.exe`.
+`/Users/corbinfloyd/Documents/TradingAgents`
 
-## Hook And Control-Plane POC
+Start every TradingAgents Codex chat from this directory. The Python application,
+Git history, local environment, runtime evidence, documentation, and recovery
+archives all live beneath this root.
 
-- Repo-local Codex hooks live under `.codex/hooks/`. They refresh compact
-  context and write small redacted event packets only; they must not trade,
-  approve, promote, cancel, or read secrets.
-- Hook event packets go under `results/_context/hook-events/`. The latest hook
-  event is summarized in compact context with event, goal, and subagent metadata
-  only; do not paste full hook payloads into chat unless debugging that hook.
-- Goal/subagent state and output rules live in
-  `docs/orchestration/goal-agent-context-contract.md`; hooks write context
-  packets only and must not create, complete, block, or rewrite goals.
-- n8n must use the allowlisted local runner only:
-  `python -m tradingagents.orchestration.n8n_runner --run-job context_snapshot`.
-  Do not give n8n arbitrary shell commands or direct Alpaca credentials.
-- Supervisor/control-plane error self-heal uses compact handoff packets:
-  `python -m cli.main research self-heal-handoff --json-output`. This writes
-  `results/self_heal/latest.json` and `latest-prompt.txt` for a fresh Codex
-  repair chat. Hooks and n8n may create/read this handoff, but they must not
-  trade, send email, mutate goals, or edit repo files by themselves.
+## Session Start
 
-## Context Budget Rules
+1. Run `pwd` and `git status --short --branch`.
+2. Read `START_HERE.md` and the current section of `CONTEXT_ROUTER.md`.
+3. Refresh compact context with `.venv/bin/python scripts/automation_context_snapshot.py --write`.
+4. Read `results/_context/latest-summary.json` and `results/_context/latest-flags.json`.
+5. Open the raw packet named by compact context when a flag calls for detail.
 
-- Do not read whole `results/` packets unless investigating that exact run.
-- Start from `latest.json` and the snapshot helper, then open timestamped packets
-  only when the summary shows a blocker, submission, changed candidate, or stale
-  validation.
-- For goals, subagents, hooks, n8n, and automations, the default route is
-  `results/_context/` first and raw packets only when `latest-flags.json` says
-  why.
-- For market-readiness work, the operational tracker is
-  `docs/superpowers/plans/2026-06-08-market-readiness-execution-board.md`.
-  Before editing, name the board ID being worked. After completing a slice,
-  update that checkbox with the date, packet/test evidence, and exact
-  verification command. Do not create duplicate trackers, and do not repeat a
-  completed item unless fresh evidence proves a regression.
-- Before any market-readiness final close-out, complete board item `P0-13`:
-  reconcile `docs/superpowers/plans/2026-06-08-finish-overnight-research-control-plane.md`,
-  `reports/market_readiness/market-readiness-goal-assessment-20260608.md`,
-  and `reports/market_readiness/market-readiness-goal-assessment-20260608.json`
-  into the board. No P0/P1 requirement from those files may remain only in a
-  superseded plan or assessment.
-- Do not read `uv.lock`, `.venv/`, images, caches, or `__pycache__/` during repo
-  orientation.
-- Keep chat updates short. Put durable detail in files or result packets.
-- For order-affecting paths, keep the known gate: `alpaca check` first, then
-  dry-run, then submit only if clean and actionable.
+`results/_context/` is the fast index to runtime state. Timestamped files under
+`results/` are the supporting evidence.
 
-## Core Files
+## Repository Map
 
-- CLI entrypoints: `cli/main.py`
-- Live/hourly/daily/premarket logic: `tradingagents/brokers/alpaca_supervisor.py`
-- Paper tournament logic: `tradingagents/brokers/paper_tournament.py`
-- Broker execution/safety: `tradingagents/brokers/alpaca.py`
-- Main automation router: `CONTEXT_ROUTER.md`
+| Area | Purpose |
+| --- | --- |
+| `cli/main.py` | Typer command surface for Alpaca, research, evaluation, and operations |
+| `tradingagents/agents/` | Analyst, researcher, trader, and risk-role implementations |
+| `tradingagents/graph/` | LangGraph workflow construction and propagation |
+| `tradingagents/brokers/` | Alpaca integration, supervisor decisions, and paper tournament |
+| `tradingagents/policy/` | Live control, approval records, risk posture, gates, and policy packets |
+| `tradingagents/execution/` | Execution locks, clocks, reconciliation, and submit coordination |
+| `tradingagents/research/` | Provider orchestration, evidence packets, crawlers, and research workflows |
+| `tradingagents/orchestration/` | n8n runner, job policy, context control, and automation plumbing |
+| `tradingagents/dataflows/` | Market, fundamentals, news, social, and vendor data routes |
+| `tradingagents/evals/` | Decision quality, telemetry, calibration, and evaluation datasets |
+| `tests/` | Unit and integration coverage organized by subsystem |
+| `scripts/mac/` | Mac launchd jobs, runner wrappers, and outbox delivery |
+| `config/` | Versioned examples, allowlists, schedules, and local runtime configuration |
+| `results/` | Generated runtime packets, compact context, logs, locks, and evidence |
+| `docs/` | Architecture, policy, orchestration, plans, and project history |
+| `archive/` | Recovery manifests, inactive checkout archives, and Windows transfer history |
 
-## Reporting Contract
+The detailed map and consolidation record live in
+`docs/consolidation/REPOSITORY_MAP.md` and
+`docs/consolidation/CONSOLIDATION_REPORT.md`.
 
-Final chat reports should usually include only: what ran or changed, packet paths,
-status, blockers/submissions, validation command, and next inspection point. Save
-long evidence in repo files or existing result folders.
+## Task Routing
+
+- CLI behavior starts at `cli/main.py`, then follows the called subsystem and
+  its matching `tests/test_*_cli.py` coverage.
+- Trading decisions start at `tradingagents/brokers/alpaca_supervisor.py` and
+  continue through `tradingagents/policy/` and `tradingagents/execution/`.
+- Research behavior starts at `tradingagents/research/provider_orchestrator.py`,
+  `tradingagents/research/automation_orchestrator.py`, and the relevant dataflow.
+- Agent workflow changes start at `tradingagents/graph/trading_graph.py` and the
+  matching role implementation under `tradingagents/agents/`.
+- n8n jobs start at `tradingagents/orchestration/n8n_runner.py` and
+  `config/n8n_tradingagents_allowlist.json`.
+- Runtime investigations start with compact context, then the named raw packet,
+  broker history, active process state, and current configuration.
+
+For code relationships, use the indexed canonical project in codebase-memory,
+then confirm exact behavior in source and focused tests. For prose, configuration,
+logs, JSON packets, and exact strings, use direct reads and `rg`.
+
+## Mac Commands
+
+```zsh
+cd /Users/corbinfloyd/Documents/TradingAgents
+.venv/bin/python -m cli.main --help
+.venv/bin/python -m cli.main alpaca --help
+.venv/bin/python scripts/automation_context_snapshot.py --write
+.venv/bin/python -m pytest -q
+.venv/bin/ruff check cli tradingagents scripts tests
+```
+
+The local n8n runner listens on `127.0.0.1:8765`. Its launchd configuration and
+wrapper point to this repository root. Mac scheduled jobs use
+`scripts/mac/ta_job.sh`; installation lives in `scripts/mac/install_launchd.sh`.
+
+## Configuration and Evidence
+
+Local credentials live in `.env` with mode `0600`. Local risk configuration may
+live in ignored configuration files. Versioned example files describe expected
+shape. Current operational state comes from the live files on disk, active
+process state, broker order history, and newest result packets.
+
+`results/policy/live_control.json` records the current live-control posture.
+Submission authority is established by the complete current policy and execution
+path at call time. Analysis packets, historical statuses, and documentation
+provide context for that evaluation.
+
+## Change and Verification Practice
+
+Match each change with focused tests for the affected subsystem. Shared policy,
+execution, broker, packet-schema, and automation changes also receive broad test
+and static-analysis coverage. Refresh compact context after changes that alter
+generated packets. Re-index the canonical repository after substantial source
+changes so architecture queries reflect the checkout.
+
+Keep source, tests, and durable documentation in Git. Keep generated results,
+credentials, environments, caches, and recovery archives in their established
+ignored locations. Record important verification commands and outcomes in the
+relevant report or plan.
+
+## History and Recovery
+
+The canonical `master` branch contains the consolidated active implementation.
+Former development lines remain available as Git branches. Complete recovery
+archives for retired checkouts and the imported public clone live under
+`archive/inactive-checkouts/`. Windows transfer material lives under
+`archive/windows-transfer-2026-07-11/`.
+
+## Completion Handoff
+
+Report the result, changed paths, verification evidence, current runtime posture,
+and the next useful starting file. Use exact absolute paths for workspace handoff
+and relative paths for files inside this repository.

@@ -1,5 +1,10 @@
 # n8n Setup for TradingAgents
 
+> **Current Mac root:** `/Users/corbinfloyd/Documents/TradingAgents`. The local
+> runner uses `.venv/bin/python -m tradingagents.orchestration.n8n_runner` and
+> serves `http://127.0.0.1:8765/health`. Windows examples below remain as
+> historical setup reference.
+
 ## Status
 
 ✓ n8n is running in Docker at `http://localhost:5678`

@@ -1,0 +1,13 @@
+Removed on 2026-08-10 after exact path, realpath, directory type, symlink, and empty-content verification.
+
+/Users/corbinfloyd/Documents/Codex/2026-07-28/own-the-autonomous-tradingagents-resilience-and
+/Users/corbinfloyd/Documents/Codex/2026-07-28/own-the-autonomous-tradingagents-resilience-and-2
+/Users/corbinfloyd/Documents/Codex/2026-07-28/own-the-autonomous-tradingagents-resilience-and-3
+/Users/corbinfloyd/Documents/Codex/2026-07-28/own-the-autonomous-tradingagents-resilience-and-4
+/Users/corbinfloyd/Documents/Codex/2026-07-29/own-the-autonomous-tradingagents-resilience-and
+/Users/corbinfloyd/Documents/Codex/2026-07-29/own-the-autonomous-tradingagents-resilience-and-2
+/Users/corbinfloyd/Documents/Codex/2026-07-30/own-the-autonomous-tradingagents-resilience-and
+/Users/corbinfloyd/Documents/Codex/2026-07-30/own-the-autonomous-tradingagents-resilience-and-2
+
+Each shell contained exactly two empty child directories named work and outputs.
+The cleanup removed 8 task shells and 16 empty child directories.

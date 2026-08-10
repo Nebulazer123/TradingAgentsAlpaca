@@ -1,5 +1,10 @@
 # CLAUDE.md — TradingAgents System Map & Operating Model
 
+> **Workspace update (2026-08-10):** The canonical repository and runnable Mac
+> root is `/Users/corbinfloyd/Documents/TradingAgents`. `START_HERE.md` and
+> `AGENTS.md` are the current entry documents. Former sibling worktrees and the
+> imported Windows layout are preserved under `archive/`.
+
 Last full audit: **2026-07-14** (Claude Fable 5; Codex pickup 2026-07-15:
 Codex scheduling active, NFLX exit path re-verified, notification-symbol bug fixed,
 n8n observer stack healthy).

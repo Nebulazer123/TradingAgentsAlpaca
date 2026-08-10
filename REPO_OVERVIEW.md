@@ -1,5 +1,10 @@
 # TradingAgents Repo Overview
 
+> **Current workspace:** `/Users/corbinfloyd/Documents/TradingAgents`. For the
+> consolidated Mac repository map and current commands, begin with
+> `START_HERE.md` and `docs/consolidation/REPOSITORY_MAP.md`. Windows examples
+> below are retained for historical and cross-platform context.
+
 This repository is a Python package and CLI for running multi-agent financial analysis, then optionally using that analysis to drive tightly controlled Alpaca paper/live-mirror workflows. It started as the TradingAgents multi-agent LLM framework and this checkout adds a practical trading-automation layer around Alpaca supervision, overnight planning, premarket briefs, paper strategy tournaments, and daily reports.
 
 The project is research and automation infrastructure, not financial advice. The Alpaca paths include explicit dry-run, paper-only, analysis-only, cap, and validation gates because the code can interact with brokerage APIs when enabled.

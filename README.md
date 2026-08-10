@@ -2,6 +2,12 @@
   <img src="assets/TauricResearch.png" style="width: 60%; height: auto;">
 </p>
 
+> **Canonical Mac workspace:** `/Users/corbinfloyd/Documents/TradingAgents`
+>
+> Start a new Codex chat here and read `START_HERE.md`. Current Mac commands use
+> `.venv/bin/python -m cli.main`; Windows paths elsewhere in this document are
+> retained as historical or cross-platform examples.
+
 <div align="center" style="line-height: 1;">
   <a href="https://arxiv.org/abs/2412.20138" target="_blank"><img alt="arXiv" src="https://img.shields.io/badge/arXiv-2412.20138-B31B1B?logo=arxiv"/></a>
   <a href="https://discord.com/invite/hk9PGKShPK" target="_blank"><img alt="Discord" src="https://img.shields.io/badge/Discord-TradingResearch-7289da?logo=discord&logoColor=white&color=7289da"/></a>

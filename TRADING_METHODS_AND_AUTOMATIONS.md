@@ -1,5 +1,11 @@
 # TradingAgents Methods and Automations
 
+> **Current workspace:** `/Users/corbinfloyd/Documents/TradingAgents`. Mac jobs
+> are defined in `scripts/mac/ta_job.sh` and installed through
+> `scripts/mac/install_launchd.sh`. The dated Windows automation material below
+> is retained as history; current automation state comes from the active Mac
+> launchd jobs and the current Codex automation definitions.
+
 Generated for the local TradingAgents checkout at:
 
 `C:\Users\Corbin\Documents\Coding projects\TradingAgents-main`
