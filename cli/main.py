@@ -131,6 +131,10 @@ from tradingagents.brokers.supervisor.daily_report import (
     compact_supervisor_daily_report_payload,
     write_supervisor_daily_report_packet,
 )
+from tradingagents.dataflows.alpaca_reference import (
+    build_alpaca_reference_audit,
+    load_alpaca_reference_catalog,
+)
 from tradingagents.dataflows.integration_registry import build_integration_registry_report
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evals.agent_intelligence_brain import (
@@ -11428,6 +11432,11 @@ def alpaca_supervisor_daily_report(
         "--execution-board-dir",
         help="Directory containing latest BOARD execution review packets.",
     ),
+    alpaca_reference_dir: Path = typer.Option(
+        Path("results/alpaca_reference"),
+        "--alpaca-reference-dir",
+        help="Directory containing the latest read-only Alpaca reference audit.",
+    ),
     email_to: str = typer.Option(
         "nebulazer2003@gmail.com",
         "--email-to",
@@ -11491,6 +11500,9 @@ def alpaca_supervisor_daily_report(
     model_telemetry_report = _read_json_packet(model_telemetry_report_path)
     execution_board_review_path = execution_board_dir / "latest.json"
     execution_board_review = _read_json_packet(execution_board_review_path)
+    alpaca_reference_summary = _read_json_packet(
+        alpaca_reference_dir / "latest-summary.json"
+    )
     payload = build_supervisor_daily_report_payload(
         portfolio=portfolio,
         packets=packets,
@@ -11501,6 +11513,7 @@ def alpaca_supervisor_daily_report(
         premarket_brief_path=premarket_brief_path,
         model_telemetry_report=model_telemetry_report,
         execution_board_review=execution_board_review,
+        alpaca_reference_summary=alpaca_reference_summary,
     )
     from tradingagents.notifications.outbox import write_outbox_message
 
@@ -11515,6 +11528,37 @@ def alpaca_supervisor_daily_report(
             typer.echo(json.dumps(payload, indent=2))
         return
     typer.echo(str(payload.get("body") or ""))
+
+
+@alpaca_app.command("reference-snapshot")
+def alpaca_reference_snapshot(
+    catalog_path: Path = typer.Option(
+        Path("config/alpaca_api_reference_catalog.json"),
+        "--catalog-path",
+        help="Versioned Alpaca API reference catalog.",
+    ),
+    output_dir: Path = typer.Option(
+        Path("results/alpaca_reference"),
+        "--output-dir",
+        help="Directory for local read-only reference audit packets.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Write a complete local Alpaca reference audit without API mutations."""
+
+    audit = build_alpaca_reference_audit(load_alpaca_reference_catalog(catalog_path))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = str(audit["generated_at"]).replace(":", "").replace("+", "-")
+    packet_path = output_dir / f"alpaca-reference-audit-{stamp}.json"
+    audit["packet_path"] = str(packet_path)
+    text = json.dumps(audit, indent=2)
+    _atomic_write_text(packet_path, text)
+    _atomic_write_text(output_dir / "latest.json", text)
+    _atomic_write_text(output_dir / "latest-summary.json", text)
+    if json_output:
+        typer.echo(text)
+        return
+    typer.echo(str(packet_path))
 
 
 @alpaca_app.command("compact-output-audit")

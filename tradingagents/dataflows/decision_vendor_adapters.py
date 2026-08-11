@@ -21,6 +21,7 @@ from tradingagents.schemas.research import SourceEvidencePacket
 
 from ._official_common import SECRET_PARAM_NAMES, OfficialDataError
 from .alpaca_news import fetch_alpaca_news
+from .alpaca_reference import fetch_alpaca_reference
 from .bea import fetch_bea_data
 from .bls import fetch_bls_timeseries
 from .eia import fetch_eia_route
@@ -71,6 +72,16 @@ def _render_packet(packet: SourceEvidencePacket, *, title: str | None = None) ->
         f"Source refs:\n{refs}\n\n"
         f"Payload preview:\n{_packet_payload_preview(packet)}"
     )
+
+
+def get_alpaca_reference_context(
+    route_id: str,
+    params: dict[str, Any] | None = None,
+) -> str:
+    """Render one explicit read-only Alpaca reference route for analyst context."""
+
+    packet = fetch_alpaca_reference(route_id, params)
+    return _render_packet(packet, title=f"Alpaca reference {route_id}")
 
 
 AS_OF_DATE_FIELDS = (

@@ -599,12 +599,12 @@ def build_hourly_evidence(
         {
             "category": "market_structure",
             "summary": (
-                "June 4 2026 intraday-margin regime: ignore old PDT day-count, "
-                "$25k PDT minimum, and old day-trading-buying-power gates; keep "
-                "broker buying power, account status, margin context, and fresh "
-                "validation."
+                "FINRA intraday-margin reform is approved but its effective date or "
+                "account-specific broker adoption is not established here. Preserve "
+                "current account restrictions until fresh broker evidence proves the "
+                "new regime applies; always keep buying-power and margin validation."
             ),
-            "source": "alpaca/finra intraday margin policy",
+            "source": "SEC 34-105226 / FINRA SR-FINRA-2025-017 / Alpaca transition guide",
         },
     ]
     evidence = {

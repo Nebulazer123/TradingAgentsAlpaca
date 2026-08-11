@@ -21,11 +21,15 @@ and $50 per-name cap re-armed, and the live-control dead-man is lapsed until the
 operator intentionally refreshes it. The repo still supports
 `autonomous_uncapped` as an explicit optional mode, where broker buying power,
 promotion, reconciliation, stock-only, limit-only, live-control, loss-review,
-and optional hard-ceiling/rate-limit gates still apply. The repo is wired for the June 4, 2026
-intraday-margin regime: old PDT day-count, old `$25k` PDT minimum, PDT
-designation, and old day-trading-buying-power logic are not bot blockers anymore;
-broker buying power, account status, intraday-margin context, and fresh
-validation still matter.
+and optional hard-ceiling/rate-limit gates still apply. FINRA's intraday-margin
+reform is approved but has no effective date established by the cited SEC order;
+the runtime preserves current account restrictions unless fresh broker/account
+evidence proves adoption. Broker buying power, account status, margin context,
+and fresh validation still matter.
+
+> **Correction (2026-08-11):** Any later historical scoreboard text that calls
+> June 4 a universally active rule is superseded by
+> `docs/regulatory/INTRADAY_MARGIN_CORRECTION_2026-08-11.md`.
 
 | Status | Meaning |
 | --- | --- |

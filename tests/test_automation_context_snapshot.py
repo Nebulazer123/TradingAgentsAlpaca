@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 
@@ -12,6 +14,19 @@ def _load_snapshot_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_snapshot_script_runs_directly_from_canonical_root():
+    result = subprocess.run(
+        [sys.executable, "scripts/automation_context_snapshot.py", "--help"],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout.lower()
 
 
 def test_overnight_summary_exposes_original_graph_tickers(tmp_path):

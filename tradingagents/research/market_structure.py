@@ -8,9 +8,16 @@ from typing import Any
 from tradingagents.dataflows._official_common import evidence_packet, request_hash
 
 UTC = datetime.timezone.utc
-PDT_REFORM_EFFECTIVE_AT = datetime.datetime(2026, 6, 4, tzinfo=UTC)
-ALPACA_INTRADAY_MARGIN_DOC = "https://docs.alpaca.markets/docs/the-intraday-margin-rule"
-FINRA_INTRADAY_MARGIN_NOTICE = "https://www.finra.org/rules-guidance/notices/25-14"
+PDT_REFORM_APPROVED_AT = datetime.datetime(2026, 4, 14, tzinfo=UTC)
+REGULATORY_STATUS = "approved_pending_finra_notice_or_broker_adoption"
+ALPACA_INTRADAY_MARGIN_DOC = (
+    "https://docs.alpaca.markets/us/docs/"
+    "understanding-finras-new-intraday-margin-rule-and-the-end-of-pdt"
+)
+SEC_INTRADAY_MARGIN_ORDER = "https://www.sec.gov/files/rules/sro/finra/2026/34-105226.pdf"
+FINRA_INTRADAY_MARGIN_FILING = (
+    "https://www.finra.org/rules-guidance/rule-filings/sr-finra-2025-017"
+)
 FORBIDDEN_MARKET_STRUCTURE_EFFECTS = (
     "create_trade_intent",
     "size_position",
@@ -30,41 +37,56 @@ def _as_utc(value: datetime.datetime | None = None) -> datetime.datetime:
 def build_intraday_margin_market_structure_packet(
     *,
     now: datetime.datetime | None = None,
+    reform_active_for_account: bool | None = None,
+    adoption_evidence_source: str | None = None,
+    adoption_evidence_as_of: str | None = None,
 ) -> Any:
-    """Return an advisory packet for the June 2026 PDT-to-intraday-margin regime."""
+    """Return advisory context for the approved, not universally effective, reform."""
 
     reference_time = _as_utc(now)
-    reform_active = reference_time.date() >= PDT_REFORM_EFFECTIVE_AT.date()
-    transition_window = reference_time.date() <= datetime.date(2026, 7, 3)
+    if reform_active_for_account is not None and not adoption_evidence_source:
+        raise ValueError("account-specific reform status requires adoption_evidence_source")
+    adoption_state: bool | str = (
+        reform_active_for_account if reform_active_for_account is not None else "unknown"
+    )
+    reform_active = reform_active_for_account is True
     payload = {
         "policy": {
             "execution_authority": "none",
             "forbidden_effects": list(FORBIDDEN_MARKET_STRUCTURE_EFFECTS),
             "source_role": "market-structure context only",
         },
-        "effective_date": PDT_REFORM_EFFECTIVE_AT.date().isoformat(),
+        "regulatory_status": REGULATORY_STATUS,
+        "approval_date": PDT_REFORM_APPROVED_AT.date().isoformat(),
+        "effective_date": None,
         "reference_time": reference_time.isoformat(timespec="seconds"),
-        "reform_active": reform_active,
+        "reform_active_for_account": adoption_state,
+        "adoption_evidence_source": adoption_evidence_source,
+        "adoption_evidence_as_of": adoption_evidence_as_of,
         "rule_interpretation": {
-            "old_pdt_designation_removed": True,
-            "old_three_day_trades_in_five_business_days_counter_removed": True,
-            "old_25000_pdt_minimum_removed": True,
-            "old_day_trading_buying_power_logic_removed": True,
-            "new_framework": "intraday margin and risk monitoring",
+            "old_pdt_designation_removed": reform_active,
+            "old_three_day_trades_in_five_business_days_counter_removed": reform_active,
+            "old_25000_pdt_minimum_removed": reform_active,
+            "old_day_trading_buying_power_logic_removed": reform_active,
+            "new_framework": "approved intraday margin and risk monitoring transition",
+            "phase_in_may_vary_by_broker": True,
         },
         "planner_flags": {
-            "ignore_old_pdt_trade_count_gate": True,
-            "ignore_old_25000_pdt_minimum_gate": True,
+            "ignore_old_pdt_trade_count_gate": reform_active,
+            "ignore_old_25000_pdt_minimum_gate": reform_active,
             "requires_fresh_broker_buying_power_check": True,
             "requires_intraday_margin_context": True,
-            "market_structure_transition": transition_window,
-            "crowd_ai_bot_unpredictability": transition_window,
+            "market_structure_transition": True,
+            "crowd_ai_bot_unpredictability": reform_active,
             "prefer_buy_the_dip_over_chasing_green_spikes": True,
             "requires_fresh_post_spike_validation": True,
             "mirrorfish_society_reaction_required": True,
         },
         "mirrorfish_prompt_seed": {
-            "scenario": "Retail traders and AI trading bots get broader access to intraday trading after old PDT constraints are removed.",
+            "scenario": (
+                "FINRA's intraday-margin reform is approved but awaits an announced effective "
+                "date or account-specific broker adoption; model phased-transition behavior only."
+            ),
             "actors_to_include": [
                 "new retail day trader",
                 "AI-bot operator",
@@ -83,10 +105,11 @@ def build_intraday_margin_market_structure_packet(
         },
         "source_urls": [
             ALPACA_INTRADAY_MARGIN_DOC,
-            FINRA_INTRADAY_MARGIN_NOTICE,
+            SEC_INTRADAY_MARGIN_ORDER,
+            FINRA_INTRADAY_MARGIN_FILING,
         ],
     }
-    source_ref = "local://market_structure/intraday_margin_rule_2026-06-04"
+    source_ref = "local://market_structure/intraday_margin_rule_pending_adoption"
     return evidence_packet(
         source_name="market_structure_policy",
         evidence_type="intraday_margin_regime",
@@ -99,8 +122,9 @@ def build_intraday_margin_market_structure_packet(
         redaction_status="no_secrets_seen",
         freshness_extra={
             "read_only": True,
-            "effective_date": PDT_REFORM_EFFECTIVE_AT.date().isoformat(),
-            "reform_active": reform_active,
-            "transition_window": transition_window,
+            "regulatory_status": REGULATORY_STATUS,
+            "effective_date": None,
+            "reform_active_for_account": adoption_state,
+            "adoption_evidence_as_of": adoption_evidence_as_of,
         },
     )

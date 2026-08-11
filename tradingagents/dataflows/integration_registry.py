@@ -185,6 +185,18 @@ DEFAULT_INTEGRATIONS: list[dict[str, Any]] = [
         "fallback_behavior": "use_yfinance_intraday_when_missing_or_stale",
     },
     {
+        "name": "alpaca_reference",
+        "category": "market_and_account_reference",
+        "env_vars": ["ALPACA_PAPER_API_KEY", "ALPACA_PAPER_SECRET_KEY"],
+        "required_env_vars": ["ALPACA_PAPER_API_KEY", "ALPACA_PAPER_SECRET_KEY"],
+        "cost_tier": "connected_account",
+        "route": "dataflow:alpaca_reference",
+        "read_authority": "allowlisted_get_only",
+        "write_authority": "none",
+        "trading_authority": "none",
+        "fallback_behavior": "skip_route_and_preserve_current_account_restrictions",
+    },
+    {
         "name": "stockstats",
         "category": "technical_indicators",
         "env_vars": [],

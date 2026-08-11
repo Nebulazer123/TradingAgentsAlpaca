@@ -5,6 +5,27 @@ from tradingagents.dataflows._official_common import OfficialDataError
 from tradingagents.schemas.research import SourceEvidencePacket
 
 
+def test_alpaca_reference_adapter_renders_analysis_only_packet(monkeypatch):
+    monkeypatch.setattr(
+        adapters,
+        "fetch_alpaca_reference",
+        lambda route_id, params=None: SourceEvidencePacket(
+            source_name="alpaca_api_reference",
+            evidence_type="alpaca_reference_read",
+            subject=route_id,
+            source_refs=["https://paper-api.alpaca.markets/v2/clock"],
+            freshness={"execution_authority": "none"},
+            payload={"request_context": params or {}, "data": {"is_open": False}},
+            quality="high",
+        ),
+    )
+
+    rendered = adapters.get_alpaca_reference_context("trading.get.v2_clock")
+
+    assert "Execution authority: none" in rendered
+    assert "trading.get.v2_clock" in rendered
+
+
 def _packet(source_name: str, payload: dict) -> SourceEvidencePacket:
     return SourceEvidencePacket(
         source_name=source_name,

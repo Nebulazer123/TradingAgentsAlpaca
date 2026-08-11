@@ -43,6 +43,7 @@ from .alpha_vantage_common import AlphaVantageRateLimitError
 from .config import get_config
 from .decision_vendor_adapters import (
     get_alpaca_news_adapter,
+    get_alpaca_reference_context,
     get_bea_macro_context,
     get_bls_macro_context,
     get_eia_energy_macro_context,
@@ -149,6 +150,7 @@ TOOLS_CATEGORIES = {
             "get_earnings_calendar_context",
             "get_release_calendar_context",
             "get_supplemental_market_context",
+            "get_alpaca_reference_context",
         ],
     },
 }
@@ -166,6 +168,7 @@ VENDOR_LIST = [
     "eodhd",
     "sec",
     "alpaca_news",
+    "alpaca_reference",
     "fred",
     "bls",
     "bea",
@@ -367,6 +370,9 @@ VENDOR_METHODS = {
     },
     "get_supplemental_market_context": {
         "local": get_supplemental_market_context,
+    },
+    "get_alpaca_reference_context": {
+        "alpaca_reference": get_alpaca_reference_context,
     },
 }
 

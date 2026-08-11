@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,11 @@ from zoneinfo import ZoneInfo
 
 import tomllib
 
-from tradingagents.storage.json_cache import JsonFileCache
-
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from tradingagents.storage.json_cache import JsonFileCache  # noqa: E402
 
 
 def _default_automation_root() -> Path:

@@ -430,6 +430,7 @@ def build_supervisor_daily_report_payload(
     premarket_brief_path: Path | str | None = None,
     model_telemetry_report: Mapping | None = None,
     execution_board_review: Mapping | None = None,
+    alpaca_reference_summary: Mapping | None = None,
 ) -> dict:
     premarket_brief_path_text = (
         premarket_brief_path.as_posix()
@@ -460,6 +461,12 @@ def build_supervisor_daily_report_payload(
             )
     if daily_context_lines:
         body = "\n".join([body, "", *daily_context_lines])
+    if alpaca_reference_summary and alpaca_reference_summary.get("material"):
+        material_summary = str(
+            alpaca_reference_summary.get("material_summary") or ""
+        ).strip()
+        if material_summary:
+            body = "\n".join([body, "", material_summary])
 
     has_problem = any(
         packet.get("issues") or packet.get("decision") == "blocked"
@@ -491,6 +498,7 @@ def build_supervisor_daily_report_payload(
         "premarket_brief": premarket_brief,
         "model_telemetry_report": model_telemetry_report,
         "execution_board_review": execution_board_review,
+        "alpaca_reference_summary": dict(alpaca_reference_summary or {}),
         "premarket_brief_status": premarket_brief_validation,
         "premarket_brief_path": premarket_brief_path_text,
         "packet_count": len(packets),
@@ -545,6 +553,7 @@ def compact_supervisor_daily_report_payload(packet: Mapping, packet_path: Path |
     )
     model_telemetry = packet.get("model_telemetry_report") or {}
     execution_board = packet.get("execution_board_review") or {}
+    alpaca_reference = packet.get("alpaca_reference_summary") or {}
     top_candidate = (
         ranked_candidates[0]
         if isinstance(ranked_candidates, list) and ranked_candidates and isinstance(ranked_candidates[0], dict)
@@ -627,6 +636,31 @@ def compact_supervisor_daily_report_payload(packet: Mapping, packet_path: Path |
                 "generated_at": execution_board.get("generated_at") if isinstance(execution_board, dict) else None,
                 "can_submit_orders": execution_board.get("can_submit_orders") if isinstance(execution_board, dict) else None,
             },
+            "alpaca_reference": {
+                "status": alpaca_reference.get("status")
+                if isinstance(alpaca_reference, dict)
+                else None,
+                "material": alpaca_reference.get("material")
+                if isinstance(alpaca_reference, dict)
+                else None,
+                "path_count": alpaca_reference.get("path_count")
+                if isinstance(alpaca_reference, dict)
+                else None,
+                "operation_count": alpaca_reference.get("operation_count")
+                if isinstance(alpaca_reference, dict)
+                else None,
+                "method_counts": alpaca_reference.get("method_counts", {})
+                if isinstance(alpaca_reference, dict)
+                else {},
+                "route_statuses": alpaca_reference.get("route_statuses", {})
+                if isinstance(alpaca_reference, dict)
+                else {},
+                "execution_authority": alpaca_reference.get(
+                    "execution_authority", "none"
+                )
+                if isinstance(alpaca_reference, dict)
+                else "none",
+            },
         },
         "raw_field_groups": [
             "body",
@@ -635,6 +669,7 @@ def compact_supervisor_daily_report_payload(packet: Mapping, packet_path: Path |
             "premarket_brief",
             "model_telemetry_report",
             "execution_board_review",
+            "alpaca_reference_summary",
             "premarket_brief_status",
         ],
     }

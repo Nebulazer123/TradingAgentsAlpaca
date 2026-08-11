@@ -755,7 +755,7 @@ def test_overnight_research_context_threads_source_quality_into_provider_fallbac
     assert result.summary["execution_authority"] == "none"
 
 
-def test_intraday_margin_market_structure_packet_removes_old_pdt_gates():
+def test_intraday_margin_market_structure_packet_defaults_to_pending_adoption():
     packet = build_intraday_margin_market_structure_packet(
         now=datetime.datetime(2026, 6, 4, 15, 0, tzinfo=datetime.timezone.utc),
     )
@@ -764,18 +764,34 @@ def test_intraday_margin_market_structure_packet_removes_old_pdt_gates():
     rule = packet.payload["rule_interpretation"]
     assert packet.analysis_only is True
     assert packet.source_name == "market_structure_policy"
-    assert packet.payload["reform_active"] is True
-    assert flags["ignore_old_pdt_trade_count_gate"] is True
-    assert flags["ignore_old_25000_pdt_minimum_gate"] is True
+    assert packet.payload["regulatory_status"] == "approved_pending_finra_notice_or_broker_adoption"
+    assert packet.payload["reform_active_for_account"] == "unknown"
+    assert packet.payload["adoption_evidence_source"] is None
+    assert flags["ignore_old_pdt_trade_count_gate"] is False
+    assert flags["ignore_old_25000_pdt_minimum_gate"] is False
     assert flags["mirrorfish_society_reaction_required"] is True
-    assert rule["old_three_day_trades_in_five_business_days_counter_removed"] is True
-    assert rule["old_25000_pdt_minimum_removed"] is True
+    assert rule["old_three_day_trades_in_five_business_days_counter_removed"] is False
+    assert rule["old_25000_pdt_minimum_removed"] is False
     assert "submit_order" in packet.payload["policy"]["forbidden_effects"]
 
 
+def test_intraday_margin_market_structure_packet_requires_evidence_for_account_adoption():
+    with pytest.raises(ValueError, match="adoption_evidence_source"):
+        build_intraday_margin_market_structure_packet(reform_active_for_account=True)
+
+    packet = build_intraday_margin_market_structure_packet(
+        reform_active_for_account=True,
+        adoption_evidence_source="alpaca-paper:/v2/account",
+        adoption_evidence_as_of="2026-08-11T14:00:00+00:00",
+    )
+
+    assert packet.payload["reform_active_for_account"] is True
+    assert packet.payload["planner_flags"]["ignore_old_pdt_trade_count_gate"] is True
+    assert packet.payload["adoption_evidence_source"] == "alpaca-paper:/v2/account"
+
+
 def test_overnight_research_context_includes_market_structure_transition(tmp_path, monkeypatch):
-    # Pin the clock inside the June 2026 transition window; after 2026-07-03
-    # the packet correctly reports the transition flags as False.
+    # Pin the clock after approval; time alone must not activate account adoption.
     import datetime as _dt
 
     monkeypatch.setattr(
@@ -785,10 +801,10 @@ def test_overnight_research_context_includes_market_structure_transition(tmp_pat
     result = write_overnight_research_context(output_dir=tmp_path)
 
     market_structure = result.summary["watchlists"]["market_structure"]
-    assert market_structure["reform_active"] in {True, False}
-    assert market_structure["planner_flags"]["ignore_old_pdt_trade_count_gate"] is True
-    assert market_structure["planner_flags"]["crowd_ai_bot_unpredictability"] is True
-    assert market_structure["rule_interpretation"]["old_day_trading_buying_power_logic_removed"] is True
+    assert market_structure["reform_active_for_account"] == "unknown"
+    assert market_structure["planner_flags"]["ignore_old_pdt_trade_count_gate"] is False
+    assert market_structure["planner_flags"]["crowd_ai_bot_unpredictability"] is False
+    assert market_structure["rule_interpretation"]["old_day_trading_buying_power_logic_removed"] is False
     assert all(packet.analysis_only is True for packet in result.packets)
 
 

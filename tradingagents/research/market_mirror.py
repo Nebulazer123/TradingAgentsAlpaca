@@ -107,7 +107,7 @@ def build_market_mirror_panel(
             "open-position mention in social/crawler evidence",
             "overnight top-candidate status",
             "support/ATR depth changes",
-            "PDT reform / intraday margin transition crowding",
+            "approved-but-pending PDT reform / intraday margin phase-in crowding",
             "retail euphoria, panic, or AI-bot herding after sudden moves",
             "fresh macro or filing invalidator",
         ],

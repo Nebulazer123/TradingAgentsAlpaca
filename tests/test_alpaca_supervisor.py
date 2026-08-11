@@ -2321,6 +2321,13 @@ def test_daily_report_payload_builder_collects_context_lines():
             "violations": [{"kind": "late_chase"}],
             "warnings": [{"kind": "source_stale"}],
         },
+        alpaca_reference_summary={
+            "status": "warning",
+            "material": True,
+            "material_summary": "Alpaca reference: explicit IEX feed is current; calendar settlement fields are stale.",
+            "operation_count": 99,
+            "route_statuses": {"trading.get.v2_calendar": "stale"},
+        },
     )
 
     assert payload["subject"].startswith("Your trading update for ")
@@ -2332,6 +2339,17 @@ def test_daily_report_payload_builder_collects_context_lines():
     assert "Tomorrow's top stock to watch: XOM." in payload["body"]
     assert "path results" not in payload["body"]
     assert "Model telemetry" not in payload["body"]
+    assert "calendar settlement fields are stale" in payload["body"]
+    assert payload["alpaca_reference_summary"]["operation_count"] == 99
+
+    compact = supervisor_daily_report.compact_supervisor_daily_report_payload(
+        payload,
+        "results/daily_reports/example.json",
+    )
+    assert compact["context_summary"]["alpaca_reference"]["operation_count"] == 99
+    assert compact["context_summary"]["alpaca_reference"]["route_statuses"] == {
+        "trading.get.v2_calendar": "stale"
+    }
 
 
 def test_daily_digest_excludes_rejected_orders_from_spent_today():
@@ -2582,8 +2600,8 @@ def test_hourly_evidence_separates_baseline_from_delta(tmp_path):
         item for item in payload["evidence"]["delta"]
         if item["category"] == "market_structure"
     ][0]
-    assert "ignore old PDT day-count" in market_structure["summary"]
-    assert "broker buying power" in market_structure["summary"]
+    assert "effective date" in market_structure["summary"]
+    assert "Preserve current account restrictions" in market_structure["summary"]
 
 
 def test_premarket_brief_aggregates_timestamped_packets_and_writes_latest(tmp_path):

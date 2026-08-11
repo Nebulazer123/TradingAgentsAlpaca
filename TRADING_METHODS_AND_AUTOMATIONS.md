@@ -20,7 +20,7 @@ These automations are trading infrastructure, not financial advice. The system u
 - Supervisor automations run dry-run first and submit only when actions are valid and checks are clean.
 - Orders are stocks-only, limit-only, and constrained by the live gate, broker buying power, and risk-envelope safety checks.
 - No crypto, options, shorts, margin expansion, or market orders.
-- The repo is wired for the June 4, 2026 intraday-margin rule: old PDT day-count, old `$25,000` PDT minimum, PDT designation, and old day-trading-buying-power logic are not bot blockers anymore. Broker buying power, account status, intraday-margin context, and fresh validation still matter.
+- FINRA's intraday-margin reform was approved on April 14, 2026, but the SEC order requires a later FINRA notice to announce the effective date and permits phased implementation. Keep current account restrictions unless fresh broker/account evidence proves adoption; broker buying power, status, margin context, and validation always apply.
 - Overnight plans and premarket briefs are analysis-only.
 - Paper tournament work is paper-only and must never place live orders.
 - Routine quiet checks usually write local packets and do not send email.
@@ -91,9 +91,9 @@ The current integration plan is `docs/superpowers/plans/2026-06-03-plugin-method
 
 ### Market-Structure Transition Overlay
 
-**Purpose:** The June 4, 2026 shift from old PDT rules to intraday-margin/risk monitoring changes crowd behavior. More retail traders and AI-bot operators may be able to trade intraday, so the research side treats sudden spikes, squeezes, panic dips, and social hype as more unstable.
+**Purpose:** Model the approved but not universally effective shift from old PDT rules to intraday-margin/risk monitoring. A future broker phase-in may change retail and AI-bot behavior, so sudden spikes, squeezes, panic dips, and social hype remain research questions rather than assumed current facts.
 
-**Important behavior:** This overlay does not submit orders. It tells overnight research, premarket context, and market-mirror simulations to ignore old PDT blockers while watching for crowd/AI-bot overreaction. The trading side still requires broker buying power, fresh price/support checks, live gate approval, and limit-only orders.
+**Important behavior:** This overlay does not submit orders. It preserves current PDT/account restrictions by default and relaxes them only when fresh account-specific broker evidence proves adoption. Market-mirror simulations may study phase-in scenarios, while trading still requires broker buying power, fresh price/support checks, live gate approval, and limit-only orders.
 
 **MiroFish final advisory handoff:** `reports/mirofish/MIROFISH_FINAL_TRADINGAGENTS_HANDOFF.md` stores the accepted final `report_9c77ca2557ae` advisory handoff. It is valid as a research prior for the June 4-13 window only and must be refreshed around premarket, open, macro/rates windows, and broker/API status changes.
 

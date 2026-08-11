@@ -16,6 +16,7 @@ from ._official_common import (
 )
 
 ALPACA_LATEST_TRADES_URL = "https://data.alpaca.markets/v2/stocks/trades/latest"
+ALPACA_STOCK_FEEDS = {"sip", "iex", "delayed_sip", "boats", "overnight", "otc"}
 
 
 def _read_windows_user_env(name: str) -> str | None:
@@ -67,11 +68,17 @@ def fetch_alpaca_latest_trades(
     secret_key: str | None = None,
     environ: Mapping[str, str] | None = None,
     session: Any | None = None,
+    feed: str = "iex",
 ):
     """Fetch latest stock trades from Alpaca market data without broker authority."""
 
     tickers = _symbols(symbols)
-    params = {"symbols": ",".join(tickers)}
+    selected_feed = feed.strip().lower()
+    if selected_feed not in ALPACA_STOCK_FEEDS:
+        raise OfficialDataError(
+            f"Unsupported Alpaca stock feed {feed!r}; expected one of {sorted(ALPACA_STOCK_FEEDS)}"
+        )
+    params = {"symbols": ",".join(tickers), "feed": selected_feed}
     headers = _headers(api_key=api_key, secret_key=secret_key, environ=environ)
     payload = get_json(ALPACA_LATEST_TRADES_URL, params=params, headers=headers, session=session)
     as_of = extract_payload_timestamp(payload, ("t", "timestamp"))
@@ -81,7 +88,14 @@ def fetch_alpaca_latest_trades(
         subject=params["symbols"],
         symbol=tickers[0] if len(tickers) == 1 else None,
         source_ref=safe_source_ref(ALPACA_LATEST_TRADES_URL, params),
-        payload=payload,
+        payload={
+            "request_context": {"feed": selected_feed, "symbols": tickers},
+            "semantic_caveat": (
+                "Latest-trade results exclude trade conditions that do not update bar price "
+                "and are not a complete tape."
+            ),
+            "data": payload,
+        },
         quality="high",
         as_of=as_of,
         request_fingerprint=request_hash("GET", ALPACA_LATEST_TRADES_URL, params, None),
@@ -89,6 +103,7 @@ def fetch_alpaca_latest_trades(
         redaction_status="redacted",
         freshness_extra={
             "read_only": True,
+            "feed": selected_feed,
             "execution_authority": "none",
             "forbidden_effects": [
                 "create_trade_intent",

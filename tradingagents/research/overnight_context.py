@@ -537,7 +537,16 @@ def summarize_overnight_research_context(
             watchlists["market_structure"] = {
                 "evidence_type": packet.evidence_type,
                 "subject": packet.subject,
-                "reform_active": packet.payload.get("reform_active"),
+                "regulatory_status": packet.payload.get("regulatory_status"),
+                "reform_active_for_account": packet.payload.get(
+                    "reform_active_for_account"
+                ),
+                "adoption_evidence_source": packet.payload.get(
+                    "adoption_evidence_source"
+                ),
+                "adoption_evidence_as_of": packet.payload.get(
+                    "adoption_evidence_as_of"
+                ),
                 "effective_date": packet.payload.get("effective_date"),
                 "planner_flags": packet.payload.get("planner_flags", {}),
                 "rule_interpretation": packet.payload.get("rule_interpretation", {}),
