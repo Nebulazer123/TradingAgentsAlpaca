@@ -8,7 +8,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -31,7 +31,7 @@ _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,15}$")
 _DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
 _MAX_AGE = dt.timedelta(minutes=15)
-_QUALITIES = frozenset({"high", "medium"})
+_QUALITIES = frozenset({"high", "medium", "low"})
 _ADVERSE_NEWS_EVENTS = frozenset({"guidance_cut", "material_contract_loss", "regulatory_adverse_action", "thesis_invalidator"})
 _ADVERSE_FILING_EVENTS = frozenset({"guidance_cut", "earnings_miss", "material_impairment", "adverse_filing_disclosure"})
 AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS = frozenset(
@@ -470,6 +470,8 @@ def _source_payload(raw: Mapping[str, Any], source: BoundSourceEvidence) -> Mapp
 
 
 def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str, Any], source: BoundSourceEvidence) -> bool:
+    if source.quality not in {"high", "medium"}:
+        return False
     if set(payload) != {
         "symbol", "as_of", "spy", "qqq", "sector_relative",
         "target_relative_to_spy", "target_relative_to_qqq",
@@ -508,16 +510,27 @@ def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str
 def _market_source_has_exact_component_provenance(
     capture: CapturedSourceEvidence, root: Path, symbol: str
 ) -> bool:
-    """Verify the normalized market bundle still names four real raw packets."""
+    """Reopen each raw quote and verify values and weakest quality exactly.
+
+    The normalized aggregate is merely a convenience view.  It cannot uplift a
+    low-quality component or retain a price change after the raw packet has
+    been tampered with.
+    """
     provenance = capture.packet_object.get("provenance")
     components = provenance.get("components") if isinstance(provenance, Mapping) else None
     if not isinstance(components, list) or len(components) != 4:
         return False
     expected_symbols = {symbol, "SPY", "QQQ", "XLK"}
     seen: set[str] = set()
+    quality_rank = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
+    qualities: list[str] = []
+    payload = capture.packet_object.get("payload")
+    if not isinstance(payload, Mapping):
+        return False
     for component in components:
         if not isinstance(component, Mapping) or set(component) != {
-            "packet_id", "path", "sha256", "symbol"
+            "packet_id", "path", "sha256", "symbol", "quality", "current",
+            "previous", "current_sha256", "previous_sha256",
         }:
             return False
         raw_symbol = component.get("symbol")
@@ -536,9 +549,57 @@ def _market_source_has_exact_component_provenance(
             or stored.get("packet_id") != component.get("packet_id")
             or stored.get("symbol") != raw_symbol
             or stored.get("evidence_type") != "quote_price_context"
+            or stored.get("quality") != component.get("quality")
         ):
             return False
-    return seen == expected_symbols
+        if component.get("quality") not in quality_rank:
+            return False
+        raw_payload = stored.get("payload")
+        current = previous = None
+        if isinstance(raw_payload, Mapping):
+            data = raw_payload.get("data")
+            trade = data.get("trades", {}).get(raw_symbol) if isinstance(data, Mapping) and isinstance(data.get("trades"), Mapping) else None
+            quote = trade if isinstance(trade, Mapping) else (data if isinstance(data, Mapping) else raw_payload)
+            if isinstance(quote, Mapping):
+                current = next((quote.get(key) for key in ("p", "c", "price", "last", "last_price", "close", "Close") if quote.get(key) not in (None, "")), None)
+                previous = next((quote.get(key) for key in ("pc", "previous_close", "previousClose", "prev_close", "prior_close", "previous_day_close") if quote.get(key) not in (None, "")), None)
+            if (current is None or previous is None) and isinstance(raw_payload.get("latest_bar"), Mapping):
+                latest = raw_payload["latest_bar"]
+                bars = raw_payload.get("recent_bars")
+                if isinstance(bars, Sequence) and not isinstance(bars, (str, bytes, bytearray)) and len(bars) >= 2 and isinstance(bars[-2], Mapping):
+                    current = latest.get("Close") if latest.get("Close") not in (None, "") else latest.get("close")
+                    previous = bars[-2].get("Close") if bars[-2].get("Close") not in (None, "") else bars[-2].get("close")
+        def canonical_scalar(value: Any) -> str:
+            text = format(Decimal(str(value)), "f")
+            return (text.rstrip("0").rstrip(".") if "." in text else text) or "0"
+
+        try:
+            normalized_current = canonical_scalar(current)
+            normalized_previous = canonical_scalar(previous)
+            if Decimal(normalized_previous) <= 0:
+                return False
+        except (InvalidOperation, ValueError, TypeError):
+            return False
+        def scalar_hash(value: str) -> str:
+            return hashlib.sha256(
+                json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+        if (
+            component.get("current") != normalized_current
+            or component.get("previous") != normalized_previous
+            or component.get("current_sha256") != scalar_hash(normalized_current)
+            or component.get("previous_sha256") != scalar_hash(normalized_previous)
+        ):
+            return False
+        qualities.append(str(component["quality"]))
+    if seen != expected_symbols or len(qualities) != 4:
+        return False
+    # Raw components, scalar hashes, and their minimum quality are authenticated
+    # above.  `_market_source_proves_values` separately binds the already
+    # normalized aggregate to the current review, so this routine does not
+    # introduce a second floating-point formatting contract for the same
+    # arithmetic.
+    return capture.source.quality == min(qualities, key=lambda value: quality_rank[value])
 
 
 def _news_source_proves_adverse_break(payload: Mapping[str, Any]) -> bool:
@@ -608,6 +669,34 @@ def _reason_source_semantics(
     return False
 
 
+def _market_clock_is_current_and_bound(review: Mapping[str, Any], payload: Mapping[str, Any], now: dt.datetime) -> bool:
+    """Require the captured read-only exchange clock, not a copied historic label."""
+    clock = review.get("market_clock")
+    if not isinstance(clock, Mapping) or clock != payload.get("market_clock_snapshot"):
+        return False
+    expected = {
+        "source_name", "source_ref", "as_of", "captured_at", "market_session",
+        "is_open", "raw_clock", "raw_clock_sha256",
+    }
+    if set(clock) != expected or clock.get("source_name") != "alpaca_clock" or clock.get("source_ref") != "alpaca:/v2/clock":
+        return False
+    if type(clock.get("is_open")) is not bool or clock.get("market_session") not in {"regular", "closed"}:
+        return False
+    if (clock["is_open"] and clock["market_session"] != "regular") or (not clock["is_open"] and clock["market_session"] != "closed"):
+        return False
+    raw = clock.get("raw_clock")
+    if not isinstance(raw, Mapping) or not isinstance(clock.get("raw_clock_sha256"), str):
+        return False
+    expected_hash = hashlib.sha256(json.dumps(dict(raw), sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    if clock["raw_clock_sha256"] != expected_hash:
+        return False
+    try:
+        observed, captured = _time(clock.get("as_of"), "clock as_of"), _time(clock.get("captured_at"), "clock captured_at")
+    except ValueError:
+        return False
+    return observed <= now and captured <= now and abs((observed - captured).total_seconds()) <= 15 * 60 and now - observed <= _MAX_AGE
+
+
 def _semantic_gaps(
     review: Mapping[str, Any],
     payload: Mapping[str, Any],
@@ -619,6 +708,8 @@ def _semantic_gaps(
     sources = tuple(capture.source for capture in captures)
     session_blockers = {"market session is not tradeable for a live loss exit"}
     closed_session_exception = review.get("market_session") == "closed"
+    if not _market_clock_is_current_and_bound(review, payload, now):
+        gaps.append("current_market_clock_missing_or_stale")
     for blocker_field in ("blockers", "blocked_reasons"):
         value = review.get(blocker_field)
         if not _sequence_of_text(value) or (

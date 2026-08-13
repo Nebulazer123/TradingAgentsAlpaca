@@ -74,16 +74,25 @@ def build_loss_review_provider_research(
     """
     target = str(symbol).strip().upper()
     proxy = str(sector_proxy or loss_review_sector_proxy(target)).strip().upper()
+    target_needs = tuple(kwargs.pop("evidence_needs", DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS))
     requested = (target, "SPY", "QQQ", proxy)
     packets: list[SourceEvidencePacket] = []
     attempts: list[dict[str, Any]] = []
     for requested_symbol in dict.fromkeys(requested):
         needs = (
-            DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS
+            target_needs
             if requested_symbol == target
             else ("quote_price_context",)
         )
-        result = provider_builder(requested_symbol, evidence_needs=needs, **kwargs)
+        result = provider_builder(
+            requested_symbol,
+            evidence_needs=needs,
+            # Loss BOARD alone needs an admissible current/previous pair for
+            # every component.  General ticker research preserves its normal
+            # packet-cap behaviour.
+            require_admissible_quote=True,
+            **kwargs,
+        )
         packets.extend(result.packets)
         attempts.extend(
             [
@@ -384,6 +393,11 @@ def _accepted_source_descriptors(
                 quote_components[component["symbol"]] = {
                     "symbol": component["symbol"],
                     "value": component["value"],
+                    "current": component["current"],
+                    "previous": component["previous"],
+                    "current_sha256": component["current_sha256"],
+                    "previous_sha256": component["previous_sha256"],
+                    "quality": packet.quality,
                     "as_of": as_of,
                     "raw_packet_path": relative.as_posix(),
                     "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
@@ -476,6 +490,11 @@ def _accepted_source_descriptors(
                     "path": item["raw_packet_path"],
                     "sha256": item["raw_packet_sha256"],
                     "symbol": item["symbol"],
+                    "quality": item["quality"],
+                    "current": item["current"],
+                    "previous": item["previous"],
+                    "current_sha256": item["current_sha256"],
+                    "previous_sha256": item["previous_sha256"],
                 }
                 for item in components
             ]
@@ -490,7 +509,10 @@ def _accepted_source_descriptors(
                 "subject": target,
                 "symbol": target,
                 "as_of": target_component["as_of"],
-                "quality": "high",
+                # An aggregate cannot acquire quality its weakest raw input
+                # does not have.  In particular a low yfinance component
+                # must never be laundered into a SELL-eligible bundle.
+                "quality": _component_quality([item["quality"] for item in components]),
                 "provenance": {"components": component_refs},
                 "payload": normalized_payload,
             }
@@ -509,7 +531,7 @@ def _accepted_source_descriptors(
                         "source_name": normalized_packet["source_name"],
                         "evidence_type": "market_context",
                         "as_of": normalized_packet["as_of"],
-                        "quality": "high",
+                        "quality": normalized_packet["quality"],
                     }
                 )
     return result
@@ -633,6 +655,22 @@ def _normalized_decimal(value: Any) -> str | None:
     return f"{numeric:.8f}".rstrip("0").rstrip(".") or "0"
 
 
+_QUALITY_RANK = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
+
+
+def _component_quality(values: Sequence[str]) -> str:
+    """Return the weakest component quality; an unrecognised label is unknown."""
+    if not values:
+        return "unknown"
+    return min(values, key=lambda value: _QUALITY_RANK.get(str(value), 0))
+
+
+def _canonical_value_hash(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _normalize_provider_packet(
     *, packet: SourceEvidencePacket, stored: Mapping[str, Any], symbol: str
 ) -> tuple[str, dict[str, Any]] | None:
@@ -663,13 +701,40 @@ def _normalize_provider_packet(
     return None
 
 
-def _quote_price(value: Any) -> float | None:
+def _quote_values(value: Any) -> tuple[float, float] | None:
     if not isinstance(value, Mapping):
         return None
-    price = _float_value(value.get("p") if value.get("p") not in (None, "") else value.get("c"))
-    previous = _float_value(value.get("pc"))
+    current = next(
+        (
+            value.get(key)
+            for key in ("p", "c", "price", "last", "last_price", "close", "Close")
+            if value.get(key) not in (None, "")
+        ),
+        None,
+    )
+    previous_raw = next(
+        (
+            value.get(key)
+            for key in (
+                "pc", "previous_close", "previousClose", "prev_close",
+                "prior_close", "previous_day_close",
+            )
+            if value.get(key) not in (None, "")
+        ),
+        None,
+    )
+    price = _float_value(current)
+    previous = _float_value(previous_raw)
     if price is None or previous is None or previous <= 0:
         return None
+    return price, previous
+
+
+def _quote_price(value: Any) -> float | None:
+    values = _quote_values(value)
+    if values is None:
+        return None
+    price, previous = values
     return (price - previous) / previous
 
 
@@ -687,35 +752,59 @@ def _configured_quote_components(
         return ()
     expected = str(expected_symbol).strip().upper()
     found: list[dict[str, str]] = []
+    def append(symbol: str, raw_quote: Mapping[str, Any]) -> None:
+        values = _quote_values(raw_quote)
+        if not symbol or values is None:
+            return
+        current, previous = values
+        normalized = _normalized_decimal((current - previous) / previous)
+        if normalized is None:
+            return
+        # Preserve both source values and their canonical scalar hashes.  The
+        # BOARD verifier recomputes the change from these exact raw values.
+        found.append({
+            "symbol": symbol,
+            "value": normalized,
+            "current": _normalized_decimal(current),
+            "previous": _normalized_decimal(previous),
+            "current_sha256": _canonical_value_hash(_normalized_decimal(current)),
+            "previous_sha256": _canonical_value_hash(_normalized_decimal(previous)),
+        })
     data = raw_payload.get("data")
     trades = data.get("trades") if isinstance(data, Mapping) else None
     if isinstance(trades, Mapping):
         for name, raw_quote in trades.items():
             symbol = str(name).strip().upper()
-            value = _quote_price(raw_quote)
-            if symbol and value is not None:
-                normalized = _normalized_decimal(value)
-                if normalized is not None:
-                    found.append({"symbol": symbol, "value": normalized})
+            if isinstance(raw_quote, Mapping):
+                append(symbol, raw_quote)
         if found:
             return tuple(found)
     # Single-symbol configured quote shape: Finnhub/FMP style current/previous
     # values or an injected test route with ``p``/``pc`` at top level.
     quote = data if isinstance(data, Mapping) else raw_payload
-    value = _quote_price(quote)
-    if value is not None and expected:
-        normalized = _normalized_decimal(value)
-        if normalized is not None:
-            return ({"symbol": expected, "value": normalized},)
+    if isinstance(quote, Mapping) and expected:
+        append(expected, quote)
+    if found:
+        return tuple(found)
+    # Massive/Polygon previous-day response shape and common injected routes.
+    previous_day = raw_payload.get("previous_day_bar") or raw_payload.get("previousDay")
+    latest_trade = raw_payload.get("latest_trade") or raw_payload.get("latestTrade")
+    if isinstance(previous_day, Mapping) and isinstance(latest_trade, Mapping) and expected:
+        current = _float_value(next((latest_trade.get(key) for key in ("p", "price", "c") if latest_trade.get(key) not in (None, "")), None))
+        previous = _float_value(next((previous_day.get(key) for key in ("c", "close", "Close") if previous_day.get(key) not in (None, "")), None))
+        if current is not None and previous is not None:
+            append(expected, {"p": current, "pc": previous})
+    if found:
+        return tuple(found)
     latest = raw_payload.get("latest_bar")
     bars = raw_payload.get("recent_bars")
     if isinstance(latest, Mapping) and isinstance(bars, Sequence) and not isinstance(bars, (str, bytes, bytearray)) and len(bars) >= 2:
         close = _float_value(latest.get("Close") or latest.get("close"))
         previous = _float_value((bars[-2] if isinstance(bars[-2], Mapping) else {}).get("Close") or (bars[-2] if isinstance(bars[-2], Mapping) else {}).get("close"))
         if close is not None and previous is not None and previous > 0:
-            normalized = _normalized_decimal((close - previous) / previous)
-            if normalized is not None:
-                return ({"symbol": expected, "value": normalized},)
+            append(expected, {"c": close, "pc": previous})
+            if found:
+                return tuple(found)
     return ()
 
 
@@ -851,12 +940,42 @@ def _normalized_source_payload(
     return payload if isinstance(payload, Mapping) else None
 
 
+def _current_market_clock(clock: Mapping[str, Any] | None) -> tuple[dict[str, Any] | None, str]:
+    """Normalize one fresh broker-clock read for immutable decision evidence."""
+    if not isinstance(clock, Mapping):
+        return None, "market clock is unavailable"
+    raw = clock.get("raw_clock")
+    as_of = _parse_timestamp(clock.get("as_of"))
+    captured_at = _parse_timestamp(clock.get("captured_at"))
+    is_open = clock.get("is_open")
+    if not isinstance(raw, Mapping) or as_of is None or captured_at is None or type(is_open) is not bool:
+        return None, "market clock is unavailable"
+    # Clock response time and local capture time must agree.  A clock can be
+    # closed and still support a decision-only SELL, but stale/malformed data
+    # cannot.
+    if abs((captured_at - as_of).total_seconds()) > 15 * 60:
+        return None, "market clock is stale"
+    raw_bytes = json.dumps(dict(raw), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    session = "regular" if is_open else "closed"
+    return {
+        "source_name": str(clock.get("source_name") or "alpaca_clock"),
+        "source_ref": str(clock.get("source_ref") or "alpaca:/v2/clock"),
+        "as_of": as_of.isoformat(),
+        "captured_at": captured_at.isoformat(),
+        "market_session": session,
+        "is_open": is_open,
+        "raw_clock": dict(raw),
+        "raw_clock_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+    }, ""
+
+
 def _derive_current_loss_review(
     *,
     historical_review: Mapping[str, Any],
     hourly_packet_path: str | Path,
     accepted_sources: Sequence[Mapping[str, Any]],
     evidence_root: str | Path | None,
+    market_clock: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the current authority candidate without changing historical review.
 
@@ -879,10 +998,8 @@ def _derive_current_loss_review(
     current_at = (
         str((market or {}).get("as_of") or (news or {}).get("as_of") or (filing or {}).get("as_of") or "")
     )
-    market_session = str(historical_review.get("market_session") or "").strip().lower()
-    canonical_session = market_session if market_session in {
-        "closed", "pre_open", "open_window", "regular", "pre_close", "after_close"
-    } else "unknown"
+    clock_binding, _clock_blocker = _current_market_clock(market_clock)
+    canonical_session = str((clock_binding or {}).get("market_session") or "unknown")
     complete = (
         supervisor is not None
         and isinstance(market_payload, Mapping)
@@ -890,7 +1007,7 @@ def _derive_current_loss_review(
         and isinstance(filing_payload, Mapping)
         and bool(symbol)
         and bool(current_at)
-        and canonical_session != "unknown"
+        and clock_binding is not None
     )
     spy = market_payload.get("spy") if isinstance(market_payload, Mapping) else None
     qqq = market_payload.get("qqq") if isinstance(market_payload, Mapping) else None
@@ -935,6 +1052,7 @@ def _derive_current_loss_review(
             **(supervisor or {}),
         },
         "market_session": canonical_session,
+        "market_clock": clock_binding,
         "current_evidence_at": current_at,
         "evidence_generated_at": current_at,
         "current_price": current_price,
@@ -951,6 +1069,9 @@ def _derive_current_loss_review(
             if complete else "Current evidence does not prove SELL is better than HOLD."
         ),
         "confidence": "0.82" if complete else "0.00",
+        # Keep the public compact reason stable.  The detailed immutable
+        # clock binding below is independently revalidated by the BOARD; a
+        # missing or stale clock still produces HOLD, never a silent sell.
         "blockers": blockers,
         "blocked_reasons": list(blockers),
         "broad_market_context": {"SPY": _normalized_decimal(spy_value), "QQQ": _normalized_decimal(qqq_value)},
@@ -1360,6 +1481,7 @@ def build_loss_review_evidence_packet(
     entry_context: Mapping[str, Any] | None = None,
     source_packet_paths: Mapping[str, str | Path] | None = None,
     decision_evidence_root: str | Path | None = None,
+    market_clock: Mapping[str, Any] | None = None,
 ) -> SourceEvidencePacket:
     """Build an advisory packet for autonomous portfolio BOARD loss-review analysis.
 
@@ -1402,6 +1524,7 @@ def build_loss_review_evidence_packet(
         hourly_packet_path=hourly_packet_path,
         accepted_sources=accepted_sources,
         evidence_root=decision_evidence_root,
+        market_clock=market_clock,
     )
     # Advisory output consumes the same derived Mapping that the recorder
     # authenticates.  It cannot introduce a second scalar reason source.
@@ -1474,6 +1597,7 @@ def build_loss_review_evidence_packet(
         "entry_context_found": bool(entry_context),
         "advisory_analysis": advisory_analysis,
         "current_loss_review": current_loss_review,
+        "market_clock_snapshot": current_loss_review.get("market_clock"),
         "remaining_blockers_before_refresh": blockers,
         "resolved_blockers_by_refresh": resolved_blockers,
         "remaining_blockers": remaining_blockers,

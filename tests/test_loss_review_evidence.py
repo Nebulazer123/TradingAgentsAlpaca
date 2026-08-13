@@ -18,6 +18,17 @@ from tradingagents.research.provider_orchestrator import TickerProviderResearchR
 runner = CliRunner()
 
 
+def _clock(now: str, *, is_open: bool = True) -> dict:
+    return {
+        "source_name": "alpaca_clock",
+        "source_ref": "alpaca:/v2/clock",
+        "as_of": now,
+        "captured_at": now,
+        "is_open": is_open,
+        "raw_clock": {"timestamp": now, "is_open": is_open},
+    }
+
+
 def _hourly_packet(symbol: str = "TSM") -> dict:
     return {
         "generated_at": "2026-06-06T20:06:33+00:00",
@@ -318,6 +329,7 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
     packet = build_loss_review_evidence_packet(
         hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider,
         source_packet_paths=source_paths, decision_evidence_root=tmp_path,
+        market_clock=_clock(now),
     )
     loss_path = write_research_packet(packet, tmp_path / "loss")
     current = packet.payload["current_loss_review"]
@@ -335,6 +347,62 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
     )
     assert recorded.decision.decision == "SELL", recorded.decision.evidence_gaps
     assert recorded.decision.can_submit_orders is False
+
+
+def test_closed_current_clock_allows_decision_only_sell_but_open_clock_is_required_for_exit_allowed(tmp_path):
+    """The present exchange clock, not the old hourly label, controls session state."""
+    now = "2026-08-13T14:55:00+00:00"
+    hourly = _hourly_packet("ORCL")
+    review = hourly["evidence"]["loss_exit_review"]
+    review.update({"decision_id": "clock-bound", "market_session": "regular", "current_price": "91", "average_entry_price": "100", "blockers": [], "blocked_reasons": []})
+    hourly_path = tmp_path / "hourly.json"
+    hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
+
+    def quote(symbol, price, previous, quality="high"):
+        return evidence_packet(source_name="finnhub", evidence_type="quote_price_context", subject=symbol, symbol=symbol, source_ref=f"https://test/{symbol}", payload={"c": price, "pc": previous}, quality=quality, as_of=now, tool_route="test")
+    provider = TickerProviderResearchResult("ORCL", [
+        quote("ORCL", 91, 100), quote("SPY", 650, 648), quote("QQQ", 580, 578), quote("XLK", 260, 259),
+        evidence_packet(
+            source_name="finnhub", evidence_type="market_news", subject="ORCL",
+            symbol="ORCL", source_ref="https://test/news",
+            payload={"data": [{"datetime": 1786632840, "headline": "Oracle cuts guidance", "summary": "Lowered guidance by 8%", "url": "https://issuer.test/x"}]},
+            quality="medium", as_of=now, tool_route="test",
+        ),
+        evidence_packet(source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL", source_ref="https://test/transcript", payload={"symbol": "ORCL", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, quality="high", as_of=now, tool_route="test"),
+    ])
+    paths = {item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets}
+    closed = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=False))
+    closed_path = write_research_packet(closed, tmp_path / "loss-closed")
+    assert closed.payload["current_loss_review"]["market_session"] == "closed"
+    assert closed.payload["current_loss_review"]["allowed"] is False
+    # The board resolves SELL as a decision-only outcome while closed.
+    decision = record_autonomous_loss_board_decision(supervisor_packet_path=hourly_path, loss_evidence_packet_path=closed_path, source_revision="1" * 40, ledger_root=tmp_path / "ledger", evidence_root=tmp_path, now=__import__("datetime").datetime.fromisoformat(now)).decision
+    assert decision.decision == "SELL" and decision.can_submit_orders is False
+
+    open_packet = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=True))
+    assert open_packet.payload["current_loss_review"]["market_session"] == "regular"
+    assert open_packet.payload["current_loss_review"]["allowed"] is True
+
+
+def test_low_quality_or_stale_clock_fails_closed_for_loss_board(tmp_path):
+    now = "2026-08-13T14:55:00+00:00"
+    # The normal complete fixture is enough to test that a low component cannot
+    # be upgraded through aggregation.
+    hourly = _hourly_packet("ORCL")
+    hourly["evidence"]["loss_exit_review"].update({"decision_id": "low-quality", "current_price": "91", "average_entry_price": "100", "blockers": [], "blocked_reasons": []})
+    hourly_path = tmp_path / "hourly.json"
+    hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
+    provider = _configured_shape_provider_result("ORCL")
+    packets = list(provider.packets)
+    packets[0] = packets[0].model_copy(update={"quality": "low"})
+    provider = TickerProviderResearchResult("ORCL", packets)
+    paths = {item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets}
+    packet = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now))
+    market = next(item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "market_context")
+    assert market["quality"] == "low"
+    loss_path = write_research_packet(packet, tmp_path / "loss")
+    decision = record_autonomous_loss_board_decision(supervisor_packet_path=hourly_path, loss_evidence_packet_path=loss_path, source_revision="2" * 40, ledger_root=tmp_path / "ledger", evidence_root=tmp_path, now=__import__("datetime").datetime.fromisoformat(now)).decision
+    assert decision.decision == "HOLD"
 
 
 def test_generic_tsm_provider_packets_are_not_normalized_into_authority(tmp_path):
@@ -484,9 +552,14 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
     hourly_path.write_text(json.dumps(_hourly_packet()), encoding="utf-8")
     output_dir = tmp_path / "loss_review"
 
+    calls = []
+    def providers(symbol, **kwargs):
+        calls.append((symbol, kwargs["evidence_needs"]))
+        return _provider_result(symbol)
+    monkeypatch.setattr("cli.main.build_loss_review_provider_research", providers)
     monkeypatch.setattr(
-        "cli.main.build_ticker_provider_research_packets",
-        lambda *args, **kwargs: _provider_result(),
+        "cli.main._alpaca_live_client",
+        lambda: type("ClockClient", (), {"get_clock": lambda self: {"timestamp": "2026-06-06T20:06:33+00:00", "is_open": False}})(),
     )
 
     result = runner.invoke(
@@ -543,3 +616,4 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
     ] is False
     assert compact["payload"]["advisory_summary"]["source_ref_count"] == 5
     assert compact["payload"]["advisory_summary"]["blocked_route_count"] == 0
+    assert calls == [("TSM", DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS)]

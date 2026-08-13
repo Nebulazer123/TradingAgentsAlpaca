@@ -283,6 +283,7 @@ from tradingagents.research.knowledge_graph import graph_memory_store_from_env
 from tradingagents.research.loss_review_evidence import (
     DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
     build_loss_review_evidence_packet,
+    build_loss_review_provider_research,
     find_latest_loss_review_packet,
 )
 from tradingagents.research.market_mirror import build_market_mirror_panel, label_market_mirror_outcome
@@ -1252,7 +1253,24 @@ def research_loss_review_evidence(
         for need in evidence_needs.split(",")
         if need and need.strip()
     )
-    result = build_ticker_provider_research_packets(
+    # One read-only broker clock is captured for the entire refresh.  The
+    # immutable evidence packet binds the exact response; no historical
+    # supervisor session label can silently become current decision authority.
+    try:
+        raw_clock = _alpaca_live_client().get_clock()
+    except Exception as exc:  # noqa: BLE001 - a clock read failure must HOLD, never abort research.
+        raw_clock = {"clock_error": type(exc).__name__}
+    captured_at = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
+    clock_as_of = str(raw_clock.get("timestamp") or captured_at) if isinstance(raw_clock, Mapping) else captured_at
+    market_clock = {
+        "source_name": "alpaca_clock",
+        "source_ref": "alpaca:/v2/clock",
+        "as_of": clock_as_of,
+        "captured_at": captured_at,
+        "is_open": raw_clock.get("is_open") if isinstance(raw_clock, Mapping) else None,
+        "raw_clock": dict(raw_clock) if isinstance(raw_clock, Mapping) else {"invalid_clock_response": True},
+    }
+    result = build_loss_review_provider_research(
         symbol,
         evidence_needs=needs or DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
         provider_config_path=provider_config_path,
@@ -1283,6 +1301,7 @@ def research_loss_review_evidence(
         evidence_needs=needs or DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
         source_packet_paths=source_packet_paths,
         decision_evidence_root=CANONICAL_BOARD_EVIDENCE_ROOT,
+        market_clock=market_clock,
     )
     packet_path = write_research_packet(packet, output_dir)
     payload = packet.model_dump()

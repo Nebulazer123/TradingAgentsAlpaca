@@ -128,6 +128,7 @@ DEFAULT_BOARD_LEDGER_ROOT = Path("state/decision_ledger")
 DEFAULT_BOARD_REVIEW_PATH = Path("results/execution_board/latest.json")
 _BOARD_TIMESTAMPED_PACKET = re.compile(r"^execution-board-review-[A-Za-z0-9._-]+\.json$")
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 
 class _PromotionStalePreimage(RuntimeError):
@@ -878,7 +879,7 @@ def _validated_autonomous_loss_board_sidecar_raw_path(
         or not isinstance(compact.get("supervisor_decision_id"), str)
         or not compact["supervisor_decision_id"].strip()
         or not isinstance(compact.get("source_revision"), str)
-        or not compact["source_revision"].strip()
+        or _SOURCE_REVISION.fullmatch(compact["source_revision"]) is None
         or compact.get("trade_decision_resolved") is not True
         or not isinstance(compact.get("exit_allowed"), bool)
         or (decision == "HOLD" and compact["exit_allowed"] is not False)
@@ -3387,8 +3388,10 @@ def build_production_recovery_request(
         or any(
             not isinstance(context.get(key), str)
             or not str(context[key]).strip()
-            for key in ("broker_account", "environment", "source_revision")
+            for key in ("broker_account", "environment")
         )
+        or not isinstance(context.get("source_revision"), str)
+        or _SOURCE_REVISION.fullmatch(str(context["source_revision"])) is None
     ):
         return {"ready": False, "outcome": "transient", "detail": "canonical recovery bindings are incomplete"}
     bindings = {

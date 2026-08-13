@@ -1109,6 +1109,43 @@ def _packet_is_gap(packet: SourceEvidencePacket) -> bool:
     )
 
 
+def _quote_packet_has_current_previous(packet: SourceEvidencePacket) -> bool:
+    """Recognise real configured quote shapes before consuming a quote slot.
+
+    This is deliberately a small, local admissibility check.  It does not
+    change a source's quality or discard the packet; it only prevents a
+    previous-day-only/cache placeholder from making the fallback loop stop
+    before a route supplies both values needed by the loss BOARD.
+    """
+    payload = packet.payload
+    if not isinstance(payload, dict):
+        return False
+
+    def values(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        current = next((value.get(key) for key in ("p", "c", "price", "last", "last_price", "close", "Close") if value.get(key) not in (None, "")), None)
+        previous = next((value.get(key) for key in ("pc", "previous_close", "previousClose", "prev_close", "prior_close", "previous_day_close") if value.get(key) not in (None, "")), None)
+        try:
+            return float(current) > 0 and float(previous) > 0
+        except (TypeError, ValueError):
+            return False
+
+    data = payload.get("data")
+    if values(data) or values(payload):
+        return True
+    if isinstance(data, dict) and isinstance(data.get("trades"), dict):
+        return any(values(item) for item in data["trades"].values())
+    latest = payload.get("latest_trade") or payload.get("latestTrade")
+    previous_day = payload.get("previous_day_bar") or payload.get("previousDay")
+    if isinstance(latest, dict) and isinstance(previous_day, dict):
+        return values({"p": latest.get("p", latest.get("price", latest.get("c"))), "pc": previous_day.get("c", previous_day.get("close", previous_day.get("Close")))})
+    latest_bar, bars = payload.get("latest_bar"), payload.get("recent_bars")
+    if isinstance(latest_bar, dict) and isinstance(bars, list) and len(bars) >= 2 and isinstance(bars[-2], dict):
+        return values({"c": latest_bar.get("Close", latest_bar.get("close")), "pc": bars[-2].get("Close", bars[-2].get("close"))})
+    return False
+
+
 def _route_status_counts(attempts: Sequence[dict[str, Any]]) -> dict[str, int]:
     statuses = sorted({str(attempt.get("status") or "unknown") for attempt in attempts})
     return {
@@ -1129,6 +1166,7 @@ def build_ticker_provider_research_packets(
     broker_snapshot_dir: str | Path = DEFAULT_BROKER_SNAPSHOT_DIR,
     source_quality_review_path: str | Path | None = None,
     now: datetime.datetime | None = None,
+    require_admissible_quote: bool = False,
 ) -> TickerProviderResearchResult:
     ticker = _symbol(symbol)
     config = load_provider_fallback_config(provider_config_path)
@@ -1169,7 +1207,12 @@ def build_ticker_provider_research_packets(
                     continue
                 packets.append(packet)
                 attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
-                written_for_need += 1
+                if (
+                    not require_admissible_quote
+                    or evidence_need != "quote_price_context"
+                    or _quote_packet_has_current_previous(packet)
+                ):
+                    written_for_need += 1
                 if written_for_need >= max(1, int(max_packets_per_need)):
                     break
                 continue
@@ -1228,7 +1271,15 @@ def build_ticker_provider_research_packets(
                 continue
             packets.append(packet)
             attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
-            written_for_need += 1
+            # Keep searching configured quote routes until there is a usable
+            # current/previous component.  This is independent of the normal
+            # max-packet cap, so two unusable packets cannot starve the third.
+            if (
+                not require_admissible_quote
+                or evidence_need != "quote_price_context"
+                or _quote_packet_has_current_previous(packet)
+            ):
+                written_for_need += 1
             if written_for_need >= max(1, int(max_packets_per_need)):
                 break
     source_ref = f"local://{Path(provider_config_path).as_posix()}#ticker_provider_orchestrator/{ticker}"
