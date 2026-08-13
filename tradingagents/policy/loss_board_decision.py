@@ -702,16 +702,81 @@ def record_autonomous_loss_board_decision(*, supervisor_packet_path: str | Path,
     return RecordedLossBoardDecision(decision, packet, packet_path, decision_path)
 
 
-def verify_autonomous_loss_board_decision(decision_evidence_path: str | Path, *, evidence_root: str | Path, now: dt.datetime | None = None) -> AutonomousLossBoardDecision:
+def _capture_evidence_ref(root: Path, reference: EvidenceRef, *, label: str) -> tuple[Path, bytes, Mapping[str, Any]]:
+    target, captured, decoded = _read_contained(root, reference.path, label=label)
+    if reference.path != str(target) or reference.size_bytes != len(captured) or reference.sha256 != hashlib.sha256(captured).hexdigest():
+        raise ValueError(f"{label} does not match its ledger evidence reference")
+    return target, captured, decoded
+
+
+def _expected_ledger_packet(
+    decision: AutonomousLossBoardDecision,
+    *,
+    decision_path: Path,
+    decision_bytes: bytes,
+    root: Path,
+    now: dt.datetime,
+) -> WorkPacket:
+    refs = (
+        EvidenceRef(path=str(decision_path), sha256=hashlib.sha256(decision_bytes).hexdigest(), size_bytes=len(decision_bytes)),
+        EvidenceRef(path=str(root / decision.supervisor_packet.path), sha256=decision.supervisor_packet.sha256, size_bytes=decision.supervisor_packet.size_bytes),
+        EvidenceRef(path=str(root / decision.loss_evidence_packet.path), sha256=decision.loss_evidence_packet.sha256, size_bytes=decision.loss_evidence_packet.size_bytes),
+    )
+    return WorkPacket.create(
+        kind="portfolio_decision",
+        producer_role="portfolio_executive",
+        run_id=decision.decision_id,
+        subject=decision.symbol,
+        evidence_refs=refs,
+        claims=(f"Autonomous loss BOARD resolved {decision.symbol} as {decision.decision}.",),
+        assumptions=(),
+        recommendation="autonomous_sell_authorized_pending_execution_intent" if decision.decision == "SELL" else "autonomous_hold",
+        confidence=float(Decimal(decision.confidence)),
+        expires_at=_time(decision.expires_at, "expires_at"),
+        allowed_effects=("record_trade_decision",),
+        now=now,
+    )
+
+
+def verify_autonomous_loss_board_decision(*, ledger_root: str | Path, ledger_packet_id: str, evidence_root: str | Path, now: dt.datetime | None = None) -> AutonomousLossBoardDecision:
+    """Authenticate a BOARD decision through its immutable ledger packet only."""
+
     current, root = _now(now), _root(evidence_root)
-    _, content, raw = _read_contained(root, decision_evidence_path, label="decision evidence")
+    packet = DecisionLedger(ledger_root).read_authenticated_packet(ledger_packet_id, evidence_root=root)
+    if len(packet.evidence_refs) != 3:
+        raise ValueError("ledger packet must have exactly three BOARD evidence references")
+    decision_path, content, raw = _capture_evidence_ref(root, packet.evidence_refs[0], label="decision evidence")
     if set(raw) != {"decision"} or not isinstance(raw["decision"], Mapping) or content != _canon(raw):
         raise ValueError("decision evidence is not exact canonical bytes")
     decision = AutonomousLossBoardDecision.from_dict(raw["decision"])
     generated, expires = _time(decision.generated_at, "generated_at"), _time(decision.expires_at, "expires_at")
     if not generated <= current < expires:
         raise ValueError("decision is not currently valid")
-    captures = tuple(_capture_source(root, item, decision.symbol) for item in decision.accepted_sources)
-    if not decision.supervisor_packet.verify(root) or not decision.loss_evidence_packet.verify(root) or any(capture is None for capture in captures):
-        raise ValueError("bound evidence verification failed")
+    expected_path = root / "autonomous_loss_board_decisions" / f"{decision.decision_id}.json"
+    if decision_path != expected_path:
+        raise ValueError("ledger packet does not reference the decision identity path")
+    supervisor_path, supervisor_bytes, supervisor_raw = _capture_evidence_ref(root, packet.evidence_refs[1], label="supervisor packet")
+    loss_path, loss_bytes, loss_raw = _capture_evidence_ref(root, packet.evidence_refs[2], label="loss evidence packet")
+    supervisor = BoundEvidence(path=supervisor_path.relative_to(root).as_posix(), sha256=hashlib.sha256(supervisor_bytes).hexdigest(), size_bytes=len(supervisor_bytes))
+    loss = BoundEvidence(path=loss_path.relative_to(root).as_posix(), sha256=hashlib.sha256(loss_bytes).hexdigest(), size_bytes=len(loss_bytes))
+    expected_decision = _build(
+        supervisor,
+        supervisor_raw,
+        loss,
+        loss_raw,
+        decision.source_revision,
+        root,
+        generated,
+    )
+    if expected_decision.compact() != decision.compact():
+        raise ValueError("decision does not exactly match authenticated evidence")
+    expected_packet = _expected_ledger_packet(
+        decision,
+        decision_path=decision_path,
+        decision_bytes=content,
+        root=root,
+        now=generated,
+    )
+    if packet.packet_id != ledger_packet_id or packet.canonical_json_bytes() != expected_packet.canonical_json_bytes():
+        raise ValueError("ledger packet is not exact autonomous BOARD provenance")
     return decision

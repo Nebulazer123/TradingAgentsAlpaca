@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+import shutil
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ import pytest
 import tradingagents.policy.loss_board_decision as loss_board_decision
 from tradingagents.brokers.supervisor.loss_review import ALLOWED_LOSS_EXIT_REASONS
 from tradingagents.orchestration.decision_ledger import DecisionLedger
+from tradingagents.orchestration.work_packets import EvidenceRef, WorkPacket
 from tradingagents.policy.loss_board_decision import (
     record_autonomous_loss_board_decision,
     verify_autonomous_loss_board_decision,
@@ -216,6 +218,15 @@ def _record(tmp_path: Path, *, supervisor: dict[str, Any] | None = None, loss: d
     )
 
 
+def _verify(tmp_path: Path, recorded, *, now: datetime = NOW):
+    return verify_autonomous_loss_board_decision(
+        ledger_root=tmp_path / "ledger",
+        ledger_packet_id=recorded.packet.packet_id,
+        evidence_root=tmp_path / "evidence",
+        now=now,
+    )
+
+
 def _rewrite_source_packet(loss_path: Path, source_path: Path, packet: dict[str, Any]) -> None:
     _write_json(source_path, packet)
     loss = json.loads(loss_path.read_text(encoding="utf-8"))
@@ -240,14 +251,7 @@ def test_records_verified_sell_only_as_an_immutable_analysis_only_decision(tmp_p
     assert recorded.packet.allowed_effects == ("record_trade_decision",)
     assert recorded.packet.recommendation == "autonomous_sell_authorized_pending_execution_intent"
     assert DecisionLedger(tmp_path / "ledger").verify(evidence_root=tmp_path / "evidence")[-1].kind == "portfolio_decision"
-    assert (
-        verify_autonomous_loss_board_decision(
-            recorded.decision_evidence_path,
-            evidence_root=tmp_path / "evidence",
-            now=NOW,
-        )
-        == recorded.decision
-    )
+    assert _verify(tmp_path, recorded) == recorded.decision
 
 
 def test_exit_reason_taxonomy_reuses_the_supervisor_contract():
@@ -307,11 +311,7 @@ def test_mutated_bound_evidence_fails_verification(tmp_path):
     loss_path.write_text("{}", encoding="utf-8")
 
     with pytest.raises(ValueError, match="verification|bound evidence|sha256"):
-        verify_autonomous_loss_board_decision(
-            recorded.decision_evidence_path,
-            evidence_root=tmp_path / "evidence",
-            now=NOW,
-        )
+        _verify(tmp_path, recorded)
 
 
 def test_rejects_conflicting_immutable_decision_object(tmp_path):
@@ -320,12 +320,8 @@ def test_rejects_conflicting_immutable_decision_object(tmp_path):
     payload["decision"]["reason_code"] = "tampered"
     recorded.decision_evidence_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="decision_id|canonical"):
-        verify_autonomous_loss_board_decision(
-            recorded.decision_evidence_path,
-            evidence_root=tmp_path / "evidence",
-            now=NOW,
-        )
+    with pytest.raises(ValueError, match="evidence|decision_id|canonical"):
+        _verify(tmp_path, recorded)
 
 
 @pytest.mark.parametrize(
@@ -380,8 +376,8 @@ def test_source_packet_mutation_and_url_descriptor_fail_verification_or_sell(tmp
     recorded = _record(tmp_path)
     source_path = tmp_path / "evidence" / "sources" / "1.json"
     source_path.write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError, match="bound evidence"):
-        verify_autonomous_loss_board_decision(recorded.decision_evidence_path, evidence_root=tmp_path / "evidence", now=NOW)
+    with pytest.raises(ValueError, match="bound evidence|authenticated evidence"):
+        _verify(tmp_path, recorded)
 
     supervisor_path, loss_path, evidence_root = _paths(tmp_path / "second", supervisor=_supervisor(), loss=_loss_evidence())
     loss = json.loads(loss_path.read_text(encoding="utf-8"))
@@ -419,15 +415,11 @@ def test_semantic_or_advisory_contradictions_force_hold(tmp_path, review_overrid
 def test_verifier_rejects_expired_and_noncanonical_decision_bytes(tmp_path):
     recorded = _record(tmp_path)
     with pytest.raises(ValueError, match="currently valid"):
-        verify_autonomous_loss_board_decision(
-            recorded.decision_evidence_path,
-            evidence_root=tmp_path / "evidence",
-            now=NOW.replace(hour=16),
-        )
+        _verify(tmp_path, recorded, now=NOW.replace(hour=16))
     payload = json.loads(recorded.decision_evidence_path.read_text(encoding="utf-8"))
     recorded.decision_evidence_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    with pytest.raises(ValueError, match="exact canonical"):
-        verify_autonomous_loss_board_decision(recorded.decision_evidence_path, evidence_root=tmp_path / "evidence", now=NOW)
+    with pytest.raises(ValueError, match="evidence|exact canonical"):
+        _verify(tmp_path, recorded)
 
 
 def test_unsafe_publication_collision_and_crash_never_append_ledger(tmp_path, monkeypatch):
@@ -656,11 +648,104 @@ def test_verifier_opens_each_source_once(tmp_path, monkeypatch):
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr(loss_board_decision.os, "open", open_once)
-    verified = verify_autonomous_loss_board_decision(
-        recorded.decision_evidence_path,
-        evidence_root=evidence_root,
-        now=NOW,
-    )
+    verified = _verify(tmp_path, recorded)
 
     assert verified == recorded.decision
     assert source_opens == {evidence_root / "sources" / f"{index}.json": 1 for index in range(3)}
+
+
+def test_authenticator_rejects_a_fabricated_canonical_decision_without_a_ledger_record(tmp_path):
+    recorded = _record(tmp_path)
+    copied_root = tmp_path / "copied-evidence"
+    shutil.copytree(tmp_path / "evidence", copied_root)
+
+    with pytest.raises(ValueError, match="ledger event"):
+        verify_autonomous_loss_board_decision(
+            ledger_root=tmp_path / "missing-ledger",
+            ledger_packet_id=recorded.packet.packet_id,
+            evidence_root=copied_root,
+            now=NOW,
+        )
+
+
+def test_authenticator_rejects_a_self_admitted_or_substituted_ledger_packet(tmp_path):
+    recorded = _record(tmp_path)
+    fake_packet = WorkPacket.create(
+        kind="portfolio_decision",
+        producer_role="portfolio_executive",
+        run_id=recorded.decision.decision_id,
+        subject=recorded.decision.symbol,
+        evidence_refs=(EvidenceRef.from_path(recorded.decision_evidence_path),),
+        claims=("Self-admitted packet.",),
+        assumptions=(),
+        recommendation="autonomous_sell_authorized_pending_execution_intent",
+        confidence=0.82,
+        expires_at=NOW + timedelta(minutes=15),
+        allowed_effects=("record_trade_decision",),
+        now=NOW,
+    )
+    fake_ledger = DecisionLedger(tmp_path / "fake-ledger")
+    fake_ledger.record(fake_packet, evidence_root=tmp_path / "evidence", now=NOW)
+
+    with pytest.raises(ValueError, match="exactly three|provenance"):
+        verify_autonomous_loss_board_decision(
+            ledger_root=tmp_path / "fake-ledger",
+            ledger_packet_id=fake_packet.packet_id,
+            evidence_root=tmp_path / "evidence",
+            now=NOW,
+        )
+
+
+def test_authenticator_rebuild_rejects_a_ledgered_fabricated_decision_flags(tmp_path):
+    recorded = _record(tmp_path)
+    original = json.loads(recorded.decision_evidence_path.read_text(encoding="utf-8"))
+    fake = dict(original["decision"])
+    fake.update(
+        {
+            "decision": "HOLD",
+            "reason_code": "evidence_incomplete",
+            "evidence_complete": False,
+            "evidence_gaps": ["fabricated"],
+            "exit_allowed": False,
+        }
+    )
+    fake.pop("decision_id")
+    fake_id = hashlib.sha256(loss_board_decision._canon(fake)).hexdigest()
+    fake_decision = {"decision_id": fake_id, **fake}
+    fake_path = tmp_path / "evidence" / "autonomous_loss_board_decisions" / f"{fake_id}.json"
+    _write_json(fake_path, {"decision": fake_decision})
+    refs = (
+        EvidenceRef.from_path(fake_path),
+        EvidenceRef.from_path(tmp_path / "evidence" / "supervisor.json"),
+        EvidenceRef.from_path(tmp_path / "evidence" / "loss.json"),
+    )
+    packet = WorkPacket.create(
+        kind="portfolio_decision",
+        producer_role="portfolio_executive",
+        run_id=fake_id,
+        subject="ORCL",
+        evidence_refs=refs,
+        claims=("Autonomous loss BOARD resolved ORCL as HOLD.",),
+        assumptions=(),
+        recommendation="autonomous_hold",
+        confidence=0.82,
+        expires_at=NOW + timedelta(minutes=15),
+        allowed_effects=("record_trade_decision",),
+        now=NOW,
+    )
+    fake_ledger = DecisionLedger(tmp_path / "fabricated-ledger")
+    fake_ledger.record(packet, evidence_root=tmp_path / "evidence", now=NOW)
+
+    with pytest.raises(ValueError, match="exactly match authenticated evidence"):
+        verify_autonomous_loss_board_decision(
+            ledger_root=tmp_path / "fabricated-ledger",
+            ledger_packet_id=packet.packet_id,
+            evidence_root=tmp_path / "evidence",
+            now=NOW,
+        )
+
+
+def test_authenticator_accepts_a_real_recorded_hold(tmp_path):
+    recorded = _record(tmp_path, supervisor=_supervisor(allowed_exit_reason="user_manual_override"))
+    assert recorded.decision.decision == "HOLD"
+    assert _verify(tmp_path, recorded) == recorded.decision

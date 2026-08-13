@@ -296,6 +296,31 @@ class DecisionLedger:
             self._verify_latest(events)
             return events
 
+    def read_authenticated_packet(
+        self,
+        packet_id: str,
+        *,
+        evidence_root: str | Path | None = None,
+    ) -> WorkPacket:
+        """Return one journal-authenticated immutable packet, or fail closed."""
+
+        if not isinstance(packet_id, str) or not packet_id:
+            raise LedgerCorruptionError("packet_id must be a nonempty string")
+        with self._locked():
+            self._ensure_managed_directories()
+            events = self._replay(evidence_root=evidence_root)
+            self._verify_latest(events)
+            matches = tuple(event for event in events if event.packet_id == packet_id)
+            if len(matches) != 1:
+                raise LedgerCorruptionError("packet must have exactly one ledger event")
+            packet, packet_bytes = self._read_packet_object(
+                self._packet_path(packet_id),
+                evidence_root=evidence_root,
+            )
+            if hashlib.sha256(packet_bytes).hexdigest() != matches[0].packet_sha256:
+                raise LedgerCorruptionError("authenticated packet digest mismatch")
+            return packet
+
     def rebuild(
         self,
         *,

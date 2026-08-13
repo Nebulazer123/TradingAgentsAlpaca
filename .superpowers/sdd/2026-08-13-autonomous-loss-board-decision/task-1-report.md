@@ -165,6 +165,46 @@ git diff --check
 (no output; passed)
 ```
 
+## Ledger-authenticated verifier interface
+
+The public `verify_autonomous_loss_board_decision` interface now requires
+`ledger_root`, `ledger_packet_id`, and `evidence_root`; a standalone decision
+path is not authentication. `DecisionLedger.read_authenticated_packet` is the
+narrow read-only provenance API: it replays the immutable journal and packet
+objects, requires exactly one matching event, and checks the stored packet hash
+against that event.
+
+The BOARD authenticator captures the exact decision, supervisor, and raw-loss
+ledger references; enforces immutable identity path/hash bindings; rebuilds the
+decision at its stored `generated_at` policy moment; preserves one capture per
+accepted source; and compares the complete rebuilt decision and canonical
+WorkPacket bytes. Current expiration remains independently enforced. It rejects
+canonical decision files without a ledger event, self-admitted or substituted
+packets, ledgered but fabricated decision flags, journal corruption, and
+evidence-reference substitution. Real recorded SELL and HOLD decisions pass.
+
+### Ledger-authenticator RED/GREEN evidence
+
+RED demonstrated that the prior standalone parser could inspect a canonical
+decision file without a matching ledger record. New adversarial tests prove
+rejection of a copied evidence tree with no journal event, a separately admitted
+self-consistent packet, and a ledgered canonical HOLD that contradicts the
+evidence-derived SELL.
+
+```text
+python -m pytest -q tests/test_loss_board_decision.py
+49 passed in 0.41s
+
+python -m pytest -q tests/test_loss_board_decision.py tests/test_work_packets.py tests/test_decision_ledger.py
+180 passed in 0.57s
+
+ruff check tradingagents/policy/loss_board_decision.py tradingagents/orchestration/decision_ledger.py tradingagents/orchestration/work_packets.py tests/test_loss_board_decision.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
 ## Repair round 3: typed source references and strict directional evidence
 
 Round 3 removes the last narrative and self-declared-boolean route to SELL.
