@@ -9,7 +9,12 @@ from collections.abc import Callable, Sequence
 from typing import Any
 from urllib.parse import quote
 
-from tradingagents.dataflows._official_common import OfficialDataError, evidence_packet, request_hash
+from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    OfficialDataError,
+    evidence_packet,
+    request_hash,
+)
 from tradingagents.schemas.research import SourceEvidencePacket
 
 UTC = datetime.timezone.utc
@@ -39,13 +44,15 @@ def _now_iso(now: datetime.datetime | None = None) -> str:
 def _extract_json_payload(stdout: str) -> dict[str, Any]:
     start = stdout.find("{")
     if start < 0:
-        raise OfficialDataError("twitter-research MCP returned no JSON object")
+        raise DataTransportError("twitter-research MCP returned no JSON object")
     try:
         payload = json.loads(stdout[start:])
     except json.JSONDecodeError as exc:
-        raise OfficialDataError("twitter-research MCP returned invalid JSON") from exc
+        raise DataTransportError("twitter-research MCP returned invalid JSON") from exc
     if not isinstance(payload, dict):
-        raise OfficialDataError("twitter-research MCP returned a non-object JSON payload")
+        raise DataTransportError(
+            "twitter-research MCP returned a non-object JSON payload"
+        )
     return payload
 
 
@@ -78,15 +85,17 @@ def _call_docker_mcp_tool(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise OfficialDataError(
+        raise DataTransportError(
             f"twitter-research MCP timed out after {timeout_seconds}s"
         ) from exc
     except OSError as exc:
-        raise OfficialDataError(f"twitter-research MCP command unavailable: {type(exc).__name__}") from exc
+        raise DataTransportError(
+            f"twitter-research MCP command unavailable: {type(exc).__name__}"
+        ) from exc
     if completed.returncode != 0:
         stderr = str(completed.stderr or "").strip()
         detail = stderr[:240] if stderr else "docker MCP tool call failed"
-        raise OfficialDataError(f"twitter-research MCP failed: {detail}")
+        raise DataTransportError(f"twitter-research MCP failed: {detail}")
     return _extract_json_payload(str(completed.stdout or ""))
 
 

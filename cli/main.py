@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import multiprocessing
 import os
@@ -11,8 +12,8 @@ import urllib.request
 from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
-from dataclasses import replace
-from decimal import ROUND_DOWN, Decimal
+from dataclasses import asdict, replace
+from decimal import Decimal
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
@@ -61,12 +62,13 @@ from tradingagents.brokers.alpaca import (
     build_paper_orders,
     classify_alpaca_submit_error,
     compare_alpaca_order_to_intent,
-    execute_order_pairs,
     execute_paper_orders,
     find_order_by_client_order_id,
-    validate_live_entry_allowed,
 )
-from tradingagents.brokers.alpaca_reconciliation import reconcile_orcl_sell_state
+from tradingagents.brokers.alpaca_reconciliation import (
+    reconcile_orcl_sell_state,
+    reconcile_symbol_incident,
+)
 from tradingagents.brokers.alpaca_supervisor import (
     AGGRESSIVE_CANDIDATE_UNIVERSE,
     CENTRAL,
@@ -74,7 +76,6 @@ from tradingagents.brokers.alpaca_supervisor import (
     DEEP_RESEARCH_EVENT_SENSITIVE_SYMBOLS,
     DEEP_RESEARCH_POSITIVE_RELATIVE_SYMBOLS,
     CandidateSignal,
-    HourlySupervisorAction,
     HourlySupervisorConfig,
     build_candidate_signals,
     build_hourly_decision,
@@ -91,7 +92,6 @@ from tradingagents.brokers.alpaca_supervisor import (
     find_latest_hourly_packet,
     is_expected_hourly_safety_lock,
     is_order_action,
-    live_exposure_from_positions,
     load_latest_overnight_plan,
     load_latest_premarket_brief,
     market_session_label,
@@ -177,6 +177,7 @@ from tradingagents.evals.execution_board import (
     write_execution_board_review,
 )
 from tradingagents.evals.hypothesis_factory import run_hypothesis_factory
+from tradingagents.evals.learning_availability import observe_forecasts
 from tradingagents.evals.overnight_calibration import (
     build_overnight_calibration_guard,
     latest_walk_forward_cohort_path,
@@ -214,6 +215,7 @@ from tradingagents.graph.analyst_execution import (
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.model_catalog import get_model_context_window_tokens
+from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.orchestration.control_plane_patrol import write_control_plane_patrol_packet
 from tradingagents.orchestration.n8n_api_sync import N8NApiSyncError, sync_n8n_evaluation_data_table
 from tradingagents.orchestration.n8n_evaluation_run_probe import (
@@ -226,6 +228,11 @@ from tradingagents.orchestration.n8n_evaluations import (
 from tradingagents.orchestration.n8n_runner import list_jobs as list_n8n_runner_jobs
 from tradingagents.orchestration.n8n_workflow_sync import sync_n8n_workflows
 from tradingagents.orchestration.night_shift_patrol import write_night_shift_patrol_packet
+from tradingagents.orchestration.recovery import (
+    evaluate_rearm_readiness,
+    load_recovery_evidence,
+    rearm_after_verified_recovery,
+)
 from tradingagents.orchestration.self_heal import (
     build_self_heal_handoff,
     build_self_heal_plan,
@@ -239,8 +246,13 @@ from tradingagents.policy.io import (
 from tradingagents.policy.io import (
     unique_packet_path as _unique_packet_path,
 )
-from tradingagents.policy.live_control import load_live_control_state, write_live_control_state
-from tradingagents.policy.order_rate_limit import record_live_order_submission
+from tradingagents.policy.live_control import (
+    _write_live_control_state_locked,
+    live_control_lock,
+    load_live_control_state,
+    parse_control_time,
+    write_live_control_state,
+)
 from tradingagents.policy.packets import write_research_packet, write_shadow_run_packet
 from tradingagents.policy.preregistration import (
     append_preregistration,
@@ -453,25 +465,16 @@ def _dynamic_live_cap_for_budget_mode(
     risk_envelope_path: str | Path = "config/risk_envelope.yaml",
 ) -> tuple[Decimal, str, list[str], Any]:
     envelope, envelope_issues = load_risk_envelope(risk_envelope_path)
-    budget_mode = (
-        envelope.live_budget_mode
-        if envelope is not None
-        else "blocked_until_risk_envelope_exists"
-    )
+    if envelope is not None:
+        budget_mode = envelope.live_budget_mode
+    elif any(issue.startswith("live_budget_mode") for issue in envelope_issues):
+        budget_mode = "invalid_or_retired"
+    else:
+        budget_mode = "blocked_until_risk_envelope_exists"
     max_cap = None
     base_cap = config.live_exposure_limit
     if envelope is not None and budget_mode == "autonomous_with_caps":
         max_cap = envelope.account_max_capital_at_risk_usd
-    elif envelope is not None and budget_mode == "autonomous_uncapped":
-        try:
-            buying_power = Decimal(str(live_account.get("buying_power") or "0"))
-        except Exception:
-            buying_power = Decimal("0")
-        base_cap = (live_exposure_from_positions(live_positions) + buying_power).quantize(
-            Decimal("0.01"),
-            rounding=ROUND_DOWN,
-        )
-        max_cap = base_cap
     dynamic_cap = calculate_dynamic_live_cap(
         live_positions=live_positions,
         recent_packets=recent_packets,
@@ -911,6 +914,21 @@ def _ledger_window_lookup(symbol: str, start_date: str, end_date: str):
         requested_end=end_date,
         bars=bars,
     )
+
+
+def _learning_producer_now() -> datetime.datetime:
+    return datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
+
+
+def _forecast_learning_availability_root(
+    ledger_path: Path,
+    override: Path | None,
+) -> Path:
+    if override is not None:
+        return override
+    if ledger_path == DEFAULT_LEDGER_PATH:
+        return Path("results/learning_availability")
+    return ledger_path.parent / "learning_availability"
 
 
 def _static_price_lookup_from_rows(rows: list[Any]):
@@ -1477,6 +1495,11 @@ def research_agent_ledger_resolve(
         "--resolution-quality-path",
         help="Machine-readable resolution-window quality summary output path.",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     context_ticker: str = typer.Option("", "--context-ticker"),
     context_setup: str = typer.Option("", "--context-setup"),
@@ -1491,6 +1514,11 @@ def research_agent_ledger_resolve(
     mismatched ticker/benchmark sessions, stale data) are deferred with a
     machine-readable reason instead of being scored against bad windows.
     """
+    producer_recorded_at = _learning_producer_now()
+    availability_root = _forecast_learning_availability_root(
+        ledger_path,
+        learning_availability_root,
+    )
     forecasts = load_ledger(ledger_path)
     unaudited_before = sum(
         1 for forecast in forecasts if forecast.resolved and not forecast.label_quality
@@ -1498,6 +1526,7 @@ def research_agent_ledger_resolve(
     resolved, quality_reports = resolve_forecasts_with_quality(
         forecasts,
         window_lookup=_ledger_window_lookup,
+        now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
     quality_summary = summarize_resolution_quality(
@@ -1505,6 +1534,11 @@ def research_agent_ledger_resolve(
         unaudited_resolved_count=unaudited_before,
     )
     write_ledger(resolved, path=ledger_path)
+    availability_admissions = observe_forecasts(
+        resolved,
+        availability_root=availability_root,
+        recorded_at=producer_recorded_at,
+    )
     write_summary(resolved, path=summary_path)
     resolution_quality_path.parent.mkdir(parents=True, exist_ok=True)
     resolution_quality_path.write_text(
@@ -1528,6 +1562,11 @@ def research_agent_ledger_resolve(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "resolution_quality_path": str(resolution_quality_path),
+        "learning_availability_root": str(availability_root),
+        "learning_observed_count": len(availability_admissions),
+        "learning_newly_recorded_count": sum(
+            admission.created for admission in availability_admissions
+        ),
         "forecast_count": len(resolved),
         "newly_resolved_count": after - before,
         "resolved_count": after,
@@ -1567,6 +1606,11 @@ def research_ledger_quality_audit(
         "--quality-path",
         help="Machine-readable resolution-window quality summary output path.",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     backup: bool = typer.Option(
         True,
@@ -1583,6 +1627,11 @@ def research_ledger_quality_audit(
     longer be verified, is downgraded to suspect so mining excludes it.
     Analysis-only; no execution authority.
     """
+    producer_recorded_at = _learning_producer_now()
+    availability_root = _forecast_learning_availability_root(
+        ledger_path,
+        learning_availability_root,
+    )
     forecasts, corrupt_line_count = load_ledger_with_stats(ledger_path)
     resolved_count = sum(1 for forecast in forecasts if forecast.resolved)
     backup_path: Path | None = None
@@ -1595,9 +1644,15 @@ def research_ledger_quality_audit(
     audited, quality_reports = audit_resolved_forecasts(
         forecasts,
         window_lookup=_ledger_window_lookup,
+        now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
     write_ledger(audited, path=ledger_path)
+    availability_admissions = observe_forecasts(
+        audited,
+        availability_root=availability_root,
+        recorded_at=producer_recorded_at,
+    )
     write_summary(audited, path=summary_path)
     quality_summary = summarize_resolution_quality(quality_reports)
     quality_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1617,6 +1672,11 @@ def research_ledger_quality_audit(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "quality_path": str(quality_path),
+        "learning_availability_root": str(availability_root),
+        "learning_observed_count": len(availability_admissions),
+        "learning_newly_recorded_count": sum(
+            admission.created for admission in availability_admissions
+        ),
         "backup_path": str(backup_path) if backup_path else None,
         "forecast_count": len(audited),
         "resolved_forecast_count": resolved_count,
@@ -1657,6 +1717,11 @@ def research_agent_ledger_update(
         "--summary-path",
         help="Agent score summary output path.",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     benchmark: str = typer.Option("SPY", "--benchmark"),
     horizon_days: int = typer.Option(5, "--horizon-days", min=1, max=60),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
@@ -1680,6 +1745,11 @@ def research_agent_ledger_update(
     It mutates only ledger/summary files and has no execution authority.
     """
 
+    producer_recorded_at = _learning_producer_now()
+    availability_root = _forecast_learning_availability_root(
+        ledger_path,
+        learning_availability_root,
+    )
     threshold = Decimal(alpha_threshold_pct)
     overnight_forecasts = []
     overnight_payload = _read_json_packet(overnight_packet)
@@ -1717,6 +1787,7 @@ def research_agent_ledger_update(
     resolved, quality_reports = resolve_forecasts_with_quality(
         forecasts,
         window_lookup=_ledger_window_lookup,
+        now=producer_recorded_at,
         alpha_threshold_pct=threshold,
     )
     quality_summary = summarize_resolution_quality(
@@ -1724,6 +1795,11 @@ def research_agent_ledger_update(
         unaudited_resolved_count=unaudited_before,
     )
     write_ledger(resolved, path=ledger_path)
+    availability_admissions = observe_forecasts(
+        resolved,
+        availability_root=availability_root,
+        recorded_at=producer_recorded_at,
+    )
     write_summary(resolved, path=summary_path)
     after_resolved = sum(1 for forecast in resolved if forecast.resolved)
     summary = summarize_agent_scores(resolved)
@@ -1751,6 +1827,11 @@ def research_agent_ledger_update(
         "include_mirofish": include_mirofish,
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
+        "learning_availability_root": str(availability_root),
+        "learning_observed_count": len(availability_admissions),
+        "learning_newly_recorded_count": sum(
+            admission.created for admission in availability_admissions
+        ),
         "forecast_count": len(resolved),
         "discovered_forecast_count": len(discovered_forecasts),
         "overnight_forecast_count": len(overnight_forecasts),
@@ -1849,6 +1930,11 @@ def research_hypothesis_factory(
         "--lifecycle-path",
         help="Append-only hypothesis lifecycle event ledger (never rewritten).",
     ),
+    learning_availability_root: Path | None = typer.Option(
+        None,
+        "--learning-availability-root",
+        help="Immutable point-in-time learning availability ledger root.",
+    ),
     min_sample: int = typer.Option(
         12,
         "--min-sample",
@@ -1882,6 +1968,7 @@ def research_hypothesis_factory(
         priors_path=priors_path,
         summary_path=summary_path,
         lifecycle_path=lifecycle_path,
+        availability_root=learning_availability_root,
         min_sample=min_sample,
         edge_threshold=Decimal(edge_threshold),
         require_audited_labels=require_audited_labels,
@@ -3283,7 +3370,14 @@ def research_self_heal_plan(
         output_dir=output_dir,
         safe_reverify_minutes=safe_reverify_minutes,
     )
-    if execute_safe:
+    # Owned integrity recovery is the autonomous default; `--execute-safe`
+    # additionally runs the pre-existing safe observer refreshes.
+    if execute_safe or any(
+        isinstance(signal, dict)
+        and signal.get("classification") == "recoverable_integrity"
+        and signal.get("status") == "owned_recovery_ready"
+        for signal in packet.get("signals") or []
+    ):
         packet = execute_self_heal_plan(packet, repo_root=Path.cwd())
     json_path, markdown_path = write_self_heal_plan(packet, output_dir)
     payload = dict(packet)
@@ -3796,16 +3890,47 @@ def policy_refresh_live_control(
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Refresh the tiny-live dead-man control state without submitting orders."""
-    expires_at = datetime.datetime.now(tz=datetime.timezone.utc) + datetime.timedelta(
-        hours=ttl_hours
-    )
-    written = write_live_control_state(
-        control_path,
-        frozen=False,
-        reason=reason,
-        dead_man_expires_at=expires_at,
-    )
+    with live_control_lock(control_path):
+        existing, existing_issues = load_live_control_state(control_path)
+        if (
+            existing is None
+            or existing_issues
+            or existing.get("frozen") is True
+            or existing.get("recovery_mode") == "verified_recovery"
+        ):
+            payload = {
+                "refreshed": False,
+                "frozen": (
+                    existing.get("frozen")
+                    if isinstance(existing, dict)
+                    else True
+                ),
+                "reason": (
+                    "live control refresh blocked; verified recovery is "
+                    "required to unfreeze"
+                ),
+                "control_path": str(control_path),
+            }
+            if json_output:
+                print(json.dumps(payload, indent=2))
+            else:
+                console.print(payload["reason"])
+            raise typer.Exit(1)
+        accepted_preimage_sha256 = hashlib.sha256(
+            control_path.read_bytes()
+        ).hexdigest()
+        expires_at = datetime.datetime.now(
+            tz=datetime.timezone.utc
+        ) + datetime.timedelta(hours=ttl_hours)
+        written = _write_live_control_state_locked(
+            control_path,
+            frozen=False,
+            reason=reason,
+            dead_man_expires_at=expires_at,
+            expected_preimage_sha256=accepted_preimage_sha256,
+        )
     payload = {
+        "refreshed": True,
         "frozen": False,
         "reason": reason,
         "dead_man_expires_at": expires_at.isoformat(timespec="seconds"),
@@ -3815,6 +3940,140 @@ def policy_refresh_live_control(
         print(json.dumps(payload, indent=2))
     else:
         console.print(f"Live control refreshed until {payload['dead_man_expires_at']}")
+
+
+@policy_app.command("recover-incident")
+def policy_recover_incident(
+    incident_path: Path = typer.Option(..., "--incident-path"),
+    reconciliation_path: Path = typer.Option(..., "--reconciliation-path"),
+    promotion_sync_path: Path = typer.Option(..., "--promotion-sync-path"),
+    focused_proof_path: Path = typer.Option(..., "--focused-proof-path"),
+    recovery_manifest_path: Path | None = typer.Option(None, "--recovery-manifest-path"),
+    repairer_run_id: str = typer.Option(..., "--repairer-run-id"),
+    verifier_run_id: str = typer.Option(..., "--verifier-run-id"),
+    ttl_minutes: int = typer.Option(90, "--ttl-minutes"),
+    control_path: Path = typer.Option(Path("results/policy/live_control.json"), "--control-path"),
+    receipt_dir: Path = typer.Option(Path("results/control_plane/rearm"), "--receipt-dir"),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Re-arm a frozen live-control lease from integrity-verified packets."""
+    control_absolute = control_path.resolve()
+    accepted_control_preimage_sha256: str | None = None
+    control_acceptance_issues: list[str] = []
+    with live_control_lock(control_absolute):
+        try:
+            control_preimage = control_absolute.read_bytes()
+        except OSError:
+            control_acceptance_issues.append(
+                "existing live control is not valid"
+            )
+        else:
+            control_state, control_issues = load_live_control_state(
+                control_absolute
+            )
+            unsafe_control_issues = [
+                issue
+                for issue in control_issues
+                if not issue.startswith("live control state is frozen:")
+                and not issue.startswith("dead-man expired at ")
+            ]
+            if (
+                control_state is None
+                or control_state.get("frozen") is not True
+                or not isinstance(control_state.get("reason"), str)
+                or not control_state["reason"].strip()
+                or parse_control_time(
+                    str(control_state.get("dead_man_expires_at", ""))
+                )
+                is None
+                or unsafe_control_issues
+            ):
+                control_acceptance_issues.append(
+                    "existing live control must be a valid frozen state"
+                )
+            else:
+                accepted_control_preimage_sha256 = hashlib.sha256(
+                    control_preimage
+                ).hexdigest()
+
+    if accepted_control_preimage_sha256 is None:
+        payload: dict[str, Any] = {
+            "ready": False,
+            "issues": control_acceptance_issues,
+            "can_submit_orders": False,
+        }
+    else:
+        evidence, parse_issues = load_recovery_evidence(
+            incident_path=incident_path,
+            reconciliation_path=reconciliation_path,
+            promotion_sync_path=promotion_sync_path,
+            focused_proof_path=focused_proof_path,
+            recovery_manifest_path=recovery_manifest_path,
+            repairer_run_id=repairer_run_id,
+            verifier_run_id=verifier_run_id,
+        )
+        if evidence is None:
+            payload = {
+                "ready": False,
+                "issues": list(parse_issues),
+                "can_submit_orders": False,
+            }
+        else:
+            verdict = evaluate_rearm_readiness(evidence)
+            if not verdict.ready:
+                payload = {
+                    "ready": False,
+                    "issues": list(verdict.issues),
+                    "can_submit_orders": False,
+                }
+            else:
+                try:
+                    request_authority = authority_for(
+                        ActionClass.REARM_REQUEST
+                    )
+                    issue_authority = authority_for(ActionClass.REARM_ISSUE)
+                    if (
+                        request_authority.allowed is not True
+                        or request_authority.human_required is not False
+                        or request_authority.owner_role
+                        != "reliability_controller"
+                        or issue_authority.allowed is not True
+                        or issue_authority.human_required is not False
+                        or issue_authority.owner_role
+                        != "integrity_verifier"
+                    ):
+                        raise ValueError(
+                            "rearm authority contract is unavailable"
+                        )
+                    receipt = rearm_after_verified_recovery(
+                        evidence=evidence,
+                        control_path=control_path,
+                        receipt_dir=receipt_dir,
+                        ttl_minutes=ttl_minutes,
+                        expected_control_preimage_sha256=(
+                            accepted_control_preimage_sha256
+                        ),
+                    )
+                except (OSError, ValueError) as exc:
+                    payload = {
+                        "ready": False,
+                        "issues": [str(exc)],
+                        "can_submit_orders": False,
+                    }
+                else:
+                    payload = {
+                        "ready": True,
+                        "receipt": receipt,
+                        "can_submit_orders": False,
+                    }
+    if json_output:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    elif payload["ready"]:
+        console.print(f"Verified recovery receipt: {payload['receipt']['receipt_path']}")
+    else:
+        console.print("Recovery re-arm blocked: " + "; ".join(payload["issues"]))
+    if not payload["ready"]:
+        raise typer.Exit(1)
 
 
 @policy_app.command("sync-promotion")
@@ -3828,6 +4087,11 @@ def policy_sync_promotion(
         Path("results/policy/promotion_state.json"),
         "--state-path",
         help="Promotion state consumed by the unified live gate.",
+    ),
+    output_state_path: Path | None = typer.Option(
+        None,
+        "--output-state-path",
+        help="Optional staged output; reads --state-path without replacing it.",
     ),
     envelope_path: Path = typer.Option(
         Path("config/risk_envelope.yaml"),
@@ -3843,6 +4107,11 @@ def policy_sync_promotion(
         False,
         "--ci-green/--no-ci-green",
         help="Attest that the focused test suite passed for this working tree.",
+    ),
+    generated_at: str | None = typer.Option(
+        None,
+        "--generated-at",
+        help="Optional timezone-aware deterministic generation time.",
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
@@ -3860,20 +4129,39 @@ def policy_sync_promotion(
         raise typer.BadParameter(
             f"risk envelope unusable at {envelope_path}: {'; '.join(envelope_issues)}"
         )
+    promotion_now = None
+    if generated_at is not None:
+        try:
+            promotion_now = datetime.datetime.fromisoformat(
+                generated_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            raise typer.BadParameter(
+                "--generated-at must be a timezone-aware ISO timestamp"
+            ) from None
+        if promotion_now.tzinfo is None:
+            raise typer.BadParameter(
+                "--generated-at must be a timezone-aware ISO timestamp"
+            )
+        promotion_now = promotion_now.astimezone(datetime.timezone.utc)
     tranche = envelope.tiny_live_tranche_usd
     result = sync_promotion_state_file(
         report_path,
         state_path,
+        output_state_path=output_state_path,
         tiny_live_tranche_usd=tranche,
         arm_live=arm_live,
         ci_green=ci_green,
+        now=promotion_now,
     )
+    written_state_path = output_state_path or state_path
     payload = {
         "summary": result.summary,
         "promoted": result.promoted,
         "demoted": result.demoted,
         "issues_by_sleeve": result.issues_by_sleeve,
-        "state_path": str(state_path),
+        "state_path": str(written_state_path),
+        "canonical_state_path": str(state_path),
         "report_path": str(report_path),
         "arm_live": arm_live,
         "ci_green": ci_green,
@@ -8686,6 +8974,7 @@ def run_analysis(checkpoint: bool = False):
             selections["ticker"],
             selections["analysis_date"],
             asset_type=selections["asset_type"],
+            past_context="",
         )
         # Pass callbacks to graph config for tool execution tracking
         # (LLM tracking is handled separately via LLM constructor)
@@ -8898,6 +9187,38 @@ def alpaca_check():
     console.print(table)
 
 
+def _write_reconciliation_packet(
+    output_dir: Path,
+    *,
+    stem: str,
+    packet: dict,
+) -> tuple[Path, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = _reserve_reconciliation_packet_path(output_dir, stem)
+    packet["json_path"] = str(output_path)
+    json_text = json.dumps(packet, indent=2, sort_keys=True) + "\n"
+    try:
+        _atomic_write_text(output_path, json_text)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise
+    _atomic_write_text(output_dir / "latest.json", json_text)
+    return output_path, json_text
+
+
+def _reserve_reconciliation_packet_path(output_dir: Path, stem: str) -> Path:
+    candidate = _unique_packet_path(output_dir, stem)
+    for index in range(1000):
+        try:
+            descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            candidate = output_dir / f"{stem}-{index + 1:03d}.json"
+            continue
+        os.close(descriptor)
+        return candidate
+    raise RuntimeError(f"could not reserve immutable reconciliation packet for {stem}")
+
+
 @alpaca_app.command("reconcile-orcl-incident")
 def alpaca_reconcile_orcl_incident(
     order_packet_paths: list[Path] = typer.Argument(None),
@@ -8940,15 +9261,15 @@ def alpaca_reconcile_orcl_incident(
         "analysis_only": True,
         "can_submit_orders": False,
         "execution_authority": "none",
+        "broker_write_calls": 0,
         "packet_discovery_issues": discovery_issues,
         **payload,
     }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"orcl-reconciliation-{generated_at:%Y%m%d-%H%M%S}.json"
-    packet["json_path"] = str(output_path)
-    json_text = json.dumps(packet, indent=2, sort_keys=True)
-    output_path.write_text(json_text, encoding="utf-8")
-    (output_dir / "latest.json").write_text(json_text, encoding="utf-8")
+    output_path, json_text = _write_reconciliation_packet(
+        output_dir,
+        stem=f"orcl-reconciliation-{generated_at:%Y%m%d-%H%M%S}",
+        packet=packet,
+    )
     if json_output:
         typer.echo(json_text)
         return
@@ -8958,6 +9279,53 @@ def alpaca_reconcile_orcl_incident(
     )
     console.print(f"open_orders={len(packet['open_orcl_orders'])}")
     console.print(f"recent_fills={len(packet['recent_orcl_fills'])}")
+    console.print(f"packet={output_path}")
+
+
+@alpaca_app.command("reconcile-symbol-incident")
+def alpaca_reconcile_symbol_incident(
+    symbol: str = typer.Option(..., "--symbol"),
+    packet_paths: list[Path] = typer.Option(
+        [],
+        "--packet-path",
+        help="Captured packet JSON to reconcile. Repeat for multiple packets.",
+    ),
+    expected_qty: str | None = typer.Option(None, "--expected-qty"),
+    output_dir: Path = typer.Option(
+        Path("results/control_plane/reconciliation"),
+        "--output-dir",
+        help="Directory for the read-only symbol reconciliation packet.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Build read-only broker reconciliation evidence for one symbol."""
+
+    reconciliation = reconcile_symbol_incident(
+        symbol=symbol,
+        packet_paths=packet_paths,
+        live_client=_alpaca_live_client(),
+        expected_qty=expected_qty,
+    )
+    generated_at = datetime.datetime.now(tz=datetime.timezone.utc)
+    packet = {
+        "schema_version": 1,
+        "kind": "symbol_broker_reconciliation",
+        "generated_at": generated_at.isoformat(timespec="seconds"),
+        "read_only": True,
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        **asdict(reconciliation),
+    }
+    output_path, json_text = _write_reconciliation_packet(
+        output_dir,
+        stem=f"symbol-reconciliation-{generated_at:%Y%m%d-%H%M%S}",
+        packet=packet,
+    )
+    if json_output:
+        typer.echo(json_text)
+        return
+    console.print(f"symbol={packet['symbol']} matched={packet['matched']}")
     console.print(f"packet={output_path}")
 
 
@@ -9093,163 +9461,24 @@ def alpaca_submit(
             raise typer.Exit(1)
         return
 
-    if not config.paper_enabled or not config.live_mirror_enabled:
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="refused",
-            reason=(
-                "TRADINGAGENTS_ALPACA_PAPER_ENABLED and "
-                "TRADINGAGENTS_ALPACA_LIVE_MIRROR_ENABLED are not both true"
-            ),
-            planned_orders={"requested": [order.__dict__ for order in orders]},
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(
-            "[red]Refusing to submit. Set "
-            "TRADINGAGENTS_ALPACA_PAPER_ENABLED=true and "
-            "TRADINGAGENTS_ALPACA_LIVE_MIRROR_ENABLED=true first.[/red]"
-        )
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    policy_issues = validate_live_entry_allowed(
-        run_id=run_id,
-        now=_alpaca_policy_now(),
-    )
-    if policy_issues:
-        for issue in policy_issues:
-            console.print(f"[red]Blocked {issue.ticket_id}: {issue.reason}[/red]")
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="blocked",
-            reason="legacy one-time live entry policy blocked the run",
-            planned_orders={"requested": [order.__dict__ for order in orders]},
-            issues=_issue_dicts(policy_issues),
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    paper_client, live_client = _alpaca_clients()
-    live_account = live_client.get_account()
-    live_positions_snapshot = live_client.list_positions()
-    current_daily_loss_usd, current_drawdown_pct = _account_circuit_breaker_values(
-        live_account
-    )
-    existing_ids = (
-        paper_client.list_open_client_order_ids()
-        | live_client.list_open_client_order_ids()
-    )
-    result = build_order_pairs(
-        orders,
-        config=config,
-        run_id=run_id,
-        existing_open_client_order_ids=existing_ids,
-    )
-    if not result.accepted:
-        _print_pair_result(result)
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="blocked",
-            reason="paper/live mirror planning produced no accepted orders",
-            planned_orders=_serialize_pair_result(result),
-            issues=[*_issue_dicts(result.rejected), *_issue_dicts(result.skipped)],
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    live_submit_issues = validate_supervisor_live_submit_allowed(
-        actions=[
-            HourlySupervisorAction(
-                action="buy",
-                symbol=pair.live.order.get("symbol", ""),
-                side=pair.live.order.get("side", "buy"),
-                notional=Decimal(str(pair.live.order.get("notional", "0"))),
-                limit_price=Decimal(str(pair.live.order.get("limit_price", "0"))),
-                order_type=pair.live.order.get("type", "limit"),
-                reason="legacy alpaca submit live mirror path",
-                account="live",
-                execution_mode="live_now",
-                sleeve="legacy-live-mirror",
-            )
-            for pair in result.accepted
-        ],
-        current_live_exposure=live_exposure_from_positions(live_positions_snapshot),
-        current_daily_loss_usd=current_daily_loss_usd,
-        current_drawdown_pct=current_drawdown_pct,
-        live_account=live_account,
-        live_positions=live_positions_snapshot,
-    )
-    if live_submit_issues:
-        _print_pair_result(result)
-        for issue in live_submit_issues:
-            console.print(f"[red]Blocked {issue.ticket_id}: {issue.reason}[/red]")
-        packet = _manual_submit_packet_base(
-            run_id=run_id,
-            account_mode="paper_live_mirror",
-            account_scope=["paper", "live"],
-            status="blocked",
-            reason="unified live-submit gate blocked the legacy live mirror path",
-            planned_orders=_serialize_pair_result(result),
-            issues=_issue_dicts(live_submit_issues),
-        )
-        packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
-        console.print(f"Packet: {packet_path}")
-        raise typer.Exit(1)
-
-    report = execute_order_pairs(
-        result.accepted,
-        paper_client=paper_client,
-        live_client=live_client,
-        live_guard_approved=True,
-    )
-    _print_pair_result(result)
-    for submitted in report.submitted:
-        console.print(
-            "[green]Submitted pair "
-            f"{submitted.pair.paper.ticket_id}: "
-            f"paper={submitted.paper_response.get('id')} "
-            f"live={submitted.live_response.get('id')}[/green]"
-        )
-    for issue in report.failed:
-        console.print(f"[red]Failed {issue.ticket_id}: {issue.reason}[/red]")
-    status = "partial_failure" if report.failed else "submitted"
     packet = _manual_submit_packet_base(
         run_id=run_id,
-        account_mode="paper_live_mirror",
-        account_scope=["paper", "live"],
-        status=status,
+        account_mode="live_submit_disabled",
+        account_scope=["live"],
+        status="refused",
         reason=(
-            "paper/live mirror submit had broker failures"
-            if report.failed
-            else "paper/live mirror orders submitted"
+            "manual live submission is disabled: an authorized normal live intent "
+            "and its activation receipt must be issued outside this CLI path"
         ),
-        planned_orders=_serialize_pair_result(result),
-        submitted=[
-            {
-                "ticket_id": submitted.pair.paper.ticket_id,
-                "paper_response": submitted.paper_response,
-                "live_response": submitted.live_response,
-            }
-            for submitted in report.submitted
-        ],
-        failed=_issue_dicts(report.failed),
-        estimated_spent_this_run_by_account=_pair_submit_spend_summary(
-            result.accepted,
-            report.failed,
-        ),
+        planned_orders={"requested": [order.__dict__ for order in orders]},
     )
     packet_path = _write_manual_alpaca_submit_packet(packet, log_dir)
+    console.print(
+        "[red]Refusing to submit: an authorized normal live intent and activation "
+        "receipt must be independently issued outside this CLI path.[/red]"
+    )
     console.print(f"Packet: {packet_path}")
-    if report.failed:
-        raise typer.Exit(1)
+    raise typer.Exit(1)
 
 
 @alpaca_app.command("pullback-support-paper")
@@ -11104,6 +11333,28 @@ def alpaca_supervise_hourly(
                         )
             if decision.issues:
                 live_actions = []
+            if live_actions:
+                decision = replace(
+                    decision,
+                    decision="blocked",
+                    material=True,
+                    reason=(
+                        "hourly supervisor live submission requires an independently "
+                        "issued authorized normal live intent and activation receipt"
+                    ),
+                    issues=[
+                        *decision.issues,
+                        OrderIssue(
+                            "normal-live-intent",
+                            (
+                                "live actions are no-submit until the exact authorized "
+                                "normal live intent and activation receipt are supplied "
+                                "outside this CLI path"
+                            ),
+                        ),
+                    ],
+                )
+                live_actions = []
             tiny_live_guard = acquire_tiny_live_operational_guard(
                 live_actions=live_actions,
                 live_client=live_client,
@@ -11124,14 +11375,6 @@ def alpaca_supervise_hourly(
                 tiny_live_guard.lock.path
                 if tiny_live_guard.lock and tiny_live_guard.lock.acquired
                 else None
-            )
-            rate_envelope, _rate_envelope_issues = load_risk_envelope(
-                "config/risk_envelope.yaml"
-            )
-            rate_limit_enabled = (
-                rate_envelope is not None
-                and rate_envelope.max_live_orders_per_window is not None
-                and rate_envelope.live_order_window_minutes is not None
             )
             submit_issues = []
             reconciled_orders = []
@@ -11161,13 +11404,10 @@ def alpaca_supervise_hourly(
                             if action.account.lower() == "paper":
                                 submitted.append(paper_client.submit_order(payload))
                             else:
-                                submitted.append(live_client.submit_order(payload))
-                                if rate_limit_enabled:
-                                    record_live_order_submission(
-                                        "results/policy/live_order_rate_state.json",
-                                        client_order_id=client_order_id,
-                                        now=decision.generated_at,
-                                    )
+                                raise RuntimeError(
+                                    "hourly CLI live submission is hard-disabled without "
+                                    "an independently issued normal live intent"
+                                )
                         except Exception as exc:  # noqa: BLE001 - preserve packet evidence for broker failures.
                             classification = classify_alpaca_submit_error(
                                 exc,
@@ -11326,8 +11566,8 @@ def alpaca_supervise_hourly(
             "The bot may choose live order size inside the risk envelope caps."
             if live_budget_mode == "autonomous_with_caps"
             else (
-                "The bot may choose live order size without a repo dollar cap; broker buying power and live safety gates still apply."
-                if live_budget_mode == "autonomous_uncapped"
+                "Live budget is blocked because the configured mode is invalid or retired."
+                if live_budget_mode == "invalid_or_retired"
                 else "Live budget is not autonomous until config/risk_envelope.yaml opts in."
             )
         ),

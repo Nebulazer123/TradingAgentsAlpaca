@@ -42,6 +42,10 @@ UTC = datetime.timezone.utc
 POLICY_STOP_FLOOR = "policy_stop_floor"
 POLICY_TIME_STOP = "policy_time_stop"
 POLICY_REASON_CODES = frozenset({POLICY_STOP_FLOOR, POLICY_TIME_STOP})
+POLICY_REASON_RULE_IDS: dict[str, frozenset[str]] = {
+    POLICY_STOP_FLOOR: frozenset({"hard_stop", "catastrophic_stop"}),
+    POLICY_TIME_STOP: frozenset({"time_stop"}),
+}
 
 
 @dataclass(frozen=True)

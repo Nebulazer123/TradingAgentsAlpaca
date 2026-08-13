@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "benchmark_symbol": "SPY",
+  "holding_sessions": 5,
+  "commission_bps_per_side": "0",
+  "half_spread_bps_per_side": "5",
+  "slippage_bps_per_side": "5",
+  "round_trip_sides": 2,
+  "analysis_only": true,
+  "execution_authority": "none",
+  "can_submit_orders": false
+}

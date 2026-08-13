@@ -211,6 +211,74 @@ def test_reconcile_latest_packet_live_orders_blocks_count_only_submission_eviden
     ]
 
 
+def test_reconcile_latest_packet_live_orders_blocks_explicit_account_mismatch():
+    packet = {
+        "actions": [
+            {
+                "symbol": "AMZN",
+                "side": "buy",
+                "account": "live",
+                "idempotency_key": "ta-tiny-account-check",
+            }
+        ],
+        "submitted": [
+            {
+                "client_order_id": "ta-tiny-account-check",
+                "symbol": "AMZN",
+                "side": "buy",
+                "type": "limit",
+                "notional": "50.00",
+                "limit_price": "208.41",
+            }
+        ],
+    }
+
+    result = reconcile_latest_packet_live_orders(
+        packet,
+        order_lookup=lambda _: {
+            "client_order_id": "ta-tiny-account-check",
+            "symbol": "AMZN",
+            "side": "buy",
+            "type": "limit",
+            "notional": "50.00",
+            "limit_price": "208.41",
+            "account": "paper",
+        },
+    )
+
+    assert result.matched is False
+    assert result.issues == [
+        "previous live order account mismatch for ta-tiny-account-check: expected live got paper"
+    ]
+
+
+def test_reconcile_latest_packet_live_orders_deduplicates_identical_ids():
+    order = {
+        "client_order_id": "ta-tiny-dedup",
+        "symbol": "AMZN",
+        "side": "buy",
+        "type": "limit",
+        "notional": "50.00",
+        "limit_price": "208.41",
+    }
+    packet = {
+        "actions": [
+            {
+                "symbol": "AMZN",
+                "side": "buy",
+                "account": "live",
+                "idempotency_key": "ta-tiny-dedup",
+            }
+        ],
+        "submitted": [order, dict(order)],
+    }
+
+    result = reconcile_latest_packet_live_orders(packet, order_lookup=lambda _: dict(order))
+
+    assert result.matched is True
+    assert result.checked_client_order_ids == ["ta-tiny-dedup"]
+
+
 def test_clock_guard_blocks_large_skew():
     ok = evaluate_clock_guard(
         local_time=datetime.datetime(2026, 6, 1, 15, 0, tzinfo=UTC),

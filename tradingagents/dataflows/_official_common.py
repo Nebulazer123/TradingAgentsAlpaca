@@ -56,6 +56,22 @@ class OfficialDataError(RuntimeError):
     """Raised when an official data source cannot produce an evidence packet."""
 
 
+class RecoverableDataflowError(OfficialDataError):
+    """A source failure for which the decision router may try another provider."""
+
+
+class DataUnavailableError(RecoverableDataflowError):
+    """A valid request produced no usable evidence from a configured source."""
+
+
+class VendorNotConfiguredError(DataUnavailableError, ValueError):
+    """An optional provider is unavailable because its configuration is absent."""
+
+
+class DataTransportError(RecoverableDataflowError):
+    """A source request exhausted its transport-level recovery policy."""
+
+
 @dataclass(frozen=True)
 class TextFetchResult:
     text: str
@@ -214,13 +230,13 @@ def record_connector_health(
         write_connector_health()
 
 
-def _circuit_open_error(connector: str) -> OfficialDataError | None:
+def _circuit_open_error(connector: str) -> DataTransportError | None:
     state = _CONNECTOR_CIRCUITS.get(connector)
     if not state:
         return None
     open_until = float(state.get("opened_until") or 0.0)
     if open_until > time.time():
-        return OfficialDataError(f"{connector} connector circuit is open")
+        return DataTransportError(f"{connector} connector circuit is open")
     return None
 
 
@@ -331,6 +347,10 @@ def _request_json(
     circuit_cooldown_seconds: float = DEFAULT_CIRCUIT_COOLDOWN_SECONDS,
     sleep_func: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
+    normalized_method = method.upper()
+    if normalized_method not in {"GET", "POST"}:
+        raise OfficialDataError("JSON response helper supports GET and POST only")
+
     connector = _connector_key(url, connector_name)
     open_error = _circuit_open_error(connector)
     if open_error is not None:
@@ -344,7 +364,7 @@ def _request_json(
         started = time.perf_counter()
         rate_limited = False
         try:
-            if method.upper() == "POST":
+            if normalized_method == "POST":
                 response = client.post(
                     url,
                     json=body,
@@ -412,7 +432,7 @@ def _request_json(
                 threshold=circuit_failure_threshold,
                 cooldown_seconds=circuit_cooldown_seconds,
             )
-            raise OfficialDataError(last_error) from exc
+            raise DataTransportError(last_error) from exc
         except ValueError as exc:
             last_error = "official source returned non-JSON data"
             record_connector_health(
@@ -427,7 +447,7 @@ def _request_json(
                 threshold=circuit_failure_threshold,
                 cooldown_seconds=circuit_cooldown_seconds,
             )
-            raise OfficialDataError(last_error) from exc
+            raise DataTransportError(last_error) from exc
         _record_circuit_success(connector)
         record_connector_health(
             connector,
@@ -445,7 +465,7 @@ def _request_json(
         threshold=circuit_failure_threshold,
         cooldown_seconds=circuit_cooldown_seconds,
     )
-    raise OfficialDataError(last_error)
+    raise DataTransportError(last_error)
 
 
 def _response_text(response: Any) -> str:
@@ -566,7 +586,7 @@ def _request_text_response(
                 threshold=circuit_failure_threshold,
                 cooldown_seconds=circuit_cooldown_seconds,
             )
-            raise OfficialDataError(last_error) from exc
+            raise DataTransportError(last_error) from exc
 
         _record_circuit_success(connector)
         record_connector_health(
@@ -587,7 +607,7 @@ def _request_text_response(
         threshold=circuit_failure_threshold,
         cooldown_seconds=circuit_cooldown_seconds,
     )
-    raise OfficialDataError(last_error)
+    raise DataTransportError(last_error)
 
 
 def get_text_response(
@@ -659,7 +679,7 @@ def env_value(name: str, explicit: str | None = None, *, required: bool = False)
     if value:
         return value
     if required:
-        raise OfficialDataError(f"{name} is missing")
+        raise VendorNotConfiguredError(f"{name} is missing")
     return None
 
 
@@ -893,10 +913,8 @@ def safe_fetch_evidence(
 ) -> SourceEvidencePacket:
     try:
         return fetcher()
-    except OfficialDataError as exc:
+    except RecoverableDataflowError as exc:
         reason = _sanitize_reason(str(exc))
-    except Exception as exc:  # pragma: no cover - exact network errors vary by source
-        reason = f"{type(exc).__name__}: source fetch failed"
     return blocked_evidence_packet(
         source_name=source_name,
         evidence_type=evidence_type,
@@ -926,11 +944,8 @@ def _cache_age_seconds(path: Path, *, now: datetime.datetime | None = None) -> f
 def _load_cached_packet(path: Path) -> SourceEvidencePacket | None:
     if not path.exists():
         return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return SourceEvidencePacket.model_validate(payload)
-    except (OSError, json.JSONDecodeError, ValueError):
-        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return SourceEvidencePacket.model_validate(payload)
 
 
 def _with_cache_state(
@@ -982,12 +997,16 @@ def cached_safe_fetch_evidence(
     cache_dir: str | Path = "results/official_data_cache",
     now: datetime.datetime | None = None,
     allow_stale_on_error: bool = True,
+    cached_packet_validator: Callable[[SourceEvidencePacket], bool] | None = None,
 ) -> SourceEvidencePacket:
     path = _cache_path(cache_dir, cache_key)
     cached = _load_cached_packet(path)
+    cached_is_usable = cached is not None and (
+        cached_packet_validator is None or cached_packet_validator(cached)
+    )
     if cached is not None and path.exists():
         age_seconds = _cache_age_seconds(path, now=now)
-        if age_seconds <= ttl_seconds:
+        if age_seconds <= ttl_seconds and cached_is_usable:
             record_connector_health(
                 source_name,
                 success=True,
@@ -1004,10 +1023,8 @@ def cached_safe_fetch_evidence(
 
     try:
         packet = fetcher()
-    except OfficialDataError as exc:
+    except RecoverableDataflowError as exc:
         reason = _sanitize_reason(str(exc))
-    except Exception as exc:  # pragma: no cover - exact source failures vary.
-        reason = f"{type(exc).__name__}: source fetch failed"
     else:
         write_official_evidence_cache(packet, cache_key=cache_key, cache_dir=cache_dir)
         record_connector_health(
@@ -1023,7 +1040,7 @@ def cached_safe_fetch_evidence(
             ttl_seconds=ttl_seconds,
         )
 
-    if allow_stale_on_error and cached is not None and path.exists():
+    if allow_stale_on_error and cached_is_usable and cached is not None and path.exists():
         record_connector_health(
             source_name,
             success=False,

@@ -12,6 +12,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 
 from ._official_common import (
+    DataTransportError,
     OfficialDataError,
     evidence_packet,
     get_text,
@@ -76,10 +77,10 @@ def _parse_rss(
     try:
         root = ET.fromstring(text)
     except ET.ParseError as exc:
-        raise OfficialDataError("Google News RSS returned invalid XML") from exc
+        raise DataTransportError("Google News RSS returned invalid XML") from exc
     channel = root.find("channel")
     if channel is None:
-        raise OfficialDataError("Google News RSS response has no channel")
+        raise DataTransportError("Google News RSS response has no channel")
     start = _parse_date_bound(start_date, end_of_day=False)
     end = _parse_date_bound(end_date, end_of_day=True)
     raw_items = []
@@ -125,6 +126,8 @@ def fetch_google_news_rss(
     end_date: str | None = None,
     session: Any | None = None,
 ) -> Any:
+    _parse_date_bound(start_date, end_of_day=False)
+    _parse_date_bound(end_date, end_of_day=True)
     params = {"hl": hl, "gl": gl, "ceid": ceid}
     url = BASE_URL
     subject = "top_stories"

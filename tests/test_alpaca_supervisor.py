@@ -3,7 +3,13 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
-from tradingagents.brokers.alpaca import AlpacaExecutionConfig
+import pytest
+
+from tradingagents.brokers.alpaca import (
+    AlpacaExecutionConfig,
+    AlpacaRestClient,
+    AlpacaSettings,
+)
 from tradingagents.brokers.alpaca_supervisor import (
     CandidateSignal,
     HourlySupervisorAction,
@@ -39,6 +45,7 @@ from tradingagents.brokers.alpaca_supervisor import (
     render_premarket_brief_markdown,
     serialize_hourly_decision,
     should_notify_supervisor,
+    submit_authorized_normal_live_order,
     supervisor_issue_category,
     supervisor_live_client_order_id,
     validate_hourly_supervisor_actions,
@@ -59,6 +66,7 @@ from tradingagents.brokers.supervisor import session as supervisor_session
 from tradingagents.brokers.supervisor import sizing as supervisor_sizing
 from tradingagents.brokers.supervisor import types as supervisor_types
 from tradingagents.evals.email_clarity import evaluate_email_clarity
+from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 
 def test_candidate_helpers_are_extracted_but_legacy_facade_stays_compatible():
@@ -103,6 +111,131 @@ def test_candidate_helpers_are_extracted_but_legacy_facade_stays_compatible():
         supervisor_overnight.validate_overnight_plan_against_candidates
         is validate_overnight_plan_against_candidates
     )
+
+
+def test_supervisor_forwards_the_identical_normal_intent_receipt_and_admission_to_live_client(
+    tmp_path,
+    monkeypatch,
+):
+    from tests.test_alpaca_execution import _normal_live_intent
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    intent = _normal_live_intent()
+    receipt = NormalLiveActivationReceipt(
+        activation_prepare_id="prepare",
+        activation_receipt_id="receipt",
+        intent_full_sha256="a" * 64,
+        canonical_before_sha256="b" * 64,
+        canonical_after_sha256="c" * 64,
+        state={},
+        created=True,
+        status="activated",
+    )
+    class _FakeSession:
+        pass
+
+    live_client = AlpacaRestClient(
+        AlpacaSettings(
+            api_key="test-key",
+            secret_key="test-secret",
+            paper=False,
+            base_url="https://api.alpaca.markets",
+        ),
+        session=_FakeSession(),
+    )
+    call = None
+
+    def capture_submit(self, order, **kwargs):
+        nonlocal call
+        call = (order, kwargs)
+        return {"id": "live-order"}
+
+    monkeypatch.setattr(AlpacaRestClient, "submit_order", capture_submit)
+    sentinel_admission = supervisor_module.NormalLiveSubmitAdmission(
+        intent_full_sha256="a" * 64,
+        issued_at="2026-07-28T12:00:00+00:00",
+        expires_at="2026-07-28T12:01:00+00:00",
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_issue_normal_live_submit_risk_metrics",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_preflight_normal_live_submit_local_prerequisites",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        supervisor_module,
+        "_issue_normal_live_submit_admission",
+        lambda *_args, **_kwargs: sentinel_admission,
+    )
+
+    assert submit_authorized_normal_live_order(
+        live_client=live_client,
+        authorized_normal_trade_intent=intent,
+        activation_receipt=receipt,
+        risk_envelope_path=(tmp_path / "risk.yaml").resolve(),
+        promotion_state_path=(tmp_path / "promotion.json").resolve(),
+        control_state_path=(tmp_path / "control.json").resolve(),
+        order_rate_state_path=(tmp_path / "rate.json").resolve(),
+        decision_evidence={},
+    ) == {"id": "live-order"}
+    order, kwargs = call
+    assert order == {
+        "symbol": intent.symbol,
+        "side": intent.side,
+        "type": "limit",
+        "time_in_force": "day",
+        "notional": intent.notional_usd,
+        "limit_price": intent.limit_price,
+        "client_order_id": intent.client_order_id,
+    }
+    assert kwargs["authorized_normal_trade_intent"] is intent
+    assert kwargs["activation_receipt"] is receipt
+    assert kwargs["supervisor_admission"].intent_full_sha256
+
+
+def test_supervisor_rejects_an_arbitrary_live_writer_before_issuing_admission(tmp_path):
+    """A duck-typed writer cannot obtain the supervisor final-gate artifact."""
+
+    class _ArbitraryWriter:
+        def __init__(self):
+            self.called = False
+
+        def submit_order(self, _order, **_kwargs):
+            self.called = True
+            return {"id": "forged"}
+
+    from tests.test_alpaca_execution import _normal_live_intent
+
+    intent = _normal_live_intent()
+    receipt = NormalLiveActivationReceipt(
+        activation_prepare_id="prepare",
+        activation_receipt_id="receipt",
+        intent_full_sha256="a" * 64,
+        canonical_before_sha256="b" * 64,
+        canonical_after_sha256="c" * 64,
+        state={},
+        created=True,
+        status="activated",
+    )
+    writer = _ArbitraryWriter()
+
+    with pytest.raises(ValueError, match="owned AlpacaRestClient"):
+        submit_authorized_normal_live_order(
+            live_client=writer,
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            risk_envelope_path=(tmp_path / "risk.yaml").resolve(),
+            promotion_state_path=(tmp_path / "promotion.json").resolve(),
+            control_state_path=(tmp_path / "control.json").resolve(),
+            order_rate_state_path=(tmp_path / "rate.json").resolve(),
+        decision_evidence={},
+        )
+
+    assert writer.called is False
 
 
 def test_extracted_hourly_packet_io_accepts_injected_facade_callbacks(tmp_path):

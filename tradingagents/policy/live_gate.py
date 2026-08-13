@@ -3,18 +3,36 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from tradingagents.brokers.alpaca import OrderIssue
-from tradingagents.policy.exit_policy import POLICY_REASON_CODES
-from tradingagents.policy.live_control import load_live_control_state
+from tradingagents.execution.authorized_normal_trade_intent import (
+    AuthorizedNormalTradeIntent,
+)
+from tradingagents.policy.decision_authority import (
+    POLICY_EXIT_RULE_IDS,
+    resolve_exit_authority,
+)
+from tradingagents.policy.live_control import (
+    load_live_control_state,
+    verify_pending_normal_live_submission_commitment,
+)
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
+from tradingagents.policy.strategy_promotion_sync import (
+    NormalLiveActivationReceipt,
+    verify_normal_live_activation_receipt,
+)
+from tradingagents.strategy.promotion_evidence import StrategyPromotionEvidence
+
+_UNSET = object()
+_AUTONOMOUS_PROMOTION_MAX_AGE = datetime.timedelta(days=7)
 
 STRICT_ALLOWED_LOSS_EXIT_REASONS = frozenset(
     {
@@ -25,7 +43,7 @@ STRICT_ALLOWED_LOSS_EXIT_REASONS = frozenset(
         "portfolio_exposure_limit",
         "user_manual_override",
     }
-) | POLICY_REASON_CODES
+)
 
 LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
     "symbol",
@@ -54,22 +72,22 @@ LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
     "blocked_reasons",
 )
 
-POLICY_RULE_LOSS_EXIT_REVIEW_REQUIRED_FIELDS = (
+POLICY_LOSS_EXIT_TEXT_FIELDS = (
     "symbol",
     "side",
     "decision_id",
+    "allowed_exit_reason",
+    "allowed_exit_reason_source",
+    "exit_policy_rule",
+    "exit_policy_rationale",
+    "evidence_generated_at",
+)
+
+POLICY_LOSS_EXIT_NUMERIC_FIELDS = (
     "current_price",
     "average_entry_price",
     "estimated_realized_loss",
     "unrealized_pnl_percent",
-    "allowed_exit_reason",
-    "allowed_exit_reason_source",
-    "policy_rule_exit",
-    "exit_policy_rule",
-    "exit_policy_rationale",
-    "evidence_generated_at",
-    "allowed",
-    "blocked_reasons",
 )
 
 
@@ -78,6 +96,10 @@ class LiveGateResult:
     allowed: bool
     issues: list[OrderIssue] = field(default_factory=list)
     checks: dict[str, bool] = field(default_factory=dict)
+
+
+class LiveGateError(ValueError):
+    """A malformed or unbound autonomous authority proof was supplied."""
 
 
 def _action_value(action: Any, name: str, default: Any = None) -> Any:
@@ -198,16 +220,7 @@ def _review_from_action_or_decision(
 
 def _missing_review_fields(review: Mapping[str, Any]) -> list[str]:
     missing = []
-    reason = str(review.get("allowed_exit_reason") or "")
-    policy_rule_review = (
-        review.get("policy_rule_exit") is True and reason in POLICY_REASON_CODES
-    )
-    required_fields = (
-        POLICY_RULE_LOSS_EXIT_REVIEW_REQUIRED_FIELDS
-        if policy_rule_review
-        else LOSS_EXIT_REVIEW_REQUIRED_FIELDS
-    )
-    for review_field in required_fields:
+    for review_field in LOSS_EXIT_REVIEW_REQUIRED_FIELDS:
         value = review.get(review_field)
         if review_field == "blocked_reasons":
             if value is None:
@@ -215,14 +228,167 @@ def _missing_review_fields(review: Mapping[str, Any]) -> list[str]:
             continue
         if value in (None, "", []):
             missing.append(review_field)
-    if not policy_rule_review:
-        source_packet_ids = review.get("source_packet_ids")
-        if (
-            (not isinstance(source_packet_ids, list) or not source_packet_ids)
-            and "source_packet_ids" not in missing
-        ):
-            missing.append("source_packet_ids")
+    source_packet_ids = review.get("source_packet_ids")
+    if (
+        (not isinstance(source_packet_ids, list) or not source_packet_ids)
+        and "source_packet_ids" not in missing
+    ):
+        missing.append("source_packet_ids")
     return missing
+
+
+def _is_policy_exit_claim(review: Mapping[str, Any]) -> bool:
+    reason = review.get("allowed_exit_reason")
+    return (
+        isinstance(reason, str) and reason in POLICY_EXIT_RULE_IDS
+        or (
+            "policy_rule_exit" in review
+            and review.get("policy_rule_exit") is not False
+        )
+    )
+
+
+def _empty_sequence_issue(
+    review: Mapping[str, Any],
+    field_name: str,
+    *,
+    optional: bool,
+) -> str | None:
+    if field_name not in review:
+        return None if optional else f"{field_name} is missing"
+    value = review.get(field_name)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return f"{field_name} must be an empty sequence"
+    if value:
+        return f"{field_name} must be empty"
+    return None
+
+
+def _finite_policy_decimal(value: Any) -> Decimal | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _policy_field_issues(review: Mapping[str, Any]) -> list[str]:
+    issues: list[str] = []
+    for field_name in POLICY_LOSS_EXIT_TEXT_FIELDS:
+        value = review.get(field_name)
+        if not isinstance(value, str) or not value.strip():
+            issues.append(f"{field_name} must be a non-empty string")
+
+    decimals: dict[str, Decimal] = {}
+    for field_name in POLICY_LOSS_EXIT_NUMERIC_FIELDS:
+        value = _finite_policy_decimal(review.get(field_name))
+        if value is None:
+            issues.append(f"{field_name} must be a finite decimal value")
+        else:
+            decimals[field_name] = value
+    if decimals.get("current_price", Decimal("0")) <= Decimal("0"):
+        issues.append("current_price must be greater than zero")
+    if decimals.get("average_entry_price", Decimal("0")) <= Decimal("0"):
+        issues.append("average_entry_price must be greater than zero")
+    if (
+        "current_price" in decimals
+        and "average_entry_price" in decimals
+        and decimals["current_price"] >= decimals["average_entry_price"]
+    ):
+        issues.append("current_price must be below average_entry_price for a policy loss exit")
+    if decimals.get("estimated_realized_loss", Decimal("0")) >= Decimal("0"):
+        issues.append("estimated_realized_loss must be below zero")
+    if decimals.get("unrealized_pnl_percent", Decimal("0")) >= Decimal("0"):
+        issues.append("unrealized_pnl_percent must be below zero")
+
+    for field_name, optional in (("blocked_reasons", False), ("blockers", True)):
+        issue = _empty_sequence_issue(review, field_name, optional=optional)
+        if issue is not None:
+            issues.append(issue)
+    return issues
+
+
+def _parse_evidence_generated_at(value: Any) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return parsed.astimezone(datetime.timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _review_binding_and_freshness_issues(
+    action: Any,
+    review: Mapping[str, Any],
+    *,
+    now: datetime.datetime | None,
+) -> list[str]:
+    issues: list[str] = []
+    action_decision_id, action_client_order_id, action_symbol = _current_action_identity(action)
+    review_decision_id = (
+        review.get("decision_id") if isinstance(review.get("decision_id"), str) else ""
+    )
+    if action_decision_id and review_decision_id != action_decision_id:
+        issues.append("decision_id does not match current action")
+    review_symbol = review.get("symbol") if isinstance(review.get("symbol"), str) else ""
+    if action_symbol and review_symbol.upper() != action_symbol:
+        issues.append("symbol does not match current action")
+    action_side = (
+        "sell" if _is_sell_action(action) else str(_action_value(action, "side", "")).lower()
+    )
+    review_side = review.get("side") if isinstance(review.get("side"), str) else ""
+    if action_side and review_side.lower() != action_side:
+        issues.append("side does not match current action")
+    if action_client_order_id:
+        review_order_id = review.get("client_order_id") or review.get("proposed_order_id") or ""
+        if not isinstance(review_order_id, str):
+            review_order_id = ""
+        if review_order_id and review_order_id != action_client_order_id:
+            issues.append("client_order_id/proposed_order_id does not match current action")
+
+    parsed = _parse_evidence_generated_at(review.get("evidence_generated_at"))
+    if parsed is None:
+        issues.append("evidence_generated_at is not an ISO timestamp")
+    elif now is not None:
+        reference_now = now.astimezone(datetime.timezone.utc)
+        age = reference_now - parsed
+        if age < datetime.timedelta(0) or age > datetime.timedelta(hours=6):
+            issues.append("loss_exit_review is stale for current submit")
+    return issues
+
+
+def _policy_loss_exit_review_issues(
+    action: Any,
+    review: Mapping[str, Any],
+    *,
+    now: datetime.datetime | None,
+) -> list[str]:
+    issues = _policy_field_issues(review)
+    if not issues:
+        policy_review = dict(review)
+        # The live contract makes blockers optional, but the shared authority
+        # resolver validates it when present. Normalize absence to its only safe
+        # value so the final gate can still require the resolver's verdict.
+        policy_review.setdefault("blockers", [])
+        verdict = resolve_exit_authority(
+            supervisor_review=policy_review,
+            advisory_analysis=None,
+        )
+        if not (
+            verdict.allowed is True
+            and verdict.authority_source == "pre_registered_policy_rule"
+        ):
+            issues.append(f"policy exit authority denied: {verdict.reason}")
+    issues.extend(_review_binding_and_freshness_issues(action, review, now=now))
+    return sorted(set(issues))
 
 
 def _current_action_identity(action: Any) -> tuple[str, str, str]:
@@ -245,44 +411,20 @@ def _loss_exit_review_issues(
 ) -> list[str]:
     if review is None:
         return ["loss_exit_review is missing"]
+    if _is_policy_exit_claim(review):
+        return _policy_loss_exit_review_issues(action, review, now=now)
     issues = _missing_review_fields(review)
     if review.get("allowed") is not True:
         issues.append("loss_exit_review.allowed is not true")
-    reason = str(review.get("allowed_exit_reason") or "")
+    reason_value = review.get("allowed_exit_reason")
+    reason = reason_value if isinstance(reason_value, str) else ""
     if reason not in STRICT_ALLOWED_LOSS_EXIT_REASONS:
         issues.append(
             "allowed_exit_reason must be one of "
             + ", ".join(sorted(STRICT_ALLOWED_LOSS_EXIT_REASONS))
         )
 
-    action_decision_id, action_client_order_id, action_symbol = _current_action_identity(action)
-    review_decision_id = str(review.get("decision_id") or "")
-    if action_decision_id and review_decision_id != action_decision_id:
-        issues.append("decision_id does not match current action")
-    if action_symbol and str(review.get("symbol") or "").upper() != action_symbol:
-        issues.append("symbol does not match current action")
-    action_side = "sell" if _is_sell_action(action) else str(_action_value(action, "side", "")).lower()
-    if action_side and str(review.get("side") or "").lower() != action_side:
-        issues.append("side does not match current action")
-    if action_client_order_id:
-        review_order_id = str(review.get("client_order_id") or review.get("proposed_order_id") or "")
-        if review_order_id and review_order_id != action_client_order_id:
-            issues.append("client_order_id/proposed_order_id does not match current action")
-
-    generated_at = review.get("evidence_generated_at")
-    if now is not None and generated_at:
-        try:
-            parsed = datetime.datetime.fromisoformat(str(generated_at).replace("Z", "+00:00"))
-        except ValueError:
-            issues.append("evidence_generated_at is not an ISO timestamp")
-        else:
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-            age = now.astimezone(datetime.timezone.utc) - parsed.astimezone(
-                datetime.timezone.utc
-            )
-            if age < datetime.timedelta(0) or age > datetime.timedelta(hours=6):
-                issues.append("loss_exit_review is stale for current submit")
+    issues.extend(_review_binding_and_freshness_issues(action, review, now=now))
     return sorted(set(issues))
 
 
@@ -345,8 +487,6 @@ def _final_submit_loss_gate_issues(
 def _risk_cap_issues(action: Any, envelope: RiskEnvelope) -> list[str]:
     notional = _decimal_action_value(action, "notional")
     issues: list[str] = []
-    if envelope.live_budget_mode == "autonomous_uncapped":
-        return issues
     if (
         envelope.live_budget_mode != "autonomous_with_caps"
         and notional > envelope.tiny_live_tranche_usd
@@ -415,6 +555,204 @@ def _broker_buying_power_issues(
     return []
 
 
+def _canonical_gate_moment(now: datetime.datetime | None) -> datetime.datetime:
+    moment = now or datetime.datetime.now(tz=datetime.timezone.utc).replace(
+        microsecond=0
+    )
+    if (
+        type(moment) is not datetime.datetime
+        or moment.tzinfo is None
+        or moment.utcoffset() is None
+        or moment.microsecond
+    ):
+        raise LiveGateError(
+            "autonomous authority verification requires a timezone-aware "
+            "whole-second time"
+        )
+    return moment.astimezone(datetime.timezone.utc)
+
+
+def _evidence_time(value: object, *, label: str) -> datetime.datetime:
+    if type(value) is not str:
+        raise LiveGateError(f"{label} must be canonical UTC")
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise LiveGateError(f"{label} must be canonical UTC") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != datetime.timedelta()
+        or parsed.microsecond
+        or parsed.isoformat(timespec="seconds") != value
+    ):
+        raise LiveGateError(f"{label} must be canonical UTC")
+    return parsed
+
+
+def _require_autonomous_authority_proofs(
+    live_actions: Sequence[Any],
+    *,
+    promotion_evidence: object,
+    normal_intent: object,
+    activation_receipt: object,
+    proposal_ledger_root: object,
+    repo_root: object,
+    normal_live_client_order_id: str | None,
+    now: datetime.datetime | None,
+) -> tuple[
+    StrategyPromotionEvidence,
+    AuthorizedNormalTradeIntent,
+    NormalLiveActivationReceipt,
+] | None:
+    requested = any(
+        value is not _UNSET
+        for value in (
+            promotion_evidence,
+            normal_intent,
+            activation_receipt,
+            proposal_ledger_root,
+            repo_root,
+        )
+    )
+    if not requested:
+        return None
+    if type(normal_intent) is not AuthorizedNormalTradeIntent:
+        raise LiveGateError(
+            "normal_intent must be an exact AuthorizedNormalTradeIntent"
+        )
+    if type(promotion_evidence) is not StrategyPromotionEvidence:
+        raise LiveGateError(
+            "promotion_evidence must be an exact StrategyPromotionEvidence"
+        )
+    if type(activation_receipt) is not NormalLiveActivationReceipt:
+        raise LiveGateError(
+            "activation_receipt must be an exact NormalLiveActivationReceipt"
+        )
+    if (
+        not isinstance(proposal_ledger_root, (str, Path))
+        or not str(proposal_ledger_root).strip()
+    ):
+        raise LiveGateError("proposal_ledger_root is required for autonomous authority")
+    if not isinstance(repo_root, (str, Path)) or not str(repo_root).strip():
+        raise LiveGateError("repo_root is required for autonomous authority")
+    intent = normal_intent
+    evidence = promotion_evidence
+    receipt = activation_receipt
+    moment = _canonical_gate_moment(now)
+    if not intent.is_active(at=moment):
+        raise LiveGateError("normal_intent is stale or not yet active")
+    effective = _evidence_time(
+        evidence.effective_at, label="promotion_evidence.effective_at"
+    )
+    recorded = _evidence_time(
+        evidence.recorded_at, label="promotion_evidence.recorded_at"
+    )
+    if (
+        effective > moment
+        or recorded > moment
+        or moment - effective > _AUTONOMOUS_PROMOTION_MAX_AGE
+    ):
+        raise LiveGateError("promotion_evidence is stale or not yet active")
+    if (
+        evidence.complete_internal_evidence is not True
+        or evidence.issues
+        or not all(passed is True for _name, passed in evidence.gates)
+    ):
+        raise LiveGateError("promotion_evidence does not prove every promotion gate")
+    if (
+        intent.genome_id != evidence.genome_id
+        or intent.genome_canonical_sha256 != evidence.genome_canonical_sha256
+        or intent.evaluation_code_commit != evidence.evaluation_code_commit
+        or intent.evaluation_runtime_sha256 != evidence.evaluation_runtime_sha256
+    ):
+        raise LiveGateError("normal_intent does not bind the promotion evidence")
+    if len(live_actions) != 1:
+        raise LiveGateError("normal_intent authorizes exactly one live action")
+    action = live_actions[0]
+    action_client_order_id = str(
+        _action_value(action, "client_order_id", "")
+        or _action_value(action, "idempotency_key", "")
+        or normal_live_client_order_id
+        or ""
+    )
+    try:
+        notional_matches = Decimal(intent.notional_usd) == _decimal_action_value(
+            action, "notional"
+        )
+        limit_matches = Decimal(intent.limit_price) == _decimal_action_value(
+            action, "limit_price"
+        )
+    except Exception as exc:
+        raise LiveGateError("normal_intent order binding is malformed") from exc
+    if (
+        intent.symbol != _action_symbol(action)
+        or intent.side != str(_action_value(action, "side", "")).lower()
+        or intent.order_type
+        != str(_action_value(action, "order_type", "")).lower()
+        or not notional_matches
+        or not limit_matches
+        or action_client_order_id != intent.client_order_id
+    ):
+        raise LiveGateError("normal_intent does not bind the exact live action")
+    try:
+        verify_normal_live_activation_receipt(
+            intent,
+            receipt,
+            proposal_ledger_root=proposal_ledger_root,
+            repo_root=repo_root,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise LiveGateError(
+            "normal-live activation proof is not current and exact"
+        ) from exc
+    return evidence, intent, receipt
+
+
+def _require_autonomous_promotion_state_binding(
+    action: Any,
+    promotion_state: Mapping[str, Any],
+    *,
+    promotion_state_path: Path,
+    evidence: StrategyPromotionEvidence,
+    intent: AuthorizedNormalTradeIntent,
+    receipt: NormalLiveActivationReceipt,
+) -> None:
+    try:
+        current_state_bytes = promotion_state_path.read_bytes()
+    except OSError as exc:
+        raise LiveGateError("current promotion state is unavailable") from exc
+    if (
+        hashlib.sha256(current_state_bytes).hexdigest()
+        != receipt.canonical_after_sha256
+        or dict(promotion_state) != receipt.state
+    ):
+        raise LiveGateError(
+            "current promotion state does not exactly match the activation receipt"
+        )
+    sleeves = promotion_state.get("sleeves")
+    sleeve_name = str(_action_value(action, "sleeve", "")).strip()
+    sleeve = sleeves.get(sleeve_name) if isinstance(sleeves, Mapping) else None
+    source = sleeve.get("source") if isinstance(sleeve, Mapping) else None
+    evidence_sha256 = hashlib.sha256(evidence.canonical_json_bytes()).hexdigest()
+    if (
+        not isinstance(source, Mapping)
+        or source.get("kind") != "immutable_strategy_evidence"
+        or source.get("promotion_evidence_id") != evidence.evidence_id
+        or source.get("promotion_evidence_sha256") != evidence_sha256
+        or source.get("proposal_id") != intent.promotion_proposal_id
+        or source.get("proposal_sha256") != intent.promotion_proposal_sha256
+        or source.get("genome_id") != intent.genome_id
+        or source.get("genome_canonical_sha256")
+        != intent.genome_canonical_sha256
+        or source.get("evaluation_code_commit") != intent.evaluation_code_commit
+        or source.get("evaluation_runtime_sha256")
+        != intent.evaluation_runtime_sha256
+    ):
+        raise LiveGateError(
+            "promotion state does not bind the supplied autonomous authority proofs"
+        )
+
+
 def evaluate_go_live_guard(
     actions: Sequence[Any],
     *,
@@ -429,10 +767,31 @@ def evaluate_go_live_guard(
     live_positions: Sequence[Mapping[str, Any]] = (),
     decision_evidence: Mapping[str, Any] | None = None,
     now: datetime.datetime | None = None,
+    rate_limit_exclude_client_order_id: str | None = None,
+    normal_live_commitment: Mapping[str, object] | None = None,
+    normal_live_intent_full_sha256: str | None = None,
+    normal_live_order_payload_sha256: str | None = None,
+    normal_live_client_order_id: str | None = None,
+    promotion_evidence: object = _UNSET,
+    normal_intent: object = _UNSET,
+    activation_receipt: object = _UNSET,
+    proposal_ledger_root: object = _UNSET,
+    repo_root: object = _UNSET,
 ) -> LiveGateResult:
     live_actions = [action for action in actions if _is_live_order_action(action)]
     if not live_actions:
         return LiveGateResult(allowed=True, checks={"no_live_actions": True})
+
+    authority_proofs = _require_autonomous_authority_proofs(
+        live_actions,
+        promotion_evidence=promotion_evidence,
+        normal_intent=normal_intent,
+        activation_receipt=activation_receipt,
+        proposal_ledger_root=proposal_ledger_root,
+        repo_root=repo_root,
+        normal_live_client_order_id=normal_live_client_order_id,
+        now=now,
+    )
 
     issues: list[OrderIssue] = []
     checks: dict[str, bool] = {
@@ -447,7 +806,6 @@ def evaluate_go_live_guard(
         "order_rate_limit": True,
         "portfolio_circuit_breakers": True,
         "autonomous_live_budget": False,
-        "autonomous_live_budget_uncapped": False,
         "promotion": True,
         "loss_exit_review": True,
         "broker_buying_power": True,
@@ -455,6 +813,7 @@ def evaluate_go_live_guard(
         "daily_loss_considered": current_daily_loss_usd is not None,
         "drawdown_considered": current_drawdown_pct is not None,
         "broker_buying_power_considered": live_buying_power is not None,
+        "autonomous_authority_proofs": authority_proofs is not None,
     }
 
     envelope, envelope_issues = load_risk_envelope(risk_envelope_path)
@@ -463,22 +822,44 @@ def evaluate_go_live_guard(
         issues.extend(OrderIssue(_action_symbol(action), issue) for action in live_actions for issue in envelope_issues)
     else:
         checks["risk_envelope_loaded"] = True
-        checks["autonomous_live_budget"] = envelope.live_budget_mode in {
-            "autonomous_with_caps",
-            "autonomous_uncapped",
-        }
-        checks["autonomous_live_budget_uncapped"] = (
-            envelope.live_budget_mode == "autonomous_uncapped"
+        checks["autonomous_live_budget"] = (
+            envelope.live_budget_mode == "autonomous_with_caps"
         )
 
     promotion_state, state_issues = _read_promotion_state(Path(promotion_state_path))
     if state_issues:
+        if authority_proofs is not None:
+            raise LiveGateError("current promotion state is unavailable or malformed")
         checks["promotion_state_loaded"] = False
         issues.extend(OrderIssue(_action_symbol(action), issue) for action in live_actions for issue in state_issues)
     else:
         checks["promotion_state_loaded"] = True
+        if authority_proofs is not None:
+            evidence, intent, receipt = authority_proofs
+            _require_autonomous_promotion_state_binding(
+                live_actions[0],
+                promotion_state,
+                promotion_state_path=Path(promotion_state_path),
+                evidence=evidence,
+                intent=intent,
+                receipt=receipt,
+            )
 
     control_state, control_issues = load_live_control_state(control_state_path, now=now)
+    if normal_live_commitment is not None:
+        try:
+            verify_pending_normal_live_submission_commitment(
+                control_state_path,
+                commitment=normal_live_commitment,
+                intent_full_sha256=str(normal_live_intent_full_sha256 or ""),
+                order_payload_sha256=str(normal_live_order_payload_sha256 or ""),
+                client_order_id=str(normal_live_client_order_id or ""),
+                rate_reservation_sha256=str(
+                    normal_live_commitment.get("rate_reservation_sha256") or ""
+                ),
+            )
+        except ValueError as exc:
+            control_issues = [*control_issues, str(exc)]
     if control_issues:
         checks["control_state_loaded"] = control_state is not None
         checks["live_not_frozen"] = not any("frozen" in issue for issue in control_issues)
@@ -558,7 +939,6 @@ def evaluate_go_live_guard(
 
     if (
         envelope is not None
-        and envelope.live_budget_mode != "autonomous_uncapped"
         and current_live_exposure + total_buy_notional > envelope.account_max_capital_at_risk_usd
     ):
         checks["risk_caps"] = False
@@ -571,8 +951,7 @@ def evaluate_go_live_guard(
             )
         )
 
-    # Hard account-exposure ceiling applies in EVERY live_budget_mode (including
-    # autonomous_uncapped). Inert unless account_hard_ceiling_usd is configured.
+    # Hard account-exposure ceiling is inert unless configured.
     if (
         envelope is not None
         and envelope.account_hard_ceiling_usd is not None
@@ -601,6 +980,7 @@ def evaluate_go_live_guard(
             window_minutes=envelope.live_order_window_minutes,
             max_orders=envelope.max_live_orders_per_window,
             new_order_count=len(live_actions),
+            exclude_client_order_id=rate_limit_exclude_client_order_id,
         )
         if rate_issues:
             checks["order_rate_limit"] = False

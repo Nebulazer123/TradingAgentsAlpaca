@@ -236,6 +236,7 @@ def compact_loss_review_evidence_payload(
         "hourly_decision": payload.get("hourly_decision"),
         "submitted_order_count": payload.get("submitted_order_count"),
         "review_allowed": payload.get("review_allowed"),
+        "supervisor_review_authority": payload.get("supervisor_review_authority") or {},
         "source_packet_ids": source_packet_ids,
         "provider_summary_packet_id": payload.get("provider_summary_packet_id"),
         "evidence_needs": payload.get("evidence_needs") or [],
@@ -249,6 +250,11 @@ def compact_loss_review_evidence_payload(
             "review_allowed_after_refresh": advisory_analysis.get(
                 "review_allowed_after_refresh"
             ),
+            "authority_source": advisory_analysis.get("authority_source"),
+            "requires_board_decision": advisory_analysis.get(
+                "requires_board_decision"
+            ),
+            "decision_owner": advisory_analysis.get("decision_owner"),
             "current_thesis_status_candidate": advisory_analysis.get(
                 "current_thesis_status_candidate"
             ),

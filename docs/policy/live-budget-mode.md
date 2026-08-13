@@ -22,7 +22,7 @@ must stay ignored. The committed example and tests define the expected shape.
   buying power, broker clock/tradability/fresh-data checks, live-control
   dead-man, promotion state, calibration guard, and rolling order rate limit.
 
-## Retired Mode
+## Retired Mode (historical compatibility)
 
 `autonomous_uncapped` is retired. The loader rejects it so stale local configs
 cannot silently widen live authority.

@@ -3,8 +3,14 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
+import requests
 
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    DataUnavailableError,
+    OfficialDataError,
+    RecoverableDataflowError,
+)
 from tradingagents.research.youtube_transcript import (
     _extract_json_payload,
     fetch_youtube_earnings_transcript_packet,
@@ -71,20 +77,20 @@ def test_youtube_transcript_success_packet_is_read_only_earnings_evidence():
     assert "--gateway-arg=profile" in command
 
 
-def test_youtube_transcript_search_without_candidates_raises_official_data_error():
+def test_youtube_transcript_search_without_candidates_is_unavailable():
     session = SimpleNamespace(get=lambda *_args, **_kwargs: _response("no videos"))
 
-    with pytest.raises(OfficialDataError, match="found no video candidates"):
+    with pytest.raises(DataUnavailableError, match="found no video candidates"):
         fetch_youtube_earnings_transcript_packet("NVDA", session=session)
 
 
-def test_youtube_transcript_timeout_raises_official_data_error():
+def test_youtube_transcript_timeout_is_transport_failure():
     session = SimpleNamespace(get=lambda *_args, **_kwargs: _response('"videoId":"abc123XYZ90"'))
 
     def fake_run(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(cmd="docker", timeout=15)
 
-    with pytest.raises(OfficialDataError, match="timed out"):
+    with pytest.raises(DataTransportError, match="timed out"):
         fetch_youtube_earnings_transcript_packet("NVDA", session=session, run_func=fake_run)
 
 
@@ -98,10 +104,48 @@ def test_youtube_transcript_non_earnings_video_is_rejected():
             '"transcript": "general market conversation about products and leadership"}'
         )
 
-    with pytest.raises(OfficialDataError, match="did not look like an earnings call"):
+    with pytest.raises(DataUnavailableError, match="did not look like an earnings call"):
         fetch_youtube_earnings_transcript_packet(
             "NVDA",
             session=session,
             run_func=fake_run,
             min_transcript_chars=10,
         )
+
+
+@pytest.mark.parametrize(
+    "run_result",
+    [
+        _completed(stdout="not JSON"),
+        _completed(stderr="docker gateway unavailable", returncode=1),
+    ],
+)
+def test_youtube_unusable_external_mcp_response_is_transport_failure(run_result):
+    session = SimpleNamespace(
+        get=lambda *_args, **_kwargs: _response('"videoId":"abc123XYZ90"')
+    )
+
+    with pytest.raises(DataTransportError):
+        fetch_youtube_earnings_transcript_packet(
+            "NVDA",
+            session=session,
+            run_func=lambda *_args, **_kwargs: run_result,
+        )
+
+
+def test_youtube_http_transport_failure_is_typed():
+    def fail_get(*_args, **_kwargs):
+        raise requests.Timeout("timed out")
+
+    with pytest.raises(DataTransportError, match="discovery failed"):
+        fetch_youtube_earnings_transcript_packet(
+            "NVDA",
+            session=SimpleNamespace(get=fail_get),
+        )
+
+
+def test_youtube_missing_ticker_remains_terminal():
+    with pytest.raises(OfficialDataError, match="ticker symbol") as exc_info:
+        fetch_youtube_earnings_transcript_packet("")
+
+    assert not isinstance(exc_info.value, RecoverableDataflowError)

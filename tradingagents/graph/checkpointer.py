@@ -25,9 +25,42 @@ def _db_path(data_dir: str | Path, ticker: str) -> Path:
     return p / f"{safe}.db"
 
 
-def thread_id(ticker: str, date: str) -> str:
-    """Deterministic thread ID for a ticker+date pair."""
-    return hashlib.sha256(f"{ticker.upper()}:{date}".encode()).hexdigest()[:16]
+def _validated_signature(
+    signature: str | None,
+    *,
+    allow_legacy_empty_signature: bool,
+) -> str:
+    """Return a canonical non-empty signature or an explicitly allowed legacy one."""
+    if signature is None or signature == "":
+        if allow_legacy_empty_signature:
+            return ""
+        raise ValueError(
+            "checkpoint signature is required; set "
+            "allow_legacy_empty_signature=True only for explicit legacy access"
+        )
+    if not isinstance(signature, str):
+        raise TypeError("checkpoint signature must be a non-empty string")
+    if signature != signature.strip():
+        raise ValueError("checkpoint signature must not contain surrounding whitespace")
+    return signature
+
+
+def thread_id(
+    ticker: str,
+    date: str,
+    signature: str | None = None,
+    *,
+    allow_legacy_empty_signature: bool = False,
+) -> str:
+    """Return a deterministic ID for one ticker, date, and decision-graph shape."""
+    validated = _validated_signature(
+        signature,
+        allow_legacy_empty_signature=allow_legacy_empty_signature,
+    )
+    base = f"{ticker.upper()}:{date}"
+    if validated:
+        base = f"{base}:{validated}"
+    return hashlib.sha256(base.encode()).hexdigest()[:16]
 
 
 @contextmanager
@@ -43,17 +76,45 @@ def get_checkpointer(data_dir: str | Path, ticker: str) -> Generator[SqliteSaver
         conn.close()
 
 
-def has_checkpoint(data_dir: str | Path, ticker: str, date: str) -> bool:
-    """Check whether a resumable checkpoint exists for ticker+date."""
-    return checkpoint_step(data_dir, ticker, date) is not None
+def has_checkpoint(
+    data_dir: str | Path,
+    ticker: str,
+    date: str,
+    signature: str | None = None,
+    *,
+    allow_legacy_empty_signature: bool = False,
+) -> bool:
+    """Check whether a resumable checkpoint exists for one signed graph shape."""
+    return (
+        checkpoint_step(
+            data_dir,
+            ticker,
+            date,
+            signature,
+            allow_legacy_empty_signature=allow_legacy_empty_signature,
+        )
+        is not None
+    )
 
 
-def checkpoint_step(data_dir: str | Path, ticker: str, date: str) -> int | None:
+def checkpoint_step(
+    data_dir: str | Path,
+    ticker: str,
+    date: str,
+    signature: str | None = None,
+    *,
+    allow_legacy_empty_signature: bool = False,
+) -> int | None:
     """Return the step number of the latest checkpoint, or None if none exists."""
+    tid = thread_id(
+        ticker,
+        date,
+        signature,
+        allow_legacy_empty_signature=allow_legacy_empty_signature,
+    )
     db = _db_path(data_dir, ticker)
     if not db.exists():
         return None
-    tid = thread_id(ticker, date)
     with get_checkpointer(data_dir, ticker) as saver:
         config = {"configurable": {"thread_id": tid}}
         cp = saver.get_tuple(config)
@@ -73,12 +134,24 @@ def clear_all_checkpoints(data_dir: str | Path) -> int:
     return len(dbs)
 
 
-def clear_checkpoint(data_dir: str | Path, ticker: str, date: str) -> None:
-    """Remove checkpoint for a specific ticker+date by deleting the thread's rows."""
+def clear_checkpoint(
+    data_dir: str | Path,
+    ticker: str,
+    date: str,
+    signature: str | None = None,
+    *,
+    allow_legacy_empty_signature: bool = False,
+) -> None:
+    """Remove a specific signed checkpoint by deleting only that thread's rows."""
+    tid = thread_id(
+        ticker,
+        date,
+        signature,
+        allow_legacy_empty_signature=allow_legacy_empty_signature,
+    )
     db = _db_path(data_dir, ticker)
     if not db.exists():
         return
-    tid = thread_id(ticker, date)
     conn = sqlite3.connect(str(db))
     try:
         for table in ("writes", "checkpoints"):

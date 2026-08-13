@@ -1,6 +1,8 @@
 import json
+from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from tradingagents.dataflows import (
     _official_common as official_common,
@@ -25,7 +27,10 @@ from tradingagents.dataflows import (
     treasury_fiscal,
 )
 from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    DataUnavailableError,
     OfficialDataError,
+    RecoverableDataflowError,
     cached_safe_fetch_evidence,
     connector_health_snapshot,
     env_value,
@@ -36,6 +41,7 @@ from tradingagents.dataflows._official_common import (
     safe_fetch_evidence,
     safe_source_ref,
 )
+from tradingagents.schemas.research import SourceEvidencePacket
 
 
 class FakeResponse:
@@ -323,9 +329,12 @@ def test_treasury_fiscal_rejects_unallowlisted_or_unsafe_paths():
         treasury_fiscal.fetch_treasury_fiscal("v9/unknown/path", session=FakeSession())
 
 
-def test_safe_fetch_turns_adapter_failure_into_blocked_packet_without_secret_leak():
+@pytest.mark.parametrize("error_type", [DataTransportError, DataUnavailableError])
+def test_safe_fetch_turns_recoverable_failure_into_blocked_packet_without_secret_leak(
+    error_type,
+):
     def broken_fetch():
-        raise RuntimeError("failed url https://api.example.test/?api_key=secret-value")
+        raise error_type("failed url https://api.example.test/?api_key=secret-value")
 
     packet = safe_fetch_evidence(
         broken_fetch,
@@ -340,6 +349,41 @@ def test_safe_fetch_turns_adapter_failure_into_blocked_packet_without_secret_lea
     assert packet.freshness["blocked"] is True
     assert packet.payload["status"] == "blocked"
     assert "secret-value" not in saved
+
+
+def _source_packet_validation_error():
+    try:
+        SourceEvidencePacket.model_validate({})
+    except Exception as exc:  # noqa: BLE001 - return the concrete Pydantic error.
+        return exc
+    raise AssertionError("invalid packet unexpectedly validated")
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda: OfficialDataError("malformed official evidence"),
+        lambda: RuntimeError("unexpected runtime failure"),
+        lambda: TypeError("programming contract failure"),
+        lambda: AssertionError("invariant failure"),
+        _source_packet_validation_error,
+    ],
+)
+def test_safe_fetch_propagates_nonrecoverable_failure_unchanged(error_factory):
+    error = error_factory()
+
+    def broken_fetch():
+        raise error
+
+    with pytest.raises(type(error)) as exc_info:
+        safe_fetch_evidence(
+            broken_fetch,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+        )
+
+    assert exc_info.value is error
 
 
 def test_request_failures_are_sanitized_before_leaving_adapter():
@@ -472,9 +516,12 @@ def test_get_json_opens_circuit_after_repeated_connector_failure(tmp_path, monke
 def test_cached_safe_fetch_uses_fresh_official_cache(tmp_path):
     cache_key = official_cache_key("fred", "GDP")
     called = {"count": 0}
+    should_fail = {"value": False}
 
     def fetcher():
         called["count"] += 1
+        if should_fail["value"]:
+            raise AssertionError("fresh cache must bypass the fetcher")
         return evidence_packet(
             source_name="fred",
             evidence_type="series_observations",
@@ -493,6 +540,7 @@ def test_cached_safe_fetch_uses_fresh_official_cache(tmp_path):
         subject="GDP",
         cache_dir=tmp_path,
     )
+    should_fail["value"] = True
     second = cached_safe_fetch_evidence(
         fetcher,
         cache_key=cache_key,
@@ -509,7 +557,119 @@ def test_cached_safe_fetch_uses_fresh_official_cache(tmp_path):
     assert second.payload == {"observations": []}
 
 
-def test_cached_safe_fetch_returns_stale_cache_when_refresh_fails(tmp_path):
+@pytest.mark.parametrize(
+    ("cache_text", "expected_error"),
+    [
+        ("{", json.JSONDecodeError),
+        ("{}", ValidationError),
+    ],
+)
+def test_cached_safe_fetch_propagates_corrupt_existing_cache_without_fetching(
+    tmp_path,
+    cache_text,
+    expected_error,
+):
+    cache_key = official_cache_key("fred", "corrupt-cache", expected_error.__name__)
+    cache_path = official_common._cache_path(tmp_path, cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(cache_text, encoding="utf-8")
+    fetch_calls = []
+
+    def fetcher():
+        fetch_calls.append(True)
+        raise AssertionError("corrupt cache must abort before refresh")
+
+    with pytest.raises(expected_error):
+        cached_safe_fetch_evidence(
+            fetcher,
+            cache_key=cache_key,
+            ttl_seconds=3600,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            cache_dir=tmp_path,
+        )
+
+    assert fetch_calls == []
+
+
+def test_cached_safe_fetch_propagates_unreadable_existing_cache_without_fetching(
+    monkeypatch,
+    tmp_path,
+):
+    cache_key = official_cache_key("fred", "unreadable-cache")
+    cache_path = official_common._cache_path(tmp_path, cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("{}", encoding="utf-8")
+    original_read_text = Path.read_text
+    fetch_calls = []
+
+    def unreadable_target(path, *args, **kwargs):
+        if path == cache_path:
+            raise PermissionError("cache read denied")
+        return original_read_text(path, *args, **kwargs)
+
+    def fetcher():
+        fetch_calls.append(True)
+        raise AssertionError("unreadable cache must abort before refresh")
+
+    monkeypatch.setattr(Path, "read_text", unreadable_target)
+
+    with pytest.raises(PermissionError, match="cache read denied"):
+        cached_safe_fetch_evidence(
+            fetcher,
+            cache_key=cache_key,
+            ttl_seconds=3600,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            cache_dir=tmp_path,
+        )
+
+    assert fetch_calls == []
+
+
+def test_cached_safe_fetch_does_not_treat_unstatable_cache_as_absent(
+    monkeypatch,
+    tmp_path,
+):
+    cache_key = official_cache_key("fred", "unstatable-cache")
+    cache_path = official_common._cache_path(tmp_path, cache_key)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("{}", encoding="utf-8")
+    original_stat = Path.stat
+    fetch_calls = []
+
+    def unstatable_target(path, *args, **kwargs):
+        if path == cache_path:
+            raise PermissionError("cache stat denied")
+        return original_stat(path, *args, **kwargs)
+
+    def fetcher():
+        fetch_calls.append(True)
+        raise AssertionError("unstatable cache must abort before refresh")
+
+    monkeypatch.setattr(Path, "stat", unstatable_target)
+
+    with pytest.raises(PermissionError, match="cache stat denied"):
+        cached_safe_fetch_evidence(
+            fetcher,
+            cache_key=cache_key,
+            ttl_seconds=3600,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            cache_dir=tmp_path,
+        )
+
+    assert fetch_calls == []
+
+
+@pytest.mark.parametrize("error_type", [DataTransportError, DataUnavailableError])
+def test_cached_safe_fetch_returns_stale_cache_on_recoverable_refresh_failure(
+    tmp_path,
+    error_type,
+):
     cache_key = official_cache_key("fred", "GDP")
 
     def good_fetch():
@@ -533,7 +693,7 @@ def test_cached_safe_fetch_returns_stale_cache_when_refresh_fails(tmp_path):
     )
 
     def broken_fetch():
-        raise OfficialDataError("api_key=secret-value failed")
+        raise error_type("api_key=secret-value failed")
 
     stale = cached_safe_fetch_evidence(
         broken_fetch,
@@ -552,9 +712,10 @@ def test_cached_safe_fetch_returns_stale_cache_when_refresh_fails(tmp_path):
     assert stale.payload["observations"][0]["date"] == "2026-01-01"
 
 
-def test_cached_safe_fetch_without_cache_returns_blocked_packet(tmp_path):
+@pytest.mark.parametrize("error_type", [DataTransportError, DataUnavailableError])
+def test_cached_safe_fetch_without_cache_returns_blocked_packet(tmp_path, error_type):
     def broken_fetch():
-        raise OfficialDataError("api_key=secret-value failed")
+        raise error_type("api_key=secret-value failed")
 
     packet = cached_safe_fetch_evidence(
         broken_fetch,
@@ -570,6 +731,102 @@ def test_cached_safe_fetch_without_cache_returns_blocked_packet(tmp_path):
     assert packet.redaction_status == "blocked"
     assert packet.payload["status"] == "blocked"
     assert "secret-value" not in saved
+
+
+def test_cached_safe_fetch_does_not_use_stale_cache_when_policy_forbids_it(tmp_path):
+    cache_key = official_cache_key("fred", "policy-forbids-stale")
+
+    def good_fetch():
+        return evidence_packet(
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            source_ref="https://api.stlouisfed.org/fred/series/observations?series_id=GDP",
+            payload={"observations": [{"date": "2026-01-01"}]},
+            request_fingerprint=cache_key,
+        )
+
+    cached_safe_fetch_evidence(
+        good_fetch,
+        cache_key=cache_key,
+        ttl_seconds=0,
+        source_name="fred",
+        evidence_type="series_observations",
+        subject="GDP",
+        cache_dir=tmp_path,
+    )
+
+    def unavailable_fetch():
+        raise DataUnavailableError("source has no current evidence")
+
+    packet = cached_safe_fetch_evidence(
+        unavailable_fetch,
+        cache_key=cache_key,
+        ttl_seconds=0,
+        source_name="fred",
+        evidence_type="series_observations",
+        subject="GDP",
+        cache_dir=tmp_path,
+        allow_stale_on_error=False,
+    )
+
+    assert packet.payload["status"] == "blocked"
+    assert packet.freshness.get("cache", {}).get("state") != "stale_fallback"
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda: OfficialDataError("malformed official evidence"),
+        lambda: RuntimeError("unexpected runtime failure"),
+        lambda: TypeError("programming contract failure"),
+        lambda: AssertionError("invariant failure"),
+        _source_packet_validation_error,
+    ],
+)
+def test_cached_safe_fetch_propagates_nonrecoverable_refresh_without_stale_fallback(
+    tmp_path,
+    error_factory,
+):
+    cache_key = official_cache_key("fred", type(error_factory).__name__)
+
+    def good_fetch():
+        return evidence_packet(
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            source_ref="https://api.stlouisfed.org/fred/series/observations?series_id=GDP",
+            payload={"observations": [{"date": "2026-01-01"}]},
+            request_fingerprint=cache_key,
+        )
+
+    cached_safe_fetch_evidence(
+        good_fetch,
+        cache_key=cache_key,
+        ttl_seconds=0,
+        source_name="fred",
+        evidence_type="series_observations",
+        subject="GDP",
+        cache_dir=tmp_path,
+    )
+    error = error_factory()
+
+    def broken_fetch():
+        raise error
+
+    with pytest.raises(type(error)) as exc_info:
+        cached_safe_fetch_evidence(
+            broken_fetch,
+            cache_key=cache_key,
+            ttl_seconds=0,
+            source_name="fred",
+            evidence_type="series_observations",
+            subject="GDP",
+            cache_dir=tmp_path,
+            allow_stale_on_error=True,
+        )
+
+    assert exc_info.value is error
 
 
 def test_eodhd_uses_api_token_without_packet_leakage():
@@ -713,6 +970,48 @@ def test_fmp_latest_earning_call_transcript_discovers_latest_quarter():
     assert packet.payload["year"] == 2026
     assert packet.payload["quarter"] == 4
     assert packet.payload["transcript_char_count"] == len(transcript)
+
+
+def test_fmp_missing_transcript_text_and_dates_are_unavailable():
+    with pytest.raises(DataUnavailableError, match="no transcript text"):
+        fmp.fetch_fmp_earning_call_transcript(
+            "AAPL",
+            year=2026,
+            quarter=1,
+            api_key="fmp-secret",
+            session=FakeSession([{"symbol": "AAPL", "content": ""}]),
+        )
+
+    with pytest.raises(DataUnavailableError, match="no earnings transcript dates"):
+        fmp.fetch_fmp_latest_earning_call_transcript(
+            "AAPL",
+            api_key="fmp-secret",
+            session=FakeSession({"data": []}),
+        )
+
+
+@pytest.mark.parametrize(
+    ("symbol", "quarter", "message"),
+    [
+        ("", 1, "symbol is missing"),
+        ("AAPL", 5, "quarter must be 1-4"),
+    ],
+)
+def test_fmp_transcript_invalid_caller_input_remains_terminal(
+    symbol,
+    quarter,
+    message,
+):
+    with pytest.raises(OfficialDataError, match=message) as exc_info:
+        fmp.fetch_fmp_earning_call_transcript(
+            symbol,
+            year=2026,
+            quarter=quarter,
+            api_key="fmp-secret",
+            session=FakeSession(),
+        )
+
+    assert not isinstance(exc_info.value, RecoverableDataflowError)
 
 
 def test_optional_vendor_route_helpers_reject_unsafe_paths():
@@ -864,6 +1163,29 @@ def test_google_news_rss_filters_items_to_requested_date_window():
         "start_date": "2026-06-01",
         "end_date": "2026-06-03",
     }
+
+
+@pytest.mark.parametrize("rss", ["not XML", "<rss></rss>"])
+def test_google_news_unusable_external_rss_is_transport_failure(rss):
+    with pytest.raises(DataTransportError):
+        google_news.fetch_google_news_rss(
+            query="AAPL stock",
+            session=FakeSession(text=rss),
+        )
+
+
+def test_google_news_invalid_caller_date_remains_terminal():
+    session = FakeSession(text="not XML")
+
+    with pytest.raises(OfficialDataError, match="date filter") as exc_info:
+        google_news.fetch_google_news_rss(
+            query="AAPL stock",
+            start_date="not-a-date",
+            session=session,
+        )
+
+    assert not isinstance(exc_info.value, RecoverableDataflowError)
+    assert session.calls == []
 
 
 def test_scrapingbee_uses_key_but_writes_only_redacted_preview():

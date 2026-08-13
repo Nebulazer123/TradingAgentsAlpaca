@@ -2,6 +2,7 @@ import datetime
 import inspect
 import json
 import sys
+import threading
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -55,6 +56,18 @@ PREMARKET_FRESH_VALIDATION_ITEMS = [
     "current positions and P/L",
     "live sizing room and buying power",
 ]
+
+
+def _order_for_reconciliation(symbol: str, client_order_id: str) -> dict:
+    return {
+        "client_order_id": client_order_id,
+        "symbol": symbol,
+        "side": "buy",
+        "type": "limit",
+        "qty": "1",
+        "limit_price": "10.00",
+        "status": "accepted",
+    }
 
 
 def _premarket_instructions(symbol: str = "ORCL") -> dict:
@@ -462,10 +475,301 @@ def test_alpaca_reconcile_orcl_incident_writes_read_only_packet(monkeypatch, tmp
     assert payload["can_submit_orders"] is False
     assert payload["read_only"] is True
     assert payload["execution_authority"] == "none"
+    assert payload["broker_write_calls"] == 0
     assert payload["final_old_sell_state"] == "filled"
     assert payload["old_sell_orders"][0]["client_order_id"] == "ta-tiny-old-orcl-sell"
     assert live_client.submitted == []
     assert (tmp_path / "orcl" / "latest.json").exists()
+
+
+def test_alpaca_reconcile_symbol_incident_writes_generic_zero_write_packet(monkeypatch, tmp_path):
+    packet_path = tmp_path / "nflx.json"
+    packet_path.write_text(
+        json.dumps(
+            {
+                "actions": [
+                    {
+                        "symbol": "NFLX",
+                        "side": "buy",
+                        "account": "live",
+                        "idempotency_key": "ta-tiny-nflx-1",
+                    }
+                ],
+                "submitted": [
+                    {
+                        "client_order_id": "ta-tiny-nflx-1",
+                        "symbol": "NFLX",
+                        "side": "buy",
+                        "type": "limit",
+                        "qty": "1",
+                        "limit_price": "10.00",
+                        "status": "accepted",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _ReadOnlyClient:
+        def __init__(self):
+            self.write_calls = []
+
+        def list_positions(self):
+            return [{"symbol": "NFLX", "qty": "1"}]
+
+        def list_orders(self, status="all"):
+            return [
+                {
+                    "client_order_id": "ta-tiny-nflx-1",
+                    "symbol": "NFLX",
+                    "side": "buy",
+                    "type": "limit",
+                    "qty": "1",
+                    "limit_price": "10.00",
+                    "status": "accepted",
+                }
+            ]
+
+        def get_order_by_client_order_id(self, client_order_id):
+            return self.list_orders()[0] if client_order_id == "ta-tiny-nflx-1" else None
+
+        def submit_order(self, *args, **kwargs):
+            self.write_calls.append(("submit", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+    live_client = _ReadOnlyClient()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: live_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "reconcile-symbol-incident",
+            "--symbol",
+            "NFLX",
+            "--packet-path",
+            str(packet_path),
+            "--expected-qty",
+            "1",
+            "--output-dir",
+            str(tmp_path / "reconciliation"),
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["kind"] == "symbol_broker_reconciliation"
+    assert payload["symbol"] == "NFLX"
+    assert payload["read_only"] is True
+    assert payload["can_submit_orders"] is False
+    assert payload["execution_authority"] == "none"
+    assert payload["broker_write_calls"] == 0
+    assert payload["matched"] is True
+    assert live_client.write_calls == []
+    assert (tmp_path / "reconciliation" / "latest.json").exists()
+
+
+def test_alpaca_reconcile_symbol_incident_invalid_expected_quantity_writes_fail_closed_packet(
+    monkeypatch, tmp_path
+):
+    class _NoReadClient:
+        def __init__(self):
+            self.read_calls = []
+            self.write_calls = []
+
+        def list_positions(self):
+            self.read_calls.append("list_positions")
+            raise AssertionError("invalid expected quantity must prevent broker reads")
+
+        def submit_order(self, *args, **kwargs):
+            self.write_calls.append(("submit", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+        def cancel_order(self, *args, **kwargs):
+            self.write_calls.append(("cancel", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+        def replace_order(self, *args, **kwargs):
+            self.write_calls.append(("replace", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+        def close_position(self, *args, **kwargs):
+            self.write_calls.append(("close", args, kwargs))
+            raise AssertionError("reconciliation attempted a broker write")
+
+    live_client = _NoReadClient()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: live_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "reconcile-symbol-incident",
+            "--symbol",
+            "NFLX",
+            "--expected-qty",
+            "NaN",
+            "--output-dir",
+            str(tmp_path / "reconciliation"),
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["matched"] is False
+    assert payload["issues"] == ["invalid expected quantity: NaN"]
+    assert payload["broker_write_calls"] == 0
+    assert live_client.read_calls == []
+    assert live_client.write_calls == []
+
+
+def test_alpaca_reconcile_symbol_incident_uses_unique_atomic_packet_paths(monkeypatch, tmp_path):
+    packet_path = tmp_path / "nflx.json"
+    packet_path.write_text(
+        json.dumps(
+            {
+                "actions": [{"symbol": "NFLX", "account": "live", "idempotency_key": "nflx-1"}],
+                "submitted": [_order_for_reconciliation("NFLX", "nflx-1")],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _Client:
+        def list_positions(self):
+            return [{"symbol": "NFLX", "qty": "1"}]
+
+        def list_orders(self, status="all"):
+            return [_order_for_reconciliation("NFLX", "nflx-1")]
+
+        def get_order_by_client_order_id(self, _client_order_id):
+            return _order_for_reconciliation("NFLX", "nflx-1")
+
+    class _FixedDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 6, 1, 12, 0, tzinfo=tz)
+
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", _Client)
+    monkeypatch.setattr(cli_main.datetime, "datetime", _FixedDateTime)
+    output_dir = tmp_path / "reconciliation"
+    args = [
+        "alpaca",
+        "reconcile-symbol-incident",
+        "--symbol",
+        "NFLX",
+        "--packet-path",
+        str(packet_path),
+        "--expected-qty",
+        "1",
+        "--output-dir",
+        str(output_dir),
+        "--json-output",
+    ]
+
+    first = runner.invoke(app, args)
+    second = runner.invoke(app, args)
+
+    assert first.exit_code == second.exit_code == 0
+    first_payload = json.loads(first.stdout)
+    second_payload = json.loads(second.stdout)
+    assert first_payload["json_path"] != second_payload["json_path"]
+    assert Path(first_payload["json_path"]).read_text(encoding="utf-8").endswith("\n")
+    assert json.loads((output_dir / "latest.json").read_text(encoding="utf-8")) == second_payload
+
+
+def test_reconciliation_packet_atomic_write_failure_leaves_complete_files(monkeypatch, tmp_path):
+    output_dir = tmp_path / "reconciliation"
+    output_dir.mkdir()
+    latest_path = output_dir / "latest.json"
+    latest_path.write_text('{"previous": true}\n', encoding="utf-8")
+    original_writer = cli_main._atomic_write_text
+
+    def fail_latest(path, text, **kwargs):
+        if Path(path) == latest_path:
+            raise OSError("injected latest write failure")
+        return original_writer(path, text, **kwargs)
+
+    monkeypatch.setattr(cli_main, "_atomic_write_text", fail_latest)
+    with pytest.raises(OSError, match="injected latest write failure"):
+        cli_main._write_reconciliation_packet(
+            output_dir,
+            stem="symbol-reconciliation-test",
+            packet={"kind": "symbol_broker_reconciliation"},
+        )
+
+    immutable_paths = list(output_dir.glob("symbol-reconciliation-test*.json"))
+    assert len(immutable_paths) == 1
+    assert immutable_paths[0].read_text(encoding="utf-8").endswith("\n")
+    assert json.loads(immutable_paths[0].read_text(encoding="utf-8"))["kind"] == (
+        "symbol_broker_reconciliation"
+    )
+    assert latest_path.read_text(encoding="utf-8") == '{"previous": true}\n'
+
+
+def test_reconciliation_packet_target_write_failure_leaves_no_truncated_packet(monkeypatch, tmp_path):
+    output_dir = tmp_path / "reconciliation"
+    output_dir.mkdir()
+    latest_path = output_dir / "latest.json"
+    latest_path.write_text('{"previous": true}\n', encoding="utf-8")
+
+    def fail_target(path, text, **kwargs):
+        raise OSError("injected target write failure")
+
+    monkeypatch.setattr(cli_main, "_atomic_write_text", fail_target)
+    with pytest.raises(OSError, match="injected target write failure"):
+        cli_main._write_reconciliation_packet(
+            output_dir,
+            stem="symbol-reconciliation-target-failure",
+            packet={"kind": "symbol_broker_reconciliation"},
+        )
+
+    assert list(output_dir.glob("symbol-reconciliation-target-failure*.json")) == []
+    assert latest_path.read_text(encoding="utf-8") == '{"previous": true}\n'
+
+
+def test_reconciliation_packet_concurrent_same_stem_preserves_two_immutable_packets(
+    monkeypatch, tmp_path
+):
+    output_dir = tmp_path / "reconciliation"
+    barrier = threading.Barrier(2)
+    errors = []
+    paths = []
+
+    def force_same_initial_candidate(output_dir_arg, stem, suffix=".json"):
+        barrier.wait(timeout=3)
+        return Path(output_dir_arg) / f"{stem}{suffix}"
+
+    monkeypatch.setattr(cli_main, "_unique_packet_path", force_same_initial_candidate)
+
+    def write_packet(run_id):
+        try:
+            path, _text = cli_main._write_reconciliation_packet(
+                output_dir,
+                stem="race",
+                packet={"kind": "symbol_broker_reconciliation", "run_id": run_id},
+            )
+            paths.append(path)
+        except Exception as exc:  # pragma: no cover - asserted below.
+            errors.append(exc)
+
+    writers = [threading.Thread(target=write_packet, args=(run_id,)) for run_id in ("a", "b")]
+    for writer in writers:
+        writer.start()
+    for writer in writers:
+        writer.join(timeout=5)
+
+    assert errors == []
+    assert len(paths) == 2
+    assert paths[0] != paths[1]
+    immutable_packets = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    assert {packet["run_id"] for packet in immutable_packets} == {"a", "b"}
+    assert all(path.read_text(encoding="utf-8").endswith("\n") for path in paths)
+    latest = json.loads((output_dir / "latest.json").read_text(encoding="utf-8"))
+    assert latest["run_id"] in {"a", "b"}
 
 
 def test_alpaca_reconcile_orcl_incident_discovers_symbol_sell_packet(monkeypatch, tmp_path):
@@ -594,10 +898,10 @@ def test_alpaca_submit_refuses_when_execution_flags_are_disabled(monkeypatch, tm
     )
 
     assert result.exit_code != 0
-    assert "TRADINGAGENTS_ALPACA_PAPER_ENABLED=true" in result.stdout
+    assert "authorized normal live intent" in result.stdout.lower()
     packet = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
     assert packet["status"] == "refused"
-    assert packet["estimated_spent_this_run_by_account"] == {"paper": "0.00", "live": "0.00"}
+    assert packet["account_scope"] == ["live"]
 
 
 def test_ticket_orders_auto_adds_ranked_third_candidate(monkeypatch):
@@ -824,7 +1128,7 @@ class _FakeCliClient:
         }
 
 
-def test_uncapped_live_budget_uses_broker_buying_power_even_after_prior_issue(tmp_path):
+def test_retired_live_budget_mode_is_reported_as_invalid(tmp_path):
     envelope_path = tmp_path / "risk_envelope.yaml"
     envelope_path.write_text(
         "\n".join(
@@ -853,9 +1157,11 @@ def test_uncapped_live_budget_uses_broker_buying_power_even_after_prior_issue(tm
         risk_envelope_path=envelope_path,
     )
 
-    assert mode == "autonomous_uncapped"
-    assert issues == []
-    assert dynamic_cap == Decimal("197.44")
+    assert mode == "invalid_or_retired"
+    assert issues == [
+        "live_budget_mode must be one of: autonomous_with_caps, fixed_tranche"
+    ]
+    assert dynamic_cap == Decimal("100.00")
 
 
 def test_mirofish_market_priors_tag_bot_attention_and_crowded_ai_beta():
@@ -945,7 +1251,7 @@ def test_rank_overnight_results_keeps_fallback_reason_visible():
     ]
 
 
-def test_alpaca_submit_live_mirror_requires_unified_live_gate(monkeypatch, tmp_path):
+def test_alpaca_submit_live_mirror_is_hard_disabled_before_any_broker_client(monkeypatch, tmp_path):
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     monkeypatch.setattr(
@@ -984,15 +1290,55 @@ def test_alpaca_submit_live_mirror_requires_unified_live_gate(monkeypatch, tmp_p
     assert result.exit_code != 0
     assert paper_client.submitted == []
     assert live_client.submitted == []
-    assert "live action must use tiny_live execution_mode" in result.stdout
+    assert "authorized normal live intent" in result.stdout.lower()
     packet = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
-    assert packet["status"] == "blocked"
-    assert packet["reason"] == "unified live-submit gate blocked the legacy live mirror path"
+    assert packet["status"] == "refused"
+    assert "authorized normal live intent" in packet["reason"]
     assert packet["submitted_count"] == 0
-    assert packet["account_scope"] == ["paper", "live"]
+    assert packet["account_scope"] == ["live"]
 
 
-def test_alpaca_submit_blocks_live_buys_after_tuesday_window(monkeypatch):
+def test_alpaca_submit_live_refuses_without_constructing_a_live_client(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_execution_config",
+        lambda: AlpacaExecutionConfig(
+            paper_enabled=True,
+            live_mirror_enabled=True,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_clients",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("manual live submit must not construct a live client")
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "submit",
+            "--run-id",
+            "20260526-tuesday",
+            "--third-symbol",
+            "MSFT",
+            "--third-limit-price",
+            "500",
+            "--log-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "authorized normal live intent" in result.stdout.lower()
+    packet = json.loads((tmp_path / "latest.json").read_text(encoding="utf-8"))
+    assert packet["status"] == "refused"
+    assert packet["submitted_count"] == 0
+
+
+def test_alpaca_submit_live_path_is_disabled_even_after_legacy_window(monkeypatch):
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     monkeypatch.setattr(
@@ -1027,7 +1373,7 @@ def test_alpaca_submit_blocks_live_buys_after_tuesday_window(monkeypatch):
     )
 
     assert result.exit_code != 0
-    assert "live entry window is closed" in result.stdout
+    assert "authorized normal live intent" in result.stdout.lower()
     assert paper_client.submitted == []
     assert live_client.submitted == []
 
@@ -1112,6 +1458,10 @@ def test_alpaca_supervise_hourly_dry_run_logs_without_submitting(monkeypatch, tm
 
 
 def test_alpaca_supervise_hourly_compact_json_output_points_to_raw_packet(monkeypatch, tmp_path):
+    envelope_path = tmp_path / "config" / "risk_envelope.yaml"
+    envelope_path.parent.mkdir()
+    _write_test_risk_envelope(envelope_path)
+    monkeypatch.chdir(tmp_path)
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
@@ -1139,7 +1489,7 @@ def test_alpaca_supervise_hourly_compact_json_output_points_to_raw_packet(monkey
     assert payload["submitted_count"] == 0
     assert payload["portfolio_summary"]["live"]["position_count"] == 1
     assert payload["portfolio_summary"]["live"]["equity"] == "200.00"
-    envelope, envelope_issues = load_risk_envelope("config/risk_envelope.yaml")
+    envelope, envelope_issues = load_risk_envelope(envelope_path)
     assert envelope is not None, envelope_issues
     assert payload["live_budget"]["mode"] == envelope.live_budget_mode
     assert Path(payload["raw_packet_path"]).exists()
@@ -1300,14 +1650,13 @@ def test_alpaca_supervise_hourly_tiny_live_guard_blocks_reconciliation_mismatch(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
-    assert payload["reason"] == "hourly supervisor tiny-live operational guard blocked submit"
-    assert "unexpected live position for AAPL" in payload["issues"][0]["reason"]
+    assert "authorized normal live intent" in payload["reason"]
     assert live_client.submitted == []
     assert paper_client.submitted == []
     assert not (tmp_path / "tiny-live-submit.lock").exists()
 
 
-def test_alpaca_supervise_hourly_live_submit_uses_tiny_live_idempotency_key(monkeypatch, tmp_path):
+def test_alpaca_supervise_hourly_live_submit_refuses_without_issued_intent(monkeypatch, tmp_path):
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     live_client.positions = []
@@ -1350,13 +1699,10 @@ def test_alpaca_supervise_hourly_live_submit_uses_tiny_live_idempotency_key(monk
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["decision"] == "buy"
-    assert len(live_client.submitted) == 1
+    assert payload["decision"] == "blocked"
+    assert "authorized normal live intent" in payload["reason"]
+    assert live_client.submitted == []
     assert paper_client.submitted == []
-    client_order_id = live_client.submitted[0]["client_order_id"]
-    assert client_order_id.startswith("ta-tiny-")
-    assert len(client_order_id) <= 48
-    assert payload["actions"][0]["idempotency_key"] == client_order_id
 
 
 def test_alpaca_supervise_hourly_honors_board_underperformer_review_for_new_live_buys(
@@ -1505,41 +1851,12 @@ def test_alpaca_supervise_hourly_duplicate_tiny_live_id_blocks_for_reconcile(
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["decision"] == "blocked"
-    assert payload["reason"] == "hourly supervisor submit failed; see issues for broker response"
+    assert "authorized normal live intent" in payload["reason"]
     assert paper_client.submitted == []
-    assert len(live_client.submitted) == 1
-    attempted_client_order_id = live_client.submitted[0]["client_order_id"]
-    assert attempted_client_order_id.startswith("ta-tiny-")
-    assert payload["actions"][0]["idempotency_key"] == attempted_client_order_id
-    assert live_client.lookup_client_order_ids == [attempted_client_order_id]
-    issue_text = payload["issues"][0]["reason"]
-    assert "duplicate client_order_id" in issue_text
-    assert "do not create a replacement order id" in issue_text
-    assert "Reconcile broker open/recent orders" in issue_text
-    assert (
-        "Existing broker order found with status=new id=alpaca-existing-order and it "
-        "matches the intended action"
-    ) in issue_text
+    assert live_client.submitted == []
+    assert live_client.lookup_client_order_ids == []
     assert payload["submitted"] == []
-    assert payload["reconciled_orders"] == [
-        {
-            "account": "live",
-            "client_order_id": attempted_client_order_id,
-            "lookup": "found",
-            "intent_match": True,
-            "comparison_issues": [],
-            "order": {
-                "id": "alpaca-existing-order",
-                "client_order_id": attempted_client_order_id,
-                "symbol": "AMZN",
-                "side": "buy",
-                "type": "limit",
-                "notional": live_client.submitted[0]["notional"],
-                "limit_price": live_client.submitted[0]["limit_price"],
-                "status": "new",
-            },
-        }
-    ]
+    assert payload["reconciled_orders"] == []
 
 
 def test_alpaca_supervise_hourly_blocks_when_latest_live_packet_order_is_missing(
@@ -1740,25 +2057,15 @@ def test_alpaca_supervise_hourly_suppresses_duplicate_alert_email(monkeypatch, t
     assert "alert_email" not in saved
 
 
-def test_live_submit_call_sites_stay_behind_unified_gate():
+def test_live_submit_call_sites_are_hard_disabled_or_exact_intent_boundaries():
     submit_source = inspect.getsource(cli_main.alpaca_submit)
-    submit_gate_index = submit_source.index("validate_supervisor_live_submit_allowed")
-    submit_execute_index = submit_source.index("execute_order_pairs(")
-    assert submit_gate_index < submit_execute_index
-    submit_guard_window = submit_source[submit_gate_index:submit_execute_index]
-    assert "if live_submit_issues" in submit_guard_window
-    assert "live_guard_approved=True" in submit_source[submit_execute_index:]
+    assert "execute_order_pairs(" not in submit_source
+    assert "authorized normal live intent" in submit_source.lower()
+    assert "_alpaca_clients(" not in submit_source
 
     supervisor_source = inspect.getsource(cli_main.alpaca_supervise_hourly)
-    supervisor_gate_index = supervisor_source.index(
-        "validate_supervisor_live_submit_allowed"
-    )
-    supervisor_live_submit_index = supervisor_source.index("live_client.submit_order")
-    guard_window = supervisor_source[supervisor_gate_index:supervisor_live_submit_index]
-    assert supervisor_gate_index < supervisor_live_submit_index
-    assert "if live_submit_issues" in guard_window
-    assert "decision = replace(" in guard_window
-    assert "not decision.issues" in guard_window
+    assert "live_client.submit_order" not in supervisor_source
+    assert "authorized normal live intent" in supervisor_source.lower()
 
 
 def test_alpaca_supervise_hourly_records_submit_failure_packet(monkeypatch, tmp_path):
@@ -3267,7 +3574,7 @@ def test_compact_hourly_supervisor_payload_points_to_raw_packet():
             "alert": {"severity": "NOTABLE", "notify": False, "email_suppressed": True},
             "evidence": {
                 "live_budget": {
-                    "mode": "autonomous_uncapped",
+                    "mode": "invalid_or_retired",
                     "repo_dollar_cap_active": False,
                     "plain_english": "broker gates apply",
                 },
@@ -3331,7 +3638,7 @@ def test_compact_hourly_supervisor_payload_points_to_raw_packet():
     assert compact["portfolio_summary"]["paper"]["open_order_count"] == 1
     assert compact["top_candidate"]["symbol"] == "NVDA"
     assert compact["context_summary"]["overnight_plan"]["status"] == "confirmed"
-    assert compact["live_budget"]["mode"] == "autonomous_uncapped"
+    assert compact["live_budget"]["mode"] == "invalid_or_retired"
     assert "portfolio" not in compact
     assert "evidence" not in compact
     assert "portfolio" in compact["raw_field_groups"]
@@ -3431,7 +3738,7 @@ def test_compact_output_audit_measures_packet_families(tmp_path):
                 "alert": {"severity": "ROUTINE", "notify": False},
                 "alert_email": bulky_text,
                 "evidence": {
-                    "live_budget": {"mode": "autonomous_uncapped"},
+                    "live_budget": {"mode": "invalid_or_retired"},
                     "risk_posture": {"name": "balanced"},
                 },
                 "portfolio": {
@@ -4063,9 +4370,10 @@ def test_preopen_submit_allows_clean_preopen_validation(monkeypatch, tmp_path):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["decision"] == "buy"
+    assert payload["decision"] == "blocked"
+    assert "authorized normal live intent" in payload["reason"]
     assert payload["evidence"]["preopen_validation"]["status"] == "pass"
-    assert len(live_client.submitted) == 1
+    assert live_client.submitted == []
     assert paper_client.submitted == []
 
 
@@ -5522,6 +5830,13 @@ def test_policy_freeze_live_writes_control_state(tmp_path):
 
 def test_policy_refresh_live_control_writes_dead_man(tmp_path):
     control_path = tmp_path / "live_control.json"
+    cli_main.write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="existing healthy lease",
+        dead_man_expires_at=datetime.datetime.now(tz=datetime.timezone.utc)
+        + datetime.timedelta(hours=1),
+    )
 
     result = runner.invoke(
         app,
@@ -5545,6 +5860,65 @@ def test_policy_refresh_live_control_writes_dead_man(tmp_path):
     assert state["frozen"] is False
     assert state["reason"] == "ops window active"
     assert state["dead_man_expires_at"]
+
+
+def test_policy_refresh_live_control_cas_preserves_newer_freeze(
+    tmp_path,
+    monkeypatch,
+):
+    control_path = tmp_path / "live_control.json"
+    cli_main.write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="existing healthy lease",
+        dead_man_expires_at=datetime.datetime.now(tz=datetime.timezone.utc)
+        + datetime.timedelta(hours=1),
+    )
+    original_write = cli_main._write_live_control_state_locked
+
+    def newer_freeze_before_refresh(*args, **kwargs):
+        control_path.write_text(
+            json.dumps(
+                {
+                    "frozen": True,
+                    "reason": "newer independent safety freeze",
+                    "dead_man_expires_at": (
+                        datetime.datetime.now(tz=datetime.timezone.utc)
+                        + datetime.timedelta(days=1)
+                    ).isoformat(timespec="seconds"),
+                    "updated_at": datetime.datetime.now(
+                        tz=datetime.timezone.utc
+                    ).isoformat(timespec="seconds"),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cli_main,
+        "_write_live_control_state_locked",
+        newer_freeze_before_refresh,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "policy",
+            "refresh-live-control",
+            "--reason",
+            "ops window active",
+            "--ttl-hours",
+            "2",
+            "--control-path",
+            str(control_path),
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 1
+    state = json.loads(control_path.read_text(encoding="utf-8"))
+    assert state["frozen"] is True
+    assert state["reason"] == "newer independent safety freeze"
 
 
 def test_research_crawl_target_writes_blocked_packet(tmp_path):
@@ -5802,6 +6176,35 @@ def test_research_self_heal_plan_can_execute_allowlisted_safe_refresh(monkeypatc
     assert payload["status"] == "verified"
     assert payload["executed_count"] == 1
     assert payload["verified_count"] == 1
+
+
+def test_research_self_heal_plan_dispatches_owned_recovery_without_execute_safe(monkeypatch, tmp_path):
+    def fake_build(repo_root, *, max_signals, output_dir, safe_reverify_minutes=15):
+        return {
+            "schema_version": 1,
+            "kind": "tradingagents_self_heal_plan",
+            "generated_at": "2026-06-03T00:00:00+00:00",
+            "analysis_only": True,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "signal_count": 1,
+            "active_plan_count": 0,
+            "escalation_count": 0,
+            "deduped_prior_count": 0,
+            "max_severity": "high",
+            "status": "owned_recovery_ready",
+            "signals": [{"classification": "recoverable_integrity", "status": "owned_recovery_ready"}],
+        }
+
+    called = []
+    monkeypatch.setattr(cli_main, "build_self_heal_plan", fake_build)
+    monkeypatch.setattr(cli_main, "execute_self_heal_plan", lambda packet, *, repo_root: called.append(repo_root) or {**packet, "owned_recovery_count": 1})
+
+    result = runner.invoke(app, ["research", "self-heal-plan", "--output-dir", str(tmp_path), "--no-refresh-context", "--json-output"])
+
+    assert result.exit_code == 0, result.output
+    assert called
+    assert json.loads(result.stdout)["owned_recovery_count"] == 1
 
 
 def test_research_reddit_watchlist_packet_writes_compact_policy(tmp_path):

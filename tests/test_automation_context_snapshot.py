@@ -157,3 +157,137 @@ def test_automation_index_excludes_non_tradingagents_automations(tmp_path, monke
     index = snapshot.collect_automation_index()
 
     assert [item["id"] for item in index["automations"]] == ["tradingagents-daily-report"]
+
+
+def _write_valid_autonomous_contract(config_dir):
+    (config_dir / "automation_roles.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "roles": {
+                    "execution_operator": {
+                        "allowed_actions": ["order_submit"],
+                        "forbidden_effects": ["trade_decision"],
+                    }
+                },
+                "automations": {"tradingagents-market-supervisor": "execution_operator"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (config_dir / "autonomous_firm.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "machine_actions": ["order_submit"],
+                "human_actions": ["credential_change"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _compact_context(tmp_path, monkeypatch, *, authority="paper"):
+    snapshot = _load_snapshot_module()
+    packet_path = tmp_path / "results" / "packets" / "latest.json"
+    packet_path.parent.mkdir(parents=True)
+    packet_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-08-13T12:00:00+00:00",
+                "analysis_only": True,
+                "execution_authority": authority,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+    monkeypatch.setattr(snapshot, "LATEST_PACKETS", [("synthetic", packet_path.parent)])
+    monkeypatch.setattr(snapshot, "LATEST_PACKET_FILES", [])
+    return snapshot.collect_snapshot(refresh=False)
+
+
+def test_compact_context_includes_packet_and_autonomous_contract_status(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    _write_valid_autonomous_contract(config_dir)
+
+    summary = _compact_context(tmp_path, monkeypatch)
+
+    assert summary["latest_packets"]
+    assert summary["automation_role_contract_status"] in {"pass", "warn", "fail"}
+    assert summary["execution_authority"] in {"none", "paper", "normal_live"}
+    assert summary["automation_role_contract_status"] == "pass"
+    assert summary["execution_authority"] == "paper"
+
+
+def test_compact_context_fails_closed_when_contract_config_is_missing(tmp_path, monkeypatch):
+    summary = _compact_context(tmp_path, monkeypatch)
+
+    assert summary["automation_role_contract_status"] == "fail"
+    assert set(summary["automation_role_contract_issues"]) == {
+        "automation_roles_unreadable",
+        "autonomous_firm_unreadable",
+    }
+    assert summary["execution_authority"] == "paper"
+
+
+def test_compact_context_fails_closed_when_contract_config_is_unreadable(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "automation_roles.json").write_text("{bad", encoding="utf-8")
+    (config_dir / "autonomous_firm.json").write_text("[bad", encoding="utf-8")
+
+    summary = _compact_context(tmp_path, monkeypatch)
+
+    assert summary["automation_role_contract_status"] == "fail"
+    assert set(summary["automation_role_contract_issues"]) == {
+        "automation_roles_unreadable",
+        "autonomous_firm_unreadable",
+    }
+
+
+def test_compact_context_fails_closed_on_malformed_role_and_assignment_shapes(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "automation_roles.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "roles": {"execution_operator": {"allowed_actions": "order_submit"}},
+                "automations": {"tradingagents-market-supervisor": "unknown_role"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (config_dir / "autonomous_firm.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "machine_actions": ["order_submit"],
+                "human_actions": ["credential_change"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = _compact_context(tmp_path, monkeypatch)
+
+    assert summary["automation_role_contract_status"] == "fail"
+    assert set(summary["automation_role_contract_issues"]) == {
+        "automation_roles_malformed",
+        "automation_assignments_malformed",
+    }
+
+
+def test_compact_context_warns_and_does_not_elevate_invalid_packet_authority(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    _write_valid_autonomous_contract(config_dir)
+
+    summary = _compact_context(tmp_path, monkeypatch, authority="unbounded_live")
+
+    assert summary["automation_role_contract_status"] == "pass"
+    assert summary["execution_authority_status"] == "warn"
+    assert summary["execution_authority"] == "none"
+    assert summary["execution_authority_invalid_labels"] == ["synthetic"]

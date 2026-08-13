@@ -1,0 +1,21 @@
+{
+  "generated_at": "2026-07-18T12:00:00+00:00",
+  "tournament_id": "tournament-20260718",
+  "rankings": [
+    {
+      "strategy_id": "pullback-support",
+      "name": "pullback-support",
+      "equity": "10353.62",
+      "total_return": "353.62",
+      "total_return_pct": "3.53",
+      "max_drawdown_pct": "-1.91",
+      "win_rate_pct": "71.42",
+      "tracked_days": 14
+    }
+  ],
+  "live_strategy_candidate": {
+    "status": "candidate",
+    "strategy_id": "pullback-support",
+    "reason": "best positive paper strategy after 14 tracked day(s)"
+  }
+}

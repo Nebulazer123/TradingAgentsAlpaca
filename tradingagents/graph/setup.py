@@ -1,5 +1,6 @@
 # TradingAgents/graph/setup.py
 
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage
@@ -12,6 +13,11 @@ from tradingagents.agents.utils.agent_states import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
 from .conditional_logic import ConditionalLogic
+from .packet_nodes import (
+    create_portfolio_decision_packet_node,
+    create_research_evidence_packet_node,
+    create_trader_proposal_packet_node,
+)
 
 
 class GraphSetup:
@@ -25,6 +31,8 @@ class GraphSetup:
         conditional_logic: ConditionalLogic,
         analyst_concurrency_limit: int = 1,
         tool_free_analysts: set[str] | None = None,
+        ledger_root: str | Path = "results/control_plane/decisions",
+        evidence_root: str | Path = "results",
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -33,6 +41,8 @@ class GraphSetup:
         self.conditional_logic = conditional_logic
         self.analyst_concurrency_limit = analyst_concurrency_limit
         self.tool_free_analysts = tool_free_analysts or set()
+        self.ledger_root = Path(ledger_root)
+        self.evidence_root = Path(evidence_root)
 
     def setup_graph(
         self, selected_analysts=None
@@ -84,6 +94,18 @@ class GraphSetup:
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
         portfolio_manager_node = create_portfolio_manager(self.deep_thinking_llm)
+        research_evidence_packet_node = create_research_evidence_packet_node(
+            self.ledger_root,
+            self.evidence_root,
+        )
+        trader_proposal_packet_node = create_trader_proposal_packet_node(
+            self.ledger_root,
+            self.evidence_root,
+        )
+        portfolio_decision_packet_node = create_portfolio_decision_packet_node(
+            self.ledger_root,
+            self.evidence_root,
+        )
 
         # Create workflow
         workflow = StateGraph(AgentState)
@@ -104,6 +126,18 @@ class GraphSetup:
         workflow.add_node("Neutral Analyst", neutral_analyst)
         workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
+        workflow.add_node(
+            "Research Evidence Packet",
+            research_evidence_packet_node,
+        )
+        workflow.add_node(
+            "Trader Proposal Packet",
+            trader_proposal_packet_node,
+        )
+        workflow.add_node(
+            "Portfolio Decision Packet",
+            portfolio_decision_packet_node,
+        )
 
         def _wire_analyst_body(spec):
             current_analyst = spec.agent_node
@@ -135,7 +169,7 @@ class GraphSetup:
                 if i < len(plan.specs) - 1:
                     workflow.add_edge(spec.clear_node, plan.specs[i + 1].agent_node)
                 else:
-                    workflow.add_edge(spec.clear_node, "Bull Researcher")
+                    workflow.add_edge(spec.clear_node, "Research Evidence Packet")
         else:
             def _send_batch(batch):
                 def route(state):
@@ -186,52 +220,51 @@ class GraphSetup:
                         _send_batch(plan.batches[batch_index + 1]),
                     )
                 else:
-                    workflow.add_edge(join_node, "Bull Researcher")
+                    workflow.add_edge(join_node, "Research Evidence Packet")
 
         # Add remaining edges
+        debate_path_map = {
+            "Bull Researcher": "Bull Researcher",
+            "Bear Researcher": "Bear Researcher",
+            "Research Manager": "Research Manager",
+        }
+        risk_path_map = {
+            "Aggressive Analyst": "Aggressive Analyst",
+            "Conservative Analyst": "Conservative Analyst",
+            "Neutral Analyst": "Neutral Analyst",
+            "Portfolio Manager": "Portfolio Manager",
+        }
         workflow.add_conditional_edges(
             "Bull Researcher",
             self.conditional_logic.should_continue_debate,
-            {
-                "Bear Researcher": "Bear Researcher",
-                "Research Manager": "Research Manager",
-            },
+            debate_path_map,
         )
         workflow.add_conditional_edges(
             "Bear Researcher",
             self.conditional_logic.should_continue_debate,
-            {
-                "Bull Researcher": "Bull Researcher",
-                "Research Manager": "Research Manager",
-            },
+            debate_path_map,
         )
+        workflow.add_edge("Research Evidence Packet", "Bull Researcher")
         workflow.add_edge("Research Manager", "Trader")
-        workflow.add_edge("Trader", "Aggressive Analyst")
+        workflow.add_edge("Trader", "Trader Proposal Packet")
+        workflow.add_edge("Trader Proposal Packet", "Aggressive Analyst")
         workflow.add_conditional_edges(
             "Aggressive Analyst",
             self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Conservative Analyst": "Conservative Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
+            risk_path_map,
         )
         workflow.add_conditional_edges(
             "Conservative Analyst",
             self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Neutral Analyst": "Neutral Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
+            risk_path_map,
         )
         workflow.add_conditional_edges(
             "Neutral Analyst",
             self.conditional_logic.should_continue_risk_analysis,
-            {
-                "Aggressive Analyst": "Aggressive Analyst",
-                "Portfolio Manager": "Portfolio Manager",
-            },
+            risk_path_map,
         )
 
-        workflow.add_edge("Portfolio Manager", END)
+        workflow.add_edge("Portfolio Manager", "Portfolio Decision Packet")
+        workflow.add_edge("Portfolio Decision Packet", END)
 
         return workflow

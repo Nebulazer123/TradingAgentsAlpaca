@@ -21,6 +21,7 @@ from tradingagents.evals.agent_intelligence_ledger import (
     resolve_forecasts,
     summarize_agent_scores,
 )
+from tradingagents.evals.learning_availability import LearningAvailabilityLedger
 from tradingagents.evals.resolution_quality import (
     DEFER_TICKER_FINAL_BAR_MISSING,
     LABEL_QUALITY_HIGH,
@@ -604,6 +605,7 @@ def test_agent_ledger_update_cli_appends_and_resolves_idempotently(tmp_path: Pat
     overnight_path = tmp_path / "overnight.json"
     ledger_path = tmp_path / "ledger.jsonl"
     summary_path = tmp_path / "summary.json"
+    availability_root = tmp_path / "learning_availability"
     packet = _overnight_packet()
     packet["generated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(
         timespec="seconds"
@@ -619,6 +621,8 @@ def test_agent_ledger_update_cli_appends_and_resolves_idempotently(tmp_path: Pat
         str(ledger_path),
         "--summary-path",
         str(summary_path),
+        "--learning-availability-root",
+        str(availability_root),
         "--benchmark",
         "QQQ",
         "--no-include-mirofish",
@@ -635,6 +639,9 @@ def test_agent_ledger_update_cli_appends_and_resolves_idempotently(tmp_path: Pat
     assert payload["mirofish_forecast_count"] == 0
     assert payload["appended_count"] == 7
     assert payload["resolved_forecast_count"] == 0
+    assert payload["learning_availability_root"] == str(availability_root)
+    assert payload["learning_observed_count"] == 0
+    assert payload["learning_newly_recorded_count"] == 0
     assert summary_path.exists()
 
     second = runner.invoke(app, args)
@@ -649,6 +656,7 @@ def test_agent_ledger_resolve_cli_sweeps_existing_ledger_across_tickers(monkeypa
     ledger_path = tmp_path / "ledger.jsonl"
     summary_path = tmp_path / "summary.json"
     quality_path = tmp_path / "resolution_quality.json"
+    availability_root = tmp_path / "learning_availability"
     base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
     append_forecasts(
         [
@@ -690,11 +698,19 @@ def test_agent_ledger_resolve_cli_sweeps_existing_ledger_across_tickers(monkeypa
     assert payload["resolved_forecast_count"] == 2
     assert payload["resolution_quality"]["label_quality_counts"][LABEL_QUALITY_HIGH] == 2
     assert payload["resolution_quality"]["deferred_count"] == 0
+    assert payload["learning_availability_root"] == str(availability_root)
+    assert payload["learning_observed_count"] == 2
+    assert payload["learning_newly_recorded_count"] == 2
     assert summary_path.exists()
     assert quality_path.exists()
     rows = load_ledger(ledger_path)
     assert all(row.label_quality == LABEL_QUALITY_HIGH for row in rows)
     assert all(row.resolution_window["final_bar_available"] is True for row in rows)
+    observations = LearningAvailabilityLedger(availability_root).verify()
+    assert len(observations) == 2
+    assert {row.recorded_at for row in observations} == {
+        row.effective_at for row in observations
+    }
 
 
 def test_agent_ledger_resolve_cli_defers_stale_ticker_windows_with_reason(
@@ -745,12 +761,63 @@ def test_agent_ledger_resolve_cli_defers_stale_ticker_windows_with_reason(
     assert row.resolution_note.startswith("deferred:")
 
 
+def test_agent_ledger_resolve_recovers_write_to_availability_crash_gap(
+    monkeypatch,
+    tmp_path: Path,
+):
+    ledger_path = tmp_path / "ledger.jsonl"
+    availability_root = tmp_path / "learning_availability"
+    base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
+    append_forecasts(
+        [replace(base[0], forecast_id="af-crash-gap", ticker="NFLX")],
+        path=ledger_path,
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_ledger_window_lookup",
+        _window_lookup_for({"NFLX": ("100", "110"), "QQQ": ("100", "102")}),
+    )
+    real_observe = cli_main.observe_forecasts
+
+    def crash_before_availability(*args, **kwargs):
+        raise RuntimeError("crash after forecast write")
+
+    monkeypatch.setattr(cli_main, "observe_forecasts", crash_before_availability)
+    args = [
+        "research",
+        "agent-ledger-resolve",
+        "--ledger-path",
+        str(ledger_path),
+        "--summary-path",
+        str(tmp_path / "summary.json"),
+        "--resolution-quality-path",
+        str(tmp_path / "quality.json"),
+        "--learning-availability-root",
+        str(availability_root),
+        "--json-output",
+    ]
+    crashed = runner.invoke(app, args)
+    assert crashed.exit_code == 1
+    assert load_ledger(ledger_path)[0].resolved is True
+    assert not availability_root.exists()
+
+    monkeypatch.setattr(cli_main, "observe_forecasts", real_observe)
+    recovered = runner.invoke(app, args)
+    assert recovered.exit_code == 0, recovered.output
+    payload = json.loads(recovered.stdout)
+    assert payload["newly_resolved_count"] == 0
+    assert payload["learning_observed_count"] == 1
+    assert payload["learning_newly_recorded_count"] == 1
+    assert len(LearningAvailabilityLedger(availability_root).verify()) == 1
+
+
 def test_ledger_quality_audit_cli_annotates_resolved_rows_and_backs_up(
     monkeypatch, tmp_path: Path
 ):
     ledger_path = tmp_path / "ledger.jsonl"
     summary_path = tmp_path / "summary.json"
     quality_path = tmp_path / "resolution_quality.json"
+    availability_root = tmp_path / "learning_availability"
     base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
     resolved_fields = {
         "resolved": True,
@@ -796,6 +863,8 @@ def test_ledger_quality_audit_cli_annotates_resolved_rows_and_backs_up(
             str(summary_path),
             "--quality-path",
             str(quality_path),
+            "--learning-availability-root",
+            str(availability_root),
             "--json-output",
         ],
     )
@@ -811,6 +880,9 @@ def test_ledger_quality_audit_cli_annotates_resolved_rows_and_backs_up(
         LABEL_QUALITY_SUSPECT: 1,
     }
     assert payload["suspect_forecast_ids"] == ["af-audit-msft"]
+    assert payload["learning_availability_root"] == str(availability_root)
+    assert payload["learning_observed_count"] == 2
+    assert payload["learning_newly_recorded_count"] == 2
     assert quality_path.exists()
     backups = list(tmp_path.glob("ledger.backup-quality-audit-*.jsonl"))
     assert len(backups) == 1

@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
+    OfficialDataError,
+    RecoverableDataflowError,
+)
 from tradingagents.dataflows.yfinance_short_interest import fetch_yfinance_short_interest
 
 
@@ -58,5 +62,28 @@ def test_fetch_yfinance_short_interest_rejects_metadata_only_packet(monkeypatch)
     fake_yfinance = SimpleNamespace(Ticker=_MetadataOnlyTicker)
     monkeypatch.setitem(__import__("sys").modules, "yfinance", fake_yfinance)
 
-    with pytest.raises(OfficialDataError, match="no short-interest fields"):
+    with pytest.raises(DataUnavailableError, match="no short-interest fields"):
         fetch_yfinance_short_interest("qqq")
+
+
+def test_fetch_yfinance_short_interest_without_metadata_is_unavailable(monkeypatch):
+    fake_yfinance = SimpleNamespace(
+        Ticker=lambda _symbol: SimpleNamespace(get_info=lambda: None)
+    )
+    monkeypatch.setitem(__import__("sys").modules, "yfinance", fake_yfinance)
+
+    with pytest.raises(DataUnavailableError, match="no metadata"):
+        fetch_yfinance_short_interest("qqq")
+
+
+def test_fetch_yfinance_short_interest_missing_symbol_remains_terminal(monkeypatch):
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "yfinance",
+        SimpleNamespace(Ticker=lambda _symbol: pytest.fail("ticker must not be built")),
+    )
+
+    with pytest.raises(OfficialDataError, match="ticker symbol") as exc_info:
+        fetch_yfinance_short_interest("")
+
+    assert not isinstance(exc_info.value, RecoverableDataflowError)

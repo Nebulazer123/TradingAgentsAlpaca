@@ -49,6 +49,57 @@ def _extract_article_data(article: dict) -> dict:
         }
 
 
+def _normalize_yahoo_news_symbol(ticker: str) -> str:
+    """Translate a requested instrument into the narrow Yahoo news syntax."""
+    symbol = ticker.strip().upper()
+    if not symbol:
+        return symbol
+
+    if symbol in {"XAUUSD", "XAUUSD+"}:
+        return "GC=F"
+
+    crypto_aliases = {
+        "BTCUSD": "BTC-USD",
+        "BTC-USDT": "BTC-USD",
+        "BTC-USDC": "BTC-USD",
+    }
+    if symbol in crypto_aliases:
+        return crypto_aliases[symbol]
+
+    if "=" in symbol or symbol.startswith("^") or symbol.endswith("-USD"):
+        return symbol
+
+    currency_codes = {
+        "AUD",
+        "BRL",
+        "CAD",
+        "CHF",
+        "CNY",
+        "DKK",
+        "EUR",
+        "GBP",
+        "HKD",
+        "INR",
+        "JPY",
+        "MXN",
+        "NOK",
+        "NZD",
+        "PLN",
+        "SEK",
+        "SGD",
+        "TRY",
+        "USD",
+        "ZAR",
+    }
+    if len(symbol) == 6:
+        base_currency = symbol[:3]
+        quote_currency = symbol[3:]
+        if base_currency in currency_codes and quote_currency in currency_codes:
+            return f"{symbol}=X"
+
+    return symbol
+
+
 def get_news_yfinance(
     ticker: str,
     start_date: str,
@@ -66,12 +117,19 @@ def get_news_yfinance(
         Formatted string containing news articles
     """
     article_limit = get_config()["news_article_limit"]
+    requested_symbol = ticker.strip().upper()
+    yahoo_symbol = _normalize_yahoo_news_symbol(ticker)
+    provenance = (
+        f" (Yahoo query: {yahoo_symbol})"
+        if yahoo_symbol != requested_symbol
+        else ""
+    )
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(yahoo_symbol)
         news = yf_retry(lambda: stock.get_news(count=article_limit))
 
         if not news:
-            return f"No news found for {ticker}"
+            return f"No news found for {requested_symbol}{provenance}"
 
         # Parse date range for filtering
         start_dt = datetime.strptime(start_date, "%Y-%m-%d")
@@ -98,12 +156,20 @@ def get_news_yfinance(
             filtered_count += 1
 
         if filtered_count == 0:
-            return f"No news found for {ticker} between {start_date} and {end_date}"
+            return (
+                f"No news found for {requested_symbol}{provenance} "
+                f"between {start_date} and {end_date}"
+            )
 
-        return f"## {ticker} News, from {start_date} to {end_date}:\n\n{news_str}"
+        return (
+            f"## {requested_symbol} News, from {start_date} to "
+            f"{end_date}{provenance}:\n\n{news_str}"
+        )
 
     except Exception as e:
-        return f"Error fetching news for {ticker}: {str(e)}"
+        return (
+            f"Error fetching news for {requested_symbol}{provenance}: {str(e)}"
+        )
 
 
 def get_global_news_yfinance(

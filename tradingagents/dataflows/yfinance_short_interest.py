@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from tradingagents.dataflows._official_common import (
+    DataUnavailableError,
     OfficialDataError,
     evidence_packet,
     now_iso,
@@ -82,7 +83,7 @@ def fetch_yfinance_short_interest(symbol: str) -> Any:
     ticker = yf.Ticker(ticker_symbol)
     info = ticker.get_info() if hasattr(ticker, "get_info") else getattr(ticker, "info", None)
     if not isinstance(info, dict):
-        raise OfficialDataError(f"yfinance returned no metadata for {ticker_symbol}")
+        raise DataUnavailableError(f"yfinance returned no metadata for {ticker_symbol}")
 
     raw_fields = {
         field: _json_safe(info.get(field))
@@ -90,7 +91,9 @@ def fetch_yfinance_short_interest(symbol: str) -> Any:
         if info.get(field) is not None
     }
     if not any(info.get(field) is not None for field in REQUIRED_SHORT_INTEREST_FIELDS):
-        raise OfficialDataError(f"yfinance returned no short-interest fields for {ticker_symbol}")
+        raise DataUnavailableError(
+            f"yfinance returned no short-interest fields for {ticker_symbol}"
+        )
 
     shares_short = _float_value(info.get("sharesShort"))
     shares_short_prior = _float_value(info.get("sharesShortPriorMonth"))

@@ -10,8 +10,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import pandas as pd
+
 from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    DataUnavailableError,
     OfficialDataError,
+    RecoverableDataflowError,
     cached_safe_fetch_evidence,
     evidence_packet,
     official_cache_key,
@@ -45,10 +50,14 @@ from tradingagents.dataflows.massive import (
 from tradingagents.dataflows.newsapi import fetch_newsapi_everything
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.sec import fetch_sec_company_tickers, fetch_sec_submissions
+from tradingagents.dataflows.stockstats_utils import validate_daily_ohlcv
 from tradingagents.dataflows.tiingo import (
     fetch_tiingo_daily_prices,
     fetch_tiingo_news,
     fetch_tiingo_ticker_metadata,
+)
+from tradingagents.dataflows.yfinance_earnings_calendar import (
+    fetch_yfinance_earnings_calendar,
 )
 from tradingagents.dataflows.yfinance_options import fetch_yfinance_options_iv_flow
 from tradingagents.dataflows.yfinance_short_interest import fetch_yfinance_short_interest
@@ -92,6 +101,10 @@ RESEARCH_GAP_EVIDENCE_NEEDS = {
     "options_iv_flow": {
         "why_it_matters": "0DTE/gamma/IV context can affect intraday dip-buy and spike-sell behavior.",
         "suggested_routes": ["massive_options_or_polygon_options", "dedicated_options_vendor"],
+    },
+    "earnings_calendar": {
+        "why_it_matters": "Upcoming earnings can materially change event risk and trade timing.",
+        "suggested_routes": ["issuer_ir_calendar", "exchange_or_vendor_earnings_calendar"],
     },
 }
 
@@ -193,8 +206,14 @@ def _fetch_yfinance_quote_price_context(
 
     ticker = yf.Ticker(symbol)
     history = ticker.history(period="1mo", interval="1d", auto_adjust=False)
-    if history is None or history.empty:
-        raise OfficialDataError(f"yfinance returned no price history for {symbol}")
+    requested_as_of = _today(now)
+    actual_latest = validate_daily_ohlcv(
+        history,
+        "yfinance",
+        symbol,
+        requested_as_of,
+    )
+    actual_latest_date = actual_latest.date().isoformat()
     fast_info = getattr(ticker, "fast_info", None)
     if fast_info is not None:
         try:
@@ -230,7 +249,12 @@ def _fetch_yfinance_quote_price_context(
         ),
         tool_route="dataflow:yfinance",
         redaction_status="no_secrets_seen",
-        freshness_extra={"read_only": True},
+        as_of=actual_latest_date,
+        freshness_extra={
+            "read_only": True,
+            "requested_as_of": requested_as_of.isoformat(),
+            "actual_latest_bar": actual_latest_date,
+        },
     )
 
 
@@ -292,8 +316,14 @@ _CANDIDATE_FIELDS = (
 
 def _json_object_from_file(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DataTransportError(
+            f"broker supervisor packet could not be read: {type(exc).__name__}"
+        ) from exc
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
         raise OfficialDataError(f"broker supervisor packet could not be read: {exc}") from exc
     if not isinstance(payload, dict):
         raise OfficialDataError("broker supervisor packet is not a JSON object")
@@ -305,7 +335,9 @@ def _latest_broker_snapshot_path(snapshot_dir: str | Path) -> Path:
     if root.is_file():
         return root
     if not root.exists():
-        raise OfficialDataError(f"no supervisor snapshot directory found at {root}")
+        raise DataUnavailableError(
+            f"no supervisor snapshot directory found at {root}"
+        )
     latest = root / "latest.json"
     if latest.exists():
         return latest
@@ -315,7 +347,9 @@ def _latest_broker_snapshot_path(snapshot_dir: str | Path) -> Path:
         if _is_raw_json_packet_path(path)
     ]
     if not candidates:
-        raise OfficialDataError(f"no supervisor snapshot packet found at {root}")
+        raise DataUnavailableError(
+            f"no supervisor snapshot packet found at {root}"
+        )
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
@@ -594,7 +628,7 @@ def _cik_for_symbol(company_tickers_payload: dict[str, Any], symbol: str) -> str
             cik = item.get("cik_str")
             if cik is not None:
                 return str(cik)
-    raise OfficialDataError(f"SEC CIK not found for ticker {target}")
+    raise DataUnavailableError(f"SEC CIK not found for ticker {target}")
 
 
 def _fetch_sec_submissions_by_symbol(symbol: str) -> SourceEvidencePacket:
@@ -744,12 +778,39 @@ def _provider_cache_key(*, symbol: str, evidence_need: str, source_name: str) ->
     return official_cache_key(*parts)
 
 
+def _yfinance_quote_cache_is_usable(
+    packet: SourceEvidencePacket,
+    *,
+    symbol: str,
+    now: datetime.datetime | None,
+) -> bool:
+    cache = packet.freshness.get("cache")
+    if packet.freshness.get("stale"):
+        return False
+    if isinstance(cache, dict) and cache.get("state") == "stale_fallback":
+        return False
+    actual_latest_bar = packet.freshness.get("actual_latest_bar")
+    if not actual_latest_bar:
+        return False
+    try:
+        validate_daily_ohlcv(
+            pd.DataFrame({"Date": [actual_latest_bar]}),
+            "yfinance provider cache",
+            symbol,
+            _today(now),
+        )
+    except DataUnavailableError:
+        return False
+    return True
+
+
 def _read_source_cache_packet(
     cache_dir: str | Path,
     *,
     symbol: str,
     evidence_need: str,
     candidate_sources: Sequence[str],
+    now: datetime.datetime | None = None,
 ) -> SourceEvidencePacket:
     for source_name in candidate_sources:
         if source_name == "official_cache":
@@ -763,11 +824,39 @@ def _read_source_cache_packet(
         if not path.exists():
             continue
         try:
-            cached = SourceEvidencePacket.model_validate_json(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise DataTransportError(
+                f"cached {evidence_need} evidence could not be read: {type(exc).__name__}"
+            ) from exc
+        cached = SourceEvidencePacket.model_validate_json(text)
         if cached.tool_route == "local:research_gap" or cached.freshness.get("gap_category"):
             continue
+        if evidence_need == "quote_price_context":
+            cache = cached.freshness.get("cache")
+            if cached.freshness.get("stale"):
+                continue
+            if isinstance(cache, dict) and cache.get("state") == "stale_fallback":
+                continue
+            current = now or datetime.datetime.now(tz=datetime.timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=datetime.timezone.utc)
+            try:
+                modified_at = path.stat().st_mtime
+            except OSError as exc:
+                raise DataTransportError(
+                    f"cached {evidence_need} evidence could not be inspected: "
+                    f"{type(exc).__name__}"
+                ) from exc
+            age_seconds = max(current.timestamp() - modified_at, 0.0)
+            if age_seconds > _cache_ttl_seconds(evidence_need):
+                continue
+            if cached.source_name == "yfinance" and not _yfinance_quote_cache_is_usable(
+                cached,
+                symbol=symbol,
+                now=now,
+            ):
+                continue
         source_ref = f"local://{path.as_posix()}"
         return evidence_packet(
             source_name="official_cache",
@@ -802,7 +891,9 @@ def _read_source_cache_packet(
             redaction_status="no_secrets_seen",
             freshness_extra={"read_only": True, "cache": {"state": "hit", "source": cached.source_name}},
         )
-    raise OfficialDataError(f"no cached {evidence_need} evidence for {symbol}")
+    raise DataUnavailableError(
+        f"no cached {evidence_need} evidence for {symbol}"
+    )
 
 
 def _unsupported_attempt(candidate: ProviderFallbackCandidate, *, evidence_need: str) -> dict[str, Any]:
@@ -882,6 +973,8 @@ def _fetcher_for_candidate(
         return lambda: _fetch_yfinance_quote_price_context(symbol, now=now)
     if source == "yfinance_options" and evidence_need == "options_iv_flow":
         return lambda: fetch_yfinance_options_iv_flow(symbol)
+    if source == "yfinance_earnings_calendar" and evidence_need == "earnings_calendar":
+        return lambda: fetch_yfinance_earnings_calendar(symbol)
     if source == "yfinance_short_interest" and evidence_need == "short_interest":
         return lambda: fetch_yfinance_short_interest(symbol)
     if source == "sec_edgar" and evidence_need == "fundamentals_profile":
@@ -1067,8 +1160,9 @@ def build_ticker_provider_research_packets(
                         symbol=ticker,
                         evidence_need=evidence_need,
                         candidate_sources=candidate_sources,
+                        now=now,
                     )
-                except OfficialDataError as exc:
+                except RecoverableDataflowError as exc:
                     attempts.append(
                         _cache_miss_attempt(candidate, evidence_need=evidence_need, reason=str(exc))
                     )
@@ -1109,7 +1203,25 @@ def build_ticker_provider_research_packets(
                 source_ref=f"{candidate.route}:{ticker}",
                 cache_dir=cache_dir,
                 now=now,
-                allow_stale_on_error=candidate.source_name not in NO_STALE_CACHE_SOURCES,
+                allow_stale_on_error=(
+                    candidate.source_name not in NO_STALE_CACHE_SOURCES
+                    and not (
+                        candidate.source_name == "yfinance"
+                        and evidence_need == "quote_price_context"
+                    )
+                ),
+                cached_packet_validator=(
+                    (
+                        lambda cached: _yfinance_quote_cache_is_usable(
+                            cached,
+                            symbol=ticker,
+                            now=now,
+                        )
+                    )
+                    if candidate.source_name == "yfinance"
+                    and evidence_need == "quote_price_context"
+                    else None
+                ),
             )
             if not _blocked_packet_counts_as_evidence(packet, candidate):
                 attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))

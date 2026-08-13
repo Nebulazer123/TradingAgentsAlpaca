@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.1.0",
+  "generated_at": "2026-07-18T12:00:00+00:00",
+  "source": {
+    "kind": "paper_tournament_sync",
+    "tournament_id": "fixture-baseline",
+    "report_generated_at": "2026-07-18T12:00:00+00:00",
+    "arm_live": false,
+    "ci_green": false
+  },
+  "sleeves": {}
+}

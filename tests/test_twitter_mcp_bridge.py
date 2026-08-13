@@ -3,7 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tradingagents.dataflows._official_common import OfficialDataError
+from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    OfficialDataError,
+    RecoverableDataflowError,
+)
 from tradingagents.research.twitter_mcp import (
     _extract_json_payload,
     fetch_twitter_recent_search_packet,
@@ -70,9 +74,31 @@ def test_twitter_mcp_unauthorized_recent_search_becomes_blocked_packet():
     assert packet.payload["execution_authority"] == "none"
 
 
-def test_twitter_mcp_timeout_raises_official_data_error():
+def test_twitter_mcp_timeout_is_transport_failure():
     def fake_run(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(cmd="docker", timeout=15)
 
-    with pytest.raises(OfficialDataError, match="timed out"):
+    with pytest.raises(DataTransportError, match="timed out"):
         fetch_twitter_recent_search_packet("NVDA", run_func=fake_run)
+
+
+@pytest.mark.parametrize(
+    "run_result",
+    [
+        _completed(stdout="not JSON"),
+        _completed(stderr="docker gateway unavailable", returncode=1),
+    ],
+)
+def test_twitter_unusable_external_mcp_output_is_transport_failure(run_result):
+    with pytest.raises(DataTransportError):
+        fetch_twitter_recent_search_packet(
+            "NVDA",
+            run_func=lambda *_args, **_kwargs: run_result,
+        )
+
+
+def test_twitter_missing_ticker_remains_terminal():
+    with pytest.raises(OfficialDataError, match="ticker symbol") as exc_info:
+        fetch_twitter_recent_search_packet("")
+
+    assert not isinstance(exc_info.value, RecoverableDataflowError)

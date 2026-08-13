@@ -20,8 +20,7 @@ class RiskEnvelope:
     new_sleeve_auto_promote: bool
     alert_email: str
     live_budget_mode: str = "fixed_tranche"
-    # Optional hard account-exposure ceiling that applies in EVERY live_budget_mode,
-    # including autonomous_uncapped. Absent (None) -> inert / no behavior change.
+    # Optional hard account-exposure ceiling. Absent (None) -> inert.
     account_hard_ceiling_usd: Decimal | None = None
     # Optional rolling-window live-order rate limit. Both must be set to enforce.
     # Absent (None) -> inert / no behavior change.
@@ -45,7 +44,7 @@ _REQUIRED_FIELDS = _DECIMAL_FIELDS | _BOOL_FIELDS | _STRING_FIELDS
 _OPTIONAL_STRING_FIELDS = {"live_budget_mode"}
 _OPTIONAL_DECIMAL_FIELDS = {"account_hard_ceiling_usd"}
 _OPTIONAL_INT_FIELDS = {"max_live_orders_per_window", "live_order_window_minutes"}
-_LIVE_BUDGET_MODES = {"fixed_tranche", "autonomous_with_caps", "autonomous_uncapped"}
+_LIVE_BUDGET_MODES = {"fixed_tranche", "autonomous_with_caps"}
 
 
 def _parse_simple_yaml(path: Path) -> dict[str, str]:

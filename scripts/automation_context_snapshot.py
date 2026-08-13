@@ -47,6 +47,7 @@ AUTOMATION_MEMORY_ROLLUP_LATEST = (
 CENTRAL = ZoneInfo("America/Chicago")
 PROVIDER_BUNDLE_SCAN_LIMIT = 50
 JSON_FILE_CACHE = JsonFileCache.from_env(max_entries=2048)
+EXECUTION_AUTHORITIES = ("none", "paper", "normal_live")
 
 
 AUTOMATION_IDS = [
@@ -289,6 +290,107 @@ def rel(path: Path) -> str:
 
 def read_json(path: Path) -> Any | None:
     return JSON_FILE_CACHE.read_json(path)
+
+
+def summarize_autonomous_role_contract() -> dict[str, Any]:
+    """Compactly validate the versioned role and authority contract.
+
+    This intentionally reads only versioned configuration, never credentials or
+    mutable execution state. An incomplete contract is reported as a compact
+    failure rather than being treated as authorization.
+    """
+
+    role_path = ROOT / "config" / "automation_roles.json"
+    firm_path = ROOT / "config" / "autonomous_firm.json"
+    summary: dict[str, Any] = {
+        "automation_role_contract_status": "fail",
+        "automation_role_contract_paths": [rel(role_path), rel(firm_path)],
+        "automation_role_count": 0,
+        "automation_role_assignment_count": 0,
+        "automation_role_contract_issues": [],
+    }
+    roles_document = read_json(role_path)
+    firm_document = read_json(firm_path)
+    issues: list[str] = []
+    if not isinstance(roles_document, dict):
+        issues.append("automation_roles_unreadable")
+        roles: dict[str, Any] = {}
+        automations: dict[str, Any] = {}
+    else:
+        roles = roles_document.get("roles") if isinstance(roles_document.get("roles"), dict) else {}
+        automations = (
+            roles_document.get("automations")
+            if isinstance(roles_document.get("automations"), dict)
+            else {}
+        )
+        if roles_document.get("schema_version") != 1:
+            issues.append("automation_roles_schema")
+        if not roles:
+            issues.append("automation_roles_missing")
+        if not automations:
+            issues.append("automation_assignments_missing")
+        invalid_roles = [
+            role
+            for role, record in roles.items()
+            if not isinstance(role, str)
+            or not role.strip()
+            or not isinstance(record, dict)
+            or not isinstance(record.get("allowed_actions"), list)
+            or not all(isinstance(action, str) and action for action in record["allowed_actions"])
+        ]
+        if invalid_roles:
+            issues.append("automation_roles_malformed")
+        invalid_assignments = [
+            automation
+            for automation, role in automations.items()
+            if not isinstance(automation, str)
+            or not automation.strip()
+            or not isinstance(role, str)
+            or role not in roles
+        ]
+        if invalid_assignments:
+            issues.append("automation_assignments_malformed")
+    if not isinstance(firm_document, dict):
+        issues.append("autonomous_firm_unreadable")
+    else:
+        machine_actions = firm_document.get("machine_actions")
+        human_actions = firm_document.get("human_actions")
+        if firm_document.get("schema_version") != 2:
+            issues.append("autonomous_firm_schema")
+        if not all(
+            isinstance(actions, list)
+            and actions
+            and all(isinstance(action, str) and action for action in actions)
+            for actions in (machine_actions, human_actions)
+        ):
+            issues.append("autonomous_firm_actions_malformed")
+        elif set(machine_actions) & set(human_actions):
+            issues.append("autonomous_firm_actions_overlap")
+    summary["automation_role_count"] = len(roles)
+    summary["automation_role_assignment_count"] = len(automations)
+    summary["automation_role_contract_issues"] = issues
+    if not issues:
+        summary["automation_role_contract_status"] = "pass"
+    return summary
+
+
+def summarize_execution_authority(packets: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the highest declared packet authority, failing closed on bad data."""
+
+    declared = [
+        (str(packet.get("label") or "unknown"), packet.get("execution_authority"))
+        for packet in packets
+        if packet.get("execution_authority") is not None
+    ]
+    invalid_labels = [label for label, value in declared if value not in EXECUTION_AUTHORITIES]
+    valid = {value for _label, value in declared if value in EXECUTION_AUTHORITIES}
+    authority = "normal_live" if "normal_live" in valid else "paper" if "paper" in valid else "none"
+    return {
+        "execution_authority": authority,
+        "execution_authority_status": "warn" if invalid_labels else "pass",
+        "execution_authority_source_labels": [label for label, _value in declared][:12],
+        "execution_authority_invalid_labels": invalid_labels[:12],
+    }
 
 
 def resolve_repo_path(value: Any) -> Path | None:
@@ -922,6 +1024,7 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
         "lines": file_metric(path).get("lines"),
         "approx_tokens": approx_tokens(path.stat().st_size),
         "generated_at": data.get("generated_at") or data.get("started_at"),
+        "execution_authority": data.get("execution_authority"),
         "drilldown_required": False,
         "drilldown_reasons": [],
     }
@@ -3191,6 +3294,8 @@ def collect_snapshot(*, refresh: bool = True) -> dict[str, Any]:
             "Open raw packets only for listed flags or task-specific drilldown.",
         ],
         "latest_packets": packets,
+        **summarize_autonomous_role_contract(),
+        **summarize_execution_authority(packets),
         "flags": flags,
         "next_open": next_open,
     }

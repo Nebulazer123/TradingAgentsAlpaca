@@ -1,11 +1,23 @@
+import datetime
 import json
+import os
 from pathlib import Path
 
+import pandas as pd
+import pytest
+import yfinance as yf
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.main import app
-from tradingagents.dataflows._official_common import evidence_packet
+from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    DataUnavailableError,
+    OfficialDataError,
+    VendorNotConfiguredError,
+    evidence_packet,
+)
 from tradingagents.research import provider_orchestrator as orchestrator
 from tradingagents.research.provider_fallbacks import load_provider_fallback_config
 from tradingagents.research.provider_orchestrator import (
@@ -13,7 +25,7 @@ from tradingagents.research.provider_orchestrator import (
     TickerProviderResearchResult,
     build_ticker_provider_research_packets,
 )
-from tradingagents.schemas.research import CrawlerRunPacket
+from tradingagents.schemas.research import CrawlerRunPacket, SourceEvidencePacket
 
 runner = CliRunner()
 
@@ -29,6 +41,64 @@ def _packet(source_name: str, *, evidence_type: str = "market_news", symbol: str
         quality="medium" if source_name != "google_news_rss" else "low",
         tool_route=f"{source_name}_test",
     )
+
+
+def _source_packet_validation_error():
+    try:
+        SourceEvidencePacket.model_validate({})
+    except Exception as exc:  # noqa: BLE001 - return the concrete Pydantic error.
+        return exc
+    raise AssertionError("invalid packet unexpectedly validated")
+
+
+def _quote_packet(
+    source_name: str,
+    *,
+    symbol: str = "NVDA",
+    requested_as_of: str = "2026-07-06",
+    actual_latest_bar: str | None = "2026-07-02",
+    stale: bool = False,
+    cache_state: str | None = None,
+):
+    freshness_extra = {"requested_as_of": requested_as_of}
+    if actual_latest_bar is not None:
+        freshness_extra["actual_latest_bar"] = actual_latest_bar
+    if cache_state is not None:
+        freshness_extra["cache"] = {"state": cache_state}
+    return evidence_packet(
+        source_name=source_name,
+        evidence_type="quote_price_context",
+        subject=symbol,
+        symbol=symbol,
+        source_ref=f"https://example.test/{source_name}/{symbol}",
+        payload={"source": source_name, "symbol": symbol},
+        quality="low" if source_name == "yfinance" else "medium",
+        tool_route=f"{source_name}_test",
+        as_of=actual_latest_bar or requested_as_of,
+        stale=stale,
+        freshness_extra=freshness_extra,
+    )
+
+
+def _write_provider_cache(
+    cache_dir,
+    *,
+    source_name: str,
+    packet,
+    now: datetime.datetime,
+    age_seconds: int = 0,
+):
+    path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="NVDA",
+        evidence_need="quote_price_context",
+        source_name=source_name,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(packet.model_dump_json(), encoding="utf-8")
+    timestamp = now.timestamp() - age_seconds
+    os.utime(path, (timestamp, timestamp))
+    return path
 
 
 def test_ticker_provider_bundle_collects_broad_overlapping_news_sources(monkeypatch, tmp_path):
@@ -443,7 +513,7 @@ def test_ticker_provider_bundle_falls_to_gap_when_yfinance_short_interest_blocks
         orchestrator,
         "fetch_yfinance_short_interest",
         lambda symbol: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("yfinance returned no short-interest fields")
+            DataUnavailableError("yfinance returned no short-interest fields")
         ),
     )
 
@@ -553,7 +623,7 @@ def test_ticker_provider_bundle_falls_to_gap_when_fmp_transcript_blocks(
         orchestrator,
         "fetch_fmp_latest_earning_call_transcript",
         lambda symbol: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("FMP_API_KEY is not set")
+            VendorNotConfiguredError("FMP_API_KEY is not set")
         ),
     )
 
@@ -593,14 +663,14 @@ def test_ticker_provider_bundle_falls_through_when_youtube_transcript_blocks(
         orchestrator,
         "fetch_youtube_earnings_transcript_packet",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("youtube_transcript MCP timed out")
+            DataTransportError("youtube_transcript MCP timed out")
         ),
     )
     monkeypatch.setattr(
         orchestrator,
         "fetch_fmp_latest_earning_call_transcript",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError("FMP_API_KEY is not set")
+            VendorNotConfiguredError("FMP_API_KEY is not set")
         ),
     )
 
@@ -631,6 +701,74 @@ def test_ticker_provider_bundle_falls_through_when_youtube_transcript_blocks(
         and attempt["blocked"] is True
         for attempt in result.route_attempts
     )
+
+
+@pytest.mark.parametrize(
+    "error_factory",
+    [
+        lambda: TypeError("provider contract failure"),
+        lambda: AssertionError("provider invariant failure"),
+        lambda: OfficialDataError("malformed provider evidence"),
+        _source_packet_validation_error,
+    ],
+)
+def test_ticker_provider_bundle_aborts_on_nonrecoverable_provider_failure(
+    monkeypatch,
+    tmp_path,
+    error_factory,
+):
+    now = datetime.datetime(2026, 7, 19, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    cache_path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="KO",
+        evidence_need="earnings_transcripts",
+        source_name="youtube_transcript",
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        _packet(
+            "youtube_transcript",
+            evidence_type="earnings_transcripts",
+            symbol="KO",
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    stale_time = now.timestamp() - (25 * 60 * 60)
+    os.utime(cache_path, (stale_time, stale_time))
+    error = error_factory()
+    later_calls = []
+
+    def broken_youtube(*_args, **_kwargs):
+        raise error
+
+    def later_fmp(*_args, **_kwargs):
+        later_calls.append("fmp")
+        return _packet("fmp", evidence_type="earnings_transcripts", symbol="KO")
+
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_youtube_earnings_transcript_packet",
+        broken_youtube,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_fmp_latest_earning_call_transcript",
+        later_fmp,
+    )
+
+    with pytest.raises(type(error)) as exc_info:
+        build_ticker_provider_research_packets(
+            "ko",
+            evidence_needs=("earnings_transcripts",),
+            disabled_sources={"official_cache", "benzinga"},
+            max_packets_per_need=1,
+            cache_dir=cache_dir,
+            now=now,
+        )
+
+    assert exc_info.value is error
+    assert later_calls == []
 
 
 def test_ticker_provider_bundle_uses_yfinance_options_before_gap(monkeypatch, tmp_path):
@@ -666,6 +804,98 @@ def test_ticker_provider_bundle_uses_yfinance_options_before_gap(monkeypatch, tm
         for attempt in result.route_attempts
     )
     assert not any(packet.source_name == "options_iv_flow_gap" for packet in result.packets)
+
+
+def test_ticker_provider_bundle_uses_configured_yfinance_earnings_calendar_order(
+    monkeypatch,
+    tmp_path,
+):
+    calls = []
+
+    def fetch_calendar(symbol):
+        calls.append(symbol)
+        packet = _packet(
+            "yfinance_earnings_calendar",
+            evidence_type="earnings_calendar",
+            symbol=symbol,
+        )
+        packet.payload["execution_authority"] = "none"
+        return packet
+
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_yfinance_earnings_calendar",
+        fetch_calendar,
+        raising=False,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("earnings_calendar",),
+        max_packets_per_need=1,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert calls == ["NVDA"]
+    assert [attempt["source_name"] for attempt in result.route_attempts] == [
+        "official_cache",
+        "release_calendar_watchlist",
+        "yfinance_earnings_calendar",
+    ]
+    assert [attempt["status"] for attempt in result.route_attempts] == [
+        "cache_miss",
+        "unsupported_in_local_orchestrator",
+        "packet_written",
+    ]
+    assert [packet.source_name for packet in result.packets] == [
+        "yfinance_earnings_calendar"
+    ]
+    assert result.packets[0].analysis_only is True
+    assert result.packets[0].payload["execution_authority"] == "none"
+    assert result.summary_packet is not None
+    assert result.summary_packet.payload["execution_authority"] == "none"
+
+
+def test_ticker_provider_bundle_falls_back_from_unavailable_earnings_calendar_to_gap(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_yfinance_earnings_calendar",
+        lambda _symbol: (_ for _ in ()).throw(
+            DataUnavailableError("no current earnings dates")
+        ),
+        raising=False,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("earnings_calendar",),
+        disabled_sources={"official_cache"},
+        max_packets_per_need=1,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert [packet.source_name for packet in result.packets] == [
+        "earnings_calendar_gap"
+    ]
+    assert [attempt["source_name"] for attempt in result.route_attempts] == [
+        "release_calendar_watchlist",
+        "yfinance_earnings_calendar",
+        "earnings_calendar_gap",
+    ]
+    yfinance_attempt = next(
+        attempt
+        for attempt in result.route_attempts
+        if attempt["source_name"] == "yfinance_earnings_calendar"
+    )
+    assert yfinance_attempt["status"] == "packet_written"
+    assert yfinance_attempt["blocked"] is True
+    gap = result.packets[0]
+    assert gap.analysis_only is True
+    assert gap.payload["execution_authority"] == "none"
+    assert gap.freshness["blocked"] is True
 
 
 def test_ticker_provider_bundle_skips_depleted_limited_sources(monkeypatch, tmp_path):
@@ -758,6 +988,88 @@ def test_ticker_provider_bundle_uses_public_reddit_social_context(monkeypatch, t
     )
 
 
+@pytest.mark.parametrize("failure_mode", ["typed_transport", "invalid_external_json"])
+def test_ticker_provider_bundle_records_reddit_failure_as_blocked_attempt(
+    monkeypatch,
+    tmp_path,
+    failure_mode,
+):
+    if failure_mode == "typed_transport":
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_reddit_posts",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                DataTransportError("Reddit public transport failed")
+            ),
+        )
+    else:
+        from tradingagents.dataflows import reddit as reddit_dataflow
+
+        class InvalidJsonResponse:
+            text = "not JSON"
+
+        monkeypatch.setattr(
+            reddit_dataflow,
+            "get_text_response",
+            lambda *_args, **_kwargs: InvalidJsonResponse(),
+        )
+
+    twitter_calls = []
+
+    def fetch_twitter(symbol, *, evidence_need):
+        twitter_calls.append(symbol)
+        return evidence_packet(
+            source_name="twitter",
+            evidence_type=evidence_need,
+            subject=f"twitter context for {symbol}",
+            symbol=symbol,
+            source_ref=f"docker-mcp://twitter-research/{symbol}",
+            payload={
+                "symbol": symbol,
+                "read_only": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+            },
+            quality="low",
+            tool_route="docker:twitter-research",
+            freshness_extra={"read_only": True, "blocked": False},
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_twitter_recent_search_packet",
+        fetch_twitter,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("social_sentiment",),
+        disabled_sources={
+            "facebook",
+            "google_news_rss",
+            "instagram",
+            "linkedin",
+            "official_cache",
+            "reddit_watchlist",
+            "social_watchlist",
+        },
+        max_packets_per_need=2,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert twitter_calls == ["NVDA"]
+    assert [packet.source_name for packet in result.packets] == ["twitter"]
+    reddit_attempt = next(
+        attempt
+        for attempt in result.route_attempts
+        if attempt["source_name"] == "reddit"
+    )
+    assert reddit_attempt["status"] == "packet_written"
+    assert reddit_attempt["blocked"] is True
+    assert result.packets[0].freshness["blocked"] is False
+    assert result.packets[0].payload["execution_authority"] == "none"
+
+
 def test_ticker_provider_bundle_uses_twitter_mcp_social_context(monkeypatch, tmp_path):
     monkeypatch.setattr(
         orchestrator,
@@ -833,7 +1145,7 @@ def test_ticker_provider_bundle_blocks_twitter_when_mcp_recent_search_unauthoriz
         orchestrator,
         "fetch_twitter_recent_search_packet",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            orchestrator.OfficialDataError(
+            DataTransportError(
                 "twitter-research MCP failed: Unauthorized recent search access"
             )
         ),
@@ -889,6 +1201,351 @@ def test_ticker_provider_bundle_uses_yfinance_price_context(monkeypatch, tmp_pat
         and attempt["cost_tier"] == "free_unmetered"
         for attempt in result.route_attempts
     )
+
+
+def test_fetch_yfinance_quote_price_context_rejects_stale_history(monkeypatch):
+    class FakeTicker:
+        fast_info = {}
+
+        def __init__(self, _symbol):
+            pass
+
+        def history(self, **_kwargs):
+            return pd.DataFrame(
+                {"Close": [100.0]},
+                index=pd.DatetimeIndex(["2025-07-06"], name="Date"),
+            )
+
+    monkeypatch.setattr(yf, "Ticker", FakeTicker)
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+
+    with pytest.raises(orchestrator.OfficialDataError) as exc_info:
+        orchestrator._fetch_yfinance_quote_price_context("NVDA", now=now)
+
+    message = str(exc_info.value)
+    assert "yfinance" in message
+    assert "NVDA" in message
+    assert "requested as-of 2026-07-06" in message
+    assert "actual latest 2025-07-06" in message
+
+
+def test_fetch_yfinance_quote_price_context_uses_actual_final_bar_metadata(monkeypatch):
+    class FakeTicker:
+        fast_info = {"last_price": 100.0}
+
+        def __init__(self, _symbol):
+            pass
+
+        def history(self, **_kwargs):
+            return pd.DataFrame(
+                {"Open": [99.0], "Close": [100.0]},
+                index=pd.DatetimeIndex(["2026-07-02T00:00:00-04:00"], name="Date"),
+            )
+
+    monkeypatch.setattr(yf, "Ticker", FakeTicker)
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+
+    packet = orchestrator._fetch_yfinance_quote_price_context("NVDA", now=now)
+
+    assert packet.as_of == "2026-07-02"
+    assert packet.freshness["as_of"] == "2026-07-02"
+    assert packet.freshness["requested_as_of"] == "2026-07-06"
+    assert packet.freshness["actual_latest_bar"] == "2026-07-02"
+    assert packet.analysis_only is True
+    assert packet.payload["execution_authority"] == "none"
+
+
+@pytest.mark.parametrize(
+    "bad_cache_case",
+    ["stale", "stale_fallback", "expired", "missing_actual_bar", "stale_actual_bar"],
+)
+def test_official_quote_cache_skips_unusable_yfinance_and_scans_later_sources(
+    tmp_path, bad_cache_case
+):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    yfinance_packet = _quote_packet(
+        "yfinance",
+        actual_latest_bar=None if bad_cache_case == "missing_actual_bar" else (
+            "2025-07-06" if bad_cache_case == "stale_actual_bar" else "2026-07-02"
+        ),
+        stale=bad_cache_case == "stale",
+        cache_state="stale_fallback" if bad_cache_case == "stale_fallback" else None,
+    )
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=yfinance_packet,
+        now=now,
+        age_seconds=301 if bad_cache_case == "expired" else 0,
+    )
+    _write_provider_cache(
+        cache_dir,
+        source_name="tiingo",
+        packet=_quote_packet("tiingo"),
+        now=now,
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={"broker_snapshot", "massive", "finnhub", "fmp", "alpha_vantage"},
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["official_cache"]
+    assert result.packets[0].payload["cached_source_name"] == "tiingo"
+
+
+def test_non_quote_official_cache_admission_is_unchanged_for_old_packet(tmp_path):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="NVDA",
+        evidence_need="market_news",
+        source_name="google_news_rss",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cached = _packet("google_news_rss", symbol="NVDA")
+    path.write_text(cached.model_dump_json(), encoding="utf-8")
+    expired_timestamp = now.timestamp() - (7 * 24 * 60 * 60)
+    os.utime(path, (expired_timestamp, expired_timestamp))
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("market_news",),
+        disabled_sources={
+            "alpaca_news",
+            "crawlee",
+            "eodhd",
+            "finnhub",
+            "fmp",
+            "marketaux",
+            "newsapi",
+            "reddit",
+            "reddit_watchlist",
+            "scrapingbee",
+            "tiingo",
+            "twitter",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["official_cache"]
+    assert result.packets[0].payload["cached_packet_id"] == cached.packet_id
+
+
+def test_stale_yfinance_refresh_cannot_return_stale_yfinance_cache(monkeypatch, tmp_path):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=_quote_packet("yfinance"),
+        now=now,
+        age_seconds=301,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            DataUnavailableError(
+                "yfinance daily OHLCV for NVDA requested as-of 2026-07-06; "
+                "actual latest 2025-07-06: stale"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_tiingo_daily_prices",
+        lambda *_args, **_kwargs: _quote_packet("tiingo"),
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={
+            "broker_snapshot",
+            "official_cache",
+            "massive",
+            "finnhub",
+            "fmp",
+            "alpha_vantage",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["tiingo"]
+    yfinance_attempt = next(
+        attempt for attempt in result.route_attempts if attempt["source_name"] == "yfinance"
+    )
+    assert yfinance_attempt["blocked"] is True
+    assert yfinance_attempt["cache_state"] != "stale_fallback"
+
+
+def test_fresh_yfinance_quote_cache_hit_remains_enabled(monkeypatch, tmp_path):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=_quote_packet("yfinance"),
+        now=now,
+        age_seconds=299,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        lambda *_args, **_kwargs: pytest.fail("fresh five-minute cache must avoid refresh"),
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={
+            "broker_snapshot",
+            "official_cache",
+            "massive",
+            "finnhub",
+            "tiingo",
+            "fmp",
+            "alpha_vantage",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["yfinance"]
+    assert result.packets[0].freshness["cache"]["state"] == "hit"
+
+
+@pytest.mark.parametrize("actual_latest_bar", [None, "2025-07-06"])
+def test_recent_invalid_yfinance_quote_cache_forces_refresh_and_falls_through(
+    monkeypatch, tmp_path, actual_latest_bar
+):
+    now = datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc)
+    cache_dir = tmp_path / "cache"
+    _write_provider_cache(
+        cache_dir,
+        source_name="yfinance",
+        packet=_quote_packet("yfinance", actual_latest_bar=actual_latest_bar),
+        now=now,
+        age_seconds=299,
+    )
+    refresh_calls = []
+
+    def stale_refresh(*_args, **_kwargs):
+        refresh_calls.append(True)
+        raise DataUnavailableError(
+            "yfinance daily OHLCV for NVDA requested as-of 2026-07-06; "
+            "actual latest 2025-07-06: stale"
+        )
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        stale_refresh,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_tiingo_daily_prices",
+        lambda *_args, **_kwargs: _quote_packet("tiingo"),
+    )
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources={
+            "broker_snapshot",
+            "official_cache",
+            "massive",
+            "finnhub",
+            "fmp",
+            "alpha_vantage",
+        },
+        max_packets_per_need=1,
+        cache_dir=cache_dir,
+        now=now,
+    )
+
+    assert refresh_calls == [True]
+    assert [packet.source_name for packet in result.packets] == ["tiingo"]
+    yfinance_attempt = next(
+        attempt for attempt in result.route_attempts if attempt["source_name"] == "yfinance"
+    )
+    assert yfinance_attempt["blocked"] is True
+    assert yfinance_attempt["cache_state"] != "hit"
+
+
+@pytest.mark.parametrize("later_source", ["massive", "alpha_vantage"])
+def test_stale_yfinance_continues_to_other_configured_quote_routes(
+    monkeypatch, tmp_path, later_source
+):
+    monkeypatch.setattr(
+        orchestrator,
+        "_fetch_yfinance_quote_price_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            DataUnavailableError("stale yfinance OHLCV")
+        ),
+    )
+    if later_source == "massive":
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_massive_previous_day_bar",
+            lambda *_args, **_kwargs: _quote_packet("massive"),
+        )
+    else:
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_alpha_vantage_stock_raw",
+            lambda *_args, **_kwargs: {"symbol": "NVDA", "latest": "2026-07-02"},
+        )
+    disabled_sources = {
+        "broker_snapshot",
+        "official_cache",
+        "finnhub",
+        "tiingo",
+        "fmp",
+        "massive",
+        "alpha_vantage",
+    }
+    disabled_sources.remove(later_source)
+
+    result = build_ticker_provider_research_packets(
+        "nvda",
+        evidence_needs=("quote_price_context",),
+        disabled_sources=disabled_sources,
+        max_packets_per_need=1,
+        cache_dir=tmp_path / "cache",
+        now=datetime.datetime(2026, 7, 6, 12, tzinfo=datetime.timezone.utc),
+    )
+
+    assert [packet.source_name for packet in result.packets] == [later_source]
+    assert result.route_attempts[0]["source_name"] == "yfinance"
+    assert result.route_attempts[0]["blocked"] is True
+
+
+def test_quote_provider_configuration_order_is_unchanged():
+    config = load_provider_fallback_config()
+
+    assert config["fallbacks"]["quote_price_context"] == [
+        {"source_name": "broker_snapshot", "route": "alpaca:read_only_snapshot", "cost_tier": "connected_mcp_read", "priority": 10},
+        {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 20},
+        {"source_name": "massive", "route": "dataflow:massive", "cost_tier": "paid_limited", "priority": 30},
+        {"source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free_limited", "priority": 40},
+        {"source_name": "tiingo", "route": "dataflow:tiingo", "cost_tier": "free_limited", "priority": 45},
+        {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 50},
+        {"source_name": "alpha_vantage", "route": "dataflow:alpha_vantage", "cost_tier": "free_limited", "priority": 60},
+        {"source_name": "yfinance", "route": "dataflow:yfinance", "cost_tier": "free_unmetered", "priority": 90},
+    ]
 
 
 def test_ticker_provider_bundle_uses_sanitized_broker_snapshot(tmp_path):
@@ -1081,6 +1738,71 @@ def test_ticker_provider_bundle_records_official_cache_miss(tmp_path):
         and attempt["status"] == "cache_miss"
         for attempt in result.route_attempts
     )
+
+
+def test_invalid_official_cache_packet_propagates_without_cache_miss_or_later_fetch(
+    monkeypatch,
+    tmp_path,
+):
+    cache_dir = tmp_path / "cache"
+    cache_path = orchestrator._cache_file_for_source(
+        cache_dir,
+        symbol="NVDA",
+        evidence_need="market_news",
+        source_name="google_news_rss",
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text("{}", encoding="utf-8")
+    cache_miss_calls = []
+    later_calls = []
+    original_cache_miss_attempt = orchestrator._cache_miss_attempt
+
+    def cache_miss_attempt(*args, **kwargs):
+        cache_miss_calls.append(True)
+        return original_cache_miss_attempt(*args, **kwargs)
+
+    def later_google(*_args, **_kwargs):
+        later_calls.append("google_news_rss")
+        return _packet("google_news_rss")
+
+    monkeypatch.setattr(orchestrator, "_cache_miss_attempt", cache_miss_attempt)
+    monkeypatch.setattr(orchestrator, "fetch_google_news_rss", later_google)
+
+    with pytest.raises(ValidationError):
+        build_ticker_provider_research_packets(
+            "nvda",
+            evidence_needs=("market_news",),
+            disabled_sources={
+                "alpaca_news",
+                "crawlee",
+                "eodhd",
+                "finnhub",
+                "fmp",
+                "marketaux",
+                "newsapi",
+                "reddit",
+                "reddit_watchlist",
+                "scrapingbee",
+                "tiingo",
+                "twitter",
+            },
+            max_packets_per_need=1,
+            cache_dir=cache_dir,
+        )
+
+    assert cache_miss_calls == []
+    assert later_calls == []
+
+
+def test_absent_broker_snapshot_and_sec_coverage_are_typed_unavailable(tmp_path):
+    with pytest.raises(DataUnavailableError, match="no supervisor snapshot directory"):
+        orchestrator._latest_broker_snapshot_path(tmp_path / "missing")
+
+    with pytest.raises(DataUnavailableError, match="SEC CIK not found"):
+        orchestrator._cik_for_symbol(
+            {"0": {"ticker": "MSFT", "cik_str": 789019}},
+            "NFLX",
+        )
 
 
 def test_ticker_provider_bundle_uses_sec_edgar_for_fundamentals(monkeypatch, tmp_path):

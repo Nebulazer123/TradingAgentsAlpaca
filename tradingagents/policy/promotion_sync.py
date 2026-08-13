@@ -24,8 +24,12 @@ limit-only checks) at submit time.
 from __future__ import annotations
 
 import datetime
+import fcntl
+import hashlib
 import json
+import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -55,6 +59,77 @@ MIN_WIN_RATE_PCT = Decimal("50")
 DEFAULT_VALIDATION_REPORT_REF = "results/paper_strategy_tournament/latest.json"
 DEFAULT_RISK_ENVELOPE_REF = "config/risk_envelope.yaml"
 
+_PROMOTION_STATE_V1_TOP_LEVEL_KEYS = frozenset(
+    {"schema_version", "generated_at", "sleeves"}
+)
+_PROMOTION_STATE_V1_LEGACY_TOP_LEVEL_KEYS = frozenset(
+    {"schema_version", "sleeves"}
+)
+_PROMOTION_STATE_V1_1_TOP_LEVEL_KEYS = frozenset(
+    {"schema_version", "generated_at", "source", "sleeves"}
+)
+_PROMOTION_SYNC_SOURCE_KEYS = frozenset(
+    {
+        "kind",
+        "tournament_id",
+        "report_generated_at",
+        "arm_live",
+        "ci_green",
+    }
+)
+_PROMOTION_RECORD_REQUIRED_KEYS = frozenset(
+    {
+        "stage",
+        "live_enabled",
+        "ci_green",
+        "shadow_confirmed",
+        "preregistered",
+        "benchmark_gate_passed",
+        "cost_gate_passed",
+        "recent_alpha_gate_passed",
+        "capacity_gate_passed",
+        "validation_report_ref",
+        "risk_envelope_ref",
+    }
+)
+_PROMOTION_RECORD_OPTIONAL_KEYS = frozenset(
+    {
+        "promoted_at",
+        "demoted_at",
+        "demotion_reason",
+        "metrics",
+        "issues",
+        "source",
+        "evidence_metrics",
+    }
+)
+_PROMOTION_METRIC_KEYS = frozenset(
+    {
+        "benchmark_excess_return",
+        "cost_adjusted_alpha",
+        "recent_alpha",
+        "capacity_usd",
+        "requested_tiny_live_tranche_usd",
+    }
+)
+_PROMOTION_RECORD_SOURCE_KEYS = frozenset(
+    {
+        "kind",
+        "tournament_id",
+        "report_generated_at",
+        "candidate_reason",
+    }
+)
+_PROMOTION_EVIDENCE_METRIC_KEYS = frozenset(
+    {
+        "total_return",
+        "total_return_pct",
+        "max_drawdown_pct",
+        "win_rate_pct",
+        "tracked_days",
+    }
+)
+
 
 @dataclass(frozen=True)
 class PromotionSyncResult:
@@ -64,6 +139,26 @@ class PromotionSyncResult:
     unchanged: list[str]
     issues_by_sleeve: dict[str, list[str]] = field(default_factory=dict)
     summary: str = ""
+
+
+def promotion_state_lock_path(state_path: str | Path) -> Path:
+    state_file = Path(state_path).resolve()
+    return state_file.with_name(f".{state_file.name}.recovery.lock")
+
+
+@contextmanager
+def promotion_state_lock(state_path: str | Path):
+    """Serialize every canonical promotion-state read/replace."""
+
+    lock_path = promotion_state_lock_path(state_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield lock_path
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def _now_iso(now: datetime.datetime | None = None) -> str:
@@ -169,6 +264,215 @@ def _demoted_record(
     )
     record["validation_report_ref"] = validation_report_ref
     return record
+
+
+def _require_exact_keys(value: dict, expected: frozenset[str], *, field: str) -> None:
+    actual = frozenset(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(
+            f"existing promotion state {field} has invalid fields "
+            f"(missing={missing}, extra={extra})"
+        )
+
+
+def _require_string(value: Any, *, field: str, allow_none: bool = False) -> None:
+    if allow_none and value is None:
+        return
+    if type(value) is not str or not value:
+        raise ValueError(
+            f"existing promotion state {field} must be a non-empty string"
+        )
+
+
+def _validate_promotion_record(record: Any, *, sleeve_id: str) -> None:
+    field = f"sleeves.{sleeve_id}"
+    if type(record) is not dict:
+        raise ValueError(f"existing promotion state {field} must be a JSON object")
+
+    actual_keys = frozenset(record)
+    missing = sorted(_PROMOTION_RECORD_REQUIRED_KEYS - actual_keys)
+    extra = sorted(
+        actual_keys
+        - _PROMOTION_RECORD_REQUIRED_KEYS
+        - _PROMOTION_RECORD_OPTIONAL_KEYS
+    )
+    if missing or extra:
+        raise ValueError(
+            f"existing promotion state {field} has invalid fields "
+            f"(missing={missing}, extra={extra})"
+        )
+
+    if record["stage"] not in {"paper_only", "tiny_live_eligible"}:
+        raise ValueError(
+            f"existing promotion state {field}.stage has an invalid value"
+        )
+    for name in (
+        "live_enabled",
+        "ci_green",
+        "shadow_confirmed",
+        "preregistered",
+        "benchmark_gate_passed",
+        "cost_gate_passed",
+        "recent_alpha_gate_passed",
+        "capacity_gate_passed",
+    ):
+        if type(record[name]) is not bool:
+            raise ValueError(
+                f"existing promotion state {field}.{name} must be a boolean"
+            )
+    for name in ("validation_report_ref", "risk_envelope_ref"):
+        _require_string(record[name], field=f"{field}.{name}")
+
+    for name in ("promoted_at", "demoted_at", "demotion_reason"):
+        if name in record:
+            _require_string(record[name], field=f"{field}.{name}")
+    if ("demoted_at" in record) != ("demotion_reason" in record):
+        raise ValueError(
+            f"existing promotion state {field} must bind demoted_at and "
+            "demotion_reason together"
+        )
+
+    if "metrics" in record:
+        metrics = record["metrics"]
+        if type(metrics) is not dict:
+            raise ValueError(
+                f"existing promotion state {field}.metrics must be a JSON object"
+            )
+        _require_exact_keys(metrics, _PROMOTION_METRIC_KEYS, field=f"{field}.metrics")
+        for name, value in metrics.items():
+            _require_string(value, field=f"{field}.metrics.{name}")
+
+    if "issues" in record:
+        issues = record["issues"]
+        if type(issues) is not list or any(type(issue) is not str for issue in issues):
+            raise ValueError(
+                f"existing promotion state {field}.issues must be a list of strings"
+            )
+
+    has_source = "source" in record
+    has_evidence_metrics = "evidence_metrics" in record
+    if has_source != has_evidence_metrics:
+        raise ValueError(
+            f"existing promotion state {field} must bind source and "
+            "evidence_metrics together"
+        )
+    if has_source:
+        source = record["source"]
+        if type(source) is not dict:
+            raise ValueError(
+                f"existing promotion state {field}.source must be a JSON object"
+            )
+        _require_exact_keys(
+            source,
+            _PROMOTION_RECORD_SOURCE_KEYS,
+            field=f"{field}.source",
+        )
+        if source["kind"] != "paper_tournament":
+            raise ValueError(
+                f"existing promotion state {field}.source.kind has an invalid value"
+            )
+        for name in ("tournament_id", "report_generated_at", "candidate_reason"):
+            _require_string(
+                source[name],
+                field=f"{field}.source.{name}",
+                allow_none=True,
+            )
+
+        evidence_metrics = record["evidence_metrics"]
+        if type(evidence_metrics) is not dict:
+            raise ValueError(
+                f"existing promotion state {field}.evidence_metrics must be a "
+                "JSON object"
+            )
+        _require_exact_keys(
+            evidence_metrics,
+            _PROMOTION_EVIDENCE_METRIC_KEYS,
+            field=f"{field}.evidence_metrics",
+        )
+        for name in _PROMOTION_EVIDENCE_METRIC_KEYS - {"tracked_days"}:
+            _require_string(
+                evidence_metrics[name],
+                field=f"{field}.evidence_metrics.{name}",
+            )
+        if (
+            type(evidence_metrics["tracked_days"]) is not int
+            or evidence_metrics["tracked_days"] < 0
+        ):
+            raise ValueError(
+                f"existing promotion state {field}.evidence_metrics.tracked_days "
+                "must be a non-negative integer"
+            )
+
+
+def _validate_existing_promotion_state(state: Any) -> dict:
+    """Accept only persisted shapes this module can preserve without data loss."""
+
+    if type(state) is not dict:
+        raise ValueError("existing promotion state must be a JSON object")
+    schema_version = state.get("schema_version")
+    if schema_version == "1.0.0":
+        if frozenset(state) not in {
+            _PROMOTION_STATE_V1_LEGACY_TOP_LEVEL_KEYS,
+            _PROMOTION_STATE_V1_TOP_LEVEL_KEYS,
+        }:
+            expected = (
+                _PROMOTION_STATE_V1_TOP_LEVEL_KEYS
+                if "generated_at" in state
+                else _PROMOTION_STATE_V1_LEGACY_TOP_LEVEL_KEYS
+            )
+            _require_exact_keys(state, expected, field="top level")
+        if "generated_at" in state:
+            _require_string(state["generated_at"], field="generated_at")
+    elif schema_version == "1.1.0":
+        _require_exact_keys(
+            state,
+            _PROMOTION_STATE_V1_1_TOP_LEVEL_KEYS,
+            field="top level",
+        )
+        _require_string(state["generated_at"], field="generated_at")
+        source = state["source"]
+        if type(source) is not dict:
+            raise ValueError(
+                "existing promotion state source must be a JSON object"
+            )
+        expected_source_keys = _PROMOTION_SYNC_SOURCE_KEYS
+        if "canonical_input_sha256" in source:
+            expected_source_keys = expected_source_keys | {"canonical_input_sha256"}
+        _require_exact_keys(source, expected_source_keys, field="source")
+        if source["kind"] != "paper_tournament_sync":
+            raise ValueError("existing promotion state source.kind has an invalid value")
+        for name in ("tournament_id", "report_generated_at"):
+            _require_string(source[name], field=f"source.{name}", allow_none=True)
+        for name in ("arm_live", "ci_green"):
+            if type(source[name]) is not bool:
+                raise ValueError(
+                    f"existing promotion state source.{name} must be a boolean"
+                )
+        if "canonical_input_sha256" in source:
+            digest = source["canonical_input_sha256"]
+            if (
+                type(digest) is not str
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError(
+                    "existing promotion state source.canonical_input_sha256 "
+                    "must be a lowercase SHA-256 digest"
+                )
+    else:
+        raise ValueError(
+            "existing promotion state schema_version must be '1.0.0' or '1.1.0'"
+        )
+
+    sleeves = state["sleeves"]
+    if type(sleeves) is not dict:
+        raise ValueError("existing promotion state sleeves must be a JSON object")
+    for sleeve_id, record in sleeves.items():
+        _require_string(sleeve_id, field="sleeve id")
+        _validate_promotion_record(record, sleeve_id=sleeve_id)
+    return state
 
 
 def sync_promotion_state_from_tournament(
@@ -277,6 +581,11 @@ def sync_promotion_state_from_tournament(
                 if candidate_id in unchanged:
                     unchanged.remove(candidate_id)
 
+    issues_by_sleeve = {
+        sleeve_id: list(record["issues"])
+        for sleeve_id, record in new_sleeves.items()
+        if isinstance(record.get("issues"), list)
+    }
     live_enabled_now = [
         sleeve
         for sleeve, record in new_sleeves.items()
@@ -319,30 +628,49 @@ def sync_promotion_state_file(
     report_path: str | Path,
     state_path: str | Path,
     *,
+    output_state_path: str | Path | None = None,
     tiny_live_tranche_usd: Decimal,
     arm_live: bool = False,
     ci_green: bool = False,
     now: datetime.datetime | None = None,
 ) -> PromotionSyncResult:
-    report = json.loads(Path(report_path).read_text(encoding="utf-8"))
-    # The tournament dir stores the full report under "latest_report" inside
-    # compact packets; accept either a bare report or a wrapper.
-    if "rankings" not in report and isinstance(report.get("latest_report"), dict):
-        report = report["latest_report"]
-    current_state: Mapping | None = None
     state_file = Path(state_path)
-    if state_file.exists():
-        try:
-            current_state = json.loads(state_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            current_state = None
-    result = sync_promotion_state_from_tournament(
-        report,
-        current_state,
-        tiny_live_tranche_usd=tiny_live_tranche_usd,
-        arm_live=arm_live,
-        ci_green=ci_green,
-        now=now,
+    output_file = (
+        Path(output_state_path) if output_state_path is not None else state_file
     )
-    atomic_write_text(state_file, json.dumps(result.state, indent=2))
-    return result
+
+    def evaluate_and_write() -> PromotionSyncResult:
+        current_state: Mapping | None = None
+        input_bytes = b""
+        if state_file.exists():
+            input_bytes = state_file.read_bytes()
+            try:
+                current_state = json.loads(input_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "existing promotion state must be valid UTF-8 JSON"
+                ) from exc
+            current_state = _validate_existing_promotion_state(current_state)
+        report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        # The tournament dir stores the full report under "latest_report" inside
+        # compact packets; accept either a bare report or a wrapper.
+        if "rankings" not in report and isinstance(
+            report.get("latest_report"), dict
+        ):
+            report = report["latest_report"]
+        result = sync_promotion_state_from_tournament(
+            report,
+            current_state,
+            tiny_live_tranche_usd=tiny_live_tranche_usd,
+            arm_live=arm_live,
+            ci_green=ci_green,
+            now=now,
+        )
+        result.state["source"]["canonical_input_sha256"] = hashlib.sha256(
+            input_bytes
+        ).hexdigest()
+        atomic_write_text(output_file, json.dumps(result.state, indent=2))
+        return result
+
+    with promotion_state_lock(state_file):
+        return evaluate_and_write()

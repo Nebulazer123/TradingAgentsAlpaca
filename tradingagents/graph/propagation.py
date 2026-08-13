@@ -1,19 +1,63 @@
 # TradingAgents/graph/propagation.py
 
+import datetime as dt
+from collections.abc import Callable
 from typing import Any
 
 from tradingagents.agents.utils.agent_states import (
     InvestDebateState,
     RiskDebateState,
 )
+from tradingagents.graph.packet_nodes import build_graph_run_id
+
+_UTC = dt.timezone.utc
+_LEARNING_CONTEXT_OMITTED = object()
+
+
+def _canonical_run_start(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("run_started_at must be a canonical aware UTC-seconds string")
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            "run_started_at must be a canonical aware UTC-seconds string"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("run_started_at must be a canonical aware UTC-seconds string")
+    normalized = parsed.astimezone(_UTC)
+    if (
+        normalized.microsecond != 0
+        or normalized.isoformat(timespec="seconds") != value
+    ):
+        raise ValueError("run_started_at must be a canonical aware UTC-seconds string")
+    return value
+
+
+def _canonical_text(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(f"{field} must be a nonempty canonical string")
+    return value
 
 
 class Propagator:
     """Handles state initialization and propagation through the graph."""
 
-    def __init__(self, max_recur_limit=100):
+    def __init__(
+        self,
+        max_recur_limit=100,
+        run_signature_factory: Callable[[str], str] | None = None,
+        learning_context_factory: Callable[[str, str, str], str] | None = None,
+    ):
         """Initialize with configuration parameters."""
+        if (
+            learning_context_factory is not None
+            and not callable(learning_context_factory)
+        ):
+            raise ValueError("learning_context_factory must be callable")
         self.max_recur_limit = max_recur_limit
+        self.run_signature_factory = run_signature_factory
+        self.learning_context_factory = learning_context_factory
 
     def create_initial_state(
         self,
@@ -21,13 +65,62 @@ class Propagator:
         trade_date: str,
         asset_type: str = "stock",
         past_context: str = "",
+        run_id: str | None = None,
+        run_started_at: str | None = None,
+        learning_context: str | object = _LEARNING_CONTEXT_OMITTED,
     ) -> dict[str, Any]:
         """Create the initial state for the agent graph."""
+        company = _canonical_text(company_name, field="company_name")
+        canonical_date = _canonical_text(str(trade_date), field="trade_date")
+        canonical_asset = _canonical_text(asset_type, field="asset_type")
+        if learning_context is _LEARNING_CONTEXT_OMITTED:
+            stable_learning_context = (
+                self.learning_context_factory(
+                    company,
+                    canonical_date,
+                    canonical_asset,
+                )
+                if self.learning_context_factory is not None
+                else ""
+            )
+            if not isinstance(stable_learning_context, str):
+                raise ValueError(
+                    "learning_context_factory must return a string"
+                )
+        elif not isinstance(learning_context, str):
+            raise ValueError("learning_context must be a string")
+        else:
+            stable_learning_context = learning_context
+        if run_id is None:
+            signature = (
+                self.run_signature_factory(canonical_asset)
+                if self.run_signature_factory is not None
+                else "standalone-v1"
+            )
+            stable_run_id = build_graph_run_id(
+                company,
+                canonical_date,
+                canonical_asset,
+                signature,
+            )
+        else:
+            stable_run_id = _canonical_text(run_id, field="run_id")
+        if run_started_at is None:
+            stable_run_start = dt.datetime.now(tz=_UTC).replace(
+                microsecond=0
+            ).isoformat(timespec="seconds")
+        else:
+            stable_run_start = _canonical_run_start(run_started_at)
+
         return {
-            "messages": [("human", company_name)],
-            "company_of_interest": company_name,
-            "asset_type": asset_type,
-            "trade_date": str(trade_date),
+            "messages": [("human", company)],
+            "company_of_interest": company,
+            "asset_type": canonical_asset,
+            "trade_date": canonical_date,
+            "run_id": stable_run_id,
+            "run_started_at": stable_run_start,
+            "decision_packet_refs": [],
+            "learning_context": stable_learning_context,
             "past_context": past_context,
             "investment_debate_state": InvestDebateState(
                 {
@@ -57,6 +150,9 @@ class Propagator:
             "fundamentals_report": "",
             "sentiment_report": "",
             "news_report": "",
+            "investment_plan": "",
+            "trader_investment_plan": "",
+            "final_trade_decision": "",
         }
 
     def get_graph_args(self, callbacks: list | None = None) -> dict[str, Any]:

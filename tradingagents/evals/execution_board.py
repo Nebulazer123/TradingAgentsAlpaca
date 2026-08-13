@@ -9,6 +9,12 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from tradingagents.policy.decision_authority import (
+    AUTHORITY_RECORD_FIELDS,
+    bounded_exit_authority_record,
+    resolve_exit_authority,
+)
+
 UTC = datetime.timezone.utc
 
 CHASING_TERMS = ("green spike", "do not chase", "breakout chase", "after the move")
@@ -205,6 +211,14 @@ def _loss_review_evidence_payload(packet: Mapping[str, Any]) -> Mapping[str, Any
     return packet
 
 
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
 def _latest_loss_review_evidence_summary(
     loss_review_evidence_dir: str | Path | None,
     packets: Sequence[Mapping[str, Any]],
@@ -219,9 +233,8 @@ def _latest_loss_review_evidence_summary(
     hourly_packet_path = str(payload.get("hourly_packet_path") or "")
     if not hourly_packet_path:
         return None
-    packet_paths = {_normalized_packet_ref(_packet_key(item)) for item in packets}
-    remaining_blockers = list(payload.get("remaining_blockers") or [])
-    resolved_blockers = list(payload.get("resolved_blockers_by_refresh") or [])
+    remaining_blockers = _string_list(payload.get("remaining_blockers"))
+    resolved_blockers = _string_list(payload.get("resolved_blockers_by_refresh"))
     advisory_summary = payload.get("advisory_summary")
     if not isinstance(advisory_summary, Mapping):
         advisory_summary = payload.get("advisory_analysis")
@@ -232,18 +245,23 @@ def _latest_loss_review_evidence_summary(
         loss_exit_candidate = {}
     supervisor_review_allowed = payload.get("review_allowed")
     review_allowed_after_refresh = advisory_summary.get("review_allowed_after_refresh")
-    effective_review_allowed = supervisor_review_allowed
-    if isinstance(review_allowed_after_refresh, bool):
-        effective_review_allowed = (
-            supervisor_review_allowed is True and review_allowed_after_refresh is True
-        )
+    source_bound, source_binding, supervisor_review = _source_binding(
+        payload=payload,
+        packets=packets,
+        hourly_packet_path=hourly_packet_path,
+    )
+    authority = resolve_exit_authority(
+        supervisor_review=supervisor_review,
+        advisory_analysis=advisory_summary,
+    )
     summary = {
         "evidence_path": str(evidence_path),
         "raw_packet_path": str(packet.get("raw_packet_path") or evidence_path),
         "hourly_packet_path": hourly_packet_path,
-        "matches_review_window": _normalized_packet_ref(hourly_packet_path) in packet_paths,
+        "matches_review_window": source_bound,
+        "source_binding": source_binding,
         "symbol": str(payload.get("symbol") or "").upper(),
-        "review_allowed": effective_review_allowed,
+        "review_allowed": authority.allowed if source_bound else False,
         "next_action": payload.get("next_action"),
         "remaining_blocker_count": len(remaining_blockers),
         "remaining_blockers": remaining_blockers[:8],
@@ -269,6 +287,55 @@ def _loss_exit_review_for_symbol(packet: Mapping[str, Any], symbol: str) -> Mapp
     if review_symbol and review_symbol != symbol.upper():
         return None
     return review
+
+
+def _source_binding(
+    *,
+    payload: Mapping[str, Any],
+    packets: Sequence[Mapping[str, Any]],
+    hourly_packet_path: str,
+) -> tuple[bool, dict[str, Any], Mapping[str, Any]]:
+    compact_record = payload.get("supervisor_review_authority")
+    if not isinstance(compact_record, Mapping):
+        return False, {"matched": False, "issue": "missing compact authority record"}, {}
+    current_packet = next(
+        (
+            packet
+            for packet in packets
+            if _normalized_packet_ref(_packet_key(packet))
+            == _normalized_packet_ref(hourly_packet_path)
+        ),
+        None,
+    )
+    if current_packet is None:
+        return False, {"matched": False, "issue": "hourly packet is missing or stale"}, {}
+    current_review = _loss_exit_review_for_symbol(
+        current_packet,
+        str(payload.get("symbol") or "").upper(),
+    )
+    if current_review is None:
+        return False, {"matched": False, "issue": "current hourly loss_exit_review is missing or mixed-symbol"}, {}
+    current_record = bounded_exit_authority_record(current_review)
+    missing = [field for field in AUTHORITY_RECORD_FIELDS if field not in compact_record]
+    if missing:
+        return False, {
+            "matched": False,
+            "issue": "compact authority record is missing fields: " + ", ".join(missing),
+        }, current_record
+    if str(payload.get("symbol") or "").upper() != current_record["symbol"]:
+        return False, {"matched": False, "issue": "payload symbol does not match current hourly review"}, current_record
+    mismatches = [
+        field
+        for field in AUTHORITY_RECORD_FIELDS
+        if compact_record.get(field) != current_record[field]
+    ]
+    if mismatches:
+        return False, {
+            "matched": False,
+            "issue": "compact authority record does not match current hourly review: "
+            + ", ".join(mismatches),
+        }, current_record
+    return True, {"matched": True, "issue": None}, current_review
 
 
 def _summarize_roles(
@@ -512,7 +579,6 @@ def build_execution_board_review(
         )
     loss_review_evidence_pending = bool(
         loss_review_evidence
-        and loss_review_evidence.get("matches_review_window") is True
         and (
             loss_review_evidence.get("review_allowed") is not True
             or int(loss_review_evidence.get("remaining_blocker_count") or 0) > 0
@@ -649,7 +715,7 @@ def build_execution_board_review(
             "paper_side": "Paper sleeves keep exploring strategy variants and feed promotion evidence; paper results do not bypass live gates.",
         },
     }
-    if loss_review_evidence and loss_review_evidence.get("matches_review_window") is True:
+    if loss_review_evidence is not None:
         review["loss_review_evidence"] = loss_review_evidence
     return review
 

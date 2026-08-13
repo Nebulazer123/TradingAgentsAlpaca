@@ -12,7 +12,14 @@ from urllib.parse import quote_plus
 
 import requests
 
-from tradingagents.dataflows._official_common import OfficialDataError, evidence_packet, request_hash
+from tradingagents.dataflows._official_common import (
+    DataTransportError,
+    DataUnavailableError,
+    OfficialDataError,
+    RecoverableDataflowError,
+    evidence_packet,
+    request_hash,
+)
 from tradingagents.schemas.research import SourceEvidencePacket
 
 UTC = datetime.timezone.utc
@@ -56,13 +63,15 @@ def _now_iso(now: datetime.datetime | None = None) -> str:
 def _extract_json_payload(stdout: str) -> dict[str, Any]:
     start = stdout.find("{")
     if start < 0:
-        raise OfficialDataError("youtube_transcript MCP returned no JSON object")
+        raise DataTransportError("youtube_transcript MCP returned no JSON object")
     try:
         payload = json.loads(stdout[start:])
     except json.JSONDecodeError as exc:
-        raise OfficialDataError("youtube_transcript MCP returned invalid JSON") from exc
+        raise DataTransportError("youtube_transcript MCP returned invalid JSON") from exc
     if not isinstance(payload, dict):
-        raise OfficialDataError("youtube_transcript MCP returned a non-object JSON payload")
+        raise DataTransportError(
+            "youtube_transcript MCP returned a non-object JSON payload"
+        )
     return payload
 
 
@@ -95,17 +104,17 @@ def _call_docker_mcp_tool(
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
-        raise OfficialDataError(
+        raise DataTransportError(
             f"youtube_transcript MCP timed out after {timeout_seconds}s"
         ) from exc
     except OSError as exc:
-        raise OfficialDataError(
+        raise DataTransportError(
             f"youtube_transcript MCP command unavailable: {type(exc).__name__}"
         ) from exc
     if completed.returncode != 0:
         stderr = str(completed.stderr or completed.stdout or "").strip()
         detail = stderr[:240] if stderr else "docker MCP tool call failed"
-        raise OfficialDataError(f"youtube_transcript MCP failed: {detail}")
+        raise DataTransportError(f"youtube_transcript MCP failed: {detail}")
     return _extract_json_payload(str(completed.stdout or ""))
 
 
@@ -135,13 +144,15 @@ def _discover_youtube_video_urls(
             headers={"User-Agent": "Mozilla/5.0 TradingAgents research bot"},
             timeout=timeout_seconds,
         )
-    except Exception as exc:  # noqa: BLE001 - network stack varies by host.
-        raise OfficialDataError(
+    except requests.RequestException as exc:
+        raise DataTransportError(
             f"YouTube transcript discovery failed: {type(exc).__name__}"
         ) from exc
     status_code = int(getattr(response, "status_code", 0) or 0)
     if status_code >= 400:
-        raise OfficialDataError(f"YouTube transcript discovery returned HTTP {status_code}")
+        raise DataTransportError(
+            f"YouTube transcript discovery returned HTTP {status_code}"
+        )
     html = str(getattr(response, "text", "") or "")
     video_ids: list[str] = []
     for match in re.finditer(r'"videoId":"([A-Za-z0-9_-]{11})"', html):
@@ -151,7 +162,9 @@ def _discover_youtube_video_urls(
         if len(video_ids) >= max(1, int(max_candidates)):
             break
     if not video_ids:
-        raise OfficialDataError("YouTube transcript discovery found no video candidates")
+        raise DataUnavailableError(
+            "YouTube transcript discovery found no video candidates"
+        )
     return [f"https://www.youtube.com/watch?v={video_id}" for video_id in video_ids]
 
 
@@ -187,7 +200,9 @@ def _fetch_transcript_json(
     )
     transcript = _transcript_text(result)
     if not transcript:
-        raise OfficialDataError("youtube_transcript MCP returned no transcript text")
+        raise DataUnavailableError(
+            "youtube_transcript MCP returned no transcript text"
+        )
     return result
 
 
@@ -212,6 +227,7 @@ def fetch_youtube_earnings_transcript_packet(
         timeout_seconds=min(timeout_seconds, 15),
     )
     errors: list[str] = []
+    recoverable_failures: list[RecoverableDataflowError] = []
     for youtube_url in urls:
         try:
             result = _fetch_transcript_json(
@@ -219,7 +235,8 @@ def fetch_youtube_earnings_transcript_packet(
                 timeout_seconds=timeout_seconds,
                 run_func=run_func,
             )
-        except OfficialDataError as exc:
+        except RecoverableDataflowError as exc:
+            recoverable_failures.append(exc)
             errors.append(f"{youtube_url}: {exc}")
             continue
         transcript = _transcript_text(result)
@@ -282,4 +299,12 @@ def fetch_youtube_earnings_transcript_packet(
             },
         )
     detail = "; ".join(errors[:3]) if errors else "no transcript candidates were usable"
-    raise OfficialDataError(f"YouTube earnings transcript unavailable for {ticker}: {detail}")
+    if recoverable_failures and len(recoverable_failures) == len(urls) and all(
+        isinstance(exc, DataTransportError) for exc in recoverable_failures
+    ):
+        raise DataTransportError(
+            f"YouTube earnings transcript transport failed for {ticker}: {detail}"
+        )
+    raise DataUnavailableError(
+        f"YouTube earnings transcript unavailable for {ticker}: {detail}"
+    )

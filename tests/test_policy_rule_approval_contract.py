@@ -73,3 +73,40 @@ def test_policy_stop_floor_approval_survives_advisory_refresh():
     assert candidate["approval_effect"] == "preserves_pre_registered_policy_approval"
     assert candidate["requires_board_decision"] is False
     assert candidate["can_submit_orders"] is False
+
+
+def test_conflicting_policy_rule_stays_fail_closed_after_fresh_advisory_evidence():
+    review = {
+        "symbol": "NFLX",
+        "decision_id": "loss-exit-NFLX-conflict",
+        "allowed": True,
+        "policy_rule_exit": True,
+        "allowed_exit_reason": "policy_stop_floor",
+        "allowed_exit_reason_source": "pre-registered exit policy rule",
+        "exit_policy_rule": "profit_target",
+        "exit_policy_rationale": "A deliberately conflicting rule for this contract.",
+        "blockers": [],
+        "blocked_reasons": [],
+        "source_packet_ids": [],
+    }
+    hourly_packet = {
+        "generated_at": "2026-07-17T18:31:27+00:00",
+        "decision": "loss-review",
+        "actions": [],
+        "submitted": [],
+        "evidence": {"loss_exit_review": review},
+        "portfolio": {"live": {"positions": []}},
+    }
+
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=Path("results/hourly_supervisor/hourly-supervisor-conflict.json"),
+        hourly_packet=hourly_packet,
+        provider_result=TickerProviderResearchResult(symbol="NFLX"),
+        entry_context={},
+    )
+
+    loss_review = packet.payload["advisory_analysis"]
+    assert loss_review["policy_rule_conflict"] is True
+    assert loss_review["review_allowed_after_refresh"] is False
+    assert packet.payload["next_action"] != "pre_registered_policy_approval_preserved"
+    assert packet.payload["execution_authority"] == "none"

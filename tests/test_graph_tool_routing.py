@@ -125,7 +125,11 @@ def test_graph_setup_uses_batched_analyst_fanout_when_concurrency_enabled(monkey
     assert ("Msg Clear Sentiment", "Analyst Batch 1 Complete") in graph.edges
     assert ("Msg Clear News", "Analyst Batch 2 Complete") in graph.edges
     assert ("Msg Clear Fundamentals", "Analyst Batch 2 Complete") in graph.edges
-    assert ("Analyst Batch 2 Complete", "Bull Researcher") in graph.edges
+    assert (
+        "Analyst Batch 2 Complete",
+        "Research Evidence Packet",
+    ) in graph.edges
+    assert ("Research Evidence Packet", "Bull Researcher") in graph.edges
     assert "tools_social" not in graph.nodes
 
     start_route = next(path for source, path, _path_map in graph.conditional_edges if source == START)
