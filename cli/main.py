@@ -108,6 +108,10 @@ from tradingagents.brokers.alpaca_supervisor import (
     write_overnight_plan_packet,
     write_premarket_brief_packet,
 )
+from tradingagents.brokers.manual_action_attribution import (
+    build_owner_manual_action_attribution,
+    write_owner_manual_action_attribution,
+)
 from tradingagents.brokers.paper_tournament import (
     ALPHAINSIDER_PAPER_WATCH_ID,
     STRATEGY_IDS,
@@ -9291,6 +9295,11 @@ def alpaca_reconcile_symbol_incident(
         help="Captured packet JSON to reconcile. Repeat for multiple packets.",
     ),
     expected_qty: str | None = typer.Option(None, "--expected-qty"),
+    owner_action_attestation_paths: list[Path] = typer.Option(
+        [],
+        "--owner-action-attestation",
+        help="Immutable owner-manual action attribution. Repeat for multiple exact actions.",
+    ),
     output_dir: Path = typer.Option(
         Path("results/control_plane/reconciliation"),
         "--output-dir",
@@ -9305,6 +9314,7 @@ def alpaca_reconcile_symbol_incident(
         packet_paths=packet_paths,
         live_client=_alpaca_live_client(),
         expected_qty=expected_qty,
+        owner_action_attestation_paths=owner_action_attestation_paths,
     )
     generated_at = datetime.datetime.now(tz=datetime.timezone.utc)
     packet = {
@@ -9327,6 +9337,47 @@ def alpaca_reconcile_symbol_incident(
         return
     console.print(f"symbol={packet['symbol']} matched={packet['matched']}")
     console.print(f"packet={output_path}")
+
+
+@alpaca_app.command("record-owner-manual-action")
+def alpaca_record_owner_manual_action(
+    source_packet: Path = typer.Option(..., "--source-packet"),
+    reconciliation_packet: Path = typer.Option(..., "--reconciliation-packet"),
+    originating_client_order_id: str = typer.Option(
+        ..., "--originating-client-order-id"
+    ),
+    manual_fill_client_order_id: str = typer.Option(
+        ..., "--manual-fill-client-order-id"
+    ),
+    attested_at: str = typer.Option(..., "--attested-at"),
+    output: Path = typer.Option(..., "--output"),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Record a local owner attestation from captured evidence without broker I/O."""
+
+    try:
+        reconciliation = json.loads(
+            reconciliation_packet.read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise typer.BadParameter(
+            "reconciliation packet must be readable JSON"
+        ) from error
+    if not isinstance(reconciliation, dict):
+        raise typer.BadParameter("reconciliation packet must be a JSON object")
+    payload = build_owner_manual_action_attribution(
+        source_packet_path=source_packet,
+        reconciliation_packet=reconciliation,
+        originating_client_order_id=originating_client_order_id,
+        manual_fill_client_order_id=manual_fill_client_order_id,
+        attested_at=attested_at,
+    )
+    written = write_owner_manual_action_attribution(output, payload)
+    text = written.read_text(encoding="utf-8")
+    if json_output:
+        typer.echo(text, nl=False)
+        return
+    console.print(f"owner_manual_action={written}")
 
 
 @alpaca_app.command("preview")

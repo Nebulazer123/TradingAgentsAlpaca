@@ -571,6 +571,91 @@ def test_alpaca_reconcile_symbol_incident_writes_generic_zero_write_packet(monke
     assert (tmp_path / "reconciliation" / "latest.json").exists()
 
 
+def test_alpaca_reconcile_symbol_incident_forwards_exact_owner_attribution(monkeypatch, tmp_path):
+    attribution = tmp_path / "owner.json"
+    attribution.write_text("{}", encoding="utf-8")
+    captured = {}
+
+    def fake_reconcile(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            symbol="NFLX", matched=False,
+            position={"symbol": "NFLX", "qty": "0"}, open_orders=[],
+            recent_fills=[], checked_client_order_ids=[], issues=["still frozen"],
+            resolved_external_actions=[], replay_suppressions=[],
+            read_only=True, broker_write_calls=0,
+        )
+
+    monkeypatch.setattr(cli_main, "reconcile_symbol_incident", fake_reconcile)
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: object())
+    monkeypatch.setattr(cli_main, "asdict", lambda value: vars(value))
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "reconcile-symbol-incident", "--symbol", "NFLX",
+            "--owner-action-attestation", str(attribution),
+            "--output-dir", str(tmp_path / "out"), "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["owner_action_attestation_paths"] == [attribution]
+
+
+def test_record_owner_manual_action_is_local_immutable_and_never_builds_broker(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "source.json"
+    source.write_text(
+        json.dumps({
+            "actions": [{"idempotency_key": "autonomous-buy", "symbol": "NFLX"}],
+            "submitted": [{"client_order_id": "autonomous-buy", "symbol": "NFLX"}],
+        }),
+        encoding="utf-8",
+    )
+    buy = {
+        "client_order_id": "autonomous-buy", "symbol": "NFLX", "side": "buy",
+        "status": "filled", "filled_qty": "1", "filled_avg_price": "10",
+        "submitted_at": "2026-06-02T20:29:44+00:00",
+        "updated_at": "2026-06-02T20:29:45+00:00",
+    }
+    sell = {
+        "client_order_id": "owner-sell", "symbol": "NFLX", "side": "sell",
+        "status": "filled", "filled_qty": "1", "filled_avg_price": "9.5",
+        "submitted_at": "2026-07-27T18:46:48+00:00",
+        "updated_at": "2026-07-27T18:46:49+00:00",
+    }
+    reconciliation = tmp_path / "reconciliation.json"
+    reconciliation.write_text(
+        json.dumps({"symbol": "NFLX", "recent_fills": [sell, buy]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_live_client",
+        lambda: (_ for _ in ()).throw(AssertionError("must not construct broker")),
+    )
+    output = tmp_path / "owner-action.json"
+    args = [
+        "alpaca", "record-owner-manual-action",
+        "--source-packet", str(source),
+        "--reconciliation-packet", str(reconciliation),
+        "--originating-client-order-id", "autonomous-buy",
+        "--manual-fill-client-order-id", "owner-sell",
+        "--attested-at", "2026-08-13T09:10:00+00:00",
+        "--output", str(output), "--json-output",
+    ]
+    first = runner.invoke(app, args)
+    second = runner.invoke(app, args)
+
+    assert first.exit_code == 0, first.output
+    payload = json.loads(first.stdout)
+    assert payload["schema_version"] == "tradingagents.owner_manual_broker_action.v1"
+    assert payload["can_submit_orders"] is False
+    assert output.exists()
+    assert second.exit_code != 0
+
+
 def test_alpaca_reconcile_symbol_incident_invalid_expected_quantity_writes_fail_closed_packet(
     monkeypatch, tmp_path
 ):

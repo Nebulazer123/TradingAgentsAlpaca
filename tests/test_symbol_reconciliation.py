@@ -1,9 +1,14 @@
+import hashlib
 import json
 from decimal import Decimal
 
 import pytest
 
 from tradingagents.brokers import alpaca_reconciliation
+from tradingagents.brokers.manual_action_attribution import (
+    build_owner_manual_action_attribution,
+    write_owner_manual_action_attribution,
+)
 
 
 class ReadOnlyBrokerSpy:
@@ -105,12 +110,165 @@ def test_reconcile_symbol_incident_matches_nflx_without_broker_writes(tmp_path):
     )
 
     assert result.symbol == "NFLX"
-    assert result.matched is True
+    assert result.matched is True, result.issues
     assert result.position["qty"] == "1"
     assert result.checked_client_order_ids == ["ta-tiny-nflx-1"]
     assert result.read_only is True
     assert result.broker_write_calls == 0
     assert spy.write_calls == []
+
+
+def _manual_exit_attribution(tmp_path, *, source_packet, reconciliation_packet, **changes):
+    payload = build_owner_manual_action_attribution(
+        source_packet_path=source_packet,
+        reconciliation_packet=reconciliation_packet,
+        originating_client_order_id="ta-tiny-nflx-1",
+        manual_fill_client_order_id="owner-manual-nflx-sell",
+        attested_at="2026-08-13T09:10:00+00:00",
+    )
+    payload.update(changes)
+    path = tmp_path / "owner-action.json"
+    write_owner_manual_action_attribution(path, payload)
+    return path
+
+
+def test_exact_owner_manual_exit_closes_only_the_attested_chain_read_only(tmp_path):
+    source = _packet(tmp_path / "nflx.json")
+    buy = _order(
+        status="filled",
+        filled_qty="1",
+        filled_avg_price="10.00",
+        submitted_at="2026-06-02T20:29:44+00:00",
+        updated_at="2026-06-02T20:29:45+00:00",
+    )
+    manual_sell = _order(
+        client_order_id="owner-manual-nflx-sell",
+        side="sell",
+        status="filled",
+        filled_qty="1",
+        filled_avg_price="9.50",
+        submitted_at="2026-07-27T18:46:48+00:00",
+        updated_at="2026-07-27T18:46:49+00:00",
+    )
+    reconciliation_packet = {
+        "symbol": "NFLX",
+        "position": {"symbol": "NFLX", "qty": "0"},
+        "open_orders": [],
+        "recent_fills": [manual_sell, buy],
+        "read_only": True,
+        "broker_write_calls": 0,
+    }
+    attribution = _manual_exit_attribution(
+        tmp_path,
+        source_packet=source,
+        reconciliation_packet=reconciliation_packet,
+    )
+    spy = ReadOnlyBrokerSpy(positions=[], orders=[manual_sell, buy])
+
+    result = _reconcile_symbol_incident(
+        symbol="NFLX",
+        packet_paths=[source],
+        owner_action_attestation_paths=[attribution],
+        live_client=spy,
+        expected_qty="0",
+    )
+
+    if result.issues:
+        raise AssertionError("\n".join(result.issues))
+    assert result.matched is True
+    assert result.checked_client_order_ids == [
+        "ta-tiny-nflx-1",
+        "owner-manual-nflx-sell",
+    ]
+    assert result.resolved_external_actions[0]["attestation_sha256"] == hashlib.sha256(
+        attribution.read_bytes()
+    ).hexdigest()
+    suppression = result.replay_suppressions[0]
+    assert suppression["scope"] == "exact_incident_exit_chain"
+    assert suppression["originating_client_order_id"] == "ta-tiny-nflx-1"
+    assert suppression["resolved_by_client_order_id"] == "owner-manual-nflx-sell"
+    assert suppression["active"] is True
+    assert result.broker_write_calls == 0
+    assert spy.write_calls == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("filled_qty", "0.5"),
+        ("filled_avg_price", "9.51"),
+        ("submitted_at", "2026-07-27T18:46:50+00:00"),
+    ],
+)
+def test_owner_manual_exit_mismatch_never_suppresses_reconciliation(tmp_path, field, value):
+    source = _packet(tmp_path / "nflx.json")
+    buy = _order(
+        status="filled", filled_qty="1", filled_avg_price="10.00",
+        submitted_at="2026-06-02T20:29:44+00:00", updated_at="2026-06-02T20:29:45+00:00",
+    )
+    manual_sell = _order(
+        client_order_id="owner-manual-nflx-sell", side="sell", status="filled",
+        filled_qty="1", filled_avg_price="9.50",
+        submitted_at="2026-07-27T18:46:48+00:00", updated_at="2026-07-27T18:46:49+00:00",
+    )
+    attribution = _manual_exit_attribution(
+        tmp_path,
+        source_packet=source,
+        reconciliation_packet={
+            "symbol": "NFLX", "position": {"symbol": "NFLX", "qty": "0"},
+            "open_orders": [], "recent_fills": [manual_sell, buy],
+            "read_only": True, "broker_write_calls": 0,
+        },
+    )
+    changed_sell = {**manual_sell, field: value}
+    spy = ReadOnlyBrokerSpy(positions=[], orders=[changed_sell, buy])
+
+    result = _reconcile_symbol_incident(
+        symbol="NFLX", packet_paths=[source],
+        owner_action_attestation_paths=[attribution], live_client=spy,
+        expected_qty="0",
+    )
+
+    assert result.matched is False
+    assert result.replay_suppressions == []
+    assert any("owner manual action attribution" in issue for issue in result.issues)
+    assert spy.write_calls == []
+
+
+def test_owner_manual_exit_cannot_close_nonzero_position_or_suppress_future_order(tmp_path):
+    source = _packet(tmp_path / "nflx.json")
+    buy = _order(
+        status="filled", filled_qty="1", filled_avg_price="10.00",
+        submitted_at="2026-06-02T20:29:44+00:00", updated_at="2026-06-02T20:29:45+00:00",
+    )
+    manual_sell = _order(
+        client_order_id="owner-manual-nflx-sell", side="sell", status="filled",
+        filled_qty="1", filled_avg_price="9.50",
+        submitted_at="2026-07-27T18:46:48+00:00", updated_at="2026-07-27T18:46:49+00:00",
+    )
+    attribution = _manual_exit_attribution(
+        tmp_path, source_packet=source,
+        reconciliation_packet={
+            "symbol": "NFLX", "position": {"symbol": "NFLX", "qty": "0"},
+            "open_orders": [], "recent_fills": [manual_sell, buy],
+            "read_only": True, "broker_write_calls": 0,
+        },
+    )
+    future = _order(client_order_id="future-independent-nflx", status="open")
+    spy = ReadOnlyBrokerSpy(
+        positions=[{"symbol": "NFLX", "qty": "1"}],
+        orders=[manual_sell, buy, future],
+    )
+
+    result = _reconcile_symbol_incident(
+        symbol="NFLX", packet_paths=[source],
+        owner_action_attestation_paths=[attribution], live_client=spy,
+        expected_qty="0",
+    )
+
+    assert result.matched is False
+    assert result.replay_suppressions == []
+    assert "unexpected open order at broker: future-independent-nflx" in result.issues
 
 
 def test_reconcile_symbol_incident_matches_orcl_and_filters_state_to_symbol(tmp_path):

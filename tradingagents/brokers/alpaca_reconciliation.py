@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -11,6 +12,10 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from tradingagents.brokers.alpaca import compact_alpaca_order, find_order_by_client_order_id
+from tradingagents.brokers.manual_action_attribution import (
+    load_owner_manual_action_attribution,
+    replay_suppression_key,
+)
 from tradingagents.execution.reconcile import reconcile_latest_packet_live_orders
 
 UTC = datetime.timezone.utc
@@ -50,6 +55,8 @@ class SymbolReconciliationResult:
     recent_fills: list[dict]
     checked_client_order_ids: list[str]
     issues: list[str] = field(default_factory=list)
+    resolved_external_actions: list[dict] = field(default_factory=list)
+    replay_suppressions: list[dict] = field(default_factory=list)
     read_only: bool = True
     broker_write_calls: int = 0
 
@@ -134,6 +141,7 @@ def reconcile_symbol_incident(
     packet_paths: Sequence[str | Path],
     live_client,
     expected_qty: Decimal | str | None = None,
+    owner_action_attestation_paths: Sequence[str | Path] = (),
 ) -> SymbolReconciliationResult:
     """Reconcile one symbol's packet evidence with live broker reads only."""
 
@@ -207,10 +215,27 @@ def reconcile_symbol_incident(
     if len(matching_positions) > 1:
         raw_position["duplicate_count"] = len(matching_positions)
         issues.append(f"duplicate broker positions for {target_symbol}: {len(matching_positions)}")
-    target_open_orders = _matching_orders(open_order_rows, target_symbol)
+    target_open_orders = [
+        order
+        for order in _matching_orders(open_order_rows, target_symbol)
+        if _is_open_order(order)
+    ]
     target_all_orders = _matching_orders(all_order_rows, target_symbol)
     open_orders = [compact_alpaca_order(order) for order in target_open_orders]
     recent_fills = _recent_fills(target_all_orders, symbol=target_symbol)
+
+    attribution_issues, resolved_external_actions, replay_suppressions = (
+        _resolve_owner_manual_actions(
+            attestation_paths=owner_action_attestation_paths,
+            source_packet_paths=resolved_paths,
+            symbol=target_symbol,
+            position=raw_position,
+            open_orders=open_orders,
+            recent_fills=recent_fills,
+            checked_client_order_ids=checked_client_order_ids,
+        )
+    )
+    issues.extend(attribution_issues)
 
     _append_position_issues(
         issues,
@@ -231,7 +256,135 @@ def reconcile_symbol_incident(
         recent_fills=recent_fills,
         checked_client_order_ids=checked_client_order_ids,
         issues=issues,
+        resolved_external_actions=resolved_external_actions,
+        replay_suppressions=replay_suppressions,
     )
+
+
+def _resolve_owner_manual_actions(
+    *,
+    attestation_paths: Sequence[str | Path],
+    source_packet_paths: Sequence[Path],
+    symbol: str,
+    position: Mapping,
+    open_orders: Sequence[Mapping],
+    recent_fills: Sequence[Mapping],
+    checked_client_order_ids: list[str],
+) -> tuple[list[str], list[dict], list[dict]]:
+    issues: list[str] = []
+    resolved: list[dict] = []
+    suppressions: list[dict] = []
+    source_digests: dict[Path, str] = {}
+    for source in source_packet_paths:
+        try:
+            resolved_source = source.resolve()
+            source_digests[resolved_source] = hashlib.sha256(
+                resolved_source.read_bytes()
+            ).hexdigest()
+        except OSError:
+            continue
+    used_manual_ids: set[str] = set()
+    for raw_path in attestation_paths:
+        path = Path(raw_path)
+        try:
+            attribution = load_owner_manual_action_attribution(path)
+            attribution_bytes = path.read_bytes()
+            origin = attribution["originating_order"]
+            manual = attribution["manual_fill"]
+            assert isinstance(origin, Mapping) and isinstance(manual, Mapping)
+            origin_id = str(origin["client_order_id"])
+            manual_id = str(manual["client_order_id"])
+            source_path = Path(str(origin["source_packet_path"])).resolve()
+            matches = {
+                "symbol": attribution.get("symbol") == symbol,
+                "source_packet": source_digests.get(source_path)
+                == origin.get("source_packet_sha256"),
+                "origin_checked": origin_id in checked_client_order_ids,
+                "unique_manual_id": manual_id not in used_manual_ids,
+                "flat_position": _nonnegative_decimal(position.get("qty"))
+                == Decimal("0"),
+                "no_open_orders": not open_orders,
+            }
+            origin_fills = [
+                fill for fill in recent_fills
+                if fill.get("client_order_id") == origin_id
+            ]
+            manual_fills = [
+                fill for fill in recent_fills
+                if fill.get("client_order_id") == manual_id
+            ]
+            matches["one_origin_fill"] = len(origin_fills) == 1
+            matches["one_manual_fill"] = len(manual_fills) == 1
+            if len(origin_fills) == 1:
+                broker_origin = origin_fills[0]
+                matches["origin_fill"] = (
+                    str(broker_origin.get("side") or "").lower() == "buy"
+                    and str(broker_origin.get("status") or "").lower() == "filled"
+                    and _nonnegative_decimal(broker_origin.get("filled_qty"))
+                    == _nonnegative_decimal(origin.get("filled_qty"))
+                )
+            if len(manual_fills) == 1:
+                broker_manual = manual_fills[0]
+                matches["manual_fill"] = all(
+                    str(broker_manual.get(name) or "") == str(manual.get(name) or "")
+                    for name in (
+                        "client_order_id",
+                        "side",
+                        "status",
+                        "filled_qty",
+                        "filled_avg_price",
+                        "submitted_at",
+                        "updated_at",
+                    )
+                )
+            if not all(matches.values()):
+                failed = ", ".join(sorted(name for name, ok in matches.items() if not ok))
+                raise ValueError(f"exact binding failed: {failed}")
+        except (OSError, ValueError, AssertionError, KeyError, TypeError) as error:
+            issues.append(
+                f"owner manual action attribution mismatch for {path}: {error}"
+            )
+            continue
+        used_manual_ids.add(manual_id)
+        checked_client_order_ids.append(manual_id)
+        attestation_sha256 = hashlib.sha256(attribution_bytes).hexdigest()
+        suppression_key = replay_suppression_key(
+            attribution_sha256=attestation_sha256,
+            resolution_id=str(attribution["resolution_id"]),
+            symbol=symbol,
+            originating_client_order_id=origin_id,
+            resolved_by_client_order_id=manual_id,
+            filled_qty=str(manual["filled_qty"]),
+            source_packet_sha256=str(origin["source_packet_sha256"]),
+        )
+        resolved.append(
+            {
+                "resolution_id": attribution["resolution_id"],
+                "attestation_path": str(path.resolve()),
+                "attestation_sha256": attestation_sha256,
+                "source_packet_path": str(source_path),
+                "source_packet_sha256": origin["source_packet_sha256"],
+                "symbol": symbol,
+                "filled_qty": manual["filled_qty"],
+                "originating_client_order_id": origin_id,
+                "resolved_by_client_order_id": manual_id,
+            }
+        )
+        suppressions.append(
+            {
+                "scope": "exact_incident_exit_chain",
+                "suppression_key": suppression_key,
+                "resolution_id": attribution["resolution_id"],
+                "attestation_sha256": attestation_sha256,
+                "source_packet_sha256": origin["source_packet_sha256"],
+                "symbol": symbol,
+                "filled_qty": manual["filled_qty"],
+                "originating_client_order_id": origin_id,
+                "resolved_by_client_order_id": manual_id,
+                "active": True,
+            }
+        )
+    return issues, resolved, suppressions
 
 
 def _iter_orcl_sell_orders_from_packet(
@@ -568,6 +721,15 @@ def _append_unknown_order_issues(
         if not client_order_id or client_order_id not in known_ids:
             label = client_order_id or "missing client_order_id"
             issues.append(f"unexpected open order at broker: {label}")
+
+
+def _is_open_order(order: Mapping) -> bool:
+    status = _normalize_status(order.get("status"))
+    return (
+        status in _OPEN_OR_UNKNOWN_STATUSES
+        or status == "partially_filled"
+        or status.startswith("pending_")
+    )
 
 
 def _append_unknown_fill_issues(
