@@ -299,8 +299,8 @@ def _latest_loss_review_evidence_summary(
     return summary
 
 
-def _source_revision() -> str:
-    """Return the checked-out source revision, with a deterministic fallback."""
+def _source_revision() -> str | None:
+    """Return an authenticated checked-out source revision, or no authority."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -314,7 +314,7 @@ def _source_revision() -> str:
             return revision
     except OSError:
         pass
-    return "0" * 40
+    return None
 
 
 def _record_loss_board_decision(
@@ -332,7 +332,7 @@ def _record_loss_board_decision(
     the raw supervisor/loss/source bytes and produces the immutable ledger
     reference before this review surfaces a decision.
     """
-    if not isinstance(loss_review_evidence, Mapping) or not supervisor_packet_path:
+    if not isinstance(loss_review_evidence, Mapping) or not supervisor_packet_path or not source_revision:
         return None
     raw_path = str(loss_review_evidence.get("raw_packet_path") or "").strip()
     if not raw_path or not Path(raw_path).is_file():
@@ -753,8 +753,18 @@ def build_execution_board_review(
                 "message": "Live unrealized P/L was negative in one or more reviewed packets.",
             }
         )
+    # A ledger write is permitted only after both the current review window and
+    # the compact-to-raw source binding are established.  This avoids durable
+    # orphan decisions for stale or mismatched advisory packets.
+    source_bound_for_recording = bool(
+        isinstance(loss_review_evidence, Mapping)
+        and loss_review_evidence.get("matches_review_window") is True
+        and isinstance(loss_review_evidence.get("source_binding"), Mapping)
+        and loss_review_evidence["source_binding"].get("matched") is True
+    )
+    resolved_revision = source_revision if source_revision is not None else _source_revision()
     autonomous_loss_decision = _record_loss_board_decision(
-        loss_review_evidence=loss_review_evidence,
+        loss_review_evidence=loss_review_evidence if source_bound_for_recording else None,
         supervisor_packet_path=(
             loss_review_evidence.get("supervisor_packet_path")
             if isinstance(loss_review_evidence, Mapping)
@@ -762,7 +772,7 @@ def build_execution_board_review(
         ),
         decision_ledger_root=decision_ledger_root,
         decision_evidence_root=decision_evidence_root,
-        source_revision=source_revision or _source_revision(),
+        source_revision=resolved_revision or "",
         now=current_now,
     )
     if autonomous_loss_decision is not None and loss_review_evidence is not None:
@@ -976,7 +986,8 @@ def write_execution_board_review(
     timestamp = datetime.datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
     json_path = path / f"execution-board-review-{timestamp}.json"
     md_path = path / f"execution-board-review-{timestamp}.md"
-    json_path.write_text(json.dumps(review, indent=2, sort_keys=True), encoding="utf-8")
+    raw_text = json.dumps(review, indent=2, sort_keys=True)
+    json_path.write_text(raw_text, encoding="utf-8")
     md_lines = [
         "# TradingAgents BOARD Execution Review",
         "",
@@ -1033,7 +1044,12 @@ def write_execution_board_review(
         encoding="utf-8",
     )
     (path / "latest.md").write_text(md_path.read_text(encoding="utf-8"), encoding="utf-8")
-    compact = compact_execution_board_review(review, raw_packet_path=json_path, markdown_path=md_path)
+    compact = compact_execution_board_review(
+        review,
+        raw_packet_path=json_path,
+        raw_packet_sha256=hashlib.sha256(raw_text.encode("utf-8")).hexdigest(),
+        markdown_path=md_path,
+    )
     compact_text = json.dumps(compact, indent=2, sort_keys=True)
     compact_path = json_path.with_name(f"{json_path.stem}.compact.json")
     compact_path.write_text(compact_text, encoding="utf-8")
@@ -1074,12 +1090,18 @@ def compact_execution_board_review(
     review: dict[str, Any],
     *,
     raw_packet_path: str | Path,
+    raw_packet_sha256: str | None = None,
     markdown_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Return a compact BOARD review summary with a raw-packet drilldown pointer."""
     violations = review.get("violations") or []
     warnings = review.get("warnings") or []
     packet_reviews = review.get("packet_reviews") or []
+    decision = review.get("autonomous_loss_decision")
+    loss = review.get("loss_review_evidence")
+    # This is intentionally a fixed allowlist of scalar fields.  Compact
+    # consumers receive a pointer to immutable raw evidence, never copied
+    # source bindings, nested research, unbounded prose, or secrets.
     compact: dict[str, Any] = {
         "schema": "compact_execution_board_review_v1",
         "kind": review.get("kind", "execution_board_review"),
@@ -1088,11 +1110,14 @@ def compact_execution_board_review(
         "can_submit_orders": False,
         "execution_authority": "none",
         "recommendation": review.get("recommendation"),
-        "new_buy_policy": review.get("new_buy_policy") or {},
-        "loss_review_evidence": review.get("loss_review_evidence") or {},
-        "autonomous_loss_decision": review.get("autonomous_loss_decision") or {},
-        "next_hour_policy": review.get("next_hour_policy") or {},
-        "metrics": review.get("metrics") or {},
+        "new_buy_state": (review.get("new_buy_policy") or {}).get("state"),
+        "loss_review_evidence": {
+            key: loss.get(key) for key in ("symbol", "review_allowed", "remaining_blocker_count", "resolved_blocker_count", "next_action")
+        } if isinstance(loss, Mapping) else {},
+        "autonomous_loss_decision": {
+            key: decision.get(key) for key in ("decision_id", "ledger_packet_id", "symbol", "decision", "trade_decision_resolved", "exit_allowed")
+        } if isinstance(decision, Mapping) else {},
+        "metrics": {key: (review.get("metrics") or {}).get(key) for key in ("packet_count", "submitted_order_count", "live_buy_count", "live_sell_count", "loss_exit_count")},
         "violation_count": len(violations),
         "warning_count": len(warnings),
         "violations": [_compact_issue(item) for item in violations[:10]],
@@ -1100,6 +1125,8 @@ def compact_execution_board_review(
         "packet_reviews": [_compact_packet_review(item) for item in packet_reviews[-5:]],
         "raw_packet_path": str(raw_packet_path),
     }
+    if raw_packet_sha256 is not None:
+        compact["raw_packet_sha256"] = raw_packet_sha256
     if markdown_path is not None:
         compact["markdown_path"] = str(markdown_path)
     return compact

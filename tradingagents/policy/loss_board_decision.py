@@ -174,15 +174,38 @@ def _read_contained(root: Path, path: str | Path, *, label: str) -> tuple[Path, 
     else:
         relative = supplied
     target = _inside(root, relative, label=label)
+    # Do not validate a parent and then reopen it by name: a malicious or
+    # merely racing writer could replace that parent with a symlink in between.
+    # Walk from the already-trusted root descriptor instead.
+    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        state = target.lstat()
-        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
-            raise ValueError(f"{label} must be a regular non-symlink file")
-        descriptor = os.open(target, os.O_RDONLY | _NOFOLLOW)
-        with os.fdopen(descriptor, "rb") as handle:
-            payload = handle.read()
+        current_fd = root_fd
+        for part in relative.parts[:-1]:
+            next_fd = os.open(
+                part,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        descriptor = os.open(relative.parts[-1], os.O_RDONLY | _NOFOLLOW, dir_fd=current_fd)
+        try:
+            state = os.fstat(descriptor)
+            if not stat.S_ISREG(state.st_mode):
+                raise ValueError(f"{label} must be a regular non-symlink file")
+            with os.fdopen(descriptor, "rb") as handle:
+                descriptor = -1
+                payload = handle.read()
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+            if current_fd != root_fd:
+                os.close(current_fd)
     except OSError as exc:
         raise ValueError(f"{label} is unreadable") from exc
+    finally:
+        os.close(root_fd)
     try:
         decoded = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -431,10 +454,10 @@ def _sources(root: Path, raw: Any, symbol: str) -> tuple[CapturedSourceEvidence,
                 quality=descriptor["quality"],
             )
         except (ValueError, TypeError):
-            return ()
+            raise ValueError("accepted source packet binding is invalid") from None
         captured = _capture_source(root, source, symbol)
         if captured is None:
-            return ()
+            raise ValueError("accepted source packet is unavailable or mismatched")
         result.append(captured)
     return tuple(result)
 
@@ -523,15 +546,44 @@ def _exact_source_reference(value: Any, sources: tuple[BoundSourceEvidence, ...]
     return len(matches) == 1
 
 
+def _reason_source_semantics(
+    reason: Any,
+    reference: Any,
+    sources: tuple[BoundSourceEvidence, ...],
+    source_payloads: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """A reason is valid only when its cited exact packet proves that reason."""
+    if not _exact_source_reference(reference, sources):
+        return False
+    referenced = next(
+        source for source in sources
+        if reference == {"packet_id": source.packet_id, "path": source.packet.path, "sha256": source.packet.sha256}
+    )
+    payload = source_payloads.get(referenced.evidence_type)
+    if payload is None:
+        return False
+    if reason == "company_specific_negative_news":
+        return referenced.evidence_type == "company_news" and _news_source_proves_adverse_break(payload)
+    if reason == "earnings_or_guidance_break":
+        return referenced.evidence_type == "earnings_guidance_filing" and _filing_source_proves_adverse_fact(payload)
+    if reason == "thesis_invalidated":
+        return (
+            (referenced.evidence_type == "company_news" and payload.get("event_category") == "thesis_invalidator" and _news_source_proves_adverse_break(payload))
+            or (referenced.evidence_type == "earnings_guidance_filing" and _filing_source_proves_adverse_fact(payload))
+        )
+    return False
+
+
 def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captures: tuple[CapturedSourceEvidence, ...], now: dt.datetime) -> tuple[str, ...]:
     gaps: list[str] = []
     sources = tuple(capture.source for capture in captures)
+    session_blockers = {"market session is not tradeable for a live loss exit"}
     for blocker_field in ("blockers", "blocked_reasons"):
         value = review.get(blocker_field)
-        if not _sequence_of_text(value) or value:
+        if not _sequence_of_text(value) or any(item not in session_blockers for item in value):
             gaps.append(f"supervisor_{blocker_field}_not_exact_empty_list")
     remaining = payload.get("remaining_blockers")
-    if not _sequence_of_text(remaining) or remaining:
+    if not _sequence_of_text(remaining) or any(item not in session_blockers for item in remaining):
         gaps.append("remaining_blockers_not_exact_empty_list")
     context = review.get("broad_market_context")
     sector = review.get("sector_or_peer_context")
@@ -545,8 +597,6 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captur
         or not _is_decimal(sector.get("relative_performance"), "sector relative_performance")
     ):
         gaps.append("actual_spy_qqq_sector_relative_values_missing")
-    if review.get("allowed") is not True or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS or not _exact_source_reference(review.get("allowed_exit_reason_source"), sources):
-        gaps.append("recognized_exit_reason_missing")
     if not all(isinstance(review.get(field), str) and review[field].strip() for field in ("current_thesis_status", "why_hold_is_worse_than_sell")):
         gaps.append("thesis_verdict_missing")
     try:
@@ -603,6 +653,17 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captur
                 source_payloads["earnings_guidance_filing"] = source_payload
             else:
                 gaps.append("filing_or_guidance_not_adverse_substantive_fact")
+    if (
+        review.get("allowed") is not True
+        or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS
+        or not _reason_source_semantics(
+            review.get("allowed_exit_reason"),
+            review.get("allowed_exit_reason_source"),
+            sources,
+            source_payloads,
+        )
+    ):
+        gaps.append("recognized_exit_reason_missing_or_mismatched_source")
     if categories != {"market", "news", "substance"}:
         gaps.append("required_source_substance_missing")
     if not _review_structured_events_match_sources(review, source_payloads):

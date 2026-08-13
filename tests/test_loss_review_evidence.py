@@ -88,6 +88,28 @@ def _provider_result(symbol: str = "TSM") -> TickerProviderResearchResult:
     )
 
 
+def _complete_provider_result(symbol: str = "ORCL") -> TickerProviderResearchResult:
+    """Real-shaped raw provider packets, not already-normalized authority."""
+    packets = [
+        evidence_packet(
+            source_name="broker_market_context", evidence_type="quote_price_context",
+            subject=symbol, symbol=symbol, source_ref="https://example.test/market",
+            payload={"market_context": {"spy": "0.10", "qqq": "0.20", "sector_relative": "-0.03"}}, quality="high", tool_route="test",
+        ),
+        evidence_packet(
+            source_name="company_news_provider", evidence_type="market_news",
+            subject=symbol, symbol=symbol, source_ref="https://example.test/news",
+            payload={"company_event": {"event_category": "thesis_invalidator", "direction": "adverse", "impact_fraction": "-0.08"}}, quality="high", tool_route="test",
+        ),
+        evidence_packet(
+            source_name="earnings_transcript_provider", evidence_type="earnings_transcripts",
+            subject=symbol, symbol=symbol, source_ref="https://example.test/transcript",
+            payload={"company_event": {"event_category": "guidance_cut", "direction": "adverse", "change_fraction": "-0.12"}}, quality="high", tool_route="test",
+        ),
+    ]
+    return TickerProviderResearchResult(symbol=symbol, packets=packets, summary_packet=None, route_attempts=[])
+
+
 def test_find_latest_loss_review_packet_selects_newest_review(tmp_path):
     old_path = tmp_path / "hourly-supervisor-20260606-190000.json"
     old_path.write_text(json.dumps({"decision": "hold"}), encoding="utf-8")
@@ -169,6 +191,41 @@ def test_build_loss_review_evidence_packet_preserves_hold_and_attaches_sources()
         "why this is not broad-market red-day noise is missing",
         "market session is not tradeable for a live loss exit",
     ]
+
+
+def test_real_shaped_provider_packets_are_normalized_before_they_count(tmp_path):
+    hourly_packet = _hourly_packet("ORCL")
+    review = hourly_packet["evidence"]["loss_exit_review"]
+    review["symbol"] = "ORCL"
+    review["blockers"] = ["SPY/QQQ/sector context is missing", "company-specific news check is missing", "earnings/guidance/filing check is missing"]
+    review["blocked_reasons"] = list(review["blockers"])
+    provider = _complete_provider_result()
+    source_paths = {packet.packet_id: write_research_packet(packet, tmp_path / "raw") for packet in provider.packets}
+
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=tmp_path / "hourly.json",
+        hourly_packet=hourly_packet,
+        provider_result=provider,
+        source_packet_paths=source_paths,
+        decision_evidence_root=tmp_path,
+    )
+
+    accepted = packet.payload["accepted_sources"]
+    assert {item["evidence_type"] for item in accepted} == {"market_context", "company_news", "earnings_guidance_filing"}
+    assert all(item["path"].startswith("normalized_loss_review_evidence/") for item in accepted)
+    assert packet.payload["advisory_analysis"]["qualified_evidence"] == {"market": True, "company_news": True, "filing": True}
+    assert packet.payload["remaining_blockers"] == []
+
+
+def test_generic_tsm_provider_packets_are_not_normalized_into_authority(tmp_path):
+    provider = _provider_result()
+    source_paths = {packet.packet_id: write_research_packet(packet, tmp_path / "raw") for packet in provider.packets}
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=tmp_path / "hourly.json", hourly_packet=_hourly_packet(), provider_result=provider,
+        source_packet_paths=source_paths, decision_evidence_root=tmp_path,
+    )
+    assert packet.payload["accepted_sources"] == []
+    assert packet.payload["advisory_analysis"]["qualified_evidence"] == {"market": False, "company_news": False, "filing": False}
 
 
 def test_loss_review_evidence_attaches_prior_live_entry_context(tmp_path):

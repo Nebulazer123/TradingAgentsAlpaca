@@ -312,14 +312,41 @@ def _accepted_source_descriptors(
             or stored.get("quality") != packet.quality
         ):
             continue
+        normalized = _normalize_provider_packet(packet=packet, stored=stored, symbol=packet.symbol)
+        if normalized is None:
+            continue
+        normalized_type, normalized_payload = normalized
+        normalized_path = root / "normalized_loss_review_evidence" / f"{packet.packet_id}-{normalized_type}.json"
+        normalized_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        normalized_packet = {
+            "packet_id": f"normalized-{packet.packet_id}-{normalized_type}",
+            "source_name": packet.source_name,
+            "evidence_type": normalized_type,
+            "subject": packet.symbol,
+            "symbol": packet.symbol,
+            "as_of": as_of,
+            "quality": packet.quality,
+            "provenance": {
+                "raw_packet_path": relative.as_posix(),
+                "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
+                "raw_packet_id": packet.packet_id,
+                "raw_evidence_type": packet.evidence_type,
+            },
+            "payload": normalized_payload,
+        }
+        normalized_raw = json.dumps(normalized_packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if normalized_path.exists() and normalized_path.read_bytes() != normalized_raw:
+            continue
+        normalized_path.write_bytes(normalized_raw)
+        normalized_relative = normalized_path.relative_to(root)
         result.append(
             {
-                "path": relative.as_posix(),
-                "sha256": hashlib.sha256(raw).hexdigest(),
-                "size_bytes": len(raw),
-                "packet_id": packet.packet_id,
+                "path": normalized_relative.as_posix(),
+                "sha256": hashlib.sha256(normalized_raw).hexdigest(),
+                "size_bytes": len(normalized_raw),
+                "packet_id": normalized_packet["packet_id"],
                 "source_name": packet.source_name,
-                "evidence_type": packet.evidence_type,
+                "evidence_type": normalized_type,
                 "as_of": as_of,
                 "quality": packet.quality,
             }
@@ -327,10 +354,66 @@ def _accepted_source_descriptors(
     return result
 
 
+def _normalized_decimal(value: Any) -> str | None:
+    numeric = _float_value(value)
+    if numeric is None:
+        return None
+    # A canonical string is required by the decision validator; avoid a
+    # provider's locale/percentage formatting leaking into authority material.
+    return f"{numeric:.8f}".rstrip("0").rstrip(".") or "0"
+
+
+def _normalize_provider_packet(
+    *, packet: SourceEvidencePacket, stored: Mapping[str, Any], symbol: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Admit only semantically complete provider material into strict BOARD types.
+
+    Raw provider packet names are never authority.  This intentionally accepts
+    only structured facts from their payload; generic quotes, news headlines,
+    SEC submission indexes, connector gaps, and cached placeholders yield None.
+    """
+    raw_payload = stored.get("payload")
+    if not isinstance(raw_payload, Mapping) or packet.quality not in {"high", "medium"}:
+        return None
+    as_of = str(packet.as_of or packet.generated_at)
+    if packet.evidence_type == "quote_price_context":
+        context = raw_payload.get("market_context")
+        if not isinstance(context, Mapping):
+            return None
+        spy, qqq, relative = (_normalized_decimal(context.get(key)) for key in ("spy", "qqq", "sector_relative"))
+        if None in {spy, qqq, relative}:
+            return None
+        return "market_context", {
+            "symbol": symbol, "as_of": as_of,
+            "spy": {"symbol": "SPY", "value": spy, "as_of": as_of},
+            "qqq": {"symbol": "QQQ", "value": qqq, "as_of": as_of},
+            "sector_relative": {"symbol": symbol, "value": relative, "as_of": as_of},
+        }
+    if packet.evidence_type in {"market_news", "earnings_transcripts", "fundamentals_profile"}:
+        event = raw_payload.get("company_event")
+        if not isinstance(event, Mapping) or event.get("direction") != "adverse":
+            return None
+        category = event.get("event_category")
+        if category not in {"guidance_cut", "material_contract_loss", "regulatory_adverse_action", "thesis_invalidator", "earnings_miss", "material_impairment", "adverse_filing_disclosure"}:
+            return None
+        fraction = _normalized_decimal(event.get("impact_fraction", event.get("change_fraction")))
+        if fraction is None or _float_value(fraction) is None or _float_value(fraction) > -0.01:
+            return None
+        if packet.evidence_type == "market_news":
+            return "company_news", {"symbol": symbol, "as_of": as_of, "event_category": category, "direction": "adverse", "impact_fraction": fraction}
+        # An SEC index has no event object and is rejected above.  A transcript
+        # or filed disclosure must identify an actual earnings/guidance fact.
+        if category not in {"guidance_cut", "earnings_miss", "material_impairment", "adverse_filing_disclosure"}:
+            return None
+        return "earnings_guidance_filing", {"symbol": symbol, "as_of": as_of, "event_category": category, "direction": "adverse", "change_fraction": fraction}
+    return None
+
+
 def _qualified_loss_review_evidence(
     provider_result: TickerProviderResearchResult,
     *,
     symbol: str,
+    accepted_sources: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, bool]:
     """Return strict source-category facts for a possible autonomous decision.
 
@@ -339,17 +422,15 @@ def _qualified_loss_review_evidence(
     clear the three evidence blockers that an autonomous loss decision needs.
     """
     result = {"market": False, "company_news": False, "filing": False}
-    for packet in provider_result.packets:
-        if packet.symbol != symbol or packet.quality not in {"high", "medium"}:
-            continue
-        descriptor = f"{packet.source_name} {packet.evidence_type}".lower()
-        if any(marker in descriptor for marker in ("watchlist", "cache", "gap", "connector", "submissions")):
-            continue
-        if packet.evidence_type == "market_context":
+    # Only descriptors produced by _accepted_source_descriptors represent
+    # canonical, semantically-admitted normalized packets.
+    for source in accepted_sources:
+        evidence_type = source.get("evidence_type") if isinstance(source, Mapping) else None
+        if evidence_type == "market_context":
             result["market"] = True
-        elif packet.evidence_type == "company_news":
+        elif evidence_type == "company_news":
             result["company_news"] = True
-        elif packet.evidence_type == "earnings_guidance_filing":
+        elif evidence_type == "earnings_guidance_filing":
             result["filing"] = True
     return result
 
@@ -558,6 +639,7 @@ def _build_advisory_analysis(
     hourly_packet: Mapping[str, Any],
     provider_result: TickerProviderResearchResult,
     coverage_by_need: Mapping[str, int],
+    accepted_sources: Sequence[Mapping[str, Any]] = (),
     entry_context: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     portfolio = hourly_packet.get("portfolio")
@@ -584,7 +666,9 @@ def _build_advisory_analysis(
         if isinstance(attempt, Mapping)
     ]
 
-    qualified_evidence = _qualified_loss_review_evidence(provider_result, symbol=symbol)
+    qualified_evidence = _qualified_loss_review_evidence(
+        provider_result, symbol=symbol, accepted_sources=accepted_sources
+    )
     has_market_context = qualified_evidence["market"]
     has_fundamental_context = qualified_evidence["filing"]
     has_news_context = qualified_evidence["company_news"]
@@ -771,6 +855,7 @@ def build_loss_review_evidence_packet(
         hourly_packet=hourly_packet,
         provider_result=provider_result,
         coverage_by_need=coverage_by_need,
+        accepted_sources=accepted_sources,
         entry_context=entry_context,
     )
     qualified_evidence = advisory_analysis.get("qualified_evidence")

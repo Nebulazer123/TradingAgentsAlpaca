@@ -205,10 +205,62 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
     assert compact["analysis_only"] is True
     assert compact["can_submit_orders"] is False
     assert compact["execution_authority"] == "none"
-    assert compact["autonomous_loss_decision"] == decision
-    assert compact["loss_review_evidence"]["source_binding"] == review[
-        "loss_review_evidence"
-    ]["source_binding"]
+    assert compact["autonomous_loss_decision"] == {
+        key: decision[key]
+        for key in ("decision_id", "ledger_packet_id", "symbol", "decision", "trade_decision_resolved", "exit_allowed")
+    }
+    assert compact["loss_review_evidence"] == {
+        key: review["loss_review_evidence"][key]
+        for key in ("symbol", "review_allowed", "remaining_blocker_count", "resolved_blocker_count", "next_action")
+    }
+
+
+def test_compact_board_is_a_fixed_scalar_projection_and_never_leaks_nested_material(tmp_path):
+    review = {
+        "kind": "execution_board_review", "generated_at": "2026-08-13T15:00:00+00:00",
+        "analysis_only": True, "recommendation": "autonomous_hold",
+        "new_buy_policy": {"state": "allowed", "secret": "DO-NOT-LEAK"},
+        "metrics": {"packet_count": 1, "submitted_order_count": 0, "live_buy_count": 0, "live_sell_count": 0, "loss_exit_count": 0, "secret": "DO-NOT-LEAK"},
+        "loss_review_evidence": {"symbol": "TSM", "review_allowed": False, "remaining_blocker_count": 1, "resolved_blocker_count": 0, "next_action": "autonomous_hold", "source_binding": {"secret": "DO-NOT-LEAK"}},
+        "autonomous_loss_decision": {"decision_id": "d", "ledger_packet_id": "l", "symbol": "TSM", "decision": "HOLD", "trade_decision_resolved": True, "exit_allowed": False, "decision_evidence": {"secret": "DO-NOT-LEAK"}},
+        "violations": [], "warnings": [], "packet_reviews": [],
+    }
+    compact = compact_execution_board_review(review, raw_packet_path=tmp_path / "board.json", raw_packet_sha256="a" * 64)
+    serialized = json.dumps(compact)
+    assert "DO-NOT-LEAK" not in serialized
+    assert compact["raw_packet_sha256"] == "a" * 64
+    assert compact["autonomous_loss_decision"] == {"decision_id": "d", "ledger_packet_id": "l", "symbol": "TSM", "decision": "HOLD", "trade_decision_resolved": True, "exit_allowed": False}
+
+
+def test_written_compact_board_points_to_the_exact_timestamped_raw_artifact(tmp_path):
+    review = build_execution_board_review(tmp_path / "hourly")
+    raw_path, _ = write_execution_board_review(review, tmp_path / "board")
+    compact = json.loads(raw_path.with_name(f"{raw_path.stem}.compact.json").read_text(encoding="utf-8"))
+    assert compact["raw_packet_path"] == str(raw_path)
+    assert compact["raw_packet_sha256"] == hashlib.sha256(raw_path.read_bytes()).hexdigest()
+
+
+def test_board_does_not_write_ledger_when_source_revision_is_unavailable(tmp_path, monkeypatch):
+    hourly, evidence_dir, _hourly_path, _loss_path = _write_exact_incomplete_loss_evidence(tmp_path)
+    monkeypatch.setattr("tradingagents.evals.execution_board._source_revision", lambda: None)
+    review = build_execution_board_review(hourly, loss_review_evidence_dir=evidence_dir, decision_evidence_root=tmp_path, decision_ledger_root=tmp_path / "ledger", now=datetime(2026, 8, 13, 15, 1, tzinfo=UTC))
+    assert "autonomous_loss_decision" not in review
+    assert not (tmp_path / "ledger" / "events.jsonl").exists()
+
+
+def test_board_does_not_write_ledger_before_mismatched_review_binding_is_rejected(tmp_path):
+    hourly, evidence_dir, _hourly_path, loss_path = _write_exact_incomplete_loss_evidence(tmp_path)
+    loss = json.loads(loss_path.read_text(encoding="utf-8"))
+    loss["payload"]["supervisor_review_authority"]["symbol"] = "ORCL"
+    loss_path.write_text(json.dumps(loss), encoding="utf-8")
+    review = build_execution_board_review(
+        hourly, loss_review_evidence_dir=evidence_dir, decision_evidence_root=tmp_path,
+        decision_ledger_root=tmp_path / "ledger", source_revision="1" * 40,
+        now=datetime(2026, 8, 13, 15, 1, tzinfo=UTC),
+    )
+    assert "autonomous_loss_decision" not in review
+    assert review["loss_review_evidence"]["matches_review_window"] is False
+    assert not (tmp_path / "ledger" / "events.jsonl").exists()
 
 
 def test_execution_board_uses_unicode_safe_canonical_accepted_source_digest(tmp_path):

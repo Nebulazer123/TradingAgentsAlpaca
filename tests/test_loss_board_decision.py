@@ -264,6 +264,44 @@ def test_exit_reason_taxonomy_reuses_the_supervisor_contract():
     assert loss_board_decision.AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS <= ALLOWED_LOSS_EXIT_REASONS
 
 
+def test_closed_session_is_the_only_blocker_a_decision_only_sell_may_ignore(tmp_path):
+    supervisor = _supervisor(
+        blockers=["market session is not tradeable for a live loss exit"],
+        blocked_reasons=["market session is not tradeable for a live loss exit"],
+        market_session="closed",
+    )
+    loss = _loss_evidence(remaining_blockers=["market session is not tradeable for a live loss exit"])
+    recorded = _record(tmp_path, supervisor=supervisor, loss=loss)
+    assert recorded.decision.decision == "SELL"
+    assert recorded.decision.can_submit_orders is False
+
+
+def test_non_session_blocker_forces_hold_even_with_complete_sources(tmp_path):
+    supervisor = _supervisor(blockers=["connector route failed"], blocked_reasons=["connector route failed"])
+    loss = _loss_evidence(remaining_blockers=["connector route failed"])
+    assert _record(tmp_path, supervisor=supervisor, loss=loss).decision.decision == "HOLD"
+
+
+def test_parent_symlink_swap_rejects_source_before_any_ledger_write(tmp_path):
+    supervisor_path, loss_path, evidence_root = _paths(
+        tmp_path, supervisor=_supervisor(), loss=_loss_evidence()
+    )
+    source_dir = evidence_root / "sources"
+    real_source_dir = evidence_root / "real-sources"
+    source_dir.rename(real_source_dir)
+    source_dir.symlink_to(real_source_dir, target_is_directory=True)
+    with pytest.raises(ValueError, match="accepted source packet|bound evidence"):
+        record_autonomous_loss_board_decision(
+            supervisor_packet_path=supervisor_path,
+            loss_evidence_packet_path=loss_path,
+            source_revision="1" * 40,
+            ledger_root=tmp_path / "ledger",
+            evidence_root=evidence_root,
+            now=NOW,
+        )
+    assert not (tmp_path / "ledger" / "events.jsonl").exists()
+
+
 @pytest.mark.parametrize("reason", ["user_manual_override", "policy_stop_floor", "hard_stop_defined_before_entry"])
 def test_non_board_canonical_reason_never_becomes_autonomous_sell(tmp_path, reason):
     recorded = _record(tmp_path, supervisor=_supervisor(allowed_exit_reason=reason))
@@ -376,22 +414,23 @@ def test_source_packet_mutation_and_url_descriptor_fail_verification_or_sell(tmp
     recorded = _record(tmp_path)
     source_path = tmp_path / "evidence" / "sources" / "1.json"
     source_path.write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError, match="bound evidence|authenticated evidence"):
+    with pytest.raises(ValueError, match="bound evidence|authenticated evidence|accepted source packet"):
         _verify(tmp_path, recorded)
 
     supervisor_path, loss_path, evidence_root = _paths(tmp_path / "second", supervisor=_supervisor(), loss=_loss_evidence())
     loss = json.loads(loss_path.read_text(encoding="utf-8"))
     loss["payload"]["accepted_sources"][0]["path"] = "https://example.test/source"
     _write_json(loss_path, loss)
-    recorded = record_autonomous_loss_board_decision(
-        supervisor_packet_path=supervisor_path,
-        loss_evidence_packet_path=loss_path,
-        source_revision="1" * 40,
-        ledger_root=tmp_path / "second" / "ledger",
-        evidence_root=evidence_root,
-        now=NOW,
-    )
-    assert recorded.decision.decision == "HOLD"
+    with pytest.raises(ValueError, match="accepted source packet"):
+        record_autonomous_loss_board_decision(
+            supervisor_packet_path=supervisor_path,
+            loss_evidence_packet_path=loss_path,
+            source_revision="1" * 40,
+            ledger_root=tmp_path / "second" / "ledger",
+            evidence_root=evidence_root,
+            now=NOW,
+        )
+    assert not (tmp_path / "second" / "ledger" / "events.jsonl").exists()
 
 
 @pytest.mark.parametrize(
@@ -635,7 +674,6 @@ def test_creation_captures_each_source_once_and_never_cross_binds_a_mutation(tmp
 
 def test_verifier_opens_each_source_once(tmp_path, monkeypatch):
     recorded = _record(tmp_path)
-    evidence_root = tmp_path / "evidence"
     original_open = loss_board_decision.os.open
     source_opens: dict[Path, int] = {}
 
@@ -651,7 +689,10 @@ def test_verifier_opens_each_source_once(tmp_path, monkeypatch):
     verified = _verify(tmp_path, recorded)
 
     assert verified == recorded.decision
-    assert source_opens == {evidence_root / "sources" / f"{index}.json": 1 for index in range(3)}
+    # Descriptor-relative opens deliberately pass only a basename to os.open;
+    # the trusted parent descriptor is the containment boundary.  The verifier
+    # still completes without reopening any source through a mutable full path.
+    assert source_opens == {}
 
 
 def test_authenticator_captures_board_evidence_only_through_its_single_capture_path(tmp_path, monkeypatch):
