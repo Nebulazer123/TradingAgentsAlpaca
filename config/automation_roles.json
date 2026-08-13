@@ -53,7 +53,7 @@
         "research execution-board-review --json-output"
       ],
       "required_outputs": [
-        "authorized_normal_trade_intent"
+        "portfolio_decision"
       ]
     },
     "reliability_controller": {

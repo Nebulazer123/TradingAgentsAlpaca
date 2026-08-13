@@ -49,6 +49,7 @@ CENTRAL = ZoneInfo("America/Chicago")
 PROVIDER_BUNDLE_SCAN_LIMIT = 50
 JSON_FILE_CACHE = JsonFileCache.from_env(max_entries=2048)
 EXECUTION_AUTHORITIES = ("none", "paper", "normal_live")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 INCIDENT_SUMMARY_STAT_LIMIT = 64
 INCIDENT_SUMMARY_MAX_BYTES = 64 * 1024
 RECOVERY_OWNER_ROLES = {"reliability_controller"}
@@ -412,6 +413,77 @@ def summarize_execution_authority(packets: list[dict[str, Any]]) -> dict[str, An
         "execution_authority_status": "warn" if invalid_labels else "pass",
         "execution_authority_source_labels": [label for label, _value in declared][:12],
         "execution_authority_invalid_labels": invalid_labels[:12],
+    }
+
+
+def compact_autonomous_loss_decision(value: Any) -> dict[str, Any]:
+    """Project only a structurally valid, decision-only BOARD receipt.
+
+    Compact context is intentionally not an authority check.  It preserves a
+    small, fixed-field projection so scheduled readers can distinguish a
+    resolved autonomous decision from a BOARD job that still needs valid
+    immutable evidence, without copying operator prose or mutable evidence
+    paths into the shared summary.
+    """
+
+    pending = {
+        "status": "business_decision_pending",
+        "plain_english": (
+            "The autonomous Portfolio Executive is waiting for valid immutable "
+            "evidence before making a HOLD or SELL decision."
+        ),
+    }
+    if not isinstance(value, dict):
+        return pending
+    decision = value.get("decision")
+    symbol = value.get("symbol")
+    decision_id = value.get("decision_id")
+    ledger_packet_id = value.get("ledger_packet_id")
+    decision_evidence = value.get("decision_evidence")
+    if (
+        decision not in {"HOLD", "SELL"}
+        or not isinstance(symbol, str)
+        or not re.fullmatch(r"[A-Z][A-Z0-9.]{0,9}", symbol)
+        or not isinstance(decision_id, str)
+        or _SHA256_HEX.fullmatch(decision_id) is None
+        or not isinstance(ledger_packet_id, str)
+        or _SHA256_HEX.fullmatch(ledger_packet_id) is None
+        or value.get("trade_decision_resolved") is not True
+        or not isinstance(value.get("exit_allowed"), bool)
+        or value.get("analysis_only") is not True
+        or value.get("execution_authority") != "none"
+        or value.get("can_submit_orders") is not False
+        or not isinstance(decision_evidence, dict)
+        or not isinstance(decision_evidence.get("path"), str)
+        or not isinstance(decision_evidence.get("sha256"), str)
+        or _SHA256_HEX.fullmatch(decision_evidence["sha256"]) is None
+        or not isinstance(decision_evidence.get("size_bytes"), int)
+        or decision_evidence["size_bytes"] < 1
+        or (decision == "HOLD" and value["exit_allowed"] is not False)
+        or (decision == "SELL" and value["exit_allowed"] is not True)
+    ):
+        return pending
+    status = "autonomous_hold" if decision == "HOLD" else "autonomous_sell"
+    plain_english = (
+        f"Autonomous HOLD: the Portfolio Executive decided to keep {symbol}; no order was created."
+        if decision == "HOLD"
+        else (
+            f"Autonomous SELL: the Portfolio Executive decided to exit {symbol}; "
+            "a separate execution intent is still required and no order was created."
+        )
+    )
+    return {
+        "status": status,
+        "plain_english": plain_english,
+        "decision": decision,
+        "symbol": symbol,
+        "decision_id": decision_id,
+        "ledger_packet_id": ledger_packet_id,
+        "trade_decision_resolved": True,
+        "exit_allowed": value["exit_allowed"],
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
     }
 
 
@@ -1245,7 +1317,8 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
                         "Latest evidence refresh resolved "
                         f"{len(resolved_blockers)} of "
                         f"{len(blockers_before_refresh)} original blocker(s); "
-                        f"{len(remaining_blockers)} blocker(s) remain for BOARD/manual review."
+                        f"{len(remaining_blockers)} blocker(s) remain for an autonomous "
+                        "Portfolio Executive decision."
                     ),
                     "reason": loss_review_refreshed_reason(
                         evidence_payload=evidence_payload,
@@ -2651,7 +2724,15 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
             else {}
         )
         latest_packet_decision = latest_packet_review.get("decision")
-        latest_packet_needs_review = latest_packet_decision == "loss-review"
+        autonomous_decision = compact_autonomous_loss_decision(
+            data.get("autonomous_loss_decision")
+        )
+        autonomous_decision_pending = (
+            autonomous_decision["status"] == "business_decision_pending"
+        )
+        latest_packet_needs_review = (
+            latest_packet_decision == "loss-review" and autonomous_decision_pending
+        )
         board_latest_reviewed_packet_path = latest_packet_review.get("packet")
         latest_hourly_path = latest_packet_path_for_label("hourly")
         latest_hourly_packet_path = rel(latest_hourly_path) if latest_hourly_path else None
@@ -2709,6 +2790,15 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
                 "board_matches_latest_hourly": board_matches_latest_hourly,
                 "latest_packet_decision": latest_packet_decision,
                 "latest_packet_needs_review": latest_packet_needs_review,
+                "autonomous_loss_decision_status": autonomous_decision["status"],
+                "autonomous_loss_decision_plain_english": autonomous_decision[
+                    "plain_english"
+                ],
+                "autonomous_loss_decision": {
+                    key: value
+                    for key, value in autonomous_decision.items()
+                    if key not in {"status", "plain_english"}
+                },
                 "analysis_only": data.get("analysis_only"),
                 "can_submit_orders": data.get("can_submit_orders"),
                 "packet_count": metrics.get("packet_count"),
@@ -2773,7 +2863,7 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
                 "resolved_blockers_by_refresh": resolved_blockers,
                 "remaining_blocker_count": len(blockers),
                 "next_action": payload.get("next_action"),
-                "next_open": "Open loss-review evidence when BOARD/manual review is deciding whether HOLD or a loss exit has better expected value.",
+                "next_open": "Open loss-review evidence when the autonomous Portfolio Executive needs to decide HOLD or SELL.",
             }
         )
         if data.get("analysis_only") is not True or freshness.get("can_submit_orders") is not False:
@@ -2782,6 +2872,12 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
             flag("stale")
         next_action = str(payload.get("next_action") or "")
         if next_action.startswith("manual_board_review"):
+            summary["next_action"] = "business_decision_pending"
+            summary["autonomous_loss_decision_status"] = "business_decision_pending"
+            summary["autonomous_loss_decision_plain_english"] = (
+                "The autonomous Portfolio Executive is waiting for valid immutable "
+                "evidence before making a HOLD or SELL decision."
+            )
             flag("board_review")
     elif label == "mirofish_handoff_status":
         freshness = data.get("freshness") or {}

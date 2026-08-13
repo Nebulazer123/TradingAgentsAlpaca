@@ -169,7 +169,21 @@ def test_execution_requires_bounded_paper_and_separate_normal_trade_inputs():
     portfolio = _registry()["roles"]["portfolio_executive"]
     execution = _registry()["roles"]["execution_operator"]
 
-    assert portfolio["required_outputs"] == ["authorized_normal_trade_intent"]
+    assert portfolio["required_outputs"] == ["portfolio_decision"]
+    assert set(portfolio["allowed_actions"]) >= {"trade_decision"}
+    assert {
+        "promotion_change",
+        "freeze",
+        "repair",
+        "verify",
+        "rearm_request",
+        "rearm_issue",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order",
+    }.issubset(portfolio["forbidden_effects"])
     assert execution["allowed_actions"] == ["order_submit"]
     assert execution["required_inputs"] == [
         "authorized_paper_order_request",

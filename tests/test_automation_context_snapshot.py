@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import tomllib
 
 
 def _load_snapshot_module():
@@ -299,6 +300,103 @@ def test_compact_context_warns_and_does_not_elevate_invalid_packet_authority(tmp
     assert summary["execution_authority_status"] == "warn"
     assert summary["execution_authority"] == "none"
     assert summary["execution_authority_invalid_labels"] == ["synthetic"]
+
+
+def test_execution_board_compact_context_projects_a_resolved_autonomous_hold(tmp_path):
+    snapshot = _load_snapshot_module()
+    packet = {
+        "generated_at": "2026-08-13T12:00:00+00:00",
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "recommendation": "no_action_needed",
+        "metrics": {},
+        "packet_reviews": [{"decision": "loss-review", "packet": "results/hourly.json"}],
+        "autonomous_loss_decision": {
+            "decision": "HOLD",
+            "symbol": "TSM",
+            "decision_id": "a" * 64,
+            "ledger_packet_id": "b" * 64,
+            "decision_evidence": {
+                "path": "loss_board_decisions/decision.json",
+                "sha256": "c" * 64,
+                "size_bytes": 321,
+            },
+            "trade_decision_resolved": True,
+            "exit_allowed": False,
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+        },
+    }
+    path = tmp_path / "execution-board.json"
+    path.write_text(json.dumps(packet), encoding="utf-8")
+
+    summary = snapshot.summarize_packet("execution_board_review", path)
+
+    assert summary["autonomous_loss_decision_status"] == "autonomous_hold"
+    assert summary["autonomous_loss_decision_plain_english"] == (
+        "Autonomous HOLD: the Portfolio Executive decided to keep TSM; no order was created."
+    )
+    assert summary["latest_packet_needs_review"] is False
+    assert "board_review" not in summary["drilldown_reasons"]
+    assert "manual_board_review" not in json.dumps(summary)
+
+
+def test_execution_board_compact_context_keeps_invalid_decision_pending(tmp_path):
+    snapshot = _load_snapshot_module()
+    packet = {
+        "generated_at": "2026-08-13T12:00:00+00:00",
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "metrics": {},
+        "packet_reviews": [{"decision": "loss-review", "packet": "results/hourly.json"}],
+        "autonomous_loss_decision": {
+            "decision": "HOLD",
+            "symbol": "TSM",
+            "trade_decision_resolved": True,
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+        },
+    }
+    path = tmp_path / "execution-board.json"
+    path.write_text(json.dumps(packet), encoding="utf-8")
+
+    summary = snapshot.summarize_packet("execution_board_review", path)
+
+    assert summary["autonomous_loss_decision_status"] == "business_decision_pending"
+    assert summary["latest_packet_needs_review"] is True
+    assert "manual_board_review" not in json.dumps(summary)
+
+
+def test_installed_execution_board_prompt_owns_decision_but_not_execution():
+    path = (
+        Path.home()
+        / ".codex"
+        / "automations"
+        / "tradingagents-autonomous-execution-board"
+        / "automation.toml"
+    )
+    if not path.exists():
+        pytest.skip("installed execution BOARD automation is unavailable")
+
+    automation = tomllib.loads(path.read_text(encoding="utf-8"))
+    prompt = automation["prompt"]
+
+    assert "own HOLD-versus-SELL trade decisions" in prompt
+    assert "do not own execution or order submission" in prompt
+    assert "missing, stale, malformed, contradictory" in prompt
+    assert "record autonomous HOLD" in prompt
+    assert "separate execution intent" in prompt
+    assert "Never change strategy, risk, or promotion settings" in prompt
+    assert "Never freeze, refresh, re-arm, or unfreeze live control" in prompt
+    assert "freeze live trading" not in prompt
+    assert automation["notification_policy"] == "failed_runs_only"
+    assert automation["rrule"] == (
+        "RRULE:FREQ=WEEKLY;BYHOUR=9,10,11,12,13,14,15;BYMINUTE=50;BYDAY=MO,TU,WE,TH,FR"
+    )
 
 
 def test_incident_summary_projects_only_structural_blocker_presence(
