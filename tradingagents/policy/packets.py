@@ -309,7 +309,7 @@ def compact_loss_review_evidence_payload(
         "payload": compact_payload,
         "raw_packet_path": str(raw_packet_path) if raw_packet_path is not None else None,
         "next_open": (
-            "Open the raw loss-review evidence packet when BOARD/manual review "
+            "Open the raw loss-review evidence packet when autonomous BOARD review "
             "needs full source refs or provider route details."
         ),
     }

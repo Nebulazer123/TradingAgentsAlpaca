@@ -1119,7 +1119,7 @@ def test_bare_thesis_broken_flag_is_not_enough_for_loss_exit():
     assert "allowed loss-exit reason source is missing" in review["blocked_reasons"]
 
 
-def test_hourly_decision_can_close_approved_broken_thesis_loss():
+def test_hourly_decision_routes_discretionary_guidance_loss_to_board():
     decision = build_hourly_decision(
         live_positions=[
             {
@@ -1131,21 +1131,13 @@ def test_hourly_decision_can_close_approved_broken_thesis_loss():
                 "avg_entry_price": "428",
                 "unrealized_pl": "-1.07",
                 "holding_period_trading_days": 5,
-                "thesis_invalidator_event": {
-                    "event_category": "thesis_invalidator",
-                    "source": "normalized_company_news",
-                    "reason_source": {
-                        "packet_id": "earnings-guidance-packet-20260603",
-                        "path": "normalized_loss_review_evidence/earnings-guidance-packet-20260603.json",
-                        "sha256": "a" * 64,
-                    },
-                },
+                "earnings_or_guidance_break": True,
                 "allowed_exit_reason_source": {
                     "packet_id": "earnings-guidance-packet-20260603",
                     "path": "normalized_loss_review_evidence/earnings-guidance-packet-20260603.json",
                     "sha256": "a" * 64,
                 },
-                "exit_reason": "thesis invalidated: product guidance cut broke the support thesis",
+                "exit_reason": "guidance cut broke the support thesis",
                 "original_buy_thesis": "Support should hold if cloud growth guidance stays intact.",
                 "current_thesis_status": "Guidance cut invalidated the support thesis.",
                 "relative_market_context": {
@@ -1167,15 +1159,11 @@ def test_hourly_decision_can_close_approved_broken_thesis_loss():
         market_session="regular",
     )
 
-    assert decision.decision == "close"
+    assert decision.decision == "loss-review"
     assert decision.material is True
-    assert decision.actions[0].symbol == "MSFT"
-    assert decision.actions[0].action == "close"
-    assert decision.actions[1].action == "hold_cash"
-    assert is_order_action(decision.actions[0]) is True
-    assert is_order_action(decision.actions[1]) is False
-    assert "Exit approved loss" in decision.actions[0].reason
-    assert decision.evidence["loss_exit_review"]["allowed"] is True
+    assert decision.actions == []
+    assert "autonomous portfolio BOARD" in decision.reason
+    assert decision.evidence["loss_exit_review"]["allowed"] is False
 
 
 def test_approved_loss_exit_requires_current_price_before_order():
@@ -1606,7 +1594,7 @@ def test_loss_review_does_not_pair_sell_with_clean_dip_candidate():
 
     assert decision.decision == "loss-review"
     assert decision.actions == []
-    assert "BOARD should review" in decision.reason
+    assert "The BOARD must decide" in decision.reason
 
 
 def test_hourly_decision_sells_profit_spike_instead_of_only_reviewing():
@@ -1659,7 +1647,7 @@ def test_extracted_loss_review_helper_blocks_without_exit_evidence():
     assert "allowed loss-exit reason is missing" in decision.evidence["loss_exit_review"]["blockers"]
 
 
-def test_extracted_loss_review_helper_keeps_sell_independent_and_holds_cash():
+def test_extracted_loss_review_helper_routes_discretionary_sell_to_board():
     decision = supervisor_hourly.build_loss_review_decision(
         worst_position={
             "symbol": "MSFT",
@@ -1670,21 +1658,13 @@ def test_extracted_loss_review_helper_keeps_sell_independent_and_holds_cash():
             "avg_entry_price": "428",
             "unrealized_pl": "-1.07",
             "holding_period_trading_days": 5,
-            "thesis_invalidator_event": {
-                "event_category": "thesis_invalidator",
-                "source": "normalized_company_news",
-                "reason_source": {
-                    "packet_id": "earnings-guidance-packet-20260603",
-                    "path": "normalized_loss_review_evidence/earnings-guidance-packet-20260603.json",
-                    "sha256": "a" * 64,
-                },
-            },
+            "earnings_or_guidance_break": True,
             "allowed_exit_reason_source": {
                 "packet_id": "earnings-guidance-packet-20260603",
                 "path": "normalized_loss_review_evidence/earnings-guidance-packet-20260603.json",
                 "sha256": "a" * 64,
             },
-            "exit_reason": "thesis invalidated: product guidance cut broke the support thesis",
+            "exit_reason": "guidance cut broke the support thesis",
             "original_buy_thesis": "Support should hold if cloud growth guidance stays intact.",
             "current_thesis_status": "Guidance cut invalidated the support thesis.",
             "relative_market_context": {
@@ -1710,13 +1690,10 @@ def test_extracted_loss_review_helper_keeps_sell_independent_and_holds_cash():
     )
 
     assert decision is not None
-    assert decision.decision == "close"
-    assert decision.actions[0].symbol == "MSFT"
-    assert decision.actions[0].normalized_side() == "sell"
-    assert decision.actions[0].sleeve == "current-aggressive"
-    assert decision.actions[1].action == "hold_cash"
-    assert decision.actions[1].reason.startswith("Sell decision is independent")
-    assert decision.evidence["loss_exit_review"]["allowed"] is True
+    assert decision.decision == "loss-review"
+    assert decision.actions == []
+    assert "autonomous portfolio BOARD" in decision.reason
+    assert decision.evidence["loss_exit_review"]["allowed"] is False
 
 
 def test_extracted_profit_take_helper_sells_spike_with_current_price():

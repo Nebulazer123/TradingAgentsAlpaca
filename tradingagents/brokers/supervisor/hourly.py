@@ -159,12 +159,12 @@ def build_loss_review_decision(
             reason=(
                 f"{symbol} crossed loss review, but no live sell was submitted "
                 "because HOLD/loss-review is active. No loss sell was submitted and "
-                "BOARD/manual review is required before a loss exit. "
+                "The autonomous portfolio BOARD must resolve HOLD versus SELL. "
                 "Missing thesis-break/exit evidence keeps HOLD mode active. "
                 f"Exact evidence gaps: {blockers or 'none'}. "
                 "Paper exploration continues while review is open. "
                 "New live buys are paused during this review. "
-                f"{session_note} BOARD should review whether holding for recovery "
+                f"{session_note} The BOARD must decide whether holding for recovery "
                 "or freeing capital has the better expected value."
             ),
             live_exposure=live_exposure,
@@ -189,7 +189,7 @@ def build_loss_review_decision(
                 f"{symbol} crossed loss review, but no live sell was submitted "
                 "because current price evidence is missing. "
                 f"Exact evidence gaps: {blockers or 'current price evidence is missing'}. "
-                "BOARD/manual review must refresh broker price data before any close order."
+                "The autonomous portfolio BOARD must refresh broker price data before any close order."
             ),
             live_exposure=live_exposure,
             evidence={"loss_exit_review": loss_exit_review},
