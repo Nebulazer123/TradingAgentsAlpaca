@@ -24,10 +24,37 @@ from tradingagents.research.provider_orchestrator import (
     DEFAULT_TICKER_EVIDENCE_NEEDS,
     TickerProviderResearchResult,
     build_ticker_provider_research_packets,
+    configured_quote_components,
 )
 from tradingagents.schemas.research import CrawlerRunPacket, SourceEvidencePacket
 
 runner = CliRunner()
+
+
+def test_configured_quote_contract_accepts_real_finnhub_fmp_and_yfinance_shapes():
+    assert configured_quote_components(
+        source_name="finnhub", evidence_type="quote", expected_symbol="ORCL",
+        raw_payload={"c": 91, "pc": 100},
+    ) == ({"symbol": "ORCL", "current": 91.0, "previous": 100.0},)
+    assert configured_quote_components(
+        source_name="fmp", evidence_type="quote", expected_symbol="ORCL",
+        raw_payload={"data": [{"c": 91, "pc": 100}]},
+    ) == ({"symbol": "ORCL", "current": 91.0, "previous": 100.0},)
+    assert configured_quote_components(
+        source_name="yfinance", evidence_type="quote_price_context", expected_symbol="ORCL",
+        raw_payload={"latest_bar": {"Close": 91}, "recent_bars": [{"Close": 100}, {"Close": 91}]},
+    ) == ({"symbol": "ORCL", "current": 91.0, "previous": 100.0},)
+
+
+def test_configured_quote_contract_rejects_loose_or_previous_day_only_labels():
+    assert not configured_quote_components(
+        source_name="finnhub", evidence_type="quote", expected_symbol="ORCL",
+        raw_payload={"price": 91, "previous_close": 100},
+    )
+    assert not configured_quote_components(
+        source_name="massive", evidence_type="quote_price_context", expected_symbol="ORCL",
+        raw_payload={"previous_day_bar": {"c": 100}},
+    )
 
 
 def _packet(source_name: str, *, evidence_type: str = "market_news", symbol: str = "NVDA"):

@@ -1257,11 +1257,29 @@ def research_loss_review_evidence(
     # immutable evidence packet binds the exact response; no historical
     # supervisor session label can silently become current decision authority.
     try:
-        raw_clock = _alpaca_live_client().get_clock()
+        raw_response = _alpaca_live_client().get_clock()
+        if isinstance(raw_response, Mapping):
+            raw_clock = dict(raw_response)
+        elif hasattr(raw_response, "model_dump"):
+            raw_clock = dict(raw_response.model_dump())
+        elif hasattr(raw_response, "dict"):
+            raw_clock = dict(raw_response.dict())
+        else:
+            raw_clock = {"invalid_clock_response": type(raw_response).__name__}
     except Exception as exc:  # noqa: BLE001 - a clock read failure must HOLD, never abort research.
         raw_clock = {"clock_error": type(exc).__name__}
-    captured_at = datetime.datetime.now(tz=datetime.timezone.utc).isoformat()
-    clock_as_of = str(raw_clock.get("timestamp") or captured_at) if isinstance(raw_clock, Mapping) else captured_at
+    captured_at = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
+    raw_timestamp = raw_clock.get("timestamp") if isinstance(raw_clock, Mapping) else None
+    try:
+        parsed_timestamp = datetime.datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
+        if parsed_timestamp.tzinfo is None:
+            raise ValueError("raw clock timestamp is timezone-naive")
+        clock_as_of = parsed_timestamp.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
+    except (TypeError, ValueError):
+        # An invalid clock is preserved as raw evidence and causes a HOLD in
+        # the strict downstream verifier.  Never synthesize as_of from local
+        # time, because that would make a broken broker response look current.
+        clock_as_of = None
     market_clock = {
         "source_name": "alpaca_clock",
         "source_ref": "alpaca:/v2/clock",

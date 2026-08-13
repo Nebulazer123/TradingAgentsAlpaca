@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -7,6 +8,7 @@ from cli.main import app
 from tradingagents.dataflows._official_common import evidence_packet
 from tradingagents.policy.loss_board_decision import record_autonomous_loss_board_decision
 from tradingagents.policy.packets import write_research_packet
+from tradingagents.research import loss_review_evidence as loss_evidence
 from tradingagents.research.loss_review_evidence import (
     DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
     build_loss_review_evidence_packet,
@@ -27,6 +29,45 @@ def _clock(now: str, *, is_open: bool = True) -> dict:
         "is_open": is_open,
         "raw_clock": {"timestamp": now, "is_open": is_open},
     }
+
+
+def test_clock_normalizer_rejects_tampered_wrapper_and_normalizes_fractional_raw_time():
+    raw = "2026-08-13T14:55:00.987654+00:00"
+    normalized, issue = loss_evidence._current_market_clock(
+        {
+            "source_name": "alpaca_clock",
+            "source_ref": "alpaca:/v2/clock",
+            "as_of": "2026-08-13T14:55:00+00:00",
+            "captured_at": "2026-08-13T14:55:01.999999+00:00",
+            "is_open": True,
+            "raw_clock": {"timestamp": raw, "is_open": True},
+        }
+    )
+    assert issue == ""
+    assert normalized["as_of"] == "2026-08-13T14:55:00+00:00"
+    assert normalized["captured_at"] == "2026-08-13T14:55:01+00:00"
+    assert loss_evidence._current_market_clock(
+        {
+            "source_name": "alpaca_clock", "source_ref": "alpaca:/v2/clock",
+            "as_of": "2026-08-13T14:55:01+00:00", "captured_at": "2026-08-13T14:55:01+00:00",
+            "is_open": True, "raw_clock": {"timestamp": raw, "is_open": False},
+        }
+    )[0] is None
+
+
+def test_keyword_only_or_generic_news_never_becomes_loss_board_adverse_fact():
+    generic = evidence_packet(
+        source_name="google_news_rss", evidence_type="market_news", subject="ORCL", symbol="ORCL",
+        source_ref="https://example.test/rss", payload={"articles": [{"headline": "Oracle cuts guidance"}]},
+        quality="high", as_of="2026-08-13T14:55:00+00:00", tool_route="google_news",
+    )
+    keyword_only = evidence_packet(
+        source_name="finnhub", evidence_type="market_news", subject="ORCL", symbol="ORCL",
+        source_ref="https://example.test/finnhub", payload={"data": [{"datetime": 1786632840, "headline": "Oracle cuts guidance", "url": "https://issuer.test/news"}]},
+        quality="medium", as_of="2026-08-13T14:55:00+00:00", tool_route="finnhub_api",
+    )
+    assert loss_evidence._normalize_provider_packet(packet=generic, stored=generic.model_dump(), symbol="ORCL") is None
+    assert loss_evidence._normalize_provider_packet(packet=keyword_only, stored=keyword_only.model_dump(), symbol="ORCL") is None
 
 
 def _hourly_packet(symbol: str = "TSM") -> dict:
@@ -349,7 +390,7 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
     assert recorded.decision.can_submit_orders is False
 
 
-def test_closed_current_clock_allows_decision_only_sell_but_open_clock_is_required_for_exit_allowed(tmp_path):
+def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_path):
     """The present exchange clock, not the old hourly label, controls session state."""
     now = "2026-08-13T14:55:00+00:00"
     hourly = _hourly_packet("ORCL")
@@ -374,7 +415,13 @@ def test_closed_current_clock_allows_decision_only_sell_but_open_clock_is_requir
     closed = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=False))
     closed_path = write_research_packet(closed, tmp_path / "loss-closed")
     assert closed.payload["current_loss_review"]["market_session"] == "closed"
-    assert closed.payload["current_loss_review"]["allowed"] is False
+    assert closed.payload["current_loss_review"]["allowed"] is True
+    assert closed.payload["current_loss_review"]["trade_decision_allowed"] is True
+    assert closed.payload["current_loss_review"]["execution_eligible"] is False
+    assert closed.payload["current_loss_review"]["execution_blockers"] == [
+        "market session is not tradeable for a live loss exit"
+    ]
+    assert closed.payload["current_loss_review"]["blockers"] == []
     # The board resolves SELL as a decision-only outcome while closed.
     decision = record_autonomous_loss_board_decision(supervisor_packet_path=hourly_path, loss_evidence_packet_path=closed_path, source_revision="1" * 40, ledger_root=tmp_path / "ledger", evidence_root=tmp_path, now=__import__("datetime").datetime.fromisoformat(now)).decision
     assert decision.decision == "SELL" and decision.can_submit_orders is False
@@ -382,6 +429,9 @@ def test_closed_current_clock_allows_decision_only_sell_but_open_clock_is_requir
     open_packet = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=True))
     assert open_packet.payload["current_loss_review"]["market_session"] == "regular"
     assert open_packet.payload["current_loss_review"]["allowed"] is True
+    assert open_packet.payload["current_loss_review"]["trade_decision_allowed"] is True
+    assert open_packet.payload["current_loss_review"]["execution_eligible"] is True
+    assert open_packet.payload["current_loss_review"]["execution_blockers"] == []
 
 
 def test_low_quality_or_stale_clock_fails_closed_for_loss_board(tmp_path):
@@ -557,9 +607,16 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
         calls.append((symbol, kwargs["evidence_needs"]))
         return _provider_result(symbol)
     monkeypatch.setattr("cli.main.build_loss_review_provider_research", providers)
+    class FrozenClockDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls.fromisoformat("2026-06-06T20:06:34.111222+00:00")
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr("cli.main.datetime.datetime", FrozenClockDatetime)
     monkeypatch.setattr(
         "cli.main._alpaca_live_client",
-        lambda: type("ClockClient", (), {"get_clock": lambda self: {"timestamp": "2026-06-06T20:06:33+00:00", "is_open": False}})(),
+        lambda: type("ClockClient", (), {"get_clock": lambda self: {"timestamp": "2026-06-06T20:06:33.918273+00:00", "is_open": False}})(),
     )
 
     result = runner.invoke(
@@ -594,6 +651,12 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
     written = json.loads(Path(payload["packet_path"]).read_text(encoding="utf-8"))
     assert written["payload"]["next_action"] == "autonomous_hold"
     assert written["payload"]["resolved_blockers_by_refresh"]
+    # The CLI captures the raw clock once, but exposes only canonical UTC
+    # whole-second wrapper values for immutable evidence.
+    assert written["payload"]["market_clock_snapshot"]["as_of"] == "2026-06-06T20:06:33+00:00"
+    assert datetime.fromisoformat(
+        written["payload"]["market_clock_snapshot"]["captured_at"]
+    ).microsecond == 0
     compact_path = Path(payload["packet_path"]).with_suffix(".compact.json")
     assert compact_path.exists()
     latest_compact_path = output_dir / "latest-compact.json"

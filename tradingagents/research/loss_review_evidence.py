@@ -21,6 +21,7 @@ from tradingagents.policy.decision_authority import (
 from tradingagents.research.provider_orchestrator import (
     TickerProviderResearchResult,
     build_ticker_provider_research_packets,
+    configured_quote_components,
 )
 from tradingagents.schemas.research import SourceEvidencePacket
 
@@ -385,9 +386,11 @@ def _accepted_source_descriptors(
         ):
             continue
         components = _configured_quote_components(
+            source_name=packet.source_name,
+            evidence_type=packet.evidence_type,
             raw_payload=stored.get("payload"),
             expected_symbol=packet.symbol,
-        ) if packet.evidence_type == "quote_price_context" else ()
+        ) if packet.evidence_type in {"quote_price_context", "quote"} else ()
         if components:
             for component in components:
                 quote_components[component["symbol"]] = {
@@ -399,6 +402,7 @@ def _accepted_source_descriptors(
                     "previous_sha256": component["previous_sha256"],
                     "quality": packet.quality,
                     "as_of": as_of,
+                    "raw_evidence_type": packet.evidence_type,
                     "raw_packet_path": relative.as_posix(),
                     "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
                     "raw_packet_id": packet.packet_id,
@@ -459,6 +463,7 @@ def _accepted_source_descriptors(
         normalized_payload = {
             "symbol": target,
             "as_of": target_component["as_of"],
+            "target": {"symbol": target, "value": target_component["value"], "as_of": target_component["as_of"]},
             "spy": {"symbol": "SPY", "value": spy_component["value"], "as_of": spy_component["as_of"]},
             "qqq": {"symbol": "QQQ", "value": qqq_component["value"], "as_of": qqq_component["as_of"]},
             "sector_relative": {
@@ -491,6 +496,8 @@ def _accepted_source_descriptors(
                     "sha256": item["raw_packet_sha256"],
                     "symbol": item["symbol"],
                     "quality": item["quality"],
+                    "as_of": item["as_of"],
+                    "evidence_type": item["raw_evidence_type"],
                     "current": item["current"],
                     "previous": item["previous"],
                     "current_sha256": item["current_sha256"],
@@ -685,7 +692,9 @@ def _normalize_provider_packet(
         return None
     as_of = str(packet.as_of or packet.generated_at)
     if packet.evidence_type == "market_news":
-        event = _adverse_finnhub_event(raw_payload, symbol=symbol, as_of=as_of)
+        event = _adverse_news_event(
+            raw_payload, source_name=packet.source_name, symbol=symbol, as_of=as_of
+        )
         if event is None:
             return None
         return "company_news", {"symbol": symbol, "as_of": as_of, **event}
@@ -739,7 +748,7 @@ def _quote_price(value: Any) -> float | None:
 
 
 def _configured_quote_components(
-    *, raw_payload: Any, expected_symbol: str
+    *, source_name: str, evidence_type: str, raw_payload: Any, expected_symbol: str
 ) -> tuple[dict[str, str], ...]:
     """Extract individual configured quote/previous-day facts, never aliases.
 
@@ -748,18 +757,18 @@ def _configured_quote_components(
     ``latest_bar``.  The caller combines only exact requested component
     symbols, so a target quote is never re-labelled as SPY/QQQ/sector data.
     """
-    if not isinstance(raw_payload, Mapping):
-        return ()
-    expected = str(expected_symbol).strip().upper()
     found: list[dict[str, str]] = []
-    def append(symbol: str, raw_quote: Mapping[str, Any]) -> None:
-        values = _quote_values(raw_quote)
-        if not symbol or values is None:
-            return
-        current, previous = values
+    for raw_component in configured_quote_components(
+        source_name=source_name,
+        evidence_type=evidence_type,
+        raw_payload=raw_payload,
+        expected_symbol=expected_symbol,
+    ):
+        symbol = str(raw_component["symbol"]).upper()
+        current, previous = raw_component["current"], raw_component["previous"]
         normalized = _normalized_decimal((current - previous) / previous)
         if normalized is None:
-            return
+            continue
         # Preserve both source values and their canonical scalar hashes.  The
         # BOARD verifier recomputes the change from these exact raw values.
         found.append({
@@ -770,42 +779,7 @@ def _configured_quote_components(
             "current_sha256": _canonical_value_hash(_normalized_decimal(current)),
             "previous_sha256": _canonical_value_hash(_normalized_decimal(previous)),
         })
-    data = raw_payload.get("data")
-    trades = data.get("trades") if isinstance(data, Mapping) else None
-    if isinstance(trades, Mapping):
-        for name, raw_quote in trades.items():
-            symbol = str(name).strip().upper()
-            if isinstance(raw_quote, Mapping):
-                append(symbol, raw_quote)
-        if found:
-            return tuple(found)
-    # Single-symbol configured quote shape: Finnhub/FMP style current/previous
-    # values or an injected test route with ``p``/``pc`` at top level.
-    quote = data if isinstance(data, Mapping) else raw_payload
-    if isinstance(quote, Mapping) and expected:
-        append(expected, quote)
-    if found:
-        return tuple(found)
-    # Massive/Polygon previous-day response shape and common injected routes.
-    previous_day = raw_payload.get("previous_day_bar") or raw_payload.get("previousDay")
-    latest_trade = raw_payload.get("latest_trade") or raw_payload.get("latestTrade")
-    if isinstance(previous_day, Mapping) and isinstance(latest_trade, Mapping) and expected:
-        current = _float_value(next((latest_trade.get(key) for key in ("p", "price", "c") if latest_trade.get(key) not in (None, "")), None))
-        previous = _float_value(next((previous_day.get(key) for key in ("c", "close", "Close") if previous_day.get(key) not in (None, "")), None))
-        if current is not None and previous is not None:
-            append(expected, {"p": current, "pc": previous})
-    if found:
-        return tuple(found)
-    latest = raw_payload.get("latest_bar")
-    bars = raw_payload.get("recent_bars")
-    if isinstance(latest, Mapping) and isinstance(bars, Sequence) and not isinstance(bars, (str, bytes, bytearray)) and len(bars) >= 2:
-        close = _float_value(latest.get("Close") or latest.get("close"))
-        previous = _float_value((bars[-2] if isinstance(bars[-2], Mapping) else {}).get("Close") or (bars[-2] if isinstance(bars[-2], Mapping) else {}).get("close"))
-        if close is not None and previous is not None and previous > 0:
-            append(expected, {"c": close, "pc": previous})
-            if found:
-                return tuple(found)
-    return ()
+    return tuple(found)
 
 
 def _news_items(payload: Mapping[str, Any]) -> Sequence[Any]:
@@ -816,29 +790,54 @@ def _news_items(payload: Mapping[str, Any]) -> Sequence[Any]:
     return ()
 
 
-def _adverse_finnhub_event(payload: Mapping[str, Any], *, symbol: str, as_of: str) -> dict[str, str] | None:
+_PERCENT = re.compile(r"(?:by|of|to)\s+(\d{1,3}(?:\.\d+)?)\s*%", re.I)
+
+
+def _adverse_news_event(
+    payload: Mapping[str, Any], *, source_name: str, symbol: str, as_of: str
+) -> dict[str, str] | None:
+    """Normalize only real Finnhub/Alpaca adverse news facts with a magnitude.
+
+    Keywords alone are not decision evidence.  This avoids the old unsafe
+    behaviour where a generic headline was silently assigned ``-1%``.
+    """
+    if str(source_name).lower() not in {"finnhub", "alpaca_news"}:
+        return None
     observed = _parse_timestamp(as_of)
     if observed is None:
         return None
     for item in _news_items(payload):
         if not isinstance(item, Mapping) or not isinstance(item.get("url"), str) or not item["url"].strip():
             continue
-        timestamp = item.get("datetime")
-        try:
-            published = datetime.fromtimestamp(float(timestamp), tz=UTC)
-        except (TypeError, ValueError, OSError):
-            continue
+        if source_name.lower() == "finnhub":
+            try:
+                published = datetime.fromtimestamp(float(item.get("datetime")), tz=UTC)
+            except (TypeError, ValueError, OSError):
+                continue
+        else:
+            published = _parse_timestamp(item.get("created_at"))
+            if published is None:
+                continue
         if abs((observed - published).total_seconds()) > 15 * 60:
             continue
         text = " ".join(str(item.get(key) or "") for key in ("category", "headline", "summary")).lower()
         if not text or any(token in text for token in _POSITIVE_WORDS):
             continue
+        magnitude = _PERCENT.search(text)
+        if magnitude is None:
+            continue
+        percent = _float_value(magnitude.group(1))
+        if percent is None or not 1 <= percent <= 100:
+            continue
+        change = _normalized_decimal(-percent / 100.0)
+        if change is None:
+            continue
         if _THESIS_INVALIDATOR.search(text):
-            category, change = "thesis_invalidator", "-0.01"
+            category = "thesis_invalidator"
         elif _GUIDANCE_CUT.search(text):
-            category, change = "guidance_cut", "-0.01"
+            category = "guidance_cut"
         elif _CONTRACT_LOSS.search(text):
-            category, change = "material_contract_loss", "-0.01"
+            category = "material_contract_loss"
         else:
             continue
         return {"event_category": category, "direction": "adverse", "impact_fraction": change}
@@ -945,10 +944,19 @@ def _current_market_clock(clock: Mapping[str, Any] | None) -> tuple[dict[str, An
     if not isinstance(clock, Mapping):
         return None, "market clock is unavailable"
     raw = clock.get("raw_clock")
+    raw_as_of = _parse_timestamp(raw.get("timestamp")) if isinstance(raw, Mapping) else None
     as_of = _parse_timestamp(clock.get("as_of"))
     captured_at = _parse_timestamp(clock.get("captured_at"))
     is_open = clock.get("is_open")
-    if not isinstance(raw, Mapping) or as_of is None or captured_at is None or type(is_open) is not bool:
+    if (
+        not isinstance(raw, Mapping)
+        or raw_as_of is None
+        or as_of is None
+        or captured_at is None
+        or type(is_open) is not bool
+        or raw.get("is_open") is not is_open
+        or as_of.replace(microsecond=0) != raw_as_of.replace(microsecond=0)
+    ):
         return None, "market clock is unavailable"
     # Clock response time and local capture time must agree.  A clock can be
     # closed and still support a decision-only SELL, but stale/malformed data
@@ -960,8 +968,8 @@ def _current_market_clock(clock: Mapping[str, Any] | None) -> tuple[dict[str, An
     return {
         "source_name": str(clock.get("source_name") or "alpaca_clock"),
         "source_ref": str(clock.get("source_ref") or "alpaca:/v2/clock"),
-        "as_of": as_of.isoformat(),
-        "captured_at": captured_at.isoformat(),
+        "as_of": as_of.replace(microsecond=0).isoformat(timespec="seconds"),
+        "captured_at": captured_at.replace(microsecond=0).isoformat(timespec="seconds"),
         "market_session": session,
         "is_open": is_open,
         "raw_clock": dict(raw),
@@ -1038,12 +1046,11 @@ def _derive_current_loss_review(
         complete = False
     if news_category not in {"guidance_cut", "material_contract_loss", "regulatory_adverse_action", "thesis_invalidator"} or news_direction != "adverse" or _normalized_decimal(news_impact) is None:
         complete = False
-    if complete and canonical_session == "closed":
-        blockers = ["market session is not tradeable for a live loss exit"]
-    elif complete:
-        blockers = []
-    else:
-        blockers = ["refreshed evidence is incomplete"]
+    blockers = [] if complete else ["refreshed evidence is incomplete"]
+    execution_eligible = bool(complete and (clock_binding or {}).get("is_open") is True)
+    execution_blockers = [] if execution_eligible else [
+        "market session is not tradeable for a live loss exit"
+    ] if complete else ["decision evidence is incomplete"]
     return {
         "schema": "tradingagents.refreshed_loss_review.v1",
         "symbol": symbol,
@@ -1057,7 +1064,12 @@ def _derive_current_loss_review(
         "evidence_generated_at": current_at,
         "current_price": current_price,
         "average_entry_price": average_entry,
-        "allowed": bool(complete and canonical_session != "closed"),
+        # `allowed` remains the historical compatibility alias for a trade
+        # decision.  It never means permission to submit an order.
+        "allowed": bool(complete),
+        "trade_decision_allowed": bool(complete),
+        "execution_eligible": execution_eligible,
+        "execution_blockers": execution_blockers,
         "allowed_exit_reason": "earnings_or_guidance_break" if complete else None,
         "allowed_exit_reason_source": reason_source if complete else None,
         "current_thesis_status": (

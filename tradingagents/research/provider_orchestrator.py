@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -185,6 +185,112 @@ def _json_safe(value: Any) -> Any:
     except Exception:  # noqa: BLE001 - best-effort data normalization.
         pass
     return str(value)
+
+
+def configured_quote_components(
+    *,
+    source_name: str,
+    evidence_type: str,
+    raw_payload: Any,
+    expected_symbol: str,
+) -> tuple[dict[str, float], ...]:
+    """Return quote/previous-close facts from explicitly supported route shapes.
+
+    This is the one admissibility contract used by both the provider fallback
+    loop and the loss BOARD normalizer.  A packet only consumes a quote slot
+    when it can also be consumed downstream.  In particular, a generic
+    ``price`` label, a previous-day-only bar, or a cache/error envelope is not
+    a quote fact.
+    """
+    if not isinstance(raw_payload, Mapping):
+        return ()
+    expected = str(expected_symbol).strip().upper()
+    source = str(source_name).strip().lower()
+    kind = str(evidence_type).strip()
+    if not expected:
+        return ()
+
+    def numeric(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    def pair(value: Any) -> tuple[float, float] | None:
+        if not isinstance(value, Mapping):
+            return None
+        # These are real configured vendor field names, not a loose scan of
+        # arbitrary JSON labels.
+        if source in {"finnhub", "fmp"} and kind == "quote":
+            current, previous = value.get("c"), value.get("pc")
+        elif kind == "quote_price_context":
+            current = next((value.get(key) for key in ("p", "c") if value.get(key) not in (None, "")), None)
+            previous = value.get("pc")
+        else:
+            return None
+        current_value, previous_value = numeric(current), numeric(previous)
+        if current_value is None or previous_value is None:
+            return None
+        return current_value, previous_value
+
+    def item(symbol: str, value: Any) -> dict[str, float] | None:
+        parsed = pair(value)
+        if parsed is None:
+            return None
+        current, previous = parsed
+        return {"symbol": symbol, "current": current, "previous": previous}
+
+    # Finnhub and FMP quote endpoints are a single configured symbol.  FMP
+    # deployments can return either the object or a one-item list.
+    if source in {"finnhub", "fmp"} and kind == "quote":
+        candidate: Any = raw_payload
+        if isinstance(raw_payload.get("data"), Mapping):
+            candidate = raw_payload["data"]
+        elif isinstance(raw_payload.get("data"), list) and raw_payload["data"]:
+            candidate = raw_payload["data"][0]
+        elif isinstance(raw_payload.get("results"), list) and raw_payload["results"]:
+            candidate = raw_payload["results"][0]
+        value = item(expected, candidate)
+        return (value,) if value is not None else ()
+
+    if kind != "quote_price_context":
+        return ()
+    data = raw_payload.get("data")
+    trades = data.get("trades") if isinstance(data, Mapping) else None
+    if isinstance(trades, Mapping):
+        found = [
+            component
+            for name, quote in trades.items()
+            if (component := item(str(name).strip().upper(), quote)) is not None
+        ]
+        if found:
+            return tuple(found)
+
+    # Explicit quote-context one-symbol packets used by configured research
+    # routes (including read-only broker snapshots) preserve c/pc or p/pc.
+    candidate = data if isinstance(data, Mapping) else raw_payload
+    value = item(expected, candidate)
+    if value is not None:
+        return (value,)
+
+    # Actual yfinance context: final daily close plus the preceding bar.
+    latest, bars = raw_payload.get("latest_bar"), raw_payload.get("recent_bars")
+    if isinstance(latest, Mapping) and isinstance(bars, Sequence) and not isinstance(bars, (str, bytes, bytearray)) and len(bars) >= 2 and isinstance(bars[-2], Mapping):
+        current = numeric(latest.get("Close", latest.get("close")))
+        previous = numeric(bars[-2].get("Close", bars[-2].get("close")))
+        if current is not None and previous is not None:
+            return ({"symbol": expected, "current": current, "previous": previous},)
+
+    # Actual latest-trade/previous-day packet shape.
+    latest_trade = raw_payload.get("latest_trade") or raw_payload.get("latestTrade")
+    previous_day = raw_payload.get("previous_day_bar") or raw_payload.get("previousDay")
+    if isinstance(latest_trade, Mapping) and isinstance(previous_day, Mapping):
+        current = numeric(latest_trade.get("p", latest_trade.get("c")))
+        previous = numeric(previous_day.get("c", previous_day.get("close")))
+        if current is not None and previous is not None:
+            return ({"symbol": expected, "current": current, "previous": previous},)
+    return ()
 
 
 def _dataframe_records(frame: Any, *, max_rows: int = 20) -> list[dict[str, Any]]:
@@ -1117,33 +1223,14 @@ def _quote_packet_has_current_previous(packet: SourceEvidencePacket) -> bool:
     previous-day-only/cache placeholder from making the fallback loop stop
     before a route supplies both values needed by the loss BOARD.
     """
-    payload = packet.payload
-    if not isinstance(payload, dict):
-        return False
-
-    def values(value: Any) -> bool:
-        if not isinstance(value, dict):
-            return False
-        current = next((value.get(key) for key in ("p", "c", "price", "last", "last_price", "close", "Close") if value.get(key) not in (None, "")), None)
-        previous = next((value.get(key) for key in ("pc", "previous_close", "previousClose", "prev_close", "prior_close", "previous_day_close") if value.get(key) not in (None, "")), None)
-        try:
-            return float(current) > 0 and float(previous) > 0
-        except (TypeError, ValueError):
-            return False
-
-    data = payload.get("data")
-    if values(data) or values(payload):
-        return True
-    if isinstance(data, dict) and isinstance(data.get("trades"), dict):
-        return any(values(item) for item in data["trades"].values())
-    latest = payload.get("latest_trade") or payload.get("latestTrade")
-    previous_day = payload.get("previous_day_bar") or payload.get("previousDay")
-    if isinstance(latest, dict) and isinstance(previous_day, dict):
-        return values({"p": latest.get("p", latest.get("price", latest.get("c"))), "pc": previous_day.get("c", previous_day.get("close", previous_day.get("Close")))})
-    latest_bar, bars = payload.get("latest_bar"), payload.get("recent_bars")
-    if isinstance(latest_bar, dict) and isinstance(bars, list) and len(bars) >= 2 and isinstance(bars[-2], dict):
-        return values({"c": latest_bar.get("Close", latest_bar.get("close")), "pc": bars[-2].get("Close", bars[-2].get("close"))})
-    return False
+    return bool(
+        configured_quote_components(
+            source_name=packet.source_name,
+            evidence_type=packet.evidence_type,
+            raw_payload=packet.payload,
+            expected_symbol=packet.symbol or packet.subject,
+        )
+    )
 
 
 def _route_status_counts(attempts: Sequence[dict[str, Any]]) -> dict[str, int]:

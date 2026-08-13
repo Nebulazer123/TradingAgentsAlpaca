@@ -8,7 +8,7 @@ import json
 import os
 import re
 import stat
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -473,21 +473,25 @@ def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str
     if source.quality not in {"high", "medium"}:
         return False
     if set(payload) != {
-        "symbol", "as_of", "spy", "qqq", "sector_relative",
+        "symbol", "as_of", "target", "spy", "qqq", "sector_relative",
         "target_relative_to_spy", "target_relative_to_qqq",
     }:
         return False
     context = review.get("broad_market_context")
     sector = review.get("sector_or_peer_context")
+    target = payload.get("target")
     spy = payload.get("spy")
     qqq = payload.get("qqq")
     sector_relative = payload.get("sector_relative")
     if not isinstance(context, Mapping) or not isinstance(sector, Mapping):
         return False
-    if not all(isinstance(value, Mapping) and set(value) == {"symbol", "value", "as_of"} for value in (spy, qqq, sector_relative)):
+    if not all(isinstance(value, Mapping) and set(value) == {"symbol", "value", "as_of"} for value in (target, spy, qqq, sector_relative)):
         return False
     return (
-        spy.get("symbol") == "SPY"
+        target.get("symbol") == review.get("symbol")
+        and _is_decimal(target.get("value"), "source target")
+        and target.get("as_of") == source.as_of
+        and spy.get("symbol") == "SPY"
         and spy.get("value") == context.get("SPY")
         and spy.get("as_of") == source.as_of
         and _is_decimal(spy.get("value"), "source SPY")
@@ -530,7 +534,7 @@ def _market_source_has_exact_component_provenance(
     for component in components:
         if not isinstance(component, Mapping) or set(component) != {
             "packet_id", "path", "sha256", "symbol", "quality", "current",
-            "previous", "current_sha256", "previous_sha256",
+            "previous", "current_sha256", "previous_sha256", "as_of", "evidence_type",
         }:
             return False
         raw_symbol = component.get("symbol")
@@ -548,27 +552,25 @@ def _market_source_has_exact_component_provenance(
             or not isinstance(stored, Mapping)
             or stored.get("packet_id") != component.get("packet_id")
             or stored.get("symbol") != raw_symbol
-            or stored.get("evidence_type") != "quote_price_context"
+            or stored.get("evidence_type") != component.get("evidence_type")
+            or stored.get("evidence_type") not in {"quote_price_context", "quote"}
             or stored.get("quality") != component.get("quality")
+            or stored.get("as_of") != component.get("as_of")
         ):
             return False
         if component.get("quality") not in quality_rank:
             return False
+        from tradingagents.research.provider_orchestrator import configured_quote_components
         raw_payload = stored.get("payload")
-        current = previous = None
-        if isinstance(raw_payload, Mapping):
-            data = raw_payload.get("data")
-            trade = data.get("trades", {}).get(raw_symbol) if isinstance(data, Mapping) and isinstance(data.get("trades"), Mapping) else None
-            quote = trade if isinstance(trade, Mapping) else (data if isinstance(data, Mapping) else raw_payload)
-            if isinstance(quote, Mapping):
-                current = next((quote.get(key) for key in ("p", "c", "price", "last", "last_price", "close", "Close") if quote.get(key) not in (None, "")), None)
-                previous = next((quote.get(key) for key in ("pc", "previous_close", "previousClose", "prev_close", "prior_close", "previous_day_close") if quote.get(key) not in (None, "")), None)
-            if (current is None or previous is None) and isinstance(raw_payload.get("latest_bar"), Mapping):
-                latest = raw_payload["latest_bar"]
-                bars = raw_payload.get("recent_bars")
-                if isinstance(bars, Sequence) and not isinstance(bars, (str, bytes, bytearray)) and len(bars) >= 2 and isinstance(bars[-2], Mapping):
-                    current = latest.get("Close") if latest.get("Close") not in (None, "") else latest.get("close")
-                    previous = bars[-2].get("Close") if bars[-2].get("Close") not in (None, "") else bars[-2].get("close")
+        actual = configured_quote_components(
+            source_name=str(stored.get("source_name") or ""),
+            evidence_type=str(stored.get("evidence_type") or ""),
+            raw_payload=raw_payload,
+            expected_symbol=raw_symbol,
+        )
+        matched = next((item for item in actual if item.get("symbol") == raw_symbol), None)
+        current = matched.get("current") if isinstance(matched, Mapping) else None
+        previous = matched.get("previous") if isinstance(matched, Mapping) else None
         def canonical_scalar(value: Any) -> str:
             text = format(Decimal(str(value)), "f")
             return (text.rstrip("0").rstrip(".") if "." in text else text) or "0"
@@ -593,6 +595,33 @@ def _market_source_has_exact_component_provenance(
             return False
         qualities.append(str(component["quality"]))
     if seen != expected_symbols or len(qualities) != 4:
+        return False
+    # Recompute every aggregate from the authenticated raw scalar values.  A
+    # normalized packet cannot substitute an invented relative-return value.
+    component_by_symbol = {str(item["symbol"]): item for item in components}
+    try:
+        change = {
+            name: (Decimal(str(item["current"])) - Decimal(str(item["previous"]))) / Decimal(str(item["previous"]))
+            for name, item in component_by_symbol.items()
+        }
+        # The normalizer emits eight decimal places maximum; recompute with
+        # the same deterministic precision before comparing, rather than
+        # relying on binary floating-point or an unbounded repeating decimal.
+        def canonical(value: Decimal) -> str:
+            return (
+                format(value.quantize(Decimal("0.00000001")), "f").rstrip("0").rstrip(".")
+                or "0"
+            )
+        if (
+            payload.get("target", {}).get("value") != canonical(change[symbol])
+            or payload.get("spy", {}).get("value") != canonical(change["SPY"])
+            or payload.get("qqq", {}).get("value") != canonical(change["QQQ"])
+            or payload.get("sector_relative", {}).get("value") != canonical(change[symbol] - change["XLK"])
+            or payload.get("target_relative_to_spy") != canonical(change[symbol] - change["SPY"])
+            or payload.get("target_relative_to_qqq") != canonical(change[symbol] - change["QQQ"])
+        ):
+            return False
+    except (InvalidOperation, TypeError, ValueError, KeyError):
         return False
     # Raw components, scalar hashes, and their minimum quality are authenticated
     # above.  `_market_source_proves_values` separately binds the already
@@ -694,6 +723,21 @@ def _market_clock_is_current_and_bound(review: Mapping[str, Any], payload: Mappi
         observed, captured = _time(clock.get("as_of"), "clock as_of"), _time(clock.get("captured_at"), "clock captured_at")
     except ValueError:
         return False
+    raw_timestamp = raw.get("timestamp")
+    try:
+        raw_observed = _time(raw_timestamp, "raw clock timestamp")
+    except ValueError:
+        return False
+    # All wrapper timestamps are canonical UTC whole seconds.  The raw provider
+    # response may retain fractional seconds, but it must normalize exactly to
+    # the wrapper's as_of value; it may not be replaced by a local clock.
+    if (
+        observed.microsecond != 0
+        or captured.microsecond != 0
+        or observed != raw_observed.replace(microsecond=0)
+        or raw.get("is_open") is not clock.get("is_open")
+    ):
+        return False
     return observed <= now and captured <= now and abs((observed - captured).total_seconds()) <= 15 * 60 and now - observed <= _MAX_AGE
 
 
@@ -706,21 +750,27 @@ def _semantic_gaps(
 ) -> tuple[str, ...]:
     gaps: list[str] = []
     sources = tuple(capture.source for capture in captures)
-    session_blockers = {"market session is not tradeable for a live loss exit"}
-    closed_session_exception = review.get("market_session") == "closed"
     if not _market_clock_is_current_and_bound(review, payload, now):
         gaps.append("current_market_clock_missing_or_stale")
     for blocker_field in ("blockers", "blocked_reasons"):
         value = review.get(blocker_field)
-        if not _sequence_of_text(value) or (
-            value and (not closed_session_exception or any(item not in session_blockers for item in value))
-        ):
+        if not _sequence_of_text(value) or value:
             gaps.append(f"supervisor_{blocker_field}_not_exact_empty_list")
     remaining = payload.get("remaining_blockers")
-    if not _sequence_of_text(remaining) or (
-        remaining and (not closed_session_exception or any(item not in session_blockers for item in remaining))
-    ):
+    if not _sequence_of_text(remaining) or remaining:
         gaps.append("remaining_blockers_not_exact_empty_list")
+    if review.get("trade_decision_allowed") is not True or review.get("allowed") is not True:
+        gaps.append("trade_decision_not_allowed")
+    execution_eligible = review.get("execution_eligible")
+    execution_blockers = review.get("execution_blockers")
+    expected_execution = review.get("market_session") == "regular"
+    if type(execution_eligible) is not bool or execution_eligible is not expected_execution:
+        gaps.append("execution_session_semantics_invalid")
+    if not _sequence_of_text(execution_blockers) or (
+        (execution_eligible and execution_blockers)
+        or (not execution_eligible and execution_blockers != ["market session is not tradeable for a live loss exit"])
+    ):
+        gaps.append("execution_blockers_invalid")
     context = review.get("broad_market_context")
     sector = review.get("sector_or_peer_context")
     if (
@@ -795,7 +845,7 @@ def _semantic_gaps(
             else:
                 gaps.append("filing_or_guidance_not_adverse_substantive_fact")
     if (
-        (review.get("allowed") is not True and not closed_session_exception)
+        review.get("trade_decision_allowed") is not True
         or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS
         or not _reason_source_semantics(
             review.get("allowed_exit_reason"),
