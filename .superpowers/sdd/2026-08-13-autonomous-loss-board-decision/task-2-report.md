@@ -113,3 +113,32 @@ Repair verification:
 ruff check: All checks passed
 git diff --check: passed
 ```
+
+## Cross-slice repair: authenticated BOARD receipt projection
+
+Task 3's strict self-heal verification exposed that the full BOARD report had
+only a ledger packet ID and human-oriented paths.  Task 2 now publishes a
+minimal machine-verifiable receipt derived after immediate ledger-authenticated
+verification:
+
+- `autonomous_loss_decision` retains the decision/result fields and adds the
+  exact decision evidence path/SHA/size, symbol, supervisor decision ID and
+  bound supervisor path/SHA/size, bound raw-loss packet ID/path/SHA/size,
+  source revision, and a canonical accepted-source-list SHA/count.
+- `loss_review_evidence.source_binding.bindings` projects exact `supervisor`
+  and `raw_loss` identities in the schema Task 3 consumes.  These bindings are
+  built from the authenticated decision and its exact captured raw-loss packet,
+  not copied from summary input.
+- Neither projection contains a caller-selectable trust root or gains any
+  execution/order authority.
+- The compact BOARD packet round-trips the complete immutable receipt and keeps
+  `kind`, schema, analysis-only, `execution_authority="none"`, and
+  `can_submit_orders=false`.
+
+Cross-slice verification:
+
+```text
+242 passed in 3.03s
+ruff check: All checks passed
+git diff --check: passed
+```

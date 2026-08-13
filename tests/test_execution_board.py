@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import UTC, datetime
 
@@ -94,15 +95,67 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
     )
 
     decision = review["autonomous_loss_decision"]
+    assert review["kind"] == "execution_board_review"
+    assert review["schema_version"] == 1
+    assert review["analysis_only"] is True
+    assert review["execution_authority"] == "none"
+    assert review["can_submit_orders"] is False
     assert decision["decision"] == "HOLD"
     assert decision["trade_decision_resolved"] is True
     assert decision["exit_allowed"] is False
     assert decision["execution_authority"] == "none"
     assert decision["can_submit_orders"] is False
     assert decision["ledger_packet_id"]
+    assert decision["decision_id"]
+    assert decision["symbol"] == "TSM"
+    assert decision["supervisor_decision_id"] == "loss-review-tsm-1"
+    assert decision["source_revision"] == "1" * 40
+    assert decision["accepted_source_count"] == 0
+    assert decision["accepted_sources_sha256"] == hashlib.sha256(b"[]").hexdigest()
+    assert decision["decision_evidence"] == {
+        "path": decision["decision_evidence_path"],
+        "sha256": decision["decision_evidence"]["sha256"],
+        "size_bytes": decision["decision_evidence"]["size_bytes"],
+    }
+    assert len(decision["decision_evidence"]["sha256"]) == 64
+    assert decision["supervisor_packet"]["path"] == (
+        "hourly/hourly-supervisor-20260813-150000.json"
+    )
+    assert decision["loss_evidence_packet"]["path"] == "loss_review_evidence/loss.json"
+    assert decision["loss_evidence_packet"]["packet_id"] == "loss-evidence-tsm-1"
     assert review["loss_review_evidence"]["next_action"] == "autonomous_hold"
+    assert review["loss_review_evidence"]["source_binding"] == {
+        "matched": True,
+        "issue": None,
+        "bindings": {
+            "supervisor": {
+                **decision["supervisor_packet"],
+                "decision_id": "loss-review-tsm-1",
+                "symbol": "TSM",
+            },
+            "raw_loss": {
+                **decision["loss_evidence_packet"],
+                "symbol": "TSM",
+                "source_revision": "1" * 40,
+            },
+        },
+    }
     assert not any("manual" in item["message"].lower() for item in review["warnings"])
     assert loss_path.exists()
+
+    compact = compact_execution_board_review(
+        review,
+        raw_packet_path=tmp_path / "board.json",
+    )
+    assert compact["kind"] == "execution_board_review"
+    assert compact["schema"] == "compact_execution_board_review_v1"
+    assert compact["analysis_only"] is True
+    assert compact["can_submit_orders"] is False
+    assert compact["execution_authority"] == "none"
+    assert compact["autonomous_loss_decision"] == decision
+    assert compact["loss_review_evidence"]["source_binding"] == review[
+        "loss_review_evidence"
+    ]["source_binding"]
 
 
 def test_execution_board_cli_does_not_expose_mutable_decision_roots():

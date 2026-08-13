@@ -18,7 +18,9 @@ from tradingagents.policy.decision_authority import (
     resolve_exit_authority,
 )
 from tradingagents.policy.loss_board_decision import (
+    BoundEvidence,
     record_autonomous_loss_board_decision,
+    verify_autonomous_loss_board_decision,
 )
 
 UTC = datetime.timezone.utc
@@ -344,15 +346,48 @@ def _record_loss_board_decision(
             evidence_root=decision_evidence_root,
             now=now,
         )
+        decision = verify_autonomous_loss_board_decision(
+            ledger_root=decision_ledger_root,
+            ledger_packet_id=recorded.packet.packet_id,
+            evidence_root=decision_evidence_root,
+            now=now,
+        )
+        loss_packet = _bound_packet_identity(
+            evidence_root=decision_evidence_root,
+            binding=decision.loss_evidence_packet,
+        )
     except (OSError, ValueError):
         return None
-    decision = recorded.decision
+    decision_ref = recorded.packet.evidence_refs[0]
+    accepted_sources_material = [item.compact() for item in decision.accepted_sources]
     return {
         "decision": decision.decision,
         "decision_id": decision.decision_id,
         "ledger_packet_id": recorded.packet.packet_id,
         "ledger_packet_path": str(recorded.packet_path),
         "decision_evidence_path": str(recorded.decision_evidence_path),
+        "decision_evidence": {
+            "path": decision_ref.path,
+            "sha256": decision_ref.sha256,
+            "size_bytes": decision_ref.size_bytes,
+        },
+        "symbol": decision.symbol,
+        "supervisor_decision_id": decision.supervisor_decision_id,
+        "supervisor_packet": decision.supervisor_packet.compact(),
+        "loss_evidence_packet": {
+            **decision.loss_evidence_packet.compact(),
+            "packet_id": loss_packet["packet_id"],
+        },
+        "source_revision": decision.source_revision,
+        "accepted_sources_sha256": hashlib.sha256(
+            json.dumps(
+                accepted_sources_material,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "accepted_source_count": len(accepted_sources_material),
         "trade_decision_resolved": decision.trade_decision_resolved,
         "exit_allowed": decision.exit_allowed,
         "analysis_only": decision.analysis_only,
@@ -360,6 +395,31 @@ def _record_loss_board_decision(
         "can_submit_orders": decision.can_submit_orders,
         "recommendation": recorded.packet.recommendation,
     }
+
+
+def _bound_packet_identity(
+    *,
+    evidence_root: str | Path,
+    binding: BoundEvidence,
+) -> dict[str, str]:
+    """Read one authenticated bound packet and return its exact identity."""
+    root = Path(evidence_root).resolve()
+    path = (root / binding.path).resolve()
+    try:
+        path.relative_to(root)
+        raw = path.read_bytes()
+        packet = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("bound loss packet is unavailable") from exc
+    if (
+        not isinstance(packet, Mapping)
+        or len(raw) != binding.size_bytes
+        or hashlib.sha256(raw).hexdigest() != binding.sha256
+        or not isinstance(packet.get("packet_id"), str)
+        or not packet["packet_id"].strip()
+    ):
+        raise ValueError("bound loss packet identity does not match authenticated decision")
+    return {"packet_id": packet["packet_id"]}
 
 
 def _loss_exit_review_for_symbol(packet: Mapping[str, Any], symbol: str) -> Mapping[str, Any] | None:
@@ -687,6 +747,22 @@ def build_execution_board_review(
     if autonomous_loss_decision is not None and loss_review_evidence is not None:
         loss_review_evidence = dict(loss_review_evidence)
         loss_review_evidence["next_action"] = autonomous_loss_decision["recommendation"]
+        loss_review_evidence["source_binding"] = {
+            "matched": True,
+            "issue": None,
+            "bindings": {
+                "supervisor": {
+                    **autonomous_loss_decision["supervisor_packet"],
+                    "decision_id": autonomous_loss_decision["supervisor_decision_id"],
+                    "symbol": autonomous_loss_decision["symbol"],
+                },
+                "raw_loss": {
+                    **autonomous_loss_decision["loss_evidence_packet"],
+                    "symbol": autonomous_loss_decision["symbol"],
+                    "source_revision": autonomous_loss_decision["source_revision"],
+                },
+            },
+        }
         current_supervisor_packet = next(
             (
                 packet
@@ -843,6 +919,7 @@ def build_execution_board_review(
         "schema_version": 1,
         "generated_at": generated_at,
         "analysis_only": True,
+        "execution_authority": "none",
         "can_submit_orders": False,
         "review_window": {
             "hourly_dir": str(hourly_dir),
