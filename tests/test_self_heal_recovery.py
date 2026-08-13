@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from tradingagents.brokers import alpaca_reconciliation
-from tradingagents.brokers.manual_action_attribution import replay_suppression_key
+from tradingagents.brokers.manual_action_attribution import (
+    build_owner_manual_action_attribution,
+    replay_suppression_key,
+    write_owner_manual_action_attribution,
+)
 from tradingagents.orchestration import recovery as recovery_module
 from tradingagents.orchestration import self_heal as self_heal_module
 from tradingagents.orchestration.authority import (
@@ -288,13 +292,42 @@ def _reconciliation_source_packet(*, symbol: str = "NFLX") -> dict:
 
 
 def test_recovery_recomputes_exact_manual_exit_suppression_and_rejects_label_only(tmp_path):
-    attestation_path = tmp_path / "owner.json"
-    attestation_path.write_text('{"owner":"exact"}\n', encoding="utf-8")
     source_path = tmp_path / "source.json"
-    source_path.write_text('{"order":"autonomous-buy"}\n', encoding="utf-8")
-    attestation_sha = hashlib.sha256(attestation_path.read_bytes()).hexdigest()
+    source_path.write_text(json.dumps({
+        "actions": [{
+            "symbol": "NFLX", "side": "buy", "account": "live",
+            "idempotency_key": "autonomous-buy",
+        }],
+        "submitted": [{
+            "symbol": "NFLX", "side": "buy", "client_order_id": "autonomous-buy",
+        }],
+    }), encoding="utf-8")
     source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    resolution_id = "owner-manual-action-" + "a" * 64
+    buy_fill = {
+        "client_order_id": "autonomous-buy", "symbol": "NFLX",
+        "side": "buy", "status": "filled", "filled_qty": "1",
+        "filled_avg_price": "10", "submitted_at": NOW.isoformat(),
+        "updated_at": NOW.isoformat(),
+    }
+    manual_fill = {
+        "client_order_id": "owner-sell", "symbol": "NFLX",
+        "side": "sell", "status": "filled", "filled_qty": "1",
+        "filled_avg_price": "9.5", "submitted_at": NOW.isoformat(),
+        "updated_at": NOW.isoformat(),
+    }
+    attestation_payload = build_owner_manual_action_attribution(
+        source_packet_path=source_path,
+        reconciliation_packet={
+            "symbol": "NFLX", "recent_fills": [manual_fill, buy_fill]
+        },
+        originating_client_order_id="autonomous-buy",
+        manual_fill_client_order_id="owner-sell",
+        attested_at=NOW.isoformat(),
+    )
+    attestation_path = tmp_path / "owner.json"
+    write_owner_manual_action_attribution(attestation_path, attestation_payload)
+    attestation_sha = hashlib.sha256(attestation_path.read_bytes()).hexdigest()
+    resolution_id = str(attestation_payload["resolution_id"])
     suppression_key = replay_suppression_key(
         attribution_sha256=attestation_sha,
         resolution_id=resolution_id,
@@ -310,18 +343,7 @@ def test_recovery_recomputes_exact_manual_exit_suppression_and_rejects_label_onl
         "source_schema_version": 1,
         "source_identity": "alpaca_symbol_incident_reconciliation",
         "open_orders": [],
-        "recent_fills": [
-            {
-                "client_order_id": "owner-sell", "symbol": "NFLX",
-                "side": "sell", "status": "filled", "filled_qty": "1",
-                "filled_avg_price": "9.5", "submitted_at": NOW.isoformat(),
-            },
-            {
-                "client_order_id": "autonomous-buy", "symbol": "NFLX",
-                "side": "buy", "status": "filled", "filled_qty": "1",
-                "filled_avg_price": "10", "submitted_at": NOW.isoformat(),
-            },
-        ],
+        "recent_fills": [manual_fill, buy_fill],
         "checked_client_order_ids": ["autonomous-buy", "owner-sell"],
         "resolved_external_actions": [{
             "resolution_id": resolution_id,
@@ -362,6 +384,23 @@ def test_recovery_recomputes_exact_manual_exit_suppression_and_rejects_label_onl
         assert not self_heal_module._valid_reconciliation_phase_packet(
             candidate, BINDINGS
         )
+    attestation_path.write_text('{"owner":"forged"}\n', encoding="utf-8")
+    forged = json.loads(json.dumps(packet))
+    forged_sha = hashlib.sha256(attestation_path.read_bytes()).hexdigest()
+    forged["resolved_external_actions"][0]["attestation_sha256"] = forged_sha
+    forged["replay_suppressions"][0]["attestation_sha256"] = forged_sha
+    forged["replay_suppressions"][0]["suppression_key"] = replay_suppression_key(
+        attribution_sha256=forged_sha,
+        resolution_id=resolution_id,
+        symbol="NFLX",
+        originating_client_order_id="autonomous-buy",
+        resolved_by_client_order_id="owner-sell",
+        filled_qty="1",
+        source_packet_sha256=source_sha,
+    )
+    assert not self_heal_module._valid_reconciliation_phase_packet(
+        forged, BINDINGS
+    )
 
 
 def _control(tmp_path: Path) -> Path:

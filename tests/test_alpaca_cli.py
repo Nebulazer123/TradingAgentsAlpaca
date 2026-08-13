@@ -608,8 +608,10 @@ def test_record_owner_manual_action_is_local_immutable_and_never_builds_broker(
     source = tmp_path / "source.json"
     source.write_text(
         json.dumps({
-            "actions": [{"idempotency_key": "autonomous-buy", "symbol": "NFLX"}],
-            "submitted": [{"client_order_id": "autonomous-buy", "symbol": "NFLX"}],
+            "actions": [{"idempotency_key": "autonomous-buy", "symbol": "NFLX",
+                         "side": "buy", "account": "live"}],
+            "submitted": [{"client_order_id": "autonomous-buy", "symbol": "NFLX",
+                           "side": "buy"}],
         }),
         encoding="utf-8",
     )

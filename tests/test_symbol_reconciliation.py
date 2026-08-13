@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 
 from tradingagents.brokers import alpaca_reconciliation
+from tradingagents.brokers import manual_action_attribution as manual_attribution_module
 from tradingagents.brokers.manual_action_attribution import (
     build_owner_manual_action_attribution,
     write_owner_manual_action_attribution,
@@ -130,6 +131,75 @@ def _manual_exit_attribution(tmp_path, *, source_packet, reconciliation_packet, 
     path = tmp_path / "owner-action.json"
     write_owner_manual_action_attribution(path, payload)
     return path
+
+
+def test_owner_manual_attribution_writer_completes_short_writes(monkeypatch, tmp_path):
+    source = _packet(tmp_path / "source.json")
+    buy = _order(status="filled", filled_qty="1", filled_avg_price="10",
+                 submitted_at="2026-06-02T20:29:44+00:00",
+                 updated_at="2026-06-02T20:29:45+00:00")
+    sell = _order(client_order_id="owner-sell", side="sell", status="filled",
+                  filled_qty="1", filled_avg_price="9.5",
+                  submitted_at="2026-07-27T18:46:48+00:00",
+                  updated_at="2026-07-27T18:46:49+00:00")
+    payload = build_owner_manual_action_attribution(
+        source_packet_path=source,
+        reconciliation_packet={"symbol": "NFLX", "recent_fills": [sell, buy]},
+        originating_client_order_id="ta-tiny-nflx-1",
+        manual_fill_client_order_id="owner-sell",
+        attested_at="2026-08-13T09:10:00+00:00",
+    )
+    real_write = manual_attribution_module.os.write
+    calls = 0
+
+    def short_once(descriptor, data):
+        nonlocal calls
+        calls += 1
+        return real_write(descriptor, data[:1] if calls == 1 else data)
+
+    monkeypatch.setattr(manual_attribution_module.os, "write", short_once)
+    output = tmp_path / "owner.json"
+    write_owner_manual_action_attribution(output, payload)
+
+    assert calls >= 2
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+@pytest.mark.parametrize("fail_call", [1, 2])
+def test_owner_manual_attribution_writer_removes_file_after_fsync_failure(
+    monkeypatch, tmp_path, fail_call
+):
+    source = _packet(tmp_path / "source.json")
+    buy = _order(status="filled", filled_qty="1", filled_avg_price="10",
+                 submitted_at="2026-06-02T20:29:44+00:00",
+                 updated_at="2026-06-02T20:29:45+00:00")
+    sell = _order(client_order_id="owner-sell", side="sell", status="filled",
+                  filled_qty="1", filled_avg_price="9.5",
+                  submitted_at="2026-07-27T18:46:48+00:00",
+                  updated_at="2026-07-27T18:46:49+00:00")
+    payload = build_owner_manual_action_attribution(
+        source_packet_path=source,
+        reconciliation_packet={"symbol": "NFLX", "recent_fills": [sell, buy]},
+        originating_client_order_id="ta-tiny-nflx-1",
+        manual_fill_client_order_id="owner-sell",
+        attested_at="2026-08-13T09:10:00+00:00",
+    )
+    real_fsync = manual_attribution_module.os.fsync
+    calls = 0
+
+    def fail_selected(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == fail_call:
+            raise OSError("injected fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(manual_attribution_module.os, "fsync", fail_selected)
+    output = tmp_path / "owner.json"
+    with pytest.raises(OSError, match="injected fsync failure"):
+        write_owner_manual_action_attribution(output, payload)
+
+    assert not output.exists()
 
 
 def test_exact_owner_manual_exit_closes_only_the_attested_chain_read_only(tmp_path):
@@ -269,6 +339,60 @@ def test_owner_manual_exit_cannot_close_nonzero_position_or_suppress_future_orde
     assert result.matched is False
     assert result.replay_suppressions == []
     assert "unexpected open order at broker: future-independent-nflx" in result.issues
+
+
+def test_owner_manual_exit_origin_must_come_from_the_same_hash_bound_source_packet(tmp_path):
+    source_a = _packet(
+        tmp_path / "source-a.json",
+        client_order_id="different-origin",
+    )
+    source_b = _packet(
+        tmp_path / "source-b.json",
+        client_order_id="ta-tiny-nflx-1",
+    )
+    buy = _order(
+        status="filled", filled_qty="1", filled_avg_price="10.00",
+        submitted_at="2026-06-02T20:29:44+00:00",
+        updated_at="2026-06-02T20:29:45+00:00",
+    )
+    manual_sell = _order(
+        client_order_id="owner-manual-nflx-sell", side="sell", status="filled",
+        filled_qty="1", filled_avg_price="9.50",
+        submitted_at="2026-07-27T18:46:48+00:00",
+        updated_at="2026-07-27T18:46:49+00:00",
+    )
+    attribution = _manual_exit_attribution(
+        tmp_path, source_packet=source_b,
+        reconciliation_packet={
+            "symbol": "NFLX", "position": {"symbol": "NFLX", "qty": "0"},
+            "open_orders": [], "recent_fills": [manual_sell, buy],
+            "read_only": True, "broker_write_calls": 0,
+        },
+    )
+    payload = json.loads(attribution.read_text(encoding="utf-8"))
+    payload["originating_order"]["source_packet_path"] = str(source_a.resolve())
+    payload["originating_order"]["source_packet_sha256"] = hashlib.sha256(
+        source_a.read_bytes()
+    ).hexdigest()
+    material = {key: payload[key] for key in payload if key != "resolution_id"}
+    payload["resolution_id"] = "owner-manual-action-" + hashlib.sha256(
+        json.dumps(
+            material, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    attribution.unlink()
+    write_owner_manual_action_attribution(attribution, payload)
+    spy = ReadOnlyBrokerSpy(positions=[], orders=[manual_sell, buy])
+
+    result = _reconcile_symbol_incident(
+        symbol="NFLX", packet_paths=[source_a, source_b],
+        owner_action_attestation_paths=[attribution], live_client=spy,
+        expected_qty="0",
+    )
+
+    assert result.matched is False
+    assert result.replay_suppressions == []
+    assert any("source_contains_origin" in issue for issue in result.issues)
 
 
 def test_reconcile_symbol_incident_matches_orcl_and_filters_state_to_symbol(tmp_path):

@@ -32,6 +32,11 @@ _ORIGIN_KEYS = {
     "filled_qty",
     "source_packet_path",
     "source_packet_sha256",
+    "source_order",
+}
+_SOURCE_ORDER_KEYS = {
+    "client_order_id", "symbol", "side", "account", "qty", "notional",
+    "type", "limit_price",
 }
 _FILL_KEYS = {
     "client_order_id",
@@ -92,23 +97,62 @@ def _find_fill(packet: Mapping[str, object], client_order_id: str) -> Mapping[st
     return matches[0]
 
 
-def _source_contains_order(path: Path, client_order_id: str) -> None:
+def source_autonomous_order(
+    path: str | Path, client_order_id: str, *, symbol: str | None = None
+) -> dict[str, object]:
+    source = Path(path)
     try:
-        packet = json.loads(path.read_text(encoding="utf-8"))
+        packet = json.loads(source.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("owner manual action source packet is unreadable") from None
     if not isinstance(packet, Mapping):
         raise ValueError("owner manual action source packet must be an object")
-    found = False
-    for row in [*(packet.get("actions") or []), *(packet.get("submitted") or [])]:
-        if not isinstance(row, Mapping):
-            continue
-        candidate = row.get("client_order_id") or row.get("idempotency_key")
-        if candidate == client_order_id:
-            found = True
-            break
-    if not found:
+    records: list[dict[str, object]] = []
+    for collection in ("actions", "submitted"):
+        for row in packet.get(collection) or []:
+            if not isinstance(row, Mapping):
+                continue
+            candidate = row.get("client_order_id") or row.get("idempotency_key")
+            if candidate != client_order_id:
+                continue
+            records.append(
+                {
+                    "client_order_id": str(candidate),
+                    "symbol": str(row.get("symbol") or "").upper(),
+                    "side": str(row.get("side") or "").lower(),
+                    "account": str(row.get("account") or "").lower(),
+                    "qty": str(row.get("qty") or ""),
+                    "notional": str(row.get("notional") or ""),
+                    "type": str(row.get("type") or row.get("order_type") or "").lower(),
+                    "limit_price": str(row.get("limit_price") or ""),
+                    "collection": collection,
+                }
+            )
+    if not records:
         raise ValueError("originating autonomous order is absent from source packet")
+    selected = dict(records[0])
+    for record in records[1:]:
+        for field in (
+            "client_order_id", "symbol", "side", "account", "qty", "notional",
+            "type", "limit_price",
+        ):
+            existing = str(selected.get(field) or "")
+            incoming = str(record.get(field) or "")
+            if existing and incoming and existing != incoming:
+                raise ValueError(
+                    "originating autonomous order conflicts inside source packet"
+                )
+            if not existing and incoming:
+                selected[field] = incoming
+    if (
+        selected["side"] != "buy"
+        or not selected["symbol"]
+        or symbol is not None
+        and selected["symbol"] != symbol.upper()
+        or selected["account"] not in {"", "live"}
+    ):
+        raise ValueError("originating source order is not the exact autonomous live buy")
+    return {key: selected[key] for key in _SOURCE_ORDER_KEYS}
 
 
 def _resolution_material(payload: Mapping[str, object]) -> dict[str, object]:
@@ -135,10 +179,10 @@ def build_owner_manual_action_attribution(
     manual_id = _nonempty(manual_fill_client_order_id, label="manual fill client order ID")
     if origin_id == manual_id:
         raise ValueError("manual fill must differ from originating order")
-    _source_contains_order(source, origin_id)
     origin = _find_fill(reconciliation_packet, origin_id)
     manual = _find_fill(reconciliation_packet, manual_id)
     symbol = _nonempty(reconciliation_packet.get("symbol"), label="symbol").upper()
+    source_order = source_autonomous_order(source, origin_id, symbol=symbol)
     if (
         str(origin.get("symbol") or "").upper() != symbol
         or str(manual.get("symbol") or "").upper() != symbol
@@ -165,6 +209,7 @@ def build_owner_manual_action_attribution(
             "filled_qty": origin_qty,
             "source_packet_path": str(source),
             "source_packet_sha256": _digest(source),
+            "source_order": source_order,
         },
         "manual_fill": {
             "client_order_id": manual_id,
@@ -224,6 +269,17 @@ def validate_owner_manual_action_attribution(value: object) -> dict[str, object]
     source_sha = _nonempty(origin.get("source_packet_sha256"), label="source packet digest")
     if not source_path.is_absolute() or len(source_sha) != 64 or any(c not in "0123456789abcdef" for c in source_sha):
         raise ValueError("owner manual action source binding is invalid")
+    source_order = origin.get("source_order")
+    if (
+        not isinstance(source_order, Mapping)
+        or set(source_order) != _SOURCE_ORDER_KEYS
+        or source_order.get("client_order_id") != origin_id
+        or source_order.get("symbol") != payload.get("symbol")
+        or source_order.get("side") != "buy"
+        or source_order.get("account") not in {"", "live"}
+        or any(not isinstance(source_order.get(key), str) for key in _SOURCE_ORDER_KEYS)
+    ):
+        raise ValueError("owner manual action source order binding is invalid")
     if payload.get("resolution_id") != _resolution_id(payload):
         raise ValueError("owner manual action resolution identity is invalid")
     return payload
@@ -247,11 +303,34 @@ def write_owner_manual_action_attribution(
     encoded = json.dumps(validated, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
-        if os.write(descriptor, encoded) != len(encoded):
-            raise OSError("incomplete owner manual action attribution write")
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError("incomplete owner manual action attribution write")
+            written += count
         os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        completed_descriptor = descriptor
+        descriptor = -1
+        os.close(completed_descriptor)
+        parent = os.open(destination.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        destination.unlink(missing_ok=True)
+        try:
+            parent = os.open(destination.parent, os.O_RDONLY)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+        except OSError:
+            pass
+        raise
     return destination
 
 

@@ -22,7 +22,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from tradingagents.brokers.manual_action_attribution import replay_suppression_key
+from tradingagents.brokers.manual_action_attribution import (
+    load_owner_manual_action_attribution,
+    replay_suppression_key,
+    source_autonomous_order,
+)
 from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.orchestration.incidents import is_safe_incident_id
 from tradingagents.orchestration.recovery import (
@@ -2211,6 +2215,38 @@ def _valid_manual_exit_replay_suppressions(
                 return False
             if actual_digest != expected_digest:
                 return False
+        try:
+            attribution = load_owner_manual_action_attribution(
+                str(action["attestation_path"])
+            )
+            attribution_origin = attribution["originating_order"]
+            attribution_manual = attribution["manual_fill"]
+            if not isinstance(attribution_origin, Mapping) or not isinstance(
+                attribution_manual, Mapping
+            ):
+                return False
+            source_order = source_autonomous_order(
+                str(action["source_packet_path"]),
+                str(origin_id),
+                symbol=symbol,
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        if (
+            attribution.get("resolution_id") != action.get("resolution_id")
+            or attribution.get("symbol") != symbol
+            or attribution_origin.get("client_order_id") != origin_id
+            or attribution_origin.get("source_packet_path")
+            != action.get("source_packet_path")
+            or attribution_origin.get("source_packet_sha256")
+            != action.get("source_packet_sha256")
+            or attribution_origin.get("filled_qty") != action.get("filled_qty")
+            or attribution_origin.get("source_order") != source_order
+            or attribution_manual.get("client_order_id") != manual_id
+            or attribution_manual.get("filled_qty") != action.get("filled_qty")
+            or source_order.get("side") != "buy"
+        ):
+            return False
         origin_fills = [
             fill for fill in recent_fills
             if isinstance(fill, Mapping) and fill.get("client_order_id") == origin_id
@@ -2231,6 +2267,14 @@ def _valid_manual_exit_replay_suppressions(
             != filled_qty
             or _finite_recovery_decimal(manual_fill.get("filled_qty"), positive=True)
             != filled_qty
+            or any(
+                str(manual_fill.get(name) or "")
+                != str(attribution_manual.get(name) or "")
+                for name in (
+                    "side", "status", "filled_qty", "filled_avg_price",
+                    "submitted_at", "updated_at",
+                )
+            )
         ):
             return False
         expected_key = replay_suppression_key(

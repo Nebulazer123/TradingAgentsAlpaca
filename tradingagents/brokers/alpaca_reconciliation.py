@@ -15,6 +15,7 @@ from tradingagents.brokers.alpaca import compact_alpaca_order, find_order_by_cli
 from tradingagents.brokers.manual_action_attribution import (
     load_owner_manual_action_attribution,
     replay_suppression_key,
+    source_autonomous_order,
 )
 from tradingagents.execution.reconcile import reconcile_latest_packet_live_orders
 
@@ -305,6 +306,16 @@ def _resolve_owner_manual_actions(
                 == Decimal("0"),
                 "no_open_orders": not open_orders,
             }
+            try:
+                exact_source_order = source_autonomous_order(
+                    source_path, origin_id, symbol=symbol
+                )
+            except ValueError:
+                matches["source_contains_origin"] = False
+            else:
+                matches["source_contains_origin"] = (
+                    exact_source_order == origin.get("source_order")
+                )
             origin_fills = [
                 fill for fill in recent_fills
                 if fill.get("client_order_id") == origin_id
