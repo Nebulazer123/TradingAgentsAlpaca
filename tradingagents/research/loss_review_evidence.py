@@ -18,7 +18,10 @@ from tradingagents.policy.decision_authority import (
     bounded_exit_authority_record,
     resolve_exit_authority,
 )
-from tradingagents.research.provider_orchestrator import TickerProviderResearchResult
+from tradingagents.research.provider_orchestrator import (
+    TickerProviderResearchResult,
+    build_ticker_provider_research_packets,
+)
 from tradingagents.schemas.research import SourceEvidencePacket
 
 DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS: tuple[str, ...] = (
@@ -36,6 +39,65 @@ LOSS_REVIEW_FORBIDDEN_EFFECTS: tuple[str, ...] = (
     "waive_live_gate",
     "mark_loss_exit_allowed",
 )
+
+# The supervisory quote route is deliberately requested per symbol.  The
+# configured providers commonly return a one-symbol quote/previous-day packet;
+# treating an imaginary four-symbol Alpaca response as the only valid shape
+# made a real evidence refresh unable to clear its market-context blocker.
+DEFAULT_LOSS_REVIEW_SECTOR_PROXY = "XLK"
+
+
+def loss_review_sector_proxy(symbol: str) -> str:
+    """Return the configured default comparison proxy for a loss review.
+
+    This is intentionally a small, explicit policy hook rather than an
+    inference from an issuer name.  A future sector-classification source may
+    replace it without changing the immutable evidence contract.
+    """
+    del symbol
+    return DEFAULT_LOSS_REVIEW_SECTOR_PROXY
+
+
+def build_loss_review_provider_research(
+    symbol: str,
+    *,
+    sector_proxy: str | None = None,
+    provider_builder=build_ticker_provider_research_packets,
+    **kwargs: Any,
+) -> TickerProviderResearchResult:
+    """Collect the target and three benchmark quotes through configured routes.
+
+    The target receives the normal loss-review research needs.  SPY, QQQ, and
+    the configured sector proxy receive quote-only requests.  All returned
+    packets are preserved so the normalizer can bind their exact raw bytes.
+    This remains research-only; it has no broker mutation path.
+    """
+    target = str(symbol).strip().upper()
+    proxy = str(sector_proxy or loss_review_sector_proxy(target)).strip().upper()
+    requested = (target, "SPY", "QQQ", proxy)
+    packets: list[SourceEvidencePacket] = []
+    attempts: list[dict[str, Any]] = []
+    for requested_symbol in dict.fromkeys(requested):
+        needs = (
+            DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS
+            if requested_symbol == target
+            else ("quote_price_context",)
+        )
+        result = provider_builder(requested_symbol, evidence_needs=needs, **kwargs)
+        packets.extend(result.packets)
+        attempts.extend(
+            [
+                {**dict(item), "requested_symbol": requested_symbol}
+                for item in result.route_attempts
+                if isinstance(item, Mapping)
+            ]
+        )
+    return TickerProviderResearchResult(
+        symbol=target,
+        packets=packets,
+        summary_packet=None,
+        route_attempts=attempts,
+    )
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -292,6 +354,7 @@ def _accepted_source_descriptors(
         return []
     root = _safe_root(evidence_root)
     result: list[dict[str, Any]] = []
+    quote_components: dict[str, dict[str, Any]] = {}
     for packet in provider_result.packets:
         supplied = source_packet_paths.get(packet.packet_id)
         if supplied is None:
@@ -311,6 +374,23 @@ def _accepted_source_descriptors(
             or stored.get("as_of") != packet.as_of
             or stored.get("quality") != packet.quality
         ):
+            continue
+        components = _configured_quote_components(
+            raw_payload=stored.get("payload"),
+            expected_symbol=packet.symbol,
+        ) if packet.evidence_type == "quote_price_context" else ()
+        if components:
+            for component in components:
+                quote_components[component["symbol"]] = {
+                    "symbol": component["symbol"],
+                    "value": component["value"],
+                    "as_of": as_of,
+                    "raw_packet_path": relative.as_posix(),
+                    "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
+                    "raw_packet_id": packet.packet_id,
+                }
+            # Quote components are collected first and normalized once below;
+            # each component is useless on its own for autonomous authority.
             continue
         normalized = _normalize_provider_packet(packet=packet, stored=stored, symbol=packet.symbol)
         if normalized is None:
@@ -350,6 +430,88 @@ def _accepted_source_descriptors(
                 "quality": packet.quality,
             }
         )
+    # A market context must contain four exact, current components.  This
+    # supports both the legacy combined packet and the configured individual
+    # target/SPY/QQQ/sector requests without granting either partial shape
+    # authority.  The normalized packet retains raw paths and hashes for all
+    # component evidence in its provenance.
+    required = {provider_result.symbol.upper(), "SPY", "QQQ", loss_review_sector_proxy(provider_result.symbol)}
+    if required <= set(quote_components):
+        target = provider_result.symbol.upper()
+        target_component = quote_components[target]
+        spy_component = quote_components["SPY"]
+        qqq_component = quote_components["QQQ"]
+        sector_component = quote_components[loss_review_sector_proxy(provider_result.symbol)]
+        normalized_payload = {
+            "symbol": target,
+            "as_of": target_component["as_of"],
+            "spy": {"symbol": "SPY", "value": spy_component["value"], "as_of": spy_component["as_of"]},
+            "qqq": {"symbol": "QQQ", "value": qqq_component["value"], "as_of": qqq_component["as_of"]},
+            "sector_relative": {
+                "symbol": target,
+                "value": _normalized_decimal(
+                    (_float_value(target_component["value"]) or 0)
+                    - (_float_value(sector_component["value"]) or 0)
+                ),
+                "as_of": target_component["as_of"],
+            },
+            "target_relative_to_spy": _normalized_decimal(
+                (_float_value(target_component["value"]) or 0)
+                - (_float_value(spy_component["value"]) or 0)
+            ),
+            "target_relative_to_qqq": _normalized_decimal(
+                (_float_value(target_component["value"]) or 0)
+                - (_float_value(qqq_component["value"]) or 0)
+            ),
+        }
+        if (
+            normalized_payload["sector_relative"]["value"] is not None
+            and normalized_payload["target_relative_to_spy"] is not None
+            and normalized_payload["target_relative_to_qqq"] is not None
+        ):
+            components = [target_component, spy_component, qqq_component, sector_component]
+            component_refs = [
+                {
+                    "packet_id": item["raw_packet_id"],
+                    "path": item["raw_packet_path"],
+                    "sha256": item["raw_packet_sha256"],
+                    "symbol": item["symbol"],
+                }
+                for item in components
+            ]
+            identity = hashlib.sha256(
+                json.dumps(component_refs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            normalized_relative = Path("normalized_loss_review_evidence") / f"market-context-{identity}.json"
+            normalized_packet = {
+                "packet_id": f"normalized-market-context-{identity}",
+                "source_name": "configured_quote_bundle",
+                "evidence_type": "market_context",
+                "subject": target,
+                "symbol": target,
+                "as_of": target_component["as_of"],
+                "quality": "high",
+                "provenance": {"components": component_refs},
+                "payload": normalized_payload,
+            }
+            normalized_raw = json.dumps(normalized_packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            try:
+                _publish_immutable(root, normalized_relative, normalized_raw)
+            except (OSError, ValueError):
+                pass
+            else:
+                result.append(
+                    {
+                        "path": normalized_relative.as_posix(),
+                        "sha256": hashlib.sha256(normalized_raw).hexdigest(),
+                        "size_bytes": len(normalized_raw),
+                        "packet_id": normalized_packet["packet_id"],
+                        "source_name": normalized_packet["source_name"],
+                        "evidence_type": "market_context",
+                        "as_of": normalized_packet["as_of"],
+                        "quality": "high",
+                    }
+                )
     return result
 
 
@@ -484,17 +646,6 @@ def _normalize_provider_packet(
     if not isinstance(raw_payload, Mapping) or packet.quality not in {"high", "medium"}:
         return None
     as_of = str(packet.as_of or packet.generated_at)
-    if packet.evidence_type == "quote_price_context":
-        values = _market_values_from_configured_quote(raw_payload, symbol)
-        spy, qqq, relative = values.get("spy"), values.get("qqq"), values.get("sector_relative")
-        if None in {spy, qqq, relative}:
-            return None
-        return "market_context", {
-            "symbol": symbol, "as_of": as_of,
-            "spy": {"symbol": "SPY", "value": spy, "as_of": as_of},
-            "qqq": {"symbol": "QQQ", "value": qqq, "as_of": as_of},
-            "sector_relative": {"symbol": symbol, "value": relative, "as_of": as_of},
-        }
     if packet.evidence_type == "market_news":
         event = _adverse_finnhub_event(raw_payload, symbol=symbol, as_of=as_of)
         if event is None:
@@ -515,25 +666,57 @@ def _normalize_provider_packet(
 def _quote_price(value: Any) -> float | None:
     if not isinstance(value, Mapping):
         return None
-    price, previous = _float_value(value.get("p")), _float_value(value.get("pc"))
+    price = _float_value(value.get("p") if value.get("p") not in (None, "") else value.get("c"))
+    previous = _float_value(value.get("pc"))
     if price is None or previous is None or previous <= 0:
         return None
     return (price - previous) / previous
 
 
-def _market_values_from_configured_quote(payload: Mapping[str, Any], symbol: str) -> dict[str, str | None]:
-    data = payload.get("data")
+def _configured_quote_components(
+    *, raw_payload: Any, expected_symbol: str
+) -> tuple[dict[str, str], ...]:
+    """Extract individual configured quote/previous-day facts, never aliases.
+
+    Alpaca can supply ``data.trades`` keyed by symbol; yfinance and several
+    configured fallback routes provide one target quote in ``data`` or
+    ``latest_bar``.  The caller combines only exact requested component
+    symbols, so a target quote is never re-labelled as SPY/QQQ/sector data.
+    """
+    if not isinstance(raw_payload, Mapping):
+        return ()
+    expected = str(expected_symbol).strip().upper()
+    found: list[dict[str, str]] = []
+    data = raw_payload.get("data")
     trades = data.get("trades") if isinstance(data, Mapping) else None
-    if not isinstance(trades, Mapping):
-        return {"spy": None, "qqq": None, "sector_relative": None}
-    target, spy, qqq, sector = (_quote_price(trades.get(name)) for name in (symbol, "SPY", "QQQ", "XLK"))
-    if None in {target, spy, qqq, sector}:
-        return {"spy": None, "qqq": None, "sector_relative": None}
-    return {
-        "spy": _normalized_decimal(spy),
-        "qqq": _normalized_decimal(qqq),
-        "sector_relative": _normalized_decimal(target - sector),
-    }
+    if isinstance(trades, Mapping):
+        for name, raw_quote in trades.items():
+            symbol = str(name).strip().upper()
+            value = _quote_price(raw_quote)
+            if symbol and value is not None:
+                normalized = _normalized_decimal(value)
+                if normalized is not None:
+                    found.append({"symbol": symbol, "value": normalized})
+        if found:
+            return tuple(found)
+    # Single-symbol configured quote shape: Finnhub/FMP style current/previous
+    # values or an injected test route with ``p``/``pc`` at top level.
+    quote = data if isinstance(data, Mapping) else raw_payload
+    value = _quote_price(quote)
+    if value is not None and expected:
+        normalized = _normalized_decimal(value)
+        if normalized is not None:
+            return ({"symbol": expected, "value": normalized},)
+    latest = raw_payload.get("latest_bar")
+    bars = raw_payload.get("recent_bars")
+    if isinstance(latest, Mapping) and isinstance(bars, Sequence) and not isinstance(bars, (str, bytes, bytearray)) and len(bars) >= 2:
+        close = _float_value(latest.get("Close") or latest.get("close"))
+        previous = _float_value((bars[-2] if isinstance(bars[-2], Mapping) else {}).get("Close") or (bars[-2] if isinstance(bars[-2], Mapping) else {}).get("close"))
+        if close is not None and previous is not None and previous > 0:
+            normalized = _normalized_decimal((close - previous) / previous)
+            if normalized is not None:
+                return ({"symbol": expected, "value": normalized},)
+    return ()
 
 
 def _news_items(payload: Mapping[str, Any]) -> Sequence[Any]:
@@ -613,6 +796,182 @@ def _qualified_loss_review_evidence(
         elif evidence_type == "earnings_guidance_filing":
             result["filing"] = True
     return result
+
+
+def _descriptor_by_type(
+    descriptors: Sequence[Mapping[str, Any]], evidence_type: str
+) -> Mapping[str, Any] | None:
+    matches = [item for item in descriptors if item.get("evidence_type") == evidence_type]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _exact_reason_reference(descriptor: Mapping[str, Any] | None) -> dict[str, str] | None:
+    if not isinstance(descriptor, Mapping):
+        return None
+    values = {key: descriptor.get(key) for key in ("packet_id", "path", "sha256")}
+    if all(isinstance(value, str) and value for value in values.values()):
+        return values  # type: ignore[return-value]
+    return None
+
+
+def _read_current_supervisor_binding(
+    *,
+    hourly_packet_path: str | Path,
+    evidence_root: str | Path | None,
+) -> dict[str, Any] | None:
+    if evidence_root is None:
+        return None
+    try:
+        root = _safe_root(evidence_root)
+        relative, raw, _packet = _read_contained_json(root, hourly_packet_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return {
+        "path": relative.as_posix(),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size_bytes": len(raw),
+    }
+
+
+def _normalized_source_payload(
+    descriptor: Mapping[str, Any] | None,
+    *,
+    evidence_root: str | Path | None,
+) -> Mapping[str, Any] | None:
+    if not isinstance(descriptor, Mapping) or evidence_root is None:
+        return None
+    try:
+        root = _safe_root(evidence_root)
+        _relative, raw, stored = _read_contained_json(root, descriptor.get("path"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if hashlib.sha256(raw).hexdigest() != descriptor.get("sha256"):
+        return None
+    payload = stored.get("payload")
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _derive_current_loss_review(
+    *,
+    historical_review: Mapping[str, Any],
+    hourly_packet_path: str | Path,
+    accepted_sources: Sequence[Mapping[str, Any]],
+    evidence_root: str | Path | None,
+) -> dict[str, Any]:
+    """Build the current authority candidate without changing historical review.
+
+    The result is materialized inside the immutable refreshed evidence packet.
+    It is the only review a BOARD recorder may evaluate.  If a precise binding
+    is unavailable, this returns a structurally valid HOLD candidate instead
+    of copying any historical scalar authority forward.
+    """
+    symbol = str(historical_review.get("symbol") or "").strip().upper()
+    supervisor = _read_current_supervisor_binding(
+        hourly_packet_path=hourly_packet_path,
+        evidence_root=evidence_root,
+    )
+    market = _descriptor_by_type(accepted_sources, "market_context")
+    news = _descriptor_by_type(accepted_sources, "company_news")
+    filing = _descriptor_by_type(accepted_sources, "earnings_guidance_filing")
+    market_payload = _normalized_source_payload(market, evidence_root=evidence_root)
+    news_payload = _normalized_source_payload(news, evidence_root=evidence_root)
+    filing_payload = _normalized_source_payload(filing, evidence_root=evidence_root)
+    current_at = (
+        str((market or {}).get("as_of") or (news or {}).get("as_of") or (filing or {}).get("as_of") or "")
+    )
+    market_session = str(historical_review.get("market_session") or "").strip().lower()
+    canonical_session = market_session if market_session in {
+        "closed", "pre_open", "open_window", "regular", "pre_close", "after_close"
+    } else "unknown"
+    complete = (
+        supervisor is not None
+        and isinstance(market_payload, Mapping)
+        and isinstance(news_payload, Mapping)
+        and isinstance(filing_payload, Mapping)
+        and bool(symbol)
+        and bool(current_at)
+        and canonical_session != "unknown"
+    )
+    spy = market_payload.get("spy") if isinstance(market_payload, Mapping) else None
+    qqq = market_payload.get("qqq") if isinstance(market_payload, Mapping) else None
+    sector = market_payload.get("sector_relative") if isinstance(market_payload, Mapping) else None
+    current_price = _normalized_decimal(historical_review.get("current_price"))
+    average_entry = _normalized_decimal(historical_review.get("average_entry_price"))
+    spy_value = spy.get("value") if isinstance(spy, Mapping) else None
+    qqq_value = qqq.get("value") if isinstance(qqq, Mapping) else None
+    sector_relative = sector.get("value") if isinstance(sector, Mapping) else None
+    reason_source = _exact_reason_reference(filing)
+    target_vs_spy = market_payload.get("target_relative_to_spy") if isinstance(market_payload, Mapping) else None
+    target_vs_qqq = market_payload.get("target_relative_to_qqq") if isinstance(market_payload, Mapping) else None
+    if not all(
+        _normalized_decimal(value) is not None
+        for value in (current_price, average_entry, spy_value, qqq_value, sector_relative, target_vs_spy, target_vs_qqq)
+    ):
+        complete = False
+    # A provider-reported guidance cut is a dedicated, structured production
+    # fact.  Generic adverse filings and generic news never become
+    # ``thesis_invalidated``.  Use the narrower, directly proven taxonomy.
+    filing_category = filing_payload.get("event_category") if isinstance(filing_payload, Mapping) else None
+    filing_direction = filing_payload.get("direction") if isinstance(filing_payload, Mapping) else None
+    filing_change = filing_payload.get("change_fraction") if isinstance(filing_payload, Mapping) else None
+    news_category = news_payload.get("event_category") if isinstance(news_payload, Mapping) else None
+    news_direction = news_payload.get("direction") if isinstance(news_payload, Mapping) else None
+    news_impact = news_payload.get("impact_fraction") if isinstance(news_payload, Mapping) else None
+    if filing_category not in {"guidance_cut", "earnings_miss", "material_impairment", "adverse_filing_disclosure"} or filing_direction != "adverse" or _normalized_decimal(filing_change) is None:
+        complete = False
+    if news_category not in {"guidance_cut", "material_contract_loss", "regulatory_adverse_action", "thesis_invalidator"} or news_direction != "adverse" or _normalized_decimal(news_impact) is None:
+        complete = False
+    if complete and canonical_session == "closed":
+        blockers = ["market session is not tradeable for a live loss exit"]
+    elif complete:
+        blockers = []
+    else:
+        blockers = ["refreshed evidence is incomplete"]
+    return {
+        "schema": "tradingagents.refreshed_loss_review.v1",
+        "symbol": symbol,
+        "original_supervisor": {
+            "decision_id": historical_review.get("decision_id"),
+            **(supervisor or {}),
+        },
+        "market_session": canonical_session,
+        "current_evidence_at": current_at,
+        "evidence_generated_at": current_at,
+        "current_price": current_price,
+        "average_entry_price": average_entry,
+        "allowed": bool(complete and canonical_session != "closed"),
+        "allowed_exit_reason": "earnings_or_guidance_break" if complete else None,
+        "allowed_exit_reason_source": reason_source if complete else None,
+        "current_thesis_status": (
+            "Structured guidance evidence broke the original entry thesis."
+            if complete else "Refreshed evidence is incomplete; HOLD remains safer."
+        ),
+        "why_hold_is_worse_than_sell": (
+            "A current, adverse guidance event is bound to the issuer and outweighs recovery hope."
+            if complete else "Current evidence does not prove SELL is better than HOLD."
+        ),
+        "confidence": "0.82" if complete else "0.00",
+        "blockers": blockers,
+        "blocked_reasons": list(blockers),
+        "broad_market_context": {"SPY": _normalized_decimal(spy_value), "QQQ": _normalized_decimal(qqq_value)},
+        "relative_performance_vs_SPY": _normalized_decimal(target_vs_spy),
+        "relative_performance_vs_QQQ": _normalized_decimal(target_vs_qqq),
+        "sector_or_peer_context": {
+            "sector": loss_review_sector_proxy(symbol),
+            "relative_performance": _normalized_decimal(sector_relative),
+        },
+        "company_news_event_category": news_category,
+        "company_news_direction": news_direction,
+        "company_news_impact_fraction": _normalized_decimal(news_impact),
+        "filing_event_category": filing_category,
+        "filing_direction": filing_direction,
+        "filing_change_fraction": _normalized_decimal(filing_change),
+        "why_this_is_not_broad_market_red_day_noise": (
+            "The bound issuer guidance event supplies company-specific adverse evidence."
+            if complete else "Company-specific versus broad-market damage is unresolved."
+        ),
+        "source_packet_ids": [str(item.get("packet_id")) for item in accepted_sources],
+    }
 
 
 def _infer_current_thesis_status(
@@ -1038,6 +1397,30 @@ def build_loss_review_evidence_packet(
         accepted_sources=accepted_sources,
         entry_context=entry_context,
     )
+    current_loss_review = _derive_current_loss_review(
+        historical_review=review,
+        hourly_packet_path=hourly_packet_path,
+        accepted_sources=accepted_sources,
+        evidence_root=decision_evidence_root,
+    )
+    # Advisory output consumes the same derived Mapping that the recorder
+    # authenticates.  It cannot introduce a second scalar reason source.
+    advisory_analysis["current_loss_review"] = dict(current_loss_review)
+    advisory_analysis["current_thesis_status_candidate"] = current_loss_review[
+        "current_thesis_status"
+    ]
+    advisory_analysis["loss_exit_candidate"] = {
+        "allowed_exit_reason_candidate": current_loss_review["allowed_exit_reason"],
+        "allowed_exit_reason_source": current_loss_review[
+            "allowed_exit_reason_source"
+        ],
+        "confidence": current_loss_review["confidence"],
+        "reason_summary": current_loss_review["why_hold_is_worse_than_sell"],
+        "approval_effect": "board_review_input_not_loss_exit_approval",
+        "requires_board_decision": True,
+        "requires_tradeable_session": True,
+        "can_submit_orders": False,
+    }
     qualified_evidence = advisory_analysis.get("qualified_evidence")
     if not isinstance(qualified_evidence, Mapping):
         qualified_evidence = {}
@@ -1052,6 +1435,12 @@ def build_loss_review_evidence_packet(
     )
     resolved_set = set(resolved_blockers)
     remaining_blockers = [blocker for blocker in blockers if blocker not in resolved_set]
+    # The immutable current review, not the frozen historic review, carries
+    # the actual decision-window blockers.  Retain the historical list for
+    # lineage/audit, but do not let it silently overrule a fully bound refresh.
+    current_remaining = current_loss_review.get("blockers")
+    if isinstance(current_remaining, list) and all(isinstance(item, str) for item in current_remaining):
+        remaining_blockers = list(current_remaining)
     hourly_path = Path(hourly_packet_path)
     source_ref = f"local://{hourly_path.as_posix()}"
     payload = {
@@ -1084,6 +1473,7 @@ def build_loss_review_evidence_packet(
         "entry_context": dict(entry_context or {}),
         "entry_context_found": bool(entry_context),
         "advisory_analysis": advisory_analysis,
+        "current_loss_review": current_loss_review,
         "remaining_blockers_before_refresh": blockers,
         "resolved_blockers_by_refresh": resolved_blockers,
         "remaining_blockers": remaining_blockers,
@@ -1104,6 +1494,7 @@ def build_loss_review_evidence_packet(
         ),
         "analysis_only": True,
         "execution_authority": "none",
+        "can_submit_orders": False,
         "forbidden_effects": list(LOSS_REVIEW_FORBIDDEN_EFFECTS),
     }
     return evidence_packet(
@@ -1131,5 +1522,6 @@ def build_loss_review_evidence_packet(
             "read_only": True,
             "can_submit_orders": False,
             "source_packet_count": len(source_ids),
+            "current_evidence_at": current_loss_review.get("current_evidence_at"),
         },
     )

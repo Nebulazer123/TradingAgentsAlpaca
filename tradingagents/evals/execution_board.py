@@ -835,7 +835,11 @@ def build_execution_board_review(
         and autonomous_loss_decision is None
         and (
             loss_review_evidence.get("review_allowed") is not True
-            or int(loss_review_evidence.get("remaining_blocker_count") or 0) > 0
+            or (
+                int(loss_review_evidence.get("remaining_blocker_count") or 0) > 0
+                and loss_review_evidence.get("next_action")
+                != "pre_registered_policy_approval_preserved"
+            )
         )
     )
     if loss_review_evidence_pending:

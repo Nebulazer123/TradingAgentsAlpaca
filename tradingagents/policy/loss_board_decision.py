@@ -36,7 +36,6 @@ _ADVERSE_NEWS_EVENTS = frozenset({"guidance_cut", "material_contract_loss", "reg
 _ADVERSE_FILING_EVENTS = frozenset({"guidance_cut", "earnings_miss", "material_impairment", "adverse_filing_disclosure"})
 AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS = frozenset(
     {
-        "thesis_invalidated",
         "company_specific_negative_news",
         "earnings_or_guidance_break",
     }
@@ -471,7 +470,10 @@ def _source_payload(raw: Mapping[str, Any], source: BoundSourceEvidence) -> Mapp
 
 
 def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str, Any], source: BoundSourceEvidence) -> bool:
-    if set(payload) != {"symbol", "as_of", "spy", "qqq", "sector_relative"}:
+    if set(payload) != {
+        "symbol", "as_of", "spy", "qqq", "sector_relative",
+        "target_relative_to_spy", "target_relative_to_qqq",
+    }:
         return False
     context = review.get("broad_market_context")
     sector = review.get("sector_or_peer_context")
@@ -496,9 +498,47 @@ def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str
         and sector_relative.get("as_of") == source.as_of
         and _is_decimal(sector_relative.get("value"), "source sector relative")
         and Decimal(sector_relative["value"]) <= Decimal("-0.01")
+        and review.get("relative_performance_vs_SPY") == payload.get("target_relative_to_spy")
+        and review.get("relative_performance_vs_QQQ") == payload.get("target_relative_to_qqq")
         and Decimal(review["relative_performance_vs_SPY"]) <= Decimal("-0.01")
         and Decimal(review["relative_performance_vs_QQQ"]) <= Decimal("-0.01")
     )
+
+
+def _market_source_has_exact_component_provenance(
+    capture: CapturedSourceEvidence, root: Path, symbol: str
+) -> bool:
+    """Verify the normalized market bundle still names four real raw packets."""
+    provenance = capture.packet_object.get("provenance")
+    components = provenance.get("components") if isinstance(provenance, Mapping) else None
+    if not isinstance(components, list) or len(components) != 4:
+        return False
+    expected_symbols = {symbol, "SPY", "QQQ", "XLK"}
+    seen: set[str] = set()
+    for component in components:
+        if not isinstance(component, Mapping) or set(component) != {
+            "packet_id", "path", "sha256", "symbol"
+        }:
+            return False
+        raw_symbol = component.get("symbol")
+        if not isinstance(raw_symbol, str) or raw_symbol in seen:
+            return False
+        seen.add(raw_symbol)
+        try:
+            _target, raw, stored = _read_contained(
+                root, component.get("path"), label="market component packet"
+            )
+        except ValueError:
+            return False
+        if (
+            hashlib.sha256(raw).hexdigest() != component.get("sha256")
+            or not isinstance(stored, Mapping)
+            or stored.get("packet_id") != component.get("packet_id")
+            or stored.get("symbol") != raw_symbol
+            or stored.get("evidence_type") != "quote_price_context"
+        ):
+            return False
+    return seen == expected_symbols
 
 
 def _news_source_proves_adverse_break(payload: Mapping[str, Any]) -> bool:
@@ -565,24 +605,30 @@ def _reason_source_semantics(
         return referenced.evidence_type == "company_news" and _news_source_proves_adverse_break(payload)
     if reason == "earnings_or_guidance_break":
         return referenced.evidence_type == "earnings_guidance_filing" and _filing_source_proves_adverse_fact(payload)
-    if reason == "thesis_invalidated":
-        return (
-            (referenced.evidence_type == "company_news" and payload.get("event_category") == "thesis_invalidator" and _news_source_proves_adverse_break(payload))
-            or (referenced.evidence_type == "earnings_guidance_filing" and _filing_source_proves_adverse_fact(payload))
-        )
     return False
 
 
-def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captures: tuple[CapturedSourceEvidence, ...], now: dt.datetime) -> tuple[str, ...]:
+def _semantic_gaps(
+    review: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    captures: tuple[CapturedSourceEvidence, ...],
+    now: dt.datetime,
+    root: Path,
+) -> tuple[str, ...]:
     gaps: list[str] = []
     sources = tuple(capture.source for capture in captures)
     session_blockers = {"market session is not tradeable for a live loss exit"}
+    closed_session_exception = review.get("market_session") == "closed"
     for blocker_field in ("blockers", "blocked_reasons"):
         value = review.get(blocker_field)
-        if not _sequence_of_text(value) or any(item not in session_blockers for item in value):
+        if not _sequence_of_text(value) or (
+            value and (not closed_session_exception or any(item not in session_blockers for item in value))
+        ):
             gaps.append(f"supervisor_{blocker_field}_not_exact_empty_list")
     remaining = payload.get("remaining_blockers")
-    if not _sequence_of_text(remaining) or any(item not in session_blockers for item in remaining):
+    if not _sequence_of_text(remaining) or (
+        remaining and (not closed_session_exception or any(item not in session_blockers for item in remaining))
+    ):
         gaps.append("remaining_blockers_not_exact_empty_list")
     context = review.get("broad_market_context")
     sector = review.get("sector_or_peer_context")
@@ -592,7 +638,9 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captur
         or not all(_is_decimal(review.get(x), x) for x in ("relative_performance_vs_SPY", "relative_performance_vs_QQQ"))
         or not isinstance(sector, Mapping)
         or not isinstance(sector.get("sector"), str)
-        or sector.get("sector") not in {"software", "semiconductors", "technology"}
+        # The current review records the configured comparison proxy (XLK by
+        # default), not an unreliable inferred industry label.
+        or not re.fullmatch(r"[A-Z][A-Z0-9.]{0,15}", sector.get("sector"))
         or not _is_decimal(sector.get("relative_performance"), "sector relative_performance")
     ):
         gaps.append("actual_spy_qqq_sector_relative_values_missing")
@@ -636,7 +684,10 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captur
         if source_payload is None:
             gaps.append("source_payload_binding_invalid")
         elif source.evidence_type == "market_context":
-            if _market_source_proves_values(source_payload, review, source):
+            if (
+                _market_source_proves_values(source_payload, review, source)
+                and _market_source_has_exact_component_provenance(capture, root, review["symbol"])
+            ):
                 categories.add("market")
             else:
                 gaps.append("market_source_values_missing_or_unbound")
@@ -653,7 +704,7 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captur
             else:
                 gaps.append("filing_or_guidance_not_adverse_substantive_fact")
     if (
-        review.get("allowed") is not True
+        (review.get("allowed") is not True and not closed_session_exception)
         or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS
         or not _reason_source_semantics(
             review.get("allowed_exit_reason"),
@@ -671,28 +722,65 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captur
 
 
 def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: BoundEvidence, loss_raw: Mapping[str, Any], revision: str, root: Path, now: dt.datetime) -> AutonomousLossBoardDecision:
-    review = ((supervisor_raw.get("evidence") or {}).get("loss_exit_review")) if isinstance(supervisor_raw.get("evidence"), Mapping) else None
+    historical_review = ((supervisor_raw.get("evidence") or {}).get("loss_exit_review")) if isinstance(supervisor_raw.get("evidence"), Mapping) else None
     payload = loss_raw.get("payload") if isinstance(loss_raw.get("payload"), Mapping) else None
     if (
-        not isinstance(review, Mapping)
+        not isinstance(historical_review, Mapping)
         or not isinstance(payload, Mapping)
-        or not isinstance(review.get("symbol"), str)
-        or _SYMBOL.fullmatch(review["symbol"]) is None
-        or loss_raw.get("symbol") != review["symbol"]
-        or payload.get("symbol") != review["symbol"]
+        or not isinstance(historical_review.get("symbol"), str)
+        or _SYMBOL.fullmatch(historical_review["symbol"]) is None
+        or loss_raw.get("symbol") != historical_review["symbol"]
+        or payload.get("symbol") != historical_review["symbol"]
         or payload.get("supervisor_packet_path") != supervisor.path
-        or payload.get("supervisor_decision_id") != review.get("decision_id")
+        or payload.get("supervisor_decision_id") != historical_review.get("decision_id")
     ):
         raise ValueError("loss packet is not exactly bound to the supervisor decision")
     if _REVISION.fullmatch(revision) is None:
         raise ValueError("source_revision must be lowercase 40-hex")
-    captures = _sources(root, payload.get("accepted_sources"), review["symbol"])
+    review = payload.get("current_loss_review")
+    if not isinstance(review, Mapping) or review.get("schema") != "tradingagents.refreshed_loss_review.v1":
+        # Legacy historical review fields are deliberately not an authority.
+        review = {}
+    original = review.get("original_supervisor") if isinstance(review, Mapping) else None
+    if not isinstance(original, Mapping) or original != {
+        "decision_id": historical_review.get("decision_id"),
+        "path": supervisor.path,
+        "sha256": supervisor.sha256,
+        "size_bytes": supervisor.size_bytes,
+    }:
+        review = {}
+    if review and review.get("symbol") != historical_review["symbol"]:
+        review = {}
+    if not review:
+        review = {
+            "symbol": historical_review["symbol"],
+            "blockers": ["refreshed evidence is incomplete"],
+            "blocked_reasons": ["refreshed evidence is incomplete"],
+        }
+    captures = _sources(root, payload.get("accepted_sources"), historical_review["symbol"])
     sources = tuple(capture.source for capture in captures)
-    gaps = list(_semantic_gaps(review, payload, captures, now))
-    if loss_raw.get("analysis_only") is not True or loss_raw.get("execution_authority") != "none" or loss_raw.get("can_submit_orders") is not False or loss_raw.get("source_name") != "loss_review_evidence" or loss_raw.get("evidence_type") != "loss_review_evidence":
+    gaps = list(_semantic_gaps(review, payload, captures, now, root))
+    # SourceEvidencePacket owns ``analysis_only`` at the envelope.  The
+    # loss-review-specific no-execution fields live in its payload, which is
+    # the actual configured packet shape written by the research route.
+    if (
+        loss_raw.get("analysis_only") is not True
+        or not isinstance(payload, Mapping)
+        or payload.get("execution_authority") != "none"
+        or payload.get("can_submit_orders") is not False
+        or loss_raw.get("source_name") != "loss_review_evidence"
+        or loss_raw.get("evidence_type") != "loss_review_evidence"
+    ):
         gaps.append("raw_loss_packet_authority_or_identity_invalid")
     try:
-        loss_generated = _time(loss_raw.get("generated_at"), "loss evidence generated_at")
+        # The immutable current review is the decision-time evidence.  The
+        # envelope's writer timestamp may be later (or, in queued local runs,
+        # earlier) than the provider observations, so verify the strict
+        # source-bound review timestamp rather than a serializer clock.
+        loss_generated = _time(
+            review.get("evidence_generated_at"),
+            "current loss review evidence_generated_at",
+        )
         if loss_generated > now or now - loss_generated > _MAX_AGE:
             gaps.append("raw_loss_packet_stale")
     except ValueError:
@@ -705,7 +793,7 @@ def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: B
         "schema_version": SCHEMA_VERSION,
         "decision": "SELL" if sell else "HOLD",
         "symbol": review["symbol"],
-        "supervisor_decision_id": review.get("decision_id"),
+        "supervisor_decision_id": historical_review.get("decision_id"),
         "supervisor_packet": supervisor.compact(),
         "loss_evidence_packet": loss.compact(),
         "accepted_sources": [x.compact() for x in sources],

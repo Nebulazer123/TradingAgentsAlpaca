@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 from cli.main import app
 from tradingagents.dataflows._official_common import evidence_packet
+from tradingagents.policy.loss_board_decision import record_autonomous_loss_board_decision
 from tradingagents.policy.packets import write_research_packet
 from tradingagents.research.loss_review_evidence import (
     DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
@@ -206,23 +207,11 @@ def test_build_loss_review_evidence_packet_preserves_hold_and_attaches_sources()
     # blockers needed for a loss decision.
     assert payload["resolved_blockers_by_refresh"] == ["source packet ids are missing"]
     assert "source packet ids are missing" not in payload["remaining_blockers"]
-    assert "SPY/QQQ/sector context is missing" in payload["remaining_blockers"]
-    assert "company-specific news check is missing" in payload["remaining_blockers"]
-    assert "earnings/guidance/filing check is missing" in payload["remaining_blockers"]
-    assert "why HOLD is worse than SELL is missing" in payload["remaining_blockers"]
-    assert "why this is not broad-market red-day noise is missing" in payload["remaining_blockers"]
+    assert payload["remaining_blockers"] == ["refreshed evidence is incomplete"]
     assert payload["advisory_analysis"]["review_allowed_after_refresh"] is False
     assert payload["advisory_analysis"]["market_context_attached"] is False
     assert "submit_order" in payload["advisory_analysis"]["forbidden_effects"]
-    assert payload["remaining_blockers"] == [
-        "allowed loss-exit reason is missing",
-        "SPY/QQQ/sector context is missing",
-        "company-specific news check is missing",
-        "earnings/guidance/filing check is missing",
-        "why HOLD is worse than SELL is missing",
-        "why this is not broad-market red-day noise is missing",
-        "market session is not tradeable for a live loss exit",
-    ]
+    assert payload["remaining_blockers"] == ["refreshed evidence is incomplete"]
 
 
 def test_fabricated_nested_provider_context_does_not_become_authority(tmp_path):
@@ -245,7 +234,7 @@ def test_fabricated_nested_provider_context_does_not_become_authority(tmp_path):
     accepted = packet.payload["accepted_sources"]
     assert accepted == []
     assert packet.payload["advisory_analysis"]["qualified_evidence"] == {"market": False, "company_news": False, "filing": False}
-    assert packet.payload["remaining_blockers"] == review["blockers"]
+    assert packet.payload["remaining_blockers"] == ["refreshed evidence is incomplete"]
 
 
 def test_configured_provider_shapes_normalize_to_complete_adverse_loss_evidence(tmp_path):
@@ -262,10 +251,90 @@ def test_configured_provider_shapes_normalize_to_complete_adverse_loss_evidence(
     )
 
     assert {item["evidence_type"] for item in packet.payload["accepted_sources"]} == {"market_context", "company_news", "earnings_guidance_filing"}
-    assert packet.payload["remaining_blockers"] == []
+    # The historical packet was not persisted inside the evidence root, so it
+    # cannot become a current authority candidate in this unit-only fixture.
+    assert packet.payload["current_loss_review"]["allowed"] is False
     news = next(item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "company_news")
     normalized = json.loads((tmp_path / news["path"]).read_text(encoding="utf-8"))
     assert normalized["payload"]["event_category"] == "guidance_cut"
+
+
+def test_real_configured_individual_quote_route_builds_bound_current_review_and_sell(tmp_path):
+    """Production-shaped path: frozen supervisor -> refresh -> immutable SELL.
+
+    Every quote is a separate configured one-symbol packet.  No test inserts a
+    decision field into the current review; the refresh derives it from raw
+    evidence and the recorder re-authenticates it through public APIs.
+    """
+    now = "2026-08-13T14:55:00+00:00"
+    hourly = _hourly_packet("ORCL")
+    review = hourly["evidence"]["loss_exit_review"]
+    review.update(
+        {
+            "decision_id": "historical-orcl-loss-1",
+            "market_session": "regular",
+            "current_price": "91",
+            "average_entry_price": "100",
+            "blockers": ["SPY/QQQ/sector context is missing"],
+            "blocked_reasons": ["SPY/QQQ/sector context is missing"],
+        }
+    )
+    hourly_path = tmp_path / "hourly" / "hourly-supervisor-orcl.json"
+    hourly_path.parent.mkdir()
+    hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
+
+    def quote(symbol, price, previous):
+        return evidence_packet(
+            source_name="finnhub", evidence_type="quote_price_context", subject=symbol,
+            symbol=symbol, source_ref=f"https://finnhub.test/quote/{symbol}",
+            payload={"c": price, "pc": previous}, quality="high", as_of=now,
+            tool_route="finnhub_api",
+        )
+
+    provider = TickerProviderResearchResult(
+        symbol="ORCL",
+        packets=[
+            quote("ORCL", 91.0, 100.0), quote("SPY", 650.0, 648.0),
+            quote("QQQ", 580.0, 578.0), quote("XLK", 260.0, 259.0),
+            evidence_packet(
+                source_name="finnhub", evidence_type="market_news", subject="ORCL", symbol="ORCL",
+                source_ref="https://finnhub.test/news/ORCL",
+                payload={"data": [{"category": "company", "datetime": 1786632840,
+                                    "headline": "Oracle cuts revenue guidance", "summary": "Lowered revenue guidance by 8%.",
+                                    "url": "https://issuer.test/adverse"}]},
+                quality="medium", as_of=now, tool_route="finnhub_api",
+            ),
+            evidence_packet(
+                source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL",
+                source_ref="https://fmp.test/transcript/ORCL",
+                payload={"symbol": "ORCL", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]},
+                quality="high", as_of=now, tool_route="fmp_api",
+            ),
+        ],
+    )
+    source_paths = {
+        item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets
+    }
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider,
+        source_packet_paths=source_paths, decision_evidence_root=tmp_path,
+    )
+    loss_path = write_research_packet(packet, tmp_path / "loss")
+    current = packet.payload["current_loss_review"]
+    assert current["allowed"] is True
+    assert current["allowed_exit_reason"] == "earnings_or_guidance_break"
+    assert isinstance(current["allowed_exit_reason_source"], dict)
+    market = next(item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "market_context")
+    normalized_market = json.loads((tmp_path / market["path"]).read_text(encoding="utf-8"))
+    assert len(normalized_market["provenance"]["components"]) == 4
+    assert {item["symbol"] for item in normalized_market["provenance"]["components"]} == {"ORCL", "SPY", "QQQ", "XLK"}
+    recorded = record_autonomous_loss_board_decision(
+        supervisor_packet_path=hourly_path, loss_evidence_packet_path=loss_path,
+        source_revision="1" * 40, ledger_root=tmp_path / "ledger",
+        evidence_root=tmp_path, now=__import__("datetime").datetime.fromisoformat(now),
+    )
+    assert recorded.decision.decision == "SELL", recorded.decision.evidence_gaps
+    assert recorded.decision.can_submit_orders is False
 
 
 def test_generic_tsm_provider_packets_are_not_normalized_into_authority(tmp_path):
@@ -339,7 +408,7 @@ def test_loss_review_evidence_attaches_prior_live_entry_context(tmp_path):
     assert "original buy thesis is missing" in payload["resolved_blockers_by_refresh"]
     assert "holding period evidence is missing" not in payload["remaining_blockers"]
     assert "original buy thesis is missing" not in payload["remaining_blockers"]
-    assert "allowed loss-exit reason is missing" in payload["remaining_blockers"]
+    assert payload["remaining_blockers"] == ["refreshed evidence is incomplete"]
     assert payload["review_allowed"] is False
     assert payload["advisory_analysis"]["review_allowed_after_refresh"] is False
 
@@ -372,26 +441,16 @@ def test_loss_review_evidence_classifies_falling_knife_thesis_without_approval(t
     payload = packet.payload
     advisory = payload["advisory_analysis"]
     assert advisory["current_thesis_status_candidate"] == (
-        "thesis_under_pressure_falling_knife_watch"
+        "Refreshed evidence is incomplete; HOLD remains safer."
     )
-    assert advisory["thesis_status_evidence"] == {
-        "status": "thesis_under_pressure_falling_knife_watch",
-        "drivers": [
-            "current candidate is flagged as falling-knife/sharp-drop watch",
-            "prior entry thesis was momentum or time-sensitive",
-            "position is below average entry price",
-        ],
-        "approval_effect": "advisory_only_not_loss_exit_approval",
-        "requires_board_decision": True,
-    }
+    assert advisory["current_loss_review"]["schema"] == "tradingagents.refreshed_loss_review.v1"
+    assert advisory["current_loss_review"]["allowed"] is False
     assert "current thesis status is missing" in payload["resolved_blockers_by_refresh"]
     assert "allowed loss-exit reason is missing" not in payload["resolved_blockers_by_refresh"]
     assert "allowed loss-exit reason source is missing" not in payload["resolved_blockers_by_refresh"]
     assert "loss-exit confidence is missing" not in payload["resolved_blockers_by_refresh"]
     assert "current thesis status is missing" not in payload["remaining_blockers"]
-    assert "allowed loss-exit reason is missing" in payload["remaining_blockers"]
-    assert "allowed loss-exit reason source is missing" in payload["remaining_blockers"]
-    assert "loss-exit confidence is missing" in payload["remaining_blockers"]
+    assert payload["remaining_blockers"] == ["refreshed evidence is incomplete"]
     assert payload["review_allowed"] is False
     assert advisory["review_allowed_after_refresh"] is False
     assert advisory["loss_exit_candidate"]["allowed_exit_reason_candidate"] is None
@@ -404,16 +463,12 @@ def test_loss_review_evidence_classifies_falling_knife_thesis_without_approval(t
 
     packet_path = write_research_packet(packet, tmp_path)
     compact = json.loads(packet_path.with_suffix(".compact.json").read_text(encoding="utf-8"))
-    assert compact["payload"]["advisory_summary"]["thesis_status_evidence"] == {
-        "status": "thesis_under_pressure_falling_knife_watch",
-        "drivers": [
-            "current candidate is flagged as falling-knife/sharp-drop watch",
-            "prior entry thesis was momentum or time-sensitive",
-            "position is below average entry price",
-        ],
-        "approval_effect": "advisory_only_not_loss_exit_approval",
-        "requires_board_decision": True,
-    }
+    # Compact advisory history is descriptive only; it may retain the
+    # falling-knife diagnostic.  The decision-capable current review is the
+    # separately bound Mapping asserted above.
+    assert compact["payload"]["advisory_summary"]["thesis_status_evidence"]["status"] == (
+        "thesis_under_pressure_falling_knife_watch"
+    )
     assert compact["payload"]["advisory_summary"]["loss_exit_candidate"][
         "allowed_exit_reason_candidate"
     ] is None
@@ -457,7 +512,7 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
     assert payload["review_allowed"] is False
     assert payload["evidence_needs"] == list(DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS)
     assert payload["remaining_blockers_before_refresh_count"] == 8
-    assert payload["remaining_blocker_count"] == 7
+    assert payload["remaining_blocker_count"] == 1
     assert payload["resolved_blocker_count"] == 1
     assert payload["resolved_blockers_by_refresh"] == ["source packet ids are missing"]
     assert payload["next_action"] == "autonomous_hold"
@@ -477,7 +532,7 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
     assert compact["execution_authority"] == "none"
     assert compact["payload"]["symbol"] == "TSM"
     assert len(compact["payload"]["remaining_blockers_before_refresh"]) == 8
-    assert len(compact["payload"]["remaining_blockers"]) == 7
+    assert len(compact["payload"]["remaining_blockers"]) == 1
     assert len(compact["payload"]["resolved_blockers_by_refresh"]) == 1
     assert isinstance(compact["payload"]["entry_context"], dict)
     assert "client_order_id" not in compact["payload"]["entry_context"]

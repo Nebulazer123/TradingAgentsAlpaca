@@ -238,18 +238,18 @@ def _rewrite_source_packet(loss_path: Path, source_path: Path, packet: dict[str,
     _write_json(loss_path, loss)
 
 
-def test_records_verified_sell_only_as_an_immutable_analysis_only_decision(tmp_path):
+def test_legacy_historical_review_cannot_become_an_immutable_sell_decision(tmp_path):
     recorded = _record(tmp_path)
 
-    assert recorded.decision.decision == "SELL"
+    assert recorded.decision.decision == "HOLD"
     assert recorded.decision.trade_decision_resolved is True
-    assert recorded.decision.exit_allowed is True
+    assert recorded.decision.exit_allowed is False
     assert recorded.decision.execution_authority == "none"
     assert recorded.decision.can_submit_orders is False
     assert recorded.packet.kind == "portfolio_decision"
     assert recorded.packet.producer_role == "portfolio_executive"
     assert recorded.packet.allowed_effects == ("record_trade_decision",)
-    assert recorded.packet.recommendation == "autonomous_sell_authorized_pending_execution_intent"
+    assert recorded.packet.recommendation == "autonomous_hold"
     assert DecisionLedger(tmp_path / "ledger").verify(evidence_root=tmp_path / "evidence")[-1].kind == "portfolio_decision"
     assert _verify(tmp_path, recorded) == recorded.decision
 
@@ -257,14 +257,13 @@ def test_records_verified_sell_only_as_an_immutable_analysis_only_decision(tmp_p
 def test_exit_reason_taxonomy_reuses_the_supervisor_contract():
     assert loss_board_decision.ALLOWED_LOSS_EXIT_REASONS is ALLOWED_LOSS_EXIT_REASONS
     assert {
-        "thesis_invalidated",
         "company_specific_negative_news",
         "earnings_or_guidance_break",
     } == loss_board_decision.AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS
     assert loss_board_decision.AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS <= ALLOWED_LOSS_EXIT_REASONS
 
 
-def test_closed_session_is_the_only_blocker_a_decision_only_sell_may_ignore(tmp_path):
+def test_closed_session_does_not_rescue_a_legacy_historical_review(tmp_path):
     supervisor = _supervisor(
         blockers=["market session is not tradeable for a live loss exit"],
         blocked_reasons=["market session is not tradeable for a live loss exit"],
@@ -272,7 +271,7 @@ def test_closed_session_is_the_only_blocker_a_decision_only_sell_may_ignore(tmp_
     )
     loss = _loss_evidence(remaining_blockers=["market session is not tradeable for a live loss exit"])
     recorded = _record(tmp_path, supervisor=supervisor, loss=loss)
-    assert recorded.decision.decision == "SELL"
+    assert recorded.decision.decision == "HOLD"
     assert recorded.decision.can_submit_orders is False
 
 
@@ -668,7 +667,7 @@ def test_creation_captures_each_source_once_and_never_cross_binds_a_mutation(tmp
         now=NOW,
     )
 
-    assert recorded.decision.decision == "SELL"
+    assert recorded.decision.decision == "HOLD"
     assert reads == {evidence_root / "sources" / f"{index}.json": 1 for index in range(3)}
 
 
