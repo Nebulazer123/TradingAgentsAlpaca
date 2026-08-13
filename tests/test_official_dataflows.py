@@ -36,6 +36,7 @@ from tradingagents.dataflows._official_common import (
     env_value,
     evidence_packet,
     get_json,
+    get_text_response,
     official_cache_key,
     reset_connector_health,
     safe_fetch_evidence,
@@ -477,6 +478,62 @@ def test_get_json_retries_transient_errors_and_records_connector_health(tmp_path
     assert row["errors"] == 2
     assert row["rate_limit_count"] == 1
     assert row["circuit_state"] == "closed"
+
+
+def test_get_text_response_does_not_retry_forbidden_request(tmp_path, monkeypatch):
+    reset_connector_health()
+    monkeypatch.setattr(
+        official_common,
+        "CONNECTOR_HEALTH_PATH",
+        tmp_path / "connector-health.json",
+    )
+    session = SequenceSession(
+        [
+            HttpResponse({}, text="blocked", status_code=403),
+            HttpResponse({}, text="must not be called", status_code=200),
+        ]
+    )
+    sleeps = []
+
+    with pytest.raises(DataTransportError, match="HTTP 403"):
+        get_text_response(
+            "https://api.example.test/data",
+            session=session,
+            connector_name="forbidden_connector",
+            max_attempts=3,
+            sleep_func=sleeps.append,
+        )
+
+    assert len(session.calls) == 1
+    assert sleeps == []
+
+
+def test_get_json_does_not_retry_forbidden_request(tmp_path, monkeypatch):
+    reset_connector_health()
+    monkeypatch.setattr(
+        official_common,
+        "CONNECTOR_HEALTH_PATH",
+        tmp_path / "connector-health.json",
+    )
+    session = SequenceSession(
+        [
+            HttpResponse({"error": "blocked"}, status_code=403),
+            HttpResponse({"ok": True}, status_code=200),
+        ]
+    )
+    sleeps = []
+
+    with pytest.raises(DataTransportError, match="HTTP 403"):
+        get_json(
+            "https://api.example.test/data",
+            session=session,
+            connector_name="forbidden_json_connector",
+            max_attempts=3,
+            sleep_func=sleeps.append,
+        )
+
+    assert len(session.calls) == 1
+    assert sleeps == []
 
 
 def test_get_json_opens_circuit_after_repeated_connector_failure(tmp_path, monkeypatch):

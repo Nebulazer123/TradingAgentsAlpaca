@@ -29,6 +29,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_news,
 )
 from tradingagents.agents.utils.reporting import analyst_report_from_result
+from tradingagents.dataflows._official_common import RecoverableDataflowError
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
 
@@ -57,7 +58,10 @@ def create_sentiment_analyst(llm):
         # always sees something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
         stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
-        reddit_block = fetch_reddit_posts(ticker)
+        try:
+            reddit_block = fetch_reddit_posts(ticker)
+        except RecoverableDataflowError as exc:
+            reddit_block = f"<reddit unavailable: {type(exc).__name__}>"
 
         system_message = _build_system_message(
             ticker=ticker,

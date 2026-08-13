@@ -185,6 +185,10 @@ class TradingAgentsGraph:
             "selected_analysts": self.selected_analysts,
             "max_debate_rounds": self.config["max_debate_rounds"],
             "max_risk_discuss_rounds": self.config["max_risk_discuss_rounds"],
+            "max_analyst_tool_rounds": self.config.get(
+                "max_analyst_tool_rounds",
+                8,
+            ),
             "analyst_concurrency_limit": self.config.get(
                 "analyst_concurrency_limit",
                 1,
@@ -236,6 +240,9 @@ class TradingAgentsGraph:
             max_debate_rounds=self._checkpoint_shape["max_debate_rounds"],
             max_risk_discuss_rounds=self._checkpoint_shape[
                 "max_risk_discuss_rounds"
+            ],
+            max_analyst_tool_rounds=self._checkpoint_shape[
+                "max_analyst_tool_rounds"
             ],
         )
         self.graph_setup = GraphSetup(
@@ -602,6 +609,7 @@ class TradingAgentsGraph:
             "asset_type": asset_type,
             "max_debate_rounds": shape["max_debate_rounds"],
             "max_risk_discuss_rounds": shape["max_risk_discuss_rounds"],
+            "max_analyst_tool_rounds": shape.get("max_analyst_tool_rounds", 8),
             "analyst_concurrency_limit": shape["analyst_concurrency_limit"],
             "tool_free_analysts": list(shape["tool_free_analysts"]),
             "source_revision": source_revision,

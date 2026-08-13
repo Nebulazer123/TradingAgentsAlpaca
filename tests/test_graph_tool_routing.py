@@ -1,3 +1,4 @@
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -16,6 +17,79 @@ def test_graph_exposes_macro_and_sentiment_context_tools_without_llm_init():
     assert "get_sentiment_context" in _tool_names(nodes["social"])
     assert "get_supplemental_market_context" in _tool_names(nodes["market"])
     assert "get_supplemental_market_context" in _tool_names(nodes["news"])
+
+
+def _tool_call_message(index: int, name: str = "get_indicators") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": name,
+                "args": {"secret_argument": "must-not-leak"},
+                "id": f"call-{index}",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    ("route_name", "expected_tool_node", "analyst"),
+    [
+        ("should_continue_market", "tools_market", "market"),
+        ("should_continue_news", "tools_news", "news"),
+        ("should_continue_fundamentals", "tools_fundamentals", "fundamentals"),
+    ],
+)
+def test_analyst_tool_round_budget_stops_repeated_model_calls(
+    route_name,
+    expected_tool_node,
+    analyst,
+):
+    from tradingagents.graph.conditional_logic import (
+        AnalystToolRoundLimitExceeded,
+        ConditionalLogic,
+    )
+
+    logic = ConditionalLogic(max_analyst_tool_rounds=2)
+    state = {"messages": [_tool_call_message(1), _tool_call_message(2)]}
+    route = getattr(logic, route_name)
+    assert route(state) == expected_tool_node
+
+    state["messages"].append(_tool_call_message(3))
+    with pytest.raises(AnalystToolRoundLimitExceeded) as exc_info:
+        route(state)
+
+    message = str(exc_info.value)
+    assert message == (
+        f"analyst_tool_round_limit_exceeded analyst={analyst} limit=2 "
+        "observed=3 last_tools=get_indicators"
+    )
+    assert "secret_argument" not in message
+    assert "must-not-leak" not in message
+
+
+def test_analyst_tool_round_error_normalizes_untrusted_tool_names():
+    from tradingagents.graph.conditional_logic import (
+        AnalystToolRoundLimitExceeded,
+        ConditionalLogic,
+    )
+
+    logic = ConditionalLogic(max_analyst_tool_rounds=1)
+    state = {
+        "messages": [
+            _tool_call_message(1),
+            _tool_call_message(2, "bad\nname=secret-value"),
+        ]
+    }
+
+    with pytest.raises(AnalystToolRoundLimitExceeded) as exc_info:
+        logic.should_continue_market(state)
+
+    message = str(exc_info.value)
+    assert "last_tools=unknown_tool" in message
+    assert "secret-value" not in message
+    assert "\n" not in message
 
 
 class CapturingStateGraph:

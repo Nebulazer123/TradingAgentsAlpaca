@@ -5044,6 +5044,49 @@ def _score_overnight_rating(rating: str) -> Decimal:
     return score_map.get(rating, Decimal("0.50"))
 
 
+class OvernightGraphIncompleteAnalysis(RuntimeError):
+    """Raised when a graph returns without its required final analysis."""
+
+
+def _require_complete_overnight_graph_state(
+    final_state: Mapping,
+    *,
+    selected_analysts: list[str],
+) -> None:
+    if not isinstance(final_state, Mapping):
+        raise OvernightGraphIncompleteAnalysis(
+            "overnight_graph_incomplete_analysis missing=graph_state"
+        )
+    report_fields = {
+        "market": "market_report",
+        "social": "sentiment_report",
+        "news": "news_report",
+        "fundamentals": "fundamentals_report",
+    }
+    incomplete_markers = {
+        "INCOMPLETE_TOOL_CALL_LOOP",
+        "EMPTY_ANALYST_RESPONSE",
+    }
+    incomplete = []
+    for analyst in selected_analysts:
+        field = report_fields.get(analyst)
+        if field is None:
+            continue
+        report = final_state.get(field)
+        if not isinstance(report, str) or not report.strip() or any(
+            marker in report for marker in incomplete_markers
+        ):
+            incomplete.append(analyst)
+    final_decision = final_state.get("final_trade_decision")
+    if not isinstance(final_decision, str) or not final_decision.strip():
+        incomplete.append("portfolio_decision")
+    if incomplete:
+        raise OvernightGraphIncompleteAnalysis(
+            "overnight_graph_incomplete_analysis missing="
+            + ",".join(sorted(set(incomplete)))
+        )
+
+
 def _run_overnight_ticker_analysis(
     symbol: str,
     trade_date: str,
@@ -5065,6 +5108,10 @@ def _run_overnight_ticker_analysis(
         debug=False,
     )
     final_state, signal = graph.propagate(symbol, trade_date, asset_type="stock")
+    _require_complete_overnight_graph_state(
+        final_state,
+        selected_analysts=list(selected_analysts),
+    )
     final_decision = str(final_state.get("final_trade_decision", ""))
     rating = parse_rating(final_decision or str(signal), default="Hold")
     creator_packet = write_creator_workflow_artifacts(
@@ -5120,7 +5167,14 @@ def _overnight_ticker_process_main(
             }
         )
     except BaseException as exc:
-        queue.put({"ok": False, "error": str(exc)})
+        queue.put(
+            {
+                "ok": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "stage": "ticker_graph",
+            }
+        )
     finally:
         with suppress(Exception):
             queue.close()
@@ -5133,6 +5187,8 @@ def _overnight_worker_message_result(symbol: str, message: dict) -> dict:
         "symbol": symbol.upper(),
         "status": "failed",
         "error": message.get("error", "unknown ticker worker failure"),
+        "error_type": message.get("error_type", "UnknownTickerWorkerFailure"),
+        "error_stage": message.get("stage", "ticker_graph"),
         "score": "0.00",
         "rating": "Hold",
     }
@@ -5188,6 +5244,8 @@ def _wait_for_overnight_worker_result(
                 "symbol": symbol.upper(),
                 "status": "failed",
                 "error": f"Timed out after {timeout_seconds:.0f} seconds",
+                "error_type": "TickerWorkerTimeout",
+                "error_stage": "ticker_graph",
                 "score": "0.00",
                 "rating": "Hold",
             }
@@ -5206,6 +5264,8 @@ def _wait_for_overnight_worker_result(
                     "symbol": symbol.upper(),
                     "status": "failed",
                     "error": f"Ticker worker exited without a result; exitcode={process.exitcode}",
+                    "error_type": "TickerWorkerExited",
+                    "error_stage": "ticker_graph",
                     "score": "0.00",
                     "rating": "Hold",
                 }
@@ -5237,6 +5297,8 @@ def _run_overnight_ticker_analysis_guarded(
                 "symbol": symbol.upper(),
                 "status": "failed",
                 "error": str(exc),
+                "error_type": type(exc).__name__,
+                "error_stage": "ticker_graph",
                 "score": "0.00",
                 "rating": "Hold",
             }
@@ -5253,6 +5315,16 @@ def _run_overnight_ticker_analysis_guarded(
         process=process,
         queue=queue,
         timeout_seconds=timeout_seconds,
+    )
+
+
+def _is_bounded_prefetch_retry_candidate(
+    graph_result: Mapping,
+    graph_config_overrides: Mapping,
+) -> bool:
+    return (
+        graph_result.get("error_type") == "AnalystToolRoundLimitExceeded"
+        and not graph_config_overrides.get("tool_free_analysts")
     )
 
 
@@ -5547,6 +5619,7 @@ def _overnight_graph_profile_overrides(graph_profile: str) -> dict:
         return {
             "overnight_graph_profile": "full",
             "_selected_analysts": ["market", "social", "news", "fundamentals"],
+            "max_analyst_tool_rounds": 8,
         }
     if normalized == "compact":
         return {
@@ -5650,6 +5723,10 @@ def _sanitize_overnight_graph_config(overrides: dict) -> dict:
             DEFAULT_CONFIG.get("max_risk_discuss_rounds"),
         ),
         "max_recur_limit": overrides.get("max_recur_limit", DEFAULT_CONFIG.get("max_recur_limit")),
+        "max_analyst_tool_rounds": overrides.get(
+            "max_analyst_tool_rounds",
+            DEFAULT_CONFIG.get("max_analyst_tool_rounds"),
+        ),
         "analyst_concurrency_limit": overrides.get(
             "analyst_concurrency_limit",
             DEFAULT_CONFIG.get("analyst_concurrency_limit"),
@@ -7490,6 +7567,14 @@ def _fallback_overnight_ticker_result(
     if graph_result and graph_result.get("status") == "failed":
         result["graph_status"] = "failed"
         result["graph_error"] = graph_result.get("error", "unknown graph failure")
+        result["graph_error_type"] = graph_result.get(
+            "error_type",
+            "UnknownTickerWorkerFailure",
+        )
+        result["graph_error_stage"] = graph_result.get(
+            "error_stage",
+            "ticker_graph",
+        )
     return result
 
 
@@ -7538,6 +7623,10 @@ def _build_original_tradingagents_graph_packet(
     time_budget_minutes: float,
     graph_config: dict,
 ) -> dict:
+    full_graph_methods = {
+        "original_tradingagents_graph",
+        "original_tradingagents_graph_bounded_prefetch_retry",
+    }
     selected: list[str] = []
     successful: list[str] = []
     failed: list[str] = []
@@ -7549,9 +7638,9 @@ def _build_original_tradingagents_graph_packet(
             continue
         method = result.get("method")
         graph_status = result.get("graph_status")
-        if method == "original_tradingagents_graph" or graph_status == "failed":
+        if method in full_graph_methods or graph_status == "failed":
             selected.append(symbol)
-        if method == "original_tradingagents_graph" and result.get("status") == "ok":
+        if method in full_graph_methods and result.get("status") == "ok":
             successful.append(symbol)
         if graph_status == "failed":
             failed.append(symbol)
@@ -10257,9 +10346,13 @@ def alpaca_plan_overnight(
         else None
     )
     full_graph_count = 0
+    full_graph_attempt_count = 0
     full_graph_success_count = 0
+    bounded_prefetch_retry_count = 0
+    bounded_prefetch_retry_success_count = 0
     fallback_count = 0
     graph_failure_count = 0
+    graph_attempt_failure_count = 0
     sorted_tradable_universe = sorted(
         tradable_universe,
         key=lambda item: (
@@ -10285,22 +10378,100 @@ def alpaca_plan_overnight(
                 timeout_seconds=per_ticker_timeout_minutes * 60,
                 graph_config_overrides=graph_config_overrides,
             )
+            full_graph_attempt_count += 1
             if graph_result.get("status") == "ok":
                 result = dict(graph_result)
                 result.setdefault("method", "original_tradingagents_graph")
                 full_graph_count += 1
                 full_graph_success_count += 1
             else:
-                graph_failure_count += 1
-                fallback_count += 1
-                full_graph_count += 1
-                result = _fallback_overnight_ticker_result(
-                    symbol=symbol,
-                    candidate=candidate,
-                    candidate_signal=signal,
-                    reason="Full TradingAgents graph failed or timed out; ranked with market snapshot fallback so the overnight packet can still complete.",
-                    graph_result=graph_result,
+                graph_attempt_failure_count += 1
+                can_retry_with_prefetch = (
+                    _is_bounded_prefetch_retry_candidate(
+                        graph_result,
+                        graph_config_overrides,
+                    )
+                    and (
+                        deadline is None
+                        or datetime.datetime.now(tz=datetime.timezone.utc) < deadline
+                    )
                 )
+                retry_result = None
+                retry_timeout_seconds = per_ticker_timeout_minutes * 60
+                if can_retry_with_prefetch and deadline is not None:
+                    remaining_budget_seconds = max(
+                        0.0,
+                        (
+                            deadline
+                            - datetime.datetime.now(tz=datetime.timezone.utc)
+                        ).total_seconds(),
+                    )
+                    if remaining_budget_seconds <= 0:
+                        can_retry_with_prefetch = False
+                    elif retry_timeout_seconds <= 0:
+                        retry_timeout_seconds = remaining_budget_seconds
+                    else:
+                        retry_timeout_seconds = min(
+                            retry_timeout_seconds,
+                            remaining_budget_seconds,
+                        )
+                if can_retry_with_prefetch:
+                    retry_overrides = dict(graph_config_overrides)
+                    retry_overrides["overnight_graph_profile"] = (
+                        "full-bounded-prefetch-retry"
+                    )
+                    retry_overrides["tool_free_analysts"] = list(
+                        retry_overrides.get(
+                            "_selected_analysts",
+                            ["market", "social", "news", "fundamentals"],
+                        )
+                    )
+                    bounded_prefetch_retry_count += 1
+                    full_graph_attempt_count += 1
+                    retry_result = _run_overnight_ticker_analysis_guarded(
+                        symbol=symbol,
+                        trade_date=run_date,
+                        output_dir=log_dir,
+                        timeout_seconds=retry_timeout_seconds,
+                        graph_config_overrides=retry_overrides,
+                    )
+                if retry_result and retry_result.get("status") == "ok":
+                    result = dict(retry_result)
+                    result["method"] = (
+                        "original_tradingagents_graph_bounded_prefetch_retry"
+                    )
+                    result["bounded_prefetch_retry"] = True
+                    result["initial_graph_error"] = graph_result.get("error")
+                    result["initial_graph_error_type"] = graph_result.get(
+                        "error_type"
+                    )
+                    result["initial_graph_error_stage"] = graph_result.get(
+                        "error_stage"
+                    )
+                    full_graph_count += 1
+                    full_graph_success_count += 1
+                    bounded_prefetch_retry_success_count += 1
+                else:
+                    if retry_result:
+                        graph_attempt_failure_count += 1
+                    graph_failure_count += 1
+                    fallback_count += 1
+                    full_graph_count += 1
+                    result = _fallback_overnight_ticker_result(
+                        symbol=symbol,
+                        candidate=candidate,
+                        candidate_signal=signal,
+                        reason="Full TradingAgents graph failed or timed out; ranked with market snapshot fallback so the overnight packet can still complete.",
+                        graph_result=retry_result or graph_result,
+                    )
+                    if retry_result:
+                        result["initial_graph_error"] = graph_result.get("error")
+                        result["initial_graph_error_type"] = graph_result.get(
+                            "error_type"
+                        )
+                        result["initial_graph_error_stage"] = graph_result.get(
+                            "error_stage"
+                        )
         else:
             fallback_count += 1
             result = _fallback_overnight_ticker_result(
@@ -10359,10 +10530,15 @@ def alpaca_plan_overnight(
             "requested_full_graph_limit": requested_full_graph_tickers,
             "graph_disabled_reason": graph_disabled_reason,
             "full_graph_count": full_graph_count,
-            "full_graph_attempt_count": full_graph_count,
+            "full_graph_attempt_count": full_graph_attempt_count,
             "full_graph_success_count": full_graph_success_count,
+            "bounded_prefetch_retry_count": bounded_prefetch_retry_count,
+            "bounded_prefetch_retry_success_count": (
+                bounded_prefetch_retry_success_count
+            ),
             "fallback_count": fallback_count,
             "graph_failure_count": graph_failure_count,
+            "graph_attempt_failure_count": graph_attempt_failure_count,
             "completion_status": completion_status,
             "completion_reasons": completion_reasons,
             "tradable_count": len(tradable_universe),

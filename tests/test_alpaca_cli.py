@@ -1121,6 +1121,8 @@ def test_overnight_worker_wait_times_out_live_process():
 
     assert result["status"] == "failed"
     assert "Timed out" in result["error"]
+    assert result["error_type"] == "TickerWorkerTimeout"
+    assert result["error_stage"] == "ticker_graph"
     assert process.terminated is True
 
 
@@ -2925,6 +2927,146 @@ def test_plan_overnight_limits_full_graph_and_scores_remaining_candidates(monkey
     assert payload["original_tradingagents_graph"]["successful_tickers"] == ["AAPL"]
     assert payload["original_tradingagents_graph"]["bounds"]["full_graph_limit"] == 1
     assert payload["original_tradingagents_graph"]["bounds"]["per_ticker_timeout_minutes"] == 0
+
+
+@pytest.mark.parametrize("retry_status", ["ok", "failed"])
+def test_plan_overnight_retries_tool_loop_once_with_bounded_prefetch(
+    monkeypatch,
+    tmp_path,
+    retry_status,
+):
+    paper_client = _FakeCliClient(paper=True)
+    live_client = _FakeCliClient(paper=False)
+    calls = []
+    monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
+    monkeypatch.setattr(cli_main, "_load_recent_market_packet_paths", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(cli_main, "_default_watchlist_paths", lambda: [])
+    monkeypatch.setattr(
+        cli_main,
+        "_fetch_aggressive_candidate_market_data",
+        lambda: {
+            "NOW": {
+                "current_price": "850",
+                "previous_close": "840",
+                "volume_ratio": "1.5",
+                "tradable": True,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "build_overnight_candidate_universe",
+        lambda **_kwargs: [
+            {
+                "symbol": "NOW",
+                "sources": ["base_universe"],
+                "owned": False,
+                "research_weight": "equal",
+            }
+        ],
+    )
+
+    def fake_guarded(**kwargs):
+        calls.append(dict(kwargs["graph_config_overrides"]))
+        if len(calls) == 1:
+            return {
+                "symbol": "NOW",
+                "status": "failed",
+                "error": (
+                    "analyst_tool_round_limit_exceeded analyst=market limit=8 "
+                    "observed=9 last_tools=get_indicators"
+                ),
+                "error_type": "AnalystToolRoundLimitExceeded",
+                "error_stage": "ticker_graph",
+                "score": "0.00",
+                "rating": "Hold",
+            }
+        if retry_status == "ok":
+            return {
+                "symbol": "NOW",
+                "status": "ok",
+                "rating": "Buy",
+                "score": "0.90",
+                "signal": "BUY",
+                "final_trade_decision": "Rating: Buy",
+                "reports": {
+                    "market": "complete market report",
+                    "sentiment": "complete sentiment report",
+                    "news": "complete news report",
+                    "fundamentals": "complete fundamentals report",
+                },
+            }
+        return {
+            "symbol": "NOW",
+            "status": "failed",
+            "error": "prefetched evidence source unavailable",
+            "error_type": "DataTransportError",
+            "error_stage": "ticker_graph",
+            "score": "0.00",
+            "rating": "Hold",
+        }
+
+    monkeypatch.setattr(cli_main, "_run_overnight_ticker_analysis_guarded", fake_guarded)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "plan-overnight",
+            "--json-output",
+            "--log-dir",
+            str(tmp_path),
+            "--full-graph-tickers",
+            "1",
+            "--per-ticker-timeout-minutes",
+            "0",
+            "--overnight-backend-url",
+            "https://example.test/v1",
+            "--no-research-context",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 2
+    assert calls[0]["overnight_graph_profile"] == "full"
+    assert calls[0].get("tool_free_analysts", []) == []
+    assert calls[1]["overnight_graph_profile"] == "full-bounded-prefetch-retry"
+    assert calls[1]["tool_free_analysts"] == [
+        "market",
+        "social",
+        "news",
+        "fundamentals",
+    ]
+    payload = json.loads(result.stdout)
+    ticker = payload["ticker_results"][0]
+    quality = payload["overnight_quality"]
+    assert quality["full_graph_count"] == 1
+    assert quality["full_graph_attempt_count"] == 2
+    assert quality["bounded_prefetch_retry_count"] == 1
+    assert quality["graph_attempt_failure_count"] == (
+        1 if retry_status == "ok" else 2
+    )
+    assert ticker["initial_graph_error_type"] == "AnalystToolRoundLimitExceeded"
+    if retry_status == "ok":
+        assert ticker["status"] == "ok"
+        assert ticker["method"] == (
+            "original_tradingagents_graph_bounded_prefetch_retry"
+        )
+        assert quality["full_graph_success_count"] == 1
+        assert quality["bounded_prefetch_retry_success_count"] == 1
+        assert quality["graph_failure_count"] == 0
+        assert quality["fallback_count"] == 0
+        assert quality["completion_status"] == "complete"
+        assert quality["original_graph_selected_tickers"] == ["NOW"]
+        assert quality["original_graph_successful_tickers"] == ["NOW"]
+    else:
+        assert ticker["status"] == "fallback"
+        assert ticker["graph_error_type"] == "DataTransportError"
+        assert quality["full_graph_success_count"] == 0
+        assert quality["bounded_prefetch_retry_success_count"] == 0
+        assert quality["graph_failure_count"] == 1
+        assert quality["fallback_count"] == 1
+        assert quality["completion_status"] == "failed"
 
 
 def test_compact_overnight_plan_payload_points_to_raw_packet():
@@ -6748,3 +6890,62 @@ def test_integrations_doctor_redacts_env_and_writes_packet(monkeypatch, tmp_path
     assert compact_payload["composio_configured"] is True
     assert compact_payload["can_submit_orders"] is False
     assert compact_payload["execution_authority"] == "none"
+
+
+def test_full_overnight_profile_keeps_rich_tools_with_a_hard_round_budget():
+    profile = cli_main._overnight_graph_profile_overrides("full")
+
+    assert profile["_selected_analysts"] == [
+        "market",
+        "social",
+        "news",
+        "fundamentals",
+    ]
+    assert profile.get("tool_free_analysts", []) == []
+    assert profile["max_analyst_tool_rounds"] == 8
+
+
+def test_overnight_worker_preserves_sanitized_error_classification():
+    failed = cli_main._overnight_worker_message_result(
+        "NOW",
+        {
+            "ok": False,
+            "error": (
+                "analyst_tool_round_limit_exceeded analyst=market limit=8 "
+                "observed=9 last_tools=get_indicators"
+            ),
+            "error_type": "AnalystToolRoundLimitExceeded",
+            "stage": "ticker_graph",
+        },
+    )
+    fallback = cli_main._fallback_overnight_ticker_result(
+        symbol="NOW",
+        candidate={"sources": ["base_universe"]},
+        candidate_signal=None,
+        reason="bounded fallback",
+        graph_result=failed,
+    )
+
+    assert fallback["graph_error_type"] == "AnalystToolRoundLimitExceeded"
+    assert fallback["graph_error_stage"] == "ticker_graph"
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    ["DataTransportError", "TickerWorkerTimeout", "TickerWorkerExited"],
+)
+def test_bounded_prefetch_retry_excludes_non_tool_loop_failures(error_type):
+    assert not cli_main._is_bounded_prefetch_retry_candidate(
+        {"status": "failed", "error_type": error_type},
+        {"overnight_graph_profile": "full"},
+    )
+
+
+def test_bounded_prefetch_retry_excludes_already_prefetched_graph():
+    assert not cli_main._is_bounded_prefetch_retry_candidate(
+        {
+            "status": "failed",
+            "error_type": "AnalystToolRoundLimitExceeded",
+        },
+        {"tool_free_analysts": ["market", "news", "fundamentals"]},
+    )

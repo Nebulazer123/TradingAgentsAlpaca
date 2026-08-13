@@ -4,6 +4,7 @@ from langchain_core.runnables import RunnableLambda
 
 from tradingagents.agents.analysts import fundamentals_analyst, news_analyst, sentiment_analyst
 from tradingagents.agents.managers import portfolio_manager, research_manager
+from tradingagents.dataflows._official_common import DataTransportError
 
 
 def test_research_manager_passes_asset_type_to_instrument_context(monkeypatch):
@@ -123,6 +124,39 @@ def test_sentiment_analyst_passes_asset_type_to_instrument_context(monkeypatch):
 
     assert seen["args"] == ("BTC-USD", "crypto")
     assert result["sentiment_report"] == "sentiment report"
+
+
+def test_sentiment_analyst_degrades_recoverable_reddit_failure(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(sentiment_analyst.get_news, "func", lambda *_args: "news")
+    monkeypatch.setattr(
+        sentiment_analyst,
+        "fetch_stocktwits_messages",
+        lambda *_args, **_kwargs: "stocktwits",
+    )
+
+    def fail_reddit(*_args, **_kwargs):
+        raise DataTransportError("HTTP 403: official source request failed")
+
+    monkeypatch.setattr(sentiment_analyst, "fetch_reddit_posts", fail_reddit)
+
+    def invoke(prompt_value):
+        seen["system_prompt"] = prompt_value.to_messages()[0].content
+        return SimpleNamespace(content="sentiment report")
+
+    node = sentiment_analyst.create_sentiment_analyst(RunnableLambda(invoke))
+    result = node(
+        {
+            "company_of_interest": "CRM",
+            "asset_type": "stock",
+            "trade_date": "2026-08-13",
+            "messages": [],
+        }
+    )
+
+    assert result["sentiment_report"] == "sentiment report"
+    assert "<reddit unavailable: DataTransportError>" in seen["system_prompt"]
+    assert "HTTP 403" not in seen["system_prompt"]
 
 
 def test_news_analyst_exposes_insider_transactions_tool(monkeypatch):

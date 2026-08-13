@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import cli.main as cli_main
 from tradingagents.research.original_workflow import (
     build_creator_workflow_status,
@@ -98,6 +100,64 @@ def test_overnight_graph_result_includes_creator_workflow_artifact_refs(monkeypa
     assert Path(workflow["packet_path"]).exists()
     assert Path(workflow["complete_report_path"]).exists()
     assert Path(workflow["packet_path"]).parent == tmp_path / "agent_runs" / "NVDA"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "missing_label"),
+    [
+        ("market_report", "", "market"),
+        (
+            "news_report",
+            "Status: INCOMPLETE_TOOL_CALL_LOOP",
+            "news",
+        ),
+        (
+            "fundamentals_report",
+            "Status: EMPTY_ANALYST_RESPONSE",
+            "fundamentals",
+        ),
+        ("final_trade_decision", "", "portfolio_decision"),
+    ],
+)
+def test_overnight_graph_rejects_incomplete_analysis_before_writing_artifacts(
+    monkeypatch,
+    tmp_path,
+    field,
+    value,
+    missing_label,
+):
+    state = _creator_final_state()
+    state[field] = value
+
+    class FakeGraph:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def propagate(self, symbol, trade_date, asset_type="stock"):
+            return state, "Hold"
+
+    monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeGraph)
+
+    with pytest.raises(
+        cli_main.OvernightGraphIncompleteAnalysis,
+        match=rf"missing=.*{missing_label}",
+    ):
+        cli_main._run_overnight_ticker_analysis(
+            "NVDA",
+            "2026-06-03",
+            tmp_path,
+            graph_config_overrides={
+                "_selected_analysts": [
+                    "market",
+                    "social",
+                    "news",
+                    "fundamentals",
+                ],
+                "llm_provider": "ollama",
+            },
+        )
+
+    assert not (tmp_path / "agent_runs" / "NVDA").exists()
 
 
 def test_creator_workflow_status_is_dashboard_only():

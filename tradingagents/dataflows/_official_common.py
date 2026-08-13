@@ -418,7 +418,7 @@ def _request_json(
                 rate_limited=rate_limited,
                 write=True,
             )
-            if attempt < attempts:
+            if attempt < attempts and _retryable_request_failure(status_code):
                 sleep_func(
                     _backoff_seconds(
                         attempt,
@@ -497,6 +497,10 @@ def _request_exception_status_code(exc: BaseException) -> int | None:
         return None
 
 
+def _retryable_request_failure(status_code: int | None) -> bool:
+    return status_code is None or status_code in {408, 429, 500, 502, 503, 504}
+
+
 def _request_text_response(
     method: str,
     url: str,
@@ -572,7 +576,7 @@ def _request_text_response(
                 rate_limited=rate_limited,
                 write=True,
             )
-            if attempt < attempts:
+            if attempt < attempts and _retryable_request_failure(status_code):
                 sleep_func(
                     _backoff_seconds(
                         attempt,

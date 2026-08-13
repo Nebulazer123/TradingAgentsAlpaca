@@ -172,6 +172,7 @@ def _bare_signature_graph(
     graph.config = {
         "max_debate_rounds": 1,
         "max_risk_discuss_rounds": 1,
+        "max_analyst_tool_rounds": 8,
         "analyst_concurrency_limit": 2,
         "tool_free_analysts": ["news", "market"],
     }
@@ -184,6 +185,7 @@ def _bare_signature_graph(
         "selected_analysts": graph.selected_analysts,
         "max_debate_rounds": graph.config["max_debate_rounds"],
         "max_risk_discuss_rounds": graph.config["max_risk_discuss_rounds"],
+        "max_analyst_tool_rounds": graph.config["max_analyst_tool_rounds"],
         "analyst_concurrency_limit": graph.config["analyst_concurrency_limit"],
         "tool_free_analysts": tuple(
             sorted(set(graph.config["tool_free_analysts"]))
@@ -217,6 +219,7 @@ def test_run_signature_is_stable_canonical_and_allowlisted():
         "analyst_concurrency_limit",
         "asset_type",
         "max_debate_rounds",
+        "max_analyst_tool_rounds",
         "max_risk_discuss_rounds",
         "packet_handoff_schema_version",
         "schema_version",
@@ -246,6 +249,7 @@ def test_run_signature_is_stable_canonical_and_allowlisted():
         (("market", "news"), "crypto", {}),
         (("market", "news"), "stock", {"max_debate_rounds": 2}),
         (("market", "news"), "stock", {"max_risk_discuss_rounds": 2}),
+        (("market", "news"), "stock", {"max_analyst_tool_rounds": 2}),
         (("market", "news"), "stock", {"analyst_concurrency_limit": 1}),
         (
             ("market", "news"),
