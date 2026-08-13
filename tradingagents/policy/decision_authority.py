@@ -38,6 +38,8 @@ AUTHORITY_RECORD_FIELDS = (
 class ExitAuthorityVerdict:
     exit_allowed: bool
     trade_decision_resolved: bool
+    execution_eligible: bool
+    execution_blockers: tuple[str, ...]
     authority_source: str
     requires_additional_decision: bool
     decision_owner: str
@@ -157,6 +159,8 @@ def _invalid_policy_verdict(reason: str) -> ExitAuthorityVerdict:
     return ExitAuthorityVerdict(
         exit_allowed=False,
         trade_decision_resolved=False,
+        execution_eligible=False,
+        execution_blockers=("pre-registered policy rule is invalid",),
         authority_source="invalid_pre_registered_policy_rule",
         requires_additional_decision=False,
         decision_owner="portfolio_executive",
@@ -223,6 +227,8 @@ def resolve_exit_authority(
         return ExitAuthorityVerdict(
             exit_allowed=True,
             trade_decision_resolved=True,
+            execution_eligible=True,
+            execution_blockers=(),
             authority_source="pre_registered_policy_rule",
             requires_additional_decision=False,
             decision_owner="execution_operator",
@@ -242,6 +248,8 @@ def resolve_exit_authority(
             return ExitAuthorityVerdict(
                 exit_allowed=verified.exit_allowed,
                 trade_decision_resolved=True,
+                execution_eligible=verified.execution_eligible,
+                execution_blockers=verified.execution_blockers,
                 authority_source="autonomous_portfolio_board",
                 requires_additional_decision=False,
                 decision_owner="portfolio_executive",
@@ -255,14 +263,20 @@ def resolve_exit_authority(
         return ExitAuthorityVerdict(
             exit_allowed=False,
             trade_decision_resolved=False,
+            execution_eligible=False,
+            execution_blockers=("discretionary loss exit requires an internal portfolio decision",),
             authority_source="advisory_research",
             requires_additional_decision=True,
             decision_owner="portfolio_executive",
             reason="discretionary loss exit requires an internal portfolio decision",
         )
     return ExitAuthorityVerdict(
-        exit_allowed=review.get("allowed") is True,
+        exit_allowed=review.get("allowed") is True and review.get("execution_eligible") is True,
         trade_decision_resolved=review.get("allowed") is True,
+        execution_eligible=review.get("execution_eligible") is True,
+        execution_blockers=tuple(
+            item for item in _bounded_strings(review.get("execution_blockers"))
+        ) or (() if review.get("execution_eligible") is True else ("execution eligibility is unverified",)),
         authority_source="supervisor_review",
         requires_additional_decision=False,
         decision_owner="portfolio_executive",

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -335,19 +336,23 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
     hourly_path.parent.mkdir()
     hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
 
-    def quote(symbol, price, previous):
+    def quote(symbol, price, previous, *, observed=now):
         return evidence_packet(
             source_name="finnhub", evidence_type="quote_price_context", subject=symbol,
             symbol=symbol, source_ref=f"https://finnhub.test/quote/{symbol}",
-            payload={"c": price, "pc": previous}, quality="high", as_of=now,
+            payload={"c": price, "pc": previous}, quality="high", as_of=observed,
             tool_route="finnhub_api",
         )
 
     provider = TickerProviderResearchResult(
         symbol="ORCL",
         packets=[
-            quote("ORCL", 91.0, 100.0), quote("SPY", 650.0, 648.0),
-            quote("QQQ", 580.0, 578.0), quote("XLK", 260.0, 259.0),
+            quote("ORCL", 91.0, 100.0),
+            # Sequential provider reads have independent source times.  All
+            # four remain fresh and inside the documented 120-second skew.
+            quote("SPY", 650.0, 648.0, observed="2026-08-13T14:54:40+00:00"),
+            quote("QQQ", 580.0, 578.0, observed="2026-08-13T14:54:20+00:00"),
+            quote("XLK", 260.0, 259.0, observed="2026-08-13T14:53:10+00:00"),
             evidence_packet(
                 source_name="finnhub", evidence_type="market_news", subject="ORCL", symbol="ORCL",
                 source_ref="https://finnhub.test/news/ORCL",
@@ -423,8 +428,28 @@ def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_pa
     ]
     assert closed.payload["current_loss_review"]["blockers"] == []
     # The board resolves SELL as a decision-only outcome while closed.
+    # Alpaca returns nanosecond timestamps.  The immutable wrapper is rounded
+    # to its whole-second source instant, never replaced by a local clock.
+    closed_packet = json.loads(closed_path.read_text(encoding="utf-8"))
+    closed_packet["payload"]["current_loss_review"]["market_clock"]["raw_clock"]["timestamp"] = "2026-08-13T14:55:00.123456789Z"
+    raw = closed_packet["payload"]["current_loss_review"]["market_clock"]["raw_clock"]
+    closed_packet["payload"]["current_loss_review"]["market_clock"]["raw_clock_sha256"] = hashlib.sha256(
+        json.dumps(raw, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    closed_packet["payload"]["market_clock_snapshot"] = closed_packet["payload"]["current_loss_review"]["market_clock"]
+    closed_path.write_text(json.dumps(closed_packet), encoding="utf-8")
     decision = record_autonomous_loss_board_decision(supervisor_packet_path=hourly_path, loss_evidence_packet_path=closed_path, source_revision="1" * 40, ledger_root=tmp_path / "ledger", evidence_root=tmp_path, now=__import__("datetime").datetime.fromisoformat(now)).decision
     assert decision.decision == "SELL" and decision.can_submit_orders is False
+    assert decision.execution_eligible is False
+    assert decision.exit_allowed is False
+
+    # Changing the raw source clock after the hash is bound makes the decision
+    # fail closed; a fractional timestamp is accepted only when authenticated.
+    tampered = json.loads(closed_path.read_text(encoding="utf-8"))
+    tampered["payload"]["current_loss_review"]["market_clock"]["raw_clock"]["timestamp"] = "2026-08-13T14:55:01.123456789Z"
+    closed_path.write_text(json.dumps(tampered), encoding="utf-8")
+    tampered_decision = record_autonomous_loss_board_decision(supervisor_packet_path=hourly_path, loss_evidence_packet_path=closed_path, source_revision="3" * 40, ledger_root=tmp_path / "ledger-tampered", evidence_root=tmp_path, now=__import__("datetime").datetime.fromisoformat(now)).decision
+    assert tampered_decision.decision == "HOLD"
 
     open_packet = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=True))
     assert open_packet.payload["current_loss_review"]["market_session"] == "regular"
@@ -432,6 +457,24 @@ def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_pa
     assert open_packet.payload["current_loss_review"]["trade_decision_allowed"] is True
     assert open_packet.payload["current_loss_review"]["execution_eligible"] is True
     assert open_packet.payload["current_loss_review"]["execution_blockers"] == []
+
+
+def test_news_magnitude_requires_explicit_change_language():
+    base = {
+        "data": [{
+            "datetime": 1786632840,
+            "headline": "Oracle cut revenue guidance",
+            "summary": "Guidance cut to 5%.",
+            "url": "https://issuer.test/adverse",
+        }]
+    }
+    assert loss_evidence._adverse_news_event(
+        base, source_name="finnhub", symbol="ORCL", as_of="2026-08-13T14:55:00+00:00"
+    ) is None
+    base["data"][0]["summary"] = "Guidance cut by 5%."
+    assert loss_evidence._adverse_news_event(
+        base, source_name="finnhub", symbol="ORCL", as_of="2026-08-13T14:55:00+00:00"
+    ) == {"event_category": "guidance_cut", "direction": "adverse", "impact_fraction": "-0.05"}
 
 
 def test_low_quality_or_stale_clock_fails_closed_for_loss_board(tmp_path):

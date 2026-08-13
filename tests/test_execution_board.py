@@ -207,7 +207,7 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
     assert compact["execution_authority"] == "none"
     assert compact["autonomous_loss_decision"] == {
         key: decision[key]
-        for key in ("decision_id", "ledger_packet_id", "symbol", "decision", "trade_decision_resolved", "exit_allowed")
+        for key in ("decision_id", "ledger_packet_id", "symbol", "decision", "trade_decision_resolved", "execution_eligible", "exit_allowed")
     }
     assert compact["loss_review_evidence"] == {
         key: review["loss_review_evidence"][key]
@@ -229,7 +229,7 @@ def test_compact_board_is_a_fixed_scalar_projection_and_never_leaks_nested_mater
     serialized = json.dumps(compact)
     assert "DO-NOT-LEAK" not in serialized
     assert compact["raw_packet_sha256"] == "a" * 64
-    assert compact["autonomous_loss_decision"] == {"decision_id": "d", "ledger_packet_id": "l", "symbol": "TSM", "decision": "HOLD", "trade_decision_resolved": True, "exit_allowed": False}
+    assert compact["autonomous_loss_decision"] == {"decision_id": "d", "ledger_packet_id": "l", "symbol": "TSM", "decision": "HOLD", "trade_decision_resolved": True, "execution_eligible": None, "exit_allowed": False}
 
 
 def test_autonomous_loss_board_compact_sidecar_is_exact_scalar_contract(tmp_path):
@@ -241,6 +241,7 @@ def test_autonomous_loss_board_compact_sidecar_is_exact_scalar_contract(tmp_path
             "ledger_packet_id": f"wp-{decision_id}-portfolio_decision",
             "symbol": "TSM", "decision": "HOLD", "supervisor_decision_id": "loss-review-1",
             "source_revision": "1" * 40, "trade_decision_resolved": True,
+            "execution_eligible": False, "execution_blockers_sha256": "c" * 64,
             "exit_allowed": False, "analysis_only": True, "execution_authority": "none",
             "can_submit_orders": False, "accepted_source_count": 3,
             "accepted_sources_sha256": "a" * 64,
@@ -253,7 +254,7 @@ def test_autonomous_loss_board_compact_sidecar_is_exact_scalar_contract(tmp_path
     assert set(compact) == {
         "schema", "generated_at", "raw_packet_path", "raw_packet_sha256", "symbol",
         "decision", "decision_id", "ledger_packet_id", "supervisor_decision_id", "source_revision",
-        "trade_decision_resolved", "exit_allowed", "analysis_only", "execution_authority",
+        "trade_decision_resolved", "execution_eligible", "execution_blockers_sha256", "exit_allowed", "analysis_only", "execution_authority",
         "can_submit_orders", "accepted_source_count", "accepted_sources_sha256",
     }
     assert all(not isinstance(value, (dict, list)) for value in compact.values())

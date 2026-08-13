@@ -132,6 +132,8 @@ def _record_strict_hold_board(tmp_path: Path, *, symbol: str = "TSM") -> dict:
         "supervisor_decision_id": decision.supervisor_decision_id,
         "source_revision": decision.source_revision,
         "trade_decision_resolved": decision.trade_decision_resolved,
+        "execution_eligible": decision.execution_eligible,
+        "execution_blockers": list(decision.execution_blockers),
         "exit_allowed": decision.exit_allowed,
         "analysis_only": decision.analysis_only,
         "execution_authority": decision.execution_authority,
@@ -161,6 +163,9 @@ def _record_strict_hold_board(tmp_path: Path, *, symbol: str = "TSM") -> dict:
                 json.dumps([], sort_keys=True, separators=(",", ":")).encode("utf-8")
             ).hexdigest(),
             "accepted_source_count": 0,
+            "execution_blockers_sha256": hashlib.sha256(
+                json.dumps(list(decision.execution_blockers), sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
         }
     )
     board = {

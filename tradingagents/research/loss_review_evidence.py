@@ -460,9 +460,19 @@ def _accepted_source_descriptors(
         spy_component = quote_components["SPY"]
         qqq_component = quote_components["QQQ"]
         sector_component = quote_components[loss_review_sector_proxy(provider_result.symbol)]
+        component_times = {
+            item["symbol"]: _parse_timestamp(item["as_of"])
+            for item in (target_component, spy_component, qqq_component, sector_component)
+        }
+        if any(value is None for value in component_times.values()):
+            return result
+        aggregate_as_of = max(component_times.values()).replace(microsecond=0).isoformat(timespec="seconds")
+        sector_as_of = max(
+            component_times[target], component_times[loss_review_sector_proxy(provider_result.symbol)]
+        ).replace(microsecond=0).isoformat(timespec="seconds")
         normalized_payload = {
             "symbol": target,
-            "as_of": target_component["as_of"],
+            "as_of": aggregate_as_of,
             "target": {"symbol": target, "value": target_component["value"], "as_of": target_component["as_of"]},
             "spy": {"symbol": "SPY", "value": spy_component["value"], "as_of": spy_component["as_of"]},
             "qqq": {"symbol": "QQQ", "value": qqq_component["value"], "as_of": qqq_component["as_of"]},
@@ -472,7 +482,7 @@ def _accepted_source_descriptors(
                     (_float_value(target_component["value"]) or 0)
                     - (_float_value(sector_component["value"]) or 0)
                 ),
-                "as_of": target_component["as_of"],
+                "as_of": sector_as_of,
             },
             "target_relative_to_spy": _normalized_decimal(
                 (_float_value(target_component["value"]) or 0)
@@ -515,7 +525,7 @@ def _accepted_source_descriptors(
                 "evidence_type": "market_context",
                 "subject": target,
                 "symbol": target,
-                "as_of": target_component["as_of"],
+                "as_of": aggregate_as_of,
                 # An aggregate cannot acquire quality its weakest raw input
                 # does not have.  In particular a low yfinance component
                 # must never be laundered into a SELL-eligible bundle.
@@ -537,7 +547,7 @@ def _accepted_source_descriptors(
                         "packet_id": normalized_packet["packet_id"],
                         "source_name": normalized_packet["source_name"],
                         "evidence_type": "market_context",
-                        "as_of": normalized_packet["as_of"],
+                    "as_of": normalized_packet["as_of"],
                         "quality": normalized_packet["quality"],
                     }
                 )
@@ -790,7 +800,13 @@ def _news_items(payload: Mapping[str, Any]) -> Sequence[Any]:
     return ()
 
 
-_PERCENT = re.compile(r"(?:by|of|to)\s+(\d{1,3}(?:\.\d+)?)\s*%", re.I)
+# A target such as "guidance cut to 5%" does not reveal the magnitude of the
+# change.  Decision evidence needs an explicit adverse delta, not an endpoint.
+_ADVERSE_CHANGE_PERCENT = re.compile(
+    r"\b(?:cut|cuts|lowered|lowers|lower|reduced|reduces|reduce)\b.{0,80}?\b(?:by|of)\s+(\d{1,3}(?:\.\d+)?)\s*%"
+    r"|\b(?:down|fell|fall)\b\s+(\d{1,3}(?:\.\d+)?)\s*%",
+    re.I,
+)
 
 
 def _adverse_news_event(
@@ -823,10 +839,10 @@ def _adverse_news_event(
         text = " ".join(str(item.get(key) or "") for key in ("category", "headline", "summary")).lower()
         if not text or any(token in text for token in _POSITIVE_WORDS):
             continue
-        magnitude = _PERCENT.search(text)
+        magnitude = _ADVERSE_CHANGE_PERCENT.search(text)
         if magnitude is None:
             continue
-        percent = _float_value(magnitude.group(1))
+        percent = _float_value(next(value for value in magnitude.groups() if value is not None))
         if percent is None or not 1 <= percent <= 100:
             continue
         change = _normalized_decimal(-percent / 100.0)

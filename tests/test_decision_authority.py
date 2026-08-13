@@ -23,11 +23,11 @@ def test_unverified_board_input_cannot_resolve_a_discretionary_exit():
 
 
 @pytest.mark.parametrize(
-    ("decision", "exit_allowed"),
-    [("HOLD", False), ("SELL", True)],
+    ("decision", "execution_eligible", "exit_allowed"),
+    [("HOLD", False, False), ("SELL", False, False), ("SELL", True, True)],
 )
 def test_verified_board_decision_closes_the_trade_decision_only(
-    monkeypatch, tmp_path, decision, exit_allowed
+    monkeypatch, tmp_path, decision, execution_eligible, exit_allowed
 ):
     review = {
         "symbol": "TSM",
@@ -50,6 +50,10 @@ def test_verified_board_decision_closes_the_trade_decision_only(
         supervisor_decision_id="loss-review-tsm-1",
         decision=decision,
         exit_allowed=exit_allowed,
+        execution_eligible=execution_eligible,
+        execution_blockers=(
+            () if execution_eligible else ("market session is not tradeable for a live loss exit",)
+        ),
         trade_decision_resolved=True,
         analysis_only=True,
         execution_authority="none",
@@ -76,6 +80,7 @@ def test_verified_board_decision_closes_the_trade_decision_only(
 
     assert verdict.exit_allowed is exit_allowed
     assert verdict.allowed is exit_allowed
+    assert verdict.execution_eligible is execution_eligible
     assert verdict.trade_decision_resolved is True
     assert verdict.requires_additional_decision is False
     assert verdict.authority_source == "autonomous_portfolio_board"
@@ -112,6 +117,8 @@ def test_board_decision_rejects_replaced_or_wrong_current_supervisor_binding(
         supervisor_decision_id="loss-review-tsm-1",
         decision="HOLD",
         exit_allowed=False,
+        execution_eligible=False,
+        execution_blockers=("decision evidence is incomplete",),
         trade_decision_resolved=True,
         analysis_only=True,
         execution_authority="none",

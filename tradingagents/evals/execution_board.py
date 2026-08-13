@@ -392,6 +392,13 @@ def _record_loss_board_decision(
             ).encode("utf-8")
         ).hexdigest(),
         "accepted_source_count": len(accepted_sources_material),
+        # The compact sidecar keeps a digest rather than free-form blockers;
+        # the immutable raw BOARD record remains the authoritative wording.
+        "execution_blockers_sha256": hashlib.sha256(
+            json.dumps(
+                list(decision.execution_blockers), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
         "_source_binding": {
             "matched": True,
             "issue": None,
@@ -410,6 +417,8 @@ def _record_loss_board_decision(
             },
         },
         "trade_decision_resolved": decision.trade_decision_resolved,
+        "execution_eligible": decision.execution_eligible,
+        "execution_blockers": list(decision.execution_blockers),
         "exit_allowed": decision.exit_allowed,
         "analysis_only": decision.analysis_only,
         "execution_authority": decision.execution_authority,
@@ -828,6 +837,8 @@ def build_execution_board_review(
         )
         loss_review_evidence["review_allowed"] = authority.exit_allowed
         autonomous_loss_decision["trade_decision_resolved"] = authority.trade_decision_resolved
+        autonomous_loss_decision["execution_eligible"] = authority.execution_eligible
+        autonomous_loss_decision["execution_blockers"] = list(authority.execution_blockers)
         autonomous_loss_decision["exit_allowed"] = authority.exit_allowed
 
     loss_review_evidence_pending = bool(
@@ -1106,7 +1117,8 @@ def compact_execution_board_review(
     sidecar_fields = (
         "decision_id", "ledger_packet_id", "symbol", "decision",
         "supervisor_decision_id", "source_revision", "trade_decision_resolved",
-        "exit_allowed", "analysis_only", "execution_authority", "can_submit_orders",
+        "execution_eligible", "execution_blockers_sha256", "exit_allowed",
+        "analysis_only", "execution_authority", "can_submit_orders",
         "accepted_source_count", "accepted_sources_sha256",
     )
     # A recorded autonomous decision has a dedicated, intentionally tiny
@@ -1141,7 +1153,10 @@ def compact_execution_board_review(
             key: loss.get(key) for key in ("symbol", "review_allowed", "remaining_blocker_count", "resolved_blocker_count", "next_action")
         } if isinstance(loss, Mapping) else {},
         "autonomous_loss_decision": {
-            key: decision.get(key) for key in ("decision_id", "ledger_packet_id", "symbol", "decision", "trade_decision_resolved", "exit_allowed")
+            key: decision.get(key) for key in (
+                "decision_id", "ledger_packet_id", "symbol", "decision",
+                "trade_decision_resolved", "execution_eligible", "exit_allowed",
+            )
         } if isinstance(decision, Mapping) else {},
         "metrics": {key: (review.get("metrics") or {}).get(key) for key in ("packet_count", "submitted_order_count", "live_buy_count", "live_sell_count", "loss_exit_count")},
         "violation_count": len(violations),

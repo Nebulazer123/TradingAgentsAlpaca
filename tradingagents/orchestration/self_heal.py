@@ -397,6 +397,13 @@ def _strict_board_projection(
         "supervisor_decision_id": verified.supervisor_decision_id,
         "source_revision": verified.source_revision,
         "trade_decision_resolved": verified.trade_decision_resolved,
+        "execution_eligible": verified.execution_eligible,
+        "execution_blockers": list(verified.execution_blockers),
+        "execution_blockers_sha256": hashlib.sha256(
+            json.dumps(
+                list(verified.execution_blockers), sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
         "exit_allowed": verified.exit_allowed,
         "analysis_only": verified.analysis_only,
         "execution_authority": verified.execution_authority,
@@ -854,6 +861,8 @@ def _validated_autonomous_loss_board_sidecar_raw_path(
         "supervisor_decision_id",
         "source_revision",
         "trade_decision_resolved",
+        "execution_eligible",
+        "execution_blockers_sha256",
         "exit_allowed",
         "analysis_only",
         "execution_authority",
@@ -881,9 +890,12 @@ def _validated_autonomous_loss_board_sidecar_raw_path(
         or not isinstance(compact.get("source_revision"), str)
         or _SOURCE_REVISION.fullmatch(compact["source_revision"]) is None
         or compact.get("trade_decision_resolved") is not True
+        or not isinstance(compact.get("execution_eligible"), bool)
+        or not isinstance(compact.get("execution_blockers_sha256"), str)
+        or _SHA256_HEX.fullmatch(compact["execution_blockers_sha256"]) is None
         or not isinstance(compact.get("exit_allowed"), bool)
+        or compact.get("execution_eligible") is not (decision == "SELL" and compact["exit_allowed"] is True)
         or (decision == "HOLD" and compact["exit_allowed"] is not False)
-        or (decision == "SELL" and compact["exit_allowed"] is not True)
         or compact.get("analysis_only") is not True
         or compact.get("execution_authority") != "none"
         or compact.get("can_submit_orders") is not False

@@ -31,6 +31,10 @@ _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,15}$")
 _DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
 _MAX_AGE = dt.timedelta(minutes=15)
+# A four-symbol context is read sequentially.  Its individual provider times
+# therefore need not be identical, but they must describe one bounded market
+# observation rather than a stitched-together history.
+_MARKET_COMPONENT_MAX_SKEW = dt.timedelta(seconds=120)
 _QUALITIES = frozenset({"high", "medium", "low"})
 _ADVERSE_NEWS_EVENTS = frozenset({"guidance_cut", "material_contract_loss", "regulatory_adverse_action", "thesis_invalidator"})
 _ADVERSE_FILING_EVENTS = frozenset({"guidance_cut", "earnings_miss", "material_impairment", "adverse_filing_disclosure"})
@@ -71,6 +75,24 @@ def _time(value: Any, field: str) -> dt.datetime:
     return parsed
 
 
+def _raw_vendor_time(value: Any, field: str) -> dt.datetime:
+    """Parse an RFC3339 vendor observation, then canonicalize to UTC seconds.
+
+    This is deliberately narrower in use than ``_time``: authority envelopes
+    remain strict canonical strings.  Only an authenticated raw vendor field
+    (currently Alpaca's clock timestamp) may carry fractional seconds or ``Z``.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be RFC3339")
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be RFC3339") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return parsed.astimezone(_UTC).replace(microsecond=0)
+
+
 def _text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip() or value.strip() != value:
         raise ValueError(f"{field} must be a nonempty canonical string")
@@ -92,6 +114,14 @@ def _decimal(value: Any, field: str) -> str:
 def _is_decimal(value: Any, field: str) -> bool:
     try:
         _decimal(value, field)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_time(value: Any, field: str) -> bool:
+    try:
+        _time(value, field)
     except ValueError:
         return False
     return True
@@ -297,6 +327,8 @@ class AutonomousLossBoardDecision:
     evidence_complete: bool
     evidence_gaps: tuple[str, ...]
     trade_decision_resolved: bool
+    execution_eligible: bool
+    execution_blockers: tuple[str, ...]
     exit_allowed: bool
     producer_role: str = field(init=False, default="portfolio_executive")
     analysis_only: bool = field(init=False, default=True)
@@ -321,6 +353,10 @@ class AutonomousLossBoardDecision:
             type(self.evidence_complete) is not bool
             or type(self.trade_decision_resolved) is not bool
             or self.trade_decision_resolved is not True
+            or type(self.execution_eligible) is not bool
+            or not isinstance(self.execution_blockers, tuple)
+            or not all(_text(x, "execution_blocker") for x in self.execution_blockers)
+            or len(self.execution_blockers) != len(set(self.execution_blockers))
             or type(self.exit_allowed) is not bool
             or not isinstance(self.evidence_gaps, tuple)
             or not all(_text(x, "evidence_gap") for x in self.evidence_gaps)
@@ -328,7 +364,14 @@ class AutonomousLossBoardDecision:
         ):
             raise ValueError("invalid decision booleans or gaps")
         sell = self.decision == "SELL"
-        if sell is not self.evidence_complete or sell is not self.exit_allowed or (sell and (self.evidence_gaps or confidence < Decimal("0.75"))) or (not sell and not self.evidence_gaps):
+        if (
+            sell is not self.evidence_complete
+            or self.exit_allowed is not (sell and self.execution_eligible)
+            or (self.execution_eligible and self.execution_blockers)
+            or (not self.execution_eligible and not self.execution_blockers)
+            or (sell and (self.evidence_gaps or confidence < Decimal("0.75")))
+            or (not sell and not self.evidence_gaps)
+        ):
             raise ValueError("decision must fail closed")
         if self.decision_id != hashlib.sha256(_canon(self._identity())).hexdigest():
             raise ValueError("decision_id does not match canonical material")
@@ -351,6 +394,8 @@ class AutonomousLossBoardDecision:
             "evidence_complete": self.evidence_complete,
             "evidence_gaps": list(self.evidence_gaps),
             "trade_decision_resolved": self.trade_decision_resolved,
+            "execution_eligible": self.execution_eligible,
+            "execution_blockers": list(self.execution_blockers),
             "exit_allowed": self.exit_allowed,
             "producer_role": self.producer_role,
             "analysis_only": self.analysis_only,
@@ -372,6 +417,7 @@ class AutonomousLossBoardDecision:
             or value.get("can_submit_orders") is not False
             or not isinstance(value.get("accepted_sources"), list)
             or not isinstance(value.get("evidence_gaps"), list)
+            or not isinstance(value.get("execution_blockers"), list)
             or not isinstance(value.get("supervisor_packet"), Mapping)
             or not isinstance(value.get("loss_evidence_packet"), Mapping)
         ):
@@ -397,6 +443,8 @@ class AutonomousLossBoardDecision:
             evidence_complete=value["evidence_complete"],
             evidence_gaps=tuple(value["evidence_gaps"]),
             trade_decision_resolved=value["trade_decision_resolved"],
+            execution_eligible=value["execution_eligible"],
+            execution_blockers=tuple(value["execution_blockers"]),
             exit_allowed=value["exit_allowed"],
         )
 
@@ -490,18 +538,18 @@ def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str
     return (
         target.get("symbol") == review.get("symbol")
         and _is_decimal(target.get("value"), "source target")
-        and target.get("as_of") == source.as_of
+        and _is_time(target.get("as_of"), "target as_of")
         and spy.get("symbol") == "SPY"
         and spy.get("value") == context.get("SPY")
-        and spy.get("as_of") == source.as_of
+        and _is_time(spy.get("as_of"), "SPY as_of")
         and _is_decimal(spy.get("value"), "source SPY")
         and qqq.get("symbol") == "QQQ"
         and qqq.get("value") == context.get("QQQ")
-        and qqq.get("as_of") == source.as_of
+        and _is_time(qqq.get("as_of"), "QQQ as_of")
         and _is_decimal(qqq.get("value"), "source QQQ")
         and sector_relative.get("symbol") == review.get("symbol")
         and sector_relative.get("value") == sector.get("relative_performance")
-        and sector_relative.get("as_of") == source.as_of
+        and _is_time(sector_relative.get("as_of"), "sector as_of")
         and _is_decimal(sector_relative.get("value"), "source sector relative")
         and Decimal(sector_relative["value"]) <= Decimal("-0.01")
         and review.get("relative_performance_vs_SPY") == payload.get("target_relative_to_spy")
@@ -512,7 +560,7 @@ def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str
 
 
 def _market_source_has_exact_component_provenance(
-    capture: CapturedSourceEvidence, root: Path, symbol: str
+    capture: CapturedSourceEvidence, root: Path, symbol: str, now: dt.datetime
 ) -> bool:
     """Reopen each raw quote and verify values and weakest quality exactly.
 
@@ -528,6 +576,7 @@ def _market_source_has_exact_component_provenance(
     seen: set[str] = set()
     quality_rank = {"unknown": 0, "low": 1, "medium": 2, "high": 3}
     qualities: list[str] = []
+    component_times: list[dt.datetime] = []
     payload = capture.packet_object.get("payload")
     if not isinstance(payload, Mapping):
         return False
@@ -555,11 +604,19 @@ def _market_source_has_exact_component_provenance(
             or stored.get("evidence_type") != component.get("evidence_type")
             or stored.get("evidence_type") not in {"quote_price_context", "quote"}
             or stored.get("quality") != component.get("quality")
-            or stored.get("as_of") != component.get("as_of")
+            or _raw_vendor_time(stored.get("as_of"), "component as_of")
+            != _time(component.get("as_of"), "component as_of")
         ):
             return False
         if component.get("quality") not in quality_rank:
             return False
+        try:
+            component_time = _time(component.get("as_of"), "component as_of")
+        except ValueError:
+            return False
+        if component_time > now or now - component_time > _MAX_AGE:
+            return False
+        component_times.append(component_time)
         from tradingagents.research.provider_orchestrator import configured_quote_components
         raw_payload = stored.get("payload")
         actual = configured_quote_components(
@@ -594,11 +651,39 @@ def _market_source_has_exact_component_provenance(
         ):
             return False
         qualities.append(str(component["quality"]))
-    if seen != expected_symbols or len(qualities) != 4:
+    if seen != expected_symbols or len(qualities) != 4 or len(component_times) != 4:
+        return False
+    aggregate_time = max(component_times)
+    try:
+        aggregate_bound = _time(capture.source.as_of, "market source as_of")
+        aggregate_payload = _time(payload.get("as_of"), "market payload as_of")
+    except ValueError:
+        return False
+    if (
+        aggregate_time - min(component_times) > _MARKET_COMPONENT_MAX_SKEW
+        or aggregate_bound != aggregate_time
+        or aggregate_payload != aggregate_time
+    ):
+        return False
+    component_by_symbol = {str(item["symbol"]): item for item in components}
+    expected_payload_times = {
+        symbol: component_by_symbol[symbol]["as_of"],
+        "SPY": component_by_symbol["SPY"]["as_of"],
+        "QQQ": component_by_symbol["QQQ"]["as_of"],
+        "sector_relative": max(
+            _time(component_by_symbol[symbol]["as_of"], "target component as_of"),
+            _time(component_by_symbol["XLK"]["as_of"], "sector component as_of"),
+        ).isoformat(timespec="seconds"),
+    }
+    if (
+        payload.get("target", {}).get("as_of") != expected_payload_times[symbol]
+        or payload.get("spy", {}).get("as_of") != expected_payload_times["SPY"]
+        or payload.get("qqq", {}).get("as_of") != expected_payload_times["QQQ"]
+        or payload.get("sector_relative", {}).get("as_of") != expected_payload_times["sector_relative"]
+    ):
         return False
     # Recompute every aggregate from the authenticated raw scalar values.  A
     # normalized packet cannot substitute an invented relative-return value.
-    component_by_symbol = {str(item["symbol"]): item for item in components}
     try:
         change = {
             name: (Decimal(str(item["current"])) - Decimal(str(item["previous"]))) / Decimal(str(item["previous"]))
@@ -725,7 +810,7 @@ def _market_clock_is_current_and_bound(review: Mapping[str, Any], payload: Mappi
         return False
     raw_timestamp = raw.get("timestamp")
     try:
-        raw_observed = _time(raw_timestamp, "raw clock timestamp")
+        raw_observed = _raw_vendor_time(raw_timestamp, "raw clock timestamp")
     except ValueError:
         return False
     # All wrapper timestamps are canonical UTC whole seconds.  The raw provider
@@ -734,7 +819,7 @@ def _market_clock_is_current_and_bound(review: Mapping[str, Any], payload: Mappi
     if (
         observed.microsecond != 0
         or captured.microsecond != 0
-        or observed != raw_observed.replace(microsecond=0)
+        or observed != raw_observed
         or raw.get("is_open") is not clock.get("is_open")
     ):
         return False
@@ -827,7 +912,9 @@ def _semantic_gaps(
         elif source.evidence_type == "market_context":
             if (
                 _market_source_proves_values(source_payload, review, source)
-                and _market_source_has_exact_component_provenance(capture, root, review["symbol"])
+                and _market_source_has_exact_component_provenance(
+                    capture, root, review["symbol"], now
+                )
             ):
                 categories.add("market")
             else:
@@ -929,6 +1016,18 @@ def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: B
     gaps = tuple(dict.fromkeys(gaps))
     confidence = review.get("confidence") if isinstance(review.get("confidence"), str) and _DECIMAL.fullmatch(review["confidence"]) else "0"
     sell = not gaps and Decimal(confidence) >= Decimal("0.75")
+    decision_execution_eligible = review.get("execution_eligible") is True
+    raw_execution_blockers = review.get("execution_blockers")
+    decision_execution_blockers = (
+        tuple(raw_execution_blockers)
+        if isinstance(raw_execution_blockers, list)
+        and all(isinstance(item, str) and item.strip() for item in raw_execution_blockers)
+        else ("decision evidence is incomplete",)
+    )
+    if decision_execution_eligible:
+        decision_execution_blockers = ()
+    elif not decision_execution_blockers:
+        decision_execution_blockers = ("market session is not tradeable for a live loss exit",)
     generated, expires = now.isoformat(timespec="seconds"), (now + _MAX_AGE).isoformat(timespec="seconds")
     base = {
         "schema_version": SCHEMA_VERSION,
@@ -947,7 +1046,9 @@ def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: B
         "evidence_complete": sell,
         "evidence_gaps": [] if sell else list(gaps or ("evidence_incomplete",)),
         "trade_decision_resolved": True,
-        "exit_allowed": sell,
+        "execution_eligible": decision_execution_eligible,
+        "execution_blockers": list(decision_execution_blockers),
+        "exit_allowed": sell and decision_execution_eligible,
         "producer_role": "portfolio_executive",
         "analysis_only": True,
         "execution_authority": "none",
