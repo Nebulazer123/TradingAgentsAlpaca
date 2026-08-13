@@ -406,6 +406,91 @@ def test_native_news_types_share_one_real_run_clock_and_stale_diagnostics_stay_n
     assert decision.decision == "SELL", decision.evidence_gaps
 
 
+def test_loss_board_selects_one_configured_priority_news_source_from_native_duplicates(tmp_path):
+    """Native duplicate headlines remain diagnostics; Alpaca is authority first."""
+    run_now = datetime.fromisoformat("2026-08-13T14:55:00+00:00")
+    symbol = "ORCL"
+    hourly = _hourly_packet(symbol)
+    hourly["evidence"]["loss_exit_review"].update(
+        {"decision_id": "duplicate-native-news", "current_price": "91", "average_entry_price": "100", "blockers": [], "blocked_reasons": []}
+    )
+    hourly_path = tmp_path / "hourly.json"
+    hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
+
+    def quote(name, current, previous):
+        return evidence_packet(source_name="finnhub", evidence_type="quote_price_context", subject=name, symbol=name, source_ref=f"https://test/{name}", payload={"c": current, "pc": previous}, quality="high", as_of="2026-08-13T14:55:00+00:00", tool_route="test")
+
+    headline = "Oracle cuts revenue guidance"
+    summary = "Revenue guidance cut by 8%."
+    alpaca = evidence_packet(
+        source_name="alpaca_news", evidence_type="market_news", subject=symbol, symbol=symbol,
+        source_ref="https://test/alpaca-news", quality="medium", as_of="2026-08-13T14:55:00.123Z",
+        payload={"news": [{"created_at": "2026-08-13T14:55:00.123Z", "headline": headline, "summary": summary, "url": "https://issuer.test/shared"}]}, tool_route="alpaca_news",
+    )
+    finnhub = evidence_packet(
+        source_name="finnhub", evidence_type="company_news", subject=symbol, symbol=symbol,
+        source_ref="https://test/finnhub-news", quality="medium", as_of="2026-08-13T14:55:00+00:00",
+        payload={"data": [{"datetime": 1786632900, "headline": headline, "summary": summary, "url": "https://issuer.test/shared"}]}, tool_route="finnhub_api",
+    )
+    fmp_news = evidence_packet(
+        source_name="fmp", evidence_type="stock_news", subject=symbol, symbol=symbol,
+        source_ref="https://test/fmp-news", quality="medium", as_of="2026-08-13T14:55:00+00:00",
+        payload={"data": [{"publishedDate": "2026-08-13T14:55:00Z", "title": headline, "text": summary, "url": "https://issuer.test/shared"}]}, tool_route="fmp_api",
+    )
+    transcript = evidence_packet(
+        source_name="fmp", evidence_type="earnings_transcripts", subject=symbol, symbol=symbol,
+        source_ref="https://test/transcript", quality="high", as_of="2026-08-13T14:55:00+00:00",
+        payload={"symbol": symbol, "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, tool_route="fmp_api",
+    )
+    provider = TickerProviderResearchResult(symbol, [
+        quote(symbol, 91, 100), quote("SPY", 650, 648), quote("QQQ", 580, 578), quote("XLK", 260, 259), alpaca, finnhub, fmp_news, transcript,
+    ])
+    paths = {item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets}
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider,
+        source_packet_paths=paths, decision_evidence_root=tmp_path,
+        market_clock=_clock("2026-08-13T14:55:00+00:00"), now=run_now,
+    )
+    company_sources = [item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "company_news"]
+    assert len(company_sources) == 1
+    assert company_sources[0]["source_name"] == "alpaca_news"
+    assert {item.packet_id for item in (alpaca, finnhub, fmp_news)} <= set(packet.payload["source_packet_ids"])
+    loss_path = write_research_packet(packet, tmp_path / "loss")
+    decision = record_autonomous_loss_board_decision(
+        supervisor_packet_path=hourly_path, loss_evidence_packet_path=loss_path,
+        source_revision="5" * 40, ledger_root=tmp_path / "ledger", evidence_root=tmp_path,
+        now=run_now,
+    ).decision
+    assert decision.decision == "SELL", decision.evidence_gaps
+
+
+def test_loss_board_chooses_newest_distinct_event_within_one_provider_deterministically(tmp_path):
+    run_now = datetime.fromisoformat("2026-08-13T14:55:00+00:00")
+    symbol = "ORCL"
+    older = evidence_packet(
+        source_name="finnhub", evidence_type="company_news", subject=symbol, symbol=symbol,
+        source_ref="https://test/finnhub/older", quality="medium", as_of="2026-08-13T14:54:00+00:00",
+        payload={"data": [{"datetime": 1786632840, "headline": "Oracle cuts revenue guidance", "summary": "Revenue guidance cut by 8%.", "url": "https://issuer.test/older"}]}, tool_route="finnhub_api",
+    )
+    newer = evidence_packet(
+        source_name="finnhub", evidence_type="company_news", subject=symbol, symbol=symbol,
+        source_ref="https://test/finnhub/newer", quality="medium", as_of="2026-08-13T14:55:00+00:00",
+        payload={"data": [{"datetime": 1786632900, "headline": "Oracle loses material customer contract", "summary": "The company lost a material customer contract and revenue guidance was cut by 9%.", "url": "https://issuer.test/newer"}]}, tool_route="finnhub_api",
+    )
+    provider = TickerProviderResearchResult(symbol, [older, newer])
+    paths = {item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets}
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=tmp_path / "hourly.json", hourly_packet=_hourly_packet(symbol),
+        provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path,
+        now=run_now,
+    )
+    company_sources = [item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "company_news"]
+    assert len(company_sources) == 1
+    normalized = json.loads((tmp_path / company_sources[0]["path"]).read_text(encoding="utf-8"))
+    assert normalized["provenance"]["raw_packet_id"] == newer.packet_id
+    assert normalized["provenance"]["selection_policy"] == "configured_provider_priority_then_newest_event_then_packet_id"
+
+
 def test_real_configured_individual_quote_route_builds_bound_current_review_and_sell(tmp_path):
     """Production-shaped path: frozen supervisor -> refresh -> immutable SELL.
 

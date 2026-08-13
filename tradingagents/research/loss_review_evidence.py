@@ -48,6 +48,16 @@ LOSS_REVIEW_FORBIDDEN_EFFECTS: tuple[str, ...] = (
 # treating an imaginary four-symbol Alpaca response as the only valid shape
 # made a real evidence refresh unable to clear its market-context blocker.
 DEFAULT_LOSS_REVIEW_SECTOR_PROXY = "XLK"
+# This is the configured loss-news route order.  It is intentionally explicit
+# here because only one issuer event may enter the current BOARD decision:
+# Alpaca first, then Finnhub, then FMP.  If the same source returns several
+# qualified events, the newest canonical event time wins; packet id is the
+# final stable tie-break.  Other raw packets remain diagnostics only.
+_LOSS_REVIEW_NEWS_PROVIDER_PRIORITY = {
+    "alpaca_news": 0,
+    "finnhub": 1,
+    "fmp": 2,
+}
 
 
 def loss_review_sector_proxy(symbol: str) -> str:
@@ -374,6 +384,7 @@ def _accepted_source_descriptors(
     root = _safe_root(evidence_root)
     result: list[dict[str, Any]] = []
     quote_components: dict[str, dict[str, Any]] = {}
+    news_candidates: list[dict[str, Any]] = []
     for packet in provider_result.packets:
         supplied = source_packet_paths.get(packet.packet_id)
         if supplied is None:
@@ -427,6 +438,21 @@ def _accepted_source_descriptors(
         if normalized is None:
             continue
         normalized_type, normalized_payload, normalized_as_of = normalized
+        if normalized_type == "company_news":
+            # Do not publish every duplicate native news event as a BOARD
+            # source.  Raw packets are still present in `source_packet_ids`
+            # for diagnostics; exactly one deterministic candidate is allowed
+            # into authority material below.
+            news_candidates.append(
+                {
+                    "packet": packet,
+                    "relative": relative,
+                    "raw": raw,
+                    "normalized_payload": normalized_payload,
+                    "normalized_as_of": normalized_as_of,
+                }
+            )
+            continue
         normalized_relative = Path("normalized_loss_review_evidence") / f"{packet.packet_id}-{normalized_type}.json"
         normalized_packet = {
             "packet_id": f"normalized-{packet.packet_id}-{normalized_type}",
@@ -461,6 +487,58 @@ def _accepted_source_descriptors(
                 "quality": packet.quality,
             }
         )
+    if news_candidates:
+        def news_sort_key(candidate: Mapping[str, Any]) -> tuple[int, float, str]:
+            packet = candidate["packet"]
+            observed = _parse_timestamp(candidate["normalized_as_of"])
+            return (
+                _LOSS_REVIEW_NEWS_PROVIDER_PRIORITY.get(packet.source_name.lower(), 999),
+                -(observed.timestamp() if observed is not None else float("-inf")),
+                packet.packet_id,
+            )
+
+        selected = min(news_candidates, key=news_sort_key)
+        packet = selected["packet"]
+        relative = selected["relative"]
+        raw = selected["raw"]
+        normalized_payload = selected["normalized_payload"]
+        normalized_as_of = selected["normalized_as_of"]
+        normalized_relative = Path("normalized_loss_review_evidence") / f"{packet.packet_id}-company_news.json"
+        normalized_packet = {
+            "packet_id": f"normalized-{packet.packet_id}-company_news",
+            "source_name": packet.source_name,
+            "evidence_type": "company_news",
+            "subject": packet.symbol,
+            "symbol": packet.symbol,
+            "as_of": normalized_as_of,
+            "quality": packet.quality,
+            "provenance": {
+                "raw_packet_path": relative.as_posix(),
+                "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
+                "raw_packet_id": packet.packet_id,
+                "raw_evidence_type": packet.evidence_type,
+                "selection_policy": "configured_provider_priority_then_newest_event_then_packet_id",
+            },
+            "payload": normalized_payload,
+        }
+        normalized_raw = json.dumps(normalized_packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        try:
+            _publish_immutable(root, normalized_relative, normalized_raw)
+        except (OSError, ValueError):
+            pass
+        else:
+            result.append(
+                {
+                    "path": normalized_relative.as_posix(),
+                    "sha256": hashlib.sha256(normalized_raw).hexdigest(),
+                    "size_bytes": len(normalized_raw),
+                    "packet_id": normalized_packet["packet_id"],
+                    "source_name": packet.source_name,
+                    "evidence_type": "company_news",
+                    "as_of": normalized_as_of,
+                    "quality": packet.quality,
+                }
+            )
     # A market context must contain four exact, current components.  This
     # supports both the legacy combined packet and the configured individual
     # target/SPY/QQQ/sector requests without granting either partial shape
