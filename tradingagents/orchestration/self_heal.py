@@ -23,9 +23,9 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.brokers.manual_action_attribution import (
-    load_owner_manual_action_attribution,
+    capture_owner_manual_action_attribution,
+    capture_source_autonomous_order,
     replay_suppression_key,
-    source_autonomous_order,
 )
 from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.orchestration.incidents import is_safe_incident_id
@@ -2197,27 +2197,11 @@ def _valid_manual_exit_replay_suppressions(
         filled_qty = _finite_recovery_decimal(action.get("filled_qty"), positive=True)
         if filled_qty is None:
             return False
-        paths = (
-            (action.get("attestation_path"), action.get("attestation_sha256")),
-            (action.get("source_packet_path"), action.get("source_packet_sha256")),
-        )
-        for raw_path, expected_digest in paths:
-            if (
-                not isinstance(raw_path, str)
-                or not Path(raw_path).is_absolute()
-                or str(Path(raw_path).resolve()) != raw_path
-                or not _valid_recovery_digest(expected_digest)
-            ):
-                return False
-            try:
-                actual_digest = hashlib.sha256(Path(raw_path).read_bytes()).hexdigest()
-            except OSError:
-                return False
-            if actual_digest != expected_digest:
-                return False
         try:
-            attribution = load_owner_manual_action_attribution(
+            attribution, actual_attestation_digest = (
+                capture_owner_manual_action_attribution(
                 str(action["attestation_path"])
+                )
             )
             attribution_origin = attribution["originating_order"]
             attribution_manual = attribution["manual_fill"]
@@ -2225,7 +2209,7 @@ def _valid_manual_exit_replay_suppressions(
                 attribution_manual, Mapping
             ):
                 return False
-            source_order = source_autonomous_order(
+            source_order, actual_source_digest = capture_source_autonomous_order(
                 str(action["source_packet_path"]),
                 str(origin_id),
                 symbol=symbol,
@@ -2234,6 +2218,14 @@ def _valid_manual_exit_replay_suppressions(
             return False
         if (
             attribution.get("resolution_id") != action.get("resolution_id")
+            or not Path(str(action["attestation_path"])).is_absolute()
+            or str(Path(str(action["attestation_path"])).resolve())
+            != action.get("attestation_path")
+            or actual_attestation_digest != action.get("attestation_sha256")
+            or not Path(str(action["source_packet_path"])).is_absolute()
+            or str(Path(str(action["source_packet_path"])).resolve())
+            != action.get("source_packet_path")
+            or actual_source_digest != action.get("source_packet_sha256")
             or attribution.get("symbol") != symbol
             or attribution_origin.get("client_order_id") != origin_id
             or attribution_origin.get("source_packet_path")

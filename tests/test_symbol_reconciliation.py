@@ -1,6 +1,7 @@
 import hashlib
 import json
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -163,6 +164,42 @@ def test_owner_manual_attribution_writer_completes_short_writes(monkeypatch, tmp
 
     assert calls >= 2
     assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+def test_reconciliation_reads_each_attribution_and_bound_source_once(monkeypatch, tmp_path):
+    source = _packet(tmp_path / "source.json")
+    buy = _order(status="filled", filled_qty="1", filled_avg_price="10",
+                 submitted_at="2026-06-02T20:29:44+00:00",
+                 updated_at="2026-06-02T20:29:45+00:00")
+    sell = _order(client_order_id="owner-manual-nflx-sell", side="sell", status="filled",
+                  filled_qty="1", filled_avg_price="9.5",
+                  submitted_at="2026-07-27T18:46:48+00:00",
+                  updated_at="2026-07-27T18:46:49+00:00")
+    attribution = _manual_exit_attribution(
+        tmp_path, source_packet=source,
+        reconciliation_packet={"symbol": "NFLX", "recent_fills": [sell, buy]},
+    )
+    original_read_bytes = Path.read_bytes
+    counts = {source.resolve(): 0, attribution.resolve(): 0}
+
+    def counted_read_bytes(path):
+        resolved = path.resolve()
+        if resolved in counts:
+            counts[resolved] += 1
+            if counts[resolved] > 1:
+                raise AssertionError("authority evidence was reread")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    spy = ReadOnlyBrokerSpy(positions=[], orders=[sell, buy])
+    result = _reconcile_symbol_incident(
+        symbol="NFLX", packet_paths=[source],
+        owner_action_attestation_paths=[attribution], live_client=spy,
+        expected_qty="0",
+    )
+
+    assert result.matched is True, result.issues
+    assert counts == {source.resolve(): 1, attribution.resolve(): 1}
 
 
 @pytest.mark.parametrize("fail_call", [1, 2])

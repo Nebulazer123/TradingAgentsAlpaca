@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -13,9 +12,9 @@ from pathlib import Path
 
 from tradingagents.brokers.alpaca import compact_alpaca_order, find_order_by_client_order_id
 from tradingagents.brokers.manual_action_attribution import (
-    load_owner_manual_action_attribution,
+    capture_owner_manual_action_attribution,
+    capture_source_autonomous_order,
     replay_suppression_key,
-    source_autonomous_order,
 )
 from tradingagents.execution.reconcile import reconcile_latest_packet_live_orders
 
@@ -275,30 +274,33 @@ def _resolve_owner_manual_actions(
     issues: list[str] = []
     resolved: list[dict] = []
     suppressions: list[dict] = []
-    source_digests: dict[Path, str] = {}
-    for source in source_packet_paths:
-        try:
-            resolved_source = source.resolve()
-            source_digests[resolved_source] = hashlib.sha256(
-                resolved_source.read_bytes()
-            ).hexdigest()
-        except OSError:
-            continue
+    supplied_sources = {source.resolve() for source in source_packet_paths}
     used_manual_ids: set[str] = set()
     for raw_path in attestation_paths:
         path = Path(raw_path)
         try:
-            attribution = load_owner_manual_action_attribution(path)
-            attribution_bytes = path.read_bytes()
+            attribution, attestation_sha256 = (
+                capture_owner_manual_action_attribution(path)
+            )
             origin = attribution["originating_order"]
             manual = attribution["manual_fill"]
             assert isinstance(origin, Mapping) and isinstance(manual, Mapping)
             origin_id = str(origin["client_order_id"])
             manual_id = str(manual["client_order_id"])
             source_path = Path(str(origin["source_packet_path"])).resolve()
+            try:
+                exact_source_order, exact_source_digest = (
+                    capture_source_autonomous_order(
+                        source_path, origin_id, symbol=symbol
+                    )
+                )
+            except ValueError:
+                exact_source_order = None
+                exact_source_digest = None
             matches = {
                 "symbol": attribution.get("symbol") == symbol,
-                "source_packet": source_digests.get(source_path)
+                "source_supplied": source_path in supplied_sources,
+                "source_packet": exact_source_digest
                 == origin.get("source_packet_sha256"),
                 "origin_checked": origin_id in checked_client_order_ids,
                 "unique_manual_id": manual_id not in used_manual_ids,
@@ -306,16 +308,9 @@ def _resolve_owner_manual_actions(
                 == Decimal("0"),
                 "no_open_orders": not open_orders,
             }
-            try:
-                exact_source_order = source_autonomous_order(
-                    source_path, origin_id, symbol=symbol
-                )
-            except ValueError:
-                matches["source_contains_origin"] = False
-            else:
-                matches["source_contains_origin"] = (
-                    exact_source_order == origin.get("source_order")
-                )
+            matches["source_contains_origin"] = (
+                exact_source_order == origin.get("source_order")
+            )
             origin_fills = [
                 fill for fill in recent_fills
                 if fill.get("client_order_id") == origin_id
@@ -358,7 +353,6 @@ def _resolve_owner_manual_actions(
             continue
         used_manual_ids.add(manual_id)
         checked_client_order_ids.append(manual_id)
-        attestation_sha256 = hashlib.sha256(attribution_bytes).hexdigest()
         suppression_key = replay_suppression_key(
             attribution_sha256=attestation_sha256,
             resolution_id=str(attribution["resolution_id"]),

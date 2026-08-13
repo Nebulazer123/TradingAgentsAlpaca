@@ -55,8 +55,16 @@ def _canonical_json(value: Mapping[str, object]) -> bytes:
     ).encode("utf-8")
 
 
-def _digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _captured_json(path: str | Path, *, label: str) -> tuple[dict[str, object], bytes, str]:
+    candidate = Path(path)
+    try:
+        raw = candidate.read_bytes()
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError(f"{label} is unreadable") from None
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be an object")
+    return value, raw, hashlib.sha256(raw).hexdigest()
 
 
 def _aware_time(value: object) -> str:
@@ -100,13 +108,20 @@ def _find_fill(packet: Mapping[str, object], client_order_id: str) -> Mapping[st
 def source_autonomous_order(
     path: str | Path, client_order_id: str, *, symbol: str | None = None
 ) -> dict[str, object]:
-    source = Path(path)
-    try:
-        packet = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        raise ValueError("owner manual action source packet is unreadable") from None
-    if not isinstance(packet, Mapping):
-        raise ValueError("owner manual action source packet must be an object")
+    packet, _raw, _digest_value = _captured_json(
+        path, label="owner manual action source packet"
+    )
+    return source_autonomous_order_from_packet(
+        packet, client_order_id, symbol=symbol
+    )
+
+
+def source_autonomous_order_from_packet(
+    packet: Mapping[str, object],
+    client_order_id: str,
+    *,
+    symbol: str | None = None,
+) -> dict[str, object]:
     records: list[dict[str, object]] = []
     for collection in ("actions", "submitted"):
         for row in packet.get(collection) or []:
@@ -155,6 +170,20 @@ def source_autonomous_order(
     return {key: selected[key] for key in _SOURCE_ORDER_KEYS}
 
 
+def capture_source_autonomous_order(
+    path: str | Path, client_order_id: str, *, symbol: str | None = None
+) -> tuple[dict[str, object], str]:
+    packet, _raw, digest = _captured_json(
+        path, label="owner manual action source packet"
+    )
+    return (
+        source_autonomous_order_from_packet(
+            packet, client_order_id, symbol=symbol
+        ),
+        digest,
+    )
+
+
 def _resolution_material(payload: Mapping[str, object]) -> dict[str, object]:
     return {key: payload[key] for key in sorted(_TOP_LEVEL_KEYS - {"resolution_id"})}
 
@@ -182,7 +211,9 @@ def build_owner_manual_action_attribution(
     origin = _find_fill(reconciliation_packet, origin_id)
     manual = _find_fill(reconciliation_packet, manual_id)
     symbol = _nonempty(reconciliation_packet.get("symbol"), label="symbol").upper()
-    source_order = source_autonomous_order(source, origin_id, symbol=symbol)
+    source_order, source_digest = capture_source_autonomous_order(
+        source, origin_id, symbol=symbol
+    )
     if (
         str(origin.get("symbol") or "").upper() != symbol
         or str(manual.get("symbol") or "").upper() != symbol
@@ -208,7 +239,7 @@ def build_owner_manual_action_attribution(
             "side": "buy",
             "filled_qty": origin_qty,
             "source_packet_path": str(source),
-            "source_packet_sha256": _digest(source),
+            "source_packet_sha256": source_digest,
             "source_order": source_order,
         },
         "manual_fill": {
@@ -286,12 +317,19 @@ def validate_owner_manual_action_attribution(value: object) -> dict[str, object]
 
 
 def load_owner_manual_action_attribution(path: str | Path) -> dict[str, object]:
-    candidate = Path(path)
-    try:
-        value = json.loads(candidate.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        raise ValueError("owner manual action attribution is unreadable") from None
+    value, _raw, _digest_value = _captured_json(
+        path, label="owner manual action attribution"
+    )
     return validate_owner_manual_action_attribution(value)
+
+
+def capture_owner_manual_action_attribution(
+    path: str | Path,
+) -> tuple[dict[str, object], str]:
+    value, _raw, digest = _captured_json(
+        path, label="owner manual action attribution"
+    )
+    return validate_owner_manual_action_attribution(value), digest
 
 
 def write_owner_manual_action_attribution(
