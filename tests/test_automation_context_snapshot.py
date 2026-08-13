@@ -569,3 +569,46 @@ def test_incident_summary_fails_closed_when_incident_root_is_unreadable(
         "recovery_last_failure": None,
         "recovery_external_blocker": "recovery_incident_unknown",
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        pytest.param("owner_role", [], id="owner-list"),
+        pytest.param("owner_role", {}, id="owner-dict"),
+        pytest.param("owner_role", None, id="owner-null"),
+        pytest.param("owner_role", 7, id="owner-number"),
+        pytest.param("phase", [], id="phase-list"),
+        pytest.param("phase", {}, id="phase-dict"),
+        pytest.param("phase", None, id="phase-null"),
+        pytest.param("phase", 7, id="phase-number"),
+        pytest.param("failure_kind", [], id="failure-kind-list"),
+        pytest.param("failure_kind", {}, id="failure-kind-dict"),
+        pytest.param("failure_kind", None, id="failure-kind-null"),
+        pytest.param("failure_kind", 7, id="failure-kind-number"),
+    ],
+)
+def test_incident_summary_rejects_nonstring_membership_values(
+    tmp_path, monkeypatch, field, value
+):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    path = _write_incident_latest(incident_root, "typed-incident")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if field == "owner_role":
+        record["owner_role"] = value
+    elif field == "phase":
+        record["recovery"]["phase"] = value
+    else:
+        record["recovery"]["last_failure"]["kind"] = value
+    path.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    ) == {
+        "recovery_owner": None,
+        "recovery_phase": None,
+        "recovery_last_failure": None,
+        "recovery_external_blocker": "recovery_incident_unknown",
+    }

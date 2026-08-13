@@ -497,19 +497,25 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
         or incident_id != _incident_id
         or updated_at is None
         or updated_at > current
+        or not isinstance(owner, str)
         or owner not in RECOVERY_OWNER_ROLES
         or not isinstance(recovery, dict)
     ):
         return unknown_summary
     phase = recovery.get("phase")
-    if phase not in RECOVERY_PHASES:
+    if not isinstance(phase, str) or phase not in RECOVERY_PHASES:
         return unknown_summary
     failure = recovery.get("last_failure")
-    if failure is not None and (
-        not isinstance(failure, dict)
-        or failure.get("kind") not in RECOVERY_FAILURE_KINDS
-    ):
-        return unknown_summary
+    failure_kind: str | None = None
+    if failure is not None:
+        if not isinstance(failure, dict):
+            return unknown_summary
+        failure_kind = failure.get("kind")
+        if (
+            not isinstance(failure_kind, str)
+            or failure_kind not in RECOVERY_FAILURE_KINDS
+        ):
+            return unknown_summary
     blockers = record.get("external_blockers")
     if blockers is None:
         blockers = []
@@ -520,7 +526,7 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
     return {
         "recovery_owner": owner,
         "recovery_phase": phase,
-        "recovery_last_failure": failure.get("kind") if isinstance(failure, dict) else None,
+        "recovery_last_failure": failure_kind,
         "recovery_external_blocker": "external_action_required" if blockers else None,
     }
 
