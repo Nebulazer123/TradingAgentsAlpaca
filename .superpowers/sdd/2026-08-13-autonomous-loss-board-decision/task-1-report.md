@@ -278,3 +278,46 @@ All checks passed!
 git diff --check
 (no output; passed)
 ```
+
+## Atomic source-capture repair
+
+Accepted source packets are now captured exactly once per source, as one
+private immutable association of the captured bytes, decoded JSON object, and
+verified source binding. During decision creation, descriptor hash/size,
+canonical JSON parsing, packet identity/as-of/quality validation, semantic
+qualification, exact exit-reason source resolution, and the decision's
+accepted-source fields all consume that single capture. The semantic phase no
+longer opens a source path.
+
+Decision verification performs one corresponding capture per accepted source
+and validates it against the stored binding without a second source read.
+This prevents a time-of-check/time-of-use cross-bind between a packet's hash,
+parsed object, and semantic content. Supervisor and raw-loss packet behavior is
+unchanged.
+
+### Atomic capture RED/GREEN evidence
+
+The two new RED tests initially failed because creation opened every source
+again for `BoundSourceEvidence.verify` and the semantic pass, while verification
+opened it twice for hash and metadata validation. The tests inject a failure on
+the second source open. Creation also mutates a source immediately after its
+first capture: the created decision remains bound to the captured bytes, and a
+later verification observes the on-disk mutation as a binding failure rather
+than cross-binding it into the creation decision.
+
+Final verification used the canonical virtualenv with this worktree on
+`PYTHONPATH`:
+
+```text
+python -m pytest -q tests/test_loss_board_decision.py
+45 passed in 0.30s
+
+python -m pytest -q tests/test_loss_board_decision.py tests/test_work_packets.py tests/test_decision_ledger.py
+176 passed in 0.49s
+
+ruff check tradingagents/policy/loss_board_decision.py tradingagents/orchestration/work_packets.py tests/test_loss_board_decision.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```

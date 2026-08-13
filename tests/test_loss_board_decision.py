@@ -606,3 +606,61 @@ def test_directory_fsync_failure_closes_fd_and_never_records_ledger(tmp_path, mo
     assert len(calls) == 3
     assert calls[-1] in closed
     assert not (tmp_path / "ledger" / "events.jsonl").exists()
+
+
+def test_creation_captures_each_source_once_and_never_cross_binds_a_mutation(tmp_path, monkeypatch):
+    supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
+    source_path = evidence_root / "sources" / "1.json"
+    original_read = loss_board_decision._read_contained
+    reads: dict[Path, int] = {}
+
+    def capture_once(root, path, *, label):
+        captured = original_read(root, path, label=label)
+        target = captured[0]
+        if target.parent.name == "sources":
+            reads[target] = reads.get(target, 0) + 1
+            if reads[target] > 1:
+                raise AssertionError("source packet was opened a second time")
+            if target == source_path:
+                mutated = json.loads(target.read_text(encoding="utf-8"))
+                mutated["payload"]["event_category"] = "unknown_event"
+                _write_json(target, mutated)
+        return captured
+
+    monkeypatch.setattr(loss_board_decision, "_read_contained", capture_once)
+    recorded = record_autonomous_loss_board_decision(
+        supervisor_packet_path=supervisor_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="1" * 40,
+        ledger_root=tmp_path / "ledger",
+        evidence_root=evidence_root,
+        now=NOW,
+    )
+
+    assert recorded.decision.decision == "SELL"
+    assert reads == {evidence_root / "sources" / f"{index}.json": 1 for index in range(3)}
+
+
+def test_verifier_opens_each_source_once(tmp_path, monkeypatch):
+    recorded = _record(tmp_path)
+    evidence_root = tmp_path / "evidence"
+    original_open = loss_board_decision.os.open
+    source_opens: dict[Path, int] = {}
+
+    def open_once(path, *args, **kwargs):
+        target = Path(path)
+        if target.parent.name == "sources":
+            source_opens[target] = source_opens.get(target, 0) + 1
+            if source_opens[target] > 1:
+                raise AssertionError("source packet was opened a second time")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(loss_board_decision.os, "open", open_once)
+    verified = verify_autonomous_loss_board_decision(
+        recorded.decision_evidence_path,
+        evidence_root=evidence_root,
+        now=NOW,
+    )
+
+    assert verified == recorded.decision
+    assert source_opens == {evidence_root / "sources" / f"{index}.json": 1 for index in range(3)}

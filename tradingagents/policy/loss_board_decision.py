@@ -209,14 +209,14 @@ class BoundSourceEvidence:
             raise ValueError("invalid source binding fields")
         return cls(packet=BoundEvidence.from_dict(value["packet"]), packet_id=value["packet_id"], source_name=value["source_name"], evidence_type=value["evidence_type"], as_of=value["as_of"], quality=value["quality"])
 
-    def verify(self, root: Path) -> bool:
-        if not self.packet.verify(root):
-            return False
-        try:
-            _, _, raw = _read_contained(root, self.packet.path, label="source packet")
-        except ValueError:
-            return False
-        return raw.get("packet_id") == self.packet_id and raw.get("source_name") == self.source_name and raw.get("evidence_type") == self.evidence_type and raw.get("as_of") == self.as_of and raw.get("quality") == self.quality
+
+@dataclass(frozen=True)
+class CapturedSourceEvidence:
+    """One source read, whose bytes and decoded object stay bound together."""
+
+    source: BoundSourceEvidence
+    packet_bytes: bytes
+    packet_object: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -355,23 +355,49 @@ def _bound(root: Path, path: str | Path, label: str) -> tuple[BoundEvidence, Map
     return BoundEvidence(path=target.relative_to(root).as_posix(), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw)), decoded
 
 
-def _sources(root: Path, raw: Any, symbol: str) -> tuple[BoundSourceEvidence, ...]:
+def _capture_source(root: Path, source: BoundSourceEvidence, symbol: str) -> CapturedSourceEvidence | None:
+    try:
+        target, packet_bytes, packet = _read_contained(root, source.packet.path, label="accepted source packet")
+    except ValueError:
+        return None
+    captured = BoundEvidence(
+        path=target.relative_to(root).as_posix(),
+        sha256=hashlib.sha256(packet_bytes).hexdigest(),
+        size_bytes=len(packet_bytes),
+    )
+    if captured != source.packet or packet.get("symbol") != symbol or packet.get("subject") != symbol or any(packet.get(key) != getattr(source, key) for key in ("packet_id", "source_name", "evidence_type", "as_of", "quality")):
+        return None
+    return CapturedSourceEvidence(source=source, packet_bytes=packet_bytes, packet_object=packet)
+
+
+def _sources(root: Path, raw: Any, symbol: str) -> tuple[CapturedSourceEvidence, ...]:
     if not isinstance(raw, list) or not raw:
         return ()
-    result: list[BoundSourceEvidence] = []
+    result: list[CapturedSourceEvidence] = []
+    seen_descriptors: set[str] = set()
     exact = {"path", "sha256", "size_bytes", "packet_id", "source_name", "evidence_type", "as_of", "quality"}
     for descriptor in raw:
         if not isinstance(descriptor, Mapping) or set(descriptor) != exact or not isinstance(descriptor.get("path"), str):
             return ()
+        descriptor_identity = json.dumps(dict(descriptor), sort_keys=True, separators=(",", ":"))
+        if descriptor_identity in seen_descriptors:
+            raise ValueError("source bindings must be unique")
+        seen_descriptors.add(descriptor_identity)
         try:
-            bound, packet = _bound(root, descriptor["path"], "accepted source packet")
-            if bound.compact() != {"path": descriptor["path"], "sha256": descriptor["sha256"], "size_bytes": descriptor["size_bytes"]}:
-                return ()
-            if packet.get("symbol") != symbol or packet.get("subject") != symbol or any(packet.get(key) != descriptor[key] for key in ("packet_id", "source_name", "evidence_type", "as_of", "quality")):
-                return ()
-            result.append(BoundSourceEvidence(packet=bound, packet_id=descriptor["packet_id"], source_name=descriptor["source_name"], evidence_type=descriptor["evidence_type"], as_of=descriptor["as_of"], quality=descriptor["quality"]))
+            source = BoundSourceEvidence(
+                packet=BoundEvidence.from_dict({key: descriptor[key] for key in ("path", "sha256", "size_bytes")}),
+                packet_id=descriptor["packet_id"],
+                source_name=descriptor["source_name"],
+                evidence_type=descriptor["evidence_type"],
+                as_of=descriptor["as_of"],
+                quality=descriptor["quality"],
+            )
         except (ValueError, TypeError):
             return ()
+        captured = _capture_source(root, source, symbol)
+        if captured is None:
+            return ()
+        result.append(captured)
     return tuple(result)
 
 
@@ -459,8 +485,9 @@ def _exact_source_reference(value: Any, sources: tuple[BoundSourceEvidence, ...]
     return len(matches) == 1
 
 
-def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], sources: tuple[BoundSourceEvidence, ...], root: Path, now: dt.datetime) -> tuple[str, ...]:
+def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], captures: tuple[CapturedSourceEvidence, ...], now: dt.datetime) -> tuple[str, ...]:
     gaps: list[str] = []
+    sources = tuple(capture.source for capture in captures)
     for blocker_field in ("blockers", "blocked_reasons"):
         value = review.get(blocker_field)
         if not _sequence_of_text(value) or value:
@@ -506,12 +533,9 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
         gaps.append("advisory_candidate_contradiction")
     categories: set[str] = set()
     source_payloads: dict[str, Mapping[str, Any]] = {}
-    for source in sources:
-        if not source.verify(root):
-            gaps.append("source_binding_invalid")
-            continue
+    for capture in captures:
+        source = capture.source
         try:
-            _, _, raw = _read_contained(root, source.packet.path, label="source packet")
             observed = _time(source.as_of, "source as_of")
         except ValueError:
             gaps.append("source_binding_invalid")
@@ -521,7 +545,7 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
         descriptor = f"{source.source_name} {source.evidence_type}".lower()
         if any(x in descriptor for x in ("gap", "connector", "submissions_index", "submissions index")):
             gaps.append("source_gap_or_index")
-        source_payload = _source_payload(raw, source)
+        source_payload = _source_payload(capture.packet_object, source)
         if source_payload is None:
             gaps.append("source_payload_binding_invalid")
         elif source.evidence_type == "market_context":
@@ -564,8 +588,9 @@ def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: B
         raise ValueError("loss packet is not exactly bound to the supervisor decision")
     if _REVISION.fullmatch(revision) is None:
         raise ValueError("source_revision must be lowercase 40-hex")
-    sources = _sources(root, payload.get("accepted_sources"), review["symbol"])
-    gaps = list(_semantic_gaps(review, payload, sources, root, now))
+    captures = _sources(root, payload.get("accepted_sources"), review["symbol"])
+    sources = tuple(capture.source for capture in captures)
+    gaps = list(_semantic_gaps(review, payload, captures, now))
     if loss_raw.get("analysis_only") is not True or loss_raw.get("execution_authority") != "none" or loss_raw.get("can_submit_orders") is not False or loss_raw.get("source_name") != "loss_review_evidence" or loss_raw.get("evidence_type") != "loss_review_evidence":
         gaps.append("raw_loss_packet_authority_or_identity_invalid")
     try:
@@ -686,6 +711,7 @@ def verify_autonomous_loss_board_decision(decision_evidence_path: str | Path, *,
     generated, expires = _time(decision.generated_at, "generated_at"), _time(decision.expires_at, "expires_at")
     if not generated <= current < expires:
         raise ValueError("decision is not currently valid")
-    if not decision.supervisor_packet.verify(root) or not decision.loss_evidence_packet.verify(root) or not all(item.verify(root) for item in decision.accepted_sources):
+    captures = tuple(_capture_source(root, item, decision.symbol) for item in decision.accepted_sources)
+    if not decision.supervisor_packet.verify(root) or not decision.loss_evidence_packet.verify(root) or any(capture is None for capture in captures):
         raise ValueError("bound evidence verification failed")
     return decision
