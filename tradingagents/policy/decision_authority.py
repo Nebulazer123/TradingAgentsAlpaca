@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from tradingagents.policy.exit_policy import POLICY_REASON_CODES, POLICY_REASON_RULE_IDS
@@ -33,11 +34,17 @@ AUTHORITY_RECORD_FIELDS = (
 
 @dataclass(frozen=True)
 class ExitAuthorityVerdict:
-    allowed: bool
+    exit_allowed: bool
+    trade_decision_resolved: bool
     authority_source: str
     requires_additional_decision: bool
     decision_owner: str
     reason: str
+
+    @property
+    def allowed(self) -> bool:
+        """Compatibility alias for callers that predate BOARD decisions."""
+        return self.exit_allowed
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -98,7 +105,8 @@ def _source_packet_ids_issue(review: Mapping[str, Any]) -> str | None:
 
 def _invalid_policy_verdict(reason: str) -> ExitAuthorityVerdict:
     return ExitAuthorityVerdict(
-        allowed=False,
+        exit_allowed=False,
+        trade_decision_resolved=False,
         authority_source="invalid_pre_registered_policy_rule",
         requires_additional_decision=False,
         decision_owner="portfolio_executive",
@@ -117,6 +125,10 @@ def resolve_exit_authority(
     *,
     supervisor_review: Mapping[str, Any] | Any,
     advisory_analysis: Mapping[str, Any] | Any | None,
+    board_decision: Mapping[str, Any] | Any | None = None,
+    decision_ledger_root: str | Path | None = None,
+    decision_evidence_root: str | Path | None = None,
+    now: Any = None,
 ) -> ExitAuthorityVerdict:
     """Resolve loss-exit authority without granting research execution power."""
     review = _mapping(supervisor_review)
@@ -158,7 +170,8 @@ def resolve_exit_authority(
                 f"pre-registered policy reason {reason} does not match rule {rule or 'missing'}"
             )
         return ExitAuthorityVerdict(
-            allowed=True,
+            exit_allowed=True,
+            trade_decision_resolved=True,
             authority_source="pre_registered_policy_rule",
             requires_additional_decision=False,
             decision_owner="execution_operator",
@@ -166,17 +179,89 @@ def resolve_exit_authority(
         )
 
     if _requires_board_decision(advisory):
+        verified = _verified_board_decision(
+            board_decision=board_decision,
+            decision_ledger_root=decision_ledger_root,
+            decision_evidence_root=decision_evidence_root,
+            now=now,
+        )
+        if verified is not None and _board_decision_matches_supervisor(verified, review):
+            return ExitAuthorityVerdict(
+                exit_allowed=verified.exit_allowed,
+                trade_decision_resolved=True,
+                authority_source="autonomous_portfolio_board",
+                requires_additional_decision=False,
+                decision_owner="portfolio_executive",
+                reason=(
+                    "autonomous portfolio BOARD recorded a SELL decision; "
+                    "a separate execution intent is still required"
+                    if verified.decision == "SELL"
+                    else "autonomous portfolio BOARD recorded a HOLD decision"
+                ),
+            )
         return ExitAuthorityVerdict(
-            allowed=False,
+            exit_allowed=False,
+            trade_decision_resolved=False,
             authority_source="advisory_research",
             requires_additional_decision=True,
             decision_owner="portfolio_executive",
             reason="discretionary loss exit requires an internal portfolio decision",
         )
     return ExitAuthorityVerdict(
-        allowed=review.get("allowed") is True,
+        exit_allowed=review.get("allowed") is True,
+        trade_decision_resolved=review.get("allowed") is True,
         authority_source="supervisor_review",
         requires_additional_decision=False,
         decision_owner="portfolio_executive",
         reason=_text(review.get("allowed_exit_reason_source")) or "supervisor review",
     )
+
+
+def _board_decision_matches_supervisor(board_decision: Any, review: Mapping[str, Any]) -> bool:
+    """Only accept a verified decision for this exact supervisor review."""
+    return (
+        getattr(board_decision, "symbol", None) == _text(review.get("symbol")).upper()
+        and getattr(board_decision, "supervisor_decision_id", None)
+        == _text(review.get("decision_id"))
+        and getattr(board_decision, "trade_decision_resolved", None) is True
+        and getattr(board_decision, "analysis_only", None) is True
+        and getattr(board_decision, "execution_authority", None) == "none"
+        and getattr(board_decision, "can_submit_orders", None) is False
+    )
+
+
+def _verified_board_decision(
+    *,
+    board_decision: Mapping[str, Any] | Any | None,
+    decision_ledger_root: str | Path | None,
+    decision_evidence_root: str | Path | None,
+    now: Any,
+) -> Any | None:
+    """Authenticate only a caller-supplied ledger packet reference.
+
+    The caller owns both roots; packet input may name a packet ID only.  This
+    prevents advisory research or a copied evidence tree from selecting its
+    own trust boundary.
+    """
+    candidate = _mapping(board_decision)
+    if (
+        set(candidate) != {"ledger_packet_id"}
+        or not isinstance(candidate.get("ledger_packet_id"), str)
+        or not candidate["ledger_packet_id"].strip()
+        or decision_ledger_root is None
+        or decision_evidence_root is None
+    ):
+        return None
+    try:
+        from tradingagents.policy.loss_board_decision import (
+            verify_autonomous_loss_board_decision,
+        )
+
+        return verify_autonomous_loss_board_decision(
+            ledger_root=decision_ledger_root,
+            ledger_packet_id=candidate["ledger_packet_id"],
+            evidence_root=decision_evidence_root,
+            now=now,
+        )
+    except (OSError, ValueError, TypeError):
+        return None

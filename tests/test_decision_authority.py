@@ -1,6 +1,63 @@
+from types import SimpleNamespace
+
 import pytest
 
 from tradingagents.policy.decision_authority import resolve_exit_authority
+
+
+def test_unverified_board_input_cannot_resolve_a_discretionary_exit():
+    verdict = resolve_exit_authority(
+        supervisor_review={"allowed": False, "policy_rule_exit": False},
+        advisory_analysis={"requires_board_decision": True},
+        board_decision={"decision": "HOLD"},
+    )
+
+    assert verdict.exit_allowed is False
+    assert verdict.trade_decision_resolved is False
+    assert verdict.requires_additional_decision is True
+
+
+@pytest.mark.parametrize(
+    ("decision", "exit_allowed"),
+    [("HOLD", False), ("SELL", True)],
+)
+def test_verified_board_decision_closes_the_trade_decision_only(
+    monkeypatch, decision, exit_allowed
+):
+    verified = SimpleNamespace(
+        symbol="TSM",
+        supervisor_decision_id="loss-review-tsm-1",
+        decision=decision,
+        exit_allowed=exit_allowed,
+        trade_decision_resolved=True,
+        analysis_only=True,
+        execution_authority="none",
+        can_submit_orders=False,
+    )
+    monkeypatch.setattr(
+        "tradingagents.policy.loss_board_decision.verify_autonomous_loss_board_decision",
+        lambda **_kwargs: verified,
+    )
+
+    verdict = resolve_exit_authority(
+        supervisor_review={
+            "symbol": "TSM",
+            "decision_id": "loss-review-tsm-1",
+            "allowed": False,
+            "policy_rule_exit": False,
+        },
+        advisory_analysis={"requires_board_decision": True},
+        board_decision={"ledger_packet_id": "portfolio-decision-1"},
+        decision_ledger_root="/installed/ledger",
+        decision_evidence_root="/installed/evidence",
+    )
+
+    assert verdict.exit_allowed is exit_allowed
+    assert verdict.allowed is exit_allowed
+    assert verdict.trade_decision_resolved is True
+    assert verdict.requires_additional_decision is False
+    assert verdict.authority_source == "autonomous_portfolio_board"
+    assert "execution intent" in verdict.reason if decision == "SELL" else "HOLD" in verdict.reason
 
 
 def test_advisory_refresh_cannot_revoke_preregistered_policy_exit():

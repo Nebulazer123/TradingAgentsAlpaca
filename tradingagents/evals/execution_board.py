@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import subprocess
 from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -13,6 +14,9 @@ from tradingagents.policy.decision_authority import (
     AUTHORITY_RECORD_FIELDS,
     bounded_exit_authority_record,
     resolve_exit_authority,
+)
+from tradingagents.policy.loss_board_decision import (
+    record_autonomous_loss_board_decision,
 )
 
 UTC = datetime.timezone.utc
@@ -258,6 +262,7 @@ def _latest_loss_review_evidence_summary(
         "evidence_path": str(evidence_path),
         "raw_packet_path": str(packet.get("raw_packet_path") or evidence_path),
         "hourly_packet_path": hourly_packet_path,
+        "supervisor_packet_path": str(payload.get("supervisor_packet_path") or ""),
         "matches_review_window": source_bound,
         "source_binding": source_binding,
         "symbol": str(payload.get("symbol") or "").upper(),
@@ -274,6 +279,71 @@ def _latest_loss_review_evidence_summary(
     if loss_exit_candidate:
         summary["loss_exit_candidate"] = dict(loss_exit_candidate)
     return summary
+
+
+def _source_revision() -> str:
+    """Return the checked-out source revision, with a deterministic fallback."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        revision = result.stdout.strip()
+        if len(revision) == 40 and all(char in "0123456789abcdef" for char in revision):
+            return revision
+    except OSError:
+        pass
+    return "0" * 40
+
+
+def _record_loss_board_decision(
+    *,
+    loss_review_evidence: Mapping[str, Any] | None,
+    supervisor_packet_path: str | Path | None,
+    decision_ledger_root: str | Path,
+    decision_evidence_root: str | Path,
+    source_revision: str,
+    now: datetime.datetime,
+) -> dict[str, Any] | None:
+    """Record a decision only from exact source-bound raw evidence.
+
+    A compact advisory packet is never enough: the Task 1 recorder verifies
+    the raw supervisor/loss/source bytes and produces the immutable ledger
+    reference before this review surfaces a decision.
+    """
+    if not isinstance(loss_review_evidence, Mapping) or not supervisor_packet_path:
+        return None
+    raw_path = str(loss_review_evidence.get("raw_packet_path") or "").strip()
+    if not raw_path or not Path(raw_path).is_file():
+        return None
+    try:
+        recorded = record_autonomous_loss_board_decision(
+            supervisor_packet_path=supervisor_packet_path,
+            loss_evidence_packet_path=raw_path,
+            source_revision=source_revision,
+            ledger_root=decision_ledger_root,
+            evidence_root=decision_evidence_root,
+            now=now,
+        )
+    except (OSError, ValueError):
+        return None
+    decision = recorded.decision
+    return {
+        "decision": decision.decision,
+        "decision_id": decision.decision_id,
+        "ledger_packet_id": recorded.packet.packet_id,
+        "ledger_packet_path": str(recorded.packet_path),
+        "decision_evidence_path": str(recorded.decision_evidence_path),
+        "trade_decision_resolved": decision.trade_decision_resolved,
+        "exit_allowed": decision.exit_allowed,
+        "analysis_only": decision.analysis_only,
+        "execution_authority": decision.execution_authority,
+        "can_submit_orders": decision.can_submit_orders,
+        "recommendation": recorded.packet.recommendation,
+    }
 
 
 def _loss_exit_review_for_symbol(packet: Mapping[str, Any], symbol: str) -> Mapping[str, Any] | None:
@@ -414,13 +484,22 @@ def build_execution_board_review(
     max_packets: int = 24,
     clean_streak_required: int = 2,
     loss_review_evidence_dir: str | Path | None = "results/loss_review_evidence",
+    decision_ledger_root: str | Path = "state/decision_ledger",
+    decision_evidence_root: str | Path = "results",
+    source_revision: str | None = None,
     now: datetime.datetime | None = None,
 ) -> dict[str, Any]:
     """Build a compact, analysis-only BOARD review from recent hourly packets."""
 
     packets = load_hourly_packets(hourly_dir, limit=max_packets)
     loss_review_evidence = _latest_loss_review_evidence_summary(loss_review_evidence_dir, packets)
-    generated_at = (now or datetime.datetime.now(tz=UTC)).isoformat(timespec="seconds")
+    current_now = now or datetime.datetime.now(tz=UTC)
+    if current_now.tzinfo is None:
+        current_now = current_now.replace(tzinfo=UTC)
+    else:
+        current_now = current_now.astimezone(UTC)
+    current_now = current_now.replace(microsecond=0)
+    generated_at = current_now.isoformat(timespec="seconds")
     violations: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     live_buy_count = 0
@@ -577,8 +656,45 @@ def build_execution_board_review(
                 "message": "Live unrealized P/L was negative in one or more reviewed packets.",
             }
         )
+    autonomous_loss_decision = _record_loss_board_decision(
+        loss_review_evidence=loss_review_evidence,
+        supervisor_packet_path=(
+            loss_review_evidence.get("supervisor_packet_path")
+            if isinstance(loss_review_evidence, Mapping)
+            else None
+        ),
+        decision_ledger_root=decision_ledger_root,
+        decision_evidence_root=decision_evidence_root,
+        source_revision=source_revision or _source_revision(),
+        now=current_now,
+    )
+    if autonomous_loss_decision is not None and loss_review_evidence is not None:
+        loss_review_evidence = dict(loss_review_evidence)
+        loss_review_evidence["next_action"] = autonomous_loss_decision["recommendation"]
+        authority = resolve_exit_authority(
+            supervisor_review=next(
+                (
+                    _loss_exit_review_for_symbol(packet, str(loss_review_evidence.get("symbol") or ""))
+                    for packet in reversed(packets)
+                    if _normalized_packet_ref(_packet_key(packet))
+                    == _normalized_packet_ref(loss_review_evidence.get("hourly_packet_path"))
+                ),
+                {},
+            )
+            or {},
+            advisory_analysis={"requires_board_decision": True},
+            board_decision={"ledger_packet_id": autonomous_loss_decision["ledger_packet_id"]},
+            decision_ledger_root=decision_ledger_root,
+            decision_evidence_root=decision_evidence_root,
+            now=current_now,
+        )
+        loss_review_evidence["review_allowed"] = authority.exit_allowed
+        autonomous_loss_decision["trade_decision_resolved"] = authority.trade_decision_resolved
+        autonomous_loss_decision["exit_allowed"] = authority.exit_allowed
+
     loss_review_evidence_pending = bool(
         loss_review_evidence
+        and autonomous_loss_decision is None
         and (
             loss_review_evidence.get("review_allowed") is not True
             or int(loss_review_evidence.get("remaining_blocker_count") or 0) > 0
@@ -586,8 +702,8 @@ def build_execution_board_review(
     )
     if loss_review_evidence_pending:
         pending_message = (
-            "Refreshed loss-review evidence is attached, but BOARD still lacks "
-            "enough thesis-break confidence to approve a loss exit."
+            "Refreshed loss-review evidence is attached, but the autonomous "
+            "HOLD record could not yet be bound to exact current source files."
         )
         remaining_blockers = list(loss_review_evidence.get("remaining_blockers") or [])
         candidate = loss_review_evidence.get("loss_exit_candidate")
@@ -599,7 +715,7 @@ def build_execution_board_review(
             "market session is not tradeable for a live loss exit"
         ]:
             pending_message = (
-                "Refreshed loss-review evidence has a BOARD-only "
+                "Refreshed loss-review evidence has an autonomous-decision "
                 f"{candidate_reason} candidate"
                 + (f" at confidence {candidate_confidence}" if candidate_confidence else "")
                 + "; live exit remains blocked until a tradeable market session "
@@ -608,7 +724,7 @@ def build_execution_board_review(
         elif candidate_reason:
             blockers_preview = "; ".join(str(item) for item in remaining_blockers[:3])
             pending_message = (
-                "Refreshed loss-review evidence has a BOARD-only "
+                "Refreshed loss-review evidence has an autonomous-decision "
                 f"{candidate_reason} candidate, but remaining blockers still need "
                 f"review: {blockers_preview}."
             )
@@ -717,6 +833,8 @@ def build_execution_board_review(
     }
     if loss_review_evidence is not None:
         review["loss_review_evidence"] = loss_review_evidence
+    if autonomous_loss_decision is not None:
+        review["autonomous_loss_decision"] = autonomous_loss_decision
     return review
 
 
@@ -843,6 +961,7 @@ def compact_execution_board_review(
         "recommendation": review.get("recommendation"),
         "new_buy_policy": review.get("new_buy_policy") or {},
         "loss_review_evidence": review.get("loss_review_evidence") or {},
+        "autonomous_loss_decision": review.get("autonomous_loss_decision") or {},
         "next_hour_policy": review.get("next_hour_policy") or {},
         "metrics": review.get("metrics") or {},
         "violation_count": len(violations),

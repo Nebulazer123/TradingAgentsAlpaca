@@ -136,7 +136,7 @@ def test_build_loss_review_evidence_packet_preserves_hold_and_attaches_sources()
     assert payload["review_allowed"] is False
     assert payload["source_packet_ids"]
     assert set(payload["evidence_needs"]) == set(DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS)
-    assert payload["next_action"] == "manual_board_review_with_refreshed_evidence_required"
+    assert payload["next_action"] == "autonomous_hold"
     assert payload["remaining_blockers_before_refresh"] == [
         "allowed loss-exit reason is missing",
         "source packet ids are missing",
@@ -147,25 +147,26 @@ def test_build_loss_review_evidence_packet_preserves_hold_and_attaches_sources()
         "why this is not broad-market red-day noise is missing",
         "market session is not tradeable for a live loss exit",
     ]
-    assert payload["resolved_blockers_by_refresh"] == [
-        "source packet ids are missing",
+    # Generic quote/news/submissions/connector-gap packets remain advisory.
+    # They cannot falsely clear the exact market, company-news, or filing
+    # blockers needed for a loss decision.
+    assert payload["resolved_blockers_by_refresh"] == ["source packet ids are missing"]
+    assert "source packet ids are missing" not in payload["remaining_blockers"]
+    assert "SPY/QQQ/sector context is missing" in payload["remaining_blockers"]
+    assert "company-specific news check is missing" in payload["remaining_blockers"]
+    assert "earnings/guidance/filing check is missing" in payload["remaining_blockers"]
+    assert "why HOLD is worse than SELL is missing" in payload["remaining_blockers"]
+    assert "why this is not broad-market red-day noise is missing" in payload["remaining_blockers"]
+    assert payload["advisory_analysis"]["review_allowed_after_refresh"] is False
+    assert payload["advisory_analysis"]["market_context_attached"] is False
+    assert "submit_order" in payload["advisory_analysis"]["forbidden_effects"]
+    assert payload["remaining_blockers"] == [
+        "allowed loss-exit reason is missing",
         "SPY/QQQ/sector context is missing",
         "company-specific news check is missing",
         "earnings/guidance/filing check is missing",
         "why HOLD is worse than SELL is missing",
         "why this is not broad-market red-day noise is missing",
-    ]
-    assert "source packet ids are missing" not in payload["remaining_blockers"]
-    assert "SPY/QQQ/sector context is missing" not in payload["remaining_blockers"]
-    assert "company-specific news check is missing" not in payload["remaining_blockers"]
-    assert "earnings/guidance/filing check is missing" not in payload["remaining_blockers"]
-    assert "why HOLD is worse than SELL is missing" not in payload["remaining_blockers"]
-    assert "why this is not broad-market red-day noise is missing" not in payload["remaining_blockers"]
-    assert payload["advisory_analysis"]["review_allowed_after_refresh"] is False
-    assert payload["advisory_analysis"]["market_context_attached"] is True
-    assert "submit_order" in payload["advisory_analysis"]["forbidden_effects"]
-    assert payload["remaining_blockers"] == [
-        "allowed loss-exit reason is missing",
         "market session is not tradeable for a live loss exit",
     ]
 
@@ -276,38 +277,21 @@ def test_loss_review_evidence_classifies_falling_knife_thesis_without_approval(t
         "requires_board_decision": True,
     }
     assert "current thesis status is missing" in payload["resolved_blockers_by_refresh"]
-    assert "allowed loss-exit reason is missing" in payload["resolved_blockers_by_refresh"]
-    assert "allowed loss-exit reason source is missing" in payload["resolved_blockers_by_refresh"]
-    assert "loss-exit confidence is missing" in payload["resolved_blockers_by_refresh"]
+    assert "allowed loss-exit reason is missing" not in payload["resolved_blockers_by_refresh"]
+    assert "allowed loss-exit reason source is missing" not in payload["resolved_blockers_by_refresh"]
+    assert "loss-exit confidence is missing" not in payload["resolved_blockers_by_refresh"]
     assert "current thesis status is missing" not in payload["remaining_blockers"]
-    assert "allowed loss-exit reason is missing" not in payload["remaining_blockers"]
-    assert "allowed loss-exit reason source is missing" not in payload["remaining_blockers"]
-    assert "loss-exit confidence is missing" not in payload["remaining_blockers"]
-    assert payload["remaining_blockers"] == [
-        "market session is not tradeable for a live loss exit",
-    ]
+    assert "allowed loss-exit reason is missing" in payload["remaining_blockers"]
+    assert "allowed loss-exit reason source is missing" in payload["remaining_blockers"]
+    assert "loss-exit confidence is missing" in payload["remaining_blockers"]
     assert payload["review_allowed"] is False
     assert advisory["review_allowed_after_refresh"] is False
-    assert advisory["loss_exit_candidate"] == {
-        "allowed_exit_reason_candidate": "thesis_invalidated",
-        "allowed_exit_reason_source": "refreshed_loss_review_evidence",
-        "confidence": "0.78",
-        "confidence_tier": "medium",
-        "reason_summary": (
-            "Prior momentum/time-sensitive thesis is under pressure while the "
-            "current candidate is a falling-knife watch below average entry."
-        ),
-        "drivers": [
-            "current candidate is flagged as falling-knife/sharp-drop watch",
-            "prior entry thesis was momentum or time-sensitive",
-            "position is below average entry price",
-            "refreshed market and company evidence attached",
-            "holding period is available",
-        ],
-        "approval_effect": "board_review_input_not_loss_exit_approval",
-        "requires_board_decision": True,
-        "requires_tradeable_session": True,
-        "can_submit_orders": False,
+    assert advisory["loss_exit_candidate"]["allowed_exit_reason_candidate"] is None
+    assert advisory["loss_exit_candidate"]["confidence"] == "0.00"
+    assert advisory["qualified_evidence"] == {
+        "market": False,
+        "company_news": False,
+        "filing": False,
     }
 
     packet_path = write_research_packet(packet, tmp_path)
@@ -324,10 +308,10 @@ def test_loss_review_evidence_classifies_falling_knife_thesis_without_approval(t
     }
     assert compact["payload"]["advisory_summary"]["loss_exit_candidate"][
         "allowed_exit_reason_candidate"
-    ] == "thesis_invalidated"
+    ] is None
     assert compact["payload"]["advisory_summary"]["loss_exit_candidate"][
         "confidence"
-    ] == "0.78"
+    ] == "0.00"
 
 
 def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_path):
@@ -365,21 +349,14 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
     assert payload["review_allowed"] is False
     assert payload["evidence_needs"] == list(DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS)
     assert payload["remaining_blockers_before_refresh_count"] == 8
-    assert payload["remaining_blocker_count"] == 2
-    assert payload["resolved_blocker_count"] == 6
-    assert payload["resolved_blockers_by_refresh"] == [
-        "source packet ids are missing",
-        "SPY/QQQ/sector context is missing",
-        "company-specific news check is missing",
-        "earnings/guidance/filing check is missing",
-        "why HOLD is worse than SELL is missing",
-        "why this is not broad-market red-day noise is missing",
-    ]
-    assert payload["next_action"] == "manual_board_review_with_refreshed_evidence_required"
+    assert payload["remaining_blocker_count"] == 7
+    assert payload["resolved_blocker_count"] == 1
+    assert payload["resolved_blockers_by_refresh"] == ["source packet ids are missing"]
+    assert payload["next_action"] == "autonomous_hold"
     assert payload["source_packet_count"] == 4
     assert payload["packet_path"].endswith(".json")
     written = json.loads(Path(payload["packet_path"]).read_text(encoding="utf-8"))
-    assert written["payload"]["next_action"] == "manual_board_review_with_refreshed_evidence_required"
+    assert written["payload"]["next_action"] == "autonomous_hold"
     assert written["payload"]["resolved_blockers_by_refresh"]
     compact_path = Path(payload["packet_path"]).with_suffix(".compact.json")
     assert compact_path.exists()
@@ -392,8 +369,8 @@ def test_loss_review_evidence_cli_writes_analysis_only_packet(monkeypatch, tmp_p
     assert compact["execution_authority"] == "none"
     assert compact["payload"]["symbol"] == "TSM"
     assert len(compact["payload"]["remaining_blockers_before_refresh"]) == 8
-    assert len(compact["payload"]["remaining_blockers"]) == 2
-    assert len(compact["payload"]["resolved_blockers_by_refresh"]) == 6
+    assert len(compact["payload"]["remaining_blockers"]) == 7
+    assert len(compact["payload"]["resolved_blockers_by_refresh"]) == 1
     assert isinstance(compact["payload"]["entry_context"], dict)
     assert "client_order_id" not in compact["payload"]["entry_context"]
     assert "submitted_at" not in compact["payload"]["entry_context"]

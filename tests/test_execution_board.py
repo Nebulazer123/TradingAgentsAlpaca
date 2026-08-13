@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 
 from typer.testing import CliRunner
 
@@ -19,6 +20,89 @@ def _write_packet(directory, name, payload):
     path = directory / name
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+def _write_exact_incomplete_loss_evidence(tmp_path):
+    """Write a Task-1-compatible raw packet that must resolve to HOLD."""
+    hourly = tmp_path / "hourly"
+    evidence_dir = tmp_path / "loss_review_evidence"
+    review = {
+        "symbol": "TSM",
+        "decision_id": "loss-review-tsm-1",
+        "allowed": False,
+        "policy_rule_exit": False,
+        "allowed_exit_reason": "",
+        "allowed_exit_reason_source": "",
+        "blockers": ["company evidence is incomplete"],
+        "blocked_reasons": ["company evidence is incomplete"],
+        "confidence": "0.00",
+        "evidence_generated_at": "2026-08-13T15:00:00+00:00",
+    }
+    hourly_path = _write_packet(
+        hourly,
+        "hourly-supervisor-20260813-150000.json",
+        {
+            "generated_at": "2026-08-13T15:00:00+00:00",
+            "decision": "loss-review",
+            "actions": [],
+            "submitted": [],
+            "evidence": {"loss_exit_review": review},
+            "portfolio": {"live": {"unrealized_pl": "-1.11"}},
+        },
+    )
+    loss_path = _write_packet(
+        evidence_dir,
+        "loss.json",
+        {
+            "packet_id": "loss-evidence-tsm-1",
+            "generated_at": "2026-08-13T15:00:00+00:00",
+            "source_name": "loss_review_evidence",
+            "evidence_type": "loss_review_evidence",
+            "subject": "TSM",
+            "symbol": "TSM",
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "payload": {
+                "symbol": "TSM",
+                "hourly_packet_path": str(hourly_path),
+                "supervisor_packet_path": "hourly/hourly-supervisor-20260813-150000.json",
+                "supervisor_decision_id": "loss-review-tsm-1",
+                "supervisor_review_authority": bounded_exit_authority_record(review),
+                "remaining_blockers": ["company evidence is incomplete"],
+                "resolved_blockers_by_refresh": [],
+                "advisory_analysis": {"requires_board_decision": True},
+                "accepted_sources": [],
+                "next_action": "autonomous_hold",
+            },
+        },
+    )
+    return hourly, evidence_dir, hourly_path, loss_path
+
+
+def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
+    hourly, evidence_dir, _hourly_path, loss_path = _write_exact_incomplete_loss_evidence(tmp_path)
+    ledger_root = tmp_path.parent / "installed-decision-ledger"
+
+    review = build_execution_board_review(
+        hourly,
+        loss_review_evidence_dir=evidence_dir,
+        decision_evidence_root=tmp_path,
+        decision_ledger_root=ledger_root,
+        source_revision="1" * 40,
+        now=datetime(2026, 8, 13, 15, 1, tzinfo=UTC),
+    )
+
+    decision = review["autonomous_loss_decision"]
+    assert decision["decision"] == "HOLD"
+    assert decision["trade_decision_resolved"] is True
+    assert decision["exit_allowed"] is False
+    assert decision["execution_authority"] == "none"
+    assert decision["can_submit_orders"] is False
+    assert decision["ledger_packet_id"]
+    assert review["loss_review_evidence"]["next_action"] == "autonomous_hold"
+    assert not any("manual" in item["message"].lower() for item in review["warnings"])
+    assert loss_path.exists()
 
 
 def test_execution_board_loader_ignores_compact_and_latest_sidecars(tmp_path):
@@ -436,6 +520,7 @@ def test_execution_board_merges_matching_loss_review_evidence(tmp_path):
         "evidence_path": str(evidence_dir / "latest-compact.json"),
         "raw_packet_path": str(evidence_dir / "source-evidence-tsm.json"),
         "hourly_packet_path": str(hourly_packet),
+        "supervisor_packet_path": "",
         "matches_review_window": True,
         "source_binding": {"matched": True, "issue": None},
         "symbol": "TSM",
@@ -587,7 +672,7 @@ def test_execution_board_names_tradeable_session_when_loss_exit_candidate_ready(
         "confidence_tier": "medium",
         "can_submit_orders": False,
     }
-    assert "BOARD-only" in pending_warning["message"]
+    assert "manual" not in pending_warning["message"].lower()
     assert "tradeable market session" in pending_warning["message"]
     assert "normal live gates" in pending_warning["message"]
 

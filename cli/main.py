@@ -1200,6 +1200,11 @@ def research_loss_review_evidence(
         "--source-output-dir",
         help="Directory for source evidence packets gathered during the refresh.",
     ),
+    decision_evidence_root: Path = typer.Option(
+        Path("results"),
+        "--decision-evidence-root",
+        help="Existing local root for immutable BOARD evidence bindings.",
+    ),
     cache_dir: Path = typer.Option(
         Path("results/research_provider_cache"),
         "--cache-dir",
@@ -1277,6 +1282,8 @@ def research_loss_review_evidence(
         hourly_packet=hourly_packet,
         provider_result=result,
         evidence_needs=needs or DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
+        source_packet_paths=source_packet_paths,
+        decision_evidence_root=decision_evidence_root,
     )
     packet_path = write_research_packet(packet, output_dir)
     payload = packet.model_dump()
@@ -3454,10 +3461,25 @@ def research_execution_board_review(
         "--output-dir",
         help="Directory for BOARD execution review artifacts.",
     ),
+    decision_ledger_root: Path = typer.Option(
+        Path("state/decision_ledger"),
+        "--decision-ledger-root",
+        help="Installed local decision-ledger directory; never taken from evidence packets.",
+    ),
+    decision_evidence_root: Path = typer.Option(
+        Path("results"),
+        "--decision-evidence-root",
+        help="Existing local root that contains the exact hourly and loss-evidence files.",
+    ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Write an analysis-only BOARD review of recent intraday execution quality."""
-    review = build_execution_board_review(hourly_dir=hourly_dir, max_packets=max_packets)
+    review = build_execution_board_review(
+        hourly_dir=hourly_dir,
+        max_packets=max_packets,
+        decision_ledger_root=decision_ledger_root,
+        decision_evidence_root=decision_evidence_root,
+    )
     json_path, md_path = write_execution_board_review(review, output_dir)
     payload = dict(review)
     payload["json_path"] = str(json_path)

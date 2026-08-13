@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -255,6 +256,7 @@ def _provider_packet_refs(provider_result: TickerProviderResearchResult) -> list
                 "source_name": packet.source_name,
                 "evidence_type": packet.evidence_type,
                 "quality": packet.quality,
+                "as_of": str(packet.as_of or packet.generated_at),
             }
         )
     if provider_result.summary_packet is not None:
@@ -265,9 +267,91 @@ def _provider_packet_refs(provider_result: TickerProviderResearchResult) -> list
                 "source_name": packet.source_name,
                 "evidence_type": packet.evidence_type,
                 "quality": packet.quality,
+                "as_of": str(packet.as_of or packet.generated_at),
             }
         )
     return refs
+
+
+def _accepted_source_descriptors(
+    provider_result: TickerProviderResearchResult,
+    *,
+    source_packet_paths: Mapping[str, str | Path] | None,
+    evidence_root: str | Path | None,
+) -> list[dict[str, Any]]:
+    """Bind written provider packets exactly for the downstream BOARD recorder.
+
+    Missing, outside-root, unreadable, or malformed source files are omitted.
+    That is intentionally conservative: an incomplete descriptor set leads to
+    HOLD rather than allowing a source's self-description to clear a blocker.
+    """
+    if not source_packet_paths or evidence_root is None:
+        return []
+    root = Path(evidence_root).resolve()
+    result: list[dict[str, Any]] = []
+    for packet in provider_result.packets:
+        supplied = source_packet_paths.get(packet.packet_id)
+        if supplied is None:
+            continue
+        try:
+            path = Path(supplied).resolve()
+            relative = path.relative_to(root)
+            raw = path.read_bytes()
+            stored = json.loads(raw)
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(stored, Mapping):
+            continue
+        as_of = str(packet.as_of or packet.generated_at)
+        if (
+            stored.get("packet_id") != packet.packet_id
+            or stored.get("source_name") != packet.source_name
+            or stored.get("evidence_type") != packet.evidence_type
+            or stored.get("symbol") != packet.symbol
+            or stored.get("as_of") != packet.as_of
+            or stored.get("quality") != packet.quality
+        ):
+            continue
+        result.append(
+            {
+                "path": relative.as_posix(),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size_bytes": len(raw),
+                "packet_id": packet.packet_id,
+                "source_name": packet.source_name,
+                "evidence_type": packet.evidence_type,
+                "as_of": as_of,
+                "quality": packet.quality,
+            }
+        )
+    return result
+
+
+def _qualified_loss_review_evidence(
+    provider_result: TickerProviderResearchResult,
+    *,
+    symbol: str,
+) -> dict[str, bool]:
+    """Return strict source-category facts for a possible autonomous decision.
+
+    Generic quotes, cache/watchlist material, SEC submissions indexes, and
+    connector-gap packets can still inform research.  They cannot falsely
+    clear the three evidence blockers that an autonomous loss decision needs.
+    """
+    result = {"market": False, "company_news": False, "filing": False}
+    for packet in provider_result.packets:
+        if packet.symbol != symbol or packet.quality not in {"high", "medium"}:
+            continue
+        descriptor = f"{packet.source_name} {packet.evidence_type}".lower()
+        if any(marker in descriptor for marker in ("watchlist", "cache", "gap", "connector", "submissions")):
+            continue
+        if packet.evidence_type == "market_context":
+            result["market"] = True
+        elif packet.evidence_type == "company_news":
+            result["company_news"] = True
+        elif packet.evidence_type == "earnings_guidance_filing":
+            result["filing"] = True
+    return result
 
 
 def _infer_current_thesis_status(
@@ -500,19 +584,10 @@ def _build_advisory_analysis(
         if isinstance(attempt, Mapping)
     ]
 
-    has_market_context = _has_coverage(
-        coverage_by_need,
-        "market_sentiment_watchlist",
-        "market_news",
-        "quote_price_context",
-    )
-    has_fundamental_context = _has_coverage(
-        coverage_by_need,
-        "fundamentals_profile",
-        "submissions",
-        "earnings_transcripts",
-    )
-    has_news_context = _has_coverage(coverage_by_need, "market_news", "news_rss")
+    qualified_evidence = _qualified_loss_review_evidence(provider_result, symbol=symbol)
+    has_market_context = qualified_evidence["market"]
+    has_fundamental_context = qualified_evidence["filing"]
+    has_news_context = qualified_evidence["company_news"]
     ranked_reason = str((ranked_entry or {}).get("reason") or "").strip()
     current_thesis_status, thesis_status_evidence = _infer_current_thesis_status(
         review=review,
@@ -558,6 +633,7 @@ def _build_advisory_analysis(
         },
         "market_context_attached": has_market_context,
         "company_context_attached": has_news_context or has_fundamental_context,
+        "qualified_evidence": qualified_evidence,
         "hold_vs_sell_frame": (
             "SELL is better only if BOARD can prove thesis break, invalidator, or superior capital reuse; otherwise HOLD remains the default because this packet cannot approve a loss exit."
             if source_refs
@@ -598,6 +674,7 @@ def _refresh_resolved_blockers(
     *,
     source_packet_ids: Sequence[str],
     coverage_by_need: Mapping[str, int],
+    qualified_evidence: Mapping[str, bool] | None = None,
     entry_context: Mapping[str, Any] | None = None,
     thesis_status_candidate: str | None = None,
     loss_exit_candidate: Mapping[str, Any] | None = None,
@@ -605,21 +682,10 @@ def _refresh_resolved_blockers(
     """Return loss-review blockers addressed by this read-only evidence refresh."""
     resolved: list[str] = []
     has_sources = bool(source_packet_ids)
-    has_news = bool(
-        int(coverage_by_need.get("market_news") or 0)
-        or int(coverage_by_need.get("news_rss") or 0)
-    )
-    has_earnings_or_filings = bool(
-        int(coverage_by_need.get("earnings_transcripts") or 0)
-        or int(coverage_by_need.get("fundamentals_profile") or 0)
-        or int(coverage_by_need.get("submissions") or 0)
-    )
-    has_market_context = _has_coverage(
-        coverage_by_need,
-        "market_sentiment_watchlist",
-        "market_news",
-        "quote_price_context",
-    )
+    qualified = dict(qualified_evidence or {})
+    has_news = qualified.get("company_news") is True
+    has_earnings_or_filings = qualified.get("filing") is True
+    has_market_context = qualified.get("market") is True
     has_hold_sell_context = has_sources and has_news and has_earnings_or_filings
     has_entry_reason = bool(str((entry_context or {}).get("entry_reason") or "").strip())
     has_holding_period = (entry_context or {}).get("holding_period_trading_days") is not None
@@ -669,6 +735,8 @@ def build_loss_review_evidence_packet(
     provider_result: TickerProviderResearchResult,
     evidence_needs: Sequence[str] = DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
     entry_context: Mapping[str, Any] | None = None,
+    source_packet_paths: Mapping[str, str | Path] | None = None,
+    decision_evidence_root: str | Path | None = None,
 ) -> SourceEvidencePacket:
     """Build an advisory packet for BOARD/manual loss-review analysis.
 
@@ -681,6 +749,11 @@ def build_loss_review_evidence_packet(
         raise ValueError("hourly packet does not contain evidence.loss_exit_review")
     symbol = str(review.get("symbol") or provider_result.symbol).strip().upper()
     source_ids = _source_packet_ids(provider_result)
+    accepted_sources = _accepted_source_descriptors(
+        provider_result,
+        source_packet_paths=source_packet_paths,
+        evidence_root=decision_evidence_root,
+    )
     blockers = _strings(review.get("blockers")) or _strings(review.get("blocked_reasons"))
     coverage_by_need = _coverage_by_need(provider_result)
     review_at = _parse_timestamp(
@@ -700,10 +773,14 @@ def build_loss_review_evidence_packet(
         coverage_by_need=coverage_by_need,
         entry_context=entry_context,
     )
+    qualified_evidence = advisory_analysis.get("qualified_evidence")
+    if not isinstance(qualified_evidence, Mapping):
+        qualified_evidence = {}
     resolved_blockers = _refresh_resolved_blockers(
         blockers,
         source_packet_ids=source_ids,
         coverage_by_need=coverage_by_need,
+        qualified_evidence=qualified_evidence,
         entry_context=entry_context,
         thesis_status_candidate=advisory_analysis.get("current_thesis_status_candidate"),
         loss_exit_candidate=advisory_analysis.get("loss_exit_candidate"),
@@ -715,6 +792,14 @@ def build_loss_review_evidence_packet(
     payload = {
         "symbol": symbol,
         "hourly_packet_path": str(hourly_path),
+        "supervisor_packet_path": (
+            str(hourly_path.resolve().relative_to(Path(decision_evidence_root).resolve()).as_posix())
+            if decision_evidence_root is not None
+            and hourly_path.exists()
+            and hourly_path.resolve().is_relative_to(Path(decision_evidence_root).resolve())
+            else None
+        ),
+        "supervisor_decision_id": review.get("decision_id"),
         "hourly_generated_at": hourly_packet.get("generated_at"),
         "hourly_decision": hourly_packet.get("decision"),
         "submitted_order_count": len(hourly_packet.get("submitted") or []),
@@ -722,6 +807,7 @@ def build_loss_review_evidence_packet(
         "supervisor_review_authority": bounded_exit_authority_record(review),
         "supervisor_review_source_packet_ids": _strings(review.get("source_packet_ids")),
         "source_packet_ids": source_ids,
+        "accepted_sources": accepted_sources,
         "provider_summary_packet_id": (
             provider_result.summary_packet.packet_id
             if provider_result.summary_packet is not None
@@ -748,9 +834,7 @@ def build_loss_review_evidence_packet(
             if advisory_analysis.get("authority_source")
             == "pre_registered_policy_rule"
             else (
-                "manual_board_review_with_refreshed_evidence_required"
-                if resolved_blockers
-                else "manual_board_review_required"
+                "autonomous_hold"
             )
         ),
         "analysis_only": True,
