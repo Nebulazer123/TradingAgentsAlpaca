@@ -38,6 +38,7 @@ ADVISORY_ALLOWED_EFFECTS = frozenset(
         "recommend_trade_proposal",
         "recommend_strategy_candidate",
         "recommend_risk_envelope",
+        "record_trade_decision",
     }
 )
 REQUIRED_FORBIDDEN_EFFECTS = frozenset(
