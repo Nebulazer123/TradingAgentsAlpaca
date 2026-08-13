@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from tradingagents.brokers.manual_action_attribution import replay_suppression_key
 from tradingagents.orchestration.authority import ActionClass, authority_for
 from tradingagents.orchestration.incidents import is_safe_incident_id
 from tradingagents.orchestration.recovery import (
@@ -2074,6 +2075,11 @@ def _valid_reconciliation_phase_packet(
         "market_value",
         "avg_entry_price",
     )
+    external_actions_valid = _valid_manual_exit_replay_suppressions(
+        packet,
+        symbol=symbol,
+        checked_client_order_ids=checked_ids,
+    )
     return (
         packet.get("schema_version") == "tradingagents.recovery_phase.v1"
         and packet.get("source_schema_version") == 1
@@ -2089,6 +2095,7 @@ def _valid_reconciliation_phase_packet(
         and packet.get("issues") == []
         and type(packet.get("broker_write_calls")) is int
         and packet.get("broker_write_calls") == 0
+        and external_actions_valid
         and isinstance(position, Mapping)
         and position.get("symbol") == symbol
         and all(
@@ -2115,6 +2122,129 @@ def _valid_reconciliation_phase_packet(
             collection="recent_fills",
         )
     )
+
+
+def _valid_manual_exit_replay_suppressions(
+    packet: Mapping[str, Any],
+    *,
+    symbol: str,
+    checked_client_order_ids: set[str],
+) -> bool:
+    resolved = packet.get("resolved_external_actions")
+    suppressions = packet.get("replay_suppressions")
+    if resolved is None and suppressions is None:
+        return True
+    if not isinstance(resolved, list) or not isinstance(suppressions, list):
+        return False
+    if not resolved and not suppressions:
+        return True
+    position = packet.get("position")
+    if (
+        len(resolved) != len(suppressions)
+        or not isinstance(position, Mapping)
+        or _finite_recovery_decimal(position.get("qty"), nonnegative=True)
+        != Decimal("0")
+        or packet.get("open_orders") != []
+    ):
+        return False
+    recent_fills = packet.get("recent_fills")
+    if not isinstance(recent_fills, list):
+        return False
+    seen: set[tuple[str, str]] = set()
+    for action, suppression in zip(resolved, suppressions, strict=True):
+        if not isinstance(action, Mapping) or not isinstance(suppression, Mapping):
+            return False
+        required_action = {
+            "resolution_id", "attestation_path", "attestation_sha256",
+            "source_packet_path", "source_packet_sha256", "symbol",
+            "filled_qty", "originating_client_order_id",
+            "resolved_by_client_order_id",
+        }
+        required_suppression = {
+            "scope", "suppression_key", "resolution_id", "attestation_sha256",
+            "source_packet_sha256", "symbol", "filled_qty",
+            "originating_client_order_id", "resolved_by_client_order_id", "active",
+        }
+        if set(action) != required_action or set(suppression) != required_suppression:
+            return False
+        origin_id = action.get("originating_client_order_id")
+        manual_id = action.get("resolved_by_client_order_id")
+        pair = (str(origin_id), str(manual_id))
+        if (
+            pair in seen
+            or not all(_nonempty_recovery_string(value) for value in pair)
+            or origin_id == manual_id
+            or origin_id not in checked_client_order_ids
+            or manual_id not in checked_client_order_ids
+            or action.get("symbol") != symbol
+            or suppression.get("scope") != "exact_incident_exit_chain"
+            or suppression.get("active") is not True
+            or any(
+                suppression.get(key) != action.get(key)
+                for key in (
+                    "resolution_id", "attestation_sha256",
+                    "source_packet_sha256", "symbol", "filled_qty",
+                    "originating_client_order_id", "resolved_by_client_order_id",
+                )
+            )
+        ):
+            return False
+        seen.add(pair)
+        filled_qty = _finite_recovery_decimal(action.get("filled_qty"), positive=True)
+        if filled_qty is None:
+            return False
+        paths = (
+            (action.get("attestation_path"), action.get("attestation_sha256")),
+            (action.get("source_packet_path"), action.get("source_packet_sha256")),
+        )
+        for raw_path, expected_digest in paths:
+            if (
+                not isinstance(raw_path, str)
+                or not Path(raw_path).is_absolute()
+                or str(Path(raw_path).resolve()) != raw_path
+                or not _valid_recovery_digest(expected_digest)
+            ):
+                return False
+            try:
+                actual_digest = hashlib.sha256(Path(raw_path).read_bytes()).hexdigest()
+            except OSError:
+                return False
+            if actual_digest != expected_digest:
+                return False
+        origin_fills = [
+            fill for fill in recent_fills
+            if isinstance(fill, Mapping) and fill.get("client_order_id") == origin_id
+        ]
+        manual_fills = [
+            fill for fill in recent_fills
+            if isinstance(fill, Mapping) and fill.get("client_order_id") == manual_id
+        ]
+        if len(origin_fills) != 1 or len(manual_fills) != 1:
+            return False
+        origin_fill, manual_fill = origin_fills[0], manual_fills[0]
+        if (
+            str(origin_fill.get("side") or "").lower() != "buy"
+            or str(manual_fill.get("side") or "").lower() != "sell"
+            or str(origin_fill.get("status") or "").lower() != "filled"
+            or str(manual_fill.get("status") or "").lower() != "filled"
+            or _finite_recovery_decimal(origin_fill.get("filled_qty"), positive=True)
+            != filled_qty
+            or _finite_recovery_decimal(manual_fill.get("filled_qty"), positive=True)
+            != filled_qty
+        ):
+            return False
+        expected_key = replay_suppression_key(
+            attribution_sha256=str(action["attestation_sha256"]),
+            resolution_id=str(action["resolution_id"]),
+            symbol=symbol,
+            originating_client_order_id=str(origin_id),
+            resolved_by_client_order_id=str(manual_id),
+            filled_qty=str(action["filled_qty"]),
+            source_packet_sha256=str(action["source_packet_sha256"]),
+        )
+        if suppression.get("suppression_key") != expected_key:
+            return False
+    return True
 
 
 def _valid_phase_packet(
@@ -2192,6 +2322,10 @@ def _valid_phase_packet(
         expected_phases = RECOVERY_PHASES[:5]
         if not all(_valid_recovery_record(outputs.get(name)) for name in expected_phases):
             return False
+        root_cause_resolution = _ready_root_cause_resolution(
+            outputs,
+            bindings=bindings,
+        )
         return (
             packet.get("schema_version") == "tradingagents.incident.v1"
             and packet.get("stage") == "ready"
@@ -2207,6 +2341,8 @@ def _valid_phase_packet(
             == "reliability_controller"
             and packet.get("owner_role") == "reliability_controller"
             and packet.get("root_cause_resolved") is True
+            and root_cause_resolution is not None
+            and packet.get("root_cause_resolution") == root_cause_resolution
             and packet.get("external_blockers") == []
         )
     if phase == "manifest":
@@ -2258,6 +2394,46 @@ def _valid_phase_packet(
             )
         )
     return False
+
+
+def _ready_root_cause_resolution(
+    phase_outputs: Mapping[str, object],
+    *,
+    bindings: Mapping[str, str],
+) -> dict[str, object] | None:
+    record = phase_outputs.get("reconcile")
+    if not _valid_recovery_record(record):
+        return None
+    path = Path(str(record["path"])).resolve()
+    try:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+            return None
+        packet = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(packet, Mapping) or not _valid_reconciliation_phase_packet(
+        packet, bindings
+    ):
+        return None
+    suppressions = packet.get("replay_suppressions")
+    actions = packet.get("resolved_external_actions")
+    if suppressions is None:
+        suppressions = []
+    if actions is None:
+        actions = []
+    if not isinstance(suppressions, list) or not isinstance(actions, list):
+        return None
+    return {
+        "reconciliation_path": str(path),
+        "reconciliation_sha256": record["sha256"],
+        "resolved_external_action_count": len(actions),
+        "replay_suppression_keys": [
+            suppression["suppression_key"]
+            for suppression in suppressions
+            if isinstance(suppression, Mapping)
+            and isinstance(suppression.get("suppression_key"), str)
+        ],
+    }
 
 
 def _canonical_packet(packet: Mapping[str, Any], bindings: Mapping[str, str], now: dt.datetime) -> dict[str, Any]:
@@ -3232,6 +3408,20 @@ def build_production_recovery_request(
         argv = [sys.executable, "-m", "cli.main", "alpaca", "reconcile-symbol-incident", "--symbol", symbol]
         for path in paths:
             argv.extend(["--packet-path", str(path)])
+        raw_attributions = context.get("owner_action_attestation_paths", [])
+        if not isinstance(raw_attributions, list):
+            return unavailable(
+                "reconcile", "owner action attribution paths are malformed"
+            )
+        attribution_paths = [
+            context_path_value(value) for value in raw_attributions
+        ]
+        if any(path is None or not path.is_file() for path in attribution_paths):
+            return unavailable(
+                "reconcile", "owner action attribution path is unavailable"
+            )
+        for path in attribution_paths:
+            argv.extend(["--owner-action-attestation", str(path)])
         result = run_json("reconcile", [*argv, "--json-output"])
         packet = result.get("packet") if isinstance(result, Mapping) else None
         required_reconciliation = {"read_only", "execution_authority", "can_submit_orders", "matched", "issues", "broker_write_calls"}
@@ -3446,6 +3636,19 @@ def derive_production_recovery_context(
         "envelope_path": str(required_paths["envelope_path"]),
         "promotion_state_path": str(required_paths["promotion_state_path"]),
         "reconciliation_packet_paths": [str(hourly_packet)],
+        "owner_action_attestation_paths": [
+            str(path.resolve())
+            for path in sorted(
+                (
+                    root
+                    / "results"
+                    / "control_plane"
+                    / "owner_manual_actions"
+                    / symbol
+                ).glob("*.json")
+            )
+            if path.is_file()
+        ],
     }
 
 
@@ -4030,6 +4233,14 @@ def coordinate_verified_recovery(
             _append_recovery_event(incident_root, {"event": "phase_started", "incident_id": incident_id, "phase": phase, "attempt": state["attempt"], "at": current.isoformat()})
             try:
                 if phase == "ready_incident":
+                    root_cause_resolution = _ready_root_cause_resolution(
+                        state["phase_outputs"],
+                        bindings=canonical_bindings,
+                    )
+                    if root_cause_resolution is None:
+                        raise ValueError(
+                            "ready incident lacks verified reconciliation resolution"
+                        )
                     packet: Mapping[str, Any] = {
                         "schema_version": "tradingagents.incident.v1",
                         "stage": "ready",
@@ -4041,6 +4252,7 @@ def coordinate_verified_recovery(
                         "repairer_run_id": owner_run_id,
                         "repairer_role_id": rearm_request_owner,
                         "root_cause_resolved": True,
+                        "root_cause_resolution": root_cause_resolution,
                         "external_blockers": [],
                     }
                 elif phase == "manifest":

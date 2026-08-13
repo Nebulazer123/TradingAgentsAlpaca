@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from tradingagents.brokers import alpaca_reconciliation
+from tradingagents.brokers.manual_action_attribution import replay_suppression_key
 from tradingagents.orchestration import recovery as recovery_module
 from tradingagents.orchestration import self_heal as self_heal_module
 from tradingagents.orchestration.authority import (
@@ -284,6 +285,83 @@ def _reconciliation_source_packet(*, symbol: str = "NFLX") -> dict:
         "issues": [],
         "broker_write_calls": 0,
     }
+
+
+def test_recovery_recomputes_exact_manual_exit_suppression_and_rejects_label_only(tmp_path):
+    attestation_path = tmp_path / "owner.json"
+    attestation_path.write_text('{"owner":"exact"}\n', encoding="utf-8")
+    source_path = tmp_path / "source.json"
+    source_path.write_text('{"order":"autonomous-buy"}\n', encoding="utf-8")
+    attestation_sha = hashlib.sha256(attestation_path.read_bytes()).hexdigest()
+    source_sha = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    resolution_id = "owner-manual-action-" + "a" * 64
+    suppression_key = replay_suppression_key(
+        attribution_sha256=attestation_sha,
+        resolution_id=resolution_id,
+        symbol="NFLX",
+        originating_client_order_id="autonomous-buy",
+        resolved_by_client_order_id="owner-sell",
+        filled_qty="1",
+        source_packet_sha256=source_sha,
+    )
+    packet = {
+        **_reconciliation_source_packet(),
+        "schema_version": "tradingagents.recovery_phase.v1",
+        "source_schema_version": 1,
+        "source_identity": "alpaca_symbol_incident_reconciliation",
+        "open_orders": [],
+        "recent_fills": [
+            {
+                "client_order_id": "owner-sell", "symbol": "NFLX",
+                "side": "sell", "status": "filled", "filled_qty": "1",
+                "filled_avg_price": "9.5", "submitted_at": NOW.isoformat(),
+            },
+            {
+                "client_order_id": "autonomous-buy", "symbol": "NFLX",
+                "side": "buy", "status": "filled", "filled_qty": "1",
+                "filled_avg_price": "10", "submitted_at": NOW.isoformat(),
+            },
+        ],
+        "checked_client_order_ids": ["autonomous-buy", "owner-sell"],
+        "resolved_external_actions": [{
+            "resolution_id": resolution_id,
+            "attestation_path": str(attestation_path.resolve()),
+            "attestation_sha256": attestation_sha,
+            "source_packet_path": str(source_path.resolve()),
+            "source_packet_sha256": source_sha,
+            "symbol": "NFLX", "filled_qty": "1",
+            "originating_client_order_id": "autonomous-buy",
+            "resolved_by_client_order_id": "owner-sell",
+        }],
+        "replay_suppressions": [{
+            "scope": "exact_incident_exit_chain",
+            "suppression_key": suppression_key,
+            "resolution_id": resolution_id,
+            "attestation_sha256": attestation_sha,
+            "source_packet_sha256": source_sha,
+            "symbol": "NFLX", "filled_qty": "1",
+            "originating_client_order_id": "autonomous-buy",
+            "resolved_by_client_order_id": "owner-sell",
+            "active": True,
+        }],
+    }
+
+    assert self_heal_module._valid_reconciliation_phase_packet(packet, BINDINGS)
+    for mutate in (
+        lambda candidate: candidate["replay_suppressions"][0].update(
+            {"suppression_key": "b" * 64}
+        ),
+        lambda candidate: candidate["resolved_external_actions"][0].update(
+            {"attestation_sha256": "c" * 64}
+        ),
+        lambda candidate: candidate.update({"replay_suppressions": []}),
+        lambda candidate: candidate["position"].update({"qty": "1"}),
+    ):
+        candidate = json.loads(json.dumps(packet))
+        mutate(candidate)
+        assert not self_heal_module._valid_reconciliation_phase_packet(
+            candidate, BINDINGS
+        )
 
 
 def _control(tmp_path: Path) -> Path:
@@ -2251,6 +2329,50 @@ def test_production_request_preserves_msft_and_rejects_preassembled_packets(tmp_
     assert request["bindings"]["symbol"] == "MSFT"
     assert request["bindings"]["broker_account"] == "paper-a"
     assert request["adapters"]["resolve_authority"]({"phase": "resolve_authority"})["outcome"] == "failed"
+
+
+def test_production_reconciliation_forwards_repo_bound_owner_attribution(tmp_path):
+    source = tmp_path / "source.json"
+    source.write_text("{}", encoding="utf-8")
+    attribution = tmp_path / "owner.json"
+    attribution.write_text("{}", encoding="utf-8")
+    invocations = []
+
+    class Result:
+        returncode = 0
+        stderr = ""
+        stdout = json.dumps({
+            "read_only": True, "execution_authority": "none",
+            "can_submit_orders": False, "matched": False,
+            "issues": ["test"], "broker_write_calls": 0,
+        })
+
+    def runner(argv, **_kwargs):
+        invocations.append(list(argv))
+        return Result()
+
+    context = {
+        "symbol": "NFLX", "broker_account": "live", "environment": "production",
+        "source_revision": "abc123", "supervisor_path": "missing.json",
+        "advisory_path": "missing.json", "hourly_dir": "missing",
+        "report_path": "missing.json", "envelope_path": "missing.yaml",
+        "promotion_state_path": "missing-state.json",
+        "reconciliation_packet_paths": ["source.json"],
+        "owner_action_attestation_paths": ["owner.json"],
+    }
+    request = build_production_recovery_request(
+        {"label": "policy_rule_conflict", "reason": "approval_conflict",
+         "symbol": "NFLX", "path": "source.json", "recovery_context": context},
+        repo_root=tmp_path,
+        command_runner=runner,
+    )
+
+    response = request["adapters"]["reconcile"]({"phase": "reconcile"})
+
+    assert "packet" in response
+    command = invocations[-1]
+    flag = command.index("--owner-action-attestation")
+    assert command[flag + 1] == str(attribution.resolve())
 
 
 @pytest.mark.parametrize(
