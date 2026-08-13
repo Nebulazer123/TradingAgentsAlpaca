@@ -1032,7 +1032,7 @@ def _production_recovery_harness(
         command = list(argv)
         invocations.append(command)
         if command[:3] == ["git", "rev-parse", "HEAD"]:
-            return Result(stdout="source-revision\n")
+            return Result(stdout="a" * 40 + "\n")
         if "loss-review-evidence" in command:
             return Result(stdout=json.dumps(evidence))
         if "reconcile-symbol-incident" in command:
@@ -1113,7 +1113,7 @@ def _production_recovery_harness(
         "symbol": "NFLX",
         "broker_account": "paper",
         "environment": "test",
-        "source_revision": "source-revision",
+        "source_revision": "a" * 40,
         "supervisor_path": str(supervisor_path),
         "advisory_path": str(advisory_path),
         "hourly_dir": str(hourly_dir),
@@ -2533,7 +2533,7 @@ def test_production_request_preserves_msft_and_rejects_preassembled_packets(tmp_
         "symbol": "MSFT",
         "broker_account": "paper-a",
         "environment": "test",
-        "source_revision": "abc123",
+            "source_revision": "b" * 40,
         "supervisor_path": "missing-supervisor.json",
         "advisory_path": "missing-advisory.json",
         "hourly_dir": "missing-hourly",
@@ -2573,7 +2573,7 @@ def test_production_reconciliation_forwards_repo_bound_owner_attribution(tmp_pat
 
     context = {
         "symbol": "NFLX", "broker_account": "live", "environment": "production",
-        "source_revision": "abc123", "supervisor_path": "missing.json",
+            "source_revision": "b" * 40, "supervisor_path": "missing.json",
         "advisory_path": "missing.json", "hourly_dir": "missing",
         "report_path": "missing.json", "envelope_path": "missing.yaml",
         "promotion_state_path": "missing-state.json",
@@ -4296,7 +4296,7 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
     def runner(argv, **_kwargs):
         invocations.append(list(argv))
         if argv[:3] == ["git", "rev-parse", "HEAD"]:
-            return Result(stdout="source-revision\n")
+            return Result(stdout="a" * 40 + "\n")
         if "loss-review-evidence" in argv:
             return Result(
                 stdout=json.dumps(

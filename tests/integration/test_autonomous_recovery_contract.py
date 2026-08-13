@@ -31,7 +31,7 @@ from tradingagents.policy.promotion_sync import sync_promotion_state_file
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "autonomous_recovery"
 NOW = dt.datetime(2026, 7, 18, 12, 0, tzinfo=dt.timezone.utc)
-SOURCE_REVISION = "fixture-source-revision"
+SOURCE_REVISION = "c" * 40
 
 PRODUCTION_AUTHORITY_PATHS = (
     REPO_ROOT / "results" / "policy" / "live_control.json",

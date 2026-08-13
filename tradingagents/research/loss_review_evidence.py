@@ -1541,21 +1541,26 @@ def build_loss_review_evidence_packet(
     # Advisory output consumes the same derived Mapping that the recorder
     # authenticates.  It cannot introduce a second scalar reason source.
     advisory_analysis["current_loss_review"] = dict(current_loss_review)
-    advisory_analysis["current_thesis_status_candidate"] = current_loss_review[
-        "current_thesis_status"
-    ]
-    advisory_analysis["loss_exit_candidate"] = {
-        "allowed_exit_reason_candidate": current_loss_review["allowed_exit_reason"],
-        "allowed_exit_reason_source": current_loss_review[
-            "allowed_exit_reason_source"
-        ],
-        "confidence": current_loss_review["confidence"],
-        "reason_summary": current_loss_review["why_hold_is_worse_than_sell"],
-        "approval_effect": "board_review_input_not_loss_exit_approval",
-        "requires_board_decision": True,
-        "requires_tradeable_session": True,
-        "can_submit_orders": False,
-    }
+    # A valid pre-registered mechanical exit remains its own authority path;
+    # a failed discretionary BOARD refresh must not erase that existing policy
+    # candidate.  Conversely, an advisory candidate can never create or
+    # upgrade a policy exit.
+    if advisory_analysis.get("authority_source") != "pre_registered_policy_rule":
+        advisory_analysis["current_thesis_status_candidate"] = current_loss_review[
+            "current_thesis_status"
+        ]
+        advisory_analysis["loss_exit_candidate"] = {
+            "allowed_exit_reason_candidate": current_loss_review["allowed_exit_reason"],
+            "allowed_exit_reason_source": current_loss_review[
+                "allowed_exit_reason_source"
+            ],
+            "confidence": current_loss_review["confidence"],
+            "reason_summary": current_loss_review["why_hold_is_worse_than_sell"],
+            "approval_effect": "board_review_input_not_loss_exit_approval",
+            "requires_board_decision": True,
+            "requires_tradeable_session": True,
+            "can_submit_orders": False,
+        }
     qualified_evidence = advisory_analysis.get("qualified_evidence")
     if not isinstance(qualified_evidence, Mapping):
         qualified_evidence = {}
