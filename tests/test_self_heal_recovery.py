@@ -2199,7 +2199,7 @@ def test_snapshot_exposes_recovery_ownership_without_raw_packet_or_secrets(tmp_p
     assert summary["recovery_owner"] == "reliability_controller"
     assert summary["recovery_phase"] == "reconcile"
     assert summary["recovery_last_failure"] == "external_blocked"
-    assert summary["recovery_external_blocker"] == "broker approval"
+    assert summary["recovery_external_blocker"] == "external_action_required"
     assert "history" not in summary
 
 

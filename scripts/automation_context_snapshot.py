@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -48,8 +49,20 @@ CENTRAL = ZoneInfo("America/Chicago")
 PROVIDER_BUNDLE_SCAN_LIMIT = 50
 JSON_FILE_CACHE = JsonFileCache.from_env(max_entries=2048)
 EXECUTION_AUTHORITIES = ("none", "paper", "normal_live")
-INCIDENT_SUMMARY_SCAN_LIMIT = 32
-INCIDENT_BLOCKER_TEXT_LIMIT = 240
+INCIDENT_SUMMARY_STAT_LIMIT = 64
+INCIDENT_SUMMARY_MAX_BYTES = 64 * 1024
+RECOVERY_OWNER_ROLES = {"reliability_controller"}
+RECOVERY_PHASES = {
+    "resolve_authority",
+    "regenerate_evidence",
+    "reconcile",
+    "focused_verify",
+    "sync_promotion",
+    "ready_incident",
+    "manifest",
+    "rearm",
+    "monitoring",
+}
 RECOVERY_FAILURE_KINDS = {
     "transient",
     "transient_exhausted",
@@ -402,30 +415,13 @@ def summarize_execution_authority(packets: list[dict[str, Any]]) -> dict[str, An
     }
 
 
-def _redact_incident_blocker(value: str) -> str:
-    """Return a bounded incident blocker without copying credential material."""
-
-    text = re.sub(
-        r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+",
-        r"\1=[REDACTED]",
-        value,
-    )
-    text = re.sub(
-        r"(?i)authorization:\s*bearer\s+[^\s,;]+",
-        "Authorization: Bearer [REDACTED]",
-        text,
-    )
-    text = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [REDACTED]", text)
-    text = re.sub(r"\bsk-[A-Za-z0-9_-]+", "sk-[REDACTED]", text)
-    return text[:INCIDENT_BLOCKER_TEXT_LIMIT]
-
-
 def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
     """Expose only the current recovery owner and status from incident records.
 
-    Incident packets are audit artifacts.  The compact context reads only a
-    bounded set of direct ``latest.json`` records and deliberately omits their
-    history, evidence references, artifact paths, and raw failure details.
+    Incident packets are audit artifacts.  The compact context examines one
+    metadata-ranked direct ``latest.json`` record and deliberately omits its
+    history, evidence references, artifact paths, raw failure details, and
+    free-form external-blocker text.
     """
 
     empty_summary = {
@@ -434,6 +430,10 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
         "recovery_last_failure": None,
         "recovery_external_blocker": None,
     }
+    unknown_summary = {
+        **empty_summary,
+        "recovery_external_blocker": "recovery_incident_unknown",
+    }
     current = now or dt.datetime.now(dt.timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=dt.timezone.utc)
@@ -441,62 +441,80 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
         current = current.astimezone(dt.timezone.utc)
     incident_root = ROOT / "results" / "control_plane" / "incidents"
     try:
-        directories = sorted(
-            (path for path in incident_root.iterdir() if path.is_dir()),
-            key=lambda path: path.name,
-        )[:INCIDENT_SUMMARY_SCAN_LIMIT]
+        candidates: list[tuple[int, str, Path, int]] = []
+        with os.scandir(incident_root) as entries:
+            for entry in entries:
+                if len(candidates) >= INCIDENT_SUMMARY_STAT_LIMIT:
+                    break
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                latest_path = Path(entry.path) / "latest.json"
+                try:
+                    metadata = latest_path.lstat()
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    return unknown_summary
+                if not stat.S_ISREG(metadata.st_mode):
+                    return unknown_summary
+                candidates.append(
+                    (metadata.st_mtime_ns, entry.name, latest_path, metadata.st_size)
+                )
     except OSError:
         return empty_summary
 
-    candidates: list[tuple[dt.datetime, str, dict[str, Any]]] = []
-    for directory in directories:
-        record = read_json(directory / "latest.json")
-        if not isinstance(record, dict):
-            continue
-        updated_at = parse_packet_timestamp(record.get("updated_at"))
-        owner = record.get("owner_role")
-        recovery = record.get("recovery")
-        if (
-            updated_at is None
-            or updated_at > current
-            or not isinstance(owner, str)
-            or not owner.strip()
-            or not isinstance(recovery, dict)
-        ):
-            continue
-        phase = recovery.get("phase")
-        if phase is not None and (
-            not isinstance(phase, str) or not phase.strip()
-        ):
-            continue
-        failure = recovery.get("last_failure")
-        if failure is not None and (
-            not isinstance(failure, dict)
-            or failure.get("kind") not in RECOVERY_FAILURE_KINDS
-        ):
-            continue
-        blockers = record.get("external_blockers")
-        if blockers is not None and (
-            not isinstance(blockers, list)
-            or any(not isinstance(item, str) for item in blockers)
-        ):
-            continue
-        candidates.append((updated_at, directory.name, record))
-
     if not candidates:
         return empty_summary
-    _updated_at, _incident_id, record = max(candidates, key=lambda item: item[:2])
-    recovery = record["recovery"]
+    _mtime, _incident_id, latest_path, byte_size = max(
+        candidates, key=lambda item: item[:2]
+    )
+    if byte_size > INCIDENT_SUMMARY_MAX_BYTES:
+        return unknown_summary
+    try:
+        with latest_path.open("rb") as handle:
+            raw_record = handle.read(INCIDENT_SUMMARY_MAX_BYTES + 1)
+    except OSError:
+        return unknown_summary
+    if len(raw_record) > INCIDENT_SUMMARY_MAX_BYTES:
+        return unknown_summary
+    try:
+        record = json.loads(raw_record)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return unknown_summary
+    if not isinstance(record, dict):
+        return unknown_summary
+
+    updated_at = parse_packet_timestamp(record.get("updated_at"))
+    owner = record.get("owner_role")
+    recovery = record.get("recovery")
+    if (
+        updated_at is None
+        or updated_at > current
+        or owner not in RECOVERY_OWNER_ROLES
+        or not isinstance(recovery, dict)
+    ):
+        return unknown_summary
+    phase = recovery.get("phase")
+    if phase not in RECOVERY_PHASES:
+        return unknown_summary
     failure = recovery.get("last_failure")
-    blockers = record.get("external_blockers") or []
-    blocker = next((item for item in blockers if item.strip()), None)
+    if failure is not None and (
+        not isinstance(failure, dict)
+        or failure.get("kind") not in RECOVERY_FAILURE_KINDS
+    ):
+        return unknown_summary
+    blockers = record.get("external_blockers")
+    if blockers is None:
+        blockers = []
+    if not isinstance(blockers, list) or not all(
+        isinstance(item, str) and item.strip() for item in blockers
+    ):
+        return unknown_summary
     return {
-        "recovery_owner": record["owner_role"].strip(),
-        "recovery_phase": recovery.get("phase"),
+        "recovery_owner": owner,
+        "recovery_phase": phase,
         "recovery_last_failure": failure.get("kind") if isinstance(failure, dict) else None,
-        "recovery_external_blocker": (
-            _redact_incident_blocker(blocker) if blocker is not None else None
-        ),
+        "recovery_external_blocker": "external_action_required" if blockers else None,
     }
 
 

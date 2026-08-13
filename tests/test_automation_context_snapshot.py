@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -298,14 +299,11 @@ def test_compact_context_warns_and_does_not_elevate_invalid_packet_authority(tmp
     assert summary["execution_authority_invalid_labels"] == ["synthetic"]
 
 
-def test_incident_summary_ignores_malformed_records_and_redacts_blockers(
+def test_incident_summary_projects_only_structural_blocker_presence(
     tmp_path, monkeypatch
 ):
     snapshot = _load_snapshot_module()
     incident_root = tmp_path / "results" / "control_plane" / "incidents"
-    malformed = incident_root / "broken" / "latest.json"
-    malformed.parent.mkdir(parents=True)
-    malformed.write_text("{not-json", encoding="utf-8")
     valid = incident_root / "recovery-nflx" / "latest.json"
     valid.parent.mkdir(parents=True)
     valid.write_text(
@@ -313,9 +311,7 @@ def test_incident_summary_ignores_malformed_records_and_redacts_blockers(
             {
                 "owner_role": "reliability_controller",
                 "updated_at": "2026-08-13T12:00:00+00:00",
-                "external_blockers": [
-                    "broker rejected Authorization: Bearer test-secret-token"
-                ],
+                "external_blockers": ["broker rejected Authorization: Bearer test-secret-token"],
                 "recovery": {
                     "phase": "reconcile",
                     "last_failure": {"kind": "external_blocked"},
@@ -336,7 +332,159 @@ def test_incident_summary_ignores_malformed_records_and_redacts_blockers(
         "recovery_owner": "reliability_controller",
         "recovery_phase": "reconcile",
         "recovery_last_failure": "external_blocked",
-        "recovery_external_blocker": (
-            "broker rejected Authorization: Bearer [REDACTED]"
+        "recovery_external_blocker": "external_action_required",
+    }
+
+
+def _write_incident_latest(
+    root: Path,
+    incident_id: str,
+    *,
+    owner_role: str = "reliability_controller",
+    phase: str = "reconcile",
+    failure_kind: str = "external_blocked",
+    blockers: list[str] | None = None,
+) -> Path:
+    path = root / incident_id / "latest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "owner_role": owner_role,
+                "updated_at": "2026-08-13T12:00:00+00:00",
+                "external_blockers": blockers if blockers is not None else [],
+                "recovery": {
+                    "phase": phase,
+                    "last_failure": {"kind": failure_kind},
+                },
+            }
         ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_incident_summary_never_projects_hostile_blocker_content(tmp_path, monkeypatch):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    secrets = [
+        "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+        "Cookie: sessionid=very-secret-session-cookie",
+        "AKIAIOSFODNN7EXAMPLE",
+        "-----BEGIN PRIVATE KEY-----\nprivate-key-material\n-----END PRIVATE KEY-----",
+        "https://username:password@example.invalid/raw-response?token=secret-token",
+        '{"raw_response":"super-secret-response-body"}',
+    ]
+    _write_incident_latest(
+        incident_root,
+        "hostile-blockers",
+        blockers=secrets,
+    )
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    summary = snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    )
+
+    assert summary["recovery_external_blocker"] == "external_action_required"
+    rendered = json.dumps(summary)
+    for secret in secrets:
+        assert secret not in rendered
+
+
+def test_incident_summary_uses_newest_metadata_not_first_32_names(tmp_path, monkeypatch):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    base = 1_700_000_000
+    for index in range(33):
+        path = _write_incident_latest(
+            incident_root,
+            f"a-{index:02d}",
+            phase="reconcile",
+            failure_kind="transient",
+        )
+        os.utime(path, (base + index, base + index))
+    newest = _write_incident_latest(
+        incident_root,
+        "z-newest",
+        phase="rearm",
+        failure_kind="external_blocked",
+        blockers=["human broker confirmation required"],
+    )
+    os.utime(newest, (base + 100, base + 100))
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    summary = snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    )
+
+    assert summary == {
+        "recovery_owner": "reliability_controller",
+        "recovery_phase": "rearm",
+        "recovery_last_failure": "external_blocked",
+        "recovery_external_blocker": "external_action_required",
+    }
+
+
+def test_incident_summary_fails_closed_for_malformed_newest_record(tmp_path, monkeypatch):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    older = _write_incident_latest(incident_root, "old-valid")
+    newest = incident_root / "new-malformed" / "latest.json"
+    newest.parent.mkdir(parents=True)
+    newest.write_text("{not-json", encoding="utf-8")
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    os.utime(newest, (1_700_000_100, 1_700_000_100))
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    ) == {
+        "recovery_owner": None,
+        "recovery_phase": None,
+        "recovery_last_failure": None,
+        "recovery_external_blocker": "recovery_incident_unknown",
+    }
+
+
+def test_incident_summary_fails_closed_for_oversized_newest_record(tmp_path, monkeypatch):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    older = _write_incident_latest(incident_root, "old-valid")
+    newest = incident_root / "new-oversized" / "latest.json"
+    newest.parent.mkdir(parents=True)
+    newest.write_bytes(b"{" + b"x" * 65_537)
+    os.utime(older, (1_700_000_000, 1_700_000_000))
+    os.utime(newest, (1_700_000_100, 1_700_000_100))
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    ) == {
+        "recovery_owner": None,
+        "recovery_phase": None,
+        "recovery_last_failure": None,
+        "recovery_external_blocker": "recovery_incident_unknown",
+    }
+
+
+def test_incident_summary_rejects_unknown_recovery_owner_or_phase(tmp_path, monkeypatch):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    path = _write_incident_latest(
+        incident_root,
+        "unknown-contract-value",
+        owner_role="untrusted_owner",
+        phase="skip_the_checks",
+    )
+    os.utime(path, (1_700_000_100, 1_700_000_100))
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    ) == {
+        "recovery_owner": None,
+        "recovery_phase": None,
+        "recovery_last_failure": None,
+        "recovery_external_blocker": "recovery_incident_unknown",
     }
