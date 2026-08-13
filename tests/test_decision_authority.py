@@ -1,8 +1,13 @@
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from tradingagents.policy.decision_authority import resolve_exit_authority
+from tradingagents.policy.decision_authority import (
+    capture_current_supervisor_review,
+    resolve_exit_authority,
+)
 
 
 def test_unverified_board_input_cannot_resolve_a_discretionary_exit():
@@ -22,8 +27,24 @@ def test_unverified_board_input_cannot_resolve_a_discretionary_exit():
     [("HOLD", False), ("SELL", True)],
 )
 def test_verified_board_decision_closes_the_trade_decision_only(
-    monkeypatch, decision, exit_allowed
+    monkeypatch, tmp_path, decision, exit_allowed
 ):
+    review = {
+        "symbol": "TSM",
+        "decision_id": "loss-review-tsm-1",
+        "allowed": False,
+        "policy_rule_exit": False,
+    }
+    evidence_root = tmp_path / "evidence"
+    evidence_root.mkdir()
+    packet_path = evidence_root / "supervisor.json"
+    packet_bytes = json.dumps({"evidence": {"loss_exit_review": review}}).encode()
+    packet_path.write_bytes(packet_bytes)
+    binding = capture_current_supervisor_review(
+        packet_path=packet_path,
+        packet_bytes=packet_bytes,
+        evidence_root=evidence_root,
+    )
     verified = SimpleNamespace(
         symbol="TSM",
         supervisor_decision_id="loss-review-tsm-1",
@@ -33,6 +54,11 @@ def test_verified_board_decision_closes_the_trade_decision_only(
         analysis_only=True,
         execution_authority="none",
         can_submit_orders=False,
+        supervisor_packet=SimpleNamespace(
+            path="supervisor.json",
+            sha256=hashlib.sha256(packet_bytes).hexdigest(),
+            size_bytes=len(packet_bytes),
+        ),
     )
     monkeypatch.setattr(
         "tradingagents.policy.loss_board_decision.verify_autonomous_loss_board_decision",
@@ -40,16 +66,12 @@ def test_verified_board_decision_closes_the_trade_decision_only(
     )
 
     verdict = resolve_exit_authority(
-        supervisor_review={
-            "symbol": "TSM",
-            "decision_id": "loss-review-tsm-1",
-            "allowed": False,
-            "policy_rule_exit": False,
-        },
+        supervisor_review=review,
         advisory_analysis={"requires_board_decision": True},
         board_decision={"ledger_packet_id": "portfolio-decision-1"},
-        decision_ledger_root="/installed/ledger",
-        decision_evidence_root="/installed/evidence",
+        decision_ledger_root=tmp_path / "ledger",
+        decision_evidence_root=evidence_root,
+        current_supervisor_binding=binding,
     )
 
     assert verdict.exit_allowed is exit_allowed
@@ -58,6 +80,64 @@ def test_verified_board_decision_closes_the_trade_decision_only(
     assert verdict.requires_additional_decision is False
     assert verdict.authority_source == "autonomous_portfolio_board"
     assert "execution intent" in verdict.reason if decision == "SELL" else "HOLD" in verdict.reason
+
+
+@pytest.mark.parametrize("alteration", ["same_id_new_bytes", "wrong_path"])
+def test_board_decision_rejects_replaced_or_wrong_current_supervisor_binding(
+    monkeypatch, tmp_path, alteration
+):
+    original_review = {
+        "symbol": "TSM",
+        "decision_id": "loss-review-tsm-1",
+        "allowed": False,
+        "policy_rule_exit": False,
+    }
+    root = tmp_path / "evidence"
+    root.mkdir()
+    path = root / "supervisor.json"
+    original_bytes = json.dumps({"evidence": {"loss_exit_review": original_review}}).encode()
+    path.write_bytes(original_bytes)
+    binding = capture_current_supervisor_review(
+        packet_path=path, packet_bytes=original_bytes, evidence_root=root
+    )
+    if alteration == "same_id_new_bytes":
+        replacement_bytes = json.dumps(
+            {"evidence": {"loss_exit_review": {**original_review, "allowed": True}}}
+        ).encode()
+        binding = capture_current_supervisor_review(
+            packet_path=path, packet_bytes=replacement_bytes, evidence_root=root
+        )
+    verified = SimpleNamespace(
+        symbol="TSM",
+        supervisor_decision_id="loss-review-tsm-1",
+        decision="HOLD",
+        exit_allowed=False,
+        trade_decision_resolved=True,
+        analysis_only=True,
+        execution_authority="none",
+        can_submit_orders=False,
+        supervisor_packet=SimpleNamespace(
+            path="other.json" if alteration == "wrong_path" else "supervisor.json",
+            sha256=hashlib.sha256(original_bytes).hexdigest(),
+            size_bytes=len(original_bytes),
+        ),
+    )
+    monkeypatch.setattr(
+        "tradingagents.policy.loss_board_decision.verify_autonomous_loss_board_decision",
+        lambda **_kwargs: verified,
+    )
+
+    verdict = resolve_exit_authority(
+        supervisor_review=binding.review,
+        advisory_analysis={"requires_board_decision": True},
+        board_decision={"ledger_packet_id": "portfolio-decision-1"},
+        decision_ledger_root=tmp_path / "ledger",
+        decision_evidence_root=root,
+        current_supervisor_binding=binding,
+    )
+
+    assert verdict.trade_decision_resolved is False
+    assert verdict.exit_allowed is False
 
 
 def test_advisory_refresh_cannot_revoke_preregistered_policy_exit():

@@ -7,6 +7,8 @@ it performs no network, broker, or model calls.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +47,54 @@ class ExitAuthorityVerdict:
     def allowed(self) -> bool:
         """Compatibility alias for callers that predate BOARD decisions."""
         return self.exit_allowed
+
+
+@dataclass(frozen=True)
+class CurrentSupervisorReviewBinding:
+    """One captured current supervisor packet, bound without a second read."""
+
+    path: str
+    sha256: str
+    size_bytes: int
+    review: Mapping[str, Any]
+
+
+def capture_current_supervisor_review(
+    *,
+    packet_path: str | Path,
+    packet_bytes: bytes,
+    evidence_root: str | Path,
+) -> CurrentSupervisorReviewBinding:
+    """Capture the exact current review bytes for an authorizing comparison.
+
+    The caller passes bytes it already read from the current supervisor packet.
+    This function never opens the packet path, so a later file replacement
+    cannot change the review that is compared with the authenticated decision.
+    """
+    if not isinstance(packet_bytes, bytes):
+        raise ValueError("current supervisor packet must be captured as bytes")
+    root = Path(evidence_root).resolve()
+    supplied = Path(packet_path).resolve()
+    try:
+        relative = supplied.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("current supervisor packet must be inside evidence root") from exc
+    try:
+        packet = json.loads(packet_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("current supervisor packet bytes are not JSON") from exc
+    if not isinstance(packet, Mapping):
+        raise ValueError("current supervisor packet bytes are not an object")
+    evidence = packet.get("evidence")
+    review = evidence.get("loss_exit_review") if isinstance(evidence, Mapping) else None
+    if not isinstance(review, Mapping):
+        raise ValueError("current supervisor packet lacks loss_exit_review")
+    return CurrentSupervisorReviewBinding(
+        path=relative.as_posix(),
+        sha256=hashlib.sha256(packet_bytes).hexdigest(),
+        size_bytes=len(packet_bytes),
+        review=dict(review),
+    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -128,6 +178,7 @@ def resolve_exit_authority(
     board_decision: Mapping[str, Any] | Any | None = None,
     decision_ledger_root: str | Path | None = None,
     decision_evidence_root: str | Path | None = None,
+    current_supervisor_binding: CurrentSupervisorReviewBinding | None = None,
     now: Any = None,
 ) -> ExitAuthorityVerdict:
     """Resolve loss-exit authority without granting research execution power."""
@@ -185,7 +236,9 @@ def resolve_exit_authority(
             decision_evidence_root=decision_evidence_root,
             now=now,
         )
-        if verified is not None and _board_decision_matches_supervisor(verified, review):
+        if verified is not None and _board_decision_matches_supervisor(
+            verified, review, current_supervisor_binding
+        ):
             return ExitAuthorityVerdict(
                 exit_allowed=verified.exit_allowed,
                 trade_decision_resolved=True,
@@ -217,10 +270,21 @@ def resolve_exit_authority(
     )
 
 
-def _board_decision_matches_supervisor(board_decision: Any, review: Mapping[str, Any]) -> bool:
+def _board_decision_matches_supervisor(
+    board_decision: Any,
+    review: Mapping[str, Any],
+    current_supervisor_binding: CurrentSupervisorReviewBinding | None,
+) -> bool:
     """Only accept a verified decision for this exact supervisor review."""
+    supervisor_packet = getattr(board_decision, "supervisor_packet", None)
     return (
-        getattr(board_decision, "symbol", None) == _text(review.get("symbol")).upper()
+        isinstance(current_supervisor_binding, CurrentSupervisorReviewBinding)
+        and current_supervisor_binding.review == review
+        and supervisor_packet is not None
+        and current_supervisor_binding.path == getattr(supervisor_packet, "path", None)
+        and current_supervisor_binding.sha256 == getattr(supervisor_packet, "sha256", None)
+        and current_supervisor_binding.size_bytes == getattr(supervisor_packet, "size_bytes", None)
+        and getattr(board_decision, "symbol", None) == _text(review.get("symbol")).upper()
         and getattr(board_decision, "supervisor_decision_id", None)
         == _text(review.get("decision_id"))
         and getattr(board_decision, "trade_decision_resolved", None) is True

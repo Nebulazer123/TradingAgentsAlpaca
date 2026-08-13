@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import subprocess
 from collections.abc import Mapping, Sequence
@@ -13,6 +14,7 @@ from typing import Any
 from tradingagents.policy.decision_authority import (
     AUTHORITY_RECORD_FIELDS,
     bounded_exit_authority_record,
+    capture_current_supervisor_review,
     resolve_exit_authority,
 )
 from tradingagents.policy.loss_board_decision import (
@@ -47,6 +49,16 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _read_json_bytes(path: Path) -> tuple[dict[str, Any], bytes] | None:
+    """Read and parse one packet once, retaining the compared bytes."""
+    try:
+        raw = path.read_bytes()
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return (data, raw) if isinstance(data, dict) else None
+
+
 def _parse_generated_at(packet: Mapping[str, Any]) -> datetime.datetime:
     raw = str(packet.get("generated_at") or packet.get("started_at") or "")
     if raw:
@@ -72,10 +84,14 @@ def load_hourly_packets(
     for packet_path in path.glob("hourly-supervisor-*.json"):
         if packet_path.name == "latest.json" or packet_path.name.endswith(".compact.json"):
             continue
-        packet = _read_json(packet_path)
-        if packet is None:
+        captured = _read_json_bytes(packet_path)
+        if captured is None:
             continue
+        packet, packet_bytes = captured
         packet["_source_path"] = str(packet_path)
+        packet["_source_bytes"] = packet_bytes
+        packet["_source_sha256"] = hashlib.sha256(packet_bytes).hexdigest()
+        packet["_source_size_bytes"] = len(packet_bytes)
         packets.append(packet)
     packets.sort(key=_parse_generated_at)
     return packets[-limit:]
@@ -671,21 +687,43 @@ def build_execution_board_review(
     if autonomous_loss_decision is not None and loss_review_evidence is not None:
         loss_review_evidence = dict(loss_review_evidence)
         loss_review_evidence["next_action"] = autonomous_loss_decision["recommendation"]
-        authority = resolve_exit_authority(
-            supervisor_review=next(
-                (
-                    _loss_exit_review_for_symbol(packet, str(loss_review_evidence.get("symbol") or ""))
-                    for packet in reversed(packets)
-                    if _normalized_packet_ref(_packet_key(packet))
-                    == _normalized_packet_ref(loss_review_evidence.get("hourly_packet_path"))
-                ),
-                {},
+        current_supervisor_packet = next(
+            (
+                packet
+                for packet in reversed(packets)
+                if _normalized_packet_ref(_packet_key(packet))
+                == _normalized_packet_ref(loss_review_evidence.get("hourly_packet_path"))
+            ),
+            None,
+        )
+        current_review = (
+            _loss_exit_review_for_symbol(
+                current_supervisor_packet,
+                str(loss_review_evidence.get("symbol") or ""),
             )
-            or {},
+            if current_supervisor_packet is not None
+            else None
+        )
+        try:
+            current_supervisor_binding = (
+                capture_current_supervisor_review(
+                    packet_path=str(current_supervisor_packet["_source_path"]),
+                    packet_bytes=current_supervisor_packet["_source_bytes"],
+                    evidence_root=decision_evidence_root,
+                )
+                if current_supervisor_packet is not None
+                and isinstance(current_supervisor_packet.get("_source_bytes"), bytes)
+                else None
+            )
+        except (TypeError, ValueError):
+            current_supervisor_binding = None
+        authority = resolve_exit_authority(
+            supervisor_review=current_review or {},
             advisory_analysis={"requires_board_decision": True},
             board_decision={"ledger_packet_id": autonomous_loss_decision["ledger_packet_id"]},
             decision_ledger_root=decision_ledger_root,
             decision_evidence_root=decision_evidence_root,
+            current_supervisor_binding=current_supervisor_binding,
             now=current_now,
         )
         loss_review_evidence["review_allowed"] = authority.exit_allowed

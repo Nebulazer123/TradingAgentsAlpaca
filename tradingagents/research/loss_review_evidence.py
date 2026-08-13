@@ -609,7 +609,7 @@ def _build_advisory_analysis(
 
     advisory_analysis = {
         "purpose": (
-            "advisory context for BOARD/manual loss review; not a loss-exit approval"
+            "advisory context for the autonomous portfolio BOARD; not a loss-exit approval"
         ),
         "symbol": symbol,
         "position_snapshot": {
@@ -738,7 +738,7 @@ def build_loss_review_evidence_packet(
     source_packet_paths: Mapping[str, str | Path] | None = None,
     decision_evidence_root: str | Path | None = None,
 ) -> SourceEvidencePacket:
-    """Build an advisory packet for BOARD/manual loss-review analysis.
+    """Build an advisory packet for autonomous portfolio BOARD loss-review analysis.
 
     The packet attaches fresh research references to the current hold, but it
     deliberately does not mutate the supervisor's loss_exit_review or approve a

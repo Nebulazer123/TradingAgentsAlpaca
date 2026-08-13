@@ -105,6 +105,21 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
     assert loss_path.exists()
 
 
+def test_execution_board_cli_does_not_expose_mutable_decision_roots():
+    result = runner.invoke(app, ["research", "execution-board-review", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--decision-ledger-root" not in result.output
+    assert "--decision-evidence-root" not in result.output
+
+
+def test_loss_review_evidence_cli_does_not_expose_mutable_decision_root():
+    result = runner.invoke(app, ["research", "loss-review-evidence", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "--decision-evidence-root" not in result.output
+
+
 def test_execution_board_loader_ignores_compact_and_latest_sidecars(tmp_path):
     hourly = tmp_path / "hourly"
     raw = {

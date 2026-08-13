@@ -82,3 +82,34 @@ No broker, live-control, schedule, rearm, submit, cancel, or replace operation
 was added or performed.  The new BOARD decision is deliberately a separate
 decision record; even an evidence-qualified SELL awaits an independently
 authorized execution intent.
+
+## Repair round 1: reviewer hardening
+
+The independent review correctly found two authority-boundary gaps.  They are
+now repaired:
+
+- **Exact current supervisor binding.**  `resolve_exit_authority` no longer
+  treats a matching symbol and decision ID as sufficient.  For an autonomous
+  BOARD decision it requires a `CurrentSupervisorReviewBinding` built from the
+  caller's already-captured supervisor packet bytes.  The comparison requires
+  the exact repository-relative path, SHA-256, byte size, decoded current
+  review, decision ID, and symbol to match the authenticated Task 1 decision.
+  The authority resolver does not reread the path, preventing a check-then-use
+  file swap.  Tests reject both a replaced packet with the same symbol/ID and
+  a wrong path/hash, while accepting the exact captured bytes.
+- **Fixed production roots.**  The two public root override flags were removed
+  from the execution BOARD and loss-evidence commands.  They now derive fixed
+  canonical repository constants for `results` evidence and the separate
+  `state/decision_ledger` boundary.  Tests verify the flags are absent from CLI
+  help.  Internal builder arguments remain explicit so isolated tests can use
+  temporary roots without weakening the production command.
+- **Terminology.**  Remaining BOARD/manual loss-review wording in the owned
+  paths now says autonomous portfolio BOARD.
+
+Repair verification:
+
+```text
+109 passed in 1.01s
+ruff check: All checks passed
+git diff --check: passed
+```
