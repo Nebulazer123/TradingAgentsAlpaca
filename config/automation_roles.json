@@ -49,6 +49,32 @@
         "cancel_order",
         "replace_order"
       ],
+      "command_family": [],
+      "required_outputs": [
+        "portfolio_decision"
+      ]
+    },
+    "portfolio_decision_board": {
+      "display_name": "Portfolio Decision Board",
+      "kind": "business",
+      "allowed_actions": [
+        "trade_decision"
+      ],
+      "forbidden_effects": [
+        "strategy_change",
+        "risk_change",
+        "promotion_change",
+        "freeze",
+        "repair",
+        "verify",
+        "rearm_request",
+        "rearm_issue",
+        "order_submit",
+        "broker_order_write",
+        "submit_order",
+        "cancel_order",
+        "replace_order"
+      ],
       "command_family": [
         "research execution-board-review --json-output"
       ],
@@ -191,7 +217,7 @@
   "automations": {
     "tradingagents-automation-sleep-controller": "schedule_controller",
     "tradingagents-automation-wake-controller": "schedule_controller",
-    "tradingagents-autonomous-execution-board": "portfolio_executive",
+    "tradingagents-autonomous-execution-board": "portfolio_decision_board",
     "tradingagents-autonomous-safety-sentinel": "integrity_verifier",
     "tradingagents-autonomous-self-healer": "reliability_controller",
     "tradingagents-daily-report": "reporting_utility",

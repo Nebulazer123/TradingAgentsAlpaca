@@ -1,6 +1,7 @@
 import datetime as dt
 import hashlib
 import json
+import os
 import threading
 import time
 from dataclasses import asdict
@@ -199,6 +200,47 @@ def _record_strict_hold_board(tmp_path: Path, *, symbol: str = "TSM") -> dict:
     board_path = evidence_root / "execution_board" / "latest.json"
     _write_json_packet(board_path, board)
     return {"board_path": board_path, "board": board, "decision": decision}
+
+
+def _write_bound_board_compact(tmp_path: Path, fixture: dict) -> Path:
+    """Write the production compact shape bound to immutable Board bytes."""
+    full_path = (
+        tmp_path
+        / "results"
+        / "execution_board"
+        / "execution-board-review-fixture-20260813-120000.json"
+    )
+    full_bytes = fixture["board_path"].read_bytes()
+    full_path.write_bytes(full_bytes)
+    return _write_json_packet(
+        tmp_path / "results" / "execution_board" / "latest-compact.json",
+        {
+            "schema": "compact_execution_board_review_v1",
+            "kind": "execution_board_review",
+            "generated_at": NOW.isoformat(),
+            "analysis_only": True,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "recommendation": "record_trade_decision",
+            "raw_packet_path": str(full_path.relative_to(tmp_path)),
+            "raw_packet_sha256": hashlib.sha256(full_bytes).hexdigest(),
+            "autonomous_loss_decision": {
+                "decision_id": fixture["decision"].decision_id,
+                "ledger_packet_id": fixture["board"]["autonomous_loss_decision"]["ledger_packet_id"],
+                "symbol": fixture["decision"].symbol,
+                "decision": fixture["decision"].decision,
+                "trade_decision_resolved": True,
+                "exit_allowed": fixture["decision"].exit_allowed,
+            },
+            "loss_review_evidence": {
+                "symbol": fixture["decision"].symbol,
+                "review_allowed": True,
+                "remaining_blocker_count": 0,
+                "resolved_blocker_count": 0,
+                "next_action": "record_trade_decision",
+            },
+        },
+    )
 
 
 def _loss_review_source_packet(
@@ -4605,19 +4647,7 @@ def test_scheduled_compact_board_and_hourly_sidecars_bind_exact_raw_provenance(
     tmp_path: Path,
 ) -> None:
     fixture = _record_strict_hold_board(tmp_path, symbol="TSM")
-    board_compact_path = tmp_path / "results" / "execution_board" / "latest-compact.json"
-    _write_json_packet(
-        board_compact_path,
-        {
-            "schema": "compact_execution_board_review_v1",
-            "kind": "execution_board_review",
-            "generated_at": NOW.isoformat(),
-            "analysis_only": True,
-            "can_submit_orders": False,
-            "execution_authority": "none",
-            "raw_packet_path": str(fixture["board_path"]),
-        },
-    )
+    board_compact_path = _write_bound_board_compact(tmp_path, fixture)
     hourly_compact_path = tmp_path / "results" / "hourly_supervisor" / "latest-compact.json"
     _write_json_packet(
         hourly_compact_path,
@@ -4903,6 +4933,37 @@ def test_compact_sidecar_requires_analysis_only_and_rejects_symlink_raw_path(
     assert parent_symlink_signal["classification"] == "business_decision_pending"
 
 
+def test_descriptor_capture_rejects_parent_symlink_swap_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parent replaced after lexical normalization cannot redirect a capture."""
+    raw = _write_json_packet(
+        tmp_path / "results" / "execution_board" / "latest.json",
+        {"kind": "execution_board_review"},
+    )
+    outside = tmp_path / "outside"
+    _write_json_packet(outside / "execution_board" / "latest.json", {"attacker": True})
+    original_open = os.open
+    swapped = False
+
+    def swap_parent(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "results" and dir_fd is not None and not swapped:
+            swapped = True
+            original_open_path = tmp_path / "results"
+            original_open_path.rename(tmp_path / "original-results")
+            original_open_path.symlink_to(outside, target_is_directory=True)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(self_heal_module.os, "open", swap_parent)
+    captured = self_heal_module._captured_signal_packet(
+        {"path": str(raw.relative_to(tmp_path))}, root=tmp_path
+    )
+
+    assert swapped is True
+    assert captured is None
+
+
 def test_unexpected_redundant_board_paths_are_rejected(tmp_path: Path) -> None:
     fixture = _record_strict_hold_board(tmp_path)
     board = fixture["board"]
@@ -5030,6 +5091,29 @@ def test_copied_strict_board_packet_cannot_become_policy_recovery(tmp_path: Path
 
     assert request["outcome"] == "not_recovery_work"
     assert "BOARD packet provenance" in request["detail"]
+
+
+@pytest.mark.parametrize("label", ["policy_rule_conflict", "promotion_state", "broker_reconciliation"])
+def test_relabelled_bound_board_compact_cannot_become_integrity_recovery(
+    tmp_path: Path, label: str
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    sidecar = _write_bound_board_compact(tmp_path, fixture)
+
+    request = build_production_recovery_request(
+        {
+            "label": label,
+            "reason": "approval_conflict",
+            "path": str(sidecar.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+    )
+
+    assert request == {
+        "ready": False,
+        "outcome": "not_recovery_work",
+        "detail": "BOARD packet provenance cannot create an integrity recovery run",
+    }
 
 
 def test_genuine_non_board_policy_packet_is_not_rejected_as_board(tmp_path: Path) -> None:

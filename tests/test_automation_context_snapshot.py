@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 import tomllib
 
+from tradingagents.orchestration.work_packets import build_packet_id
+
 
 def _load_snapshot_module():
     module_path = Path("scripts/automation_context_snapshot.py")
@@ -314,9 +316,9 @@ def test_execution_board_compact_context_projects_a_resolved_autonomous_hold(tmp
         "packet_reviews": [{"decision": "loss-review", "packet": "results/hourly.json"}],
         "autonomous_loss_decision": {
             "decision": "HOLD",
-            "symbol": "TSM",
+            "symbol": "SIXTEENCHARS.TSM",
             "decision_id": "a" * 64,
-            "ledger_packet_id": "b" * 64,
+            "ledger_packet_id": build_packet_id("a" * 64, "portfolio_decision"),
             "decision_evidence": {
                 "path": "loss_board_decisions/decision.json",
                 "sha256": "c" * 64,
@@ -336,11 +338,52 @@ def test_execution_board_compact_context_projects_a_resolved_autonomous_hold(tmp
 
     assert summary["autonomous_loss_decision_status"] == "autonomous_hold"
     assert summary["autonomous_loss_decision_plain_english"] == (
-        "Autonomous HOLD: the Portfolio Executive decided to keep TSM; no order was created."
+        "Autonomous HOLD: the Portfolio Executive decided to keep SIXTEENCHARS.TSM; no order was created."
     )
     assert summary["latest_packet_needs_review"] is False
     assert "board_review" not in summary["drilldown_reasons"]
     assert "manual_board_review" not in json.dumps(summary)
+
+
+@pytest.mark.parametrize(
+    "ledger_packet_id",
+    [
+        "b" * 64,
+        build_packet_id("b" * 64, "portfolio_decision"),
+        build_packet_id("a" * 63, "portfolio_decision"),
+    ],
+)
+def test_execution_board_compact_context_rejects_noncanonical_ledger_receipts(
+    tmp_path, ledger_packet_id
+):
+    snapshot = _load_snapshot_module()
+    packet = {
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "autonomous_loss_decision": {
+            "decision": "HOLD",
+            "symbol": "TSM",
+            "decision_id": "a" * 64,
+            "ledger_packet_id": ledger_packet_id,
+            "decision_evidence": {
+                "path": "loss_board_decisions/decision.json",
+                "sha256": "c" * 64,
+                "size_bytes": 1,
+            },
+            "trade_decision_resolved": True,
+            "exit_allowed": False,
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+        },
+    }
+    path = tmp_path / "execution-board.json"
+    path.write_text(json.dumps(packet), encoding="utf-8")
+
+    summary = snapshot.summarize_packet("execution_board_review", path)
+
+    assert summary["autonomous_loss_decision_status"] == "business_decision_pending"
 
 
 def test_execution_board_compact_context_keeps_invalid_decision_pending(tmp_path):

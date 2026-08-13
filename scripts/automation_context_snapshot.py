@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from tradingagents.orchestration.work_packets import build_packet_id  # noqa: E402
 from tradingagents.storage.json_cache import JsonFileCache  # noqa: E402
 
 
@@ -443,11 +444,11 @@ def compact_autonomous_loss_decision(value: Any) -> dict[str, Any]:
     if (
         decision not in {"HOLD", "SELL"}
         or not isinstance(symbol, str)
-        or not re.fullmatch(r"[A-Z][A-Z0-9.]{0,9}", symbol)
+        or not re.fullmatch(r"[A-Z][A-Z0-9.]{0,15}", symbol)
         or not isinstance(decision_id, str)
         or _SHA256_HEX.fullmatch(decision_id) is None
         or not isinstance(ledger_packet_id, str)
-        or _SHA256_HEX.fullmatch(ledger_packet_id) is None
+        or ledger_packet_id != build_packet_id(decision_id, "portfolio_decision")
         or value.get("trade_decision_resolved") is not True
         or not isinstance(value.get("exit_allowed"), bool)
         or value.get("analysis_only") is not True

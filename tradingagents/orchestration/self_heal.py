@@ -125,6 +125,8 @@ BOARD_REVIEW_SIGNALS = frozenset(
 DEFAULT_BOARD_EVIDENCE_ROOT = Path("results")
 DEFAULT_BOARD_LEDGER_ROOT = Path("state/decision_ledger")
 DEFAULT_BOARD_REVIEW_PATH = Path("results/execution_board/latest.json")
+_BOARD_TIMESTAMPED_PACKET = re.compile(r"^execution-board-review-[A-Za-z0-9._-]+\.json$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 class _PromotionStalePreimage(RuntimeError):
@@ -541,11 +543,10 @@ def _authenticated_latest_board_decision(
     fields must agree with the independently replayed immutable decision.
     """
     board_path = repo_root / DEFAULT_BOARD_REVIEW_PATH
-    try:
-        board_raw = board_path.read_bytes()
-        board = json.loads(board_raw)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    captured = _capture_contained_json_file(board_path, root=repo_root)
+    if captured is None:
         return None
+    board_path, board_raw, board = captured
     if not isinstance(board, Mapping):
         return None
     displayed = board.get("autonomous_loss_decision")
@@ -579,7 +580,7 @@ def _authenticated_latest_board_decision(
         "decision_id": verified.decision_id,
         "ledger_packet_id": ledger_packet_id,
         "symbol": verified.symbol,
-        "board_path": str(board_path.resolve()),
+        "board_path": str(board_path),
         "board_sha256": hashlib.sha256(board_raw).hexdigest(),
         "board_size_bytes": len(board_raw),
         "supervisor_packet": {
@@ -599,16 +600,7 @@ def _captured_signal_packet(
     path = _safe_lexical_trigger_file(signal, root=root)
     if path is None:
         return None
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(descriptor, "rb") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return None
-            captured = handle.read()
-        decoded = json.loads(captured)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return None
-    return (path, captured, decoded) if isinstance(decoded, Mapping) else None
+    return _capture_contained_json_file(path, root=root)
 
 
 def _safe_lexical_trigger_file(
@@ -622,7 +614,13 @@ def _safe_lexical_trigger_file(
 
 
 def _safe_lexical_file_path(raw_path: str, *, root: Path) -> Path | None:
-    """Validate a compact/raw path lexically before any resolving operation."""
+    """Normalize a contained path without inspecting mutable parents.
+
+    The returned pathname is deliberately *not* proof that it is safe to read.
+    Callers must use ``_capture_contained_json_file`` below, which walks every
+    parent from an already-open root descriptor.  Splitting lexical containment
+    from the read avoids an inspect-then-open parent-symlink race.
+    """
     root = root.resolve()
     candidate = Path(raw_path)
     supplied = candidate if candidate.is_absolute() else root / candidate
@@ -631,22 +629,78 @@ def _safe_lexical_file_path(raw_path: str, *, root: Path) -> Path | None:
     try:
         relative = lexical.relative_to(root)
     except ValueError:
-        return None
-    current = root
-    try:
-        for index, part in enumerate(relative.parts):
-            current /= part
-            state = current.lstat()
-            if stat.S_ISLNK(state.st_mode):
-                return None
-            if index < len(relative.parts) - 1:
-                if not stat.S_ISDIR(state.st_mode):
-                    return None
-            elif not stat.S_ISREG(state.st_mode):
-                return None
-    except OSError:
+        # macOS exposes the same temporary hierarchy through both ``/var``
+        # and ``/private/var``.  Translate only that root alias while keeping
+        # every untrusted child component lexical for descriptor traversal.
+        root_text = str(root)
+        if not root_text.startswith("/private/"):
+            return None
+        try:
+            relative = lexical.relative_to(Path(root_text.removeprefix("/private")))
+        except ValueError:
+            return None
+        lexical = root / relative
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
         return None
     return lexical
+
+
+def _capture_contained_json_file(
+    path: str | Path, *, root: Path
+) -> tuple[Path, bytes, Mapping[str, Any]] | None:
+    """Capture a regular JSON file through no-follow descriptor traversal.
+
+    Each directory is opened relative to the previous trusted descriptor with
+    ``O_DIRECTORY | O_NOFOLLOW``.  The final file is also no-followed and
+    fstat-checked before reading.  This is intentionally the only reader for
+    trigger, compact-sidecar, and raw BOARD paths.
+    """
+    lexical = _safe_lexical_file_path(str(path), root=root)
+    if lexical is None:
+        return None
+    canonical_root = root.resolve()
+    try:
+        relative = lexical.relative_to(canonical_root)
+    except ValueError:
+        return None
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = -1
+    parent_fd = -1
+    descriptor = -1
+    try:
+        root_fd = os.open(canonical_root, directory_flags)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            return None
+        parent_fd = root_fd
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            if not stat.S_ISDIR(os.fstat(next_fd).st_mode):
+                os.close(next_fd)
+                return None
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
+        descriptor = os.open(
+            relative.parts[-1],
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            captured = handle.read()
+        decoded = json.loads(captured)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+        if parent_fd != -1 and parent_fd != root_fd:
+            os.close(parent_fd)
+        if root_fd != -1:
+            os.close(root_fd)
+    return (lexical, captured, decoded) if isinstance(decoded, Mapping) else None
 
 
 def _regular_non_symlink_trigger_path(trigger: Mapping[str, Any], *, root: Path) -> Path | None:
@@ -659,16 +713,141 @@ def _is_execution_board_packet(
     packet: Mapping[str, Any],
     root: Path,
 ) -> bool:
-    """Identify real BOARD provenance, not a caller-selected label or basename."""
-    if captured_path == (root / DEFAULT_BOARD_REVIEW_PATH).resolve():
+    """Authenticate raw or compact BOARD origin before trusting signal labels."""
+    latest = _capture_contained_json_file(root / DEFAULT_BOARD_REVIEW_PATH, root=root)
+    if latest is None:
+        return False
+    _latest_path, latest_bytes, latest_packet = latest
+    if (
+        latest_packet.get("kind") != "execution_board_review"
+        or latest_packet.get("schema_version") != 1
+        or latest_packet.get("analysis_only") is not True
+        or latest_packet.get("can_submit_orders") is not False
+        or latest_packet.get("execution_authority") != "none"
+        or not isinstance(latest_packet.get("autonomous_loss_decision"), Mapping)
+    ):
+        return False
+    canonical = {
+        "board_sha256": hashlib.sha256(latest_bytes).hexdigest(),
+        "board_size_bytes": len(latest_bytes),
+        # Decision validity and freshness are evaluated later by the business
+        # path.  Recovery exclusion needs only immutable Board provenance.
+        "decision_id": None,
+    }
+    # The packet's exact raw bytes are intentionally re-captured only here.
+    # ``captured_path`` has already been descriptor-walked by the caller.
+    captured = _capture_contained_json_file(captured_path, root=root)
+    if captured is None:
+        return False
+    path, raw, captured_packet = captured
+    if dict(captured_packet) != dict(packet):
+        return False
+    if _is_canonical_board_raw_packet(
+        captured_path=path,
+        captured_bytes=raw,
+        packet=captured_packet,
+        authenticated=canonical,
+        root=root,
+    ):
         return True
-    return (
-        packet.get("kind") == "execution_board_review"
+    # A byte-identical Board copied under a caller-selected recovery label is
+    # still Board-origin evidence.  It cannot gain recovery authority merely
+    # by being moved outside the canonical directory.
+    if (
+        hashlib.sha256(raw).hexdigest() == canonical["board_sha256"]
+        and len(raw) == canonical["board_size_bytes"]
+        and packet.get("kind") == "execution_board_review"
         and packet.get("schema_version") == 1
         and packet.get("analysis_only") is True
         and packet.get("can_submit_orders") is False
         and packet.get("execution_authority") == "none"
         and isinstance(packet.get("autonomous_loss_decision"), Mapping)
+    ):
+        return True
+    return _is_canonical_board_compact_packet(
+        captured_path=path,
+        compact=captured_packet,
+        authenticated=canonical,
+        root=root,
+    )
+
+
+def _is_canonical_board_raw_packet(
+    *,
+    captured_path: Path,
+    captured_bytes: bytes,
+    packet: Mapping[str, Any],
+    authenticated: Mapping[str, Any],
+    root: Path,
+) -> bool:
+    """Require the canonical current Board bytes at an approved Board location."""
+    board_root = _contained_canonical_path(root, DEFAULT_BOARD_EVIDENCE_ROOT / "execution_board")
+    if board_root is None:
+        return False
+    try:
+        captured_path.relative_to(board_root)
+    except ValueError:
+        return False
+    if captured_path.name != "latest.json" and _BOARD_TIMESTAMPED_PACKET.fullmatch(captured_path.name) is None:
+        return False
+    return (
+        len(captured_bytes) == authenticated.get("board_size_bytes")
+        and hashlib.sha256(captured_bytes).hexdigest() == authenticated.get("board_sha256")
+        and packet.get("kind") == "execution_board_review"
+        and packet.get("schema_version") == 1
+        and packet.get("analysis_only") is True
+        and packet.get("can_submit_orders") is False
+        and packet.get("execution_authority") == "none"
+        and isinstance(packet.get("autonomous_loss_decision"), Mapping)
+        and (
+            authenticated.get("decision_id") is None
+            or packet["autonomous_loss_decision"].get("decision_id")
+            == authenticated.get("decision_id")
+        )
+    )
+
+
+def _is_canonical_board_compact_packet(
+    *,
+    captured_path: Path,
+    compact: Mapping[str, Any],
+    authenticated: Mapping[str, Any],
+    root: Path,
+) -> bool:
+    """Authenticate a fixed compact Board sidecar against the canonical bytes."""
+    board_root = _contained_canonical_path(root, DEFAULT_BOARD_EVIDENCE_ROOT / "execution_board")
+    if board_root is None:
+        return False
+    try:
+        captured_path.relative_to(board_root)
+    except ValueError:
+        return False
+    if captured_path.name != "latest-compact.json" and not captured_path.name.endswith(".compact.json"):
+        return False
+    if (
+        compact.get("schema") != "compact_execution_board_review_v1"
+        or compact.get("kind") != "execution_board_review"
+        or compact.get("analysis_only") is not True
+        or compact.get("can_submit_orders") is not False
+        or compact.get("execution_authority") != "none"
+        or not isinstance(compact.get("raw_packet_path"), str)
+        or not isinstance(compact.get("raw_packet_sha256"), str)
+        or _SHA256_HEX.fullmatch(str(compact.get("raw_packet_sha256"))) is None
+    ):
+        return False
+    raw = _capture_contained_json_file(str(compact["raw_packet_path"]), root=root)
+    if raw is None:
+        return False
+    raw_path, raw_bytes, raw_packet = raw
+    return (
+        hashlib.sha256(raw_bytes).hexdigest() == compact["raw_packet_sha256"]
+        and _is_canonical_board_raw_packet(
+            captured_path=raw_path,
+            captured_bytes=raw_bytes,
+            packet=raw_packet,
+            authenticated=authenticated,
+            root=root,
+        )
     )
 
 
@@ -732,6 +911,18 @@ def _compact_trigger_raw_path(
     raw_path = _safe_lexical_file_path(raw_value, root=root)
     if raw_path is None:
         return None
+    if label == "execution_board_review":
+        raw_sha256 = compact.get("raw_packet_sha256")
+        if not isinstance(raw_sha256, str) or _SHA256_HEX.fullmatch(raw_sha256) is None:
+            return None
+        # A BOARD compact pointer must name an immutable timestamped full
+        # packet; the mutable latest alias is authenticated separately but is
+        # never the sidecar's raw binding.
+        if _BOARD_TIMESTAMPED_PACKET.fullmatch(raw_path.name) is None:
+            return None
+        raw_captured = _capture_contained_json_file(raw_path, root=root)
+        if raw_captured is None or hashlib.sha256(raw_captured[1]).hexdigest() != raw_sha256:
+            return None
     results_root = _contained_canonical_path(root, DEFAULT_BOARD_EVIDENCE_ROOT)
     if results_root is None:
         return None
@@ -776,7 +967,6 @@ def _board_decision_matches_trigger(
         trigger=trigger, captured_path=path, compact=packet, root=root
     )
     if compact_raw_path is not None:
-        expected_board_path = Path(str(authenticated.get("board_path"))).resolve()
         supervisor = authenticated.get("supervisor_packet")
         if not isinstance(supervisor, Mapping):
             return False
@@ -784,12 +974,7 @@ def _board_decision_matches_trigger(
             root,
             DEFAULT_BOARD_EVIDENCE_ROOT / str(supervisor.get("path") or ""),
         )
-        expected_raw_path = (
-            expected_board_path
-            if label == "execution_board_review"
-            else expected_supervisor_path
-        )
-        if compact_raw_path != expected_raw_path:
+        if label == "hourly" and compact_raw_path != expected_supervisor_path:
             return False
         raw_trigger = dict(trigger)
         raw_trigger["path"] = str(compact_raw_path)
@@ -801,17 +986,13 @@ def _board_decision_matches_trigger(
         # A sidecar that failed strict schema/path validation must never fall
         # through as though it were a raw supervisor packet.
         return False
-    expected_board_path = Path(str(authenticated.get("board_path"))).resolve()
-    if path == expected_board_path:
-        return (
-            label == "execution_board_review"
-            and
-            len(raw) == authenticated.get("board_size_bytes")
-            and hashlib.sha256(raw).hexdigest() == authenticated.get("board_sha256")
-            and packet.get("kind") == "execution_board_review"
-            and packet.get("schema_version") == 1
-            and packet.get("autonomous_loss_decision", {}).get("decision_id")
-            == authenticated.get("decision_id")
+    if label == "execution_board_review":
+        return _is_canonical_board_raw_packet(
+            captured_path=path,
+            captured_bytes=raw,
+            packet=packet,
+            authenticated=authenticated,
+            root=root,
         )
     supervisor = authenticated.get("supervisor_packet")
     if not isinstance(supervisor, Mapping):

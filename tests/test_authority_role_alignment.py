@@ -11,7 +11,7 @@ ROOT = Path(__file__).parents[1]
 EXPECTED_AUTOMATIONS = {
     "tradingagents-automation-sleep-controller": "schedule_controller",
     "tradingagents-automation-wake-controller": "schedule_controller",
-    "tradingagents-autonomous-execution-board": "portfolio_executive",
+    "tradingagents-autonomous-execution-board": "portfolio_decision_board",
     "tradingagents-autonomous-safety-sentinel": "integrity_verifier",
     "tradingagents-autonomous-self-healer": "reliability_controller",
     "tradingagents-daily-report": "reporting_utility",
@@ -23,6 +23,7 @@ EXPECTED_AUTOMATIONS = {
 MACHINE_ROLE_ACTIONS = {
     "strategy_learning": {"strategy_change", "promotion_change"},
     "portfolio_executive": {"trade_decision", "risk_change"},
+    "portfolio_decision_board": {"trade_decision"},
     "reliability_controller": {"repair", "rearm_request"},
     "integrity_verifier": {"freeze", "verify", "rearm_issue"},
     "execution_operator": {"order_submit"},
@@ -40,7 +41,8 @@ EXPECTED_COMMAND_FAMILIES = {
         "alpaca paper-tournament run --all --dry-run --json-output",
         "policy sync-promotion",
     ],
-    "portfolio_executive": [
+    "portfolio_executive": [],
+    "portfolio_decision_board": [
         "research execution-board-review --json-output",
     ],
     "reliability_controller": [
@@ -127,11 +129,20 @@ def test_each_business_action_has_exactly_one_registry_owner():
         for action in machine_actions
     }
 
-    assert all(len(action_owners) == 1 for action_owners in owners.values())
+    assert owners["trade_decision"] == ["portfolio_executive", "portfolio_decision_board"]
+    assert all(
+        len(action_owners) == 1
+        for action, action_owners in owners.items()
+        if action != "trade_decision"
+    )
     assert {
-        action: action_owners[0] for action, action_owners in owners.items()
+        action: action_owners[0]
+        for action, action_owners in owners.items()
+        if action != "trade_decision"
     } == {
-        action: authority_for(action).owner_role for action in machine_actions
+        action: authority_for(action).owner_role
+        for action in machine_actions
+        if action != "trade_decision"
     }
 
 
@@ -167,6 +178,7 @@ def test_role_contract_does_not_cross_the_chain_of_command(role, forbidden):
 
 def test_execution_requires_bounded_paper_and_separate_normal_trade_inputs():
     portfolio = _registry()["roles"]["portfolio_executive"]
+    board = _registry()["roles"]["portfolio_decision_board"]
     execution = _registry()["roles"]["execution_operator"]
 
     assert portfolio["required_outputs"] == ["portfolio_decision"]
@@ -184,6 +196,9 @@ def test_execution_requires_bounded_paper_and_separate_normal_trade_inputs():
         "cancel_order",
         "replace_order",
     }.issubset(portfolio["forbidden_effects"])
+    assert board["allowed_actions"] == ["trade_decision"]
+    assert board["required_outputs"] == ["portfolio_decision"]
+    assert "risk_change" in board["forbidden_effects"]
     assert execution["allowed_actions"] == ["order_submit"]
     assert execution["required_inputs"] == [
         "authorized_paper_order_request",
