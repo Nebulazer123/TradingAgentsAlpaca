@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -358,6 +359,155 @@ def classify_recovery_signal(trigger: Mapping[str, Any]) -> dict[str, Any]:
     return {**base, "classification": "observe_only", "status": "observed"}
 
 
+def _strict_board_projection(
+    board: Mapping[str, Any],
+    *,
+    verified: Any,
+    ledger_packet_id: str,
+    evidence_root: Path,
+) -> bool:
+    """Require the BOARD projection to be one exact view of its evidence.
+
+    The authenticated decision is necessary but not sufficient: it must be the
+    decision for the exact loss-review subject the latest BOARD actually
+    displays.  This rejects copied, cross-symbol, and cross-evidence BOARD
+    projections before a decision can close a self-heal signal.
+    """
+    if (
+        board.get("kind") != "execution_board_review"
+        or board.get("schema_version") != 1
+        or board.get("analysis_only") is not True
+        or board.get("can_submit_orders") is not False
+        or board.get("execution_authority") != "none"
+    ):
+        return False
+    projected = board.get("autonomous_loss_decision")
+    loss = board.get("loss_review_evidence")
+    if not isinstance(projected, Mapping) or not isinstance(loss, Mapping):
+        return False
+    expected_projection = {
+        "decision": verified.decision,
+        "decision_id": verified.decision_id,
+        "ledger_packet_id": ledger_packet_id,
+        "symbol": verified.symbol,
+        "supervisor_decision_id": verified.supervisor_decision_id,
+        "source_revision": verified.source_revision,
+        "trade_decision_resolved": verified.trade_decision_resolved,
+        "exit_allowed": verified.exit_allowed,
+        "analysis_only": verified.analysis_only,
+        "execution_authority": verified.execution_authority,
+        "can_submit_orders": verified.can_submit_orders,
+        "recommendation": (
+            "autonomous_hold"
+            if verified.decision == "HOLD"
+            else "autonomous_sell_authorized_pending_execution_intent"
+        ),
+    }
+    if any(projected.get(key) != value for key, value in expected_projection.items()):
+        return False
+    try:
+        from tradingagents.orchestration.decision_ledger import DecisionLedger
+
+        ledger_packet = DecisionLedger(
+            evidence_root.parent / DEFAULT_BOARD_LEDGER_ROOT
+        ).read_authenticated_packet(ledger_packet_id, evidence_root=evidence_root)
+    except (OSError, TypeError, ValueError):
+        return False
+    if len(ledger_packet.evidence_refs) != 3:
+        return False
+    decision_ref, supervisor_ref, loss_ref = ledger_packet.evidence_refs
+    try:
+        loss_path = (evidence_root / verified.loss_evidence_packet.path).resolve()
+        loss_path.relative_to(evidence_root.resolve())
+        loss_state = loss_path.lstat()
+        if stat.S_ISLNK(loss_state.st_mode) or not stat.S_ISREG(loss_state.st_mode):
+            return False
+        loss_bytes = loss_path.read_bytes()
+        loss_packet = json.loads(loss_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    if (
+        not isinstance(loss_packet, Mapping)
+        or hashlib.sha256(loss_bytes).hexdigest()
+        != verified.loss_evidence_packet.sha256
+        or len(loss_bytes) != verified.loss_evidence_packet.size_bytes
+        or loss_packet.get("symbol") != verified.symbol
+        or not isinstance(loss_packet.get("packet_id"), str)
+        or not loss_packet["packet_id"]
+    ):
+        return False
+    source_digest = hashlib.sha256(
+        json.dumps(
+            [source.compact() for source in verified.accepted_sources],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    expected_receipt = {
+        "decision_evidence": {
+            "path": decision_ref.path,
+            "sha256": decision_ref.sha256,
+            "size_bytes": decision_ref.size_bytes,
+        },
+        "supervisor_packet": {
+            "path": supervisor_ref.path,
+            "sha256": supervisor_ref.sha256,
+            "size_bytes": supervisor_ref.size_bytes,
+        },
+        "loss_evidence_packet": {
+            "path": loss_ref.path,
+            "sha256": loss_ref.sha256,
+            "size_bytes": loss_ref.size_bytes,
+            "packet_id": loss_packet["packet_id"],
+        },
+        "accepted_sources_sha256": source_digest,
+        "accepted_source_count": len(verified.accepted_sources),
+    }
+    if any(projected.get(key) != value for key, value in expected_receipt.items()):
+        return False
+    expected_loss = {
+        "symbol": verified.symbol,
+        "supervisor_packet_path": verified.supervisor_packet.path,
+        "raw_packet_path": verified.loss_evidence_packet.path,
+        "next_action": expected_projection["recommendation"],
+    }
+    if any(loss.get(key) != value for key, value in expected_loss.items()):
+        return False
+    source_binding = loss.get("source_binding")
+    if not isinstance(source_binding, Mapping) or source_binding.get("matched") is not True:
+        return False
+    bindings = source_binding.get("bindings")
+    if not isinstance(bindings, Mapping):
+        return False
+    supervisor = bindings.get("supervisor")
+    raw_loss = bindings.get("raw_loss")
+    if not isinstance(supervisor, Mapping) or not isinstance(raw_loss, Mapping):
+        return False
+    expected_supervisor = {
+        "path": verified.supervisor_packet.path,
+        "sha256": verified.supervisor_packet.sha256,
+        "size_bytes": verified.supervisor_packet.size_bytes,
+        "decision_id": verified.supervisor_decision_id,
+        "symbol": verified.symbol,
+    }
+    projected_loss_packet = projected.get("loss_evidence_packet")
+    if not isinstance(projected_loss_packet, Mapping) or projected_loss_packet.get(
+        "packet_id"
+    ) != loss_packet["packet_id"]:
+        return False
+    expected_loss_binding = {
+        "path": verified.loss_evidence_packet.path,
+        "sha256": verified.loss_evidence_packet.sha256,
+        "size_bytes": verified.loss_evidence_packet.size_bytes,
+        "symbol": verified.symbol,
+        "source_revision": verified.source_revision,
+        "packet_id": loss_packet["packet_id"],
+    }
+    return all(supervisor.get(key) == value for key, value in expected_supervisor.items()) and all(
+        raw_loss.get(key) == value for key, value in expected_loss_binding.items()
+    )
+
+
 def _authenticated_latest_board_decision(
     repo_root: Path,
     *,
@@ -397,36 +547,58 @@ def _authenticated_latest_board_decision(
         )
     except (OSError, TypeError, ValueError):
         return None
-    expected = {
-        "decision": verified.decision,
-        "decision_id": verified.decision_id,
-        "ledger_packet_id": ledger_packet_id,
-        "trade_decision_resolved": verified.trade_decision_resolved,
-        "exit_allowed": verified.exit_allowed,
-        "analysis_only": verified.analysis_only,
-        "execution_authority": verified.execution_authority,
-        "can_submit_orders": verified.can_submit_orders,
-        "recommendation": (
-            "autonomous_hold"
-            if verified.decision == "HOLD"
-            else "autonomous_sell_authorized_pending_execution_intent"
-        ),
-    }
-    if any(displayed.get(key) != value for key, value in expected.items()):
-        return None
-    if (
-        expected["trade_decision_resolved"] is not True
-        or expected["analysis_only"] is not True
-        or expected["execution_authority"] != "none"
-        or expected["can_submit_orders"] is not False
-        or verified.producer_role != "portfolio_executive"
-    ):
+    if not _strict_board_projection(
+        board,
+        verified=verified,
+        ledger_packet_id=ledger_packet_id,
+        evidence_root=repo_root / DEFAULT_BOARD_EVIDENCE_ROOT,
+    ) or verified.producer_role != "portfolio_executive":
         return None
     return {
         "decision": verified.decision,
         "decision_id": verified.decision_id,
         "ledger_packet_id": ledger_packet_id,
     }
+
+
+def _captured_signal_packet(
+    signal: Mapping[str, Any], *, root: Path
+) -> tuple[Path, bytes, Mapping[str, Any]] | None:
+    """Capture one declared signal packet without letting it escape the repo."""
+    raw_path = signal.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    candidate = Path(raw_path)
+    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    try:
+        resolved.relative_to(root)
+        state = resolved.lstat()
+        if not resolved.is_file() or stat.S_ISLNK(state.st_mode):
+            return None
+        captured = resolved.read_bytes()
+        decoded = json.loads(captured)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    return (resolved, captured, decoded) if isinstance(decoded, Mapping) else None
+
+
+def _is_execution_board_packet(
+    *,
+    captured_path: Path,
+    packet: Mapping[str, Any],
+    root: Path,
+) -> bool:
+    """Identify real BOARD provenance, not a caller-selected label or basename."""
+    if captured_path == (root / DEFAULT_BOARD_REVIEW_PATH).resolve():
+        return True
+    return (
+        packet.get("kind") == "execution_board_review"
+        and packet.get("schema_version") == 1
+        and packet.get("analysis_only") is True
+        and packet.get("can_submit_orders") is False
+        and packet.get("execution_authority") == "none"
+        and isinstance(packet.get("autonomous_loss_decision"), Mapping)
+    )
 
 
 def _recovery_now(value: dt.datetime | None) -> dt.datetime:
@@ -2719,6 +2891,16 @@ def build_production_recovery_request(
     recovery state, never a manual or silently skipped outcome. Real runtime
     integrations can replace the packet producers, not this authority boundary.
     """
+    root = Path(repo_root).resolve()
+    captured_signal = _captured_signal_packet(signal, root=root)
+    if captured_signal is not None and _is_execution_board_packet(
+        captured_path=captured_signal[0], packet=captured_signal[2], root=root
+    ):
+        return {
+            "ready": False,
+            "outcome": "not_recovery_work",
+            "detail": "BOARD packet provenance cannot create an integrity recovery run",
+        }
     recovery_classification = classify_recovery_signal(signal)
     if recovery_classification["classification"] != "recoverable_integrity":
         return {
@@ -2726,7 +2908,6 @@ def build_production_recovery_request(
             "outcome": "not_recovery_work",
             "detail": "signal is not an integrity recovery and cannot create a recovery run",
         }
-    root = Path(repo_root).resolve()
     signature = _trigger_signature(signal)
     incident_id = f"self-heal-{hashlib.sha256(signature.encode()).hexdigest()[:20]}"
     context = signal.get("recovery_context")

@@ -36,6 +36,9 @@ from tradingagents.orchestration.self_heal import (
 )
 from tradingagents.policy.live_control import load_live_control_state, write_live_control_state
 from tradingagents.policy.live_gate import evaluate_go_live_guard
+from tradingagents.policy.loss_board_decision import (
+    record_autonomous_loss_board_decision,
+)
 from tradingagents.policy.promotion_sync import sync_promotion_state_file
 
 NOW = dt.datetime(2026, 7, 18, 12, 0, tzinfo=dt.timezone.utc)
@@ -46,6 +49,156 @@ BINDINGS = {
     "environment": "test",
     "source_revision": "59ea344",
 }
+
+
+def _write_json_packet(path: Path, payload: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    return path
+
+
+def _write_self_heal_context(root: Path, *, flags: list[dict]) -> None:
+    context_dir = root / "results" / "_context"
+    context_dir.mkdir(parents=True, exist_ok=True)
+    _write_json_packet(context_dir / "latest-flags.json", {"flags": flags})
+    _write_json_packet(
+        context_dir / "latest-summary.json", {"generated_at": NOW.isoformat(), "latest_packets": []}
+    )
+
+
+def _record_strict_hold_board(tmp_path: Path, *, symbol: str = "TSM") -> dict:
+    """Create a real Task 1 ledger decision and its exact BOARD projection."""
+    evidence_root = tmp_path / "results"
+    supervisor_path = evidence_root / "hourly_supervisor" / "hourly.json"
+    supervisor = {
+        "generated_at": NOW.isoformat(),
+        "decision": "loss-review",
+        "evidence": {
+            "loss_exit_review": {
+                "symbol": symbol,
+                "decision_id": f"loss-review-{symbol.lower()}-1",
+                "allowed": False,
+                "policy_rule_exit": False,
+                "allowed_exit_reason": "",
+                "allowed_exit_reason_source": "",
+                "blockers": ["company evidence incomplete"],
+                "blocked_reasons": ["company evidence incomplete"],
+                "confidence": "0.00",
+                "evidence_generated_at": NOW.isoformat(),
+            }
+        },
+    }
+    _write_json_packet(supervisor_path, supervisor)
+    loss_path = evidence_root / "loss_review_evidence" / "loss.json"
+    loss = {
+        "schema_version": "1.0.0",
+        "packet_id": f"loss-evidence-{symbol.lower()}-1",
+        "generated_at": NOW.isoformat(),
+        "source_name": "loss_review_evidence",
+        "evidence_type": "loss_review_evidence",
+        "subject": symbol,
+        "symbol": symbol,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "payload": {
+            "symbol": symbol,
+            "supervisor_packet_path": supervisor_path.relative_to(evidence_root).as_posix(),
+            "supervisor_decision_id": supervisor["evidence"]["loss_exit_review"]["decision_id"],
+            "remaining_blockers": ["company evidence incomplete"],
+            "accepted_sources": [],
+            "advisory_analysis": {"requires_board_decision": True},
+        },
+    }
+    _write_json_packet(loss_path, loss)
+    recorded = record_autonomous_loss_board_decision(
+        supervisor_packet_path=supervisor_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="1" * 40,
+        ledger_root=tmp_path / "state" / "decision_ledger",
+        evidence_root=evidence_root,
+        now=NOW,
+    )
+    decision = recorded.decision
+    decision_projection = {
+        "decision": decision.decision,
+        "decision_id": decision.decision_id,
+        "ledger_packet_id": recorded.packet.packet_id,
+        "symbol": decision.symbol,
+        "supervisor_decision_id": decision.supervisor_decision_id,
+        "source_revision": decision.source_revision,
+        "trade_decision_resolved": decision.trade_decision_resolved,
+        "exit_allowed": decision.exit_allowed,
+        "analysis_only": decision.analysis_only,
+        "execution_authority": decision.execution_authority,
+        "can_submit_orders": decision.can_submit_orders,
+        "recommendation": recorded.packet.recommendation,
+    }
+    decision_ref, supervisor_ref, loss_ref = recorded.packet.evidence_refs
+    decision_projection.update(
+        {
+            "decision_evidence": {
+                "path": decision_ref.path,
+                "sha256": decision_ref.sha256,
+                "size_bytes": decision_ref.size_bytes,
+            },
+            "supervisor_packet": {
+                "path": supervisor_ref.path,
+                "sha256": supervisor_ref.sha256,
+                "size_bytes": supervisor_ref.size_bytes,
+            },
+            "loss_evidence_packet": {
+                "packet_id": loss["packet_id"],
+                "path": loss_ref.path,
+                "sha256": loss_ref.sha256,
+                "size_bytes": loss_ref.size_bytes,
+            },
+            "accepted_sources_sha256": hashlib.sha256(
+                json.dumps([], sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest(),
+            "accepted_source_count": 0,
+        }
+    )
+    board = {
+        "kind": "execution_board_review",
+        "schema_version": 1,
+        "generated_at": NOW.isoformat(),
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "autonomous_loss_decision": decision_projection,
+        "loss_review_evidence": {
+            "symbol": symbol,
+            "supervisor_packet_path": decision.supervisor_packet.path,
+            "raw_packet_path": decision.loss_evidence_packet.path,
+            "next_action": recorded.packet.recommendation,
+            "source_binding": {
+                "matched": True,
+                "bindings": {
+                    "supervisor": {
+                        "path": decision.supervisor_packet.path,
+                        "sha256": decision.supervisor_packet.sha256,
+                        "size_bytes": decision.supervisor_packet.size_bytes,
+                        "decision_id": decision.supervisor_decision_id,
+                        "symbol": symbol,
+                    },
+                    "raw_loss": {
+                        "path": decision.loss_evidence_packet.path,
+                        "sha256": decision.loss_evidence_packet.sha256,
+                        "size_bytes": decision.loss_evidence_packet.size_bytes,
+                        "packet_id": loss["packet_id"],
+                        "symbol": symbol,
+                        "source_revision": decision.source_revision,
+                    },
+                },
+            },
+        },
+    }
+    board_path = evidence_root / "execution_board" / "latest.json"
+    _write_json_packet(board_path, board)
+    return {"board_path": board_path, "board": board, "decision": decision}
 
 
 def _loss_review_source_packet(
@@ -4350,6 +4503,143 @@ def test_missing_or_invalid_board_decision_is_retryable_business_work(
         "outcome": "not_recovery_work",
         "detail": "signal is not an integrity recovery and cannot create a recovery run",
     }
+
+
+def test_real_ledger_bound_board_hold_resolves_without_recovery_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    _write_self_heal_context(
+        tmp_path,
+        flags=[
+            {
+                "label": "execution_board_review",
+                "reason": "board_review",
+                "path": "results/execution_board/latest.json",
+            }
+        ],
+    )
+    control_path = tmp_path / "results" / "policy" / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="remain frozen",
+        dead_man_expires_at=NOW + dt.timedelta(hours=1),
+        now=NOW,
+    )
+    frozen_before = control_path.read_bytes()
+    recovery_calls: list[dict] = []
+    monkeypatch.setattr(
+        self_heal_module,
+        "coordinate_verified_recovery",
+        lambda **kwargs: recovery_calls.append(kwargs),
+    )
+
+    plan = self_heal_module.build_self_heal_plan(tmp_path, now=NOW)
+    signal = plan["signals"][0]
+
+    assert fixture["decision"].decision == "HOLD"
+    assert signal["classification"] == "resolved_no_action"
+    assert signal["decision_reference"]["decision_id"] == fixture["decision"].decision_id
+    result = self_heal_module.execute_self_heal_plan(plan, repo_root=tmp_path)
+    assert result["owned_recovery_count"] == 0
+    assert recovery_calls == []
+    assert control_path.read_bytes() == frozen_before
+    assert not (tmp_path / "results" / "control_plane" / "recovery").exists()
+    assert not (tmp_path / "results" / "control_plane" / "rearm_receipts").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        (("loss_review_evidence", "symbol"), "MSFT"),
+        (("loss_review_evidence", "source_binding", "bindings", "raw_loss", "sha256"), "f" * 64),
+        (("loss_review_evidence", "source_binding", "bindings", "supervisor", "decision_id"), "other-review"),
+    ],
+)
+def test_cross_subject_or_evidence_board_projection_is_retryable(
+    tmp_path: Path, field: tuple[str, ...], replacement: str
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    board = fixture["board"]
+    target = board
+    for key in field[:-1]:
+        target = target[key]
+    target[field[-1]] = replacement
+    _write_json_packet(fixture["board_path"], board)
+    _write_self_heal_context(
+        tmp_path,
+        flags=[
+            {
+                "label": "hourly",
+                "reason": "board_review",
+                "path": "results/hourly_supervisor/latest-compact.json",
+            }
+        ],
+    )
+
+    signal = self_heal_module.build_self_heal_plan(tmp_path, now=NOW)["signals"][0]
+
+    assert signal["classification"] == "business_decision_pending"
+    assert signal["status"] == "retryable"
+    assert signal["decision_reference"] is None
+    assert signal["may_rearm"] is False
+
+
+def test_relabelled_board_packet_cannot_become_policy_recovery(tmp_path: Path) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+
+    request = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "path": str(fixture["board_path"].relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+    )
+
+    assert request == {
+        "ready": False,
+        "outcome": "not_recovery_work",
+        "detail": "BOARD packet provenance cannot create an integrity recovery run",
+    }
+
+
+def test_copied_strict_board_packet_cannot_become_policy_recovery(tmp_path: Path) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    copied_path = _write_json_packet(
+        tmp_path / "results" / "policy" / "relabelled.json", fixture["board"]
+    )
+
+    request = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "path": str(copied_path.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+    )
+
+    assert request["outcome"] == "not_recovery_work"
+    assert "BOARD packet provenance" in request["detail"]
+
+
+def test_genuine_non_board_policy_packet_is_not_rejected_as_board(tmp_path: Path) -> None:
+    policy_path = _write_json_packet(
+        tmp_path / "results" / "policy" / "conflict.json",
+        {"kind": "policy_conflict", "schema_version": 1, "symbol": "NFLX"},
+    )
+
+    request = build_production_recovery_request(
+        {
+            "label": "policy_rule_conflict",
+            "reason": "approval_conflict",
+            "path": str(policy_path.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+    )
+
+    assert request["outcome"] != "not_recovery_work"
 
 
 def test_immutable_strategy_promotion_sleeve_record_is_accepted() -> None:
