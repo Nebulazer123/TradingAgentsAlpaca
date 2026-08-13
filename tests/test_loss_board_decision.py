@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 import tradingagents.policy.loss_board_decision as loss_board_decision
+from tradingagents.brokers.supervisor.loss_review import ALLOWED_LOSS_EXIT_REASONS
 from tradingagents.orchestration.decision_ledger import DecisionLedger
 from tradingagents.policy.loss_board_decision import (
     record_autonomous_loss_board_decision,
@@ -130,9 +131,31 @@ def _paths(tmp_path: Path, *, supervisor: dict[str, Any], loss: dict[str, Any]) 
             "as_of": source["as_of"],
             "quality": source["quality"],
             "payload": (
-                {"headline": "Company guidance was reduced after a material customer demand decline."}
+                {
+                    "symbol": payload["symbol"],
+                    "as_of": source["as_of"],
+                    "sentiment": "negative",
+                    "thesis_break": True,
+                    "headline": "Company guidance was reduced after a material customer demand decline.",
+                }
                 if source["evidence_type"] == "company_news"
-                else ({"summary": "Current guidance and earnings filing substantively confirm the revenue outlook deterioration."} if source["evidence_type"] == "earnings_guidance_filing" else {"summary": "SPY and QQQ relative market observations are current and sector-normalized."})
+                else (
+                    {
+                        "symbol": payload["symbol"],
+                        "as_of": source["as_of"],
+                        "guidance_or_earnings": "adverse",
+                        "adverse_fact": True,
+                        "fact": "Current earnings guidance reduced expected revenue after a material demand deterioration.",
+                    }
+                    if source["evidence_type"] == "earnings_guidance_filing"
+                    else {
+                        "symbol": payload["symbol"],
+                        "as_of": source["as_of"],
+                        "spy": {"symbol": "SPY", "value": "0.1", "as_of": source["as_of"]},
+                        "qqq": {"symbol": "QQQ", "value": "0.2", "as_of": source["as_of"]},
+                        "sector_relative": {"symbol": payload["symbol"], "value": "0.028", "as_of": source["as_of"]},
+                    }
+                )
             ),
         }
         _write_json(source_path, packet)
@@ -173,6 +196,17 @@ def _record(tmp_path: Path, *, supervisor: dict[str, Any] | None = None, loss: d
     )
 
 
+def _rewrite_source_packet(loss_path: Path, source_path: Path, packet: dict[str, Any]) -> None:
+    _write_json(source_path, packet)
+    loss = json.loads(loss_path.read_text(encoding="utf-8"))
+    content = source_path.read_bytes()
+    for descriptor in loss["payload"]["accepted_sources"]:
+        if descriptor["path"] == source_path.relative_to(loss_path.parent).as_posix():
+            descriptor["sha256"] = hashlib.sha256(content).hexdigest()
+            descriptor["size_bytes"] = len(content)
+    _write_json(loss_path, loss)
+
+
 def test_records_verified_sell_only_as_an_immutable_analysis_only_decision(tmp_path):
     recorded = _record(tmp_path)
 
@@ -194,6 +228,22 @@ def test_records_verified_sell_only_as_an_immutable_analysis_only_decision(tmp_p
         )
         == recorded.decision
     )
+
+
+def test_exit_reason_taxonomy_reuses_the_supervisor_contract():
+    assert loss_board_decision.ALLOWED_LOSS_EXIT_REASONS is ALLOWED_LOSS_EXIT_REASONS
+    assert {
+        "thesis_invalidated",
+        "company_specific_negative_news",
+        "earnings_or_guidance_break",
+    } == loss_board_decision.AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS
+    assert loss_board_decision.AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS <= ALLOWED_LOSS_EXIT_REASONS
+
+
+@pytest.mark.parametrize("reason", ["user_manual_override", "policy_stop_floor", "hard_stop_defined_before_entry"])
+def test_non_board_canonical_reason_never_becomes_autonomous_sell(tmp_path, reason):
+    recorded = _record(tmp_path, supervisor=_supervisor(allowed_exit_reason=reason))
+    assert recorded.decision.decision == "HOLD"
 
 
 @pytest.mark.parametrize(
@@ -376,19 +426,92 @@ def test_unsafe_publication_collision_and_crash_never_append_ledger(tmp_path, mo
         )
     assert not (tmp_path / "ledger" / "events.jsonl").exists()
 
-    unsafe_parent.unlink()
-    monkeypatch.setattr(
-        loss_board_decision,
-        "_after_decision_fsync",
-        lambda _path: (_ for _ in ()).throw(RuntimeError("crash boundary")),
+
+@pytest.mark.parametrize(
+    "source_payload",
+    [
+        {"headline": "Company guidance improved and demand remains favorable.", "sentiment": "favorable"},
+        {"headline": "Neutral company update with no thesis impact today.", "sentiment": "neutral"},
+        {"headline": "Company event", "sentiment": "negative"},
+    ],
+)
+def test_company_news_source_must_prove_current_adverse_thesis_break(tmp_path, source_payload):
+    supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
+    source_path = evidence_root / "sources" / "1.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    source["payload"] = source_payload
+    _rewrite_source_packet(loss_path, source_path, source)
+    recorded = record_autonomous_loss_board_decision(
+        supervisor_packet_path=supervisor_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="1" * 40,
+        ledger_root=tmp_path / "ledger",
+        evidence_root=evidence_root,
+        now=NOW,
     )
-    with pytest.raises(RuntimeError, match="crash boundary"):
+    assert recorded.decision.decision == "HOLD"
+
+
+def test_market_and_filing_sources_require_structured_current_adverse_facts(tmp_path):
+    supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
+    market_path = evidence_root / "sources" / "0.json"
+    market = json.loads(market_path.read_text(encoding="utf-8"))
+    market["payload"] = {"summary": "SPY QQQ and sector labels are available."}
+    _rewrite_source_packet(loss_path, market_path, market)
+    recorded = record_autonomous_loss_board_decision(
+        supervisor_packet_path=supervisor_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="1" * 40,
+        ledger_root=tmp_path / "ledger",
+        evidence_root=evidence_root,
+        now=NOW,
+    )
+    assert recorded.decision.decision == "HOLD"
+
+    supervisor_path, loss_path, evidence_root = _paths(tmp_path / "filing", supervisor=_supervisor(), loss=_loss_evidence())
+    filing_path = evidence_root / "sources" / "2.json"
+    filing = json.loads(filing_path.read_text(encoding="utf-8"))
+    filing["payload"] = {"summary": "A current filing is available for review."}
+    _rewrite_source_packet(loss_path, filing_path, filing)
+    recorded = record_autonomous_loss_board_decision(
+        supervisor_packet_path=supervisor_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="1" * 40,
+        ledger_root=tmp_path / "filing" / "ledger",
+        evidence_root=evidence_root,
+        now=NOW,
+    )
+    assert recorded.decision.decision == "HOLD"
+
+
+def test_directory_fsync_failure_closes_fd_and_never_records_ledger(tmp_path, monkeypatch):
+    supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
+    original_fsync = loss_board_decision.os.fsync
+    original_close = loss_board_decision.os.close
+    calls: list[int] = []
+    closed: list[int] = []
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        calls.append(descriptor)
+        if len(calls) == 2:
+            raise OSError("directory fsync failed")
+        original_fsync(descriptor)
+
+    def record_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(loss_board_decision.os, "fsync", fail_directory_fsync)
+    monkeypatch.setattr(loss_board_decision.os, "close", record_close)
+    with pytest.raises(OSError, match="directory fsync failed"):
         record_autonomous_loss_board_decision(
             supervisor_packet_path=supervisor_path,
             loss_evidence_packet_path=loss_path,
             source_revision="1" * 40,
             ledger_root=tmp_path / "ledger",
-            evidence_root=root,
+            evidence_root=evidence_root,
             now=NOW,
         )
+    assert len(calls) == 2
+    assert calls[-1] in closed
     assert not (tmp_path / "ledger" / "events.jsonl").exists()

@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
 
+from tradingagents.brokers.supervisor.loss_review import ALLOWED_LOSS_EXIT_REASONS
 from tradingagents.orchestration.decision_ledger import DecisionLedger
 from tradingagents.orchestration.work_packets import EvidenceRef, WorkPacket
 
@@ -26,7 +27,15 @@ _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,15}$")
 _DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
 _MAX_AGE = dt.timedelta(minutes=15)
 _QUALITIES = frozenset({"high", "medium"})
-_EXIT_REASONS = frozenset({"thesis_invalidated", "guidance_cut", "fundamental_deterioration", "risk_limit_breach"})
+AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS = frozenset(
+    {
+        "thesis_invalidated",
+        "company_specific_negative_news",
+        "earnings_or_guidance_break",
+    }
+)
+if not AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS <= ALLOWED_LOSS_EXIT_REASONS:
+    raise RuntimeError("autonomous BOARD loss-exit subset drifted from supervisor taxonomy")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _GENERIC = frozenset({"ok", "good", "news", "filing", "update", "available", "none", "n/a", "unknown"})
 
@@ -370,6 +379,54 @@ def _sources(root: Path, raw: Any, symbol: str) -> tuple[BoundSourceEvidence, ..
     return tuple(result)
 
 
+def _source_payload(raw: Mapping[str, Any], source: BoundSourceEvidence) -> Mapping[str, Any] | None:
+    payload = raw.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("symbol") != raw.get("symbol") or payload.get("as_of") != source.as_of:
+        return None
+    return payload
+
+
+def _contains_contradiction(payload: Mapping[str, Any]) -> bool:
+    text = json.dumps(payload, sort_keys=True).lower()
+    return any(token in text for token in ("favorable", "neutral", "positive", "improved", "no thesis impact"))
+
+
+def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str, Any], source: BoundSourceEvidence) -> bool:
+    context = review.get("broad_market_context")
+    sector = review.get("sector_or_peer_context")
+    spy = payload.get("spy")
+    qqq = payload.get("qqq")
+    sector_relative = payload.get("sector_relative")
+    if not isinstance(context, Mapping) or not isinstance(sector, Mapping):
+        return False
+    if not all(isinstance(value, Mapping) for value in (spy, qqq, sector_relative)):
+        return False
+    return (
+        spy.get("symbol") == "SPY"
+        and spy.get("value") == context.get("SPY")
+        and spy.get("as_of") == source.as_of
+        and _is_decimal(spy.get("value"), "source SPY")
+        and qqq.get("symbol") == "QQQ"
+        and qqq.get("value") == context.get("QQQ")
+        and qqq.get("as_of") == source.as_of
+        and _is_decimal(qqq.get("value"), "source QQQ")
+        and sector_relative.get("symbol") == review.get("symbol")
+        and sector_relative.get("value") == sector.get("relative_performance")
+        and sector_relative.get("as_of") == source.as_of
+        and _is_decimal(sector_relative.get("value"), "source sector relative")
+    )
+
+
+def _news_source_proves_adverse_break(payload: Mapping[str, Any]) -> bool:
+    return payload.get("sentiment") == "negative" and payload.get("thesis_break") is True and _meaningful(payload.get("headline")) and not _contains_contradiction(payload)
+
+
+def _filing_source_proves_adverse_fact(payload: Mapping[str, Any]) -> bool:
+    return payload.get("guidance_or_earnings") == "adverse" and payload.get("adverse_fact") is True and _meaningful(payload.get("fact")) and not _contains_contradiction(payload)
+
+
 def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], sources: tuple[BoundSourceEvidence, ...], root: Path, now: dt.datetime) -> tuple[str, ...]:
     gaps: list[str] = []
     for blocker_field in ("blockers", "blocked_reasons"):
@@ -390,7 +447,7 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
         or not _is_decimal(sector.get("relative_performance"), "sector relative_performance")
     ):
         gaps.append("actual_spy_qqq_sector_relative_values_missing")
-    if review.get("allowed") is not True or review.get("allowed_exit_reason") not in _EXIT_REASONS or not _meaningful(review.get("allowed_exit_reason_source")):
+    if review.get("allowed") is not True or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS or not _meaningful(review.get("allowed_exit_reason_source")):
         gaps.append("recognized_exit_reason_missing")
     filing = review.get("earnings_guidance_or_filing_check")
     if not _meaningful(review.get("current_thesis_status")) or not _meaningful(review.get("why_hold_is_worse_than_sell")) or not _meaningful(review.get("company_specific_negative_news_check")) or not _meaningful(filing) or "submissions index" in filing.lower():
@@ -433,12 +490,24 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
         descriptor = f"{source.source_name} {source.evidence_type}".lower()
         if any(x in descriptor or x in payload_text for x in ("gap", "connector", "submissions_index", "submissions index")):
             gaps.append("source_gap_or_index")
-        if source.evidence_type == "market_context":
-            categories.add("market")
-        elif source.evidence_type == "company_news" and _meaningful((raw.get("payload") or {}).get("headline")):
-            categories.add("news")
-        elif source.evidence_type in {"earnings_guidance_filing", "earnings_transcript"} and _meaningful((raw.get("payload") or {}).get("summary")):
-            categories.add("substance")
+        source_payload = _source_payload(raw, source)
+        if source_payload is None:
+            gaps.append("source_payload_binding_invalid")
+        elif source.evidence_type == "market_context":
+            if _market_source_proves_values(source_payload, review, source):
+                categories.add("market")
+            else:
+                gaps.append("market_source_values_missing_or_unbound")
+        elif source.evidence_type == "company_news":
+            if _news_source_proves_adverse_break(source_payload):
+                categories.add("news")
+            else:
+                gaps.append("company_news_not_adverse_thesis_break")
+        elif source.evidence_type in {"earnings_guidance_filing", "earnings_transcript"}:
+            if _filing_source_proves_adverse_fact(source_payload):
+                categories.add("substance")
+            else:
+                gaps.append("filing_or_guidance_not_adverse_substantive_fact")
     if categories != {"market", "news", "substance"}:
         gaps.append("required_source_substance_missing")
     return tuple(dict.fromkeys(gaps))
@@ -523,8 +592,10 @@ def _publish(root: Path, relative: Path, content: bytes) -> Path:
             handle.flush()
             os.fsync(handle.fileno())
         directory = os.open(parent, os.O_RDONLY)
-        os.fsync(directory)
-        os.close(directory)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except BaseException:
         with suppress(OSError):
             target.unlink()

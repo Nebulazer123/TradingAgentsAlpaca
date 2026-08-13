@@ -166,3 +166,58 @@ git diff --check
 ```
 
 Repair implementation commit: `99d94b082a170b7190d314ec4f2154d97232bff2`
+
+## Repair round 2: authentic source-content qualification
+
+Source review found that round 1 authenticated source packet identity and bytes
+but still accepted semantic labels and generic prose. Repair round 2 requires
+the accepted source packet contents themselves to prove each decision input:
+
+- The market source must bind the decision symbol and current `as_of`, and
+  carry structured finite SPY, QQQ, and symbol-sector-relative decimal values
+  that exactly equal the supervisor review values. Labels or prose mentioning
+  those benchmarks cannot qualify.
+- Company-news source data must bind the symbol/current `as_of`, explicitly
+  mark `sentiment="negative"` and `thesis_break=true`, and provide meaningful
+  adverse company-specific text. Favorable, neutral, positive/improved,
+  no-impact, and placeholder content force HOLD.
+- Filing/earnings/guidance data must bind symbol/current `as_of`, explicitly
+  mark an adverse earnings/guidance state and `adverse_fact=true`, and include a
+  meaningful adverse fact. A merely available filing or generic prose cannot
+  qualify.
+- The taxonomy source of truth is now the exact supervisor
+  `ALLOWED_LOSS_EXIT_REASONS` set. The autonomous BOARD subset is deliberately
+  narrower: `thesis_invalidated`, `company_specific_negative_news`, and
+  `earnings_or_guidance_break`. It is checked against the canonical set at
+  import time and in the contract tests. `user_manual_override` and mechanical
+  policy/pre-registered exits remain non-BOARD and fail closed here; their
+  separately authorized routes are outside this decision-only boundary.
+- Directory fsync is now inside a `try/finally` that closes its descriptor even
+  when `fsync` fails; fault injection proves no ledger event is written.
+
+### Repair round 2 RED/GREEN evidence
+
+The new RED slice initially failed six cases: the policy module lacked the
+canonical taxonomy export, favorable/neutral/placeholder news and label-only
+market/filing content could be accepted, and a directory-fsync exception left
+its descriptor open.
+
+Final targeted GREEN:
+
+```text
+pytest -q tests/test_loss_board_decision.py -k 'taxonomy or non_board or company_news_source or market_and_filing or directory_fsync'
+9 passed, 28 deselected in 0.17s
+```
+
+Final combined verification:
+
+```text
+python -m pytest -q tests/test_loss_board_decision.py tests/test_work_packets.py tests/test_decision_ledger.py
+168 passed in 0.48s
+
+ruff check tradingagents/policy/loss_board_decision.py tradingagents/orchestration/work_packets.py tests/test_loss_board_decision.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
