@@ -596,21 +596,42 @@ def _captured_signal_packet(
     signal: Mapping[str, Any], *, root: Path
 ) -> tuple[Path, bytes, Mapping[str, Any]] | None:
     """Capture one declared signal packet without letting it escape the repo."""
+    root = root.resolve()
     raw_path = signal.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
         return None
     candidate = Path(raw_path)
-    resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
+    supplied = candidate if candidate.is_absolute() else root / candidate
     try:
-        resolved.relative_to(root)
-        state = resolved.lstat()
-        if not resolved.is_file() or stat.S_ISLNK(state.st_mode):
+        supplied_state = supplied.lstat()
+        if stat.S_ISLNK(supplied_state.st_mode) or not stat.S_ISREG(
+            supplied_state.st_mode
+        ):
             return None
+        resolved = supplied.resolve()
+        resolved.relative_to(root)
         captured = resolved.read_bytes()
         decoded = json.loads(captured)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
     return (resolved, captured, decoded) if isinstance(decoded, Mapping) else None
+
+
+def _regular_non_symlink_trigger_path(trigger: Mapping[str, Any], *, root: Path) -> Path | None:
+    raw_path = trigger.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    candidate = Path(raw_path)
+    supplied = candidate if candidate.is_absolute() else root / candidate
+    try:
+        state = supplied.lstat()
+        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+            return None
+        resolved = supplied.resolve()
+        resolved.relative_to(root.resolve())
+    except (OSError, ValueError):
+        return None
+    return resolved
 
 
 def _is_execution_board_packet(
@@ -632,6 +653,78 @@ def _is_execution_board_packet(
     )
 
 
+def _contained_canonical_path(root: Path, relative: Path) -> Path | None:
+    root = root.resolve()
+    candidate = (root / relative).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def _compact_trigger_raw_path(
+    *,
+    trigger: Mapping[str, Any],
+    captured_path: Path,
+    compact: Mapping[str, Any],
+    root: Path,
+) -> Path | None:
+    """Validate one fixed compact sidecar and return its contained raw path."""
+    root = root.resolve()
+    label = trigger.get("label")
+    if label == "hourly":
+        compact_root = _contained_canonical_path(
+            root, DEFAULT_BOARD_EVIDENCE_ROOT / "hourly_supervisor"
+        )
+        expected_schema = "compact_hourly_supervisor_v1"
+        expected_kind = None
+    elif label == "execution_board_review":
+        compact_root = _contained_canonical_path(
+            root, DEFAULT_BOARD_EVIDENCE_ROOT / "execution_board"
+        )
+        expected_schema = "compact_execution_board_review_v1"
+        expected_kind = "execution_board_review"
+    else:
+        return None
+    if compact_root is None:
+        return None
+    try:
+        captured_path.relative_to(compact_root)
+    except ValueError:
+        return None
+    if (
+        captured_path.name != "latest-compact.json"
+        and not captured_path.name.endswith(".compact.json")
+    ):
+        return None
+    if (
+        compact.get("schema") != expected_schema
+        or compact.get("can_submit_orders") is not False
+        or compact.get("execution_authority") != "none"
+    ):
+        return None
+    if expected_kind is not None and compact.get("kind") != expected_kind:
+        return None
+    raw_value = compact.get("raw_packet_path")
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        return None
+    raw_candidate = Path(raw_value)
+    raw_path = (
+        raw_candidate.resolve()
+        if raw_candidate.is_absolute()
+        else (root / raw_candidate).resolve()
+    )
+    results_root = _contained_canonical_path(root, DEFAULT_BOARD_EVIDENCE_ROOT)
+    if results_root is None:
+        return None
+    try:
+        raw_path.relative_to(results_root)
+    except ValueError:
+        return None
+    return raw_path
+
+
 def _board_decision_matches_trigger(
     authenticated: Mapping[str, Any],
     trigger: Mapping[str, Any],
@@ -639,6 +732,7 @@ def _board_decision_matches_trigger(
     root: Path,
 ) -> bool:
     """Bind a resolved BOARD decision to the exact signal that raised it."""
+    root = root.resolve()
     symbol = trigger.get("symbol")
     if symbol is not None and (
         not isinstance(symbol, str)
@@ -646,18 +740,8 @@ def _board_decision_matches_trigger(
         or symbol.strip().upper() != authenticated.get("symbol")
     ):
         return False
-    raw_path = trigger.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return False
-    candidate = Path(raw_path)
-    trigger_path = (
-        candidate.resolve()
-        if candidate.is_absolute()
-        else (root / candidate).resolve()
-    )
-    try:
-        trigger_path.relative_to(root)
-    except ValueError:
+    trigger_path = _regular_non_symlink_trigger_path(trigger, root=root)
+    if trigger_path is None:
         return False
     # The canonical BOARD bytes were captured and parsed exactly once by
     # `_authenticated_latest_board_decision`; do not re-open that mutable file
@@ -668,10 +752,48 @@ def _board_decision_matches_trigger(
     if captured is None:
         return False
     path, raw, packet = captured
+    compact_raw_path = _compact_trigger_raw_path(
+        trigger=trigger, captured_path=path, compact=packet, root=root
+    )
+    if compact_raw_path is not None:
+        expected_board_path = Path(str(authenticated.get("board_path"))).resolve()
+        supervisor = authenticated.get("supervisor_packet")
+        if not isinstance(supervisor, Mapping):
+            return False
+        expected_supervisor_path = _contained_canonical_path(
+            root,
+            DEFAULT_BOARD_EVIDENCE_ROOT / str(supervisor.get("path") or ""),
+        )
+        if compact_raw_path not in {expected_board_path, expected_supervisor_path}:
+            return False
+        raw_trigger = dict(trigger)
+        raw_trigger["path"] = str(compact_raw_path)
+        raw_captured = _captured_signal_packet(raw_trigger, root=root)
+        if raw_captured is None:
+            return False
+        path, raw, packet = raw_captured
+    elif path.name == "latest-compact.json" or path.name.endswith(".compact.json"):
+        # A sidecar that failed strict schema/path validation must never fall
+        # through as though it were a raw supervisor packet.
+        return False
+    expected_board_path = Path(str(authenticated.get("board_path"))).resolve()
+    if path == expected_board_path:
+        return (
+            len(raw) == authenticated.get("board_size_bytes")
+            and hashlib.sha256(raw).hexdigest() == authenticated.get("board_sha256")
+            and packet.get("kind") == "execution_board_review"
+            and packet.get("schema_version") == 1
+            and packet.get("autonomous_loss_decision", {}).get("decision_id")
+            == authenticated.get("decision_id")
+        )
     supervisor = authenticated.get("supervisor_packet")
     if not isinstance(supervisor, Mapping):
         return False
-    expected_path = (root / DEFAULT_BOARD_EVIDENCE_ROOT / str(supervisor.get("path") or "")).resolve()
+    expected_path = _contained_canonical_path(
+        root, DEFAULT_BOARD_EVIDENCE_ROOT / str(supervisor.get("path") or "")
+    )
+    if expected_path is None:
+        return False
     if path != expected_path:
         return False
     if (

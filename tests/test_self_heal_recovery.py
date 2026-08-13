@@ -4601,6 +4601,194 @@ def test_authenticated_board_decision_requires_matching_trigger_symbol_and_prove
     assert signal["decision_reference"] is None
 
 
+def test_scheduled_compact_board_and_hourly_sidecars_bind_exact_raw_provenance(
+    tmp_path: Path,
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path, symbol="TSM")
+    board_compact_path = tmp_path / "results" / "execution_board" / "latest-compact.json"
+    _write_json_packet(
+        board_compact_path,
+        {
+            "schema": "compact_execution_board_review_v1",
+            "kind": "execution_board_review",
+            "generated_at": NOW.isoformat(),
+            "analysis_only": True,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "raw_packet_path": str(fixture["board_path"]),
+        },
+    )
+    hourly_compact_path = tmp_path / "results" / "hourly_supervisor" / "latest-compact.json"
+    _write_json_packet(
+        hourly_compact_path,
+        {
+            "schema": "compact_hourly_supervisor_v1",
+            "generated_at": NOW.isoformat(),
+            "decision": "loss-review",
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "raw_packet_path": str(
+                tmp_path / "results" / "hourly_supervisor" / "hourly.json"
+            ),
+        },
+    )
+    for label, path in (
+        ("execution_board_review", board_compact_path),
+        ("hourly", hourly_compact_path),
+    ):
+        signal = self_heal_module._classify_self_heal_signal(
+            {
+                "label": label,
+                "reason": "board_review",
+                "symbol": "TSM",
+                "path": str(path.relative_to(tmp_path)),
+            },
+            prior_signatures=set(),
+            repo_root=tmp_path,
+            now=NOW,
+        )
+        assert signal["classification"] == "resolved_no_action"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "replacement"),
+    [
+        ("schema", "compact_execution_board_review_v0"),
+        ("raw_packet_path", "results/policy/not-board.json"),
+        ("can_submit_orders", True),
+    ],
+)
+def test_compact_board_sidecar_rejects_malformed_or_wrong_raw_path(
+    tmp_path: Path, mutation: str, replacement: object
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    sidecar_path = tmp_path / "results" / "execution_board" / "latest-compact.json"
+    sidecar = {
+        "schema": "compact_execution_board_review_v1",
+        "kind": "execution_board_review",
+        "analysis_only": True,
+        "can_submit_orders": False,
+        "execution_authority": "none",
+        "raw_packet_path": str(fixture["board_path"]),
+    }
+    sidecar[mutation] = replacement
+    _write_json_packet(sidecar_path, sidecar)
+    if mutation == "raw_packet_path":
+        _write_json_packet(tmp_path / "results" / "policy" / "not-board.json", {})
+
+    signal = self_heal_module._classify_self_heal_signal(
+        {
+            "label": "execution_board_review",
+            "reason": "board_review",
+            "symbol": "TSM",
+            "path": str(sidecar_path.relative_to(tmp_path)),
+        },
+        prior_signatures=set(),
+        repo_root=tmp_path,
+        now=NOW,
+    )
+    assert signal["classification"] == "business_decision_pending"
+
+
+def test_compact_sidecar_rejects_copied_root_and_replaced_raw_hourly(
+    tmp_path: Path,
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    copied_sidecar = tmp_path / "outside" / "latest-compact.json"
+    _write_json_packet(
+        copied_sidecar,
+        {
+            "schema": "compact_hourly_supervisor_v1",
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "raw_packet_path": "results/hourly_supervisor/hourly.json",
+        },
+    )
+    signal = self_heal_module._classify_self_heal_signal(
+        {
+            "label": "hourly",
+            "reason": "board_review",
+            "symbol": "TSM",
+            "path": str(copied_sidecar.relative_to(tmp_path)),
+        },
+        prior_signatures=set(),
+        repo_root=tmp_path,
+        now=NOW,
+    )
+    assert signal["classification"] == "business_decision_pending"
+
+    sidecar_path = tmp_path / "results" / "hourly_supervisor" / "latest-compact.json"
+    replacement = _write_json_packet(
+        tmp_path / "results" / "hourly_supervisor" / "replacement.json",
+        {"evidence": {"loss_exit_review": {"symbol": "TSM", "decision_id": "other"}}},
+    )
+    _write_json_packet(
+        sidecar_path,
+        {
+            "schema": "compact_hourly_supervisor_v1",
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "raw_packet_path": str(replacement),
+        },
+    )
+    signal = self_heal_module._classify_self_heal_signal(
+        {
+            "label": "hourly",
+            "reason": "board_review",
+            "symbol": "TSM",
+            "path": str(sidecar_path.relative_to(tmp_path)),
+        },
+        prior_signatures=set(),
+        repo_root=tmp_path,
+        now=NOW,
+    )
+    assert fixture["decision"].decision == "HOLD"
+    assert signal["classification"] == "business_decision_pending"
+
+
+def test_compact_sidecar_rejects_label_mismatch_and_symlink(tmp_path: Path) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    board_sidecar = tmp_path / "results" / "execution_board" / "latest-compact.json"
+    _write_json_packet(
+        board_sidecar,
+        {
+            "schema": "compact_execution_board_review_v1",
+            "kind": "execution_board_review",
+            "analysis_only": True,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "raw_packet_path": str(fixture["board_path"]),
+        },
+    )
+    wrong_label = self_heal_module._classify_self_heal_signal(
+        {
+            "label": "hourly",
+            "reason": "board_review",
+            "symbol": "TSM",
+            "path": str(board_sidecar.relative_to(tmp_path)),
+        },
+        prior_signatures=set(),
+        repo_root=tmp_path,
+        now=NOW,
+    )
+    assert wrong_label["classification"] == "business_decision_pending"
+
+    linked = tmp_path / "results" / "execution_board" / "linked-compact.json"
+    linked.symlink_to(board_sidecar)
+    symlink_signal = self_heal_module._classify_self_heal_signal(
+        {
+            "label": "execution_board_review",
+            "reason": "board_review",
+            "symbol": "TSM",
+            "path": str(linked.relative_to(tmp_path)),
+        },
+        prior_signatures=set(),
+        repo_root=tmp_path,
+        now=NOW,
+    )
+    assert symlink_signal["classification"] == "business_decision_pending"
+
+
 def test_unexpected_redundant_board_paths_are_rejected(tmp_path: Path) -> None:
     fixture = _record_strict_hold_board(tmp_path)
     board = fixture["board"]
