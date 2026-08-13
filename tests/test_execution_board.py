@@ -232,6 +232,33 @@ def test_compact_board_is_a_fixed_scalar_projection_and_never_leaks_nested_mater
     assert compact["autonomous_loss_decision"] == {"decision_id": "d", "ledger_packet_id": "l", "symbol": "TSM", "decision": "HOLD", "trade_decision_resolved": True, "exit_allowed": False}
 
 
+def test_autonomous_loss_board_compact_sidecar_is_exact_scalar_contract(tmp_path):
+    decision_id = "d" * 64
+    review = {
+        "generated_at": "2026-08-13T15:00:00+00:00", "analysis_only": True,
+        "autonomous_loss_decision": {
+            "decision_id": decision_id,
+            "ledger_packet_id": f"wp-{decision_id}-portfolio_decision",
+            "symbol": "TSM", "decision": "HOLD", "supervisor_decision_id": "loss-review-1",
+            "source_revision": "1" * 40, "trade_decision_resolved": True,
+            "exit_allowed": False, "analysis_only": True, "execution_authority": "none",
+            "can_submit_orders": False, "accepted_source_count": 3,
+            "accepted_sources_sha256": "a" * 64,
+        },
+    }
+    compact = compact_execution_board_review(
+        review, raw_packet_path=tmp_path / "execution-board-review-20260813-150000.json",
+        raw_packet_sha256="b" * 64,
+    )
+    assert set(compact) == {
+        "schema", "generated_at", "raw_packet_path", "raw_packet_sha256", "symbol",
+        "decision", "decision_id", "ledger_packet_id", "supervisor_decision_id", "source_revision",
+        "trade_decision_resolved", "exit_allowed", "analysis_only", "execution_authority",
+        "can_submit_orders", "accepted_source_count", "accepted_sources_sha256",
+    }
+    assert all(not isinstance(value, (dict, list)) for value in compact.values())
+
+
 def test_written_compact_board_points_to_the_exact_timestamped_raw_artifact(tmp_path):
     review = build_execution_board_review(tmp_path / "hourly")
     raw_path, _ = write_execution_board_review(review, tmp_path / "board")

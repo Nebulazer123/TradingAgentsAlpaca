@@ -1099,6 +1099,28 @@ def compact_execution_board_review(
     packet_reviews = review.get("packet_reviews") or []
     decision = review.get("autonomous_loss_decision")
     loss = review.get("loss_review_evidence")
+    sidecar_fields = (
+        "decision_id", "ledger_packet_id", "symbol", "decision",
+        "supervisor_decision_id", "source_revision", "trade_decision_resolved",
+        "exit_allowed", "analysis_only", "execution_authority", "can_submit_orders",
+        "accepted_source_count", "accepted_sources_sha256",
+    )
+    # A recorded autonomous decision has a dedicated, intentionally tiny
+    # sidecar.  It is a transport pointer only: the raw BOARD packet and its
+    # ledger remain the source of authority.  Keep the legacy compact summary
+    # for ordinary BOARD reviews that have no authenticated decision yet.
+    if (
+        isinstance(decision, Mapping)
+        and raw_packet_sha256 is not None
+        and all(field in decision for field in sidecar_fields)
+    ):
+        return {
+            "schema": "autonomous_loss_board_sidecar_v1",
+            "generated_at": review.get("generated_at"),
+            "raw_packet_path": str(raw_packet_path),
+            "raw_packet_sha256": raw_packet_sha256,
+            **{field: decision[field] for field in sidecar_fields},
+        }
     # This is intentionally a fixed allowlist of scalar fields.  Compact
     # consumers receive a pointer to immutable raw evidence, never copied
     # source bindings, nested research, unbounded prose, or secrets.

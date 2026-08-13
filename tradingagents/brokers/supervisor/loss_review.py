@@ -86,7 +86,7 @@ def loss_exit_review_packet(
     holding_days = _holding_period_trading_days(position, generated_at=generated_at)
     original_buy_thesis = str(position.get("original_buy_thesis") or position.get("buy_thesis") or "").strip()
     current_thesis_status = str(position.get("current_thesis_status") or position.get("thesis_status") or "").strip()
-    allowed_reason_source = str(position.get("allowed_exit_reason_source") or "").strip()
+    allowed_reason_source = _exact_reason_source(position.get("allowed_exit_reason_source"))
     company_news = str(
         position.get("company_specific_news_check")
         or position.get("company_news_check")
@@ -125,7 +125,7 @@ def loss_exit_review_packet(
         blockers.append("position is not proven below average entry price")
     if allowed_reason not in ALLOWED_LOSS_EXIT_REASONS:
         blockers.append("allowed loss-exit reason is missing")
-    if not allowed_reason_source:
+    if allowed_reason_source is None:
         blockers.append("allowed loss-exit reason source is missing")
     if holding_days is None and not policy_rule_exit:
         blockers.append("holding period evidence is missing")
@@ -176,7 +176,7 @@ def loss_exit_review_packet(
         "original_entry_thesis": original_buy_thesis or None,
         "original_buy_thesis": original_buy_thesis or None,
         "current_thesis_status": current_thesis_status or None,
-        "allowed_exit_reason_source": allowed_reason_source or None,
+        "allowed_exit_reason_source": allowed_reason_source,
         "broad_market_context": market_context,
         "relative_performance_vs_SPY": market_context.get("relative_performance_vs_SPY")
         or market_context.get("spy")
@@ -253,8 +253,6 @@ def _normalize_loss_exit_reason(position: Mapping) -> str | None:
         if value in ALLOWED_LOSS_EXIT_REASONS:
             return value
     for key, reason in (
-        ("thesis_invalidated", "thesis_invalidated"),
-        ("thesis_broken", "thesis_invalidated"),
         ("company_specific_negative_news", "company_specific_negative_news"),
         ("earnings_or_guidance_break", "earnings_or_guidance_break"),
         ("hard_stop_defined_before_entry", "hard_stop_defined_before_entry"),
@@ -264,11 +262,39 @@ def _normalize_loss_exit_reason(position: Mapping) -> str | None:
     ):
         if _truthy_position_flag(position.get(key)):
             return reason
+    if _thesis_invalidator_event(position.get("thesis_invalidator_event")):
+        return "thesis_invalidated"
     exit_reason = str(position.get("exit_reason") or "").strip().lower()
     for token, reason in LOSS_EXIT_REASON_ALIASES.items():
+        if reason == "thesis_invalidated":
+            continue
         if token in exit_reason:
             return reason
     return None
+
+
+def _exact_reason_source(value: object) -> dict[str, str] | None:
+    """Reason authority is a bound packet identity, never a human-text label."""
+    if not isinstance(value, Mapping) or set(value) != {"packet_id", "path", "sha256"}:
+        return None
+    packet_id, path, sha256 = (value.get(key) for key in ("packet_id", "path", "sha256"))
+    if not all(isinstance(item, str) and item.strip() == item for item in (packet_id, path, sha256)):
+        return None
+    if len(sha256) != 64 or any(character not in "0123456789abcdef" for character in sha256):
+        return None
+    return {"packet_id": packet_id, "path": path, "sha256": sha256}
+
+
+def _thesis_invalidator_event(value: object) -> bool:
+    """Only a dedicated normalized invalidator event can claim thesis failure."""
+    if not isinstance(value, Mapping):
+        return False
+    return (
+        set(value) == {"event_category", "source", "reason_source"}
+        and value.get("event_category") == "thesis_invalidator"
+        and value.get("source") == "normalized_company_news"
+        and _exact_reason_source(value.get("reason_source")) is not None
+    )
 
 
 def _parse_position_time(value: object) -> datetime.datetime | None:

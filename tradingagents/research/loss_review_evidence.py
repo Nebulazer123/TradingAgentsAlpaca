@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import stat
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -287,17 +290,14 @@ def _accepted_source_descriptors(
     """
     if not source_packet_paths or evidence_root is None:
         return []
-    root = Path(evidence_root).resolve()
+    root = _safe_root(evidence_root)
     result: list[dict[str, Any]] = []
     for packet in provider_result.packets:
         supplied = source_packet_paths.get(packet.packet_id)
         if supplied is None:
             continue
         try:
-            path = Path(supplied).resolve()
-            relative = path.relative_to(root)
-            raw = path.read_bytes()
-            stored = json.loads(raw)
+            relative, raw, stored = _read_contained_json(root, supplied)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if not isinstance(stored, Mapping):
@@ -316,8 +316,7 @@ def _accepted_source_descriptors(
         if normalized is None:
             continue
         normalized_type, normalized_payload = normalized
-        normalized_path = root / "normalized_loss_review_evidence" / f"{packet.packet_id}-{normalized_type}.json"
-        normalized_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        normalized_relative = Path("normalized_loss_review_evidence") / f"{packet.packet_id}-{normalized_type}.json"
         normalized_packet = {
             "packet_id": f"normalized-{packet.packet_id}-{normalized_type}",
             "source_name": packet.source_name,
@@ -335,10 +334,10 @@ def _accepted_source_descriptors(
             "payload": normalized_payload,
         }
         normalized_raw = json.dumps(normalized_packet, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        if normalized_path.exists() and normalized_path.read_bytes() != normalized_raw:
+        try:
+            _publish_immutable(root, normalized_relative, normalized_raw)
+        except (OSError, ValueError):
             continue
-        normalized_path.write_bytes(normalized_raw)
-        normalized_relative = normalized_path.relative_to(root)
         result.append(
             {
                 "path": normalized_relative.as_posix(),
@@ -352,6 +351,115 @@ def _accepted_source_descriptors(
             }
         )
     return result
+
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_POSITIVE_WORDS = frozenset({"raise", "raises", "raised", "beat", "beats", "growth", "wins", "won", "approval", "approved", "partnership", "expands", "expansion"})
+_GUIDANCE_CUT = re.compile(r"\b(cut|cuts|lower(?:ed|s)?|reduces?|revised?\s+down|withdraws?)\b.{0,80}\b(guidance|outlook|forecast|revenue)\b|\b(guidance|outlook|forecast|revenue)\b.{0,80}\b(cut|lower(?:ed|s)?|reduc(?:ed|es)|down)\b", re.I)
+_CONTRACT_LOSS = re.compile(r"\b(lost|loss|terminated|termination|cancel(?:led|ed)?|canceled)\b.{0,80}\b(contract|customer|client|agreement)\b", re.I)
+_THESIS_INVALIDATOR = re.compile(r"\b(bankruptcy|fraud|restatement|going concern|delist(?:ing)?|material weakness)\b", re.I)
+
+
+def _safe_root(value: str | Path) -> Path:
+    root = Path(value)
+    state = root.lstat()
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise ValueError("evidence root must be a real directory")
+    return root.resolve()
+
+
+def _relative_under(root: Path, supplied: str | Path) -> Path:
+    value = Path(supplied)
+    if value.is_absolute():
+        try:
+            value = value.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("source packet escapes evidence root") from exc
+    if not value.parts or ".." in value.parts:
+        raise ValueError("source packet escapes evidence root")
+    return value
+
+
+def _read_contained_json(root: Path, supplied: str | Path) -> tuple[Path, bytes, Mapping[str, Any]]:
+    relative = _relative_under(root, supplied)
+    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW)
+    current_fd = root_fd
+    try:
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        descriptor = os.open(relative.parts[-1], os.O_RDONLY | _NOFOLLOW, dir_fd=current_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("source packet must be a regular file")
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                raw = stream.read()
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+        stored = json.loads(raw)
+        if not isinstance(stored, Mapping):
+            raise ValueError("source packet must be an object")
+        return relative, raw, stored
+    finally:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        os.close(root_fd)
+
+
+def _mkdir_relative(root: Path, parts: tuple[str, ...]) -> int:
+    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW)
+    current_fd = root_fd
+    try:
+        for part in parts:
+            try:
+                os.mkdir(part, 0o700, dir_fd=current_fd)
+                os.fsync(current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW, dir_fd=current_fd)
+            if current_fd != root_fd:
+                os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        if current_fd != root_fd:
+            os.close(current_fd)
+        raise
+    finally:
+        os.close(root_fd)
+
+
+def _publish_immutable(root: Path, relative: Path, content: bytes) -> None:
+    if relative.is_absolute() or ".." in relative.parts or len(relative.parts) < 2:
+        raise ValueError("normalized evidence path is unsafe")
+    parent_fd = _mkdir_relative(root, tuple(relative.parts[:-1]))
+    try:
+        try:
+            descriptor = os.open(relative.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            descriptor = os.open(relative.name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_fd)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode) or os.read(descriptor, max(len(content) + 1, 1)) != content:
+                    raise ValueError("immutable normalized evidence collision")
+            finally:
+                os.close(descriptor)
+            return
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                descriptor = -1
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.fsync(parent_fd)
+        finally:
+            if descriptor != -1:
+                os.close(descriptor)
+    finally:
+        os.close(parent_fd)
 
 
 def _normalized_decimal(value: Any) -> str | None:
@@ -377,10 +485,8 @@ def _normalize_provider_packet(
         return None
     as_of = str(packet.as_of or packet.generated_at)
     if packet.evidence_type == "quote_price_context":
-        context = raw_payload.get("market_context")
-        if not isinstance(context, Mapping):
-            return None
-        spy, qqq, relative = (_normalized_decimal(context.get(key)) for key in ("spy", "qqq", "sector_relative"))
+        values = _market_values_from_configured_quote(raw_payload, symbol)
+        spy, qqq, relative = values.get("spy"), values.get("qqq"), values.get("sector_relative")
         if None in {spy, qqq, relative}:
             return None
         return "market_context", {
@@ -389,24 +495,98 @@ def _normalize_provider_packet(
             "qqq": {"symbol": "QQQ", "value": qqq, "as_of": as_of},
             "sector_relative": {"symbol": symbol, "value": relative, "as_of": as_of},
         }
-    if packet.evidence_type in {"market_news", "earnings_transcripts", "fundamentals_profile"}:
-        event = raw_payload.get("company_event")
+    if packet.evidence_type == "market_news":
+        event = _adverse_finnhub_event(raw_payload, symbol=symbol, as_of=as_of)
+        if event is None:
+            return None
+        return "company_news", {"symbol": symbol, "as_of": as_of, **event}
+    if packet.evidence_type in {"earnings_transcripts", "fundamentals_profile"}:
+        event = _adverse_transcript_event(raw_payload, symbol=symbol)
         if not isinstance(event, Mapping) or event.get("direction") != "adverse":
             return None
         category = event.get("event_category")
-        if category not in {"guidance_cut", "material_contract_loss", "regulatory_adverse_action", "thesis_invalidator", "earnings_miss", "material_impairment", "adverse_filing_disclosure"}:
-            return None
-        fraction = _normalized_decimal(event.get("impact_fraction", event.get("change_fraction")))
-        if fraction is None or _float_value(fraction) is None or _float_value(fraction) > -0.01:
-            return None
-        if packet.evidence_type == "market_news":
-            return "company_news", {"symbol": symbol, "as_of": as_of, "event_category": category, "direction": "adverse", "impact_fraction": fraction}
-        # An SEC index has no event object and is rejected above.  A transcript
-        # or filed disclosure must identify an actual earnings/guidance fact.
-        if category not in {"guidance_cut", "earnings_miss", "material_impairment", "adverse_filing_disclosure"}:
+        fraction = _normalized_decimal(event.get("change_fraction", event.get("impact_fraction")))
+        if category not in {"guidance_cut", "adverse_filing_disclosure"} or fraction is None or _float_value(fraction) is None or _float_value(fraction) > -0.01:
             return None
         return "earnings_guidance_filing", {"symbol": symbol, "as_of": as_of, "event_category": category, "direction": "adverse", "change_fraction": fraction}
     return None
+
+
+def _quote_price(value: Any) -> float | None:
+    if not isinstance(value, Mapping):
+        return None
+    price, previous = _float_value(value.get("p")), _float_value(value.get("pc"))
+    if price is None or previous is None or previous <= 0:
+        return None
+    return (price - previous) / previous
+
+
+def _market_values_from_configured_quote(payload: Mapping[str, Any], symbol: str) -> dict[str, str | None]:
+    data = payload.get("data")
+    trades = data.get("trades") if isinstance(data, Mapping) else None
+    if not isinstance(trades, Mapping):
+        return {"spy": None, "qqq": None, "sector_relative": None}
+    target, spy, qqq, sector = (_quote_price(trades.get(name)) for name in (symbol, "SPY", "QQQ", "XLK"))
+    if None in {target, spy, qqq, sector}:
+        return {"spy": None, "qqq": None, "sector_relative": None}
+    return {
+        "spy": _normalized_decimal(spy),
+        "qqq": _normalized_decimal(qqq),
+        "sector_relative": _normalized_decimal(target - sector),
+    }
+
+
+def _news_items(payload: Mapping[str, Any]) -> Sequence[Any]:
+    for key in ("data", "articles", "news"):
+        candidate = payload.get(key)
+        if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes, bytearray)):
+            return candidate
+    return ()
+
+
+def _adverse_finnhub_event(payload: Mapping[str, Any], *, symbol: str, as_of: str) -> dict[str, str] | None:
+    observed = _parse_timestamp(as_of)
+    if observed is None:
+        return None
+    for item in _news_items(payload):
+        if not isinstance(item, Mapping) or not isinstance(item.get("url"), str) or not item["url"].strip():
+            continue
+        timestamp = item.get("datetime")
+        try:
+            published = datetime.fromtimestamp(float(timestamp), tz=UTC)
+        except (TypeError, ValueError, OSError):
+            continue
+        if abs((observed - published).total_seconds()) > 15 * 60:
+            continue
+        text = " ".join(str(item.get(key) or "") for key in ("category", "headline", "summary")).lower()
+        if not text or any(token in text for token in _POSITIVE_WORDS):
+            continue
+        if _THESIS_INVALIDATOR.search(text):
+            category, change = "thesis_invalidator", "-0.01"
+        elif _GUIDANCE_CUT.search(text):
+            category, change = "guidance_cut", "-0.01"
+        elif _CONTRACT_LOSS.search(text):
+            category, change = "material_contract_loss", "-0.01"
+        else:
+            continue
+        return {"event_category": category, "direction": "adverse", "impact_fraction": change}
+    return None
+
+
+def _adverse_transcript_event(payload: Mapping[str, Any], *, symbol: str) -> dict[str, str] | None:
+    if str(payload.get("symbol") or "").upper() != symbol:
+        return None
+    items = payload.get("transcript_items")
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes, bytearray)):
+        return None
+    text = " ".join(str(item.get("content") or item.get("text") or "") for item in items if isinstance(item, Mapping)).lower()
+    if not text or any(token in text for token in _POSITIVE_WORDS) or not _GUIDANCE_CUT.search(text):
+        return None
+    match = re.search(r"(?:guidance|outlook|revenue).{0,80}?(?:by|of)\s+(\d+(?:\.\d+)?)\s*%|(?:by|of)\s+(\d+(?:\.\d+)?)\s*%.{0,80}?(?:guidance|outlook|revenue)", text)
+    value = next((entry for entry in (match.groups() if match else ()) if entry), None)
+    if value is None or float(value) < 1:
+        return None
+    return {"event_category": "guidance_cut", "direction": "adverse", "change_fraction": _normalized_decimal(-float(value) / 100.0) or "-0.01"}
 
 
 def _qualified_loss_review_evidence(

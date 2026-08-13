@@ -110,6 +110,38 @@ def _complete_provider_result(symbol: str = "ORCL") -> TickerProviderResearchRes
     return TickerProviderResearchResult(symbol=symbol, packets=packets, summary_packet=None, route_attempts=[])
 
 
+def _configured_shape_provider_result(symbol: str = "ORCL") -> TickerProviderResearchResult:
+    """Fixtures mirror the configured Alpaca, Finnhub, and FMP route shapes."""
+    return TickerProviderResearchResult(
+        symbol=symbol,
+        packets=[
+            evidence_packet(
+                source_name="alpaca_market_data", evidence_type="quote_price_context",
+                subject="ORCL,SPY,QQQ,XLK", symbol=symbol,
+                source_ref="https://data.alpaca.markets/v2/stocks/trades/latest",
+                payload={"request_context": {"symbols": [symbol, "SPY", "QQQ", "XLK"]}, "data": {"trades": {
+                    symbol: {"p": 91.0, "pc": 100.0, "t": "2026-08-13T14:55:00Z"},
+                    "SPY": {"p": 650.0, "pc": 648.0, "t": "2026-08-13T14:55:00Z"},
+                    "QQQ": {"p": 580.0, "pc": 578.0, "t": "2026-08-13T14:55:00Z"},
+                    "XLK": {"p": 260.0, "pc": 259.0, "t": "2026-08-13T14:55:00Z"},
+                }}}, quality="high", as_of="2026-08-13T14:55:00+00:00", tool_route="alpaca_market_data_read_only",
+            ),
+            evidence_packet(
+                source_name="finnhub", evidence_type="market_news", subject=symbol, symbol=symbol,
+                source_ref="https://finnhub.io/api/v1/company-news",
+                payload={"data": [{"category": "company news", "datetime": 1786632840, "headline": "Oracle cuts fiscal guidance after material contract loss", "summary": "The company lowered fiscal revenue guidance by 8% after losing a material customer contract.", "url": "https://issuer.example/adverse"}]},
+                quality="medium", as_of="2026-08-13T14:55:00+00:00", tool_route="finnhub_api",
+            ),
+            evidence_packet(
+                source_name="fmp", evidence_type="earnings_transcripts", subject=symbol, symbol=symbol,
+                source_ref="https://financialmodelingprep.com/api/v3/earning-call-transcript/ORCL",
+                payload={"symbol": symbol, "year": 2026, "quarter": 1, "transcript_items": [{"content": "Management lowered full-year revenue guidance by 12% because of the contract loss."}]},
+                quality="high", as_of="2026-08-13T14:55:00+00:00", tool_route="fmp_api",
+            ),
+        ],
+    )
+
+
 def test_find_latest_loss_review_packet_selects_newest_review(tmp_path):
     old_path = tmp_path / "hourly-supervisor-20260606-190000.json"
     old_path.write_text(json.dumps({"decision": "hold"}), encoding="utf-8")
@@ -193,7 +225,7 @@ def test_build_loss_review_evidence_packet_preserves_hold_and_attaches_sources()
     ]
 
 
-def test_real_shaped_provider_packets_are_normalized_before_they_count(tmp_path):
+def test_fabricated_nested_provider_context_does_not_become_authority(tmp_path):
     hourly_packet = _hourly_packet("ORCL")
     review = hourly_packet["evidence"]["loss_exit_review"]
     review["symbol"] = "ORCL"
@@ -211,10 +243,29 @@ def test_real_shaped_provider_packets_are_normalized_before_they_count(tmp_path)
     )
 
     accepted = packet.payload["accepted_sources"]
-    assert {item["evidence_type"] for item in accepted} == {"market_context", "company_news", "earnings_guidance_filing"}
-    assert all(item["path"].startswith("normalized_loss_review_evidence/") for item in accepted)
-    assert packet.payload["advisory_analysis"]["qualified_evidence"] == {"market": True, "company_news": True, "filing": True}
+    assert accepted == []
+    assert packet.payload["advisory_analysis"]["qualified_evidence"] == {"market": False, "company_news": False, "filing": False}
+    assert packet.payload["remaining_blockers"] == review["blockers"]
+
+
+def test_configured_provider_shapes_normalize_to_complete_adverse_loss_evidence(tmp_path):
+    provider = _configured_shape_provider_result()
+    hourly = _hourly_packet("ORCL")
+    review = hourly["evidence"]["loss_exit_review"]
+    review["blockers"] = ["SPY/QQQ/sector context is missing", "company-specific news check is missing", "earnings/guidance/filing check is missing"]
+    review["blocked_reasons"] = list(review["blockers"])
+    source_paths = {packet.packet_id: write_research_packet(packet, tmp_path / "raw") for packet in provider.packets}
+
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=tmp_path / "hourly.json", hourly_packet=hourly,
+        provider_result=provider, source_packet_paths=source_paths, decision_evidence_root=tmp_path,
+    )
+
+    assert {item["evidence_type"] for item in packet.payload["accepted_sources"]} == {"market_context", "company_news", "earnings_guidance_filing"}
     assert packet.payload["remaining_blockers"] == []
+    news = next(item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "company_news")
+    normalized = json.loads((tmp_path / news["path"]).read_text(encoding="utf-8"))
+    assert normalized["payload"]["event_category"] == "guidance_cut"
 
 
 def test_generic_tsm_provider_packets_are_not_normalized_into_authority(tmp_path):

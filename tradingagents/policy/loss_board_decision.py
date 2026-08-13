@@ -9,7 +9,6 @@ import os
 import re
 import stat
 from collections.abc import Mapping
-from contextlib import suppress
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -730,40 +729,43 @@ def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: B
 
 def _publish(root: Path, relative: Path, content: bytes) -> Path:
     target = _inside(root, relative, label="decision evidence")
-    parent = target.parent
-    if parent.exists():
-        if stat.S_ISLNK(parent.lstat().st_mode) or not stat.S_ISDIR(parent.lstat().st_mode):
-            raise ValueError("decision evidence parent is unsafe")
-    else:
-        parent.mkdir(mode=0o700)
-        root_descriptor = os.open(root, os.O_RDONLY)
-        try:
-            os.fsync(root_descriptor)
-        finally:
-            os.close(root_descriptor)
-    if stat.S_ISLNK(parent.lstat().st_mode):
-        raise ValueError("decision evidence parent is unsafe")
+    root_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW)
+    parent_fd = root_fd
     try:
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
-    except FileExistsError:
-        state = target.lstat()
-        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode) or target.read_bytes() != content:
-            raise ValueError("immutable decision evidence collision") from None
-        return target
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        directory = os.open(parent, os.O_RDONLY)
+        for part in relative.parts[:-1]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW, dir_fd=parent_fd)
+            if parent_fd != root_fd:
+                os.close(parent_fd)
+            parent_fd = next_fd
         try:
-            os.fsync(directory)
+            descriptor = os.open(relative.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            descriptor = os.open(relative.name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_fd)
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode) or os.read(descriptor, len(content) + 1) != content:
+                    raise ValueError("immutable decision evidence collision")
+            finally:
+                os.close(descriptor)
+            return target
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.fsync(parent_fd)
         finally:
-            os.close(directory)
-    except BaseException:
-        with suppress(OSError):
-            target.unlink()
-        raise
+            if descriptor != -1:
+                os.close(descriptor)
+    finally:
+        if parent_fd != root_fd:
+            os.close(parent_fd)
+        os.close(root_fd)
     return target
 
 
