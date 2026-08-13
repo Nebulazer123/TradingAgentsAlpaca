@@ -115,6 +115,15 @@ RECOVERY_FOCUSED_TESTS = (
 RECOVERY_MAX_ATTEMPTS = 3
 RECOVERY_BACKOFF_SECONDS = (0, 30, 120)
 RECOVERY_LEASE_MINUTES = 30
+BOARD_REVIEW_SIGNALS = frozenset(
+    {
+        ("hourly", "board_review"),
+        ("execution_board_review", "board_review"),
+    }
+)
+DEFAULT_BOARD_EVIDENCE_ROOT = Path("results")
+DEFAULT_BOARD_LEDGER_ROOT = Path("state/decision_ledger")
+DEFAULT_BOARD_REVIEW_PATH = Path("results/execution_board/latest.json")
 
 
 class _PromotionStalePreimage(RuntimeError):
@@ -316,6 +325,16 @@ def classify_recovery_signal(trigger: Mapping[str, Any]) -> dict[str, Any]:
             "status": "external_authority_required",
             "external_blocker": "broker_state_authority",
         }
+    if (label, reason) in BOARD_REVIEW_SIGNALS:
+        return {
+            **base,
+            "classification": "business_decision_pending",
+            "status": "retryable",
+            "owner_role": "portfolio_executive",
+            "recipe": None,
+            "allowed_effects": ["trade_decision"],
+            "may_rearm": False,
+        }
     recoverable_labels = {
         "policy_rule_conflict",
         "promotion_state",
@@ -326,11 +345,9 @@ def classify_recovery_signal(trigger: Mapping[str, Any]) -> dict[str, Any]:
         "policy_conflict",
         "reconciliation_mismatch",
     }
-    exact_hourly_board_review = label == "hourly" and reason == "board_review"
     if (
         label in recoverable_labels
         or reason in recoverable_reasons
-        or exact_hourly_board_review
     ):
         return {
             **base,
@@ -339,6 +356,77 @@ def classify_recovery_signal(trigger: Mapping[str, Any]) -> dict[str, Any]:
             "may_rearm": True,
         }
     return {**base, "classification": "observe_only", "status": "observed"}
+
+
+def _authenticated_latest_board_decision(
+    repo_root: Path,
+    *,
+    now: dt.datetime | None = None,
+) -> dict[str, str] | None:
+    """Read one fixed BOARD reference and authenticate it through the ledger.
+
+    A self-heal signal is not allowed to nominate a decision file, ledger, or
+    evidence root.  The installed paths below are the sole trust boundary.
+    This helper never treats the BOARD's displayed fields as authority: those
+    fields must agree with the independently replayed immutable decision.
+    """
+    board_path = repo_root / DEFAULT_BOARD_REVIEW_PATH
+    try:
+        board_raw = board_path.read_bytes()
+        board = json.loads(board_raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(board, Mapping):
+        return None
+    displayed = board.get("autonomous_loss_decision")
+    if not isinstance(displayed, Mapping):
+        return None
+    ledger_packet_id = displayed.get("ledger_packet_id")
+    if not isinstance(ledger_packet_id, str) or not ledger_packet_id.strip():
+        return None
+    try:
+        from tradingagents.policy.loss_board_decision import (
+            verify_autonomous_loss_board_decision,
+        )
+
+        verified = verify_autonomous_loss_board_decision(
+            ledger_root=repo_root / DEFAULT_BOARD_LEDGER_ROOT,
+            ledger_packet_id=ledger_packet_id,
+            evidence_root=repo_root / DEFAULT_BOARD_EVIDENCE_ROOT,
+            now=now,
+        )
+    except (OSError, TypeError, ValueError):
+        return None
+    expected = {
+        "decision": verified.decision,
+        "decision_id": verified.decision_id,
+        "ledger_packet_id": ledger_packet_id,
+        "trade_decision_resolved": verified.trade_decision_resolved,
+        "exit_allowed": verified.exit_allowed,
+        "analysis_only": verified.analysis_only,
+        "execution_authority": verified.execution_authority,
+        "can_submit_orders": verified.can_submit_orders,
+        "recommendation": (
+            "autonomous_hold"
+            if verified.decision == "HOLD"
+            else "autonomous_sell_authorized_pending_execution_intent"
+        ),
+    }
+    if any(displayed.get(key) != value for key, value in expected.items()):
+        return None
+    if (
+        expected["trade_decision_resolved"] is not True
+        or expected["analysis_only"] is not True
+        or expected["execution_authority"] != "none"
+        or expected["can_submit_orders"] is not False
+        or verified.producer_role != "portfolio_executive"
+    ):
+        return None
+    return {
+        "decision": verified.decision,
+        "decision_id": verified.decision_id,
+        "ledger_packet_id": ledger_packet_id,
+    }
 
 
 def _recovery_now(value: dt.datetime | None) -> dt.datetime:
@@ -2631,6 +2719,13 @@ def build_production_recovery_request(
     recovery state, never a manual or silently skipped outcome. Real runtime
     integrations can replace the packet producers, not this authority boundary.
     """
+    recovery_classification = classify_recovery_signal(signal)
+    if recovery_classification["classification"] != "recoverable_integrity":
+        return {
+            "ready": False,
+            "outcome": "not_recovery_work",
+            "detail": "signal is not an integrity recovery and cannot create a recovery run",
+        }
     root = Path(repo_root).resolve()
     signature = _trigger_signature(signal)
     incident_id = f"self-heal-{hashlib.sha256(signature.encode()).hexdigest()[:20]}"
@@ -5155,6 +5250,7 @@ def _classify_self_heal_signal(
     *,
     prior_signatures: set[str],
     prior_state_records: Mapping[str, Mapping[str, Any]] | None = None,
+    repo_root: Path | None = None,
     now: dt.datetime | None = None,
     safe_reverify_minutes: int = DEFAULT_SAFE_REVERIFY_MINUTES,
 ) -> dict[str, Any]:
@@ -5193,6 +5289,60 @@ def _classify_self_heal_signal(
         )
         return signal
     recovery_signal = classify_recovery_signal(trigger)
+    if recovery_signal["classification"] == "business_decision_pending":
+        authenticated = _authenticated_latest_board_decision(
+            repo_root or Path("."), now=now
+        )
+        common = {
+            "owner_role": "portfolio_executive",
+            "recipe": None,
+            "allowed_effects": ["trade_decision"],
+            "safe_effects": [],
+            "may_rearm": False,
+            "escalation_required": False,
+            "decision_reference": authenticated,
+        }
+        if authenticated is None:
+            signal.update(
+                {
+                    **common,
+                    "classification": "business_decision_pending",
+                    "status": "retryable",
+                    "recommended_action": "await_current_autonomous_portfolio_decision",
+                    "verify_command": None,
+                }
+            )
+        elif authenticated["decision"] == "HOLD":
+            signal.update(
+                {
+                    **common,
+                    "classification": "resolved_no_action",
+                    "status": "resolved_no_action",
+                    "recommended_action": "autonomous_hold_recorded_no_execution_action",
+                    "verify_command": None,
+                }
+            )
+        elif authenticated["decision"] == "SELL":
+            signal.update(
+                {
+                    **common,
+                    "classification": "decision_resolved_execution_pending",
+                    "status": "decision_resolved_execution_pending",
+                    "recommended_action": "separate_execution_intent_required",
+                    "verify_command": None,
+                }
+            )
+        else:
+            signal.update(
+                {
+                    **common,
+                    "classification": "business_decision_pending",
+                    "status": "retryable",
+                    "recommended_action": "await_current_autonomous_portfolio_decision",
+                    "verify_command": None,
+                }
+            )
+        return signal
     if recovery_signal["classification"] == "external_blocked":
         signal.update(
             {
@@ -5421,6 +5571,7 @@ def build_self_heal_plan(
             signal,
             prior_signatures=prior_signatures,
             prior_state_records=prior_state_records,
+            repo_root=root,
             now=now,
             safe_reverify_minutes=safe_reverify_minutes,
         )
@@ -5431,10 +5582,17 @@ def build_self_heal_plan(
     deduped_prior_count = sum(1 for signal in signals if signal.get("status") == "already_recorded")
     max_severity = _max_severity(signals)
     status = "quiet"
+    business_decision_pending_count = sum(
+        1
+        for signal in signals
+        if signal.get("classification") == "business_decision_pending"
+    )
     if escalation_count:
         status = "escalation_required"
     elif active_plan_count:
         status = "safe_plan_ready"
+    elif business_decision_pending_count:
+        status = "business_decision_pending"
     elif deduped_prior_count:
         status = "deduped"
     packet: dict[str, Any] = {
@@ -5452,6 +5610,7 @@ def build_self_heal_plan(
         "active_plan_count": active_plan_count,
         "escalation_count": escalation_count,
         "deduped_prior_count": deduped_prior_count,
+        "business_decision_pending_count": business_decision_pending_count,
         "max_severity": max_severity,
         "status": status,
         "signals": signals,

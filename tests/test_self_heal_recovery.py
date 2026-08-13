@@ -2030,7 +2030,7 @@ def test_policy_conflict_is_recoverable_not_manual_escalation():
     assert signal["recipe"] == "resolve_policy_sync_reconcile_verify_rearm"
 
 
-def test_only_exact_hourly_board_review_is_owned_recovery():
+def test_exact_board_reviews_are_portfolio_business_decisions_not_recovery():
     exact = {
         "label": "hourly",
         "reason": "board_review",
@@ -2039,9 +2039,12 @@ def test_only_exact_hourly_board_review_is_owned_recovery():
 
     classified = classify_recovery_signal(exact)
 
-    assert classified["classification"] == "recoverable_integrity"
-    assert classified["status"] == "owned_recovery_ready"
-    assert classified["may_rearm"] is True
+    assert classified["classification"] == "business_decision_pending"
+    assert classified["status"] == "retryable"
+    assert classified["owner_role"] == "portfolio_executive"
+    assert classified["allowed_effects"] == ["trade_decision"]
+    assert classified["may_rearm"] is False
+    assert classified["recipe"] is None
 
     other_order_adjacent = _classify_self_heal_signal(
         {
@@ -2060,8 +2063,10 @@ def test_only_exact_hourly_board_review_is_owned_recovery():
         prior_signatures=set(),
     )
 
-    assert other_order_adjacent["classification"] == "escalate_order_adjacent"
-    assert other_order_adjacent["status"] == "escalated"
+    assert other_order_adjacent["classification"] == "business_decision_pending"
+    assert other_order_adjacent["status"] == "retryable"
+    assert other_order_adjacent["owner_role"] == "portfolio_executive"
+    assert other_order_adjacent["may_rearm"] is False
     assert malformed_label["classification"] == "observe_only"
     assert malformed_label["status"] == "observed"
 
@@ -4237,179 +4242,114 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
     assert paper_signal["ready"] is False
 
 
-def test_hourly_board_review_without_symbol_uses_canonical_evidence_and_completes(
-    tmp_path,
-):
-    hourly_path = (
-        tmp_path
-        / "results"
-        / "hourly_supervisor"
-        / "hourly-supervisor-nflx.json"
-    )
-    hourly_path.parent.mkdir(parents=True)
-    source_packet = _loss_review_source_packet(
-        account="live",
-        packet_path=str(
-            tmp_path / "results" / "loss_review_evidence" / "latest.json"
-        ),
-        hourly_packet_path=str(hourly_path.relative_to(tmp_path)),
-    )
-    supervisor = source_packet["payload"]["supervisor_review_authority"]
-    hourly_path.write_text(
+@pytest.mark.parametrize(
+    ("decision", "expected_classification"),
+    [
+        ("HOLD", "resolved_no_action"),
+        ("SELL", "decision_resolved_execution_pending"),
+    ],
+)
+def test_board_decision_never_dispatches_recovery_or_changes_frozen_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+    expected_classification: str,
+) -> None:
+    context_dir = tmp_path / "results" / "_context"
+    context_dir.mkdir(parents=True)
+    (context_dir / "latest-flags.json").write_text(
         json.dumps(
             {
-                "generated_at": NOW.isoformat(),
-                "decision": "loss-review",
-                "evidence": {"loss_exit_review": supervisor},
-            }
-        ),
-        encoding="utf-8",
-    )
-    compact_path = (
-        tmp_path / "results" / "hourly_supervisor" / "latest-compact.json"
-    )
-    compact_path.write_text(
-        json.dumps(
-            {
-                "label": "hourly",
-                "reason": "board_review",
-                "path": str(compact_path.relative_to(tmp_path)),
-            }
-        ),
-        encoding="utf-8",
-    )
-    evidence_path = tmp_path / "results" / "loss_review_evidence" / "latest.json"
-    evidence_path.parent.mkdir(parents=True)
-    evidence_path.write_text(json.dumps(source_packet), encoding="utf-8")
-    for path, content in (
-        (
-            tmp_path / "results" / "paper_strategy_tournament" / "latest.json",
-            json.dumps(_current_like_tournament_report()),
-        ),
-        (
-            tmp_path / "results" / "policy" / "promotion_state.json",
-            json.dumps({"schema_version": "1.0.0", "sleeves": {}}),
-        ),
-            (
-                tmp_path / "config" / "risk_envelope.yaml",
-                "\n".join(
-                    (
-                        "account_max_capital_at_risk_usd: 250.00",
-                        "per_name_cap_usd: 50.00",
-                        "per_sector_cap_pct: 0.20",
-                        "aggregate_beta_cap: 1.25",
-                        "daily_loss_halt_usd: 25.00",
-                        "max_drawdown_halt_pct: 0.05",
-                        "tiny_live_tranche_usd: 25.00",
-                        "tiny_live_max_loss_usd: 5.00",
-                        "new_sleeve_auto_promote: false",
-                        "alert_email: ops@example.com",
-                    )
-                ),
-            ),
-    ):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-
-    invocations: list[list[str]] = []
-
-    class Result:
-        def __init__(self, *, stdout="", stderr="", returncode=0):
-            self.stdout = stdout
-            self.stderr = stderr
-            self.returncode = returncode
-
-    def runner(argv, **_kwargs):
-        invocations.append(list(argv))
-        if argv[:3] == ["git", "rev-parse", "HEAD"]:
-            return Result(stdout="source-revision\n")
-        if "loss-review-evidence" in argv:
-            return Result(stdout=json.dumps(source_packet))
-        if "sync-promotion" in argv:
-            canonical_path = argv[argv.index("--state-path") + 1]
-            stage_path = argv[argv.index("--output-state-path") + 1]
-            result = sync_promotion_state_file(
-                argv[argv.index("--report-path") + 1],
-                canonical_path,
-                output_state_path=stage_path,
-                    tiny_live_tranche_usd=Decimal("25.00"),
-                arm_live="--arm-live" in argv,
-                ci_green="--ci-green" in argv,
-                now=NOW,
-            )
-            return Result(
-                stdout=json.dumps(
+                "flags": [
                     {
-                        "promoted": result.promoted,
-                        "demoted": result.demoted,
-                        "issues_by_sleeve": result.issues_by_sleeve,
-                        "state": result.state,
+                        "label": "hourly",
+                        "reason": "board_review",
+                        "path": "results/hourly_supervisor/latest-compact.json",
                     }
-                )
-            )
-        if "reconcile-symbol-incident" in argv:
-            return Result(stdout=json.dumps(_reconciliation_source_packet()))
-        if "pytest" in argv:
-            return Result(stdout="passed")
-        raise AssertionError(argv)
-
-    exact_signal = {
-        "label": "hourly",
-        "reason": "board_review",
-        "path": "results/hourly_supervisor/latest-compact.json",
-    }
-    assert (
-        classify_recovery_signal(exact_signal)["classification"]
-        == "recoverable_integrity"
+                ]
+            }
+        ),
+        encoding="utf-8",
     )
-    request = build_production_recovery_request(
-        exact_signal,
+    (context_dir / "latest-summary.json").write_text(
+        json.dumps({"latest_packets": []}), encoding="utf-8"
+    )
+    control_path = tmp_path / "results" / "policy" / "live_control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="remain frozen",
+        dead_man_expires_at=NOW + dt.timedelta(hours=1),
+        now=NOW,
+    )
+    frozen_before = control_path.read_bytes()
+    recovery_calls: list[dict] = []
+    runner_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        self_heal_module,
+        "_authenticated_latest_board_decision",
+        lambda *_args, **_kwargs: {
+            "decision": decision,
+            "decision_id": "a" * 64,
+            "ledger_packet_id": "packet-1",
+        },
+    )
+    monkeypatch.setattr(
+        self_heal_module,
+        "coordinate_verified_recovery",
+        lambda **kwargs: recovery_calls.append(kwargs),
+    )
+
+    plan = self_heal_module.build_self_heal_plan(tmp_path, now=NOW)
+    signal = plan["signals"][0]
+    assert signal["classification"] == expected_classification
+    assert signal["owner_role"] == "portfolio_executive"
+    assert signal["may_rearm"] is False
+    assert signal["forbidden_effects"] == list(self_heal_module.FORBIDDEN_EFFECTS)
+
+    result = self_heal_module.execute_self_heal_plan(
+        plan,
         repo_root=tmp_path,
-        command_runner=runner,
+        runner=lambda argv, **_kwargs: runner_calls.append(list(argv)),
     )
 
-    assert request["ready"] is True
-    assert request["bindings"]["symbol"] == "NFLX"
-    assert request["bindings"]["broker_account"] == "live"
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
-    result = coordinate_verified_recovery(
-        **coordinator_args,
-        control_path=_control(tmp_path / "production-control"),
-        receipt_dir=tmp_path / "production-receipts",
-        recovery_root=tmp_path / "production-recovery",
+    assert result["owned_recovery_count"] == 0
+    assert recovery_calls == []
+    assert runner_calls == []
+    assert control_path.read_bytes() == frozen_before
+    assert not (tmp_path / "results" / "control_plane" / "recovery").exists()
+    assert not (tmp_path / "results" / "control_plane" / "rearm_receipts").exists()
+
+
+def test_missing_or_invalid_board_decision_is_retryable_business_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        self_heal_module,
+        "_authenticated_latest_board_decision",
+        lambda *_args, **_kwargs: None,
+    )
+    signal = self_heal_module._classify_self_heal_signal(
+        {"label": "execution_board_review", "reason": "board_review"},
+        prior_signatures=set(),
+        repo_root=tmp_path,
         now=NOW,
     )
 
-    assert result["status"] == "monitoring"
-    state_path = (
-        tmp_path
-        / "production-recovery"
-        / request["incident_id"]
-        / "state.json"
+    assert signal["classification"] == "business_decision_pending"
+    assert signal["status"] == "retryable"
+    assert signal["owner_role"] == "portfolio_executive"
+    assert signal["may_rearm"] is False
+    assert signal["recipe"] is None
+    request = build_production_recovery_request(
+        {"label": "hourly", "reason": "board_review"}, repo_root=tmp_path
     )
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    expected_source_schemas = {
-        "regenerate_evidence": "1.0.0",
-        "sync_promotion": "1.1.0",
-        "reconcile": 1,
+    assert request == {
+        "ready": False,
+        "outcome": "not_recovery_work",
+        "detail": "signal is not an integrity recovery and cannot create a recovery run",
     }
-    for phase, source_schema in expected_source_schemas.items():
-        packet = json.loads(
-            Path(state["phase_outputs"][phase]["path"]).read_text(encoding="utf-8")
-        )
-        assert packet["schema_version"] == "tradingagents.recovery_phase.v1"
-        assert packet["source_schema_version"] == source_schema
-    assert any("loss-review-evidence" in argv for argv in invocations)
-    assert any("reconcile-symbol-incident" in argv for argv in invocations)
-    assert sum("pytest" in argv for argv in invocations) == 1
-
-    conflict = build_production_recovery_request(
-        {**exact_signal, "symbol": "TSLA"},
-        repo_root=tmp_path,
-        command_runner=runner,
-    )
-    assert conflict["ready"] is False
 
 
 def test_immutable_strategy_promotion_sleeve_record_is_accepted() -> None:
