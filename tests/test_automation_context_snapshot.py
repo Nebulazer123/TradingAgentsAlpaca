@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_snapshot_module():
     module_path = Path("scripts/automation_context_snapshot.py")
@@ -309,6 +311,8 @@ def test_incident_summary_projects_only_structural_blocker_presence(
     valid.write_text(
         json.dumps(
             {
+                "schema_version": "tradingagents.incident.v1",
+                "incident_id": "recovery-nflx",
                 "owner_role": "reliability_controller",
                 "updated_at": "2026-08-13T12:00:00+00:00",
                 "external_blockers": ["broker rejected Authorization: Bearer test-secret-token"],
@@ -344,12 +348,18 @@ def _write_incident_latest(
     phase: str = "reconcile",
     failure_kind: str = "external_blocked",
     blockers: list[str] | None = None,
+    schema_version: str = "tradingagents.incident.v1",
+    record_incident_id: str | None = None,
 ) -> Path:
     path = root / incident_id / "latest.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(
             {
+                "schema_version": schema_version,
+                "incident_id": (
+                    incident_id if record_incident_id is None else record_incident_id
+                ),
                 "owner_role": owner_role,
                 "updated_at": "2026-08-13T12:00:00+00:00",
                 "external_blockers": blockers if blockers is not None else [],
@@ -479,6 +489,77 @@ def test_incident_summary_rejects_unknown_recovery_owner_or_phase(tmp_path, monk
     )
     os.utime(path, (1_700_000_100, 1_700_000_100))
     monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    ) == {
+        "recovery_owner": None,
+        "recovery_phase": None,
+        "recovery_last_failure": None,
+        "recovery_external_blocker": "recovery_incident_unknown",
+    }
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["foreign_schema", "minimal_legacy_shape", "mismatched_incident_id"],
+)
+def test_incident_summary_requires_exact_schema_and_directory_bound_incident_id(
+    tmp_path, monkeypatch, shape
+):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    path = _write_incident_latest(incident_root, "bound-incident")
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if shape == "foreign_schema":
+        record["schema_version"] = "foreign.incident.v1"
+    elif shape == "minimal_legacy_shape":
+        record.pop("schema_version")
+        record.pop("incident_id")
+    else:
+        record["incident_id"] = "different-incident"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    ) == {
+        "recovery_owner": None,
+        "recovery_phase": None,
+        "recovery_last_failure": None,
+        "recovery_external_blocker": "recovery_incident_unknown",
+    }
+
+
+def test_incident_summary_fails_closed_when_candidate_cap_is_exceeded(
+    tmp_path, monkeypatch
+):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    for index in range(snapshot.INCIDENT_SUMMARY_STAT_LIMIT + 1):
+        _write_incident_latest(incident_root, f"adversarial-{index:03d}")
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    assert snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    ) == {
+        "recovery_owner": None,
+        "recovery_phase": None,
+        "recovery_last_failure": None,
+        "recovery_external_blocker": "recovery_incident_unknown",
+    }
+
+
+def test_incident_summary_fails_closed_when_incident_root_is_unreadable(
+    tmp_path, monkeypatch
+):
+    snapshot = _load_snapshot_module()
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    def unreadable_scandir(_path):
+        raise PermissionError("test-only unreadable incident root")
+
+    monkeypatch.setattr(snapshot.os, "scandir", unreadable_scandir)
 
     assert snapshot.summarize_incidents(
         now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)

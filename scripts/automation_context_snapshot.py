@@ -444,8 +444,6 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
         candidates: list[tuple[int, str, Path, int]] = []
         with os.scandir(incident_root) as entries:
             for entry in entries:
-                if len(candidates) >= INCIDENT_SUMMARY_STAT_LIMIT:
-                    break
                 if not entry.is_dir(follow_symlinks=False):
                     continue
                 latest_path = Path(entry.path) / "latest.json"
@@ -457,11 +455,15 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
                     return unknown_summary
                 if not stat.S_ISREG(metadata.st_mode):
                     return unknown_summary
+                if len(candidates) >= INCIDENT_SUMMARY_STAT_LIMIT:
+                    return unknown_summary
                 candidates.append(
                     (metadata.st_mtime_ns, entry.name, latest_path, metadata.st_size)
                 )
-    except OSError:
+    except FileNotFoundError:
         return empty_summary
+    except OSError:
+        return unknown_summary
 
     if not candidates:
         return empty_summary
@@ -485,10 +487,15 @@ def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
         return unknown_summary
 
     updated_at = parse_packet_timestamp(record.get("updated_at"))
+    incident_id = record.get("incident_id")
     owner = record.get("owner_role")
     recovery = record.get("recovery")
     if (
-        updated_at is None
+        record.get("schema_version") != "tradingagents.incident.v1"
+        or not isinstance(incident_id, str)
+        or not incident_id.strip()
+        or incident_id != _incident_id
+        or updated_at is None
         or updated_at > current
         or owner not in RECOVERY_OWNER_ROLES
         or not isinstance(recovery, dict)
