@@ -38,7 +38,6 @@
     ],
     "quote_price_context": [
       {"source_name": "broker_snapshot", "route": "alpaca:read_only_snapshot", "cost_tier": "connected_mcp_read", "priority": 10},
-      {"source_name": "alpaca_reference", "route": "dataflow:alpaca_reference", "cost_tier": "connected_mcp_read", "priority": 15},
       {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 20},
       {"source_name": "massive", "route": "dataflow:massive", "cost_tier": "paid_limited", "priority": 30},
       {"source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free_limited", "priority": 40},
