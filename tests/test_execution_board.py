@@ -82,7 +82,7 @@ def _write_exact_incomplete_loss_evidence(tmp_path):
 
 
 def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
-    hourly, evidence_dir, _hourly_path, loss_path = _write_exact_incomplete_loss_evidence(tmp_path)
+    hourly, evidence_dir, hourly_path, loss_path = _write_exact_incomplete_loss_evidence(tmp_path)
     ledger_root = tmp_path.parent / "installed-decision-ledger"
 
     review = build_execution_board_review(
@@ -118,10 +118,8 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
         "size_bytes": decision["decision_evidence"]["size_bytes"],
     }
     assert len(decision["decision_evidence"]["sha256"]) == 64
-    assert decision["supervisor_packet"]["path"] == (
-        "hourly/hourly-supervisor-20260813-150000.json"
-    )
-    assert decision["loss_evidence_packet"]["path"] == "loss_review_evidence/loss.json"
+    assert decision["supervisor_packet"]["path"] == str(hourly_path)
+    assert decision["loss_evidence_packet"]["path"] == str(loss_path)
     assert decision["loss_evidence_packet"]["packet_id"] == "loss-evidence-tsm-1"
     assert review["loss_review_evidence"]["next_action"] == "autonomous_hold"
     assert review["loss_review_evidence"]["source_binding"] == {
@@ -129,12 +127,17 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
         "issue": None,
         "bindings": {
             "supervisor": {
-                **decision["supervisor_packet"],
+                "path": "hourly/hourly-supervisor-20260813-150000.json",
+                "sha256": decision["supervisor_packet"]["sha256"],
+                "size_bytes": decision["supervisor_packet"]["size_bytes"],
                 "decision_id": "loss-review-tsm-1",
                 "symbol": "TSM",
             },
             "raw_loss": {
-                **decision["loss_evidence_packet"],
+                "path": "loss_review_evidence/loss.json",
+                "sha256": decision["loss_evidence_packet"]["sha256"],
+                "size_bytes": decision["loss_evidence_packet"]["size_bytes"],
+                "packet_id": "loss-evidence-tsm-1",
                 "symbol": "TSM",
                 "source_revision": "1" * 40,
             },

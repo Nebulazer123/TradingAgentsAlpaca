@@ -358,7 +358,7 @@ def _record_loss_board_decision(
         )
     except (OSError, ValueError):
         return None
-    decision_ref = recorded.packet.evidence_refs[0]
+    decision_ref, supervisor_ref, loss_ref = recorded.packet.evidence_refs
     accepted_sources_material = [item.compact() for item in decision.accepted_sources]
     return {
         "decision": decision.decision,
@@ -373,9 +373,15 @@ def _record_loss_board_decision(
         },
         "symbol": decision.symbol,
         "supervisor_decision_id": decision.supervisor_decision_id,
-        "supervisor_packet": decision.supervisor_packet.compact(),
+        "supervisor_packet": {
+            "path": supervisor_ref.path,
+            "sha256": supervisor_ref.sha256,
+            "size_bytes": supervisor_ref.size_bytes,
+        },
         "loss_evidence_packet": {
-            **decision.loss_evidence_packet.compact(),
+            "path": loss_ref.path,
+            "sha256": loss_ref.sha256,
+            "size_bytes": loss_ref.size_bytes,
             "packet_id": loss_packet["packet_id"],
         },
         "source_revision": decision.source_revision,
@@ -388,6 +394,23 @@ def _record_loss_board_decision(
             ).encode("utf-8")
         ).hexdigest(),
         "accepted_source_count": len(accepted_sources_material),
+        "_source_binding": {
+            "matched": True,
+            "issue": None,
+            "bindings": {
+                "supervisor": {
+                    **decision.supervisor_packet.compact(),
+                    "decision_id": decision.supervisor_decision_id,
+                    "symbol": decision.symbol,
+                },
+                "raw_loss": {
+                    **decision.loss_evidence_packet.compact(),
+                    "packet_id": loss_packet["packet_id"],
+                    "symbol": decision.symbol,
+                    "source_revision": decision.source_revision,
+                },
+            },
+        },
         "trade_decision_resolved": decision.trade_decision_resolved,
         "exit_allowed": decision.exit_allowed,
         "analysis_only": decision.analysis_only,
@@ -747,22 +770,15 @@ def build_execution_board_review(
     if autonomous_loss_decision is not None and loss_review_evidence is not None:
         loss_review_evidence = dict(loss_review_evidence)
         loss_review_evidence["next_action"] = autonomous_loss_decision["recommendation"]
-        loss_review_evidence["source_binding"] = {
-            "matched": True,
-            "issue": None,
-            "bindings": {
-                "supervisor": {
-                    **autonomous_loss_decision["supervisor_packet"],
-                    "decision_id": autonomous_loss_decision["supervisor_decision_id"],
-                    "symbol": autonomous_loss_decision["symbol"],
-                },
-                "raw_loss": {
-                    **autonomous_loss_decision["loss_evidence_packet"],
-                    "symbol": autonomous_loss_decision["symbol"],
-                    "source_revision": autonomous_loss_decision["source_revision"],
-                },
-            },
-        }
+        loss_review_evidence["source_binding"] = autonomous_loss_decision.pop(
+            "_source_binding"
+        )
+        loss_review_evidence["supervisor_packet_path"] = loss_review_evidence[
+            "source_binding"
+        ]["bindings"]["supervisor"]["path"]
+        loss_review_evidence["raw_packet_path"] = loss_review_evidence["source_binding"][
+            "bindings"
+        ]["raw_loss"]["path"]
         current_supervisor_packet = next(
             (
                 packet

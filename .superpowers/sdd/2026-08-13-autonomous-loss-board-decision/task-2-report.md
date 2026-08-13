@@ -142,3 +142,15 @@ Cross-slice verification:
 ruff check: All checks passed
 git diff --check: passed
 ```
+
+After Task 3 finalized its strict consumer, the receipt projection was aligned
+exactly: nested decision/supervisor/loss evidence records use the absolute
+ledger `EvidenceRef` paths, while `loss_review_evidence.source_binding` uses
+the decision's evidence-root-relative bound paths.  The raw loss packet ID is
+included in both projections.  Joint Task 2 and Task 3 verification passed:
+
+```text
+243 passed in 3.25s
+ruff check: All checks passed
+git diff --check: passed
+```
