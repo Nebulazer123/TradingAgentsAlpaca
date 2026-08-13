@@ -291,6 +291,29 @@ def test_compact_context_fails_closed_on_malformed_role_and_assignment_shapes(tm
     }
 
 
+def test_compact_context_rejects_board_scope_outside_its_owner_role(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    _write_valid_autonomous_contract(config_dir)
+    roles_path = config_dir / "automation_roles.json"
+    contract = json.loads(roles_path.read_text(encoding="utf-8"))
+    contract["automation_constraints"] = {
+        "tradingagents-market-supervisor": {
+            "allowed_actions": ["trade_decision"],
+            "required_outputs": ["portfolio_decision"],
+            "forbidden_effects": [],
+        }
+    }
+    roles_path.write_text(json.dumps(contract), encoding="utf-8")
+
+    summary = _compact_context(tmp_path, monkeypatch)
+
+    assert summary["automation_role_contract_status"] == "fail"
+    assert summary["automation_role_contract_issues"] == [
+        "automation_constraints_malformed"
+    ]
+
+
 def test_compact_context_warns_and_does_not_elevate_invalid_packet_authority(tmp_path, monkeypatch):
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -319,11 +342,6 @@ def test_execution_board_compact_context_projects_a_resolved_autonomous_hold(tmp
             "symbol": "SIXTEENCHARS.TSM",
             "decision_id": "a" * 64,
             "ledger_packet_id": build_packet_id("a" * 64, "portfolio_decision"),
-            "decision_evidence": {
-                "path": "loss_board_decisions/decision.json",
-                "sha256": "c" * 64,
-                "size_bytes": 321,
-            },
             "trade_decision_resolved": True,
             "exit_allowed": False,
             "analysis_only": True,
@@ -343,6 +361,29 @@ def test_execution_board_compact_context_projects_a_resolved_autonomous_hold(tmp
     assert summary["latest_packet_needs_review"] is False
     assert "board_review" not in summary["drilldown_reasons"]
     assert "manual_board_review" not in json.dumps(summary)
+
+
+def test_execution_board_compact_context_projects_scalar_only_autonomous_sell():
+    """The phone-sized view accepts the producer's scalar-only sidecar receipt."""
+    snapshot = _load_snapshot_module()
+    decision = {
+        "decision": "SELL",
+        "symbol": "TSM",
+        "decision_id": "b" * 64,
+        "ledger_packet_id": build_packet_id("b" * 64, "portfolio_decision"),
+        "trade_decision_resolved": True,
+        "exit_allowed": True,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+
+    compact = snapshot.compact_autonomous_loss_decision(decision)
+
+    assert compact["status"] == "autonomous_sell"
+    assert compact["decision"] == "SELL"
+    assert compact["symbol"] == "TSM"
+    assert compact["plain_english"].endswith("no order was created.")
 
 
 @pytest.mark.parametrize(

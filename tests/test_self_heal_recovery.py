@@ -203,7 +203,7 @@ def _record_strict_hold_board(tmp_path: Path, *, symbol: str = "TSM") -> dict:
 
 
 def _write_bound_board_compact(tmp_path: Path, fixture: dict) -> Path:
-    """Write the production compact shape bound to immutable Board bytes."""
+    """Write the production scalar-only sidecar bound to immutable Board bytes."""
     full_path = (
         tmp_path
         / "results"
@@ -215,30 +215,23 @@ def _write_bound_board_compact(tmp_path: Path, fixture: dict) -> Path:
     return _write_json_packet(
         tmp_path / "results" / "execution_board" / "latest-compact.json",
         {
-            "schema": "compact_execution_board_review_v1",
-            "kind": "execution_board_review",
+            "schema": "autonomous_loss_board_sidecar_v1",
             "generated_at": NOW.isoformat(),
+            "raw_packet_path": str(full_path.relative_to(tmp_path)),
+            "raw_packet_sha256": hashlib.sha256(full_bytes).hexdigest(),
+            "symbol": fixture["decision"].symbol,
+            "decision": fixture["decision"].decision,
+            "decision_id": fixture["decision"].decision_id,
+            "ledger_packet_id": fixture["board"]["autonomous_loss_decision"]["ledger_packet_id"],
+            "supervisor_decision_id": fixture["decision"].supervisor_decision_id,
+            "source_revision": fixture["decision"].source_revision,
+            "trade_decision_resolved": True,
+            "exit_allowed": fixture["decision"].exit_allowed,
             "analysis_only": True,
             "can_submit_orders": False,
             "execution_authority": "none",
-            "recommendation": "record_trade_decision",
-            "raw_packet_path": str(full_path.relative_to(tmp_path)),
-            "raw_packet_sha256": hashlib.sha256(full_bytes).hexdigest(),
-            "autonomous_loss_decision": {
-                "decision_id": fixture["decision"].decision_id,
-                "ledger_packet_id": fixture["board"]["autonomous_loss_decision"]["ledger_packet_id"],
-                "symbol": fixture["decision"].symbol,
-                "decision": fixture["decision"].decision,
-                "trade_decision_resolved": True,
-                "exit_allowed": fixture["decision"].exit_allowed,
-            },
-            "loss_review_evidence": {
-                "symbol": fixture["decision"].symbol,
-                "review_allowed": True,
-                "remaining_blocker_count": 0,
-                "resolved_blocker_count": 0,
-                "next_action": "record_trade_decision",
-            },
+            "accepted_source_count": 0,
+            "accepted_sources_sha256": hashlib.sha256(b"[]").hexdigest(),
         },
     )
 
@@ -4679,6 +4672,47 @@ def test_scheduled_compact_board_and_hourly_sidecars_bind_exact_raw_provenance(
             now=NOW,
         )
         assert signal["classification"] == "resolved_no_action"
+
+
+@pytest.mark.parametrize(
+    ("label", "reason"),
+    [
+        ("policy_rule_conflict", "approval_conflict"),
+        ("promotion_state", "policy_conflict"),
+        ("broker_reconciliation", "reconciliation_mismatch"),
+    ],
+)
+def test_board_origin_blocks_recovery_even_when_its_decision_is_malformed(
+    tmp_path: Path, label: str, reason: str
+) -> None:
+    """A caller cannot turn a malformed Board packet into repair authority."""
+    board_path = _write_json_packet(
+        tmp_path / "results" / "execution_board" / "latest.json",
+        {
+            "kind": "execution_board_review",
+            "schema_version": 1,
+            "generated_at": NOW.isoformat(),
+            "analysis_only": True,
+            "can_submit_orders": False,
+            "execution_authority": "none",
+            "autonomous_loss_decision": "malformed-on-purpose",
+        },
+    )
+
+    request = build_production_recovery_request(
+        {
+            "label": label,
+            "reason": reason,
+            "path": str(board_path.relative_to(tmp_path)),
+        },
+        repo_root=tmp_path,
+    )
+
+    assert request == {
+        "ready": False,
+        "outcome": "not_recovery_work",
+        "detail": "BOARD packet provenance cannot create an integrity recovery run",
+    }
 
 
 @pytest.mark.parametrize(

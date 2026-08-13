@@ -35,6 +35,7 @@ from tradingagents.orchestration.recovery import (
     publish_rearm_receipt,
     rearm_after_verified_recovery,
 )
+from tradingagents.orchestration.work_packets import build_packet_id
 from tradingagents.policy.decision_authority import resolve_exit_authority
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.live_control import (
@@ -724,7 +725,6 @@ def _is_execution_board_packet(
         or latest_packet.get("analysis_only") is not True
         or latest_packet.get("can_submit_orders") is not False
         or latest_packet.get("execution_authority") != "none"
-        or not isinstance(latest_packet.get("autonomous_loss_decision"), Mapping)
     ):
         return False
     canonical = {
@@ -761,7 +761,6 @@ def _is_execution_board_packet(
         and packet.get("analysis_only") is True
         and packet.get("can_submit_orders") is False
         and packet.get("execution_authority") == "none"
-        and isinstance(packet.get("autonomous_loss_decision"), Mapping)
     ):
         return True
     return _is_canonical_board_compact_packet(
@@ -798,12 +797,6 @@ def _is_canonical_board_raw_packet(
         and packet.get("analysis_only") is True
         and packet.get("can_submit_orders") is False
         and packet.get("execution_authority") == "none"
-        and isinstance(packet.get("autonomous_loss_decision"), Mapping)
-        and (
-            authenticated.get("decision_id") is None
-            or packet["autonomous_loss_decision"].get("decision_id")
-            == authenticated.get("decision_id")
-        )
     )
 
 
@@ -824,24 +817,17 @@ def _is_canonical_board_compact_packet(
         return False
     if captured_path.name != "latest-compact.json" and not captured_path.name.endswith(".compact.json"):
         return False
-    if (
-        compact.get("schema") != "compact_execution_board_review_v1"
-        or compact.get("kind") != "execution_board_review"
-        or compact.get("analysis_only") is not True
-        or compact.get("can_submit_orders") is not False
-        or compact.get("execution_authority") != "none"
-        or not isinstance(compact.get("raw_packet_path"), str)
-        or not isinstance(compact.get("raw_packet_sha256"), str)
-        or _SHA256_HEX.fullmatch(str(compact.get("raw_packet_sha256"))) is None
-    ):
+    raw_path = _validated_autonomous_loss_board_sidecar_raw_path(
+        compact, root=root
+    )
+    if raw_path is None:
         return False
-    raw = _capture_contained_json_file(str(compact["raw_packet_path"]), root=root)
+    raw = _capture_contained_json_file(raw_path, root=root)
     if raw is None:
         return False
     raw_path, raw_bytes, raw_packet = raw
     return (
-        hashlib.sha256(raw_bytes).hexdigest() == compact["raw_packet_sha256"]
-        and _is_canonical_board_raw_packet(
+        _is_canonical_board_raw_packet(
             captured_path=raw_path,
             captured_bytes=raw_bytes,
             packet=raw_packet,
@@ -849,6 +835,74 @@ def _is_canonical_board_compact_packet(
             root=root,
         )
     )
+
+
+def _validated_autonomous_loss_board_sidecar_raw_path(
+    compact: Mapping[str, Any], *, root: Path
+) -> Path | None:
+    """Validate the scalar-only Board sidecar before following its raw pointer."""
+    required = {
+        "schema",
+        "generated_at",
+        "raw_packet_path",
+        "raw_packet_sha256",
+        "symbol",
+        "decision",
+        "decision_id",
+        "ledger_packet_id",
+        "supervisor_decision_id",
+        "source_revision",
+        "trade_decision_resolved",
+        "exit_allowed",
+        "analysis_only",
+        "execution_authority",
+        "can_submit_orders",
+        "accepted_source_count",
+        "accepted_sources_sha256",
+    }
+    if set(compact) != required:
+        return None
+    symbol = compact.get("symbol")
+    decision = compact.get("decision")
+    decision_id = compact.get("decision_id")
+    ledger_packet_id = compact.get("ledger_packet_id")
+    if (
+        compact.get("schema") != "autonomous_loss_board_sidecar_v1"
+        or _parse_aware_recovery_time(compact.get("generated_at")) is None
+        or not isinstance(symbol, str)
+        or re.fullmatch(r"[A-Z][A-Z0-9.]{0,15}", symbol) is None
+        or decision not in {"HOLD", "SELL"}
+        or not isinstance(decision_id, str)
+        or _SHA256_HEX.fullmatch(decision_id) is None
+        or ledger_packet_id != build_packet_id(decision_id, "portfolio_decision")
+        or not isinstance(compact.get("supervisor_decision_id"), str)
+        or not compact["supervisor_decision_id"].strip()
+        or not isinstance(compact.get("source_revision"), str)
+        or not compact["source_revision"].strip()
+        or compact.get("trade_decision_resolved") is not True
+        or not isinstance(compact.get("exit_allowed"), bool)
+        or (decision == "HOLD" and compact["exit_allowed"] is not False)
+        or (decision == "SELL" and compact["exit_allowed"] is not True)
+        or compact.get("analysis_only") is not True
+        or compact.get("execution_authority") != "none"
+        or compact.get("can_submit_orders") is not False
+        or isinstance(compact.get("accepted_source_count"), bool)
+        or not isinstance(compact.get("accepted_source_count"), int)
+        or compact["accepted_source_count"] < 0
+        or not isinstance(compact.get("accepted_sources_sha256"), str)
+        or _SHA256_HEX.fullmatch(compact["accepted_sources_sha256"]) is None
+        or not isinstance(compact.get("raw_packet_path"), str)
+        or not isinstance(compact.get("raw_packet_sha256"), str)
+        or _SHA256_HEX.fullmatch(compact["raw_packet_sha256"]) is None
+    ):
+        return None
+    raw_path = _safe_lexical_file_path(compact["raw_packet_path"], root=root)
+    if raw_path is None or _BOARD_TIMESTAMPED_PACKET.fullmatch(raw_path.name) is None:
+        return None
+    raw = _capture_contained_json_file(raw_path, root=root)
+    if raw is None or hashlib.sha256(raw[1]).hexdigest() != compact["raw_packet_sha256"]:
+        return None
+    return raw_path
 
 
 def _contained_canonical_path(root: Path, relative: Path) -> Path | None:
@@ -881,8 +935,8 @@ def _compact_trigger_raw_path(
         compact_root = _contained_canonical_path(
             root, DEFAULT_BOARD_EVIDENCE_ROOT / "execution_board"
         )
-        expected_schema = "compact_execution_board_review_v1"
-        expected_kind = "execution_board_review"
+        expected_schema = "autonomous_loss_board_sidecar_v1"
+        expected_kind = None
     else:
         return None
     if compact_root is None:
@@ -891,6 +945,8 @@ def _compact_trigger_raw_path(
         captured_path.relative_to(compact_root)
     except ValueError:
         return None
+    if label == "execution_board_review":
+        return _validated_autonomous_loss_board_sidecar_raw_path(compact, root=root)
     if (
         captured_path.name != "latest-compact.json"
         and not captured_path.name.endswith(".compact.json")
@@ -911,18 +967,6 @@ def _compact_trigger_raw_path(
     raw_path = _safe_lexical_file_path(raw_value, root=root)
     if raw_path is None:
         return None
-    if label == "execution_board_review":
-        raw_sha256 = compact.get("raw_packet_sha256")
-        if not isinstance(raw_sha256, str) or _SHA256_HEX.fullmatch(raw_sha256) is None:
-            return None
-        # A BOARD compact pointer must name an immutable timestamped full
-        # packet; the mutable latest alias is authenticated separately but is
-        # never the sidecar's raw binding.
-        if _BOARD_TIMESTAMPED_PACKET.fullmatch(raw_path.name) is None:
-            return None
-        raw_captured = _capture_contained_json_file(raw_path, root=root)
-        if raw_captured is None or hashlib.sha256(raw_captured[1]).hexdigest() != raw_sha256:
-            return None
     results_root = _contained_canonical_path(root, DEFAULT_BOARD_EVIDENCE_ROOT)
     if results_root is None:
         return None

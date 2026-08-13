@@ -374,6 +374,47 @@ def summarize_autonomous_role_contract() -> dict[str, Any]:
         ]
         if invalid_assignments:
             issues.append("automation_assignments_malformed")
+        constraints = roles_document.get("automation_constraints", {})
+        if not isinstance(constraints, dict):
+            issues.append("automation_constraints_malformed")
+        else:
+            malformed_constraints = False
+            for automation, constraint in constraints.items():
+                owner = automations.get(automation)
+                owner_record = roles.get(owner) if isinstance(owner, str) else None
+                allowed = (
+                    constraint.get("allowed_actions")
+                    if isinstance(constraint, dict)
+                    else None
+                )
+                required_outputs = (
+                    constraint.get("required_outputs")
+                    if isinstance(constraint, dict)
+                    else None
+                )
+                forbidden = (
+                    constraint.get("forbidden_effects")
+                    if isinstance(constraint, dict)
+                    else None
+                )
+                if (
+                    not isinstance(automation, str)
+                    or automation not in automations
+                    or not isinstance(owner_record, dict)
+                    or not isinstance(allowed, list)
+                    or not allowed
+                    or not all(isinstance(action, str) and action for action in allowed)
+                    or not set(allowed).issubset(set(owner_record.get("allowed_actions") or []))
+                    or not isinstance(required_outputs, list)
+                    or not all(isinstance(output, str) and output for output in required_outputs)
+                    or not isinstance(forbidden, list)
+                    or not all(isinstance(effect, str) and effect for effect in forbidden)
+                    or set(allowed).intersection(forbidden)
+                ):
+                    malformed_constraints = True
+                    break
+            if malformed_constraints:
+                issues.append("automation_constraints_malformed")
     if not isinstance(firm_document, dict):
         issues.append("autonomous_firm_unreadable")
     else:
@@ -440,7 +481,6 @@ def compact_autonomous_loss_decision(value: Any) -> dict[str, Any]:
     symbol = value.get("symbol")
     decision_id = value.get("decision_id")
     ledger_packet_id = value.get("ledger_packet_id")
-    decision_evidence = value.get("decision_evidence")
     if (
         decision not in {"HOLD", "SELL"}
         or not isinstance(symbol, str)
@@ -454,12 +494,6 @@ def compact_autonomous_loss_decision(value: Any) -> dict[str, Any]:
         or value.get("analysis_only") is not True
         or value.get("execution_authority") != "none"
         or value.get("can_submit_orders") is not False
-        or not isinstance(decision_evidence, dict)
-        or not isinstance(decision_evidence.get("path"), str)
-        or not isinstance(decision_evidence.get("sha256"), str)
-        or _SHA256_HEX.fullmatch(decision_evidence["sha256"]) is None
-        or not isinstance(decision_evidence.get("size_bytes"), int)
-        or decision_evidence["size_bytes"] < 1
         or (decision == "HOLD" and value["exit_allowed"] is not False)
         or (decision == "SELL" and value["exit_allowed"] is not True)
     ):
