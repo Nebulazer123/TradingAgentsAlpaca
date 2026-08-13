@@ -34,9 +34,14 @@ runner = CliRunner()
 
 
 def _strict_loss_news_packet(source_name: str, *, as_of: str, item: dict):
+    evidence_type = {
+        "alpaca_news": "market_news",
+        "finnhub": "company_news",
+        "fmp": "stock_news",
+    }[source_name]
     return evidence_packet(
         source_name=source_name,
-        evidence_type="market_news",
+        evidence_type=evidence_type,
         subject="ORCL",
         symbol="ORCL",
         source_ref=f"https://example.test/{source_name}/ORCL",

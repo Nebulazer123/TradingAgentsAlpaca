@@ -1268,7 +1268,8 @@ def research_loss_review_evidence(
             raw_clock = {"invalid_clock_response": type(raw_response).__name__}
     except Exception as exc:  # noqa: BLE001 - a clock read failure must HOLD, never abort research.
         raw_clock = {"clock_error": type(exc).__name__}
-    captured_at = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
+    refresh_now = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
+    captured_at = refresh_now.isoformat(timespec="seconds")
     raw_timestamp = raw_clock.get("timestamp") if isinstance(raw_clock, Mapping) else None
     try:
         parsed_timestamp = datetime.datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
@@ -1302,6 +1303,7 @@ def research_loss_review_evidence(
             if source_quality_ordering and source_quality_review_path.exists()
             else None
         ),
+        now=refresh_now,
     )
     source_packet_paths = {
         packet.packet_id: write_research_packet(packet, source_output_dir)
@@ -1320,6 +1322,7 @@ def research_loss_review_evidence(
         source_packet_paths=source_packet_paths,
         decision_evidence_root=CANONICAL_BOARD_EVIDENCE_ROOT,
         market_clock=market_clock,
+        now=refresh_now,
     )
     packet_path = write_research_packet(packet, output_dir)
     payload = packet.model_dump()

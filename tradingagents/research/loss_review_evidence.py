@@ -358,6 +358,7 @@ def _accepted_source_descriptors(
     *,
     source_packet_paths: Mapping[str, str | Path] | None,
     evidence_root: str | Path | None,
+    now: datetime | None,
 ) -> list[dict[str, Any]]:
     """Bind written provider packets exactly for the downstream BOARD recorder.
 
@@ -366,6 +367,9 @@ def _accepted_source_descriptors(
     HOLD rather than allowing a source's self-description to clear a blocker.
     """
     if not source_packet_paths or evidence_root is None:
+        return []
+    run_now = now or datetime.now(tz=UTC)
+    if run_now.tzinfo is None or run_now.utcoffset() is None:
         return []
     root = _safe_root(evidence_root)
     result: list[dict[str, Any]] = []
@@ -417,7 +421,9 @@ def _accepted_source_descriptors(
             # Quote components are collected first and normalized once below;
             # each component is useless on its own for autonomous authority.
             continue
-        normalized = _normalize_provider_packet(packet=packet, stored=stored, symbol=packet.symbol)
+        normalized = _normalize_provider_packet(
+            packet=packet, stored=stored, symbol=packet.symbol, now=run_now
+        )
         if normalized is None:
             continue
         normalized_type, normalized_payload, normalized_as_of = normalized
@@ -696,8 +702,12 @@ def _canonical_value_hash(value: Any) -> str:
 
 
 def _normalize_provider_packet(
-    *, packet: SourceEvidencePacket, stored: Mapping[str, Any], symbol: str
-) -> tuple[str, dict[str, Any]] | None:
+    *,
+    packet: SourceEvidencePacket,
+    stored: Mapping[str, Any],
+    symbol: str,
+    now: datetime | None = None,
+) -> tuple[str, dict[str, Any], str] | None:
     """Admit only semantically complete provider material into strict BOARD types.
 
     Raw provider packet names are never authority.  This intentionally accepts
@@ -710,16 +720,22 @@ def _normalize_provider_packet(
     as_of = canonical_provider_timestamp(packet.as_of or packet.generated_at)
     if as_of is None:
         return None
-    if packet.evidence_type == "market_news":
+    if (
+        (packet.source_name.lower(), packet.evidence_type)
+        in {
+            ("alpaca_news", "market_news"),
+            ("finnhub", "company_news"),
+            ("fmp", "stock_news"),
+        }
+    ):
         event = strict_loss_review_news_event(
             source_name=packet.source_name,
+            evidence_type=packet.evidence_type,
             payload=raw_payload,
             as_of=packet.as_of or packet.generated_at,
             quality=packet.quality,
             freshness=packet.freshness,
-            # This function is also used in deterministic fixture assembly;
-            # the source observation itself anchors its bounded event window.
-            now=_parse_timestamp(as_of),
+            now=now,
         )
         if event is None:
             return None
@@ -836,6 +852,7 @@ def _adverse_news_event(
     """
     event = strict_loss_review_news_event(
         source_name=source_name,
+        evidence_type="market_news" if source_name.lower() == "alpaca_news" else "company_news",
         payload=payload,
         as_of=as_of,
         quality="medium",
@@ -1500,6 +1517,7 @@ def build_loss_review_evidence_packet(
     source_packet_paths: Mapping[str, str | Path] | None = None,
     decision_evidence_root: str | Path | None = None,
     market_clock: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> SourceEvidencePacket:
     """Build an advisory packet for autonomous portfolio BOARD loss-review analysis.
 
@@ -1516,6 +1534,7 @@ def build_loss_review_evidence_packet(
         provider_result,
         source_packet_paths=source_packet_paths,
         evidence_root=decision_evidence_root,
+        now=now,
     )
     blockers = _strings(review.get("blockers")) or _strings(review.get("blocked_reasons"))
     coverage_by_need = _coverage_by_need(provider_result)

@@ -90,6 +90,11 @@ DEFAULT_TICKER_EVIDENCE_NEEDS = (
 )
 NO_STALE_CACHE_SOURCES = {"broker_snapshot", "crawlee", "twitter", "yfinance_short_interest"}
 _LOSS_REVIEW_EVENT_SOURCES = frozenset({"alpaca_news", "finnhub", "fmp"})
+_LOSS_REVIEW_NATIVE_NEWS_TYPES = {
+    "alpaca_news": "market_news",
+    "finnhub": "company_news",
+    "fmp": "stock_news",
+}
 _LOSS_REVIEW_EVENT_MAX_AGE = datetime.timedelta(minutes=15)
 _LOSS_REVIEW_POSITIVE_WORDS = frozenset(
     {"raise", "raises", "raised", "beat", "beats", "growth", "wins", "won", "approval", "approved", "partnership", "expands", "expansion"}
@@ -209,6 +214,7 @@ def _loss_review_news_items(payload: Mapping[str, Any]) -> Sequence[Mapping[str,
 def strict_loss_review_news_event(
     *,
     source_name: str,
+    evidence_type: str,
     payload: Mapping[str, Any],
     as_of: Any,
     quality: str,
@@ -223,7 +229,11 @@ def strict_loss_review_news_event(
     without an explicit adverse magnitude.
     """
     source = str(source_name).strip().lower()
-    if source not in _LOSS_REVIEW_EVENT_SOURCES or quality not in {"high", "medium"}:
+    if (
+        source not in _LOSS_REVIEW_EVENT_SOURCES
+        or evidence_type != _LOSS_REVIEW_NATIVE_NEWS_TYPES.get(source)
+        or quality not in {"high", "medium"}
+    ):
         return None
     info = freshness if isinstance(freshness, Mapping) else {}
     cache = info.get("cache")
@@ -302,6 +312,7 @@ def loss_review_news_packet_is_admissible(
 ) -> bool:
     return strict_loss_review_news_event(
         source_name=packet.source_name,
+        evidence_type=packet.evidence_type,
         payload=packet.payload,
         as_of=packet.as_of,
         quality=packet.quality,

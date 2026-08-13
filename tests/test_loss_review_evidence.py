@@ -84,7 +84,8 @@ def test_loss_normalizer_publishes_canonical_vendor_event_times_but_keeps_raw_pa
         quality="medium", as_of="2026-08-13T14:55:00.123456Z", tool_route="alpaca_news",
     )
     normalized = loss_evidence._normalize_provider_packet(
-        packet=alpaca, stored=alpaca.model_dump(), symbol="ORCL"
+        packet=alpaca, stored=alpaca.model_dump(), symbol="ORCL",
+        now=datetime.fromisoformat("2026-08-13T14:55:00+00:00"),
     )
     assert normalized is not None
     kind, payload, as_of = normalized
@@ -218,7 +219,7 @@ def _configured_shape_provider_result(symbol: str = "ORCL") -> TickerProviderRes
                 }}}, quality="high", as_of="2026-08-13T14:55:00+00:00", tool_route="alpaca_market_data_read_only",
             ),
             evidence_packet(
-                source_name="finnhub", evidence_type="market_news", subject=symbol, symbol=symbol,
+                source_name="finnhub", evidence_type="company_news", subject=symbol, symbol=symbol,
                 source_ref="https://finnhub.io/api/v1/company-news",
                 payload={"data": [{"category": "company news", "datetime": 1786632840, "headline": "Oracle cuts fiscal guidance after material contract loss", "summary": "The company lowered fiscal revenue guidance by 8% after losing a material customer contract.", "url": "https://issuer.example/adverse"}]},
                 quality="medium", as_of="2026-08-13T14:55:00+00:00", tool_route="finnhub_api",
@@ -338,6 +339,7 @@ def test_configured_provider_shapes_normalize_to_complete_adverse_loss_evidence(
     packet = build_loss_review_evidence_packet(
         hourly_packet_path=tmp_path / "hourly.json", hourly_packet=hourly,
         provider_result=provider, source_packet_paths=source_paths, decision_evidence_root=tmp_path,
+        now=datetime.fromisoformat("2026-08-13T14:55:00+00:00"),
     )
 
     assert {item["evidence_type"] for item in packet.payload["accepted_sources"]} == {"market_context", "company_news", "earnings_guidance_filing"}
@@ -347,6 +349,61 @@ def test_configured_provider_shapes_normalize_to_complete_adverse_loss_evidence(
     news = next(item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "company_news")
     normalized = json.loads((tmp_path / news["path"]).read_text(encoding="utf-8"))
     assert normalized["payload"]["event_category"] == "guidance_cut"
+
+
+def test_native_news_types_share_one_real_run_clock_and_stale_diagnostics_stay_non_authorizing(tmp_path):
+    """Only the current native company-news packet can reach authority.
+
+    The stale packet remains a normal research diagnostic/source id; it is not
+    silently re-qualified by using its own old timestamp as the clock.
+    """
+    run_now = datetime.fromisoformat("2026-08-13T14:55:00+00:00")
+    symbol = "ORCL"
+    hourly = _hourly_packet(symbol)
+    hourly["evidence"]["loss_exit_review"].update(
+        {"decision_id": "native-fresh-only", "current_price": "91", "average_entry_price": "100", "blockers": [], "blocked_reasons": []}
+    )
+    hourly_path = tmp_path / "hourly.json"
+    hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
+
+    def quote(name, current, previous, observed="2026-08-13T14:55:00+00:00"):
+        return evidence_packet(source_name="finnhub", evidence_type="quote_price_context", subject=name, symbol=name, source_ref=f"https://test/{name}", payload={"c": current, "pc": previous}, quality="high", as_of=observed, tool_route="test")
+
+    def news(observed, published, label):
+        return evidence_packet(
+            source_name="finnhub", evidence_type="company_news", subject=symbol, symbol=symbol,
+            source_ref=f"https://test/news/{label}", quality="medium", as_of=observed,
+            payload={"data": [{"datetime": published, "headline": "Oracle cuts revenue guidance", "summary": "Revenue guidance cut by 8%.", "url": f"https://issuer.test/{label}"}]}, tool_route="finnhub_api",
+        )
+
+    stale = news("2026-08-13T14:10:00+00:00", 1786630200, "stale")
+    fresh = news("2026-08-13T14:55:00+00:00", 1786632840, "fresh")
+    transcript = evidence_packet(
+        source_name="fmp", evidence_type="earnings_transcripts", subject=symbol, symbol=symbol,
+        source_ref="https://test/transcript", quality="high", as_of="2026-08-13T14:55:00+00:00",
+        payload={"symbol": symbol, "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, tool_route="fmp_api",
+    )
+    provider = TickerProviderResearchResult(symbol, [
+        quote("ORCL", 91, 100), quote("SPY", 650, 648), quote("QQQ", 580, 578), quote("XLK", 260, 259), stale, fresh, transcript,
+    ])
+    paths = {item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets}
+    packet = build_loss_review_evidence_packet(
+        hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider,
+        source_packet_paths=paths, decision_evidence_root=tmp_path,
+        market_clock=_clock("2026-08-13T14:55:00+00:00"), now=run_now,
+    )
+    company_sources = [item for item in packet.payload["accepted_sources"] if item["evidence_type"] == "company_news"]
+    assert len(company_sources) == 1
+    assert stale.packet_id not in company_sources[0]["packet_id"]
+    assert fresh.packet_id in company_sources[0]["packet_id"]
+    assert stale.packet_id in packet.payload["source_packet_ids"]
+    loss_path = write_research_packet(packet, tmp_path / "loss")
+    decision = record_autonomous_loss_board_decision(
+        supervisor_packet_path=hourly_path, loss_evidence_packet_path=loss_path,
+        source_revision="4" * 40, ledger_root=tmp_path / "ledger", evidence_root=tmp_path,
+        now=run_now,
+    ).decision
+    assert decision.decision == "SELL", decision.evidence_gaps
 
 
 def test_real_configured_individual_quote_route_builds_bound_current_review_and_sell(tmp_path):
@@ -391,7 +448,7 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
             quote("QQQ", 580.0, 578.0, observed="2026-08-13T14:54:20+00:00"),
             quote("XLK", 260.0, 259.0, observed="2026-08-13T14:53:10+00:00"),
             evidence_packet(
-                source_name="finnhub", evidence_type="market_news", subject="ORCL", symbol="ORCL",
+                    source_name="finnhub", evidence_type="company_news", subject="ORCL", symbol="ORCL",
                 source_ref="https://finnhub.test/news/ORCL",
                 payload={"data": [{"category": "company", "datetime": 1786632840,
                                     "headline": "Oracle cuts revenue guidance", "summary": "Lowered revenue guidance by 8%.",
@@ -411,8 +468,8 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
     }
     packet = build_loss_review_evidence_packet(
         hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider,
-        source_packet_paths=source_paths, decision_evidence_root=tmp_path,
-        market_clock=_clock(now),
+            source_packet_paths=source_paths, decision_evidence_root=tmp_path,
+            market_clock=_clock(now), now=datetime.fromisoformat(now),
     )
     loss_path = write_research_packet(packet, tmp_path / "loss")
     current = packet.payload["current_loss_review"]
@@ -446,7 +503,7 @@ def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_pa
     provider = TickerProviderResearchResult("ORCL", [
         quote("ORCL", 91, 100), quote("SPY", 650, 648), quote("QQQ", 580, 578), quote("XLK", 260, 259),
         evidence_packet(
-            source_name="finnhub", evidence_type="market_news", subject="ORCL",
+                source_name="finnhub", evidence_type="company_news", subject="ORCL",
             symbol="ORCL", source_ref="https://test/news",
             payload={"data": [{"datetime": 1786632840, "headline": "Oracle cuts guidance", "summary": "Lowered guidance by 8%", "url": "https://issuer.test/x"}]},
             quality="medium", as_of=now, tool_route="test",
@@ -454,7 +511,7 @@ def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_pa
         evidence_packet(source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL", source_ref="https://test/transcript", payload={"symbol": "ORCL", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, quality="high", as_of=now, tool_route="test"),
     ])
     paths = {item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets}
-    closed = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=False))
+    closed = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=False), now=datetime.fromisoformat(now))
     closed_path = write_research_packet(closed, tmp_path / "loss-closed")
     assert closed.payload["current_loss_review"]["market_session"] == "closed"
     assert closed.payload["current_loss_review"]["allowed"] is True
@@ -488,7 +545,7 @@ def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_pa
     tampered_decision = record_autonomous_loss_board_decision(supervisor_packet_path=hourly_path, loss_evidence_packet_path=closed_path, source_revision="3" * 40, ledger_root=tmp_path / "ledger-tampered", evidence_root=tmp_path, now=__import__("datetime").datetime.fromisoformat(now)).decision
     assert tampered_decision.decision == "HOLD"
 
-    open_packet = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=True))
+    open_packet = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=True), now=datetime.fromisoformat(now))
     assert open_packet.payload["current_loss_review"]["market_session"] == "regular"
     assert open_packet.payload["current_loss_review"]["allowed"] is True
     assert open_packet.payload["current_loss_review"]["trade_decision_allowed"] is True
