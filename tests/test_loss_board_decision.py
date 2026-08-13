@@ -49,7 +49,7 @@ def _supervisor(*, symbol: str = "ORCL", **review_overrides: Any) -> dict[str, A
         "decision_id": "supervisor-loss-review-1",
         "allowed": True,
         "allowed_exit_reason": "thesis_invalidated",
-        "allowed_exit_reason_source": "earnings_guidance_packet",
+        "allowed_exit_reason_source": None,
         "current_thesis_status": "Company guidance invalidated the original thesis.",
         "why_hold_is_worse_than_sell": "The catalyst broke and recovery odds are worse than cash.",
         "confidence": "0.82",
@@ -61,11 +61,17 @@ def _supervisor(*, symbol: str = "ORCL", **review_overrides: Any) -> dict[str, A
         "relative_performance_vs_SPY": "-0.031",
         "relative_performance_vs_QQQ": "-0.033",
         "sector_or_peer_context": {
-            "sector": "Enterprise software peers remain stable while ORCL declines.",
-            "relative_performance": "0.028",
+            "sector": "software",
+            "relative_performance": "-0.028",
         },
         "company_specific_negative_news_check": "Guidance cut confirmed.",
         "earnings_guidance_or_filing_check": "Earnings guidance cut broke the thesis.",
+        "company_news_event_category": "guidance_cut",
+        "company_news_direction": "adverse",
+        "company_news_impact_fraction": "-0.08",
+        "filing_event_category": "guidance_cut",
+        "filing_direction": "adverse",
+        "filing_change_fraction": "-0.12",
         "why_this_is_not_broad_market_red_day_noise": "SPY and QQQ are stable.",
     }
     review.update(review_overrides)
@@ -84,7 +90,7 @@ def _loss_evidence(*, symbol: str = "ORCL", **payload_overrides: Any) -> dict[st
             "current_thesis_status_candidate": "Company guidance invalidated the original thesis.",
             "loss_exit_candidate": {
                 "allowed_exit_reason_candidate": "thesis_invalidated",
-                "allowed_exit_reason_source": "earnings_guidance_packet",
+                "allowed_exit_reason_source": None,
                 "confidence": "0.82",
                 "reason_summary": "The catalyst broke and recovery odds are worse than cash.",
                 "approval_effect": "board_review_input_not_loss_exit_approval",
@@ -134,18 +140,18 @@ def _paths(tmp_path: Path, *, supervisor: dict[str, Any], loss: dict[str, Any]) 
                 {
                     "symbol": payload["symbol"],
                     "as_of": source["as_of"],
-                    "sentiment": "negative",
-                    "thesis_break": True,
-                    "headline": "Company guidance was reduced after a material customer demand decline.",
+                    "event_category": "guidance_cut",
+                    "direction": "adverse",
+                    "impact_fraction": "-0.08",
                 }
                 if source["evidence_type"] == "company_news"
                 else (
                     {
                         "symbol": payload["symbol"],
                         "as_of": source["as_of"],
-                        "guidance_or_earnings": "adverse",
-                        "adverse_fact": True,
-                        "fact": "Current earnings guidance reduced expected revenue after a material demand deterioration.",
+                        "event_category": "guidance_cut",
+                        "direction": "adverse",
+                        "change_fraction": "-0.12",
                     }
                     if source["evidence_type"] == "earnings_guidance_filing"
                     else {
@@ -153,7 +159,7 @@ def _paths(tmp_path: Path, *, supervisor: dict[str, Any], loss: dict[str, Any]) 
                         "as_of": source["as_of"],
                         "spy": {"symbol": "SPY", "value": "0.1", "as_of": source["as_of"]},
                         "qqq": {"symbol": "QQQ", "value": "0.2", "as_of": source["as_of"]},
-                        "sector_relative": {"symbol": payload["symbol"], "value": "0.028", "as_of": source["as_of"]},
+                        "sector_relative": {"symbol": payload["symbol"], "value": "-0.028", "as_of": source["as_of"]},
                     }
                 )
             ),
@@ -173,6 +179,20 @@ def _paths(tmp_path: Path, *, supervisor: dict[str, Any], loss: dict[str, Any]) 
             }
         )
     payload["accepted_sources"] = descriptors
+    if len(descriptors) >= 3:
+        filing = descriptors[2]
+        reference = {
+            "packet_id": filing["packet_id"],
+            "path": filing["path"],
+            "sha256": filing["sha256"],
+        }
+        review = supervisor["evidence"]["loss_exit_review"]
+        candidate = payload["advisory_analysis"]["loss_exit_candidate"]
+        if review["allowed_exit_reason_source"] is None:
+            review["allowed_exit_reason_source"] = reference
+        if candidate.get("allowed_exit_reason_source") is None and "allowed_exit_reason_source" in candidate:
+            candidate["allowed_exit_reason_source"] = reference
+    _write_json(supervisor_path, supervisor)
     return (
         supervisor_path,
         _write_json(evidence_root / "loss.json", loss),
@@ -253,8 +273,8 @@ def test_non_board_canonical_reason_never_becomes_autonomous_sell(tmp_path, reas
         ({"symbol": "TSM"}, {}, {}),
         ({"evidence_generated_at": "2026-08-13T14:30:00+00:00"}, {}, {}),
         ({"broad_market_context": {"SPY": "0.1", "QQQ": "0.2"}, "sector_or_peer_context": ""}, {}, {}),
-        ({"company_specific_negative_news_check": ""}, {}, {}),
-        ({"earnings_guidance_or_filing_check": "SEC submissions index"}, {}, {}),
+        ({"company_news_direction": "neutral"}, {}, {}),
+        ({"filing_event_category": "unknown_event"}, {}, {}),
         ({}, {"accepted_sources": [_source(source_name="company_news", evidence_type="company_news", as_of="2026-08-13T14:30:00+00:00")]}, {}),
         ({}, {"accepted_sources": [_source(source_name="sec", evidence_type="submissions_index")]}, {}),
         ({}, {"accepted_sources": [_source(source_name="transcript_gap", evidence_type="earnings_transcripts_gap")]}, {}),
@@ -382,7 +402,7 @@ def test_source_packet_mutation_and_url_descriptor_fail_verification_or_sell(tmp
     ("review_override", "payload_override"),
     [
         ({"allowed_exit_reason": "sell_now"}, {}),
-        ({"company_specific_negative_news_check": "News update available."}, {}),
+        ({"company_news_event_category": "unknown_event"}, {}),
         ({}, {"advisory_analysis": {"current_thesis_status_candidate": "different", "loss_exit_candidate": {}}}),
     ],
 )
@@ -430,9 +450,10 @@ def test_unsafe_publication_collision_and_crash_never_append_ledger(tmp_path, mo
 @pytest.mark.parametrize(
     "source_payload",
     [
-        {"headline": "Company guidance improved and demand remains favorable.", "sentiment": "favorable"},
-        {"headline": "Neutral company update with no thesis impact today.", "sentiment": "neutral"},
-        {"headline": "Company event", "sentiment": "negative"},
+        {"symbol": "ORCL", "as_of": "2026-08-13T14:55:00+00:00", "event_category": "guidance_cut", "direction": "adverse", "impact_fraction": "0.08"},
+        {"symbol": "ORCL", "as_of": "2026-08-13T14:55:00+00:00", "event_category": "guidance_raised", "direction": "adverse", "impact_fraction": "-0.08"},
+        {"symbol": "ORCL", "as_of": "2026-08-13T14:55:00+00:00", "event_category": "unknown_event", "direction": "adverse", "impact_fraction": "-0.08"},
+        {"symbol": "ORCL", "as_of": "2026-08-13T14:55:00+00:00", "event_category": "guidance_cut", "direction": "adverse", "impact_fraction": "-0.08", "headline": "strong beat"},
     ],
 )
 def test_company_news_source_must_prove_current_adverse_thesis_break(tmp_path, source_payload):
@@ -456,7 +477,13 @@ def test_market_and_filing_sources_require_structured_current_adverse_facts(tmp_
     supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
     market_path = evidence_root / "sources" / "0.json"
     market = json.loads(market_path.read_text(encoding="utf-8"))
-    market["payload"] = {"summary": "SPY QQQ and sector labels are available."}
+    market["payload"] = {
+        "symbol": "ORCL",
+        "as_of": "2026-08-13T14:55:00+00:00",
+        "spy": {"symbol": "SPY", "value": "0.1", "as_of": "2026-08-13T14:55:00+00:00"},
+        "qqq": {"symbol": "QQQ", "value": "0.2", "as_of": "2026-08-13T14:55:00+00:00"},
+        "sector_relative": {"symbol": "ORCL", "value": "0.028", "as_of": "2026-08-13T14:55:00+00:00"},
+    }
     _rewrite_source_packet(loss_path, market_path, market)
     recorded = record_autonomous_loss_board_decision(
         supervisor_packet_path=supervisor_path,
@@ -471,7 +498,7 @@ def test_market_and_filing_sources_require_structured_current_adverse_facts(tmp_
     supervisor_path, loss_path, evidence_root = _paths(tmp_path / "filing", supervisor=_supervisor(), loss=_loss_evidence())
     filing_path = evidence_root / "sources" / "2.json"
     filing = json.loads(filing_path.read_text(encoding="utf-8"))
-    filing["payload"] = {"summary": "A current filing is available for review."}
+    filing["payload"] = {"symbol": "ORCL", "as_of": "2026-08-13T14:55:00+00:00", "event_category": "earnings_miss", "direction": "adverse", "change_fraction": "0.12"}
     _rewrite_source_packet(loss_path, filing_path, filing)
     recorded = record_autonomous_loss_board_decision(
         supervisor_packet_path=supervisor_path,
@@ -484,6 +511,70 @@ def test_market_and_filing_sources_require_structured_current_adverse_facts(tmp_
     assert recorded.decision.decision == "HOLD"
 
 
+@pytest.mark.parametrize("source_ref", ["nonexistent", "company_news"])
+def test_exit_reason_source_must_exactly_resolve_one_accepted_binding(tmp_path, source_ref):
+    supervisor = _supervisor(allowed_exit_reason_source=source_ref)
+    recorded = _record(tmp_path, supervisor=supervisor)
+    assert recorded.decision.decision == "HOLD"
+
+
+def test_advisory_reason_source_must_match_the_exact_supervisor_binding(tmp_path):
+    loss = _loss_evidence()
+    loss["payload"]["advisory_analysis"]["loss_exit_candidate"]["allowed_exit_reason_source"] = "source-1"
+    recorded = _record(tmp_path, loss=loss)
+    assert recorded.decision.decision == "HOLD"
+
+
+def test_exit_reason_source_reference_is_rejected_when_ambiguous(tmp_path):
+    supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
+    loss = json.loads(loss_path.read_text(encoding="utf-8"))
+    loss["payload"]["accepted_sources"].append(dict(loss["payload"]["accepted_sources"][2]))
+    _write_json(loss_path, loss)
+
+    with pytest.raises(ValueError, match="unique"):
+        record_autonomous_loss_board_decision(
+            supervisor_packet_path=supervisor_path,
+            loss_evidence_packet_path=loss_path,
+            source_revision="1" * 40,
+            ledger_root=tmp_path / "ledger",
+            evidence_root=evidence_root,
+            now=NOW,
+        )
+    assert not (tmp_path / "ledger" / "events.jsonl").exists()
+
+
+def test_new_loss_board_directory_fsync_failure_never_records_ledger(tmp_path, monkeypatch):
+    supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
+    original_fsync = loss_board_decision.os.fsync
+    original_close = loss_board_decision.os.close
+    closed: list[int] = []
+    calls: list[int] = []
+
+    def fail_root_fsync(descriptor: int) -> None:
+        calls.append(descriptor)
+        original_fsync(descriptor)
+        if len(calls) == 1:
+            raise OSError("root mkdir fsync failed")
+
+    def track_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(loss_board_decision.os, "fsync", fail_root_fsync)
+    monkeypatch.setattr(loss_board_decision.os, "close", track_close)
+    with pytest.raises(OSError, match="root mkdir fsync failed"):
+        record_autonomous_loss_board_decision(
+            supervisor_packet_path=supervisor_path,
+            loss_evidence_packet_path=loss_path,
+            source_revision="1" * 40,
+            ledger_root=tmp_path / "ledger",
+            evidence_root=evidence_root,
+            now=NOW,
+        )
+    assert calls[-1] in closed
+    assert not (tmp_path / "ledger" / "events.jsonl").exists()
+
+
 def test_directory_fsync_failure_closes_fd_and_never_records_ledger(tmp_path, monkeypatch):
     supervisor_path, loss_path, evidence_root = _paths(tmp_path, supervisor=_supervisor(), loss=_loss_evidence())
     original_fsync = loss_board_decision.os.fsync
@@ -493,7 +584,7 @@ def test_directory_fsync_failure_closes_fd_and_never_records_ledger(tmp_path, mo
 
     def fail_directory_fsync(descriptor: int) -> None:
         calls.append(descriptor)
-        if len(calls) == 2:
+        if len(calls) == 3:
             raise OSError("directory fsync failed")
         original_fsync(descriptor)
 
@@ -512,6 +603,6 @@ def test_directory_fsync_failure_closes_fd_and_never_records_ledger(tmp_path, mo
             evidence_root=evidence_root,
             now=NOW,
         )
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[-1] in closed
     assert not (tmp_path / "ledger" / "events.jsonl").exists()

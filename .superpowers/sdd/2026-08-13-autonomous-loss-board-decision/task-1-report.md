@@ -165,6 +165,63 @@ git diff --check
 (no output; passed)
 ```
 
+## Repair round 3: typed source references and strict directional evidence
+
+Round 3 removes the last narrative and self-declared-boolean route to SELL.
+Every SELL-supporting source payload now has one exact, bounded schema:
+
+- Market evidence contains only the symbol/current as-of plus exact SPY, QQQ,
+  and company-sector-relative typed value records. The source values must equal
+  the supervisor values and each company relative value must be at or below
+  `-0.01`; favorable numeric values fail closed.
+- News evidence contains only symbol/current as-of, one allowlisted adverse
+  event category, `direction="adverse"`, and a finite negative impact fraction
+  at or below `-0.01`. Unknown or raised guidance categories, favorable
+  numeric values, and extra prose fields do not qualify.
+- Filing/guidance evidence has the corresponding exact typed schema, using an
+  allowlisted adverse filing event and a finite negative change fraction at or
+  below `-0.01`. Transcript sources remain insufficient rather than being
+  treated as a substitute for substantive filing/guidance evidence.
+- Supervisor and raw advisory `allowed_exit_reason_source` fields are now an
+  exact typed `{packet_id, path, sha256}` reference to exactly one captured
+  accepted source binding. Text labels, missing/nonexistent bindings,
+  disagreement, and duplicate bindings are rejected before ledger publication.
+- On creation of the immutable decision directory, the pre-existing resolved
+  evidence root is fsynced after `mkdir` and before file publication. Both
+  root- and decision-directory descriptor cleanup is covered under injected
+  fsync failures, and neither failure permits a ledger record.
+
+The autonomous exit-reason subset remains deliberately narrower than the
+canonical supervisor taxonomy: it permits only thesis invalidation,
+company-specific negative news, and earnings/guidance breaks. Manual override
+and pre-registered mechanical policy exits are not re-authorized by BOARD and
+continue to fail closed in this analysis-only boundary.
+
+### Repair round 3 RED/GREEN evidence
+
+The round began RED with the new strict-schema and typed-reference adversarial
+tests: legacy prose/flag qualification produced a HOLD baseline mismatch, and
+the test helpers still supplied string source labels rather than immutable
+bindings. The minimal implementation then replaced those contracts with exact
+structured source packets and the typed binding reference.
+
+Final verification used the canonical virtualenv with this worktree on
+`PYTHONPATH`:
+
+```text
+python -m pytest -q tests/test_loss_board_decision.py
+43 passed in 0.30s
+
+python -m pytest -q tests/test_loss_board_decision.py tests/test_work_packets.py tests/test_decision_ledger.py
+174 passed in 0.54s
+
+ruff check tradingagents/policy/loss_board_decision.py tradingagents/orchestration/work_packets.py tests/test_loss_board_decision.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
 Repair implementation commit: `99d94b082a170b7190d314ec4f2154d97232bff2`
 
 ## Repair round 2: authentic source-content qualification

@@ -27,6 +27,8 @@ _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,15}$")
 _DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
 _MAX_AGE = dt.timedelta(minutes=15)
 _QUALITIES = frozenset({"high", "medium"})
+_ADVERSE_NEWS_EVENTS = frozenset({"guidance_cut", "material_contract_loss", "regulatory_adverse_action", "thesis_invalidator"})
+_ADVERSE_FILING_EVENTS = frozenset({"guidance_cut", "earnings_miss", "material_impairment", "adverse_filing_disclosure"})
 AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS = frozenset(
     {
         "thesis_invalidated",
@@ -37,7 +39,6 @@ AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS = frozenset(
 if not AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS <= ALLOWED_LOSS_EXIT_REASONS:
     raise RuntimeError("autonomous BOARD loss-exit subset drifted from supervisor taxonomy")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
-_GENERIC = frozenset({"ok", "good", "news", "filing", "update", "available", "none", "n/a", "unknown"})
 
 
 def _canon(value: Mapping[str, Any]) -> bytes:
@@ -82,11 +83,6 @@ def _decimal(value: Any, field: str) -> str:
     except InvalidOperation as exc:
         raise ValueError(f"{field} must be a canonical decimal string") from exc
     return value
-
-
-def _meaningful(value: Any) -> bool:
-    normalized = value.strip().lower() if isinstance(value, str) else ""
-    return len(normalized) >= 20 and normalized not in _GENERIC and not any(marker in normalized for marker in ("news update", "information available", "generic update", "no material change"))
 
 
 def _is_decimal(value: Any, field: str) -> bool:
@@ -388,12 +384,9 @@ def _source_payload(raw: Mapping[str, Any], source: BoundSourceEvidence) -> Mapp
     return payload
 
 
-def _contains_contradiction(payload: Mapping[str, Any]) -> bool:
-    text = json.dumps(payload, sort_keys=True).lower()
-    return any(token in text for token in ("favorable", "neutral", "positive", "improved", "no thesis impact"))
-
-
 def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str, Any], source: BoundSourceEvidence) -> bool:
+    if set(payload) != {"symbol", "as_of", "spy", "qqq", "sector_relative"}:
+        return False
     context = review.get("broad_market_context")
     sector = review.get("sector_or_peer_context")
     spy = payload.get("spy")
@@ -401,7 +394,7 @@ def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str
     sector_relative = payload.get("sector_relative")
     if not isinstance(context, Mapping) or not isinstance(sector, Mapping):
         return False
-    if not all(isinstance(value, Mapping) for value in (spy, qqq, sector_relative)):
+    if not all(isinstance(value, Mapping) and set(value) == {"symbol", "value", "as_of"} for value in (spy, qqq, sector_relative)):
         return False
     return (
         spy.get("symbol") == "SPY"
@@ -416,15 +409,54 @@ def _market_source_proves_values(payload: Mapping[str, Any], review: Mapping[str
         and sector_relative.get("value") == sector.get("relative_performance")
         and sector_relative.get("as_of") == source.as_of
         and _is_decimal(sector_relative.get("value"), "source sector relative")
+        and Decimal(sector_relative["value"]) <= Decimal("-0.01")
+        and Decimal(review["relative_performance_vs_SPY"]) <= Decimal("-0.01")
+        and Decimal(review["relative_performance_vs_QQQ"]) <= Decimal("-0.01")
     )
 
 
 def _news_source_proves_adverse_break(payload: Mapping[str, Any]) -> bool:
-    return payload.get("sentiment") == "negative" and payload.get("thesis_break") is True and _meaningful(payload.get("headline")) and not _contains_contradiction(payload)
+    return (
+        set(payload) == {"symbol", "as_of", "event_category", "direction", "impact_fraction"}
+        and payload.get("event_category") in _ADVERSE_NEWS_EVENTS
+        and payload.get("direction") == "adverse"
+        and payload.get("impact_fraction") is not None
+        and _is_decimal(payload.get("impact_fraction"), "news impact_fraction")
+        and Decimal(payload["impact_fraction"]) <= Decimal("-0.01")
+    )
 
 
 def _filing_source_proves_adverse_fact(payload: Mapping[str, Any]) -> bool:
-    return payload.get("guidance_or_earnings") == "adverse" and payload.get("adverse_fact") is True and _meaningful(payload.get("fact")) and not _contains_contradiction(payload)
+    return (
+        set(payload) == {"symbol", "as_of", "event_category", "direction", "change_fraction"}
+        and payload.get("event_category") in _ADVERSE_FILING_EVENTS
+        and payload.get("direction") == "adverse"
+        and payload.get("change_fraction") is not None
+        and _is_decimal(payload.get("change_fraction"), "filing change_fraction")
+        and Decimal(payload["change_fraction"]) <= Decimal("-0.01")
+    )
+
+
+def _review_structured_events_match_sources(review: Mapping[str, Any], source_payloads: Mapping[str, Mapping[str, Any]]) -> bool:
+    news = source_payloads.get("company_news")
+    filing = source_payloads.get("earnings_guidance_filing")
+    return (
+        isinstance(news, Mapping)
+        and isinstance(filing, Mapping)
+        and review.get("company_news_event_category") == news.get("event_category")
+        and review.get("company_news_direction") == news.get("direction")
+        and review.get("company_news_impact_fraction") == news.get("impact_fraction")
+        and review.get("filing_event_category") == filing.get("event_category")
+        and review.get("filing_direction") == filing.get("direction")
+        and review.get("filing_change_fraction") == filing.get("change_fraction")
+    )
+
+
+def _exact_source_reference(value: Any, sources: tuple[BoundSourceEvidence, ...]) -> bool:
+    if not isinstance(value, Mapping) or set(value) != {"packet_id", "path", "sha256"}:
+        return False
+    matches = [source for source in sources if value == {"packet_id": source.packet_id, "path": source.packet.path, "sha256": source.packet.sha256}]
+    return len(matches) == 1
 
 
 def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], sources: tuple[BoundSourceEvidence, ...], root: Path, now: dt.datetime) -> tuple[str, ...]:
@@ -443,15 +475,15 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
         or not all(_is_decimal(context.get(x), x) for x in ("SPY", "QQQ"))
         or not all(_is_decimal(review.get(x), x) for x in ("relative_performance_vs_SPY", "relative_performance_vs_QQQ"))
         or not isinstance(sector, Mapping)
-        or not _meaningful(sector.get("sector"))
+        or not isinstance(sector.get("sector"), str)
+        or sector.get("sector") not in {"software", "semiconductors", "technology"}
         or not _is_decimal(sector.get("relative_performance"), "sector relative_performance")
     ):
         gaps.append("actual_spy_qqq_sector_relative_values_missing")
-    if review.get("allowed") is not True or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS or not _meaningful(review.get("allowed_exit_reason_source")):
+    if review.get("allowed") is not True or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS or not _exact_source_reference(review.get("allowed_exit_reason_source"), sources):
         gaps.append("recognized_exit_reason_missing")
-    filing = review.get("earnings_guidance_or_filing_check")
-    if not _meaningful(review.get("current_thesis_status")) or not _meaningful(review.get("why_hold_is_worse_than_sell")) or not _meaningful(review.get("company_specific_negative_news_check")) or not _meaningful(filing) or "submissions index" in filing.lower():
-        gaps.append("meaningful_thesis_news_or_filing_missing")
+    if not all(isinstance(review.get(field), str) and review[field].strip() for field in ("current_thesis_status", "why_hold_is_worse_than_sell")):
+        gaps.append("thesis_verdict_missing")
     try:
         if Decimal(_decimal(review.get("confidence"), "supervisor confidence")) < Decimal("0.75"):
             gaps.append("confidence_below_0_75")
@@ -468,12 +500,12 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
         or candidate.get("allowed_exit_reason_candidate") != review.get("allowed_exit_reason")
         or candidate.get("allowed_exit_reason_source") != review.get("allowed_exit_reason_source")
         or candidate.get("confidence") != review.get("confidence")
-        or not _meaningful(candidate.get("reason_summary"))
         or candidate.get("reason_summary") != review.get("why_hold_is_worse_than_sell")
         or advisory.get("current_thesis_status_candidate") != review.get("current_thesis_status")
     ):
         gaps.append("advisory_candidate_contradiction")
     categories: set[str] = set()
+    source_payloads: dict[str, Mapping[str, Any]] = {}
     for source in sources:
         if not source.verify(root):
             gaps.append("source_binding_invalid")
@@ -486,9 +518,8 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
             continue
         if observed > now or now - observed > _MAX_AGE:
             gaps.append("source_stale")
-        payload_text = json.dumps(raw.get("payload"), sort_keys=True).lower()
         descriptor = f"{source.source_name} {source.evidence_type}".lower()
-        if any(x in descriptor or x in payload_text for x in ("gap", "connector", "submissions_index", "submissions index")):
+        if any(x in descriptor for x in ("gap", "connector", "submissions_index", "submissions index")):
             gaps.append("source_gap_or_index")
         source_payload = _source_payload(raw, source)
         if source_payload is None:
@@ -501,15 +532,19 @@ def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], source
         elif source.evidence_type == "company_news":
             if _news_source_proves_adverse_break(source_payload):
                 categories.add("news")
+                source_payloads["company_news"] = source_payload
             else:
                 gaps.append("company_news_not_adverse_thesis_break")
-        elif source.evidence_type in {"earnings_guidance_filing", "earnings_transcript"}:
+        elif source.evidence_type == "earnings_guidance_filing":
             if _filing_source_proves_adverse_fact(source_payload):
                 categories.add("substance")
+                source_payloads["earnings_guidance_filing"] = source_payload
             else:
                 gaps.append("filing_or_guidance_not_adverse_substantive_fact")
     if categories != {"market", "news", "substance"}:
         gaps.append("required_source_substance_missing")
+    if not _review_structured_events_match_sources(review, source_payloads):
+        gaps.append("review_structured_event_binding_invalid")
     return tuple(dict.fromkeys(gaps))
 
 
@@ -554,7 +589,7 @@ def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: B
         "source_revision": revision,
         "generated_at": generated,
         "expires_at": expires,
-        "thesis_verdict": review.get("current_thesis_status") if _meaningful(review.get("current_thesis_status")) else "Evidence is incomplete; HOLD remains safer.",
+        "thesis_verdict": review.get("current_thesis_status") if isinstance(review.get("current_thesis_status"), str) and review["current_thesis_status"].strip() else "Evidence is incomplete; HOLD remains safer.",
         "reason_code": "loss_exit_evidence_complete" if sell else "evidence_incomplete",
         "confidence": confidence,
         "evidence_complete": sell,
@@ -577,6 +612,11 @@ def _publish(root: Path, relative: Path, content: bytes) -> Path:
             raise ValueError("decision evidence parent is unsafe")
     else:
         parent.mkdir(mode=0o700)
+        root_descriptor = os.open(root, os.O_RDONLY)
+        try:
+            os.fsync(root_descriptor)
+        finally:
+            os.close(root_descriptor)
     if stat.S_ISLNK(parent.lstat().st_mode):
         raise ValueError("decision evidence parent is unsafe")
     try:
