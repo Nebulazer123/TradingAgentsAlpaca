@@ -99,3 +99,70 @@ git diff --check
 This task introduces no execution authority and submits no orders. A recorded
 SELL remains a ledgered portfolio decision pending a separate execution intent
 and its independent controls.
+
+## Repair round 1: review NO-GO remediation
+
+The review found that the first implementation could infer completeness from
+missing structures and could accept self-described source metadata. Repair
+round 1 replaced that permissive path with a fail-closed contract:
+
+- Supervisor `blockers` and `blocked_reasons` must each be present as exact
+  empty lists; missing, malformed, or nonempty values force HOLD.
+- Raw loss `remaining_blockers` must be present as an exact empty list.
+  Missing is not interpreted as empty.
+- The raw loss payload must bind the exact relative supervisor packet path and
+  supervisor decision ID, in addition to both matching the same uppercase
+  symbol. Unrelated same-symbol packets are rejected before any publication.
+- Each accepted source is now an exact descriptor for a contained, regular,
+  non-symlink source packet: relative path, captured SHA-256, byte count,
+  packet ID, source name/type, as-of timestamp, and quality. The source file is
+  read once for its hash and parse; all descriptor and packet fields must match.
+  URL/self-label descriptors do not qualify. Mutation is detected by the
+  decision verifier.
+- SELL qualification now requires exact allowlisted loss-exit reasons,
+  canonical SPY/QQQ and their relative-performance values, a meaningful sector
+  relative value, substantive company-specific news and filing/guidance text,
+  and all three fresh, high/medium-quality source categories. Gap, connector,
+  and submissions-index source material remains a blocker.
+- The advisory loss-exit candidate must exactly agree with the supervisor on
+  reason, source, confidence, current thesis, and why HOLD is worse, and must
+  remain explicitly BOARD-only. Missing/zero/contradictory candidate state
+  forces HOLD.
+- Verification now requires exact canonical JSON bytes, the exact schema with
+  no dropped/extra entries, source-byte validation, and
+  `generated_at <= now < expires_at`.
+- Publication resolves a real evidence root, rejects symlink or escaping target
+  paths/parents, uses no-follow creation where supported, fsyncs the file and
+  directory, and calls the ledger only after the durable boundary. Collision and
+  injected crash-boundary tests confirm no new ledger event is appended.
+
+### Repair RED/GREEN evidence
+
+The repair began with targeted RED tests against the original implementation:
+
+```text
+tests/test_loss_board_decision.py -k 'supervisor_blockers or missing_raw'
+5 failed
+```
+
+Those failures showed nonempty/malformed supervisor blockers and omitted raw
+remaining blockers could incorrectly produce SELL.
+
+Final repair verification used the canonical virtualenv with this worktree on
+`PYTHONPATH`:
+
+```text
+python -m pytest -q tests/test_loss_board_decision.py
+28 passed in 0.24s
+
+python -m pytest -q tests/test_loss_board_decision.py tests/test_work_packets.py tests/test_decision_ledger.py
+159 passed in 0.45s
+
+ruff check tradingagents/policy/loss_board_decision.py tradingagents/orchestration/work_packets.py tests/test_loss_board_decision.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+The repair commit is recorded below after commit creation.

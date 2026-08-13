@@ -1,9 +1,4 @@
-"""Immutable, decision-only autonomous loss BOARD records.
-
-This module deliberately establishes a decision boundary, not an execution
-boundary.  A recorded ``SELL`` is only an evidence-backed portfolio decision;
-it cannot create an order or grant submission authority.
-"""
+"""Fail-closed, immutable, decision-only autonomous loss BOARD records."""
 
 from __future__ import annotations
 
@@ -12,7 +7,8 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Mapping, Sequence
+import stat
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -27,153 +23,195 @@ _UTC = dt.timezone.utc
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SYMBOL = re.compile(r"^[A-Z][A-Z0-9.]{0,15}$")
-_DECIMAL = re.compile(r"^(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
-_ACCEPTED_QUALITY = frozenset({"high", "medium"})
-_MAX_EVIDENCE_AGE = dt.timedelta(minutes=15)
-_CLOSED_SESSION = frozenset({"closed", "non_tradeable", "non-tradeable"})
-_GAP_MARKERS = ("gap", "missing", "unavailable", "connector")
-_INDEX_MARKERS = ("submissions_index", "submissions index", "sec index")
+_DECIMAL = re.compile(r"^-?(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?$")
+_MAX_AGE = dt.timedelta(minutes=15)
+_QUALITIES = frozenset({"high", "medium"})
+_EXIT_REASONS = frozenset({"thesis_invalidated", "guidance_cut", "fundamental_deterioration", "risk_limit_breach"})
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_GENERIC = frozenset({"ok", "good", "news", "filing", "update", "available", "none", "n/a", "unknown"})
 
 
-def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
-    return json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+def _canon(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
-def _utc_now(value: dt.datetime | None) -> dt.datetime:
-    current = value if value is not None else dt.datetime.now(tz=_UTC)
-    if not isinstance(current, dt.datetime) or current.tzinfo is None or current.utcoffset() is None:
-        raise ValueError("now must be a timezone-aware datetime")
-    return current.astimezone(_UTC).replace(microsecond=0)
+def _now(value: dt.datetime | None) -> dt.datetime:
+    result = value if value is not None else dt.datetime.now(tz=_UTC)
+    if not isinstance(result, dt.datetime) or result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return result.astimezone(_UTC).replace(microsecond=0)
 
 
-def _parse_utc(value: Any, *, field_name: str) -> dt.datetime:
+def _time(value: Any, field: str) -> dt.datetime:
     if not isinstance(value, str):
-        raise ValueError(f"{field_name} must be a UTC ISO-8601 seconds string")
+        raise ValueError(f"{field} must be UTC ISO-8601 seconds")
     try:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as exc:
-        raise ValueError(f"{field_name} must be a UTC ISO-8601 seconds string") from exc
+        raise ValueError(f"{field} must be UTC ISO-8601 seconds") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"{field_name} must be timezone-aware")
-    normalized = parsed.astimezone(_UTC)
-    if normalized.microsecond or normalized.isoformat(timespec="seconds") != value:
-        raise ValueError(f"{field_name} must be canonical UTC seconds")
-    return normalized
+        raise ValueError(f"{field} must be timezone-aware")
+    parsed = parsed.astimezone(_UTC)
+    if parsed.microsecond or parsed.isoformat(timespec="seconds") != value:
+        raise ValueError(f"{field} must be canonical UTC seconds")
+    return parsed
 
 
-def _utc_text(value: dt.datetime) -> str:
-    return _utc_now(value).isoformat(timespec="seconds")
-
-
-def _text(value: Any, *, field_name: str) -> str:
+def _text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip() or value.strip() != value:
-        raise ValueError(f"{field_name} must be a nonempty canonical string")
+        raise ValueError(f"{field} must be a nonempty canonical string")
     return value
 
 
-def _canonical_decimal(value: Any, *, field_name: str) -> str:
+def _decimal(value: Any, field: str) -> str:
     if not isinstance(value, str) or _DECIMAL.fullmatch(value) is None:
-        raise ValueError(f"{field_name} must use canonical decimal syntax")
+        raise ValueError(f"{field} must be a canonical decimal string")
     try:
-        parsed = Decimal(value)
+        decimal_value = Decimal(value)
+        if not decimal_value.is_finite() or (decimal_value == 0 and value.startswith("-")):
+            raise ValueError(f"{field} must be finite")
     except InvalidOperation as exc:
-        raise ValueError(f"{field_name} must use canonical decimal syntax") from exc
-    if not parsed.is_finite() or Decimal(value) != parsed:
-        raise ValueError(f"{field_name} must be finite")
+        raise ValueError(f"{field} must be a canonical decimal string") from exc
     return value
 
 
-def _has_decimal(value: Any) -> bool:
+def _meaningful(value: Any) -> bool:
+    normalized = value.strip().lower() if isinstance(value, str) else ""
+    return len(normalized) >= 20 and normalized not in _GENERIC and not any(marker in normalized for marker in ("news update", "information available", "generic update", "no material change"))
+
+
+def _is_decimal(value: Any, field: str) -> bool:
     try:
-        text = str(value).strip().removesuffix("%")
-        parsed = Decimal(text)
-    except (InvalidOperation, ValueError):
+        _decimal(value, field)
+    except ValueError:
         return False
-    return parsed.is_finite()
+    return True
 
 
-def _nonempty(value: Any) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+def _sequence_of_text(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
 
 
-def _mapping(value: Any) -> Mapping[str, Any] | None:
-    return value if isinstance(value, Mapping) else None
+def _root(value: str | Path) -> Path:
+    path = Path(value)
+    try:
+        state = path.lstat()
+    except OSError as exc:
+        raise ValueError("evidence_root must exist") from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise ValueError("evidence_root must be a real directory")
+    return path.resolve()
+
+
+def _inside(root: Path, relative: str | Path, *, label: str) -> Path:
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError(f"{label} escapes evidence_root")
+    candidate = root / relative_path
+    try:
+        candidate.resolve().relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} escapes evidence_root") from exc
+    current = root
+    for part in Path(relative).parts[:-1]:
+        current /= part
+        if current.exists() and stat.S_ISLNK(current.lstat().st_mode):
+            raise ValueError(f"{label} parent must not be a symlink")
+    return candidate
+
+
+def _read_contained(root: Path, path: str | Path, *, label: str) -> tuple[Path, bytes, Mapping[str, Any]]:
+    supplied = Path(path)
+    if supplied.is_absolute():
+        supplied = supplied.resolve()
+        try:
+            relative = supplied.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be contained by evidence_root") from exc
+    else:
+        relative = supplied
+    target = _inside(root, relative, label=label)
+    try:
+        state = target.lstat()
+        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
+            raise ValueError(f"{label} must be a regular non-symlink file")
+        descriptor = os.open(target, os.O_RDONLY | _NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as handle:
+            payload = handle.read()
+    except OSError as exc:
+        raise ValueError(f"{label} is unreadable") from exc
+    try:
+        decoded = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} must contain a JSON object") from exc
+    if not isinstance(decoded, Mapping):
+        raise ValueError(f"{label} must contain a JSON object")
+    return target, payload, decoded
 
 
 @dataclass(frozen=True)
 class BoundEvidence:
-    """A source-root-relative immutable evidence binding."""
-
     path: str
     sha256: str
     size_bytes: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.path, str) or not self.path or Path(self.path).is_absolute():
-            raise ValueError("bound evidence path must be a nonempty relative path")
-        if _SHA256.fullmatch(self.sha256) is None:
-            raise ValueError("bound evidence sha256 must be lowercase SHA-256")
-        if isinstance(self.size_bytes, bool) or not isinstance(self.size_bytes, int) or self.size_bytes < 0:
-            raise ValueError("bound evidence size_bytes must be a nonnegative integer")
+        if not isinstance(self.path, str) or not self.path or Path(self.path).is_absolute() or _SHA256.fullmatch(self.sha256) is None or type(self.size_bytes) is not int or self.size_bytes < 0:
+            raise ValueError("invalid bound evidence")
 
     def compact(self) -> dict[str, Any]:
         return {"path": self.path, "sha256": self.sha256, "size_bytes": self.size_bytes}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> BoundEvidence:
-        if set(payload) != {"path", "sha256", "size_bytes"}:
-            raise ValueError("bound evidence fields are invalid")
-        return cls(
-            path=payload["path"], sha256=payload["sha256"], size_bytes=payload["size_bytes"]
-        )
+    def from_dict(cls, value: Mapping[str, Any]) -> BoundEvidence:
+        if set(value) != {"path", "sha256", "size_bytes"}:
+            raise ValueError("invalid bound evidence fields")
+        return cls(**dict(value))
 
-    def verify(self, evidence_root: str | Path) -> bool:
+    def verify(self, root: Path) -> bool:
         try:
-            root = Path(evidence_root).resolve()
-            path = (root / self.path).resolve()
-            path.relative_to(root)
-            payload = path.read_bytes()
-        except (OSError, ValueError):
+            target, payload, _ = _read_contained(root, self.path, label="bound evidence")
+        except ValueError:
             return False
-        return len(payload) == self.size_bytes and hashlib.sha256(payload).hexdigest() == self.sha256
+        return target == _inside(root, self.path, label="bound evidence") and len(payload) == self.size_bytes and hashlib.sha256(payload).hexdigest() == self.sha256
 
 
 @dataclass(frozen=True)
 class BoundSourceEvidence:
-    """A canonical binding to accepted source evidence described in the raw packet."""
-
+    packet: BoundEvidence
+    packet_id: str
     source_name: str
     evidence_type: str
-    source_ref: str
     as_of: str
     quality: str
-    source_sha256: str
 
     def __post_init__(self) -> None:
-        for field_name in ("source_name", "evidence_type", "source_ref", "quality"):
-            _text(getattr(self, field_name), field_name=field_name)
-        _parse_utc(self.as_of, field_name="source as_of")
-        if _SHA256.fullmatch(self.source_sha256) is None:
-            raise ValueError("source_sha256 must be lowercase SHA-256")
+        if not isinstance(self.packet, BoundEvidence):
+            raise ValueError("source packet binding is required")
+        for name in ("packet_id", "source_name", "evidence_type"):
+            _text(getattr(self, name), name)
+        _time(self.as_of, "source as_of")
+        if self.quality not in _QUALITIES:
+            raise ValueError("source quality is not accepted")
 
-    def compact(self) -> dict[str, str]:
-        return {
-            "source_name": self.source_name,
-            "evidence_type": self.evidence_type,
-            "source_ref": self.source_ref,
-            "as_of": self.as_of,
-            "quality": self.quality,
-            "source_sha256": self.source_sha256,
-        }
+    def compact(self) -> dict[str, Any]:
+        return {"packet": self.packet.compact(), "packet_id": self.packet_id, "source_name": self.source_name, "evidence_type": self.evidence_type, "as_of": self.as_of, "quality": self.quality}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> BoundSourceEvidence:
-        expected = {"source_name", "evidence_type", "source_ref", "as_of", "quality", "source_sha256"}
-        if set(payload) != expected:
-            raise ValueError("bound source evidence fields are invalid")
-        return cls(**dict(payload))
+    def from_dict(cls, value: Mapping[str, Any]) -> BoundSourceEvidence:
+        expected = {"packet", "packet_id", "source_name", "evidence_type", "as_of", "quality"}
+        if set(value) != expected or not isinstance(value["packet"], Mapping):
+            raise ValueError("invalid source binding fields")
+        return cls(packet=BoundEvidence.from_dict(value["packet"]), packet_id=value["packet_id"], source_name=value["source_name"], evidence_type=value["evidence_type"], as_of=value["as_of"], quality=value["quality"])
+
+    def verify(self, root: Path) -> bool:
+        if not self.packet.verify(root):
+            return False
+        try:
+            _, _, raw = _read_contained(root, self.packet.path, label="source packet")
+        except ValueError:
+            return False
+        return raw.get("packet_id") == self.packet_id and raw.get("source_name") == self.source_name and raw.get("evidence_type") == self.evidence_type and raw.get("as_of") == self.as_of and raw.get("quality") == self.quality
 
 
 @dataclass(frozen=True)
@@ -202,53 +240,36 @@ class AutonomousLossBoardDecision:
     can_submit_orders: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
-        if self.schema_version != SCHEMA_VERSION:
-            raise ValueError("schema_version is invalid")
-        if self.decision not in {"HOLD", "SELL"}:
-            raise ValueError("decision must be HOLD or SELL")
-        if not isinstance(self.symbol, str) or _SYMBOL.fullmatch(self.symbol) is None:
-            raise ValueError("symbol must be uppercase ticker")
-        _text(self.supervisor_decision_id, field_name="supervisor_decision_id")
-        if not isinstance(self.supervisor_packet, BoundEvidence) or not isinstance(self.loss_evidence_packet, BoundEvidence):
-            raise ValueError("decision evidence bindings are invalid")
-        if not isinstance(self.accepted_sources, tuple):
-            raise ValueError("accepted_sources must be a tuple")
-        if not all(isinstance(item, BoundSourceEvidence) for item in self.accepted_sources):
-            raise ValueError("accepted_sources must contain source bindings")
-        source_keys = tuple(_canonical_json_bytes(item.compact()) for item in self.accepted_sources)
-        if len(source_keys) != len(set(source_keys)):
-            raise ValueError("accepted_sources must be unique exact bindings")
-        if _REVISION.fullmatch(self.source_revision) is None:
-            raise ValueError("source_revision must be lowercase 40-hex")
-        generated = _parse_utc(self.generated_at, field_name="generated_at")
-        expires = _parse_utc(self.expires_at, field_name="expires_at")
-        if not generated < expires <= generated + _MAX_EVIDENCE_AGE:
-            raise ValueError("expires_at must be within 15 minutes after generated_at")
-        _text(self.thesis_verdict, field_name="thesis_verdict")
-        _text(self.reason_code, field_name="reason_code")
-        confidence = Decimal(_canonical_decimal(self.confidence, field_name="confidence"))
-        if not isinstance(self.evidence_complete, bool):
-            raise ValueError("evidence_complete must be an exact boolean")
-        if not isinstance(self.trade_decision_resolved, bool) or self.trade_decision_resolved is not True:
-            raise ValueError("trade_decision_resolved must be true")
-        if not isinstance(self.exit_allowed, bool):
-            raise ValueError("exit_allowed must be an exact boolean")
-        if not isinstance(self.evidence_gaps, tuple) or not all(_nonempty(item) for item in self.evidence_gaps):
-            raise ValueError("evidence_gaps must be a tuple of nonempty strings")
-        if len(self.evidence_gaps) != len(set(self.evidence_gaps)):
-            raise ValueError("evidence_gaps must be unique")
+        if self.schema_version != SCHEMA_VERSION or self.decision not in {"HOLD", "SELL"} or not isinstance(self.symbol, str) or _SYMBOL.fullmatch(self.symbol) is None or _REVISION.fullmatch(self.source_revision) is None:
+            raise ValueError("invalid decision identity")
+        _text(self.supervisor_decision_id, "supervisor_decision_id")
+        if not isinstance(self.supervisor_packet, BoundEvidence) or not isinstance(self.loss_evidence_packet, BoundEvidence) or not isinstance(self.accepted_sources, tuple) or not all(isinstance(item, BoundSourceEvidence) for item in self.accepted_sources):
+            raise ValueError("invalid decision bindings")
+        if len(self.accepted_sources) != len({json.dumps(item.compact(), sort_keys=True) for item in self.accepted_sources}):
+            raise ValueError("source bindings must be unique")
+        generated, expires = _time(self.generated_at, "generated_at"), _time(self.expires_at, "expires_at")
+        if not generated < expires <= generated + _MAX_AGE:
+            raise ValueError("invalid decision lifetime")
+        _text(self.thesis_verdict, "thesis_verdict")
+        _text(self.reason_code, "reason_code")
+        confidence = Decimal(_decimal(self.confidence, "confidence"))
+        if (
+            type(self.evidence_complete) is not bool
+            or type(self.trade_decision_resolved) is not bool
+            or self.trade_decision_resolved is not True
+            or type(self.exit_allowed) is not bool
+            or not isinstance(self.evidence_gaps, tuple)
+            or not all(_text(x, "evidence_gap") for x in self.evidence_gaps)
+            or len(self.evidence_gaps) != len(set(self.evidence_gaps))
+        ):
+            raise ValueError("invalid decision booleans or gaps")
         sell = self.decision == "SELL"
-        if sell is not self.exit_allowed or sell is not self.evidence_complete:
-            raise ValueError("decision, exit_allowed, and evidence_complete must agree")
-        if sell and (self.evidence_gaps or confidence < Decimal("0.75")):
-            raise ValueError("SELL requires complete evidence, no gaps, and confidence at least 0.75")
-        if not self.evidence_complete and not self.evidence_gaps:
-            raise ValueError("incomplete evidence requires a nonempty evidence gap")
-        expected = hashlib.sha256(_canonical_json_bytes(self._identity_payload())).hexdigest()
-        if _SHA256.fullmatch(self.decision_id) is None or self.decision_id != expected:
-            raise ValueError("decision_id does not match canonical decision material")
+        if sell is not self.evidence_complete or sell is not self.exit_allowed or (sell and (self.evidence_gaps or confidence < Decimal("0.75"))) or (not sell and not self.evidence_gaps):
+            raise ValueError("decision must fail closed")
+        if self.decision_id != hashlib.sha256(_canon(self._identity())).hexdigest():
+            raise ValueError("decision_id does not match canonical material")
 
-    def _identity_payload(self) -> dict[str, Any]:
+    def _identity(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "decision": self.decision,
@@ -256,7 +277,7 @@ class AutonomousLossBoardDecision:
             "supervisor_decision_id": self.supervisor_decision_id,
             "supervisor_packet": self.supervisor_packet.compact(),
             "loss_evidence_packet": self.loss_evidence_packet.compact(),
-            "accepted_sources": [item.compact() for item in self.accepted_sources],
+            "accepted_sources": [x.compact() for x in self.accepted_sources],
             "source_revision": self.source_revision,
             "generated_at": self.generated_at,
             "expires_at": self.expires_at,
@@ -274,44 +295,45 @@ class AutonomousLossBoardDecision:
         }
 
     def compact(self) -> dict[str, Any]:
-        return {"decision_id": self.decision_id, **self._identity_payload()}
+        return {"decision_id": self.decision_id, **self._identity()}
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> AutonomousLossBoardDecision:
-        expected = {
-            "schema_version", "decision_id", "decision", "symbol", "supervisor_decision_id",
-            "supervisor_packet", "loss_evidence_packet", "accepted_sources", "source_revision",
-            "generated_at", "expires_at", "thesis_verdict", "reason_code", "confidence",
-            "evidence_complete", "evidence_gaps", "trade_decision_resolved", "exit_allowed",
-            "producer_role", "analysis_only", "execution_authority", "can_submit_orders",
-        }
-        if set(payload) != expected:
-            raise ValueError("decision fields are invalid")
-        if payload["producer_role"] != "portfolio_executive" or payload["analysis_only"] is not True or payload["execution_authority"] != "none" or payload["can_submit_orders"] is not False:
-            raise ValueError("decision execution authority is invalid")
-        if not isinstance(payload["supervisor_packet"], Mapping) or not isinstance(payload["loss_evidence_packet"], Mapping):
-            raise ValueError("decision evidence bindings are invalid")
-        if not isinstance(payload["accepted_sources"], list) or not isinstance(payload["evidence_gaps"], list):
-            raise ValueError("decision collection fields are invalid")
+    def from_dict(cls, value: Mapping[str, Any]) -> AutonomousLossBoardDecision:
+        expected = set(cls.__dataclass_fields__) | {"producer_role", "analysis_only", "execution_authority", "can_submit_orders"}
+        if (
+            set(value) != expected
+            or value.get("producer_role") != "portfolio_executive"
+            or value.get("analysis_only") is not True
+            or value.get("execution_authority") != "none"
+            or value.get("can_submit_orders") is not False
+            or not isinstance(value.get("accepted_sources"), list)
+            or not isinstance(value.get("evidence_gaps"), list)
+            or not isinstance(value.get("supervisor_packet"), Mapping)
+            or not isinstance(value.get("loss_evidence_packet"), Mapping)
+        ):
+            raise ValueError("invalid exact decision schema")
+        sources = value["accepted_sources"]
+        if not all(isinstance(x, Mapping) for x in sources):
+            raise ValueError("invalid source entry")
         return cls(
-            schema_version=payload["schema_version"],
-            decision_id=payload["decision_id"],
-            decision=payload["decision"],
-            symbol=payload["symbol"],
-            supervisor_decision_id=payload["supervisor_decision_id"],
-            supervisor_packet=BoundEvidence.from_dict(payload["supervisor_packet"]),
-            loss_evidence_packet=BoundEvidence.from_dict(payload["loss_evidence_packet"]),
-            accepted_sources=tuple(BoundSourceEvidence.from_dict(item) for item in payload["accepted_sources"] if isinstance(item, Mapping)),
-            source_revision=payload["source_revision"],
-            generated_at=payload["generated_at"],
-            expires_at=payload["expires_at"],
-            thesis_verdict=payload["thesis_verdict"],
-            reason_code=payload["reason_code"],
-            confidence=payload["confidence"],
-            evidence_complete=payload["evidence_complete"],
-            evidence_gaps=tuple(payload["evidence_gaps"]),
-            trade_decision_resolved=payload["trade_decision_resolved"],
-            exit_allowed=payload["exit_allowed"],
+            schema_version=value["schema_version"],
+            decision_id=value["decision_id"],
+            decision=value["decision"],
+            symbol=value["symbol"],
+            supervisor_decision_id=value["supervisor_decision_id"],
+            supervisor_packet=BoundEvidence.from_dict(value["supervisor_packet"]),
+            loss_evidence_packet=BoundEvidence.from_dict(value["loss_evidence_packet"]),
+            accepted_sources=tuple(BoundSourceEvidence.from_dict(x) for x in sources),
+            source_revision=value["source_revision"],
+            generated_at=value["generated_at"],
+            expires_at=value["expires_at"],
+            thesis_verdict=value["thesis_verdict"],
+            reason_code=value["reason_code"],
+            confidence=value["confidence"],
+            evidence_complete=value["evidence_complete"],
+            evidence_gaps=tuple(value["evidence_gaps"]),
+            trade_decision_resolved=value["trade_decision_resolved"],
+            exit_allowed=value["exit_allowed"],
         )
 
 
@@ -323,211 +345,151 @@ class RecordedLossBoardDecision:
     decision_evidence_path: Path
 
 
-def _capture_bound_json(path: str | Path, evidence_root: Path) -> tuple[BoundEvidence, Mapping[str, Any]]:
-    supplied = Path(path)
-    try:
-        resolved_root = evidence_root.resolve()
-        resolved = supplied.resolve()
-        relative = resolved.relative_to(resolved_root)
-        payload_bytes = resolved.read_bytes()
-    except (OSError, ValueError) as exc:
-        raise ValueError("bound evidence path must be a readable file beneath evidence_root") from exc
-    try:
-        payload = json.loads(payload_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("bound evidence must contain a JSON object") from exc
-    if not isinstance(payload, Mapping):
-        raise ValueError("bound evidence must contain a JSON object")
-    return (
-        BoundEvidence(path=relative.as_posix(), sha256=hashlib.sha256(payload_bytes).hexdigest(), size_bytes=len(payload_bytes)),
-        payload,
-    )
+def _bound(root: Path, path: str | Path, label: str) -> tuple[BoundEvidence, Mapping[str, Any]]:
+    target, raw, decoded = _read_contained(root, path, label=label)
+    return BoundEvidence(path=target.relative_to(root).as_posix(), sha256=hashlib.sha256(raw).hexdigest(), size_bytes=len(raw)), decoded
 
 
-def _source_bindings(loss_payload: Mapping[str, Any]) -> tuple[BoundSourceEvidence, ...]:
-    candidates = loss_payload.get("accepted_sources")
-    if candidates is None:
-        advisory = _mapping(loss_payload.get("advisory_analysis")) or {}
-        candidates = advisory.get("source_refs")
-    if not isinstance(candidates, Sequence) or isinstance(candidates, (str, bytes, bytearray)):
+def _sources(root: Path, raw: Any, symbol: str) -> tuple[BoundSourceEvidence, ...]:
+    if not isinstance(raw, list) or not raw:
         return ()
-    sources: list[BoundSourceEvidence] = []
-    for item in candidates:
-        if not isinstance(item, Mapping):
-            continue
+    result: list[BoundSourceEvidence] = []
+    exact = {"path", "sha256", "size_bytes", "packet_id", "source_name", "evidence_type", "as_of", "quality"}
+    for descriptor in raw:
+        if not isinstance(descriptor, Mapping) or set(descriptor) != exact or not isinstance(descriptor.get("path"), str):
+            return ()
         try:
-            material = {
-                "source_name": _text(item.get("source_name") or item.get("source") or "", field_name="source_name"),
-                "evidence_type": _text(item.get("evidence_type") or "", field_name="evidence_type"),
-                "source_ref": _text(item.get("source_ref") or item.get("path") or item.get("packet_id") or "", field_name="source_ref"),
-                "as_of": item.get("as_of") or item.get("generated_at"),
-                "quality": _text(item.get("quality") or "", field_name="quality"),
-            }
-            sources.append(BoundSourceEvidence(**material, source_sha256=hashlib.sha256(_canonical_json_bytes(material)).hexdigest()))
-        except ValueError:
-            continue
-    return tuple(sources)
+            bound, packet = _bound(root, descriptor["path"], "accepted source packet")
+            if bound.compact() != {"path": descriptor["path"], "sha256": descriptor["sha256"], "size_bytes": descriptor["size_bytes"]}:
+                return ()
+            if packet.get("symbol") != symbol or packet.get("subject") != symbol or any(packet.get(key) != descriptor[key] for key in ("packet_id", "source_name", "evidence_type", "as_of", "quality")):
+                return ()
+            result.append(BoundSourceEvidence(packet=bound, packet_id=descriptor["packet_id"], source_name=descriptor["source_name"], evidence_type=descriptor["evidence_type"], as_of=descriptor["as_of"], quality=descriptor["quality"]))
+        except (ValueError, TypeError):
+            return ()
+    return tuple(result)
 
 
-def _fresh_source(source: BoundSourceEvidence, now: dt.datetime) -> bool:
-    try:
-        observed = _parse_utc(source.as_of, field_name="source as_of")
-    except ValueError:
-        return False
-    return observed <= now and now - observed <= _MAX_EVIDENCE_AGE
-
-
-def _has_accepted_source(sources: Sequence[BoundSourceEvidence], *, category: str, now: dt.datetime) -> bool:
-    for source in sources:
-        descriptor = f"{source.source_name} {source.evidence_type}".lower()
-        if source.quality not in _ACCEPTED_QUALITY or not _fresh_source(source, now):
-            continue
-        if any(marker in descriptor for marker in (*_GAP_MARKERS, *_INDEX_MARKERS)):
-            continue
-        if category == "market" and any(marker in descriptor for marker in ("market", "quote", "sector", "benchmark")):
-            return True
-        if category == "news" and "news" in descriptor:
-            return True
-        if category == "substance" and any(marker in descriptor for marker in ("earnings", "guidance", "filing", "transcript")):
-            return True
-    return False
-
-
-def _actual_market_values(review: Mapping[str, Any]) -> bool:
-    context = _mapping(review.get("broad_market_context")) or {}
-    spy = context.get("SPY", context.get("spy"))
-    qqq = context.get("QQQ", context.get("qqq"))
-    sector = review.get("sector_or_peer_context")
-    return _has_decimal(spy) and _has_decimal(qqq) and _nonempty(sector) and any(char.isdigit() for char in str(sector))
-
-
-def _gaps(
-    *, review: Mapping[str, Any], loss_payload: Mapping[str, Any], sources: Sequence[BoundSourceEvidence], now: dt.datetime
-) -> tuple[str, ...]:
+def _semantic_gaps(review: Mapping[str, Any], payload: Mapping[str, Any], sources: tuple[BoundSourceEvidence, ...], root: Path, now: dt.datetime) -> tuple[str, ...]:
     gaps: list[str] = []
-    if review.get("allowed") is not True:
-        gaps.append("supervisor_loss_exit_not_exactly_allowed")
-    if not _actual_market_values(review):
-        gaps.append("spy_qqq_sector_values_missing")
-    if not _has_accepted_source(sources, category="market", now=now):
-        gaps.append("accepted_market_source_missing_or_stale")
-    if not _nonempty(review.get("company_specific_negative_news_check")):
-        gaps.append("company_specific_news_missing")
-    if not _has_accepted_source(sources, category="news", now=now):
-        gaps.append("accepted_company_news_missing_or_stale")
+    for blocker_field in ("blockers", "blocked_reasons"):
+        value = review.get(blocker_field)
+        if not _sequence_of_text(value) or value:
+            gaps.append(f"supervisor_{blocker_field}_not_exact_empty_list")
+    remaining = payload.get("remaining_blockers")
+    if not _sequence_of_text(remaining) or remaining:
+        gaps.append("remaining_blockers_not_exact_empty_list")
+    context = review.get("broad_market_context")
+    sector = review.get("sector_or_peer_context")
+    if (
+        not isinstance(context, Mapping)
+        or not all(_is_decimal(context.get(x), x) for x in ("SPY", "QQQ"))
+        or not all(_is_decimal(review.get(x), x) for x in ("relative_performance_vs_SPY", "relative_performance_vs_QQQ"))
+        or not isinstance(sector, Mapping)
+        or not _meaningful(sector.get("sector"))
+        or not _is_decimal(sector.get("relative_performance"), "sector relative_performance")
+    ):
+        gaps.append("actual_spy_qqq_sector_relative_values_missing")
+    if review.get("allowed") is not True or review.get("allowed_exit_reason") not in _EXIT_REASONS or not _meaningful(review.get("allowed_exit_reason_source")):
+        gaps.append("recognized_exit_reason_missing")
     filing = review.get("earnings_guidance_or_filing_check")
-    if not _nonempty(filing) or any(marker in filing.lower() for marker in _INDEX_MARKERS):
-        gaps.append("earnings_guidance_filing_substance_missing")
-    if not _has_accepted_source(sources, category="substance", now=now):
-        gaps.append("accepted_earnings_guidance_filing_source_missing_or_stale")
-    reason = review.get("allowed_exit_reason")
-    reason_source = review.get("allowed_exit_reason_source")
-    if not _nonempty(reason) or not _nonempty(reason_source):
-        gaps.append("recognized_loss_exit_reason_missing")
-    thesis = review.get("current_thesis_status")
-    hold_worse = review.get("why_hold_is_worse_than_sell")
-    if not _nonempty(thesis) or not _nonempty(hold_worse):
-        gaps.append("current_thesis_verdict_missing")
+    if not _meaningful(review.get("current_thesis_status")) or not _meaningful(review.get("why_hold_is_worse_than_sell")) or not _meaningful(review.get("company_specific_negative_news_check")) or not _meaningful(filing) or "submissions index" in filing.lower():
+        gaps.append("meaningful_thesis_news_or_filing_missing")
     try:
-        confidence = Decimal(_canonical_decimal(review.get("confidence"), field_name="supervisor confidence"))
-    except ValueError:
-        confidence = Decimal("0")
-        gaps.append("confidence_missing_or_noncanonical")
-    if confidence < Decimal("0.75"):
-        gaps.append("confidence_below_0_75")
-    generated = review.get("evidence_generated_at")
-    try:
-        observed = _parse_utc(generated, field_name="evidence_generated_at")
-        if observed > now or now - observed > _MAX_EVIDENCE_AGE:
+        if Decimal(_decimal(review.get("confidence"), "supervisor confidence")) < Decimal("0.75"):
+            gaps.append("confidence_below_0_75")
+        observed = _time(review.get("evidence_generated_at"), "supervisor evidence_generated_at")
+        if observed > now or now - observed > _MAX_AGE:
             gaps.append("supervisor_evidence_stale")
     except ValueError:
-        gaps.append("supervisor_evidence_timestamp_invalid")
-    raw_blockers = loss_payload.get("remaining_blockers")
-    if isinstance(raw_blockers, Sequence) and not isinstance(raw_blockers, (str, bytes, bytearray)):
-        non_session = [item for item in raw_blockers if str(item).strip().lower() not in _CLOSED_SESSION]
-        if non_session:
-            gaps.append("remaining_loss_evidence_blockers")
-    elif raw_blockers is not None:
-        gaps.append("remaining_loss_evidence_blockers_invalid")
-    session = str(review.get("market_session") or "").strip().lower()
-    if session in _CLOSED_SESSION:
-        # Closed session prevents execution later but does not invalidate a completed decision.
-        pass
+        gaps.append("supervisor_confidence_or_timestamp_invalid")
+    advisory = payload.get("advisory_analysis")
+    candidate = advisory.get("loss_exit_candidate") if isinstance(advisory, Mapping) else None
+    if (
+        not isinstance(candidate, Mapping)
+        or candidate.get("approval_effect") != "board_review_input_not_loss_exit_approval"
+        or candidate.get("allowed_exit_reason_candidate") != review.get("allowed_exit_reason")
+        or candidate.get("allowed_exit_reason_source") != review.get("allowed_exit_reason_source")
+        or candidate.get("confidence") != review.get("confidence")
+        or not _meaningful(candidate.get("reason_summary"))
+        or candidate.get("reason_summary") != review.get("why_hold_is_worse_than_sell")
+        or advisory.get("current_thesis_status_candidate") != review.get("current_thesis_status")
+    ):
+        gaps.append("advisory_candidate_contradiction")
+    categories: set[str] = set()
+    for source in sources:
+        if not source.verify(root):
+            gaps.append("source_binding_invalid")
+            continue
+        try:
+            _, _, raw = _read_contained(root, source.packet.path, label="source packet")
+            observed = _time(source.as_of, "source as_of")
+        except ValueError:
+            gaps.append("source_binding_invalid")
+            continue
+        if observed > now or now - observed > _MAX_AGE:
+            gaps.append("source_stale")
+        payload_text = json.dumps(raw.get("payload"), sort_keys=True).lower()
+        descriptor = f"{source.source_name} {source.evidence_type}".lower()
+        if any(x in descriptor or x in payload_text for x in ("gap", "connector", "submissions_index", "submissions index")):
+            gaps.append("source_gap_or_index")
+        if source.evidence_type == "market_context":
+            categories.add("market")
+        elif source.evidence_type == "company_news" and _meaningful((raw.get("payload") or {}).get("headline")):
+            categories.add("news")
+        elif source.evidence_type in {"earnings_guidance_filing", "earnings_transcript"} and _meaningful((raw.get("payload") or {}).get("summary")):
+            categories.add("substance")
+    if categories != {"market", "news", "substance"}:
+        gaps.append("required_source_substance_missing")
     return tuple(dict.fromkeys(gaps))
 
 
-def _raw_loss_packet_gaps(loss_packet: Mapping[str, Any], now: dt.datetime) -> tuple[str, ...]:
-    """Validate the authority and freshness envelope around loss payload content."""
-    gaps: list[str] = []
-    if loss_packet.get("analysis_only") is not True:
-        gaps.append("loss_evidence_analysis_only_invalid")
-    if loss_packet.get("execution_authority") != "none":
-        gaps.append("loss_evidence_execution_authority_invalid")
-    if loss_packet.get("can_submit_orders") is not False:
-        gaps.append("loss_evidence_can_submit_orders_invalid")
-    if loss_packet.get("source_name") != "loss_review_evidence" or loss_packet.get("evidence_type") != "loss_review_evidence":
-        gaps.append("loss_evidence_packet_identity_invalid")
-    try:
-        generated = _parse_utc(loss_packet.get("generated_at"), field_name="loss evidence generated_at")
-        if generated > now or now - generated > _MAX_EVIDENCE_AGE:
-            gaps.append("loss_evidence_packet_stale")
-    except ValueError:
-        gaps.append("loss_evidence_packet_timestamp_invalid")
-    return tuple(gaps)
-
-
-def _decision_from_captured(
-    *, supervisor: BoundEvidence, supervisor_payload: Mapping[str, Any], loss: BoundEvidence,
-    loss_payload: Mapping[str, Any], source_revision: str, now: dt.datetime
-) -> AutonomousLossBoardDecision:
-    review_root = _mapping(supervisor_payload.get("evidence")) or {}
-    review = _mapping(review_root.get("loss_exit_review"))
-    if review is None:
-        raise ValueError("supervisor packet does not contain evidence.loss_exit_review")
-    symbol = review.get("symbol")
-    raw_loss_payload = _mapping(loss_payload.get("payload")) or loss_payload
-    loss_symbol = loss_payload.get("symbol", raw_loss_payload.get("symbol"))
-    if not isinstance(symbol, str) or _SYMBOL.fullmatch(symbol) is None or loss_symbol != symbol:
-        raise ValueError("supervisor and loss evidence symbols must exactly match uppercase ticker")
-    supervisor_decision_id = review.get("decision_id")
-    if not _nonempty(supervisor_decision_id):
-        raise ValueError("supervisor decision_id is required")
-    if _REVISION.fullmatch(source_revision) is None:
+def _build(supervisor: BoundEvidence, supervisor_raw: Mapping[str, Any], loss: BoundEvidence, loss_raw: Mapping[str, Any], revision: str, root: Path, now: dt.datetime) -> AutonomousLossBoardDecision:
+    review = ((supervisor_raw.get("evidence") or {}).get("loss_exit_review")) if isinstance(supervisor_raw.get("evidence"), Mapping) else None
+    payload = loss_raw.get("payload") if isinstance(loss_raw.get("payload"), Mapping) else None
+    if (
+        not isinstance(review, Mapping)
+        or not isinstance(payload, Mapping)
+        or not isinstance(review.get("symbol"), str)
+        or _SYMBOL.fullmatch(review["symbol"]) is None
+        or loss_raw.get("symbol") != review["symbol"]
+        or payload.get("symbol") != review["symbol"]
+        or payload.get("supervisor_packet_path") != supervisor.path
+        or payload.get("supervisor_decision_id") != review.get("decision_id")
+    ):
+        raise ValueError("loss packet is not exactly bound to the supervisor decision")
+    if _REVISION.fullmatch(revision) is None:
         raise ValueError("source_revision must be lowercase 40-hex")
-    sources = _source_bindings(raw_loss_payload)
-    gaps = tuple(
-        dict.fromkeys(
-            (*_gaps(review=review, loss_payload=raw_loss_payload, sources=sources, now=now), *_raw_loss_packet_gaps(loss_payload, now))
-        )
-    )
-    confidence = review.get("confidence")
+    sources = _sources(root, payload.get("accepted_sources"), review["symbol"])
+    gaps = list(_semantic_gaps(review, payload, sources, root, now))
+    if loss_raw.get("analysis_only") is not True or loss_raw.get("execution_authority") != "none" or loss_raw.get("can_submit_orders") is not False or loss_raw.get("source_name") != "loss_review_evidence" or loss_raw.get("evidence_type") != "loss_review_evidence":
+        gaps.append("raw_loss_packet_authority_or_identity_invalid")
     try:
-        confidence_text = _canonical_decimal(confidence, field_name="supervisor confidence")
+        loss_generated = _time(loss_raw.get("generated_at"), "loss evidence generated_at")
+        if loss_generated > now or now - loss_generated > _MAX_AGE:
+            gaps.append("raw_loss_packet_stale")
     except ValueError:
-        confidence_text = "0"
-    complete = not gaps
-    sell = complete and Decimal(confidence_text) >= Decimal("0.75")
-    decision = "SELL" if sell else "HOLD"
-    reason_code = "evidence_incomplete" if decision == "HOLD" else "loss_exit_evidence_complete"
-    thesis = review.get("current_thesis_status") or review.get("why_hold_is_worse_than_sell") or "Evidence is incomplete; HOLD remains the safe decision."
-    generated_at = _utc_text(now)
-    expires_at = _utc_text(now + _MAX_EVIDENCE_AGE)
+        gaps.append("raw_loss_packet_timestamp_invalid")
+    gaps = tuple(dict.fromkeys(gaps))
+    confidence = review.get("confidence") if isinstance(review.get("confidence"), str) and _DECIMAL.fullmatch(review["confidence"]) else "0"
+    sell = not gaps and Decimal(confidence) >= Decimal("0.75")
+    generated, expires = now.isoformat(timespec="seconds"), (now + _MAX_AGE).isoformat(timespec="seconds")
     base = {
         "schema_version": SCHEMA_VERSION,
-        "decision": decision,
-        "symbol": symbol,
-        "supervisor_decision_id": supervisor_decision_id,
+        "decision": "SELL" if sell else "HOLD",
+        "symbol": review["symbol"],
+        "supervisor_decision_id": review.get("decision_id"),
         "supervisor_packet": supervisor.compact(),
         "loss_evidence_packet": loss.compact(),
-        "accepted_sources": [item.compact() for item in sources],
-        "source_revision": source_revision,
-        "generated_at": generated_at,
-        "expires_at": expires_at,
-        "thesis_verdict": thesis,
-        "reason_code": reason_code,
-        "confidence": confidence_text,
-        "evidence_complete": complete,
-        "evidence_gaps": list(gaps),
+        "accepted_sources": [x.compact() for x in sources],
+        "source_revision": revision,
+        "generated_at": generated,
+        "expires_at": expires,
+        "thesis_verdict": review.get("current_thesis_status") if _meaningful(review.get("current_thesis_status")) else "Evidence is incomplete; HOLD remains safer.",
+        "reason_code": "loss_exit_evidence_complete" if sell else "evidence_incomplete",
+        "confidence": confidence,
+        "evidence_complete": sell,
+        "evidence_gaps": [] if sell else list(gaps or ("evidence_incomplete",)),
         "trade_decision_resolved": True,
         "exit_allowed": sell,
         "producer_role": "portfolio_executive",
@@ -535,106 +497,84 @@ def _decision_from_captured(
         "execution_authority": "none",
         "can_submit_orders": False,
     }
-    return AutonomousLossBoardDecision.from_dict({"decision_id": hashlib.sha256(_canonical_json_bytes(base)).hexdigest(), **base})
+    return AutonomousLossBoardDecision.from_dict({"decision_id": hashlib.sha256(_canon(base)).hexdigest(), **base})
 
 
-def _write_immutable(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _publish(root: Path, relative: Path, content: bytes) -> Path:
+    target = _inside(root, relative, label="decision evidence")
+    parent = target.parent
+    if parent.exists():
+        if stat.S_ISLNK(parent.lstat().st_mode) or not stat.S_ISDIR(parent.lstat().st_mode):
+            raise ValueError("decision evidence parent is unsafe")
+    else:
+        parent.mkdir(mode=0o700)
+    if stat.S_ISLNK(parent.lstat().st_mode):
+        raise ValueError("decision evidence parent is unsafe")
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, 0o600)
     except FileExistsError:
-        try:
-            existing = path.read_bytes()
-        except OSError as exc:
-            raise ValueError("decision evidence object is unreadable") from exc
-        if existing != content:
-            raise ValueError("decision evidence object conflicts with immutable bytes") from None
-        return
+        state = target.lstat()
+        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode) or target.read_bytes() != content:
+            raise ValueError("immutable decision evidence collision") from None
+        return target
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-    except Exception:
+        directory = os.open(parent, os.O_RDONLY)
+        os.fsync(directory)
+        os.close(directory)
+    except BaseException:
         with suppress(OSError):
-            path.unlink()
+            target.unlink()
         raise
+    return target
 
 
-def record_autonomous_loss_board_decision(
-    *, supervisor_packet_path: str | Path, loss_evidence_packet_path: str | Path,
-    source_revision: str, ledger_root: str | Path, evidence_root: str | Path,
-    now: dt.datetime | None = None,
-) -> RecordedLossBoardDecision:
-    """Record one verified HOLD/SELL decision without granting execution authority."""
-    current = _utc_now(now)
-    root = Path(evidence_root)
-    supervisor, supervisor_payload = _capture_bound_json(supervisor_packet_path, root)
-    loss, loss_payload = _capture_bound_json(loss_evidence_packet_path, root)
-    decision = _decision_from_captured(
-        supervisor=supervisor, supervisor_payload=supervisor_payload, loss=loss,
-        loss_payload=loss_payload, source_revision=source_revision, now=current,
-    )
-    relative_decision_path = Path("autonomous_loss_board_decisions") / f"{decision.decision_id}.json"
-    decision_path = root / relative_decision_path
-    decision_bytes = _canonical_json_bytes({"decision": decision.compact()})
-    _write_immutable(decision_path, decision_bytes)
-    decision_ref = EvidenceRef(
-        path=relative_decision_path.as_posix(),
-        sha256=hashlib.sha256(decision_bytes).hexdigest(),
-        size_bytes=len(decision_bytes),
-    )
+def _after_decision_fsync(_path: Path) -> None:
+    """Test seam: ledger publication starts only after this durable boundary."""
+
+
+def record_autonomous_loss_board_decision(*, supervisor_packet_path: str | Path, loss_evidence_packet_path: str | Path, source_revision: str, ledger_root: str | Path, evidence_root: str | Path, now: dt.datetime | None = None) -> RecordedLossBoardDecision:
+    current, root = _now(now), _root(evidence_root)
+    supervisor, supervisor_raw = _bound(root, supervisor_packet_path, "supervisor packet")
+    loss, loss_raw = _bound(root, loss_evidence_packet_path, "loss evidence packet")
+    decision = _build(supervisor, supervisor_raw, loss, loss_raw, source_revision, root, current)
+    relative = Path("autonomous_loss_board_decisions") / f"{decision.decision_id}.json"
+    content = _canon({"decision": decision.compact()})
+    decision_path = _publish(root, relative, content)
+    _after_decision_fsync(decision_path)
+    refs = (EvidenceRef(path=str(decision_path), sha256=hashlib.sha256(content).hexdigest(), size_bytes=len(content)), EvidenceRef(path=str(root / supervisor.path), sha256=supervisor.sha256, size_bytes=supervisor.size_bytes), EvidenceRef(path=str(root / loss.path), sha256=loss.sha256, size_bytes=loss.size_bytes))
     packet = WorkPacket.create(
         kind="portfolio_decision",
         producer_role="portfolio_executive",
         run_id=decision.decision_id,
         subject=decision.symbol,
-        evidence_refs=(
-            EvidenceRef(
-                path=str(decision_path.resolve()),
-                sha256=decision_ref.sha256,
-                size_bytes=decision_ref.size_bytes,
-            ),
-            EvidenceRef(
-                path=str((root / decision.supervisor_packet.path).resolve()),
-                sha256=decision.supervisor_packet.sha256,
-                size_bytes=decision.supervisor_packet.size_bytes,
-            ),
-            EvidenceRef(
-                path=str((root / decision.loss_evidence_packet.path).resolve()),
-                sha256=decision.loss_evidence_packet.sha256,
-                size_bytes=decision.loss_evidence_packet.size_bytes,
-            ),
-        ),
+        evidence_refs=refs,
         claims=(f"Autonomous loss BOARD resolved {decision.symbol} as {decision.decision}.",),
         assumptions=(),
-        recommendation=("autonomous_sell_authorized_pending_execution_intent" if decision.decision == "SELL" else "autonomous_hold"),
+        recommendation="autonomous_sell_authorized_pending_execution_intent" if decision.decision == "SELL" else "autonomous_hold",
         confidence=float(Decimal(decision.confidence)),
-        expires_at=_parse_utc(decision.expires_at, field_name="expires_at"),
+        expires_at=_time(decision.expires_at, "expires_at"),
         allowed_effects=("record_trade_decision",),
         now=current,
     )
     ledger = DecisionLedger(ledger_root)
     packet_path = ledger.record(packet, evidence_root=root, now=current)
     ledger.verify(evidence_root=root)
-    return RecordedLossBoardDecision(decision=decision, packet=packet, packet_path=packet_path, decision_evidence_path=decision_path)
+    return RecordedLossBoardDecision(decision, packet, packet_path, decision_path)
 
 
-def verify_autonomous_loss_board_decision(
-    decision_evidence_path: str | Path, *, evidence_root: str | Path, now: dt.datetime | None = None
-) -> AutonomousLossBoardDecision:
-    """Verify canonical bytes and every immutable evidence binding for a decision."""
-    _utc_now(now)
-    root = Path(evidence_root).resolve()
-    path = Path(decision_evidence_path).resolve()
-    try:
-        path.relative_to(root)
-        payload = json.loads(path.read_bytes())
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("decision evidence is unreadable or invalid JSON") from exc
-    if not isinstance(payload, Mapping) or set(payload) != {"decision"} or not isinstance(payload["decision"], Mapping):
-        raise ValueError("decision evidence payload is invalid")
-    decision = AutonomousLossBoardDecision.from_dict(payload["decision"])
-    if not decision.supervisor_packet.verify(root) or not decision.loss_evidence_packet.verify(root):
+def verify_autonomous_loss_board_decision(decision_evidence_path: str | Path, *, evidence_root: str | Path, now: dt.datetime | None = None) -> AutonomousLossBoardDecision:
+    current, root = _now(now), _root(evidence_root)
+    _, content, raw = _read_contained(root, decision_evidence_path, label="decision evidence")
+    if set(raw) != {"decision"} or not isinstance(raw["decision"], Mapping) or content != _canon(raw):
+        raise ValueError("decision evidence is not exact canonical bytes")
+    decision = AutonomousLossBoardDecision.from_dict(raw["decision"])
+    generated, expires = _time(decision.generated_at, "generated_at"), _time(decision.expires_at, "expires_at")
+    if not generated <= current < expires:
+        raise ValueError("decision is not currently valid")
+    if not decision.supervisor_packet.verify(root) or not decision.loss_evidence_packet.verify(root) or not all(item.verify(root) for item in decision.accepted_sources):
         raise ValueError("bound evidence verification failed")
     return decision
