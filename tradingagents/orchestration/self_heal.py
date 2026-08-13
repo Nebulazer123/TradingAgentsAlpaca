@@ -436,13 +436,7 @@ def _strict_board_projection(
         or not loss_packet["packet_id"]
     ):
         return False
-    source_digest = hashlib.sha256(
-        json.dumps(
-            [source.compact() for source in verified.accepted_sources],
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+    source_digest = _accepted_sources_digest(verified.accepted_sources)
     expected_receipt = {
         "decision_evidence": {
             "path": decision_ref.path,
@@ -464,6 +458,20 @@ def _strict_board_projection(
         "accepted_source_count": len(verified.accepted_sources),
     }
     if any(projected.get(key) != value for key, value in expected_receipt.items()):
+        return False
+    redundant_paths = {
+        "ledger_packet_path": str(
+            evidence_root.parent
+            / DEFAULT_BOARD_LEDGER_ROOT
+            / "packets"
+            / f"{ledger_packet_id}.json"
+        ),
+        "decision_evidence_path": decision_ref.path,
+    }
+    if any(
+        key in projected and projected.get(key) != value
+        for key, value in redundant_paths.items()
+    ):
         return False
     expected_loss = {
         "symbol": verified.symbol,
@@ -508,11 +516,23 @@ def _strict_board_projection(
     )
 
 
+def _accepted_sources_digest(sources: Any) -> str:
+    """Match the producer's canonical Unicode JSON digest for source receipts."""
+    return hashlib.sha256(
+        json.dumps(
+            [source.compact() for source in sources],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _authenticated_latest_board_decision(
     repo_root: Path,
     *,
     now: dt.datetime | None = None,
-) -> dict[str, str] | None:
+) -> dict[str, Any] | None:
     """Read one fixed BOARD reference and authenticate it through the ledger.
 
     A self-heal signal is not allowed to nominate a decision file, ledger, or
@@ -558,6 +578,17 @@ def _authenticated_latest_board_decision(
         "decision": verified.decision,
         "decision_id": verified.decision_id,
         "ledger_packet_id": ledger_packet_id,
+        "symbol": verified.symbol,
+        "board_path": str(board_path.resolve()),
+        "board_sha256": hashlib.sha256(board_raw).hexdigest(),
+        "board_size_bytes": len(board_raw),
+        "supervisor_packet": {
+            "path": verified.supervisor_packet.path,
+            "sha256": verified.supervisor_packet.sha256,
+            "size_bytes": verified.supervisor_packet.size_bytes,
+            "decision_id": verified.supervisor_decision_id,
+            "symbol": verified.symbol,
+        },
     }
 
 
@@ -598,6 +629,62 @@ def _is_execution_board_packet(
         and packet.get("can_submit_orders") is False
         and packet.get("execution_authority") == "none"
         and isinstance(packet.get("autonomous_loss_decision"), Mapping)
+    )
+
+
+def _board_decision_matches_trigger(
+    authenticated: Mapping[str, Any],
+    trigger: Mapping[str, Any],
+    *,
+    root: Path,
+) -> bool:
+    """Bind a resolved BOARD decision to the exact signal that raised it."""
+    symbol = trigger.get("symbol")
+    if symbol is not None and (
+        not isinstance(symbol, str)
+        or not symbol.strip()
+        or symbol.strip().upper() != authenticated.get("symbol")
+    ):
+        return False
+    raw_path = trigger.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return False
+    candidate = Path(raw_path)
+    trigger_path = (
+        candidate.resolve()
+        if candidate.is_absolute()
+        else (root / candidate).resolve()
+    )
+    try:
+        trigger_path.relative_to(root)
+    except ValueError:
+        return False
+    # The canonical BOARD bytes were captured and parsed exactly once by
+    # `_authenticated_latest_board_decision`; do not re-open that mutable file
+    # merely to repeat the trigger check.
+    if trigger_path == Path(str(authenticated.get("board_path"))).resolve():
+        return True
+    captured = _captured_signal_packet(trigger, root=root)
+    if captured is None:
+        return False
+    path, raw, packet = captured
+    supervisor = authenticated.get("supervisor_packet")
+    if not isinstance(supervisor, Mapping):
+        return False
+    expected_path = (root / DEFAULT_BOARD_EVIDENCE_ROOT / str(supervisor.get("path") or "")).resolve()
+    if path != expected_path:
+        return False
+    if (
+        len(raw) != supervisor.get("size_bytes")
+        or hashlib.sha256(raw).hexdigest() != supervisor.get("sha256")
+    ):
+        return False
+    evidence = packet.get("evidence")
+    review = evidence.get("loss_exit_review") if isinstance(evidence, Mapping) else None
+    return (
+        isinstance(review, Mapping)
+        and review.get("symbol") == supervisor.get("symbol")
+        and review.get("decision_id") == supervisor.get("decision_id")
     )
 
 
@@ -5471,9 +5558,14 @@ def _classify_self_heal_signal(
         return signal
     recovery_signal = classify_recovery_signal(trigger)
     if recovery_signal["classification"] == "business_decision_pending":
+        decision_root = repo_root or Path(".")
         authenticated = _authenticated_latest_board_decision(
-            repo_root or Path("."), now=now
+            decision_root, now=now
         )
+        if authenticated is not None and not _board_decision_matches_trigger(
+            authenticated, trigger, root=decision_root
+        ):
+            authenticated = None
         common = {
             "owner_role": "portfolio_executive",
             "recipe": None,

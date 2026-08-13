@@ -4453,6 +4453,11 @@ def test_board_decision_never_dispatches_recovery_or_changes_frozen_control(
         "coordinate_verified_recovery",
         lambda **kwargs: recovery_calls.append(kwargs),
     )
+    monkeypatch.setattr(
+        self_heal_module,
+        "_board_decision_matches_trigger",
+        lambda *_args, **_kwargs: True,
+    )
 
     plan = self_heal_module.build_self_heal_plan(tmp_path, now=NOW)
     signal = plan["signals"][0]
@@ -4547,6 +4552,107 @@ def test_real_ledger_bound_board_hold_resolves_without_recovery_side_effects(
     assert control_path.read_bytes() == frozen_before
     assert not (tmp_path / "results" / "control_plane" / "recovery").exists()
     assert not (tmp_path / "results" / "control_plane" / "rearm_receipts").exists()
+
+
+def test_authenticated_board_decision_requires_matching_trigger_symbol_and_provenance(
+    tmp_path: Path,
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path, symbol="TSM")
+    board_trigger = {
+        "label": "execution_board_review",
+        "reason": "board_review",
+        "symbol": "TSM",
+        "path": str(fixture["board_path"].relative_to(tmp_path)),
+    }
+    supervisor_trigger = {
+        "label": "hourly",
+        "reason": "board_review",
+        "symbol": "TSM",
+        "path": "results/hourly_supervisor/hourly.json",
+    }
+
+    for trigger in (board_trigger, supervisor_trigger):
+        signal = self_heal_module._classify_self_heal_signal(
+            trigger, prior_signatures=set(), repo_root=tmp_path, now=NOW
+        )
+        assert signal["classification"] == "resolved_no_action"
+
+    for bad_symbol in ("NFLX", "AAPL"):
+        signal = self_heal_module._classify_self_heal_signal(
+            {**board_trigger, "symbol": bad_symbol},
+            prior_signatures=set(),
+            repo_root=tmp_path,
+            now=NOW,
+        )
+        assert signal["classification"] == "business_decision_pending"
+        assert signal["decision_reference"] is None
+
+    copied_hourly = _write_json_packet(
+        tmp_path / "results" / "hourly_supervisor" / "copied.json",
+        json.loads((tmp_path / "results" / "hourly_supervisor" / "hourly.json").read_bytes()),
+    )
+    signal = self_heal_module._classify_self_heal_signal(
+        {**supervisor_trigger, "path": str(copied_hourly.relative_to(tmp_path))},
+        prior_signatures=set(),
+        repo_root=tmp_path,
+        now=NOW,
+    )
+    assert signal["classification"] == "business_decision_pending"
+    assert signal["decision_reference"] is None
+
+
+def test_unexpected_redundant_board_paths_are_rejected(tmp_path: Path) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    board = fixture["board"]
+    board["autonomous_loss_decision"]["ledger_packet_path"] = "/not/a/ledger/object"
+    _write_json_packet(fixture["board_path"], board)
+
+    signal = self_heal_module._classify_self_heal_signal(
+        {
+            "label": "execution_board_review",
+            "reason": "board_review",
+            "symbol": "TSM",
+            "path": str(fixture["board_path"].relative_to(tmp_path)),
+        },
+        prior_signatures=set(),
+        repo_root=tmp_path,
+        now=NOW,
+    )
+
+    assert signal["classification"] == "business_decision_pending"
+
+
+def test_unicode_accepted_source_digest_uses_producer_canonical_encoding(
+    tmp_path: Path,
+) -> None:
+    fixture = _record_strict_hold_board(tmp_path)
+    source = {
+        "packet": {"path": "sources/évidence.json", "sha256": "a" * 64, "size_bytes": 1},
+        "packet_id": "source-unicode",
+        "source_name": "résumé",
+        "evidence_type": "company_news",
+        "as_of": NOW.isoformat(),
+        "quality": "high",
+    }
+    class Source:
+        def compact(self) -> dict:
+            return source
+
+    digest = self_heal_module._accepted_sources_digest((Source(),))
+    expected = hashlib.sha256(
+        json.dumps(
+            [source], sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    ).hexdigest()
+    escaped_digest = hashlib.sha256(
+        json.dumps(
+            [source], sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    ).hexdigest()
+
+    assert digest == expected
+    assert digest != escaped_digest
+    assert fixture["decision"].accepted_sources == ()
 
 
 @pytest.mark.parametrize(
