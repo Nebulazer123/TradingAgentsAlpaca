@@ -1405,10 +1405,10 @@ def test_freeze_winning_the_control_lock_prevents_all_owned_broker_io(
     assert client.session.requests == []
 
 
-def test_committed_order_survives_later_freeze_without_holding_control_lock_for_io(
+def test_committed_order_is_denied_by_later_freeze_without_holding_control_lock_for_io(
     tmp_path, monkeypatch
 ):
-    """A freeze after commitment observes it promptly; only that order may finish."""
+    """A freeze after commitment observes it promptly and blocks the pending POST."""
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
         tmp_path, monkeypatch
     )
@@ -1442,20 +1442,31 @@ def test_committed_order_survives_later_freeze_without_holding_control_lock_for_
     client = _fake_live_client(
         root, repo_root=repo_root, session=session, clock=lambda: activated_at
     )
-    response = client.submit_order(
-        _bound_normal_live_order(intent),
-        authorized_normal_trade_intent=intent,
-        activation_receipt=receipt,
-        supervisor_admission=_normal_live_admission(
-            tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
-            activated_at=activated_at,
-        ),
-    )
+    with pytest.raises(
+        ValueError,
+        match="live control state is frozen: freeze after exact commitment",
+    ):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
 
-    assert response["client_order_id"] == intent.client_order_id
-    assert session.post_calls == 1
+    assert freeze_complete.is_set()
+    assert session.post_calls == 0
     control = json.loads(control_path.read_text(encoding="utf-8"))
     assert control["frozen"] is True
+    commitments = control["normal_live_submission_commitments"]
+    assert commitments[0]["client_order_id"] == intent.client_order_id
+    assert commitments[0]["outcome"] is None
     assert control["normal_live_freeze_observed_committed_client_order_ids"] == [
         intent.client_order_id
     ]
@@ -2090,10 +2101,10 @@ def test_live_client_get_only_retry_does_not_record_the_same_order_twice(
     assert [request[0] for request in client.session.requests].count("GET") >= 3
 
 
-def test_live_client_preserves_a_prior_control_commitment_after_freeze(
+def test_live_client_preserves_prior_commitment_but_denies_after_freeze(
     tmp_path, monkeypatch
 ):
-    """A later freeze cannot erase an exact order committed before broker I/O."""
+    """A later freeze preserves the exact commitment but still denies the POST."""
     root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
         tmp_path, monkeypatch
     )
@@ -2119,25 +2130,31 @@ def test_live_client_preserves_a_prior_control_commitment_after_freeze(
         root, repo_root=repo_root, session=session, clock=lambda: activated_at
     )
 
-    response = client.submit_order(
-        _bound_normal_live_order(intent),
-        authorized_normal_trade_intent=intent,
-        activation_receipt=receipt,
-        supervisor_admission=_normal_live_admission(
-            tmp_path,
-            monkeypatch,
-            root=root,
-            intent=intent,
-            receipt=receipt,
-            activated_at=activated_at,
-        ),
-    )
+    with pytest.raises(
+        ValueError,
+        match="live control state is frozen: post-lookup test freeze",
+    ):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
 
-    assert response["client_order_id"] == intent.client_order_id
     assert [request[0] for request in session.requests].count("GET") >= 1
-    assert session.post_calls == 1
+    assert session.post_calls == 0
     frozen_state = json.loads(control_path.read_text(encoding="utf-8"))
     assert frozen_state["frozen"] is True
+    commitments = frozen_state["normal_live_submission_commitments"]
+    assert commitments[0]["client_order_id"] == intent.client_order_id
+    assert commitments[0]["outcome"] is None
     assert frozen_state[
         "normal_live_freeze_observed_committed_client_order_ids"
     ] == [intent.client_order_id]
