@@ -168,6 +168,37 @@ def test_loss_review_news_fallback_exhaustion_keeps_hold_candidate_unadmitted(mo
     assert not loss_review_news_packet_is_admissible(result.packets[0], now=now)
 
 
+def test_loss_review_collection_does_not_reject_a_native_packet_crossing_the_start_second(
+    monkeypatch, tmp_path
+):
+    """Routing time is not authority time; post-fetch evaluation owns freshness."""
+    started = datetime.datetime(2026, 8, 13, 14, 54, 59, tzinfo=datetime.timezone.utc)
+    authority = datetime.datetime(2026, 8, 13, 14, 55, 1, tzinfo=datetime.timezone.utc)
+    config_path = tmp_path / "fallbacks.json"
+    config_path.write_text(
+        json.dumps({
+            "policy": {"forbidden_effects": []},
+            "fallbacks": {"market_news": [{
+                "source_name": "finnhub", "route": "dataflow:finnhub", "cost_tier": "free", "priority": 1,
+            }]},
+        }), encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        orchestrator, "fetch_finnhub_company_news",
+        lambda *_args, **_kwargs: _strict_loss_news_packet(
+            "finnhub", as_of="2026-08-13T14:55:00+00:00",
+            item={"datetime": 1786632840, "headline": "Oracle cuts guidance", "summary": "Revenue guidance cut by 8%.", "url": "https://issuer.test/crossed-second"},
+        ),
+    )
+    result = build_ticker_provider_research_packets(
+        "ORCL", evidence_needs=("market_news",), provider_config_path=config_path,
+        cache_dir=tmp_path / "cache", now=started, require_admissible_loss_news=True,
+    )
+    assert [packet.source_name for packet in result.packets] == ["finnhub"]
+    assert loss_review_news_packet_is_admissible(result.packets[0], now=authority)
+    assert len(result.route_attempts) == 1
+
+
 def test_configured_quote_contract_accepts_real_finnhub_fmp_and_yfinance_shapes():
     assert configured_quote_components(
         source_name="finnhub", evidence_type="quote", expected_symbol="ORCL",

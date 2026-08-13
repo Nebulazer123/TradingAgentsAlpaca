@@ -1253,6 +1253,9 @@ def research_loss_review_evidence(
         for need in evidence_needs.split(",")
         if need and need.strip()
     )
+    # This drives request windows/cache routing only.  Decision authority is
+    # evaluated once all provider calls have returned, below.
+    refresh_started_at = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
     # One read-only broker clock is captured for the entire refresh.  The
     # immutable evidence packet binds the exact response; no historical
     # supervisor session label can silently become current decision authority.
@@ -1268,8 +1271,7 @@ def research_loss_review_evidence(
             raw_clock = {"invalid_clock_response": type(raw_response).__name__}
     except Exception as exc:  # noqa: BLE001 - a clock read failure must HOLD, never abort research.
         raw_clock = {"clock_error": type(exc).__name__}
-    refresh_now = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
-    captured_at = refresh_now.isoformat(timespec="seconds")
+    captured_at = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
     raw_timestamp = raw_clock.get("timestamp") if isinstance(raw_clock, Mapping) else None
     try:
         parsed_timestamp = datetime.datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
@@ -1303,7 +1305,7 @@ def research_loss_review_evidence(
             if source_quality_ordering and source_quality_review_path.exists()
             else None
         ),
-        now=refresh_now,
+        now=refresh_started_at,
     )
     source_packet_paths = {
         packet.packet_id: write_research_packet(packet, source_output_dir)
@@ -1314,6 +1316,10 @@ def research_loss_review_evidence(
         if result.summary_packet is not None
         else None
     )
+    # One post-fetch authority instant evaluates every diagnostic packet.  It
+    # is deliberately not the routing-start time and is not a source packet's
+    # own timestamp, so stale/future evidence cannot self-qualify.
+    authority_now = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
     packet = build_loss_review_evidence_packet(
         hourly_packet_path=hourly_packet_path,
         hourly_packet=hourly_packet,
@@ -1322,7 +1328,7 @@ def research_loss_review_evidence(
         source_packet_paths=source_packet_paths,
         decision_evidence_root=CANONICAL_BOARD_EVIDENCE_ROOT,
         market_clock=market_clock,
-        now=refresh_now,
+        now=authority_now,
     )
     packet_path = write_research_packet(packet, output_dir)
     payload = packet.model_dump()

@@ -920,6 +920,20 @@ def test_finnhub_uses_header_token_without_packet_leakage():
     assert packet.symbol == "MSFT"
 
 
+@pytest.mark.parametrize("vendor_time", [1786632840, "1786632840"])
+def test_finnhub_company_news_numeric_epoch_becomes_canonical_vendor_as_of(vendor_time):
+    session = FakeSession(
+        [{"datetime": vendor_time, "headline": "Issuer update", "url": "https://issuer.test/news"}]
+    )
+    packet = finnhub.fetch_finnhub_company_news(
+        "ORCL", from_date="2026-08-10", to_date="2026-08-13",
+        api_key="finnhub-secret", session=session,
+    )
+    assert packet.as_of == "2026-08-13T14:54:00+00:00"
+    assert packet.freshness["as_of"] == packet.as_of
+    assert packet.payload["data"][0]["datetime"] == vendor_time
+
+
 def test_fmp_massive_and_marketaux_strip_query_tokens():
     fmp_session = FakeSession({"data": [{"symbol": "AAPL"}], "apikey": "echo-secret"})
     massive_session = FakeSession({"results": {"ticker": "AAPL"}, "apiKey": "echo-secret"})

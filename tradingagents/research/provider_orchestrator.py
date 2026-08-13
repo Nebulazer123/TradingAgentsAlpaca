@@ -1457,6 +1457,7 @@ def build_ticker_provider_research_packets(
     broker_snapshot_dir: str | Path = DEFAULT_BROKER_SNAPSHOT_DIR,
     source_quality_review_path: str | Path | None = None,
     now: datetime.datetime | None = None,
+    authority_now: datetime.datetime | None = None,
     require_admissible_quote: bool = False,
     require_admissible_loss_news: bool = False,
 ) -> TickerProviderResearchResult:
@@ -1507,7 +1508,14 @@ def build_ticker_provider_research_packets(
                 ) and (
                     not require_admissible_loss_news
                     or evidence_need != "market_news"
-                    or loss_review_news_packet_is_admissible(packet, now=now)
+                    # Collection begins before all network reads finish.  Do
+                    # not reject an observation simply because it crossed a
+                    # second boundary after the run began; with no authority
+                    # instant yet, retain it diagnostically and keep routing.
+                    or (
+                        authority_now is not None
+                        and loss_review_news_packet_is_admissible(packet, now=authority_now)
+                    )
                 ):
                     written_for_need += 1
                 if written_for_need >= max(1, int(max_packets_per_need)):
@@ -1579,7 +1587,10 @@ def build_ticker_provider_research_packets(
             ) and (
                 not require_admissible_loss_news
                 or evidence_need != "market_news"
-                or loss_review_news_packet_is_admissible(packet, now=now)
+                or (
+                    authority_now is not None
+                    and loss_review_news_packet_is_admissible(packet, now=authority_now)
+                )
             ):
                 written_for_need += 1
             if written_for_need >= max(1, int(max_packets_per_need)):

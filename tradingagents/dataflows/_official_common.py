@@ -760,14 +760,41 @@ def validate_official_path(value: str, *, allowed_prefixes: tuple[str, ...]) -> 
 
 
 def extract_payload_timestamp(payload: dict[str, Any], candidate_keys: tuple[str, ...]) -> str | None:
+    """Return a provider timestamp without turning numeric epochs into ``now``.
+
+    Finnhub company-news items use numeric epoch seconds.  Preserve normal
+    textual provider timestamps verbatim here, but normalize numeric epochs to
+    the common UTC whole-second form so an evidence wrapper reflects the
+    vendor observation rather than its post-network serialization time.
+    """
+    def timestamp(value: Any) -> str | None:
+        raw: float | None = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            raw = float(value)
+        elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+(?:\.\d+)?", value.strip()):
+            try:
+                raw = float(value.strip())
+            except ValueError:
+                return None
+        elif isinstance(value, str) and value.strip():
+            return value.strip()
+        if raw is None:
+            return None
+        try:
+            return datetime.datetime.fromtimestamp(raw, tz=UTC).replace(microsecond=0).isoformat(timespec="seconds")
+        except (OverflowError, OSError, ValueError):
+            return None
+
     lowered_keys = {key.lower() for key in candidate_keys}
     stack: list[Any] = [payload]
     while stack:
         current = stack.pop()
         if isinstance(current, dict):
             for key, value in current.items():
-                if key.lower() in lowered_keys and isinstance(value, str) and value.strip():
-                    return value.strip()
+                if key.lower() in lowered_keys:
+                    parsed = timestamp(value)
+                    if parsed is not None:
+                        return parsed
                 if isinstance(value, (dict, list)):
                     stack.append(value)
         elif isinstance(current, list):
