@@ -154,3 +154,28 @@ included in both projections.  Joint Task 2 and Task 3 verification passed:
 ruff check: All checks passed
 git diff --check: passed
 ```
+
+## Producer cleanup round 2
+
+The BOARD projection now has one authenticated decision-evidence binding and
+one ledger packet ID.  Redundant, separately restated `ledger_packet_path` and
+top-level `decision_evidence_path` fields were removed so they cannot drift
+from the nested ledger evidence reference.
+
+The accepted-source-list digest remains exactly SHA-256 over UTF-8 canonical
+JSON with sorted keys, compact separators, and `ensure_ascii=false`.  A BOARD
+round-trip test with the Unicode source identity `notícias_東京` proves that the
+emitted digest is computed from the authenticated accepted-source list without
+ASCII-escape drift.
+
+Task 2 verification:
+
+```text
+110 passed in 1.53s
+ruff check: All checks passed
+git diff --check: passed
+```
+
+The concurrent Task 3 suite had two self-heal classification failures while
+its trigger-binding repair was still in progress; those files were left to the
+Task 3 owner and were not included in this Task 2 commit.

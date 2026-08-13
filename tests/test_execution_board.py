@@ -81,6 +81,56 @@ def _write_exact_incomplete_loss_evidence(tmp_path):
     return hourly, evidence_dir, hourly_path, loss_path
 
 
+def _add_unicode_bound_source(tmp_path, loss_path):
+    source_path = _write_packet(
+        tmp_path / "sources",
+        "unicode.json",
+        {
+            "packet_id": "source-unicode-1",
+            "source_name": "notícias_東京",
+            "evidence_type": "company_context_advisory",
+            "subject": "TSM",
+            "symbol": "TSM",
+            "as_of": "2026-08-13T15:00:00+00:00",
+            "quality": "medium",
+            "payload": {
+                "symbol": "TSM",
+                "as_of": "2026-08-13T15:00:00+00:00",
+            },
+        },
+    )
+    source_bytes = source_path.read_bytes()
+    descriptor = {
+        "path": source_path.relative_to(tmp_path).as_posix(),
+        "sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "size_bytes": len(source_bytes),
+        "packet_id": "source-unicode-1",
+        "source_name": "notícias_東京",
+        "evidence_type": "company_context_advisory",
+        "as_of": "2026-08-13T15:00:00+00:00",
+        "quality": "medium",
+    }
+    loss = json.loads(loss_path.read_text(encoding="utf-8"))
+    loss["payload"]["accepted_sources"] = [descriptor]
+    loss_path.write_text(json.dumps(loss), encoding="utf-8")
+    compact = {
+        "packet": {
+            key: descriptor[key] for key in ("path", "sha256", "size_bytes")
+        },
+        **{
+            key: descriptor[key]
+            for key in (
+                "packet_id",
+                "source_name",
+                "evidence_type",
+                "as_of",
+                "quality",
+            )
+        },
+    }
+    return compact
+
+
 def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
     hourly, evidence_dir, hourly_path, loss_path = _write_exact_incomplete_loss_evidence(tmp_path)
     ledger_root = tmp_path.parent / "installed-decision-ledger"
@@ -112,11 +162,11 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
     assert decision["source_revision"] == "1" * 40
     assert decision["accepted_source_count"] == 0
     assert decision["accepted_sources_sha256"] == hashlib.sha256(b"[]").hexdigest()
-    assert decision["decision_evidence"] == {
-        "path": decision["decision_evidence_path"],
-        "sha256": decision["decision_evidence"]["sha256"],
-        "size_bytes": decision["decision_evidence"]["size_bytes"],
-    }
+    assert "ledger_packet_path" not in decision
+    assert "decision_evidence_path" not in decision
+    assert decision["decision_evidence"]["path"].endswith(
+        f"autonomous_loss_board_decisions/{decision['decision_id']}.json"
+    )
     assert len(decision["decision_evidence"]["sha256"]) == 64
     assert decision["supervisor_packet"]["path"] == str(hourly_path)
     assert decision["loss_evidence_packet"]["path"] == str(loss_path)
@@ -159,6 +209,35 @@ def test_execution_board_records_an_immutable_autonomous_hold(tmp_path):
     assert compact["loss_review_evidence"]["source_binding"] == review[
         "loss_review_evidence"
     ]["source_binding"]
+
+
+def test_execution_board_uses_unicode_safe_canonical_accepted_source_digest(tmp_path):
+    hourly, evidence_dir, _hourly_path, loss_path = _write_exact_incomplete_loss_evidence(
+        tmp_path
+    )
+    compact_source = _add_unicode_bound_source(tmp_path, loss_path)
+
+    review = build_execution_board_review(
+        hourly,
+        loss_review_evidence_dir=evidence_dir,
+        decision_evidence_root=tmp_path,
+        decision_ledger_root=tmp_path.parent / "unicode-decision-ledger",
+        source_revision="2" * 40,
+        now=datetime(2026, 8, 13, 15, 1, tzinfo=UTC),
+    )
+
+    decision = review["autonomous_loss_decision"]
+    expected = hashlib.sha256(
+        json.dumps(
+            [compact_source],
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    assert decision["decision"] == "HOLD"
+    assert decision["accepted_source_count"] == 1
+    assert decision["accepted_sources_sha256"] == expected
 
 
 def test_execution_board_cli_does_not_expose_mutable_decision_roots():

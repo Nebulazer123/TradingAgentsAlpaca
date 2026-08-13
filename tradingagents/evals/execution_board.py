@@ -364,8 +364,6 @@ def _record_loss_board_decision(
         "decision": decision.decision,
         "decision_id": decision.decision_id,
         "ledger_packet_id": recorded.packet.packet_id,
-        "ledger_packet_path": str(recorded.packet_path),
-        "decision_evidence_path": str(recorded.decision_evidence_path),
         "decision_evidence": {
             "path": decision_ref.path,
             "sha256": decision_ref.sha256,
