@@ -596,42 +596,61 @@ def _captured_signal_packet(
     signal: Mapping[str, Any], *, root: Path
 ) -> tuple[Path, bytes, Mapping[str, Any]] | None:
     """Capture one declared signal packet without letting it escape the repo."""
-    root = root.resolve()
-    raw_path = signal.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
+    path = _safe_lexical_trigger_file(signal, root=root)
+    if path is None:
         return None
-    candidate = Path(raw_path)
-    supplied = candidate if candidate.is_absolute() else root / candidate
     try:
-        supplied_state = supplied.lstat()
-        if stat.S_ISLNK(supplied_state.st_mode) or not stat.S_ISREG(
-            supplied_state.st_mode
-        ):
-            return None
-        resolved = supplied.resolve()
-        resolved.relative_to(root)
-        captured = resolved.read_bytes()
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            captured = handle.read()
         decoded = json.loads(captured)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
-    return (resolved, captured, decoded) if isinstance(decoded, Mapping) else None
+    return (path, captured, decoded) if isinstance(decoded, Mapping) else None
+
+
+def _safe_lexical_trigger_file(
+    signal: Mapping[str, Any], *, root: Path
+) -> Path | None:
+    """Return a contained regular file only when no lexical component is a symlink."""
+    raw_path = signal.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return None
+    return _safe_lexical_file_path(raw_path, root=root)
+
+
+def _safe_lexical_file_path(raw_path: str, *, root: Path) -> Path | None:
+    """Validate a compact/raw path lexically before any resolving operation."""
+    root = root.resolve()
+    candidate = Path(raw_path)
+    supplied = candidate if candidate.is_absolute() else root / candidate
+    # ``abspath`` normalizes dots but intentionally does not resolve symlinks.
+    lexical = Path(os.path.abspath(str(supplied)))
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError:
+        return None
+    current = root
+    try:
+        for index, part in enumerate(relative.parts):
+            current /= part
+            state = current.lstat()
+            if stat.S_ISLNK(state.st_mode):
+                return None
+            if index < len(relative.parts) - 1:
+                if not stat.S_ISDIR(state.st_mode):
+                    return None
+            elif not stat.S_ISREG(state.st_mode):
+                return None
+    except OSError:
+        return None
+    return lexical
 
 
 def _regular_non_symlink_trigger_path(trigger: Mapping[str, Any], *, root: Path) -> Path | None:
-    raw_path = trigger.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return None
-    candidate = Path(raw_path)
-    supplied = candidate if candidate.is_absolute() else root / candidate
-    try:
-        state = supplied.lstat()
-        if stat.S_ISLNK(state.st_mode) or not stat.S_ISREG(state.st_mode):
-            return None
-        resolved = supplied.resolve()
-        resolved.relative_to(root.resolve())
-    except (OSError, ValueError):
-        return None
-    return resolved
+    return _safe_lexical_trigger_file(trigger, root=root)
 
 
 def _is_execution_board_packet(
@@ -700,6 +719,7 @@ def _compact_trigger_raw_path(
         return None
     if (
         compact.get("schema") != expected_schema
+        or compact.get("analysis_only") is not True
         or compact.get("can_submit_orders") is not False
         or compact.get("execution_authority") != "none"
     ):
@@ -709,12 +729,9 @@ def _compact_trigger_raw_path(
     raw_value = compact.get("raw_packet_path")
     if not isinstance(raw_value, str) or not raw_value.strip():
         return None
-    raw_candidate = Path(raw_value)
-    raw_path = (
-        raw_candidate.resolve()
-        if raw_candidate.is_absolute()
-        else (root / raw_candidate).resolve()
-    )
+    raw_path = _safe_lexical_file_path(raw_value, root=root)
+    if raw_path is None:
+        return None
     results_root = _contained_canonical_path(root, DEFAULT_BOARD_EVIDENCE_ROOT)
     if results_root is None:
         return None
@@ -743,11 +760,14 @@ def _board_decision_matches_trigger(
     trigger_path = _regular_non_symlink_trigger_path(trigger, root=root)
     if trigger_path is None:
         return False
+    label = trigger.get("label")
+    if label not in {"hourly", "execution_board_review"}:
+        return False
     # The canonical BOARD bytes were captured and parsed exactly once by
     # `_authenticated_latest_board_decision`; do not re-open that mutable file
     # merely to repeat the trigger check.
     if trigger_path == Path(str(authenticated.get("board_path"))).resolve():
-        return True
+        return label == "execution_board_review"
     captured = _captured_signal_packet(trigger, root=root)
     if captured is None:
         return False
@@ -764,7 +784,12 @@ def _board_decision_matches_trigger(
             root,
             DEFAULT_BOARD_EVIDENCE_ROOT / str(supervisor.get("path") or ""),
         )
-        if compact_raw_path not in {expected_board_path, expected_supervisor_path}:
+        expected_raw_path = (
+            expected_board_path
+            if label == "execution_board_review"
+            else expected_supervisor_path
+        )
+        if compact_raw_path != expected_raw_path:
             return False
         raw_trigger = dict(trigger)
         raw_trigger["path"] = str(compact_raw_path)
@@ -779,6 +804,8 @@ def _board_decision_matches_trigger(
     expected_board_path = Path(str(authenticated.get("board_path"))).resolve()
     if path == expected_board_path:
         return (
+            label == "execution_board_review"
+            and
             len(raw) == authenticated.get("board_size_bytes")
             and hashlib.sha256(raw).hexdigest() == authenticated.get("board_sha256")
             and packet.get("kind") == "execution_board_review"
@@ -793,6 +820,8 @@ def _board_decision_matches_trigger(
         root, DEFAULT_BOARD_EVIDENCE_ROOT / str(supervisor.get("path") or "")
     )
     if expected_path is None:
+        return False
+    if label != "hourly":
         return False
     if path != expected_path:
         return False
