@@ -16,6 +16,7 @@ from tradingagents.brokers.manual_action_attribution import (
     replay_suppression_key,
     write_owner_manual_action_attribution,
 )
+from tradingagents.evals.execution_board import compact_execution_board_review
 from tradingagents.orchestration import recovery as recovery_module
 from tradingagents.orchestration import self_heal as self_heal_module
 from tradingagents.orchestration.authority import (
@@ -212,27 +213,14 @@ def _write_bound_board_compact(tmp_path: Path, fixture: dict) -> Path:
     )
     full_bytes = fixture["board_path"].read_bytes()
     full_path.write_bytes(full_bytes)
+    compact = compact_execution_board_review(
+        fixture["board"],
+        raw_packet_path=full_path.relative_to(tmp_path),
+        raw_packet_sha256=hashlib.sha256(full_bytes).hexdigest(),
+    )
     return _write_json_packet(
         tmp_path / "results" / "execution_board" / "latest-compact.json",
-        {
-            "schema": "autonomous_loss_board_sidecar_v1",
-            "generated_at": NOW.isoformat(),
-            "raw_packet_path": str(full_path.relative_to(tmp_path)),
-            "raw_packet_sha256": hashlib.sha256(full_bytes).hexdigest(),
-            "symbol": fixture["decision"].symbol,
-            "decision": fixture["decision"].decision,
-            "decision_id": fixture["decision"].decision_id,
-            "ledger_packet_id": fixture["board"]["autonomous_loss_decision"]["ledger_packet_id"],
-            "supervisor_decision_id": fixture["decision"].supervisor_decision_id,
-            "source_revision": fixture["decision"].source_revision,
-            "trade_decision_resolved": True,
-            "exit_allowed": fixture["decision"].exit_allowed,
-            "analysis_only": True,
-            "can_submit_orders": False,
-            "execution_authority": "none",
-            "accepted_source_count": 0,
-            "accepted_sources_sha256": hashlib.sha256(b"[]").hexdigest(),
-        },
+        compact,
     )
 
 
