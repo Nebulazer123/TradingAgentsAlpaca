@@ -21,7 +21,9 @@ from tradingagents.policy.decision_authority import (
 from tradingagents.research.provider_orchestrator import (
     TickerProviderResearchResult,
     build_ticker_provider_research_packets,
+    canonical_provider_timestamp,
     configured_quote_components,
+    strict_loss_review_news_event,
 )
 from tradingagents.schemas.research import SourceEvidencePacket
 
@@ -92,6 +94,9 @@ def build_loss_review_provider_research(
             # every component.  General ticker research preserves its normal
             # packet-cap behaviour.
             require_admissible_quote=True,
+            # Loss BOARD research needs a strict, current company event, not
+            # merely the first cache/RSS/blocked news packet returned.
+            require_admissible_loss_news=True,
             **kwargs,
         )
         packets.extend(result.packets)
@@ -375,7 +380,9 @@ def _accepted_source_descriptors(
             continue
         if not isinstance(stored, Mapping):
             continue
-        as_of = str(packet.as_of or packet.generated_at)
+        as_of = canonical_provider_timestamp(packet.as_of or packet.generated_at)
+        if as_of is None:
+            continue
         if (
             stored.get("packet_id") != packet.packet_id
             or stored.get("source_name") != packet.source_name
@@ -413,7 +420,7 @@ def _accepted_source_descriptors(
         normalized = _normalize_provider_packet(packet=packet, stored=stored, symbol=packet.symbol)
         if normalized is None:
             continue
-        normalized_type, normalized_payload = normalized
+        normalized_type, normalized_payload, normalized_as_of = normalized
         normalized_relative = Path("normalized_loss_review_evidence") / f"{packet.packet_id}-{normalized_type}.json"
         normalized_packet = {
             "packet_id": f"normalized-{packet.packet_id}-{normalized_type}",
@@ -421,7 +428,7 @@ def _accepted_source_descriptors(
             "evidence_type": normalized_type,
             "subject": packet.symbol,
             "symbol": packet.symbol,
-            "as_of": as_of,
+            "as_of": normalized_as_of,
             "quality": packet.quality,
             "provenance": {
                 "raw_packet_path": relative.as_posix(),
@@ -444,7 +451,7 @@ def _accepted_source_descriptors(
                 "packet_id": normalized_packet["packet_id"],
                 "source_name": packet.source_name,
                 "evidence_type": normalized_type,
-                "as_of": as_of,
+                "as_of": normalized_as_of,
                 "quality": packet.quality,
             }
         )
@@ -700,14 +707,24 @@ def _normalize_provider_packet(
     raw_payload = stored.get("payload")
     if not isinstance(raw_payload, Mapping) or packet.quality not in {"high", "medium"}:
         return None
-    as_of = str(packet.as_of or packet.generated_at)
+    as_of = canonical_provider_timestamp(packet.as_of or packet.generated_at)
+    if as_of is None:
+        return None
     if packet.evidence_type == "market_news":
-        event = _adverse_news_event(
-            raw_payload, source_name=packet.source_name, symbol=symbol, as_of=as_of
+        event = strict_loss_review_news_event(
+            source_name=packet.source_name,
+            payload=raw_payload,
+            as_of=packet.as_of or packet.generated_at,
+            quality=packet.quality,
+            freshness=packet.freshness,
+            # This function is also used in deterministic fixture assembly;
+            # the source observation itself anchors its bounded event window.
+            now=_parse_timestamp(as_of),
         )
         if event is None:
             return None
-        return "company_news", {"symbol": symbol, "as_of": as_of, **event}
+        event_as_of = event.pop("as_of")
+        return "company_news", {"symbol": symbol, "as_of": event_as_of, **event}, event_as_of
     if packet.evidence_type in {"earnings_transcripts", "fundamentals_profile"}:
         event = _adverse_transcript_event(raw_payload, symbol=symbol)
         if not isinstance(event, Mapping) or event.get("direction") != "adverse":
@@ -716,7 +733,7 @@ def _normalize_provider_packet(
         fraction = _normalized_decimal(event.get("change_fraction", event.get("impact_fraction")))
         if category not in {"guidance_cut", "adverse_filing_disclosure"} or fraction is None or _float_value(fraction) is None or _float_value(fraction) > -0.01:
             return None
-        return "earnings_guidance_filing", {"symbol": symbol, "as_of": as_of, "event_category": category, "direction": "adverse", "change_fraction": fraction}
+        return "earnings_guidance_filing", {"symbol": symbol, "as_of": as_of, "event_category": category, "direction": "adverse", "change_fraction": fraction}, as_of
     return None
 
 
@@ -817,47 +834,20 @@ def _adverse_news_event(
     Keywords alone are not decision evidence.  This avoids the old unsafe
     behaviour where a generic headline was silently assigned ``-1%``.
     """
-    if str(source_name).lower() not in {"finnhub", "alpaca_news"}:
+    event = strict_loss_review_news_event(
+        source_name=source_name,
+        payload=payload,
+        as_of=as_of,
+        quality="medium",
+        now=_parse_timestamp(as_of),
+    )
+    if event is None:
         return None
-    observed = _parse_timestamp(as_of)
-    if observed is None:
-        return None
-    for item in _news_items(payload):
-        if not isinstance(item, Mapping) or not isinstance(item.get("url"), str) or not item["url"].strip():
-            continue
-        if source_name.lower() == "finnhub":
-            try:
-                published = datetime.fromtimestamp(float(item.get("datetime")), tz=UTC)
-            except (TypeError, ValueError, OSError):
-                continue
-        else:
-            published = _parse_timestamp(item.get("created_at"))
-            if published is None:
-                continue
-        if abs((observed - published).total_seconds()) > 15 * 60:
-            continue
-        text = " ".join(str(item.get(key) or "") for key in ("category", "headline", "summary")).lower()
-        if not text or any(token in text for token in _POSITIVE_WORDS):
-            continue
-        magnitude = _ADVERSE_CHANGE_PERCENT.search(text)
-        if magnitude is None:
-            continue
-        percent = _float_value(next(value for value in magnitude.groups() if value is not None))
-        if percent is None or not 1 <= percent <= 100:
-            continue
-        change = _normalized_decimal(-percent / 100.0)
-        if change is None:
-            continue
-        if _THESIS_INVALIDATOR.search(text):
-            category = "thesis_invalidator"
-        elif _GUIDANCE_CUT.search(text):
-            category = "guidance_cut"
-        elif _CONTRACT_LOSS.search(text):
-            category = "material_contract_loss"
-        else:
-            continue
-        return {"event_category": category, "direction": "adverse", "impact_fraction": change}
-    return None
+    return {
+        "event_category": event["event_category"],
+        "direction": event["direction"],
+        "impact_fraction": event["impact_fraction"],
+    }
 
 
 def _adverse_transcript_event(payload: Mapping[str, Any], *, symbol: str) -> dict[str, str] | None:

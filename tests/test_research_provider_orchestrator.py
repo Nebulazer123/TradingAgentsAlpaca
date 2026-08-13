@@ -24,11 +24,143 @@ from tradingagents.research.provider_orchestrator import (
     DEFAULT_TICKER_EVIDENCE_NEEDS,
     TickerProviderResearchResult,
     build_ticker_provider_research_packets,
+    canonical_provider_timestamp,
     configured_quote_components,
+    loss_review_news_packet_is_admissible,
 )
 from tradingagents.schemas.research import CrawlerRunPacket, SourceEvidencePacket
 
 runner = CliRunner()
+
+
+def _strict_loss_news_packet(source_name: str, *, as_of: str, item: dict):
+    return evidence_packet(
+        source_name=source_name,
+        evidence_type="market_news",
+        subject="ORCL",
+        symbol="ORCL",
+        source_ref=f"https://example.test/{source_name}/ORCL",
+        payload={"data": [item]},
+        quality="medium",
+        as_of=as_of,
+        tool_route=f"{source_name}_test",
+    )
+
+
+def test_loss_review_timestamp_contract_canonicalizes_vendor_forms_without_local_time():
+    assert canonical_provider_timestamp("2026-08-13T14:55:00.987654Z") == "2026-08-13T14:55:00+00:00"
+    assert canonical_provider_timestamp(1786632840) == "2026-08-13T14:54:00+00:00"
+    assert canonical_provider_timestamp("2026-08-13") == "2026-08-13T00:00:00+00:00"
+    assert canonical_provider_timestamp("not-a-time") is None
+    assert canonical_provider_timestamp("2026-08-13T14:55:00") is None
+
+
+def test_loss_review_news_admissibility_is_current_and_source_specific():
+    now = datetime.datetime(2026, 8, 13, 14, 55, tzinfo=datetime.timezone.utc)
+    alpaca = _strict_loss_news_packet(
+        "alpaca_news",
+        as_of="2026-08-13T14:55:00.123456Z",
+        item={
+            "created_at": "2026-08-13T14:54:59.999999Z",
+            "headline": "Oracle lowers revenue guidance",
+            "summary": "Management lowered revenue guidance by 8%.",
+            "url": "https://issuer.test/adverse",
+        },
+    )
+    assert loss_review_news_packet_is_admissible(alpaca, now=now) is True
+    fmp = _strict_loss_news_packet(
+        "fmp",
+        as_of="2026-08-13T14:55:00+00:00",
+        item={
+            "publishedDate": "2026-08-13T14:54:30Z",
+            "title": "Oracle cuts guidance",
+            "text": "Revenue guidance was cut by 8%.",
+            "url": "https://issuer.test/adverse-fmp",
+        },
+    )
+    assert loss_review_news_packet_is_admissible(fmp, now=now) is True
+    assert loss_review_news_packet_is_admissible(
+        fmp.model_copy(update={"as_of": "2026-08-13T15:20:01+00:00"}), now=now
+    ) is False
+    assert loss_review_news_packet_is_admissible(
+        fmp.model_copy(update={"freshness": {"blocked": True}}), now=now
+    ) is False
+
+
+@pytest.mark.parametrize("later_source", ["finnhub", "fmp"])
+def test_loss_review_news_fallback_does_not_spend_cap_on_cache_rss_or_blocked_routes(
+    monkeypatch, tmp_path, later_source
+):
+    now = datetime.datetime(2026, 8, 13, 14, 55, tzinfo=datetime.timezone.utc)
+    config_path = tmp_path / "fallbacks.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "policy": {"forbidden_effects": []},
+                "fallbacks": {
+                    "market_news": [
+                        {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "free", "priority": 1},
+                        {"source_name": "google_news_rss", "route": "dataflow:google_news_rss", "cost_tier": "free", "priority": 2},
+                        {"source_name": "alpaca_news", "route": "dataflow:alpaca_news", "cost_tier": "free", "priority": 3},
+                        {"source_name": later_source, "route": f"dataflow:{later_source}", "cost_tier": "free", "priority": 4},
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_google_news_rss",
+        lambda **_kwargs: _packet("google_news_rss", symbol="ORCL"),
+    )
+    from tradingagents.dataflows._official_common import blocked_evidence_packet
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_alpaca_news",
+        lambda **_kwargs: blocked_evidence_packet(
+            source_name="alpaca_news", evidence_type="market_news", subject="ORCL",
+            symbol="ORCL", source_ref="https://example.test/alpaca", reason="blocked",
+        ),
+    )
+    if later_source == "finnhub":
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_finnhub_company_news",
+            lambda *_args, **_kwargs: _strict_loss_news_packet(
+                "finnhub", as_of="2026-08-13T14:55:00+00:00",
+                item={"datetime": 1786632840, "headline": "Oracle cuts guidance", "summary": "Revenue guidance cut by 8%.", "url": "https://issuer.test/finnhub"},
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            orchestrator,
+            "fetch_fmp_stock_news",
+            lambda *_args, **_kwargs: _strict_loss_news_packet(
+                "fmp", as_of="2026-08-13T14:55:00+00:00",
+                item={"publishedDate": "2026-08-13T14:54:30Z", "title": "Oracle cuts guidance", "text": "Revenue guidance cut by 8%.", "url": "https://issuer.test/fmp"},
+            ),
+        )
+    result = build_ticker_provider_research_packets(
+        "ORCL", evidence_needs=("market_news",), provider_config_path=config_path,
+        cache_dir=tmp_path / "cache", now=now, require_admissible_loss_news=True,
+    )
+    assert [packet.source_name for packet in result.packets] == ["google_news_rss", later_source]
+    assert [attempt["source_name"] for attempt in result.route_attempts] == [
+        "official_cache", "google_news_rss", "alpaca_news", later_source,
+    ]
+
+
+def test_loss_review_news_fallback_exhaustion_keeps_hold_candidate_unadmitted(monkeypatch, tmp_path):
+    now = datetime.datetime(2026, 8, 13, 14, 55, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(orchestrator, "fetch_google_news_rss", lambda **_kwargs: _packet("google_news_rss", symbol="ORCL"))
+    result = build_ticker_provider_research_packets(
+        "ORCL", evidence_needs=("market_news",), cache_dir=tmp_path / "cache", now=now,
+        require_admissible_loss_news=True,
+        disabled_sources={"official_cache", "alpaca_news", "reddit_watchlist", "reddit", "finnhub", "newsapi", "fmp", "tiingo", "eodhd", "marketaux", "scrapingbee"},
+    )
+    assert [packet.source_name for packet in result.packets] == ["google_news_rss"]
+    assert not loss_review_news_packet_is_admissible(result.packets[0], now=now)
 
 
 def test_configured_quote_contract_accepts_real_finnhub_fmp_and_yfinance_shapes():

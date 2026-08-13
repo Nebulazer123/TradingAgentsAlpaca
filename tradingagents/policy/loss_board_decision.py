@@ -93,6 +93,18 @@ def _raw_vendor_time(value: Any, field: str) -> dt.datetime:
     return parsed.astimezone(_UTC).replace(microsecond=0)
 
 
+def _canonical_raw_provider_time(value: Any, field: str) -> dt.datetime:
+    """Parse an authenticated provider timestamp using the research contract."""
+    # Kept as a local import so policy does not make provider orchestration a
+    # module-load dependency.  It only translates already-bound raw evidence.
+    from tradingagents.research.provider_orchestrator import canonical_provider_timestamp
+
+    canonical = canonical_provider_timestamp(value)
+    if canonical is None:
+        raise ValueError(f"{field} must be a supported provider timestamp")
+    return _time(canonical, field)
+
+
 def _text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip() or value.strip() != value:
         raise ValueError(f"{field} must be a nonempty canonical string")
@@ -604,7 +616,11 @@ def _market_source_has_exact_component_provenance(
             or stored.get("evidence_type") != component.get("evidence_type")
             or stored.get("evidence_type") not in {"quote_price_context", "quote"}
             or stored.get("quality") != component.get("quality")
-            or _raw_vendor_time(stored.get("as_of"), "component as_of")
+            # Raw provider packets may preserve RFC3339 fractional/Z forms,
+            # Finnhub epoch values, or FMP date strings.  Their descriptor is
+            # canonical UTC seconds, so compare parsed instants rather than
+            # requiring textual equality.
+            or _canonical_raw_provider_time(stored.get("as_of"), "component as_of")
             != _time(component.get("as_of"), "component as_of")
         ):
             return False

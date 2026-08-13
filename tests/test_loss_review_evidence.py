@@ -71,6 +71,43 @@ def test_keyword_only_or_generic_news_never_becomes_loss_board_adverse_fact():
     assert loss_evidence._normalize_provider_packet(packet=keyword_only, stored=keyword_only.model_dump(), symbol="ORCL") is None
 
 
+def test_loss_normalizer_publishes_canonical_vendor_event_times_but_keeps_raw_packet_material():
+    alpaca = evidence_packet(
+        source_name="alpaca_news", evidence_type="market_news", subject="ORCL", symbol="ORCL",
+        source_ref="https://example.test/alpaca",
+        payload={"news": [{
+            "created_at": "2026-08-13T14:54:59.987654Z",
+            "headline": "Oracle lowers revenue guidance",
+            "summary": "The company lowered revenue guidance by 8%.",
+            "url": "https://issuer.test/adverse",
+        }]},
+        quality="medium", as_of="2026-08-13T14:55:00.123456Z", tool_route="alpaca_news",
+    )
+    normalized = loss_evidence._normalize_provider_packet(
+        packet=alpaca, stored=alpaca.model_dump(), symbol="ORCL"
+    )
+    assert normalized is not None
+    kind, payload, as_of = normalized
+    assert kind == "company_news"
+    assert as_of == "2026-08-13T14:54:59+00:00"
+    assert payload["as_of"] == as_of
+    # The packet written as raw evidence still has the provider's exact
+    # fractional-Z value; normalization changes only authority-facing fields.
+    assert alpaca.model_dump()["payload"]["news"][0]["created_at"].endswith(".987654Z")
+
+    fmp = evidence_packet(
+        source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL",
+        source_ref="https://example.test/fmp",
+        payload={"symbol": "ORCL", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]},
+        quality="high", as_of="2026-08-13", tool_route="fmp_api",
+    )
+    normalized_fmp = loss_evidence._normalize_provider_packet(
+        packet=fmp, stored=fmp.model_dump(), symbol="ORCL"
+    )
+    assert normalized_fmp is not None
+    assert normalized_fmp[2] == "2026-08-13T00:00:00+00:00"
+
+
 def _hourly_packet(symbol: str = "TSM") -> dict:
     return {
         "generated_at": "2026-06-06T20:06:33+00:00",

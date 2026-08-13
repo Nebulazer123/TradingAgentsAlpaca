@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +89,28 @@ DEFAULT_TICKER_EVIDENCE_NEEDS = (
     "crawler_research",
 )
 NO_STALE_CACHE_SOURCES = {"broker_snapshot", "crawlee", "twitter", "yfinance_short_interest"}
+_LOSS_REVIEW_EVENT_SOURCES = frozenset({"alpaca_news", "finnhub", "fmp"})
+_LOSS_REVIEW_EVENT_MAX_AGE = datetime.timedelta(minutes=15)
+_LOSS_REVIEW_POSITIVE_WORDS = frozenset(
+    {"raise", "raises", "raised", "beat", "beats", "growth", "wins", "won", "approval", "approved", "partnership", "expands", "expansion"}
+)
+_LOSS_REVIEW_GUIDANCE_CUT = re.compile(
+    r"\b(cut|cuts|lower(?:ed|s)?|reduces?|revised?\s+down|withdraws?)\b.{0,80}\b(guidance|outlook|forecast|revenue)\b|\b(guidance|outlook|forecast|revenue)\b.{0,80}\b(cut|lower(?:ed|s)?|reduc(?:ed|es)|down)\b",
+    re.I,
+)
+_LOSS_REVIEW_CONTRACT_LOSS = re.compile(
+    r"\b(lost|loss|terminated|termination|cancel(?:led|ed)?|canceled)\b.{0,80}\b(contract|customer|client|agreement)\b",
+    re.I,
+)
+_LOSS_REVIEW_THESIS_INVALIDATOR = re.compile(
+    r"\b(bankruptcy|fraud|restatement|going concern|delist(?:ing)?|material weakness)\b",
+    re.I,
+)
+_LOSS_REVIEW_ADVERSE_CHANGE_PERCENT = re.compile(
+    r"\b(?:cut|cuts|lowered|lowers|lower|reduced|reduces|reduce)\b.{0,80}?\b(?:by|of)\s+(\d{1,3}(?:\.\d+)?)\s*%"
+    r"|\b(?:down|fell|fall)\b\s+(\d{1,3}(?:\.\d+)?)\s*%",
+    re.I,
+)
 
 RESEARCH_GAP_EVIDENCE_NEEDS = {
     "earnings_transcripts": {
@@ -135,6 +158,176 @@ def _news_dates(now: datetime.datetime | None = None, *, lookback_days: int = 3)
     end = _today(now)
     start = end - datetime.timedelta(days=max(1, int(lookback_days)))
     return start.isoformat(), end.isoformat()
+
+
+def canonical_provider_timestamp(value: Any) -> str | None:
+    """Return one vendor observation in the authority-safe UTC-second form.
+
+    Provider payloads retain their original timestamps and bytes.  This helper
+    only normalizes the wrapper/descriptor representation: RFC3339 ``Z`` and
+    fractional forms, Finnhub epoch seconds, and FMP date-only values all map
+    to the same canonical UTC whole-second string.  Unparseable or naive
+    timestamp values have no authority representation.
+    """
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            parsed = datetime.datetime.fromtimestamp(float(value), tz=datetime.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    elif isinstance(value, str) and value.strip():
+        raw = value.strip()
+        try:
+            if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", raw):
+                parsed = datetime.datetime.fromtimestamp(float(raw), tz=datetime.timezone.utc)
+            elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+                # FMP commonly supplies a date without a clock.  It is an
+                # explicit UTC date, not an invitation to use local time.
+                parsed = datetime.datetime.combine(
+                    datetime.date.fromisoformat(raw), datetime.time(), tzinfo=datetime.timezone.utc
+                )
+            else:
+                parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (OverflowError, OSError, ValueError):
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(datetime.timezone.utc).replace(microsecond=0).isoformat(timespec="seconds")
+
+
+def _loss_review_news_items(payload: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
+    for key in ("data", "articles", "news", "results"):
+        value = payload.get(key)
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+            return tuple(item for item in value if isinstance(item, Mapping))
+    return ()
+
+
+def strict_loss_review_news_event(
+    *,
+    source_name: str,
+    payload: Mapping[str, Any],
+    as_of: Any,
+    quality: str,
+    freshness: Mapping[str, Any] | None = None,
+    now: datetime.datetime | None = None,
+) -> dict[str, str] | None:
+    """Return the one strict, current issuer-news fact a loss BOARD may use.
+
+    This is intentionally shared by the fallback counter and the downstream
+    normalizer.  A route therefore cannot satisfy collection merely by
+    returning a cache envelope, RSS headline, blocked response, or a keyword
+    without an explicit adverse magnitude.
+    """
+    source = str(source_name).strip().lower()
+    if source not in _LOSS_REVIEW_EVENT_SOURCES or quality not in {"high", "medium"}:
+        return None
+    info = freshness if isinstance(freshness, Mapping) else {}
+    cache = info.get("cache")
+    if (
+        info.get("blocked") is True
+        or info.get("stale") is True
+        or (isinstance(cache, Mapping) and cache.get("state") in {"hit", "stale_fallback"})
+    ):
+        return None
+    observed_text = canonical_provider_timestamp(as_of)
+    if observed_text is None:
+        return None
+    observed = datetime.datetime.fromisoformat(observed_text)
+    current = now or datetime.datetime.now(tz=datetime.timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        return None
+    current = current.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    if observed > current or current - observed > _LOSS_REVIEW_EVENT_MAX_AGE:
+        return None
+    for item in _loss_review_news_items(payload):
+        raw_time = (
+            item.get("datetime")
+            if source == "finnhub"
+            else next(
+                (item.get(key) for key in ("created_at", "published_at", "publishedDate", "date", "timestamp") if item.get(key) not in (None, "")),
+                None,
+            )
+        )
+        published_text = canonical_provider_timestamp(raw_time)
+        if published_text is None:
+            continue
+        published = datetime.datetime.fromisoformat(published_text)
+        if published > current or current - published > _LOSS_REVIEW_EVENT_MAX_AGE:
+            continue
+        if abs((observed - published).total_seconds()) > _LOSS_REVIEW_EVENT_MAX_AGE.total_seconds():
+            continue
+        url = item.get("url") or item.get("link")
+        if not isinstance(url, str) or not url.strip():
+            continue
+        text = " ".join(
+            str(item.get(key) or "")
+            for key in ("category", "headline", "title", "summary", "text", "content")
+        ).lower()
+        if not text or any(token in text for token in _LOSS_REVIEW_POSITIVE_WORDS):
+            continue
+        magnitude = _LOSS_REVIEW_ADVERSE_CHANGE_PERCENT.search(text)
+        if magnitude is None:
+            continue
+        raw_percent = next((value for value in magnitude.groups() if value is not None), None)
+        try:
+            percent = float(raw_percent)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= percent <= 100:
+            continue
+        if _LOSS_REVIEW_THESIS_INVALIDATOR.search(text):
+            category = "thesis_invalidator"
+        elif _LOSS_REVIEW_GUIDANCE_CUT.search(text):
+            category = "guidance_cut"
+        elif _LOSS_REVIEW_CONTRACT_LOSS.search(text):
+            category = "material_contract_loss"
+        else:
+            continue
+        change = format(-percent / 100.0, ".8f").rstrip("0").rstrip(".")
+        return {
+            "event_category": category,
+            "direction": "adverse",
+            "impact_fraction": change,
+            "as_of": published_text,
+        }
+    return None
+
+
+def loss_review_news_packet_is_admissible(
+    packet: SourceEvidencePacket, *, now: datetime.datetime | None = None
+) -> bool:
+    return strict_loss_review_news_event(
+        source_name=packet.source_name,
+        payload=packet.payload,
+        as_of=packet.as_of,
+        quality=packet.quality,
+        freshness=packet.freshness,
+        now=now,
+    ) is not None
+
+
+def _canonicalize_provider_packet_timestamp(packet: SourceEvidencePacket) -> SourceEvidencePacket:
+    """Canonicalize wrapper timestamps while preserving the vendor payload verbatim."""
+    canonical = canonical_provider_timestamp(packet.as_of)
+    if canonical is None or canonical == packet.as_of:
+        return packet
+    data = packet.model_dump()
+    freshness = dict(data.get("freshness") or {})
+    freshness["raw_vendor_as_of"] = packet.as_of
+    freshness["as_of"] = canonical
+    data["as_of"] = canonical
+    data["freshness"] = freshness
+    data["sources"] = [
+        {**dict(source), "as_of": canonical}
+        if isinstance(source, Mapping)
+        else source
+        for source in data.get("sources") or []
+    ]
+    return SourceEvidencePacket.model_validate(data)
 
 
 def _payload_dict(value: Any) -> dict[str, Any]:
@@ -1254,6 +1447,7 @@ def build_ticker_provider_research_packets(
     source_quality_review_path: str | Path | None = None,
     now: datetime.datetime | None = None,
     require_admissible_quote: bool = False,
+    require_admissible_loss_news: bool = False,
 ) -> TickerProviderResearchResult:
     ticker = _symbol(symbol)
     config = load_provider_fallback_config(provider_config_path)
@@ -1292,12 +1486,17 @@ def build_ticker_provider_research_packets(
                         _cache_miss_attempt(candidate, evidence_need=evidence_need, reason=str(exc))
                     )
                     continue
+                packet = _canonicalize_provider_packet_timestamp(packet)
                 packets.append(packet)
                 attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
                 if (
                     not require_admissible_quote
                     or evidence_need != "quote_price_context"
                     or _quote_packet_has_current_previous(packet)
+                ) and (
+                    not require_admissible_loss_news
+                    or evidence_need != "market_news"
+                    or loss_review_news_packet_is_admissible(packet, now=now)
                 ):
                     written_for_need += 1
                 if written_for_need >= max(1, int(max_packets_per_need)):
@@ -1353,6 +1552,7 @@ def build_ticker_provider_research_packets(
                     else None
                 ),
             )
+            packet = _canonicalize_provider_packet_timestamp(packet)
             if not _blocked_packet_counts_as_evidence(packet, candidate):
                 attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
                 continue
@@ -1365,6 +1565,10 @@ def build_ticker_provider_research_packets(
                 not require_admissible_quote
                 or evidence_need != "quote_price_context"
                 or _quote_packet_has_current_previous(packet)
+            ) and (
+                not require_admissible_loss_news
+                or evidence_need != "market_news"
+                or loss_review_news_packet_is_admissible(packet, now=now)
             ):
                 written_for_need += 1
             if written_for_need >= max(1, int(max_packets_per_need)):
