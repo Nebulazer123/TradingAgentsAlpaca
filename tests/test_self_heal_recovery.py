@@ -1786,9 +1786,7 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
         )
 
     foreign_state = {
-        "schema_version": "1.1.0",
-        "generated_at": NOW.isoformat(),
-        "source": {"kind": "foreign_canonical_writer"},
+        "schema_version": "1.0.0",
         "sleeves": {},
     }
     foreign_bytes = json.dumps(foreign_state, sort_keys=True).encode("utf-8")
@@ -1856,6 +1854,53 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
         == foreign_sha256
     )
     assert broker_spy.write_calls == []
+
+
+def test_invalid_v1_1_foreign_preimage_stays_frozen_and_byte_identical(tmp_path):
+    request, canonical_path, _invocations, broker_spy = (
+        _production_recovery_harness(tmp_path)
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+
+    def crash(event):
+        if event["boundary"] == "after_promotion_prepare_fsync":
+            raise SystemExit("prepared before invalid foreign writer")
+
+    with pytest.raises(SystemExit, match="prepared before invalid foreign writer"):
+        coordinate_verified_recovery(
+            **coordinator_args,
+            control_path=_control(tmp_path),
+            receipt_dir=tmp_path / "receipts",
+            recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+            now=NOW,
+            fault_hook=crash,
+        )
+
+    foreign_bytes = json.dumps(
+        {
+            "schema_version": "1.1.0",
+            "generated_at": NOW.isoformat(),
+            "source": {"kind": "foreign_canonical_writer"},
+            "sleeves": {},
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    canonical_path.write_bytes(foreign_bytes)
+
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "frozen"
+    assert result["failure"]["kind"] == "permanent_integrity"
+    assert canonical_path.read_bytes() == foreign_bytes
+    assert broker_spy.write_calls == []
+    assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
 
 
 def test_policy_conflict_is_recoverable_not_manual_escalation():

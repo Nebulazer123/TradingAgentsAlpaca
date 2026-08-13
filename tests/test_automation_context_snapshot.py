@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
 import subprocess
@@ -219,6 +220,10 @@ def test_compact_context_includes_packet_and_autonomous_contract_status(tmp_path
     assert summary["execution_authority"] in {"none", "paper", "normal_live"}
     assert summary["automation_role_contract_status"] == "pass"
     assert summary["execution_authority"] == "paper"
+    assert summary["recovery_owner"] is None
+    assert summary["recovery_phase"] is None
+    assert summary["recovery_last_failure"] is None
+    assert summary["recovery_external_blocker"] is None
 
 
 def test_compact_context_fails_closed_when_contract_config_is_missing(tmp_path, monkeypatch):
@@ -291,3 +296,47 @@ def test_compact_context_warns_and_does_not_elevate_invalid_packet_authority(tmp
     assert summary["execution_authority_status"] == "warn"
     assert summary["execution_authority"] == "none"
     assert summary["execution_authority_invalid_labels"] == ["synthetic"]
+
+
+def test_incident_summary_ignores_malformed_records_and_redacts_blockers(
+    tmp_path, monkeypatch
+):
+    snapshot = _load_snapshot_module()
+    incident_root = tmp_path / "results" / "control_plane" / "incidents"
+    malformed = incident_root / "broken" / "latest.json"
+    malformed.parent.mkdir(parents=True)
+    malformed.write_text("{not-json", encoding="utf-8")
+    valid = incident_root / "recovery-nflx" / "latest.json"
+    valid.parent.mkdir(parents=True)
+    valid.write_text(
+        json.dumps(
+            {
+                "owner_role": "reliability_controller",
+                "updated_at": "2026-08-13T12:00:00+00:00",
+                "external_blockers": [
+                    "broker rejected Authorization: Bearer test-secret-token"
+                ],
+                "recovery": {
+                    "phase": "reconcile",
+                    "last_failure": {"kind": "external_blocked"},
+                },
+                "history": [{"secret": "must-not-leak"}],
+                "evidence_refs": ["/private/raw-packet.json"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(snapshot, "ROOT", tmp_path)
+
+    summary = snapshot.summarize_incidents(
+        now=dt.datetime(2026, 8, 13, 12, 0, tzinfo=dt.timezone.utc)
+    )
+
+    assert summary == {
+        "recovery_owner": "reliability_controller",
+        "recovery_phase": "reconcile",
+        "recovery_last_failure": "external_blocked",
+        "recovery_external_blocker": (
+            "broker rejected Authorization: Bearer [REDACTED]"
+        ),
+    }
