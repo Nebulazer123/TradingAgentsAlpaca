@@ -310,7 +310,7 @@ def test_mutated_bound_evidence_fails_verification(tmp_path):
     loss_path = tmp_path / "evidence" / "loss.json"
     loss_path.write_text("{}", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="verification|bound evidence|sha256"):
+    with pytest.raises(ValueError, match="verification|bound evidence|sha256|ledger evidence reference"):
         _verify(tmp_path, recorded)
 
 
@@ -654,18 +654,78 @@ def test_verifier_opens_each_source_once(tmp_path, monkeypatch):
     assert source_opens == {evidence_root / "sources" / f"{index}.json": 1 for index in range(3)}
 
 
+def test_authenticator_captures_board_evidence_only_through_its_single_capture_path(tmp_path, monkeypatch):
+    """The ledger authenticates provenance; BOARD owns its one evidence read."""
+
+    recorded = _record(tmp_path)
+    evidence_root = tmp_path / "evidence"
+    board_evidence = {
+        recorded.decision_evidence_path,
+        evidence_root / "supervisor.json",
+        evidence_root / "loss.json",
+    }
+    original_read_bytes = Path.read_bytes
+
+    def reject_generic_evidence_read(path: Path) -> bytes:
+        if path in board_evidence:
+            raise AssertionError("authorizing verifier must capture board evidence once itself")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_generic_evidence_read)
+
+    assert _verify(tmp_path, recorded) == recorded.decision
+
+
+@pytest.mark.parametrize("field", ["path", "sha256", "packet_id"])
+def test_authenticator_rejects_tampered_ledger_packet_material(tmp_path, field):
+    """A journal event cannot make substituted BOARD packet material authoritative."""
+
+    recorded = _record(tmp_path)
+    packet_path = recorded.packet_path
+    raw = json.loads(packet_path.read_text(encoding="utf-8"))
+    if field == "path":
+        raw["evidence_refs"][1]["path"] = str(tmp_path / "evidence" / "loss.json")
+    elif field == "sha256":
+        raw["evidence_refs"][1]["sha256"] = "0" * 64
+    else:
+        raw["packet_id"] = "wp-substituted-portfolio_decision"
+        raw["run_id"] = "substituted"
+    packet_path.write_bytes(loss_board_decision._canon(raw))
+
+    with pytest.raises(ValueError, match="digest mismatch|schema is invalid|evidence is invalid"):
+        _verify(tmp_path, recorded)
+
+
 def test_authenticator_rejects_a_fabricated_canonical_decision_without_a_ledger_record(tmp_path):
     recorded = _record(tmp_path)
     copied_root = tmp_path / "copied-evidence"
     shutil.copytree(tmp_path / "evidence", copied_root)
 
-    with pytest.raises(ValueError, match="ledger event"):
+    with pytest.raises(ValueError, match="trusted ledger root"):
         verify_autonomous_loss_board_decision(
             ledger_root=tmp_path / "missing-ledger",
             ledger_packet_id=recorded.packet.packet_id,
             evidence_root=copied_root,
             now=NOW,
         )
+
+
+def test_authenticator_requires_a_preexisting_trusted_ledger_outside_evidence_root(tmp_path):
+    recorded = _record(tmp_path)
+    evidence_root = tmp_path / "evidence"
+    nested_copy = evidence_root / "untrusted-ledger"
+    shutil.copytree(tmp_path / "ledger", nested_copy)
+    linked_copy = tmp_path / "ledger-link"
+    linked_copy.symlink_to(tmp_path / "ledger")
+
+    for root in (nested_copy, linked_copy):
+        with pytest.raises(ValueError, match="trusted ledger root"):
+            verify_autonomous_loss_board_decision(
+                ledger_root=root,
+                ledger_packet_id=recorded.packet.packet_id,
+                evidence_root=evidence_root,
+                now=NOW,
+            )
 
 
 def test_authenticator_rejects_a_self_admitted_or_substituted_ledger_packet(tmp_path):

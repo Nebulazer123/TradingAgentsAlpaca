@@ -302,13 +302,23 @@ class DecisionLedger:
         *,
         evidence_root: str | Path | None = None,
     ) -> WorkPacket:
-        """Return one journal-authenticated immutable packet, or fail closed."""
+        """Return one journal-authenticated immutable packet, or fail closed.
+
+        This is a provenance read: it authenticates the journal chain and the
+        canonical packet object without dereferencing packet evidence.  A
+        consumer with a narrower evidence contract must capture and validate
+        those references itself, exactly once, after this method returns.
+        ``verify()`` remains the full-ledger integrity check.
+        """
 
         if not isinstance(packet_id, str) or not packet_id:
             raise LedgerCorruptionError("packet_id must be a nonempty string")
         with self._locked():
             self._ensure_managed_directories()
-            events = self._replay(evidence_root=evidence_root)
+            events = self._replay(
+                evidence_root=evidence_root,
+                verify_evidence=False,
+            )
             self._verify_latest(events)
             matches = tuple(event for event in events if event.packet_id == packet_id)
             if len(matches) != 1:
@@ -316,6 +326,7 @@ class DecisionLedger:
             packet, packet_bytes = self._read_packet_object(
                 self._packet_path(packet_id),
                 evidence_root=evidence_root,
+                verify_evidence=False,
             )
             if hashlib.sha256(packet_bytes).hexdigest() != matches[0].packet_sha256:
                 raise LedgerCorruptionError("authenticated packet digest mismatch")
@@ -591,6 +602,7 @@ class DecisionLedger:
         path: Path,
         *,
         evidence_root: str | Path | None,
+        verify_evidence: bool = True,
     ) -> tuple[WorkPacket, bytes]:
         raw = self._read_regular(path, label="packet object")
         try:
@@ -618,7 +630,7 @@ class DecisionLedger:
             packet,
             now=created_at,
             evidence_root=evidence_root,
-            verify_evidence=True,
+            verify_evidence=verify_evidence,
         )
         if issues:
             raise LedgerCorruptionError(
@@ -630,6 +642,7 @@ class DecisionLedger:
         self,
         *,
         evidence_root: str | Path | None,
+        verify_evidence: bool = True,
     ) -> tuple[LedgerEvent, ...]:
         state = self._path_state(self._events_path, label="event journal")
         if state is None:
@@ -664,6 +677,7 @@ class DecisionLedger:
             packet, packet_bytes = self._read_packet_object(
                 self._packet_path(event.packet_id),
                 evidence_root=evidence_root,
+                verify_evidence=verify_evidence,
             )
             digest = hashlib.sha256(packet_bytes).hexdigest()
             if digest != event.packet_sha256:

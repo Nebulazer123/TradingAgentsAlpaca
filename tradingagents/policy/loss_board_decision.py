@@ -17,7 +17,13 @@ from typing import Any, Literal
 
 from tradingagents.brokers.supervisor.loss_review import ALLOWED_LOSS_EXIT_REASONS
 from tradingagents.orchestration.decision_ledger import DecisionLedger
-from tradingagents.orchestration.work_packets import EvidenceRef, WorkPacket
+from tradingagents.orchestration.work_packets import (
+    REQUIRED_FORBIDDEN_EFFECTS,
+    WORK_PACKET_SCHEMA_VERSION,
+    EvidenceRef,
+    WorkPacket,
+    build_packet_id,
+)
 
 SCHEMA_VERSION = "tradingagents.autonomous_loss_board_decision.v1"
 _UTC = dt.timezone.utc
@@ -106,6 +112,38 @@ def _root(value: str | Path) -> Path:
     if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
         raise ValueError("evidence_root must be a real directory")
     return path.resolve()
+
+
+def _trusted_ledger_root(value: str | Path, evidence_root: Path) -> Path:
+    """Resolve the caller-configured ledger boundary for an authorizing read.
+
+    The ledger root is configuration owned by the caller, never a path read
+    from a decision packet.  It must already be a real directory and remain a
+    separate trust boundary from mutable evidence; a nested copied ledger is
+    not an authentication source for BOARD decisions.
+    """
+
+    path = Path(value).expanduser()
+    try:
+        state = path.lstat()
+    except OSError as exc:
+        raise ValueError("trusted ledger root must be a preexisting real directory") from exc
+    if stat.S_ISLNK(state.st_mode) or not stat.S_ISDIR(state.st_mode):
+        raise ValueError("trusted ledger root must be a preexisting real directory")
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(evidence_root)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("trusted ledger root must be outside evidence_root")
+    try:
+        evidence_root.relative_to(resolved)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("trusted ledger root must not contain evidence_root")
+    return resolved
 
 
 def _inside(root: Path, relative: str | Path, *, label: str) -> Path:
@@ -722,27 +760,42 @@ def _expected_ledger_packet(
         EvidenceRef(path=str(root / decision.supervisor_packet.path), sha256=decision.supervisor_packet.sha256, size_bytes=decision.supervisor_packet.size_bytes),
         EvidenceRef(path=str(root / decision.loss_evidence_packet.path), sha256=decision.loss_evidence_packet.sha256, size_bytes=decision.loss_evidence_packet.size_bytes),
     )
-    return WorkPacket.create(
+    # ``WorkPacket.create`` validates references by reopening their paths.  The
+    # BOARD verifier already captured all three authoritative references above,
+    # so reconstruct the known schema directly and compare canonical bytes
+    # without creating a second read path.
+    return WorkPacket(
+        schema_version=WORK_PACKET_SCHEMA_VERSION,
+        packet_id=build_packet_id(decision.decision_id, "portfolio_decision"),
         kind="portfolio_decision",
+        created_at=now.isoformat(timespec="seconds"),
+        expires_at=decision.expires_at,
         producer_role="portfolio_executive",
         run_id=decision.decision_id,
         subject=decision.symbol,
         evidence_refs=refs,
+        parent_packet_ids=(),
         claims=(f"Autonomous loss BOARD resolved {decision.symbol} as {decision.decision}.",),
         assumptions=(),
         recommendation="autonomous_sell_authorized_pending_execution_intent" if decision.decision == "SELL" else "autonomous_hold",
         confidence=float(Decimal(decision.confidence)),
-        expires_at=_time(decision.expires_at, "expires_at"),
         allowed_effects=("record_trade_decision",),
-        now=now,
+        forbidden_effects=tuple(sorted(REQUIRED_FORBIDDEN_EFFECTS)),
     )
 
 
 def verify_autonomous_loss_board_decision(*, ledger_root: str | Path, ledger_packet_id: str, evidence_root: str | Path, now: dt.datetime | None = None) -> AutonomousLossBoardDecision:
-    """Authenticate a BOARD decision through its immutable ledger packet only."""
+    """Authenticate a BOARD decision through its immutable ledger packet only.
+
+    ``ledger_root`` is a caller-configured, preexisting trust boundary.  It is
+    deliberately not obtained from the decision, supervisor, loss, or source
+    packet.  Callers must supply the installed ledger root, not a copied or
+    nested evidence directory.
+    """
 
     current, root = _now(now), _root(evidence_root)
-    packet = DecisionLedger(ledger_root).read_authenticated_packet(ledger_packet_id, evidence_root=root)
+    trusted_ledger = _trusted_ledger_root(ledger_root, root)
+    packet = DecisionLedger(trusted_ledger).read_authenticated_packet(ledger_packet_id, evidence_root=root)
     if len(packet.evidence_refs) != 3:
         raise ValueError("ledger packet must have exactly three BOARD evidence references")
     decision_path, content, raw = _capture_evidence_ref(root, packet.evidence_refs[0], label="decision evidence")

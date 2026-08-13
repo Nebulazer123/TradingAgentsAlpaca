@@ -262,6 +262,82 @@ git diff --check
 (no output; passed)
 ```
 
+## Repair round 4: one-capture ledger authentication
+
+The first ledger-authenticated verifier still had a subtle duplicate-read path:
+the generic ledger replay validated each packet's evidence references before
+the BOARD verifier captured the decision, supervisor, and raw loss evidence.
+It also rebuilt the expected packet through `WorkPacket.create`, which reopened
+those same files.  That weakened the exact-one-capture guarantee.
+
+`DecisionLedger.read_authenticated_packet` is now explicitly a provenance read:
+it verifies the immutable journal chain, event-to-packet binding, and canonical
+packet digest without dereferencing evidence.  Full `DecisionLedger.verify`
+continues to perform complete evidence validation.  The BOARD verifier then
+owns the only authoritative capture of its decision, supervisor, raw loss, and
+accepted source packets, rechecks their hashes and semantics, and rebuilds the
+expected packet directly for canonical-byte comparison.
+
+New adversarial tests prove that generic `Path.read_bytes` cannot touch BOARD
+evidence during authorizing verification; packet material with a substituted
+path, hash, or packet identity is rejected by the journal/packet integrity
+checks.  Existing tests retain rejection of fabricated canonical files without
+a ledger record, self-admitted packets, semantically fabricated flags, and
+expired real records.  Recorded HOLD and SELL decisions continue to authenticate.
+
+### Repair round 4 RED/GREEN evidence
+
+RED: the new one-capture test failed because generic ledger evidence validation
+and the expected-packet constructor reopened the BOARD evidence files.
+
+GREEN:
+
+```text
+PYTHONPATH=. /Users/corbinfloyd/Documents/TradingAgents/.venv/bin/python -m pytest -q tests/test_loss_board_decision.py tests/test_work_packets.py tests/test_decision_ledger.py
+184 passed in 0.63s
+
+/Users/corbinfloyd/Documents/TradingAgents/.venv/bin/ruff check tradingagents/policy/loss_board_decision.py tradingagents/orchestration/decision_ledger.py tradingagents/orchestration/work_packets.py tests/test_loss_board_decision.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
+## Repair round 5: configured ledger-root boundary
+
+An authenticated journal is only meaningful relative to the installed ledger
+root selected by the caller.  The authorizing verifier now resolves that root
+as a preexisting, non-symlink real directory before consulting the journal.  It
+must be separate from `evidence_root`: it may neither live inside the mutable
+evidence tree nor contain that tree.  The decision, supervisor, loss, and
+source schemas contain no ledger-root field, so packet content cannot select or
+substitute this boundary.
+
+Caller invariant: pass the configured installed ledger location to
+`verify_autonomous_loss_board_decision`; do not pass a copied ledger, an
+evidence-nested ledger, or a path derived from a decision packet.
+
+### Repair round 5 RED/GREEN evidence
+
+RED: a copied journal placed under the evidence tree authenticated when passed
+as `ledger_root`.
+
+GREEN: an evidence-nested copied ledger and a symlink to the real ledger both
+fail before journal access; a missing ledger root also fails closed.  The
+existing exact packet, semantic reconstruction, expiry, and one-capture tests
+remain green.
+
+```text
+PYTHONPATH=. /Users/corbinfloyd/Documents/TradingAgents/.venv/bin/python -m pytest -q tests/test_loss_board_decision.py tests/test_work_packets.py tests/test_decision_ledger.py
+185 passed in 0.63s
+
+/Users/corbinfloyd/Documents/TradingAgents/.venv/bin/ruff check tradingagents/policy/loss_board_decision.py tradingagents/orchestration/decision_ledger.py tradingagents/orchestration/work_packets.py tests/test_loss_board_decision.py
+All checks passed!
+
+git diff --check
+(no output; passed)
+```
+
 Repair implementation commit: `99d94b082a170b7190d314ec4f2154d97232bff2`
 
 ## Repair round 2: authentic source-content qualification
