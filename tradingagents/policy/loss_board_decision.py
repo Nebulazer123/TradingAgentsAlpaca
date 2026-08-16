@@ -732,6 +732,172 @@ def _market_source_has_exact_component_provenance(
     return capture.source.quality == min(qualities, key=lambda value: quality_rank[value])
 
 
+_RAW_SOURCE_PROVENANCE_FIELDS = frozenset(
+    {
+        "raw_packet_path",
+        "raw_packet_sha256",
+        "raw_packet_id",
+        "raw_evidence_type",
+        "raw_source_name",
+        "raw_symbol",
+        "raw_subject",
+        "raw_as_of",
+        "raw_quality",
+        "raw_generated_at",
+    }
+)
+_NEWS_SELECTION_POLICY = "configured_provider_priority_then_newest_event_then_packet_id"
+_NEWS_PROVIDER_PRIORITY = {"alpaca_news": 0, "finnhub": 1, "fmp": 2}
+
+
+def _capture_raw_provider_packet(
+    *,
+    root: Path,
+    provenance: Mapping[str, Any],
+    symbol: str,
+    now: dt.datetime,
+    cache: dict[str, tuple[bytes, Mapping[str, Any]]],
+) -> tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]] | None:
+    """Open one raw provider packet once, verify identity, and replay it.
+
+    The normalized packet is not authority by itself.  Its raw source is read
+    through the evidence root's no-follow descriptor, then run through the
+    same strict source normalizer used at collection time.
+    """
+    if set(provenance) != _RAW_SOURCE_PROVENANCE_FIELDS:
+        return None
+    raw_path = provenance.get("raw_packet_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    try:
+        if raw_path in cache:
+            raw, stored = cache[raw_path]
+        else:
+            _target, raw, stored = _read_contained(
+                root, raw_path, label="raw provider source packet"
+            )
+            cache[raw_path] = (raw, stored)
+    except ValueError:
+        return None
+    if (
+        hashlib.sha256(raw).hexdigest() != provenance.get("raw_packet_sha256")
+        or stored.get("packet_id") != provenance.get("raw_packet_id")
+        or stored.get("evidence_type") != provenance.get("raw_evidence_type")
+        or stored.get("source_name") != provenance.get("raw_source_name")
+        or stored.get("symbol") != provenance.get("raw_symbol")
+        or stored.get("subject") != provenance.get("raw_subject")
+        or stored.get("as_of") != provenance.get("raw_as_of")
+        or stored.get("quality") != provenance.get("raw_quality")
+        or str(stored.get("generated_at")) != provenance.get("raw_generated_at")
+        or stored.get("symbol") != symbol
+    ):
+        return None
+    from tradingagents.research.loss_review_evidence import (
+        replay_normalized_loss_review_source,
+    )
+
+    replayed = replay_normalized_loss_review_source(
+        raw_packet=stored,
+        symbol=symbol,
+        now=now,
+    )
+    return (stored, replayed) if replayed is not None else None
+
+
+def _replayed_normalized_source_matches_raw(
+    capture: CapturedSourceEvidence,
+    *,
+    root: Path,
+    symbol: str,
+    now: dt.datetime,
+    raw_cache: dict[str, tuple[bytes, Mapping[str, Any]]],
+) -> bool:
+    """Require exact raw-to-normalized replay, including news selection."""
+    provenance = capture.packet_object.get("provenance")
+    if not isinstance(provenance, Mapping):
+        return False
+    raw_provenance = {
+        key: provenance.get(key) for key in _RAW_SOURCE_PROVENANCE_FIELDS
+    }
+    provenance_keys = set(provenance)
+    if provenance_keys != set(_RAW_SOURCE_PROVENANCE_FIELDS) and provenance_keys != (
+        set(_RAW_SOURCE_PROVENANCE_FIELDS)
+        | {"selection_policy", "candidate_raw_packets"}
+    ):
+        return False
+
+    if capture.source.evidence_type == "company_news":
+        if (
+            provenance.get("selection_policy") != _NEWS_SELECTION_POLICY
+            or not isinstance(provenance.get("candidate_raw_packets"), list)
+            or not provenance["candidate_raw_packets"]
+        ):
+            return False
+        candidates: list[tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]]] = []
+        seen_candidates: set[str] = set()
+        for candidate in provenance["candidate_raw_packets"]:
+            if not isinstance(candidate, Mapping):
+                return False
+            captured = _capture_raw_provider_packet(
+                root=root,
+                provenance=candidate,
+                symbol=symbol,
+                now=now,
+                cache=raw_cache,
+            )
+            if captured is None:
+                return False
+            stored, replayed = captured
+            if replayed[0] != "company_news":
+                return False
+            packet_id = str(stored.get("packet_id") or "")
+            if not packet_id or packet_id in seen_candidates:
+                return False
+            seen_candidates.add(packet_id)
+            candidates.append((candidate, replayed))
+
+        def selection_key(
+            candidate: tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]]
+        ) -> tuple[int, float, str]:
+            raw, replayed = candidate
+            observed = _time(replayed[2], "replayed news as_of")
+            return (
+                _NEWS_PROVIDER_PRIORITY.get(str(raw.get("raw_source_name")).lower(), 999),
+                -observed.timestamp(),
+                str(raw.get("raw_packet_id")),
+            )
+
+        selected_provenance, selected_replay = min(candidates, key=selection_key)
+        if raw_provenance != dict(selected_provenance):
+            return False
+        replayed = selected_replay
+    else:
+        captured = _capture_raw_provider_packet(
+            root=root,
+            provenance=raw_provenance,
+            symbol=symbol,
+            now=now,
+            cache=raw_cache,
+        )
+        if captured is None:
+            return False
+        _stored, replayed = captured
+
+    normalized_type, normalized_payload, normalized_as_of = replayed
+    normalized = capture.packet_object
+    return (
+        normalized_type == capture.source.evidence_type
+        and normalized.get("packet_id")
+        == f"normalized-{raw_provenance['raw_packet_id']}-{normalized_type}"
+        and normalized.get("source_name") == raw_provenance["raw_source_name"]
+        and normalized.get("subject") == symbol
+        and normalized.get("symbol") == symbol
+        and normalized.get("as_of") == normalized_as_of == capture.source.as_of
+        and normalized.get("quality") == raw_provenance["raw_quality"] == capture.source.quality
+        and normalized.get("payload") == normalized_payload
+    )
+
+
 def _news_source_proves_adverse_break(payload: Mapping[str, Any]) -> bool:
     return (
         set(payload) == {"symbol", "as_of", "event_category", "direction", "impact_fraction"}
@@ -744,13 +910,19 @@ def _news_source_proves_adverse_break(payload: Mapping[str, Any]) -> bool:
 
 
 def _filing_source_proves_adverse_fact(payload: Mapping[str, Any]) -> bool:
+    expected = {
+        "symbol", "as_of", "event_category", "direction", "change_fraction"
+    }
+    if "event_at" in payload:
+        expected.add("event_at")
     return (
-        set(payload) == {"symbol", "as_of", "event_category", "direction", "change_fraction"}
+        set(payload) == expected
         and payload.get("event_category") in _ADVERSE_FILING_EVENTS
         and payload.get("direction") == "adverse"
         and payload.get("change_fraction") is not None
         and _is_decimal(payload.get("change_fraction"), "filing change_fraction")
         and Decimal(payload["change_fraction"]) <= Decimal("-0.01")
+        and ("event_at" not in payload or _is_time(payload.get("event_at"), "filing event_at"))
     )
 
 
@@ -910,6 +1082,7 @@ def _semantic_gaps(
         gaps.append("advisory_candidate_contradiction")
     categories: set[str] = set()
     source_payloads: dict[str, Mapping[str, Any]] = {}
+    raw_source_cache: dict[str, tuple[bytes, Mapping[str, Any]]] = {}
     for capture in captures:
         source = capture.source
         try:
@@ -936,17 +1109,35 @@ def _semantic_gaps(
             else:
                 gaps.append("market_source_values_missing_or_unbound")
         elif source.evidence_type == "company_news":
-            if _news_source_proves_adverse_break(source_payload):
+            if (
+                _news_source_proves_adverse_break(source_payload)
+                and _replayed_normalized_source_matches_raw(
+                    capture,
+                    root=root,
+                    symbol=review["symbol"],
+                    now=now,
+                    raw_cache=raw_source_cache,
+                )
+            ):
                 categories.add("news")
                 source_payloads["company_news"] = source_payload
             else:
-                gaps.append("company_news_not_adverse_thesis_break")
+                gaps.append("company_news_raw_provenance_replay_failed")
         elif source.evidence_type == "earnings_guidance_filing":
-            if _filing_source_proves_adverse_fact(source_payload):
+            if (
+                _filing_source_proves_adverse_fact(source_payload)
+                and _replayed_normalized_source_matches_raw(
+                    capture,
+                    root=root,
+                    symbol=review["symbol"],
+                    now=now,
+                    raw_cache=raw_source_cache,
+                )
+            ):
                 categories.add("substance")
                 source_payloads["earnings_guidance_filing"] = source_payload
             else:
-                gaps.append("filing_or_guidance_not_adverse_substantive_fact")
+                gaps.append("filing_raw_provenance_replay_failed")
     if (
         review.get("trade_decision_allowed") is not True
         or review.get("allowed_exit_reason") not in AUTONOMOUS_BOARD_ELIGIBLE_LOSS_EXIT_REASONS

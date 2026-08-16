@@ -96,6 +96,7 @@ _LOSS_REVIEW_NATIVE_NEWS_TYPES = {
     "fmp": "stock_news",
 }
 _LOSS_REVIEW_EVENT_MAX_AGE = datetime.timedelta(minutes=15)
+_LOSS_REVIEW_SUBSTANCE_EVENT_MAX_AGE = datetime.timedelta(days=7)
 _LOSS_REVIEW_POSITIVE_WORDS = frozenset(
     {"raise", "raises", "raised", "beat", "beats", "growth", "wins", "won", "approval", "approved", "partnership", "expands", "expansion"}
 )
@@ -319,6 +320,62 @@ def loss_review_news_packet_is_admissible(
         freshness=packet.freshness,
         now=now,
     ) is not None
+
+
+def loss_review_substance_packet_is_admissible(
+    packet: SourceEvidencePacket, *, now: datetime.datetime | None = None
+) -> bool:
+    """Accept only a fresh FMP transcript with an authenticated event time.
+
+    Transcript publication is a real event whose validity can extend beyond a
+    quote/news observation.  Packet capture, however, is a separate fact and
+    must be current.  A cache, YouTube transcript text, or a wrapper timestamp
+    invented from local collection time cannot satisfy this loss-BOARD slot.
+    """
+    if (
+        packet.source_name != "fmp"
+        or packet.evidence_type != "earnings_transcripts"
+        or packet.quality not in {"high", "medium"}
+        or not isinstance(packet.payload, Mapping)
+        or str(packet.payload.get("symbol") or "").upper() != str(packet.symbol or "").upper()
+    ):
+        return False
+    freshness = packet.freshness if isinstance(packet.freshness, Mapping) else {}
+    cache = freshness.get("cache")
+    if (
+        freshness.get("blocked") is True
+        or freshness.get("stale") is True
+        or (isinstance(cache, Mapping) and cache.get("state") in {"hit", "stale_fallback"})
+    ):
+        return False
+    published_text = canonical_provider_timestamp(packet.payload.get("published_at"))
+    captured_text = canonical_provider_timestamp(packet.generated_at)
+    if published_text is None or captured_text is None:
+        return False
+    items = packet.payload.get("transcript_items")
+    if (
+        not isinstance(items, Sequence)
+        or isinstance(items, (str, bytes, bytearray))
+        or not any(
+            isinstance(item, Mapping)
+            and isinstance(item.get("content") or item.get("text"), str)
+            and (item.get("content") or item.get("text")).strip()
+            for item in items
+        )
+    ):
+        return False
+    current = now or datetime.datetime.now(tz=datetime.timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        return False
+    current = current.astimezone(datetime.timezone.utc).replace(microsecond=0)
+    published = datetime.datetime.fromisoformat(published_text)
+    captured = datetime.datetime.fromisoformat(captured_text)
+    return (
+        published <= current
+        and current - published <= _LOSS_REVIEW_SUBSTANCE_EVENT_MAX_AGE
+        and captured <= current
+        and current - captured <= _LOSS_REVIEW_EVENT_MAX_AGE
+    )
 
 
 def _canonicalize_provider_packet_timestamp(packet: SourceEvidencePacket) -> SourceEvidencePacket:
@@ -1460,6 +1517,7 @@ def build_ticker_provider_research_packets(
     authority_now: datetime.datetime | None = None,
     require_admissible_quote: bool = False,
     require_admissible_loss_news: bool = False,
+    require_admissible_loss_substance: bool = False,
 ) -> TickerProviderResearchResult:
     ticker = _symbol(symbol)
     config = load_provider_fallback_config(provider_config_path)
@@ -1516,6 +1574,15 @@ def build_ticker_provider_research_packets(
                         authority_now is not None
                         and loss_review_news_packet_is_admissible(packet, now=authority_now)
                     )
+                ) and (
+                    not require_admissible_loss_substance
+                    or evidence_need != "earnings_transcripts"
+                    or (
+                        authority_now is not None
+                        and loss_review_substance_packet_is_admissible(
+                            packet, now=authority_now
+                        )
+                    )
                 ):
                     written_for_need += 1
                 if written_for_need >= max(1, int(max_packets_per_need)):
@@ -1542,7 +1609,13 @@ def build_ticker_provider_research_packets(
                 fetcher,
                 cache_key=cache_key,
                 ttl_seconds=0
-                if candidate.source_name in NO_STALE_CACHE_SOURCES
+                if (
+                    candidate.source_name in NO_STALE_CACHE_SOURCES
+                    or (
+                        require_admissible_loss_substance
+                        and evidence_need == "earnings_transcripts"
+                    )
+                )
                 else _cache_ttl_seconds(evidence_need),
                 source_name=candidate.source_name,
                 evidence_type=evidence_need,
@@ -1553,6 +1626,10 @@ def build_ticker_provider_research_packets(
                 now=now,
                 allow_stale_on_error=(
                     candidate.source_name not in NO_STALE_CACHE_SOURCES
+                    and not (
+                        require_admissible_loss_substance
+                        and evidence_need == "earnings_transcripts"
+                    )
                     and not (
                         candidate.source_name == "yfinance"
                         and evidence_need == "quote_price_context"
@@ -1590,6 +1667,15 @@ def build_ticker_provider_research_packets(
                 or (
                     authority_now is not None
                     and loss_review_news_packet_is_admissible(packet, now=authority_now)
+                    )
+            ) and (
+                not require_admissible_loss_substance
+                or evidence_need != "earnings_transcripts"
+                or (
+                    authority_now is not None
+                    and loss_review_substance_packet_is_admissible(
+                        packet, now=authority_now
+                    )
                 )
             ):
                 written_for_need += 1

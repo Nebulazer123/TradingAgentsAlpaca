@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import tomllib
 
+from tradingagents.evals.execution_board import write_execution_board_review
 from tradingagents.orchestration.work_packets import build_packet_id
 
 
@@ -343,6 +344,7 @@ def test_execution_board_compact_context_projects_a_resolved_autonomous_hold(tmp
             "decision_id": "a" * 64,
             "ledger_packet_id": build_packet_id("a" * 64, "portfolio_decision"),
             "trade_decision_resolved": True,
+            "execution_eligible": False,
             "exit_allowed": False,
             "analysis_only": True,
             "execution_authority": "none",
@@ -372,6 +374,7 @@ def test_execution_board_compact_context_projects_scalar_only_autonomous_sell():
         "decision_id": "b" * 64,
         "ledger_packet_id": build_packet_id("b" * 64, "portfolio_decision"),
         "trade_decision_resolved": True,
+        "execution_eligible": True,
         "exit_allowed": True,
         "analysis_only": True,
         "execution_authority": "none",
@@ -384,6 +387,68 @@ def test_execution_board_compact_context_projects_scalar_only_autonomous_sell():
     assert compact["decision"] == "SELL"
     assert compact["symbol"] == "TSM"
     assert compact["plain_english"].endswith("no order was created.")
+
+
+@pytest.mark.parametrize(
+    ("decision", "execution_eligible", "expected_status"),
+    [
+        ("HOLD", False, "autonomous_hold"),
+        ("SELL", True, "autonomous_sell"),
+        ("SELL", False, "autonomous_sell"),
+    ],
+)
+def test_execution_board_context_reads_written_top_level_scalar_sidecar(
+    tmp_path, decision, execution_eligible, expected_status
+):
+    """Writer-produced HOLD/open-SELL/closed-SELL sidecars stay resolved."""
+    decision_id = "c" * 64
+    review = {
+        "generated_at": "2026-08-13T15:00:00+00:00",
+        "recommendation": "review_underperformers_before_new_buys",
+        "new_buy_policy": {"state": "caution"},
+        "metrics": {"packet_count": 1, "submitted_order_count": 0},
+        "violations": [],
+        "warnings": [],
+        "board_roles": [],
+        "next_hour_policy": {},
+        "packet_reviews": [{"decision": "loss-review", "packet": "hourly.json"}],
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "autonomous_loss_decision": {
+            "decision_id": decision_id,
+            "ledger_packet_id": build_packet_id(decision_id, "portfolio_decision"),
+            "symbol": "TSM",
+            "decision": decision,
+            "supervisor_decision_id": "loss-review-tsm-1",
+            "source_revision": "1" * 40,
+            "trade_decision_resolved": True,
+            "execution_eligible": execution_eligible,
+            "execution_blockers_sha256": "a" * 64,
+            "exit_allowed": decision == "SELL" and execution_eligible,
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "accepted_source_count": 3,
+            "accepted_sources_sha256": "b" * 64,
+        },
+    }
+    write_execution_board_review(review, tmp_path / "board")
+    compact_path = tmp_path / "board" / "latest-compact.json"
+    compact = json.loads(compact_path.read_text(encoding="utf-8"))
+    assert compact["schema"] == "autonomous_loss_board_sidecar_v1"
+    assert "autonomous_loss_decision" not in compact
+
+    summary = _load_snapshot_module().summarize_packet(
+        "execution_board_review", compact_path
+    )
+
+    assert summary["autonomous_loss_decision_status"] == expected_status
+    assert summary["autonomous_loss_decision"]["execution_eligible"] is execution_eligible
+    assert summary["autonomous_loss_decision"]["exit_allowed"] is (
+        decision == "SELL" and execution_eligible
+    )
+    assert summary["latest_packet_needs_review"] is False
 
 
 @pytest.mark.parametrize(

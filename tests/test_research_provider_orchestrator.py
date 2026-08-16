@@ -27,6 +27,7 @@ from tradingagents.research.provider_orchestrator import (
     canonical_provider_timestamp,
     configured_quote_components,
     loss_review_news_packet_is_admissible,
+    loss_review_substance_packet_is_admissible,
 )
 from tradingagents.schemas.research import CrawlerRunPacket, SourceEvidencePacket
 
@@ -166,6 +167,81 @@ def test_loss_review_news_fallback_exhaustion_keeps_hold_candidate_unadmitted(mo
     )
     assert [packet.source_name for packet in result.packets] == ["google_news_rss"]
     assert not loss_review_news_packet_is_admissible(result.packets[0], now=now)
+
+
+def test_loss_review_substance_fallback_skips_cache_and_youtube_for_fmp_packet(
+    monkeypatch, tmp_path
+):
+    now = datetime.datetime(2026, 8, 13, 14, 55, tzinfo=datetime.timezone.utc)
+    config_path = tmp_path / "fallbacks.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "policy": {"forbidden_effects": []},
+                "fallbacks": {
+                    "earnings_transcripts": [
+                        {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 1},
+                        {"source_name": "youtube_transcript", "route": "docker:youtube_transcript", "cost_tier": "local_unlimited", "priority": 2},
+                        {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 3},
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "fetch_youtube_earnings_transcript_packet",
+        lambda *_args, **_kwargs: evidence_packet(
+            source_name="youtube_transcript",
+            evidence_type="earnings_transcripts",
+            subject="ORCL",
+            symbol="ORCL",
+            source_ref="https://example.test/youtube/ORCL",
+            payload={"symbol": "ORCL", "transcript_text": "Management lowered guidance."},
+            quality="medium",
+            as_of=now.isoformat(),
+            tool_route="youtube_test",
+        ),
+    )
+    fmp = evidence_packet(
+        source_name="fmp",
+        evidence_type="earnings_transcripts",
+        subject="ORCL",
+        symbol="ORCL",
+        source_ref="https://example.test/fmp/ORCL",
+        payload={
+            "symbol": "ORCL",
+            "published_at": "2026-08-12T21:00:00+00:00",
+            "transcript_items": [
+                {"content": "Management lowered revenue guidance by 12%."}
+            ],
+        },
+        quality="high",
+        as_of="2026-08-12T21:00:00+00:00",
+        tool_route="fmp_api",
+    ).model_copy(update={"generated_at": now.isoformat()})
+    monkeypatch.setattr(
+        orchestrator, "fetch_fmp_latest_earning_call_transcript", lambda *_args, **_kwargs: fmp
+    )
+
+    result = build_ticker_provider_research_packets(
+        "ORCL",
+        evidence_needs=("earnings_transcripts",),
+        provider_config_path=config_path,
+        cache_dir=tmp_path / "cache",
+        now=now,
+        authority_now=now,
+        require_admissible_loss_substance=True,
+    )
+
+    assert [packet.source_name for packet in result.packets] == ["youtube_transcript", "fmp"]
+    assert loss_review_substance_packet_is_admissible(result.packets[-1], now=now)
+    assert [attempt["source_name"] for attempt in result.route_attempts] == [
+        "official_cache",
+        "youtube_transcript",
+        "fmp",
+    ]
 
 
 def test_loss_review_collection_does_not_reject_a_native_packet_crossing_the_start_second(

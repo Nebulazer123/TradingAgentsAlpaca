@@ -1375,7 +1375,7 @@ def _policy_exit_review(**overrides):
     )
     position = {
         "symbol": "NFLX",
-        "qty": "0.320946047",
+        "qty": "0.4101",
         "avg_entry_price": "83.37",
         "current_price": "69.00",
         "market_value": "22.23",
@@ -1408,6 +1408,7 @@ def _policy_exit_gate_result(
     review,
     *,
     action_overrides=None,
+    live_position_overrides=None,
     now=datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc),
 ):
     envelope_path = tmp_path / "risk_envelope.yaml"
@@ -1449,17 +1450,25 @@ def _policy_exit_gate_result(
         current_price = Decimal("69.28")
         average_entry_price = Decimal("83.37")
         unrealized_plpc = Decimal("-0.1690")
+    live_position = _loss_position(
+        symbol=action.symbol,
+        avg_entry_price=str(average_entry_price),
+        current_price=str(current_price),
+        market_value="22.23",
+        cost_basis="26.76",
+        unrealized_pl="-4.52",
+        unrealized_plpc=str(unrealized_plpc),
+    )
+    if review.get("holding_period_trading_days") is not None:
+        live_position["holding_period_trading_days"] = review[
+            "holding_period_trading_days"
+        ]
+    if review.get("opened_at") is not None:
+        live_position["opened_at"] = review["opened_at"]
+    live_position.update(live_position_overrides or {})
     return evaluate_go_live_guard(
         actions=[action],
-        live_positions=[_loss_position(
-            symbol=action.symbol,
-            avg_entry_price=str(average_entry_price),
-            current_price=str(current_price),
-            market_value="22.23",
-            cost_basis="26.76",
-            unrealized_pl="-4.52",
-            unrealized_plpc=str(unrealized_plpc),
-        )],
+        live_positions=[live_position],
         decision_evidence={"loss_exit_review": review},
         risk_envelope_path=envelope_path,
         promotion_state_path=promotion_path,
@@ -1478,6 +1487,45 @@ def test_live_gate_allows_current_pre_registered_policy_time_stop_review(tmp_pat
     )
 
     assert result.allowed is True
+
+
+def test_live_gate_denies_internally_inconsistent_policy_review_before_submit(tmp_path):
+    """A self-consistent policy claim cannot launder a mismatched loss return."""
+    review = _policy_exit_review()
+    review["unrealized_plpc"] = "-17.22"
+    review["exit_policy_loss_pct"] = "17.22"
+    review["exit_policy_rationale"] = review["exit_policy_rationale"].replace(
+        "17.24%", "17.22%"
+    )
+
+    result = _policy_exit_gate_result(tmp_path, review)
+
+    assert result.allowed is False
+    assert any("policy" in issue.reason.lower() for issue in result.issues)
+
+
+def test_live_gate_denies_policy_review_with_forged_quantity_before_submit(tmp_path):
+    review = _policy_exit_review()
+    review["quantity"] = "0.3000"
+
+    result = _policy_exit_gate_result(tmp_path, review)
+
+    assert result.allowed is False
+    assert any("policy" in issue.reason.lower() for issue in result.issues)
+
+
+def test_live_gate_denies_policy_review_when_current_broker_position_conflicts(tmp_path):
+    """The final gate must bind the review to the independently read position."""
+    review = _policy_exit_review()
+
+    result = _policy_exit_gate_result(
+        tmp_path,
+        review,
+        live_position_overrides={"current_price": "71.00"},
+    )
+
+    assert result.allowed is False
+    assert any("policy" in issue.reason.lower() for issue in result.issues)
 
 
 @pytest.mark.parametrize("reason", [["policy_stop_floor"], {"reason": "policy_stop_floor"}])

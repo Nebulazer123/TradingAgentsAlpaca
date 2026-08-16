@@ -109,6 +109,51 @@ def test_loss_normalizer_publishes_canonical_vendor_event_times_but_keeps_raw_pa
     assert normalized_fmp[2] == "2026-08-13T00:00:00+00:00"
 
 
+def test_configured_fmp_substance_keeps_provider_event_time_separate_from_capture():
+    now = datetime.fromisoformat("2026-08-13T14:55:00+00:00")
+    fmp = evidence_packet(
+        source_name="fmp",
+        evidence_type="earnings_transcripts",
+        subject="ORCL",
+        symbol="ORCL",
+        source_ref="https://example.test/fmp/ORCL",
+        payload={
+            "symbol": "ORCL",
+            "published_at": "2026-08-12T21:00:00+00:00",
+            "transcript_items": [
+                {"content": "Management lowered revenue guidance by 12%."}
+            ],
+        },
+        quality="high",
+        as_of="2026-08-12T21:00:00+00:00",
+        tool_route="fmp_api",
+    ).model_copy(update={"generated_at": now.isoformat()})
+
+    normalized = loss_evidence._normalize_provider_packet(
+        packet=fmp,
+        stored=fmp.model_dump(),
+        symbol="ORCL",
+        now=now,
+    )
+
+    assert normalized is not None
+    assert normalized[2] == now.isoformat()
+    assert normalized[1]["event_at"] == "2026-08-12T21:00:00+00:00"
+    assert (
+        loss_evidence._normalize_provider_packet(
+            packet=fmp.model_copy(
+                update={"generated_at": "2026-08-13T14:39:00+00:00"}
+            ),
+            stored=fmp.model_copy(
+                update={"generated_at": "2026-08-13T14:39:00+00:00"}
+            ).model_dump(),
+            symbol="ORCL",
+            now=now,
+        )
+        is None
+    )
+
+
 def _hourly_packet(symbol: str = "TSM") -> dict:
     return {
         "generated_at": "2026-06-06T20:06:33+00:00",
@@ -404,6 +449,140 @@ def test_native_news_types_share_one_real_run_clock_and_stale_diagnostics_stay_n
         now=run_now,
     ).decision
     assert decision.decision == "SELL", decision.evidence_gaps
+
+
+def test_loss_board_replays_raw_news_and_filing_before_issuing_sell(tmp_path):
+    """Changing a bound raw source after normalization must turn SELL into HOLD."""
+    run_now = datetime.fromisoformat("2026-08-13T14:55:00+00:00")
+    symbol = "ORCL"
+    hourly = _hourly_packet(symbol)
+    hourly["evidence"]["loss_exit_review"].update(
+        {
+            "decision_id": "raw-replay-required",
+            "current_price": "91",
+            "average_entry_price": "100",
+            "blockers": [],
+            "blocked_reasons": [],
+        }
+    )
+    hourly_path = tmp_path / "hourly.json"
+    hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
+
+    def quote(name, current, previous):
+        return evidence_packet(
+            source_name="finnhub",
+            evidence_type="quote_price_context",
+            subject=name,
+            symbol=name,
+            source_ref=f"https://test/{name}",
+            payload={"c": current, "pc": previous},
+            quality="high",
+            as_of="2026-08-13T14:55:00+00:00",
+            tool_route="test",
+        )
+
+    def news(observed, published, label):
+        return evidence_packet(
+            source_name="finnhub",
+            evidence_type="company_news",
+            subject=symbol,
+            symbol=symbol,
+            source_ref=f"https://test/news/{label}",
+            quality="medium",
+            as_of=observed,
+            payload={
+                "data": [
+                    {
+                        "datetime": published,
+                        "headline": "Oracle cuts revenue guidance",
+                        "summary": "Revenue guidance cut by 8%.",
+                        "url": f"https://issuer.test/{label}",
+                    }
+                ]
+            },
+            tool_route="finnhub_api",
+        )
+
+    stale = news("2026-08-13T14:10:00+00:00", 1786630200, "stale")
+    fresh = news("2026-08-13T14:55:00+00:00", 1786632840, "fresh")
+    transcript = evidence_packet(
+        source_name="fmp",
+        evidence_type="earnings_transcripts",
+        subject=symbol,
+        symbol=symbol,
+        source_ref="https://test/transcript",
+        quality="high",
+        as_of="2026-08-13T14:55:00+00:00",
+        payload={
+            "symbol": symbol,
+            "published_at": "2026-08-12T21:00:00+00:00",
+            "transcript_items": [
+                {"content": "Management lowered revenue guidance by 12%."}
+            ],
+        },
+        tool_route="fmp_api",
+    ).model_copy(update={"generated_at": run_now.isoformat()})
+    provider = TickerProviderResearchResult(
+        symbol,
+        [
+            quote("ORCL", 91, 100),
+            quote("SPY", 650, 648),
+            quote("QQQ", 580, 578),
+            quote("XLK", 260, 259),
+            stale,
+            fresh,
+            transcript,
+        ],
+    )
+    source_paths = {
+        item.packet_id: write_research_packet(item, tmp_path / "raw")
+        for item in provider.packets
+    }
+    loss_packet = build_loss_review_evidence_packet(
+        hourly_packet_path=hourly_path,
+        hourly_packet=hourly,
+        provider_result=provider,
+        source_packet_paths=source_paths,
+        decision_evidence_root=tmp_path,
+        market_clock=_clock("2026-08-13T14:55:00+00:00"),
+        now=run_now,
+    )
+    loss_path = write_research_packet(loss_packet, tmp_path / "loss")
+    baseline = record_autonomous_loss_board_decision(
+        supervisor_packet_path=hourly_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="6" * 40,
+        ledger_root=tmp_path / "baseline-ledger",
+        evidence_root=tmp_path,
+        now=run_now,
+    ).decision
+    assert baseline.decision == "SELL", baseline.evidence_gaps
+
+    for raw_packet in (fresh, transcript):
+        raw_path = source_paths[raw_packet.packet_id]
+        original_raw = raw_path.read_bytes()
+        raw = json.loads(original_raw)
+        if raw_packet.source_name == "finnhub":
+            raw["payload"]["data"][0]["headline"] = "Oracle reiterates guidance"
+            raw["payload"]["data"][0]["summary"] = "Management repeated prior revenue guidance."
+        elif raw_packet.source_name == "fmp":
+            raw["payload"]["transcript_items"][0]["content"] = (
+                "Management raised full-year revenue guidance after a strong quarter."
+            )
+        else:
+            continue
+        raw_path.write_text(json.dumps(raw), encoding="utf-8")
+        decision = record_autonomous_loss_board_decision(
+            supervisor_packet_path=hourly_path,
+            loss_evidence_packet_path=loss_path,
+            source_revision="6" * 40,
+            ledger_root=tmp_path / f"tampered-{raw_packet.source_name}-ledger",
+            evidence_root=tmp_path,
+            now=run_now,
+        ).decision
+        assert decision.decision == "HOLD", decision.evidence_gaps
+
+        raw_path.write_bytes(original_raw)
 
 
 def test_loss_board_selects_one_configured_priority_news_source_from_native_duplicates(tmp_path):

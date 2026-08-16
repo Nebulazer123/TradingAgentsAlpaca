@@ -281,16 +281,21 @@ def verify_pre_registered_exit_policy_review(
     review: Mapping,
     *,
     policy: ExitPolicy | None = None,
+    current_position: Mapping | None = None,
+    now: datetime.datetime | None = None,
 ) -> ExitPolicyDecision | None:
-    """Reconstruct and verify a persisted mechanical-review snapshot.
+    """Verify a persisted mechanical review against current broker facts.
 
-    Authority consumers receive a persisted supervisor review rather than the
-    transient position mapping.  Rebuild the policy inputs from its immutable
-    facts and require the same exact reason, source, rationale, and limit
-    checks as the producer-side review.
+    The producer may self-check a review before it leaves the supervisor.  The
+    final submit gate must additionally supply the independently captured
+    current broker position and current clock.  In that mode, a persisted
+    review cannot substitute for live price, entry, quantity, or holding facts.
     """
     policy = policy or DEFAULT_EXIT_POLICY
+    if current_position is not None and now is None:
+        return None
     generated_at = _review_generated_at(review.get("evidence_generated_at"))
+    evaluation_at = _review_generated_at(now.isoformat()) if now is not None else generated_at
     current_price = _finite_decimal(review.get("current_price"))
     average_entry_price = _finite_decimal(review.get("average_entry_price"))
     unrealized_pct = _finite_decimal(review.get("unrealized_plpc"))
@@ -298,6 +303,7 @@ def verify_pre_registered_exit_policy_review(
     holding_days = _review_holding_days(review.get("holding_period_trading_days"))
     if (
         generated_at is None
+        or evaluation_at is None
         or current_price is None
         or current_price <= 0
         or average_entry_price is None
@@ -326,9 +332,67 @@ def verify_pre_registered_exit_policy_review(
     }
     if holding_days is not None:
         position["holding_period_trading_days"] = holding_days
+    if current_position is not None:
+        live_symbol = str(current_position.get("symbol") or "").upper()
+        review_symbol = str(review.get("symbol") or "").upper()
+        live_current_price = _finite_decimal(current_position.get("current_price"))
+        live_average_entry = _finite_decimal(
+            current_position.get("avg_entry_price")
+            if current_position.get("avg_entry_price") not in (None, "")
+            else current_position.get("average_entry_price")
+        )
+        live_quantity = _finite_decimal(
+            current_position.get("qty")
+            if current_position.get("qty") not in (None, "")
+            else current_position.get("quantity")
+        )
+        review_quantity = _finite_decimal(review.get("quantity"))
+        if (
+            not live_symbol
+            or live_symbol != review_symbol
+            or live_current_price is None
+            or live_average_entry is None
+            or live_quantity is None
+            or live_current_price <= 0
+            or live_average_entry <= 0
+            or live_quantity <= 0
+            or review_quantity is None
+            or review_quantity <= 0
+            or current_price != live_current_price
+            or average_entry_price != live_average_entry
+            or review_quantity != live_quantity
+        ):
+            return None
+        live_holding_days = _review_holding_days(
+            current_position.get("holding_period_trading_days")
+        )
+        review_opened_at = _review_opened_at(review.get("opened_at"))
+        live_opened_at = _position_opened_at(current_position)
+        if holding_days != live_holding_days or review_opened_at != live_opened_at:
+            return None
+        # Recompute the loss from broker price/entry rather than accepting a
+        # persisted percentage.  The unrounded value drives the rule/rationale;
+        # the persisted percentage remains the fixed-format receipt.
+        recomputed_unrealized_pct = (
+            (live_current_price - live_average_entry) / live_average_entry
+            * Decimal("100")
+        ).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        if unrealized_pct != recomputed_unrealized_pct:
+            return None
+        position = {
+            **position,
+            "current_price": str(live_current_price),
+            "unrealized_plpc": str(
+                (live_current_price - live_average_entry) / live_average_entry
+            ),
+        }
+        if live_holding_days is not None:
+            position["holding_period_trading_days"] = live_holding_days
+        else:
+            position.pop("holding_period_trading_days", None)
     return verify_pre_registered_exit_policy(
         position,
-        generated_at=generated_at,
+        generated_at=evaluation_at,
         proposed_limit_price=review.get("proposed_limit_price"),
         policy=policy,
     )
@@ -377,6 +441,23 @@ def _review_holding_days(value: object) -> int | None:
     if parsed is None or parsed < 0 or parsed != parsed.to_integral_value():
         return None
     return int(parsed)
+
+
+def _review_opened_at(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str):
+        return None
+    parsed = _review_generated_at(value)
+    return parsed.isoformat(timespec="seconds") if parsed is not None else None
+
+
+def _position_opened_at(position: Mapping) -> str | None:
+    for key in ("opened_at", "entry_at", "buy_filled_at", "filled_at"):
+        normalized = _review_opened_at(position.get(key))
+        if normalized is not None:
+            return normalized
+    return None
 
 
 def apply_exit_policy_to_position(

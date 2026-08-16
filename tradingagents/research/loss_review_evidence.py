@@ -107,6 +107,9 @@ def build_loss_review_provider_research(
             # Loss BOARD research needs a strict, current company event, not
             # merely the first cache/RSS/blocked news packet returned.
             require_admissible_loss_news=True,
+            # Only a production-shaped transcript route with an issuer event
+            # time and fresh capture can clear the loss-board substance slot.
+            require_admissible_loss_substance=True,
             **kwargs,
         )
         packets.extend(result.packets)
@@ -385,6 +388,25 @@ def _accepted_source_descriptors(
     result: list[dict[str, Any]] = []
     quote_components: dict[str, dict[str, Any]] = {}
     news_candidates: list[dict[str, Any]] = []
+
+    def raw_packet_provenance(
+        packet: SourceEvidencePacket,
+        relative: Path,
+        raw: bytes,
+    ) -> dict[str, Any]:
+        """Preserve the exact raw identity needed for later no-follow replay."""
+        return {
+            "raw_packet_path": relative.as_posix(),
+            "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_packet_id": packet.packet_id,
+            "raw_evidence_type": packet.evidence_type,
+            "raw_source_name": packet.source_name,
+            "raw_symbol": packet.symbol,
+            "raw_subject": packet.subject,
+            "raw_as_of": packet.as_of,
+            "raw_quality": packet.quality,
+            "raw_generated_at": str(packet.generated_at),
+        }
     for packet in provider_result.packets:
         supplied = source_packet_paths.get(packet.packet_id)
         if supplied is None:
@@ -463,10 +485,7 @@ def _accepted_source_descriptors(
             "as_of": normalized_as_of,
             "quality": packet.quality,
             "provenance": {
-                "raw_packet_path": relative.as_posix(),
-                "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
-                "raw_packet_id": packet.packet_id,
-                "raw_evidence_type": packet.evidence_type,
+                **raw_packet_provenance(packet, relative, raw),
             },
             "payload": normalized_payload,
         }
@@ -513,11 +532,17 @@ def _accepted_source_descriptors(
             "as_of": normalized_as_of,
             "quality": packet.quality,
             "provenance": {
-                "raw_packet_path": relative.as_posix(),
-                "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
-                "raw_packet_id": packet.packet_id,
-                "raw_evidence_type": packet.evidence_type,
+                **raw_packet_provenance(packet, relative, raw),
                 "selection_policy": "configured_provider_priority_then_newest_event_then_packet_id",
+                "candidate_raw_packets": [
+                    raw_packet_provenance(
+                        candidate["packet"], candidate["relative"], candidate["raw"]
+                    )
+                    for candidate in sorted(
+                        news_candidates,
+                        key=lambda candidate: str(candidate["packet"].packet_id),
+                    )
+                ],
             },
             "payload": normalized_payload,
         }
@@ -827,8 +852,65 @@ def _normalize_provider_packet(
         fraction = _normalized_decimal(event.get("change_fraction", event.get("impact_fraction")))
         if category not in {"guidance_cut", "adverse_filing_disclosure"} or fraction is None or _float_value(fraction) is None or _float_value(fraction) > -0.01:
             return None
-        return "earnings_guidance_filing", {"symbol": symbol, "as_of": as_of, "event_category": category, "direction": "adverse", "change_fraction": fraction}, as_of
+        normalized_payload = {
+            "symbol": symbol,
+            "as_of": as_of,
+            "event_category": category,
+            "direction": "adverse",
+            "change_fraction": fraction,
+        }
+        # FMP's configured transcript adapter preserves a provider-published
+        # event time separately from its fresh collection timestamp.  The
+        # latter controls BOARD freshness; the former proves the event was not
+        # fabricated from local wall-clock time.
+        if packet.source_name == "fmp" and raw_payload.get("published_at") not in (None, ""):
+            event_at = canonical_provider_timestamp(raw_payload.get("published_at"))
+            captured_at = canonical_provider_timestamp(packet.generated_at)
+            if event_at is None or captured_at is None:
+                return None
+            if now is not None:
+                current = now.astimezone(UTC).replace(microsecond=0)
+                event_time = datetime.fromisoformat(event_at)
+                capture_time = datetime.fromisoformat(captured_at)
+                if (
+                    event_time > current
+                    or current - event_time > timedelta(days=7)
+                    or capture_time > current
+                    or current - capture_time > timedelta(minutes=15)
+                ):
+                    return None
+            as_of = captured_at
+            normalized_payload["as_of"] = captured_at
+            normalized_payload["event_at"] = event_at
+        return "earnings_guidance_filing", normalized_payload, as_of
     return None
+
+
+def replay_normalized_loss_review_source(
+    *,
+    raw_packet: Mapping[str, Any],
+    symbol: str,
+    now: datetime,
+) -> tuple[str, dict[str, Any], str] | None:
+    """Re-run the source normalizer from exact raw packet bytes.
+
+    This is deliberately separate from descriptor creation so the BOARD
+    verifier can prove that a normalized news or filing packet still follows
+    from the authenticated provider packet it names.  Invalid/malformed raw
+    evidence remains non-authorizing.
+    """
+    try:
+        packet = SourceEvidencePacket.model_validate(dict(raw_packet))
+    except Exception:
+        return None
+    if packet.symbol != symbol or packet.subject in (None, ""):
+        return None
+    return _normalize_provider_packet(
+        packet=packet,
+        stored=raw_packet,
+        symbol=symbol,
+        now=now,
+    )
 
 
 def _quote_values(value: Any) -> tuple[float, float] | None:

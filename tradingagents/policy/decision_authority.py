@@ -34,8 +34,10 @@ AUTHORITY_RECORD_FIELDS = (
     "current_price",
     "proposed_limit_price",
     "average_entry_price",
+    "quantity",
     "unrealized_plpc",
     "holding_period_trading_days",
+    "opened_at",
     "evidence_generated_at",
     "exit_policy_loss_pct",
     "blockers",
@@ -141,8 +143,10 @@ def bounded_exit_authority_record(review: Mapping[str, Any] | Any) -> dict[str, 
         "current_price": _text(source.get("current_price")),
         "proposed_limit_price": _text(source.get("proposed_limit_price")),
         "average_entry_price": _text(source.get("average_entry_price")),
+        "quantity": _text(source.get("quantity")),
         "unrealized_plpc": _text(source.get("unrealized_plpc")),
         "holding_period_trading_days": _text(source.get("holding_period_trading_days")),
+        "opened_at": _text(source.get("opened_at")),
         "evidence_generated_at": _text(source.get("evidence_generated_at")),
         "exit_policy_loss_pct": _text(source.get("exit_policy_loss_pct")),
         "blockers": _bounded_strings(source.get("blockers")),
@@ -201,6 +205,7 @@ def resolve_exit_authority(
     decision_ledger_root: str | Path | None = None,
     decision_evidence_root: str | Path | None = None,
     current_supervisor_binding: CurrentSupervisorReviewBinding | None = None,
+    current_position: Mapping[str, Any] | None = None,
     now: Any = None,
 ) -> ExitAuthorityVerdict:
     """Resolve loss-exit authority without granting research execution power."""
@@ -242,7 +247,11 @@ def resolve_exit_authority(
             return _invalid_policy_verdict(
                 f"pre-registered policy reason {reason} does not match rule {rule or 'missing'}"
             )
-        if verify_pre_registered_exit_policy_review(review) is None:
+        if verify_pre_registered_exit_policy_review(
+            review,
+            current_position=current_position,
+            now=now,
+        ) is None:
             return _invalid_policy_verdict(
                 "pre-registered policy exit does not match fresh policy evaluation"
             )

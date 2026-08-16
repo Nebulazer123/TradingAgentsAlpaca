@@ -481,6 +481,7 @@ def compact_autonomous_loss_decision(value: Any) -> dict[str, Any]:
     symbol = value.get("symbol")
     decision_id = value.get("decision_id")
     ledger_packet_id = value.get("ledger_packet_id")
+    execution_eligible = value.get("execution_eligible")
     if (
         decision not in {"HOLD", "SELL"}
         or not isinstance(symbol, str)
@@ -490,12 +491,14 @@ def compact_autonomous_loss_decision(value: Any) -> dict[str, Any]:
         or not isinstance(ledger_packet_id, str)
         or ledger_packet_id != build_packet_id(decision_id, "portfolio_decision")
         or value.get("trade_decision_resolved") is not True
+        or type(execution_eligible) is not bool
         or not isinstance(value.get("exit_allowed"), bool)
         or value.get("analysis_only") is not True
         or value.get("execution_authority") != "none"
         or value.get("can_submit_orders") is not False
-        or (decision == "HOLD" and value["exit_allowed"] is not False)
-        or (decision == "SELL" and value["exit_allowed"] is not True)
+        or value["exit_allowed"] is not (
+            decision == "SELL" and execution_eligible
+        )
     ):
         return pending
     status = "autonomous_hold" if decision == "HOLD" else "autonomous_sell"
@@ -515,11 +518,70 @@ def compact_autonomous_loss_decision(value: Any) -> dict[str, Any]:
         "decision_id": decision_id,
         "ledger_packet_id": ledger_packet_id,
         "trade_decision_resolved": True,
+        "execution_eligible": execution_eligible,
         "exit_allowed": value["exit_allowed"],
         "analysis_only": True,
         "execution_authority": "none",
         "can_submit_orders": False,
     }
+
+
+_AUTONOMOUS_LOSS_BOARD_SIDECAR_FIELDS = frozenset(
+    {
+        "schema",
+        "generated_at",
+        "raw_packet_path",
+        "raw_packet_sha256",
+        "decision_id",
+        "ledger_packet_id",
+        "symbol",
+        "decision",
+        "supervisor_decision_id",
+        "source_revision",
+        "trade_decision_resolved",
+        "execution_eligible",
+        "execution_blockers_sha256",
+        "exit_allowed",
+        "analysis_only",
+        "execution_authority",
+        "can_submit_orders",
+        "accepted_source_count",
+        "accepted_sources_sha256",
+    }
+)
+
+
+def compact_autonomous_loss_board_sidecar(value: Any) -> dict[str, Any]:
+    """Read the producer's top-level scalar BOARD sidecar, fail closed.
+
+    The sidecar is a transport projection, never execution authority.  Still,
+    the compact context must read its real wire shape rather than looking for
+    a nested decision object which this producer deliberately does not write.
+    """
+    pending = compact_autonomous_loss_decision(None)
+    if (
+        not isinstance(value, dict)
+        or set(value) != _AUTONOMOUS_LOSS_BOARD_SIDECAR_FIELDS
+        or value.get("schema") != "autonomous_loss_board_sidecar_v1"
+        or not isinstance(value.get("generated_at"), str)
+        or not value.get("generated_at").strip()
+        or not isinstance(value.get("raw_packet_path"), str)
+        or not value.get("raw_packet_path").strip()
+        or not isinstance(value.get("raw_packet_sha256"), str)
+        or _SHA256_HEX.fullmatch(value["raw_packet_sha256"]) is None
+        or not isinstance(value.get("supervisor_decision_id"), str)
+        or not value.get("supervisor_decision_id").strip()
+        or not isinstance(value.get("source_revision"), str)
+        or not re.fullmatch(r"[0-9a-f]{40}", value["source_revision"])
+        or not isinstance(value.get("execution_blockers_sha256"), str)
+        or _SHA256_HEX.fullmatch(value["execution_blockers_sha256"]) is None
+        or type(value.get("accepted_source_count")) is not int
+        or value["accepted_source_count"] < 0
+        or not isinstance(value.get("accepted_sources_sha256"), str)
+        or _SHA256_HEX.fullmatch(value["accepted_sources_sha256"]) is None
+    ):
+        return pending
+    return compact_autonomous_loss_decision(value)
 
 
 def summarize_incidents(*, now: dt.datetime | None = None) -> dict[str, Any]:
@@ -2759,8 +2821,10 @@ def summarize_packet(label: str, path: Path) -> dict[str, Any]:
             else {}
         )
         latest_packet_decision = latest_packet_review.get("decision")
-        autonomous_decision = compact_autonomous_loss_decision(
-            data.get("autonomous_loss_decision")
+        autonomous_decision = (
+            compact_autonomous_loss_board_sidecar(data)
+            if data.get("schema") == "autonomous_loss_board_sidecar_v1"
+            else compact_autonomous_loss_decision(data.get("autonomous_loss_decision"))
         )
         autonomous_decision_pending = (
             autonomous_decision["status"] == "business_decision_pending"

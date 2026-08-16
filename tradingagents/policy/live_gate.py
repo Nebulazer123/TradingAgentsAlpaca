@@ -86,6 +86,7 @@ POLICY_LOSS_EXIT_TEXT_FIELDS = (
 POLICY_LOSS_EXIT_NUMERIC_FIELDS = (
     "current_price",
     "average_entry_price",
+    "quantity",
     "estimated_realized_loss",
     "unrealized_pnl_percent",
 )
@@ -360,7 +361,7 @@ def _review_binding_and_freshness_issues(
     elif now is not None:
         reference_now = now.astimezone(datetime.timezone.utc)
         age = reference_now - parsed
-        if age < datetime.timedelta(0) or age > datetime.timedelta(hours=6):
+        if age < datetime.timedelta(0) or age > datetime.timedelta(minutes=15):
             issues.append("loss_exit_review is stale for current submit")
     return issues
 
@@ -370,6 +371,7 @@ def _policy_loss_exit_review_issues(
     review: Mapping[str, Any],
     *,
     now: datetime.datetime | None,
+    current_position: Mapping[str, Any],
 ) -> list[str]:
     issues = _policy_field_issues(review)
     if not issues:
@@ -381,6 +383,8 @@ def _policy_loss_exit_review_issues(
         verdict = resolve_exit_authority(
             supervisor_review=policy_review,
             advisory_analysis=None,
+            current_position=current_position,
+            now=now,
         )
         if not (
             verdict.allowed is True
@@ -408,11 +412,17 @@ def _loss_exit_review_issues(
     review: Mapping[str, Any] | None,
     *,
     now: datetime.datetime | None,
+    current_position: Mapping[str, Any],
 ) -> list[str]:
     if review is None:
         return ["loss_exit_review is missing"]
     if _is_policy_exit_claim(review):
-        return _policy_loss_exit_review_issues(action, review, now=now)
+        return _policy_loss_exit_review_issues(
+            action,
+            review,
+            now=now,
+            current_position=current_position,
+        )
     issues = _missing_review_fields(review)
     if review.get("allowed") is not True:
         issues.append("loss_exit_review.allowed is not true")
@@ -473,7 +483,12 @@ def _final_submit_loss_gate_issues(
         # Either a confirmed loss, or price/entry-price provenance is incomplete.
         # Fail closed: require a valid loss-exit review instead of skipping the gate.
         review = _review_from_action_or_decision(action, decision_evidence)
-        failed = _loss_exit_review_issues(action, review, now=now)
+        failed = _loss_exit_review_issues(
+            action,
+            review,
+            now=now,
+            current_position=position,
+        )
         if failed:
             issues.append(
                 OrderIssue(

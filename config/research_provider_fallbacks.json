@@ -81,8 +81,8 @@
     ],
     "earnings_transcripts": [
       {"source_name": "official_cache", "route": "local:official_cache", "cost_tier": "cache", "priority": 10},
-      {"source_name": "youtube_transcript", "route": "docker:youtube_transcript", "cost_tier": "local_unlimited", "priority": 20},
-      {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 30},
+      {"source_name": "fmp", "route": "dataflow:fmp", "cost_tier": "free_limited", "priority": 20},
+      {"source_name": "youtube_transcript", "route": "docker:youtube_transcript", "cost_tier": "local_unlimited", "priority": 30},
       {"source_name": "benzinga", "route": "composio:benzinga", "cost_tier": "connected_mcp_read", "priority": 40},
       {"source_name": "earnings_transcripts_gap", "route": "local:research_gap", "cost_tier": "local_unlimited", "priority": 999}
     ],

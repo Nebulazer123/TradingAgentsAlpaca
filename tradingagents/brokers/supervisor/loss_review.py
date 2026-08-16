@@ -184,6 +184,7 @@ def loss_exit_review_packet(
         "current_price": _price(current_price),
         "proposed_limit_price": _price(proposed_price),
         "average_entry_price": _price(avg_entry_price),
+        "quantity": str(qty),
         "estimated_realized_loss": _money(realized_loss),
         "unrealized_pl": _money(position.get("unrealized_pl", "0")),
         "unrealized_pnl_percent": _pct(position.get("unrealized_plpc")),
