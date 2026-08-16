@@ -1,47 +1,10 @@
 {
-  "supervisor_review_authority": {
+  "position": {
     "symbol": "NFLX",
-    "decision_id": "loss-exit-NFLX-20260718",
-    "allowed": true,
-    "policy_rule_exit": true,
-    "allowed_exit_reason": "policy_stop_floor",
-    "allowed_exit_reason_source": "pre-registered exit policy rule",
-    "exit_policy_rule": "catastrophic_stop",
-    "exit_policy_rationale": "The pre-registered rule fired.",
-    "blockers": [],
-    "blocked_reasons": [],
-    "source_packet_ids": [
-      "supervisor-nflx"
-    ],
-    "source_identity": "hourly_supervisor.loss_exit_review"
-  },
-  "advisory_analysis": {
-    "symbol": "NFLX",
-    "review_allowed_after_refresh": true,
-    "authority_source": "pre_registered_policy_rule",
-    "requires_board_decision": false,
-    "decision_owner": "execution_operator",
-    "loss_exit_candidate": {
-      "allowed_exit_reason_candidate": "policy_stop_floor",
-      "allowed_exit_reason_source": "pre-registered exit policy rule",
-      "confidence": null,
-      "confidence_tier": "pre_registered_policy",
-      "reason_summary": "The pre-registered rule fired.",
-      "drivers": [
-        "pre-registered exit rule remains authoritative: policy_stop_floor"
-      ],
-      "approval_effect": "preserves_pre_registered_policy_approval",
-      "requires_board_decision": false,
-      "requires_tradeable_session": true,
-      "can_submit_orders": false
-    },
-    "forbidden_effects": [
-      "create_trade_intent",
-      "size_position",
-      "submit_order",
-      "promote_sleeve",
-      "waive_live_gate",
-      "mark_loss_exit_allowed"
-    ]
+    "qty": "0.320946047",
+    "avg_entry_price": "83.37",
+    "current_price": "69.00",
+    "unrealized_pl": "-4.52",
+    "unrealized_plpc": "-0.1690"
   }
 }

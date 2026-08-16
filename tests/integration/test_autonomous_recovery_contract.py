@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from tradingagents.brokers import alpaca_reconciliation
+from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
 from tradingagents.orchestration.recovery import (
     rearm_after_verified_recovery,
 )
@@ -21,12 +22,15 @@ from tradingagents.orchestration.self_heal import (
     build_production_recovery_request,
     coordinate_verified_recovery,
 )
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.live_control import (
     load_live_control_state,
     write_live_control_state,
 )
 from tradingagents.policy.live_gate import evaluate_go_live_guard
 from tradingagents.policy.promotion_sync import sync_promotion_state_file
+from tradingagents.research.loss_review_evidence import build_loss_review_evidence_packet
+from tradingagents.research.provider_orchestrator import TickerProviderResearchResult
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "autonomous_recovery"
@@ -169,6 +173,47 @@ def _copy_fixture(name: str, destination: Path) -> None:
     destination.write_bytes((FIXTURE_ROOT / name).read_bytes())
 
 
+def _genuine_policy_authority(position: dict, *, supervisor_path: Path) -> dict:
+    enriched = apply_exit_policy_to_position(position, generated_at=NOW)
+    supervisor = loss_exit_review_packet(
+        enriched,
+        generated_at=NOW,
+        decision_id="loss-exit-NFLX-20260718",
+        proposed_limit_price=enriched["exit_policy_limit_price"],
+    )
+    hourly_packet = {
+        "generated_at": NOW.isoformat(),
+        "decision": "close",
+        "actions": [],
+        "submitted": [],
+        "evidence": {"loss_exit_review": supervisor},
+        "portfolio": {
+            "live": {
+                "positions": [
+                    {
+                        "symbol": supervisor["symbol"],
+                        "qty": position["qty"],
+                        "current_price": position["current_price"],
+                        "avg_entry_price": position["avg_entry_price"],
+                        "unrealized_pl": position["unrealized_pl"],
+                        "unrealized_plpc": position["unrealized_plpc"],
+                    }
+                ]
+            }
+        },
+    }
+    evidence = build_loss_review_evidence_packet(
+        hourly_packet_path=supervisor_path,
+        hourly_packet=hourly_packet,
+        provider_result=TickerProviderResearchResult(symbol=supervisor["symbol"]),
+        entry_context={"symbol": supervisor["symbol"], "account": "live"},
+    )
+    return {
+        "supervisor_review_authority": supervisor,
+        "advisory_analysis": evidence.payload["advisory_analysis"],
+    }
+
+
 class _ReadOnlyBroker:
     def __init__(self, snapshot: dict):
         self.positions = copy.deepcopy(snapshot["positions"])
@@ -232,14 +277,6 @@ def _build_fixture_recovery_request(
     *,
     focused_gate_records: list[dict],
 ) -> dict:
-    authority = _load_fixture("policy_authority.json")
-    evidence = _load_fixture("loss_review_evidence.json")
-    evidence_path = (
-        tmp_path / "results" / "loss_review_evidence" / "latest.json"
-    )
-    evidence["packet_path"] = str(evidence_path.resolve())
-    evidence["payload"].update(copy.deepcopy(authority))
-
     supervisor_path = (
         tmp_path / "results" / "hourly_supervisor" / "supervisor.json"
     )
@@ -255,6 +292,16 @@ def _build_fixture_recovery_request(
     reconciliation_path = (
         tmp_path / "results" / "alpaca_reconciliation" / "latest.json"
     )
+    authority = _genuine_policy_authority(
+        _load_fixture("policy_authority.json")["position"],
+        supervisor_path=supervisor_path,
+    )
+    evidence = _load_fixture("loss_review_evidence.json")
+    evidence_path = (
+        tmp_path / "results" / "loss_review_evidence" / "latest.json"
+    )
+    evidence["packet_path"] = str(evidence_path.resolve())
+    evidence["payload"].update(copy.deepcopy(authority))
 
     _write_json(
         supervisor_path,
