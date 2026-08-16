@@ -14,7 +14,10 @@ from tradingagents.policy.decision_authority import (
     POLICY_EXIT_REASONS,
     resolve_exit_authority,
 )
-from tradingagents.policy.exit_policy import POLICY_STOP_FLOOR
+from tradingagents.policy.exit_policy import (
+    POLICY_STOP_FLOOR,
+    verify_pre_registered_exit_policy,
+)
 
 UTC = datetime.timezone.utc
 
@@ -86,7 +89,16 @@ def loss_exit_review_packet(
     holding_days = _holding_period_trading_days(position, generated_at=generated_at)
     original_buy_thesis = str(position.get("original_buy_thesis") or position.get("buy_thesis") or "").strip()
     current_thesis_status = str(position.get("current_thesis_status") or position.get("thesis_status") or "").strip()
-    allowed_reason_source = _exact_reason_source(position.get("allowed_exit_reason_source"))
+    mechanical_policy_decision = verify_pre_registered_exit_policy(
+        position,
+        generated_at=generated_at,
+        proposed_limit_price=proposed_limit_price,
+    )
+    allowed_reason_source = (
+        position.get("allowed_exit_reason_source")
+        if mechanical_policy_decision is not None
+        else _exact_reason_source(position.get("allowed_exit_reason_source"))
+    )
     company_news = str(
         position.get("company_specific_news_check")
         or position.get("company_news_check")
@@ -115,7 +127,7 @@ def loss_exit_review_packet(
     blockers: list[str] = []
     review_decision_id = decision_id or f"loss-exit-{symbol}-{generated_at:%Y%m%d%H%M%S}"
 
-    policy_rule_exit = allowed_reason in POLICY_EXIT_REASONS
+    policy_rule_exit = mechanical_policy_decision is not None
 
     if current_price <= 0:
         blockers.append("current price evidence is missing")
@@ -125,6 +137,8 @@ def loss_exit_review_packet(
         blockers.append("position is not proven below average entry price")
     if allowed_reason not in ALLOWED_LOSS_EXIT_REASONS:
         blockers.append("allowed loss-exit reason is missing")
+    if allowed_reason in POLICY_EXIT_REASONS and not policy_rule_exit:
+        blockers.append("pre-registered policy exit does not match fresh policy evaluation")
     if allowed_reason_source is None:
         blockers.append("allowed loss-exit reason source is missing")
     if holding_days is None and not policy_rule_exit:

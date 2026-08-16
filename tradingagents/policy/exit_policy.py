@@ -242,6 +242,57 @@ def evaluate_exit_policy(
     return ExitPolicyDecision(triggered=False, loss_pct=loss_pct)
 
 
+def verify_pre_registered_exit_policy(
+    position: Mapping,
+    *,
+    generated_at: datetime.datetime,
+    proposed_limit_price: Decimal | int | float | str | None,
+    policy: ExitPolicy | None = None,
+) -> ExitPolicyDecision | None:
+    """Return a fresh matching policy decision, never caller-supplied authority.
+
+    A mechanical exit may carry a deterministic source string instead of a
+    discretionary evidence-packet descriptor.  That exception is valid only
+    when every policy claim and the proposed sell limit agree with a fresh
+    evaluation of the current position.
+    """
+    policy = policy or DEFAULT_EXIT_POLICY
+    decision = evaluate_exit_policy(position, generated_at=generated_at, policy=policy)
+    if not decision.triggered or decision.proposed_limit_price is None:
+        return None
+    if position.get("allowed_exit_reason") != decision.reason_code:
+        return None
+    if position.get("allowed_exit_reason_source") != _policy_reason_source(decision, policy):
+        return None
+    if position.get("exit_policy_rule") != decision.rule_id:
+        return None
+    if position.get("exit_policy_rationale") != decision.rationale:
+        return None
+    if not _matches_policy_limit(
+        position.get("exit_policy_limit_price"), decision.proposed_limit_price
+    ):
+        return None
+    if not _matches_policy_limit(proposed_limit_price, decision.proposed_limit_price):
+        return None
+    return decision
+
+
+def _policy_reason_source(decision: ExitPolicyDecision, policy: ExitPolicy) -> str:
+    return (
+        f"pre-registered exit policy rule '{decision.rule_id}' "
+        f"(tradingagents/policy/exit_policy.py; thresholds {policy.as_dict()})"
+    )
+
+
+def _matches_policy_limit(value: object, expected: Decimal) -> bool:
+    if value in (None, ""):
+        return False
+    try:
+        return Decimal(str(value)) == expected
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
 def apply_exit_policy_to_position(
     position: Mapping,
     *,
@@ -261,10 +312,7 @@ def apply_exit_policy_to_position(
     if not decision.triggered:
         return enriched
     enriched["allowed_exit_reason"] = decision.reason_code
-    enriched["allowed_exit_reason_source"] = (
-        f"pre-registered exit policy rule '{decision.rule_id}' "
-        f"(tradingagents/policy/exit_policy.py; thresholds {policy.as_dict()})"
-    )
+    enriched["allowed_exit_reason_source"] = _policy_reason_source(decision, policy)
     enriched["exit_policy_rule"] = decision.rule_id
     enriched["exit_policy_rationale"] = decision.rationale
     if decision.proposed_limit_price is not None:

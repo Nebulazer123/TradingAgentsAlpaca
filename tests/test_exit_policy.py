@@ -1,6 +1,8 @@
 import datetime
 from decimal import Decimal
 
+import pytest
+
 from tradingagents.brokers.supervisor.hourly import build_loss_review_decision
 from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
 from tradingagents.policy.exit_policy import (
@@ -84,6 +86,35 @@ def test_policy_exit_review_packet_is_allowed_without_narrative():
     assert packet["allowed_exit_reason"] == "policy_stop_floor"
     assert packet["policy_rule_exit"] is True
     assert packet["exit_policy_rule"] == "hard_stop"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("allowed_exit_reason", "policy_time_stop"),
+        ("allowed_exit_reason_source", "caller-supplied policy source"),
+        ("exit_policy_rule", "catastrophic_stop"),
+        ("exit_policy_rationale", "caller-supplied policy rationale"),
+        ("exit_policy_limit_price", "90.73"),
+    ],
+)
+def test_policy_exit_review_rejects_metadata_that_disagrees_with_fresh_evaluation(
+    field, value
+):
+    enriched = apply_exit_policy_to_position(_position("-0.09"), generated_at=NOW)
+    enriched[field] = value
+
+    packet = loss_exit_review_packet(
+        enriched,
+        generated_at=NOW,
+        proposed_limit_price=enriched.get("exit_policy_limit_price"),
+    )
+
+    assert packet["policy_rule_exit"] is False
+    assert packet["allowed"] is False
+    assert "pre-registered policy exit does not match fresh policy evaluation" in packet[
+        "blockers"
+    ]
 
 
 def test_narrative_exit_contract_unchanged():
