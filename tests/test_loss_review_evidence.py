@@ -776,6 +776,80 @@ def test_loss_board_selects_one_configured_priority_news_source_from_native_dupl
     ).decision
     assert omitted_priority.decision == "HOLD", omitted_priority.evidence_gaps
 
+    # A lower-priority Finnhub winner is otherwise fully authentic and
+    # normalized.  The manifest still declares the higher-priority Alpaca raw
+    # event, but that raw file has disappeared.  A missing declared packet is
+    # an authentication failure, not an ineligible-news diagnostic.
+    finnhub_raw = json.loads(paths[finnhub.packet_id].read_text(encoding="utf-8"))
+    finnhub_replayed = loss_evidence.replay_normalized_loss_review_source(
+        raw_packet=finnhub_raw,
+        symbol=symbol,
+        now=run_now,
+    )
+    assert finnhub_replayed is not None
+    finnhub_type, finnhub_payload, finnhub_as_of = finnhub_replayed
+    assert finnhub_type == "company_news"
+    finnhub_provenance = raw_provenance(finnhub)
+    lower_priority_normalized = {
+        "packet_id": f"normalized-{finnhub.packet_id}-company_news",
+        "source_name": finnhub.source_name,
+        "evidence_type": "company_news",
+        "subject": symbol,
+        "symbol": symbol,
+        "as_of": finnhub_as_of,
+        "quality": finnhub.quality,
+        "provenance": {
+            **finnhub_provenance,
+            "selection_policy": (
+                "configured_provider_priority_then_newest_event_then_packet_id"
+            ),
+            "candidate_raw_packets": [finnhub_provenance],
+        },
+        "payload": finnhub_payload,
+    }
+    lower_priority_raw = json.dumps(
+        lower_priority_normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    lower_priority_path = (
+        tmp_path
+        / "normalized_loss_review_evidence"
+        / f"{finnhub.packet_id}-company_news-missing-priority.json"
+    )
+    lower_priority_path.write_bytes(lower_priority_raw)
+    for descriptor in tampered_loss["payload"]["accepted_sources"]:
+        if descriptor["evidence_type"] == "company_news":
+            descriptor.update(
+                {
+                    "path": lower_priority_path.relative_to(tmp_path).as_posix(),
+                    "sha256": hashlib.sha256(lower_priority_raw).hexdigest(),
+                    "size_bytes": len(lower_priority_raw),
+                    "packet_id": lower_priority_normalized["packet_id"],
+                    "source_name": "finnhub",
+                    "as_of": finnhub_as_of,
+                    "quality": "medium",
+                }
+            )
+    tampered_loss["payload"]["news_candidate_manifest"] = [
+        finnhub_provenance,
+        fmp_provenance,
+    ]
+    loss_path.write_text(json.dumps(tampered_loss), encoding="utf-8")
+    paths[alpaca.packet_id].unlink()
+
+    missing_declared_priority = record_autonomous_loss_board_decision(
+        supervisor_packet_path=hourly_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="6" * 40,
+        ledger_root=tmp_path / "ledger-missing-declared-priority",
+        evidence_root=tmp_path,
+        now=run_now,
+    ).decision
+    assert missing_declared_priority.decision == "HOLD", (
+        missing_declared_priority.evidence_gaps
+    )
+
 
 def test_loss_board_chooses_newest_distinct_event_within_one_provider_deterministically(tmp_path):
     run_now = datetime.fromisoformat("2026-08-13T14:55:00+00:00")

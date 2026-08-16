@@ -755,19 +755,19 @@ _NATIVE_NEWS_RAW_TYPES = {
 }
 
 
-def _capture_raw_provider_packet(
+def _authenticate_raw_provider_packet(
     *,
     root: Path,
     provenance: Mapping[str, Any],
     symbol: str,
-    now: dt.datetime,
     cache: dict[str, tuple[bytes, Mapping[str, Any]]],
-) -> tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]] | None:
-    """Open one raw provider packet once, verify identity, and replay it.
+) -> Mapping[str, Any] | None:
+    """Open one declared raw packet and prove its exact recorded identity.
 
-    The normalized packet is not authority by itself.  Its raw source is read
-    through the evidence root's no-follow descriptor, then run through the
-    same strict source normalizer used at collection time.
+    Manifest authentication intentionally precedes source semantics.  A raw
+    packet that is stale or otherwise ineligible can be diagnostic, but a
+    missing, substituted, malformed, or hash-mismatched declared packet makes
+    the complete candidate manifest untrustworthy.
     """
     if set(provenance) != _RAW_SOURCE_PROVENANCE_FIELDS:
         return None
@@ -784,6 +784,21 @@ def _capture_raw_provider_packet(
             cache[raw_path] = (raw, stored)
     except ValueError:
         return None
+    try:
+        stored_as_of = _canonical_raw_provider_time(
+            stored.get("as_of"), "raw provider as_of"
+        )
+        declared_as_of = _canonical_raw_provider_time(
+            provenance.get("raw_as_of"), "raw provenance as_of"
+        )
+        stored_generated_at = _canonical_raw_provider_time(
+            stored.get("generated_at"), "raw provider generated_at"
+        )
+        declared_generated_at = _canonical_raw_provider_time(
+            provenance.get("raw_generated_at"), "raw provenance generated_at"
+        )
+    except ValueError:
+        return None
     if (
         hashlib.sha256(raw).hexdigest() != provenance.get("raw_packet_sha256")
         or stored.get("packet_id") != provenance.get("raw_packet_id")
@@ -791,17 +806,57 @@ def _capture_raw_provider_packet(
         or stored.get("source_name") != provenance.get("raw_source_name")
         or stored.get("symbol") != provenance.get("raw_symbol")
         or stored.get("subject") != provenance.get("raw_subject")
-        or stored.get("as_of") != provenance.get("raw_as_of")
+        or stored_as_of != declared_as_of
         or stored.get("quality") != provenance.get("raw_quality")
-        or str(stored.get("generated_at")) != provenance.get("raw_generated_at")
-        or stored.get("symbol") != symbol
+        or stored_generated_at != declared_generated_at
+        # The complete manifest includes market-context components such as
+        # SPY/QQQ/sector quotes.  Their symbol is authenticated against the
+        # declared raw identity above; semantic admission of issuer-specific
+        # news below still requires the reviewed symbol.
+        or not isinstance(provenance.get("raw_symbol"), str)
+        or not provenance["raw_symbol"].strip()
     ):
         return None
+    return stored
+
+
+def _replay_authenticated_raw_provider_packet(
+    *,
+    raw_packet: Mapping[str, Any],
+    symbol: str,
+    now: dt.datetime,
+) -> tuple[str, dict[str, Any], str] | None:
+    """Apply semantic eligibility only after raw packet authentication."""
     from tradingagents.research.loss_review_evidence import (
         replay_normalized_loss_review_source,
     )
 
-    replayed = replay_normalized_loss_review_source(
+    return replay_normalized_loss_review_source(
+        raw_packet=raw_packet,
+        symbol=symbol,
+        now=now,
+    )
+
+
+def _capture_raw_provider_packet(
+    *,
+    root: Path,
+    provenance: Mapping[str, Any],
+    symbol: str,
+    now: dt.datetime,
+    cache: dict[str, tuple[bytes, Mapping[str, Any]]],
+) -> tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]] | None:
+    """Authenticate one raw provider packet and replay it for source use."""
+    stored = _authenticate_raw_provider_packet(
+        root=root,
+        provenance=provenance,
+        symbol=symbol,
+        cache=cache,
+    )
+    if stored is None:
+        return None
+
+    replayed = _replay_authenticated_raw_provider_packet(
         raw_packet=stored,
         symbol=symbol,
         now=now,
@@ -851,29 +906,38 @@ def _authoritative_news_selection(
     if set(raw_by_id) != set(source_ids):
         return None
 
+    authenticated_raw: dict[str, Mapping[str, Any]] = {}
+    for packet_id, provenance in raw_by_id.items():
+        stored = _authenticate_raw_provider_packet(
+            root=root,
+            provenance=provenance,
+            symbol=symbol,
+            cache=raw_cache,
+        )
+        if stored is None:
+            return None
+        authenticated_raw[packet_id] = stored
+
     replayed_candidates: list[
         tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]]
     ] = []
-    for provenance in raw_by_id.values():
+    for packet_id, provenance in raw_by_id.items():
         raw_type = (
             str(provenance.get("raw_source_name") or "").lower(),
             str(provenance.get("raw_evidence_type") or ""),
         )
         if raw_type not in _NATIVE_NEWS_RAW_TYPES:
             continue
-        captured = _capture_raw_provider_packet(
-            root=root,
-            provenance=provenance,
+        replayed = _replay_authenticated_raw_provider_packet(
+            raw_packet=authenticated_raw[packet_id],
             symbol=symbol,
             now=now,
-            cache=raw_cache,
         )
-        # A native packet that is malformed, stale, or not a strict issuer
-        # event is diagnostic only.  It cannot be a candidate, but every
-        # eligible one below is still authenticated and replayed.
-        if captured is None:
+        # Raw manifest authenticity was proved before this loop.  A stale,
+        # low-quality, or non-adverse native event may therefore be skipped as
+        # an ineligible diagnostic without masking a missing declared packet.
+        if replayed is None:
             continue
-        _stored, replayed = captured
         if replayed[0] == "company_news":
             replayed_candidates.append((provenance, replayed))
 

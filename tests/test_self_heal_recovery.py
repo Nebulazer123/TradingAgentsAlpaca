@@ -656,7 +656,69 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
             packet = json.loads(json.dumps(packets[phase]))
             generated_at = arguments.get("generated_at", NOW.isoformat())
             packet["generated_at"] = generated_at
-            if phase == "regenerate_evidence":
+            if phase == "resolve_authority":
+                authority_dir = Path(arguments["run_root"]) / "test-authority"
+                authority_dir.mkdir(parents=True, exist_ok=True)
+                entry_path = authority_dir / "entry-evidence.json"
+                snapshot_path = authority_dir / "hourly-snapshot.json"
+                position = _current_broker_position()
+                entry_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0.0",
+                            "source_name": "loss_review_evidence",
+                            "evidence_type": "loss_review_evidence",
+                            "symbol": BINDINGS["symbol"],
+                            "payload": {
+                                "entry_context": {
+                                    "symbol": BINDINGS["symbol"],
+                                    "account": BINDINGS["broker_account"],
+                                    "submitted_at": position["opened_at"],
+                                }
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                snapshot_path.write_text(
+                    json.dumps(
+                        {
+                            "generated_at": generated_at,
+                            "evidence": {
+                                "loss_exit_review": {
+                                    "symbol": BINDINGS["symbol"],
+                                    "evidence_generated_at": generated_at,
+                                }
+                            },
+                            "portfolio": {"live": {"positions": [position]}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                entry_raw = entry_path.read_bytes()
+                snapshot_raw = snapshot_path.read_bytes()
+                packet.update(
+                    {
+                        "authority_now": generated_at,
+                        "current_position_snapshot": {
+                            "source_identity": (
+                                "hourly_supervisor.portfolio.live.position"
+                            ),
+                            "packet_path": str(snapshot_path.resolve()),
+                            "sha256": hashlib.sha256(snapshot_raw).hexdigest(),
+                            "size_bytes": len(snapshot_raw),
+                            "opened_at": position["opened_at"],
+                            "entry_packet_path": str(entry_path.resolve()),
+                            "entry_packet_sha256": hashlib.sha256(
+                                entry_raw
+                            ).hexdigest(),
+                            "entry_packet_size_bytes": len(entry_raw),
+                            "captured_at": generated_at,
+                            "review_evidence_generated_at": generated_at,
+                        },
+                    }
+                )
+            elif phase == "regenerate_evidence":
                 packet["freshness"]["as_of"] = generated_at
                 for source in packet["sources"]:
                     source["as_of"] = generated_at
@@ -911,6 +973,8 @@ def _production_recovery_harness(
     *,
     fail_phase: str | None = None,
     include_current_position_snapshot: bool = True,
+    snapshot_generated_at: dt.datetime | None = None,
+    review_evidence_generated_at: dt.datetime | None = None,
 ) -> tuple[dict, Path, list[list[str]], object]:
     evidence = _loss_review_source_packet(
         account="paper",
@@ -926,11 +990,18 @@ def _production_recovery_harness(
     envelope_path = tmp_path / "config" / "risk_envelope.yaml"
     reconciliation_path = tmp_path / "results" / "alpaca_reconciliation" / "latest.json"
     current_position = _current_broker_position()
+    hourly_generated_at = snapshot_generated_at or NOW
+    hourly_review = json.loads(
+        json.dumps(evidence["payload"]["supervisor_review_authority"])
+    )
+    hourly_review["evidence_generated_at"] = (
+        review_evidence_generated_at or NOW
+    ).isoformat()
     hourly_packet = {
-        "generated_at": NOW.isoformat(),
+        "generated_at": hourly_generated_at.isoformat(),
         "decision": "loss-review",
         "evidence": {
-            "loss_exit_review": evidence["payload"]["supervisor_review_authority"]
+            "loss_exit_review": hourly_review
         },
         "portfolio": {"live": {"positions": [current_position]}},
     }
@@ -1274,6 +1345,36 @@ def test_production_recovery_authority_requires_coordinator_clock(tmp_path):
     assert result["outcome"] == "failed"
     assert result["failure_type"] == "permanent"
     assert "recovery clock" in result["detail"]
+
+
+@pytest.mark.parametrize(
+    ("snapshot_generated_at", "review_evidence_generated_at"),
+    [
+        (NOW - dt.timedelta(minutes=16), NOW),
+        (NOW, NOW - dt.timedelta(minutes=16)),
+    ],
+    ids=("stale_hourly_snapshot", "stale_review_evidence"),
+)
+def test_production_recovery_authority_rejects_expired_snapshot_or_review_evidence(
+    tmp_path,
+    snapshot_generated_at,
+    review_evidence_generated_at,
+):
+    request, _state_path, _invocations, broker_spy = _production_recovery_harness(
+        tmp_path,
+        snapshot_generated_at=snapshot_generated_at,
+        review_evidence_generated_at=review_evidence_generated_at,
+    )
+
+    result = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority", "generated_at": NOW.isoformat()}
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["failure_type"] == "permanent"
+    assert "current broker position snapshot" in result["detail"]
+    assert broker_spy.read_calls == []
+    assert broker_spy.write_calls == []
 
 
 def test_production_recovery_authority_rejects_replaced_current_snapshot(
@@ -2531,7 +2632,7 @@ def test_competing_owner_is_noop_and_stale_lease_takeover_is_audited(tmp_path):
     assert '"event":"lease_taken_over"' in events
 
 
-def test_stale_takeover_revalidates_prior_phase_owner_without_rewriting_it(tmp_path):
+def test_stale_takeover_fails_closed_when_prior_authority_lease_expired(tmp_path):
     calls: list[str] = []
     first = _run(
         tmp_path,
@@ -2564,7 +2665,15 @@ def test_stale_takeover_revalidates_prior_phase_owner_without_rewriting_it(tmp_p
         now=NOW + dt.timedelta(minutes=30),
     )
 
-    assert resumed["status"] == "monitoring", resumed
+    assert resumed["status"] == "frozen", resumed
+    assert resumed["phase"] == "resolve_authority"
+    assert resumed["failure"]["kind"] == "permanent_integrity"
+    assert calls == [
+        "resolve_authority",
+        "regenerate_evidence",
+        "reconcile",
+        "focused_verify",
+    ]
     assert (
         json.loads(resolve_path.read_text(encoding="utf-8"))["owner_run_id"]
         == original_owner
@@ -2973,6 +3082,86 @@ def test_malformed_orphan_packet_is_not_recovered_as_completed(tmp_path):
 
     assert result["status"] == "frozen"
     assert result["failure"]["kind"] == "permanent_integrity"
+
+
+@pytest.mark.parametrize(
+    "current_facts",
+    [
+        {},
+        {
+            "authority_now": NOW.isoformat(),
+            "current_position_snapshot": {
+                "source_identity": "hourly_supervisor.portfolio.live.position",
+                "packet_path": "/forged/hourly.json",
+                "sha256": "f" * 64,
+                "size_bytes": 1,
+                "opened_at": NOW.isoformat(),
+                "entry_packet_path": "/forged/entry.json",
+                "entry_packet_sha256": "e" * 64,
+                "entry_packet_size_bytes": 1,
+                "captured_at": NOW.isoformat(),
+                "review_evidence_generated_at": NOW.isoformat(),
+            },
+        },
+    ],
+    ids=("missing_current_facts", "forged_current_facts"),
+)
+def test_orphan_authority_cannot_adopt_missing_or_forged_current_facts(
+    tmp_path,
+    current_facts,
+):
+    calls: list[str] = []
+    first = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(
+            calls,
+            fail={"phase": "resolve_authority", "failure_type": "transient"},
+        ),
+    )
+    assert first["status"] == "frozen"
+    orphan = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "recovery-nflx-1"
+        / "packets"
+        / "resolve_authority.json"
+    )
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_text(
+        json.dumps(
+            {
+                "schema_version": "tradingagents.recovery_phase.v1",
+                "kind": "recovery_authority",
+                "phase": "resolve_authority",
+                "generated_at": NOW.isoformat(),
+                "recovery_run_id": "recovery-nflx-1",
+                "owner_run_id": "repair-nflx-1",
+                "owner_role": "reliability_controller",
+                "allowed": True,
+                "requires_additional_decision": False,
+                "authority_source": "pre_registered_policy_rule",
+                "decision_owner": "execution_operator",
+                **BINDINGS,
+                **current_facts,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(calls),
+        now=NOW + dt.timedelta(seconds=30),
+    )
+
+    assert result["status"] == "frozen"
+    assert result["failure"]["kind"] == "permanent_integrity"
+    assert calls == ["resolve_authority"]
 
 
 def test_expired_persisted_owner_lock_is_quarantined_and_taken_over(tmp_path):
