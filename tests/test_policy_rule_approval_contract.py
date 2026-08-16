@@ -1,34 +1,36 @@
+from datetime import datetime
 from pathlib import Path
 
+from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.research.loss_review_evidence import (
     build_loss_review_evidence_packet,
 )
 from tradingagents.research.provider_orchestrator import TickerProviderResearchResult
 
 
-def test_policy_stop_floor_approval_survives_advisory_refresh():
-    review = {
+def _policy_review() -> dict:
+    generated_at = "2026-07-17T18:31:27+00:00"
+    position = {
         "symbol": "NFLX",
-        "side": "sell",
-        "decision_id": "loss-exit-NFLX-20260717183127",
-        "current_price": "69.28",
-        "average_entry_price": "83.37",
+        "qty": "0.320946047",
+        "avg_entry_price": "83.37",
+        "current_price": "69.00",
         "unrealized_pl": "-4.52",
-        "unrealized_pnl_percent": "-16.90",
-        "allowed_exit_reason": "policy_stop_floor",
-        "allowed_exit_reason_source": (
-            "pre-registered exit policy rule 'catastrophic_stop'"
-        ),
-        "policy_rule_exit": True,
-        "exit_policy_rule": "catastrophic_stop",
-        "exit_policy_rationale": (
-            "Position is beyond the pre-registered catastrophic floor."
-        ),
-        "evidence_generated_at": "2026-07-17T18:31:27+00:00",
-        "allowed": True,
-        "blocked_reasons": [],
-        "blockers": [],
+        "unrealized_plpc": "-0.1690",
     }
+    now = datetime.fromisoformat(generated_at)
+    enriched = apply_exit_policy_to_position(position, generated_at=now)
+    return loss_exit_review_packet(
+        enriched,
+        generated_at=now,
+        decision_id="loss-exit-NFLX-20260717183127",
+        proposed_limit_price=enriched["exit_policy_limit_price"],
+    )
+
+
+def test_policy_stop_floor_approval_survives_advisory_refresh():
+    review = _policy_review()
     hourly_packet = {
         "generated_at": "2026-07-17T18:31:27+00:00",
         "decision": "close",
@@ -41,8 +43,8 @@ def test_policy_stop_floor_approval_survives_advisory_refresh():
                     {
                         "symbol": "NFLX",
                         "qty": "0.320946047",
-                        "current_price": "69.28",
-                        "avg_entry_price": "83.37",
+                        "current_price": review["current_price"],
+                        "avg_entry_price": review["average_entry_price"],
                         "unrealized_pl": "-4.52",
                         "unrealized_plpc": "-0.1690",
                     }
@@ -77,17 +79,9 @@ def test_policy_stop_floor_approval_survives_advisory_refresh():
 
 def test_conflicting_policy_rule_stays_fail_closed_after_fresh_advisory_evidence():
     review = {
-        "symbol": "NFLX",
+        **_policy_review(),
         "decision_id": "loss-exit-NFLX-conflict",
-        "allowed": True,
-        "policy_rule_exit": True,
-        "allowed_exit_reason": "policy_stop_floor",
-        "allowed_exit_reason_source": "pre-registered exit policy rule",
         "exit_policy_rule": "profit_target",
-        "exit_policy_rationale": "A deliberately conflicting rule for this contract.",
-        "blockers": [],
-        "blocked_reasons": [],
-        "source_packet_ids": [],
     }
     hourly_packet = {
         "generated_at": "2026-07-17T18:31:27+00:00",

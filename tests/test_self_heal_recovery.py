@@ -16,6 +16,7 @@ from tradingagents.brokers.manual_action_attribution import (
     replay_suppression_key,
     write_owner_manual_action_attribution,
 )
+from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
 from tradingagents.evals.execution_board import compact_execution_board_review
 from tradingagents.orchestration import recovery as recovery_module
 from tradingagents.orchestration import self_heal as self_heal_module
@@ -36,6 +37,7 @@ from tradingagents.orchestration.self_heal import (
     coordinate_verified_recovery,
     recovery_recipe,
 )
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.live_control import load_live_control_state, write_live_control_state
 from tradingagents.policy.live_gate import evaluate_go_live_guard
 from tradingagents.policy.loss_board_decision import (
@@ -236,20 +238,21 @@ def _loss_review_source_packet(
     packet_path: str = "/tmp/loss-review-evidence.json",
     hourly_packet_path: str = "/tmp/hourly-supervisor.json",
 ) -> dict:
-    supervisor = {
+    position = {
         "symbol": symbol,
-        "decision_id": f"loss-exit-{symbol}-20260718",
-        "allowed": True,
-        "policy_rule_exit": True,
-        "allowed_exit_reason": "policy_stop_floor",
-        "allowed_exit_reason_source": "pre-registered exit policy rule",
-        "exit_policy_rule": "catastrophic_stop",
-        "exit_policy_rationale": "The pre-registered rule fired.",
-        "blockers": [],
-        "blocked_reasons": [],
-        "source_packet_ids": [f"supervisor-{symbol.lower()}"],
-        "source_identity": "hourly_supervisor.loss_exit_review",
+        "qty": "0.320946047",
+        "avg_entry_price": "83.37",
+        "current_price": "69.00",
+        "unrealized_pl": "-4.52",
+        "unrealized_plpc": "-0.1690",
     }
+    enriched = apply_exit_policy_to_position(position, generated_at=NOW)
+    supervisor = loss_exit_review_packet(
+        enriched,
+        generated_at=NOW,
+        decision_id=f"loss-exit-{symbol}-20260718",
+        proposed_limit_price=enriched["exit_policy_limit_price"],
+    )
     advisory = {
         "symbol": symbol,
         "review_allowed_after_refresh": True,
@@ -258,10 +261,10 @@ def _loss_review_source_packet(
         "decision_owner": "execution_operator",
         "loss_exit_candidate": {
             "allowed_exit_reason_candidate": "policy_stop_floor",
-            "allowed_exit_reason_source": "pre-registered exit policy rule",
+            "allowed_exit_reason_source": supervisor["allowed_exit_reason_source"],
             "confidence": None,
             "confidence_tier": "pre_registered_policy",
-            "reason_summary": "The pre-registered rule fired.",
+            "reason_summary": supervisor["exit_policy_rationale"],
             "drivers": [
                 "pre-registered exit rule remains authoritative: policy_stop_floor"
             ],
@@ -4230,19 +4233,10 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
         / "hourly-supervisor-nflx.json"
     )
     hourly_path.parent.mkdir(parents=True)
-    supervisor = {
-        "symbol": "NFLX",
-        "decision_id": "loss-exit-NFLX-20260718",
-        "allowed": True,
-        "policy_rule_exit": True,
-        "allowed_exit_reason": "policy_stop_floor",
-        "allowed_exit_reason_source": "pre-registered exit policy rule",
-        "exit_policy_rule": "catastrophic_stop",
-        "exit_policy_rationale": "The pre-registered rule fired.",
-        "blockers": [],
-        "blocked_reasons": [],
-        "source_packet_ids": ["supervisor-nflx"],
-    }
+    supervisor = _loss_review_source_packet(
+        symbol="NFLX",
+        account="live",
+    )["payload"]["supervisor_review_authority"]
     advisory = {
         "symbol": "NFLX",
         "requires_board_decision": False,

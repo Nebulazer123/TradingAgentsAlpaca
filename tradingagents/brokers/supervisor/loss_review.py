@@ -128,6 +128,10 @@ def loss_exit_review_packet(
     review_decision_id = decision_id or f"loss-exit-{symbol}-{generated_at:%Y%m%d%H%M%S}"
 
     policy_rule_exit = mechanical_policy_decision is not None
+    authority_source_ids = (
+        source_ids
+        or ([review_decision_id] if policy_rule_exit else [])
+    )
 
     if current_price <= 0:
         blockers.append("current price evidence is missing")
@@ -210,10 +214,16 @@ def loss_exit_review_packet(
         "why_this_is_not_broad_market_red_day_noise": anti_noise or None,
         "confidence": str(confidence),
         "evidence_generated_at": generated_at.isoformat(timespec="seconds"),
-        "source_packet_ids": source_ids,
+        "source_packet_ids": authority_source_ids,
+        "source_identity": "hourly_supervisor.loss_exit_review",
         "policy_rule_exit": policy_rule_exit,
         "exit_policy_rule": position.get("exit_policy_rule"),
         "exit_policy_rationale": position.get("exit_policy_rationale"),
+        "exit_policy_loss_pct": (
+            str(mechanical_policy_decision.loss_pct)
+            if mechanical_policy_decision is not None
+            else None
+        ),
         "allowed": not blockers,
         "blocked_reasons": blockers,
         "blockers": blockers,

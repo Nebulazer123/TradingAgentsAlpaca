@@ -1,13 +1,18 @@
 import hashlib
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
 from tradingagents.policy.decision_authority import (
     capture_current_supervisor_review,
     resolve_exit_authority,
 )
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
+
+NOW = datetime(2026, 7, 14, 15, 0, tzinfo=timezone.utc)
 
 
 def test_unverified_board_input_cannot_resolve_a_discretionary_exit():
@@ -149,18 +154,7 @@ def test_board_decision_rejects_replaced_or_wrong_current_supervisor_binding(
 
 def test_advisory_refresh_cannot_revoke_preregistered_policy_exit():
     verdict = resolve_exit_authority(
-        supervisor_review={
-            "allowed": True,
-            "policy_rule_exit": True,
-            "allowed_exit_reason": "policy_stop_floor",
-            "symbol": "NFLX",
-            "decision_id": "loss-exit-NFLX-20260717183127",
-            "allowed_exit_reason_source": "pre-registered exit policy rule",
-            "exit_policy_rule": "catastrophic_stop",
-            "exit_policy_rationale": "The pre-registered rule fired.",
-            "blockers": [],
-            "blocked_reasons": [],
-        },
+        supervisor_review=_valid_policy_review(),
         advisory_analysis={
             "requires_board_decision": True,
             "approval_effect": "board_review_input_not_loss_exit_approval",
@@ -183,20 +177,22 @@ def test_discretionary_loss_exit_still_requires_machine_board_decision():
     assert verdict.decision_owner == "portfolio_executive"
 
 
-def _valid_policy_review(*, reason="policy_stop_floor", rule="catastrophic_stop"):
-    return {
+def _valid_policy_review():
+    position = {
         "symbol": "NFLX",
-        "decision_id": "loss-exit-NFLX-20260717183127",
-        "allowed": True,
-        "policy_rule_exit": True,
-        "allowed_exit_reason": reason,
-        "allowed_exit_reason_source": "pre-registered exit policy rule",
-        "exit_policy_rule": rule,
-        "exit_policy_rationale": "The pre-registered rule fired.",
-        "blockers": [],
-        "blocked_reasons": [],
-        "source_packet_ids": ["supervisor-nflx"],
+        "qty": "0.5",
+        "avg_entry_price": "100.00",
+        "current_price": "91.00",
+        "market_value": "45.50",
+        "unrealized_pl": "-4.50",
+        "unrealized_plpc": "-0.09",
     }
+    enriched = apply_exit_policy_to_position(position, generated_at=NOW)
+    return loss_exit_review_packet(
+        enriched,
+        generated_at=NOW,
+        proposed_limit_price=enriched["exit_policy_limit_price"],
+    )
 
 
 def test_string_booleans_cannot_authorize_policy_exit():
@@ -242,12 +238,34 @@ def test_policy_claim_with_blockers_fails_closed():
 
 def test_policy_reason_and_rule_must_be_a_valid_pair():
     verdict = resolve_exit_authority(
-        supervisor_review=_valid_policy_review(rule="time_stop"),
+        supervisor_review={**_valid_policy_review(), "exit_policy_rule": "time_stop"},
         advisory_analysis=None,
     )
 
     assert verdict.allowed is False
     assert "does not match" in verdict.reason
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("allowed_exit_reason", "policy_time_stop"),
+        ("allowed_exit_reason_source", "arbitrary policy source"),
+        ("exit_policy_rule", "catastrophic_stop"),
+        ("exit_policy_rationale", "arbitrary policy rationale"),
+        ("proposed_limit_price", "90.73"),
+    ],
+)
+def test_resolver_rejects_forged_pre_registered_policy_review(field, value):
+    review = {**_valid_policy_review(), field: value}
+
+    verdict = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+    )
+
+    assert verdict.allowed is False
+    assert verdict.authority_source == "invalid_pre_registered_policy_rule"
 
 
 def test_nested_discretionary_candidate_requires_internal_board_decision():

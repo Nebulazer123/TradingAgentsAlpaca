@@ -277,6 +277,63 @@ def verify_pre_registered_exit_policy(
     return decision
 
 
+def verify_pre_registered_exit_policy_review(
+    review: Mapping,
+    *,
+    policy: ExitPolicy | None = None,
+) -> ExitPolicyDecision | None:
+    """Reconstruct and verify a persisted mechanical-review snapshot.
+
+    Authority consumers receive a persisted supervisor review rather than the
+    transient position mapping.  Rebuild the policy inputs from its immutable
+    facts and require the same exact reason, source, rationale, and limit
+    checks as the producer-side review.
+    """
+    policy = policy or DEFAULT_EXIT_POLICY
+    generated_at = _review_generated_at(review.get("evidence_generated_at"))
+    current_price = _finite_decimal(review.get("current_price"))
+    average_entry_price = _finite_decimal(review.get("average_entry_price"))
+    unrealized_pct = _finite_decimal(review.get("unrealized_plpc"))
+    policy_loss_pct = _finite_decimal(review.get("exit_policy_loss_pct"))
+    holding_days = _review_holding_days(review.get("holding_period_trading_days"))
+    if (
+        generated_at is None
+        or current_price is None
+        or current_price <= 0
+        or average_entry_price is None
+        or current_price >= average_entry_price
+        or unrealized_pct is None
+    ):
+        return None
+    if policy_loss_pct is not None:
+        if policy_loss_pct <= 0:
+            return None
+        if unrealized_pct != (-policy_loss_pct).quantize(
+            Decimal("0.01"), rounding=ROUND_DOWN
+        ):
+            return None
+        unrealized_plpc = -policy_loss_pct / Decimal("100")
+    else:
+        unrealized_plpc = unrealized_pct / Decimal("100")
+    position = {
+        "unrealized_plpc": unrealized_plpc,
+        "current_price": str(current_price),
+        "allowed_exit_reason": review.get("allowed_exit_reason"),
+        "allowed_exit_reason_source": review.get("allowed_exit_reason_source"),
+        "exit_policy_rule": review.get("exit_policy_rule"),
+        "exit_policy_rationale": review.get("exit_policy_rationale"),
+        "exit_policy_limit_price": review.get("proposed_limit_price"),
+    }
+    if holding_days is not None:
+        position["holding_period_trading_days"] = holding_days
+    return verify_pre_registered_exit_policy(
+        position,
+        generated_at=generated_at,
+        proposed_limit_price=review.get("proposed_limit_price"),
+        policy=policy,
+    )
+
+
 def _policy_reason_source(decision: ExitPolicyDecision, policy: ExitPolicy) -> str:
     return (
         f"pre-registered exit policy rule '{decision.rule_id}' "
@@ -291,6 +348,35 @@ def _matches_policy_limit(value: object, expected: Decimal) -> bool:
         return Decimal(str(value)) == expected
     except (InvalidOperation, TypeError, ValueError):
         return False
+
+
+def _finite_decimal(value: object) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _review_generated_at(value: object) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _review_holding_days(value: object) -> int | None:
+    parsed = _finite_decimal(value)
+    if parsed is None or parsed < 0 or parsed != parsed.to_integral_value():
+        return None
+    return int(parsed)
 
 
 def apply_exit_policy_to_position(

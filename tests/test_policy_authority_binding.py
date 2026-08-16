@@ -1,34 +1,43 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
 from tradingagents.evals.execution_board import build_execution_board_review
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.packets import write_research_packet
 from tradingagents.research.loss_review_evidence import build_loss_review_evidence_packet
 from tradingagents.research.provider_orchestrator import TickerProviderResearchResult
 
 
 def _review(*, reason="policy_stop_floor", rule="catastrophic_stop") -> dict:
-    return {
+    position = {
         "symbol": "NFLX",
-        "side": "sell",
-        "decision_id": "loss-exit-NFLX-20260717183127",
-        "current_price": "69.28",
-        "average_entry_price": "83.37",
+        "qty": "0.320946047",
+        "avg_entry_price": "83.37",
+        "current_price": "69.00",
         "unrealized_pl": "-4.52",
-        "unrealized_pnl_percent": "-16.90",
-        "allowed_exit_reason": reason,
-        "allowed_exit_reason_source": "pre-registered exit policy rule",
-        "policy_rule_exit": True,
-        "exit_policy_rule": rule,
-        "exit_policy_rationale": "The pre-registered rule fired.",
-        "evidence_generated_at": "2026-07-17T18:31:27+00:00",
-        "allowed": True,
-        "blocked_reasons": [],
-        "blockers": [],
-        "source_packet_ids": ["supervisor-nflx"],
+        "unrealized_plpc": "-0.1690",
     }
+    if reason == "policy_time_stop" and rule == "time_stop":
+        position.update(
+            {
+                "avg_entry_price": "100.00",
+                "current_price": "94.00",
+                "unrealized_plpc": "-0.06",
+                "holding_period_trading_days": 20,
+            }
+        )
+    generated_at = datetime(2026, 7, 17, 18, 31, 27, tzinfo=timezone.utc)
+    enriched = apply_exit_policy_to_position(position, generated_at=generated_at)
+    return loss_exit_review_packet(
+        enriched,
+        generated_at=generated_at,
+        decision_id="loss-exit-NFLX-20260717183127",
+        proposed_limit_price=enriched["exit_policy_limit_price"],
+    )
 
 
 def _hourly_packet(review: dict) -> dict:
@@ -44,8 +53,8 @@ def _hourly_packet(review: dict) -> dict:
                     {
                         "symbol": review["symbol"],
                         "qty": "1",
-                        "current_price": "69.28",
-                        "avg_entry_price": "83.37",
+                        "current_price": review["current_price"],
+                        "avg_entry_price": review["average_entry_price"],
                     }
                 ]
             }

@@ -10,7 +10,9 @@ from tradingagents.brokers.alpaca_supervisor import (
     HourlySupervisorAction,
     validate_supervisor_live_submit_allowed,
 )
+from tradingagents.brokers.supervisor.loss_review import loss_exit_review_packet
 from tradingagents.policy import live_gate as live_gate_module
+from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.live_gate import LiveGateError, evaluate_go_live_guard
 from tradingagents.policy.order_rate_limit import record_live_order_submission
 from tradingagents.policy.promotion_sync import sync_promotion_state_file
@@ -1360,87 +1362,43 @@ def test_live_gate_allows_strict_current_approved_loss_exit_review(tmp_path):
 
 
 def test_live_gate_allows_current_pre_registered_policy_stop_review(tmp_path):
-    envelope_path = tmp_path / "risk_envelope.yaml"
-    promotion_path = tmp_path / "promotion.json"
-    control_path = tmp_path / "live_control.json"
-    _write_envelope(envelope_path, live_budget_mode="autonomous_with_caps")
-    _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
-    promotion_path.write_text(
-        json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
-        encoding="utf-8",
-    )
-    review = {
-        "symbol": "NFLX",
-        "side": "sell",
-        "decision_id": "decision-current",
-        "current_price": "69.28",
-        "proposed_limit_price": "69.07",
-        "average_entry_price": "83.37",
-        "estimated_realized_loss": "-4.52",
-        "unrealized_pnl_percent": "-16.90",
-        "allowed_exit_reason": "policy_stop_floor",
-        "allowed_exit_reason_source": (
-            "pre-registered exit policy rule 'catastrophic_stop'"
-        ),
-        "policy_rule_exit": True,
-        "exit_policy_rule": "catastrophic_stop",
-        "exit_policy_rationale": (
-            "Position is beyond the pre-registered catastrophic floor."
-        ),
-        "evidence_generated_at": "2026-06-03T15:00:00+00:00",
-        "allowed": True,
-        "blocked_reasons": [],
-    }
-
-    result = evaluate_go_live_guard(
-        actions=[
-            _tiny_live_action(
-                action="close",
-                side="sell",
-                symbol="NFLX",
-                notional=Decimal("22.23"),
-                limit_price=Decimal("69.07"),
-                decision_id="decision-current",
-            )
-        ],
-        live_positions=[_loss_position(
-            symbol="NFLX",
-            avg_entry_price="83.37",
-            current_price="69.28",
-            market_value="22.23",
-            cost_basis="26.76",
-            unrealized_pl="-4.52",
-            unrealized_plpc="-0.1690",
-        )],
-        decision_evidence={"loss_exit_review": review},
-        risk_envelope_path=envelope_path,
-        promotion_state_path=promotion_path,
-        control_state_path=control_path,
-        now=datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc),
-    )
+    result = _policy_exit_gate_result(tmp_path, _policy_exit_review())
 
     assert result.allowed is True
 
 
 def _policy_exit_review(**overrides):
-    review = {
+    generated_at = datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc)
+    is_time_stop = (
+        overrides.get("allowed_exit_reason") == "policy_time_stop"
+        and overrides.get("exit_policy_rule") == "time_stop"
+    )
+    position = {
         "symbol": "NFLX",
-        "side": "sell",
-        "decision_id": "decision-current",
-        "current_price": "69.28",
-        "average_entry_price": "83.37",
+        "qty": "0.320946047",
+        "avg_entry_price": "83.37",
+        "current_price": "69.00",
+        "market_value": "22.23",
         "estimated_realized_loss": "-4.52",
-        "unrealized_pnl_percent": "-16.90",
-        "allowed_exit_reason": "policy_stop_floor",
-        "allowed_exit_reason_source": "pre-registered exit policy rule",
-        "policy_rule_exit": True,
-        "exit_policy_rule": "catastrophic_stop",
-        "exit_policy_rationale": "Position is beyond the pre-registered floor.",
-        "evidence_generated_at": "2026-06-03T15:00:00+00:00",
-        "allowed": True,
-        "blockers": [],
-        "blocked_reasons": [],
+        "unrealized_pl": "-4.52",
+        "unrealized_plpc": "-0.172364159769701331414177762",
     }
+    if is_time_stop:
+        position.update(
+            {
+                "avg_entry_price": "100.00",
+                "current_price": "94.00",
+                "unrealized_plpc": "-0.06",
+                "holding_period_trading_days": 20,
+            }
+        )
+    enriched = apply_exit_policy_to_position(position, generated_at=generated_at)
+    review = loss_exit_review_packet(
+        enriched,
+        generated_at=generated_at,
+        decision_id="decision-current",
+        proposed_limit_price=enriched["exit_policy_limit_price"],
+    )
     review.update(overrides)
     return review
 
@@ -1461,26 +1419,46 @@ def _policy_exit_gate_result(
         json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
         encoding="utf-8",
     )
+    is_policy_exit = review.get("policy_rule_exit") is True
     action_values = {
         "action": "close",
         "side": "sell",
         "symbol": "NFLX",
         "notional": Decimal("22.23"),
-        "limit_price": Decimal("69.07"),
+        "limit_price": Decimal(
+            str(review.get("proposed_limit_price") or "68.79")
+            if is_policy_exit
+            else "69.07"
+        ),
         "decision_id": "decision-current",
     }
     action_values.update(action_overrides or {})
     action = _tiny_live_action(**action_values)
+    if is_policy_exit:
+        try:
+            current_price = Decimal(str(review.get("current_price")))
+            average_entry_price = Decimal(str(review.get("average_entry_price")))
+            unrealized_plpc = Decimal(str(review.get("unrealized_plpc"))) / Decimal("100")
+            if current_price <= 0 or average_entry_price <= 0:
+                raise ValueError
+        except Exception:
+            current_price = Decimal("69.00")
+            average_entry_price = Decimal("83.37")
+            unrealized_plpc = Decimal("-0.172364159769701331414177762")
+    else:
+        current_price = Decimal("69.28")
+        average_entry_price = Decimal("83.37")
+        unrealized_plpc = Decimal("-0.1690")
     return evaluate_go_live_guard(
         actions=[action],
         live_positions=[_loss_position(
             symbol=action.symbol,
-            avg_entry_price="83.37",
-            current_price="69.28",
+            avg_entry_price=str(average_entry_price),
+            current_price=str(current_price),
             market_value="22.23",
             cost_basis="26.76",
             unrealized_pl="-4.52",
-            unrealized_plpc="-0.1690",
+            unrealized_plpc=str(unrealized_plpc),
         )],
         decision_evidence={"loss_exit_review": review},
         risk_envelope_path=envelope_path,
@@ -1567,7 +1545,7 @@ def test_live_gate_rejects_invalid_policy_numeric_fields(tmp_path, field, value)
     "field,value",
     [
         ("current_price", "83.37"),
-        ("average_entry_price", "69.28"),
+        ("average_entry_price", "69.00"),
         ("estimated_realized_loss", "0.01"),
         ("unrealized_pnl_percent", "0.01"),
     ],
@@ -1604,7 +1582,7 @@ def test_live_gate_rejects_malformed_or_falsey_policy_timestamp(tmp_path, value)
         ("current_price", 69),
         ("average_entry_price", Decimal("83.37")),
         ("estimated_realized_loss", "-4.52"),
-        ("unrealized_pnl_percent", Decimal("-16.90")),
+        ("unrealized_pnl_percent", Decimal("-17.24")),
     ],
 )
 def test_live_gate_allows_valid_policy_numeric_scalar_forms(tmp_path, field, value):

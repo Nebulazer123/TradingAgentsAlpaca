@@ -88,6 +88,22 @@ def test_policy_exit_review_packet_is_allowed_without_narrative():
     assert packet["exit_policy_rule"] == "hard_stop"
 
 
+def test_policy_exit_review_rejects_mismatching_caller_limit():
+    enriched = apply_exit_policy_to_position(_position("-0.09"), generated_at=NOW)
+
+    packet = loss_exit_review_packet(
+        enriched,
+        generated_at=NOW,
+        proposed_limit_price="90.73",
+    )
+
+    assert packet["policy_rule_exit"] is False
+    assert packet["allowed"] is False
+    assert "pre-registered policy exit does not match fresh policy evaluation" in packet[
+        "blockers"
+    ]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

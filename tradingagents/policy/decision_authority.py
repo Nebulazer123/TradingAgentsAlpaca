@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tradingagents.policy.exit_policy import POLICY_REASON_CODES, POLICY_REASON_RULE_IDS
+from tradingagents.policy.exit_policy import (
+    POLICY_REASON_CODES,
+    POLICY_REASON_RULE_IDS,
+    verify_pre_registered_exit_policy_review,
+)
 
 POLICY_EXIT_REASONS = POLICY_REASON_CODES
 POLICY_EXIT_RULE_IDS = POLICY_REASON_RULE_IDS
@@ -27,6 +31,13 @@ AUTHORITY_RECORD_FIELDS = (
     "allowed_exit_reason_source",
     "exit_policy_rule",
     "exit_policy_rationale",
+    "current_price",
+    "proposed_limit_price",
+    "average_entry_price",
+    "unrealized_plpc",
+    "holding_period_trading_days",
+    "evidence_generated_at",
+    "exit_policy_loss_pct",
     "blockers",
     "blocked_reasons",
     "source_packet_ids",
@@ -127,6 +138,13 @@ def bounded_exit_authority_record(review: Mapping[str, Any] | Any) -> dict[str, 
         "allowed_exit_reason_source": _text(source.get("allowed_exit_reason_source")),
         "exit_policy_rule": _text(source.get("exit_policy_rule")),
         "exit_policy_rationale": _text(source.get("exit_policy_rationale")),
+        "current_price": _text(source.get("current_price")),
+        "proposed_limit_price": _text(source.get("proposed_limit_price")),
+        "average_entry_price": _text(source.get("average_entry_price")),
+        "unrealized_plpc": _text(source.get("unrealized_plpc")),
+        "holding_period_trading_days": _text(source.get("holding_period_trading_days")),
+        "evidence_generated_at": _text(source.get("evidence_generated_at")),
+        "exit_policy_loss_pct": _text(source.get("exit_policy_loss_pct")),
         "blockers": _bounded_strings(source.get("blockers")),
         "blocked_reasons": _bounded_strings(source.get("blocked_reasons")),
         "source_packet_ids": _bounded_strings(source.get("source_packet_ids")),
@@ -223,6 +241,10 @@ def resolve_exit_authority(
         if rule not in POLICY_EXIT_RULE_IDS[reason]:
             return _invalid_policy_verdict(
                 f"pre-registered policy reason {reason} does not match rule {rule or 'missing'}"
+            )
+        if verify_pre_registered_exit_policy_review(review) is None:
+            return _invalid_policy_verdict(
+                "pre-registered policy exit does not match fresh policy evaluation"
             )
         return ExitAuthorityVerdict(
             exit_allowed=True,
