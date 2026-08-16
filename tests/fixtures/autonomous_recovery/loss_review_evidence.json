@@ -38,10 +38,11 @@
     "review_allowed": true,
     "entry_context": {
       "symbol": "NFLX",
-      "account": "live"
+      "account": "live",
+      "submitted_at": "2026-07-13T15:00:00+00:00"
     },
     "entry_context_found": true,
-    "next_action": "pre_registered_policy_approval_preserved",
+    "next_action": "autonomous_hold",
     "analysis_only": true,
     "execution_authority": "none",
     "forbidden_effects": [
@@ -63,7 +64,8 @@
   "entry_context_found": true,
   "entry_context": {
     "symbol": "NFLX",
-    "account": "live"
+    "account": "live",
+    "submitted_at": "2026-07-13T15:00:00+00:00"
   },
   "evidence_needs": [
     "company_specific_news"
@@ -77,7 +79,7 @@
   ],
   "remaining_blocker_count": 0,
   "resolved_blocker_count": 1,
-  "next_action": "pre_registered_policy_approval_preserved",
+  "next_action": "autonomous_hold",
   "source_packet_count": 1,
   "source_packet_paths": {
     "provider-nflx": "/fixture/provider-nflx.json"

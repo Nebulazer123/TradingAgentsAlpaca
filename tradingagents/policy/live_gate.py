@@ -391,6 +391,14 @@ def _policy_loss_exit_review_issues(
             and verdict.authority_source == "pre_registered_policy_rule"
         ):
             issues.append(f"policy exit authority denied: {verdict.reason}")
+        action_limit = _finite_policy_decimal(_action_value(action, "limit_price"))
+        review_limit = _finite_policy_decimal(review.get("proposed_limit_price"))
+        if (
+            action_limit is None
+            or review_limit is None
+            or action_limit != review_limit
+        ):
+            issues.append("action limit_price does not match pre-registered policy limit")
     issues.extend(_review_binding_and_freshness_issues(action, review, now=now))
     return sorted(set(issues))
 

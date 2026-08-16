@@ -29,7 +29,7 @@ def _policy_review() -> dict:
     )
 
 
-def test_policy_stop_floor_approval_survives_advisory_refresh():
+def test_policy_stop_floor_review_cannot_authorize_from_advisory_refresh_alone():
     review = _policy_review()
     hourly_packet = {
         "generated_at": "2026-07-17T18:31:27+00:00",
@@ -63,18 +63,10 @@ def test_policy_stop_floor_approval_survives_advisory_refresh():
     )
 
     advisory = packet.payload["advisory_analysis"]
-    candidate = advisory["loss_exit_candidate"]
-    assert packet.payload["next_action"] == (
-        "pre_registered_policy_approval_preserved"
-    )
-    assert advisory["review_allowed_after_refresh"] is True
-    assert candidate["allowed_exit_reason_candidate"] == "policy_stop_floor"
-    assert candidate["allowed_exit_reason_source"] == review[
-        "allowed_exit_reason_source"
-    ]
-    assert candidate["approval_effect"] == "preserves_pre_registered_policy_approval"
-    assert candidate["requires_board_decision"] is False
-    assert candidate["can_submit_orders"] is False
+    assert packet.payload["next_action"] == "autonomous_hold"
+    assert advisory["review_allowed_after_refresh"] is False
+    assert advisory["authority_source"] == "pre_registered_policy_rule_candidate"
+    assert advisory["policy_rule_conflict"] is False
 
 
 def test_conflicting_policy_rule_stays_fail_closed_after_fresh_advisory_evidence():

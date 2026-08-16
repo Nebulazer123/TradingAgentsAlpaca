@@ -1291,6 +1291,9 @@ def research_loss_review_evidence(
         "is_open": raw_clock.get("is_open") if isinstance(raw_clock, Mapping) else None,
         "raw_clock": dict(raw_clock) if isinstance(raw_clock, Mapping) else {"invalid_clock_response": True},
     }
+    def post_fetch_authority_now() -> datetime.datetime:
+        return datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
+
     result = build_loss_review_provider_research(
         symbol,
         evidence_needs=needs or DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
@@ -1306,6 +1309,7 @@ def research_loss_review_evidence(
             else None
         ),
         now=refresh_started_at,
+        authority_now=post_fetch_authority_now,
     )
     source_packet_paths = {
         packet.packet_id: write_research_packet(packet, source_output_dir)
@@ -1319,7 +1323,7 @@ def research_loss_review_evidence(
     # One post-fetch authority instant evaluates every diagnostic packet.  It
     # is deliberately not the routing-start time and is not a source packet's
     # own timestamp, so stale/future evidence cannot self-qualify.
-    authority_now = datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
+    authority_now = post_fetch_authority_now()
     packet = build_loss_review_evidence_packet(
         hourly_packet_path=hourly_packet_path,
         hourly_packet=hourly_packet,

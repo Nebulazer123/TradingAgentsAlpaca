@@ -378,6 +378,18 @@ def loss_review_substance_packet_is_admissible(
     )
 
 
+def _post_fetch_authority_now(value: Any) -> datetime.datetime | None:
+    """Resolve an authority instant after a source read has completed."""
+    candidate = value() if callable(value) else value
+    if (
+        not isinstance(candidate, datetime.datetime)
+        or candidate.tzinfo is None
+        or candidate.utcoffset() is None
+    ):
+        return None
+    return candidate.astimezone(datetime.timezone.utc).replace(microsecond=0)
+
+
 def _canonicalize_provider_packet_timestamp(packet: SourceEvidencePacket) -> SourceEvidencePacket:
     """Canonicalize wrapper timestamps while preserving the vendor payload verbatim."""
     canonical = canonical_provider_timestamp(packet.as_of)
@@ -1514,7 +1526,7 @@ def build_ticker_provider_research_packets(
     broker_snapshot_dir: str | Path = DEFAULT_BROKER_SNAPSHOT_DIR,
     source_quality_review_path: str | Path | None = None,
     now: datetime.datetime | None = None,
-    authority_now: datetime.datetime | None = None,
+    authority_now: datetime.datetime | Any | None = None,
     require_admissible_quote: bool = False,
     require_admissible_loss_news: bool = False,
     require_admissible_loss_substance: bool = False,
@@ -1557,6 +1569,7 @@ def build_ticker_provider_research_packets(
                     )
                     continue
                 packet = _canonicalize_provider_packet_timestamp(packet)
+                admission_now = _post_fetch_authority_now(authority_now)
                 packets.append(packet)
                 attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
                 if (
@@ -1571,16 +1584,16 @@ def build_ticker_provider_research_packets(
                     # second boundary after the run began; with no authority
                     # instant yet, retain it diagnostically and keep routing.
                     or (
-                        authority_now is not None
-                        and loss_review_news_packet_is_admissible(packet, now=authority_now)
+                        admission_now is not None
+                        and loss_review_news_packet_is_admissible(packet, now=admission_now)
                     )
                 ) and (
                     not require_admissible_loss_substance
                     or evidence_need != "earnings_transcripts"
                     or (
-                        authority_now is not None
+                        admission_now is not None
                         and loss_review_substance_packet_is_admissible(
-                            packet, now=authority_now
+                            packet, now=admission_now
                         )
                     )
                 ):
@@ -1649,6 +1662,7 @@ def build_ticker_provider_research_packets(
                 ),
             )
             packet = _canonicalize_provider_packet_timestamp(packet)
+            admission_now = _post_fetch_authority_now(authority_now)
             if not _blocked_packet_counts_as_evidence(packet, candidate):
                 attempts.append(_packet_attempt(packet, candidate, evidence_need=evidence_need))
                 continue
@@ -1665,16 +1679,16 @@ def build_ticker_provider_research_packets(
                 not require_admissible_loss_news
                 or evidence_need != "market_news"
                 or (
-                    authority_now is not None
-                    and loss_review_news_packet_is_admissible(packet, now=authority_now)
+                    admission_now is not None
+                    and loss_review_news_packet_is_admissible(packet, now=admission_now)
                     )
             ) and (
                 not require_admissible_loss_substance
                 or evidence_need != "earnings_transcripts"
                 or (
-                    authority_now is not None
+                    admission_now is not None
                     and loss_review_substance_packet_is_admissible(
-                        packet, now=authority_now
+                        packet, now=admission_now
                     )
                 )
             ):

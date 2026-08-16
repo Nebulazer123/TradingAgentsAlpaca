@@ -748,6 +748,11 @@ _RAW_SOURCE_PROVENANCE_FIELDS = frozenset(
 )
 _NEWS_SELECTION_POLICY = "configured_provider_priority_then_newest_event_then_packet_id"
 _NEWS_PROVIDER_PRIORITY = {"alpaca_news": 0, "finnhub": 1, "fmp": 2}
+_NATIVE_NEWS_RAW_TYPES = {
+    ("alpaca_news", "market_news"),
+    ("finnhub", "company_news"),
+    ("fmp", "stock_news"),
+}
 
 
 def _capture_raw_provider_packet(
@@ -804,6 +809,108 @@ def _capture_raw_provider_packet(
     return (stored, replayed) if replayed is not None else None
 
 
+def _authoritative_news_selection(
+    payload: Mapping[str, Any],
+    *,
+    root: Path,
+    symbol: str,
+    now: dt.datetime,
+    raw_cache: dict[str, tuple[bytes, Mapping[str, Any]]],
+) -> Mapping[str, Any] | None:
+    """Replay every native-news raw packet, never a normalized self-subset.
+
+    ``source_packet_ids`` is the loss packet's complete direct-provider
+    identity list.  Its matching raw manifest lets the recorder discover all
+    configured native-news packets, authenticate them, and re-run the strict
+    normalizer before considering the writer's eligible-candidate receipt.
+    """
+    source_ids = payload.get("source_packet_ids")
+    raw_manifest = payload.get("raw_source_packet_manifest")
+    declared_candidates = payload.get("news_candidate_manifest")
+    if (
+        not isinstance(source_ids, list)
+        or not source_ids
+        or not all(isinstance(item, str) and item for item in source_ids)
+        or len(source_ids) != len(set(source_ids))
+        or not isinstance(raw_manifest, list)
+        or not isinstance(declared_candidates, list)
+    ):
+        return None
+
+    raw_by_id: dict[str, Mapping[str, Any]] = {}
+    for provenance in raw_manifest:
+        if (
+            not isinstance(provenance, Mapping)
+            or set(provenance) != _RAW_SOURCE_PROVENANCE_FIELDS
+        ):
+            return None
+        packet_id = provenance.get("raw_packet_id")
+        if not isinstance(packet_id, str) or not packet_id or packet_id in raw_by_id:
+            return None
+        raw_by_id[packet_id] = provenance
+    if set(raw_by_id) != set(source_ids):
+        return None
+
+    replayed_candidates: list[
+        tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]]
+    ] = []
+    for provenance in raw_by_id.values():
+        raw_type = (
+            str(provenance.get("raw_source_name") or "").lower(),
+            str(provenance.get("raw_evidence_type") or ""),
+        )
+        if raw_type not in _NATIVE_NEWS_RAW_TYPES:
+            continue
+        captured = _capture_raw_provider_packet(
+            root=root,
+            provenance=provenance,
+            symbol=symbol,
+            now=now,
+            cache=raw_cache,
+        )
+        # A native packet that is malformed, stale, or not a strict issuer
+        # event is diagnostic only.  It cannot be a candidate, but every
+        # eligible one below is still authenticated and replayed.
+        if captured is None:
+            continue
+        _stored, replayed = captured
+        if replayed[0] == "company_news":
+            replayed_candidates.append((provenance, replayed))
+
+    declared_by_id: dict[str, Mapping[str, Any]] = {}
+    for provenance in declared_candidates:
+        if (
+            not isinstance(provenance, Mapping)
+            or set(provenance) != _RAW_SOURCE_PROVENANCE_FIELDS
+        ):
+            return None
+        packet_id = provenance.get("raw_packet_id")
+        if not isinstance(packet_id, str) or not packet_id or packet_id in declared_by_id:
+            return None
+        declared_by_id[packet_id] = provenance
+    eligible_by_id = {
+        str(provenance["raw_packet_id"]): provenance
+        for provenance, _replayed in replayed_candidates
+    }
+    if declared_by_id != eligible_by_id or not replayed_candidates:
+        return None
+
+    def selection_key(
+        candidate: tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]]
+    ) -> tuple[int, float, str]:
+        provenance, replayed = candidate
+        observed = _time(replayed[2], "replayed news as_of")
+        return (
+            _NEWS_PROVIDER_PRIORITY.get(
+                str(provenance.get("raw_source_name")).lower(), 999
+            ),
+            -observed.timestamp(),
+            str(provenance.get("raw_packet_id")),
+        )
+
+    return min(replayed_candidates, key=selection_key)[0]
+
+
 def _replayed_normalized_source_matches_raw(
     capture: CapturedSourceEvidence,
     *,
@@ -811,6 +918,7 @@ def _replayed_normalized_source_matches_raw(
     symbol: str,
     now: dt.datetime,
     raw_cache: dict[str, tuple[bytes, Mapping[str, Any]]],
+    selected_news_provenance: Mapping[str, Any] | None = None,
 ) -> bool:
     """Require exact raw-to-normalized replay, including news selection."""
     provenance = capture.packet_object.get("provenance")
@@ -820,58 +928,35 @@ def _replayed_normalized_source_matches_raw(
         key: provenance.get(key) for key in _RAW_SOURCE_PROVENANCE_FIELDS
     }
     provenance_keys = set(provenance)
-    if provenance_keys != set(_RAW_SOURCE_PROVENANCE_FIELDS) and provenance_keys != (
-        set(_RAW_SOURCE_PROVENANCE_FIELDS)
-        | {"selection_policy", "candidate_raw_packets"}
-    ):
-        return False
-
     if capture.source.evidence_type == "company_news":
         if (
             provenance.get("selection_policy") != _NEWS_SELECTION_POLICY
-            or not isinstance(provenance.get("candidate_raw_packets"), list)
-            or not provenance["candidate_raw_packets"]
+            or selected_news_provenance is None
+            or provenance_keys
+            not in (
+                set(_RAW_SOURCE_PROVENANCE_FIELDS) | {"selection_policy"},
+                # Read legacy packets without using their self-declared
+                # candidate list.  It is deliberately ignored below.
+                set(_RAW_SOURCE_PROVENANCE_FIELDS)
+                | {"selection_policy", "candidate_raw_packets"},
+            )
         ):
             return False
-        candidates: list[tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]]] = []
-        seen_candidates: set[str] = set()
-        for candidate in provenance["candidate_raw_packets"]:
-            if not isinstance(candidate, Mapping):
-                return False
-            captured = _capture_raw_provider_packet(
-                root=root,
-                provenance=candidate,
-                symbol=symbol,
-                now=now,
-                cache=raw_cache,
-            )
-            if captured is None:
-                return False
-            stored, replayed = captured
-            if replayed[0] != "company_news":
-                return False
-            packet_id = str(stored.get("packet_id") or "")
-            if not packet_id or packet_id in seen_candidates:
-                return False
-            seen_candidates.add(packet_id)
-            candidates.append((candidate, replayed))
-
-        def selection_key(
-            candidate: tuple[Mapping[str, Any], tuple[str, dict[str, Any], str]]
-        ) -> tuple[int, float, str]:
-            raw, replayed = candidate
-            observed = _time(replayed[2], "replayed news as_of")
-            return (
-                _NEWS_PROVIDER_PRIORITY.get(str(raw.get("raw_source_name")).lower(), 999),
-                -observed.timestamp(),
-                str(raw.get("raw_packet_id")),
-            )
-
-        selected_provenance, selected_replay = min(candidates, key=selection_key)
-        if raw_provenance != dict(selected_provenance):
+        if raw_provenance != dict(selected_news_provenance):
             return False
-        replayed = selected_replay
+        captured = _capture_raw_provider_packet(
+            root=root,
+            provenance=raw_provenance,
+            symbol=symbol,
+            now=now,
+            cache=raw_cache,
+        )
+        if captured is None:
+            return False
+        _stored, replayed = captured
     else:
+        if provenance_keys != set(_RAW_SOURCE_PROVENANCE_FIELDS):
+            return False
         captured = _capture_raw_provider_packet(
             root=root,
             provenance=raw_provenance,
@@ -1083,6 +1168,15 @@ def _semantic_gaps(
     categories: set[str] = set()
     source_payloads: dict[str, Mapping[str, Any]] = {}
     raw_source_cache: dict[str, tuple[bytes, Mapping[str, Any]]] = {}
+    selected_news_provenance = _authoritative_news_selection(
+        payload,
+        root=root,
+        symbol=review["symbol"],
+        now=now,
+        raw_cache=raw_source_cache,
+    )
+    if selected_news_provenance is None:
+        gaps.append("news_candidate_manifest_invalid_or_incomplete")
     for capture in captures:
         source = capture.source
         try:
@@ -1117,6 +1211,7 @@ def _semantic_gaps(
                     symbol=review["symbol"],
                     now=now,
                     raw_cache=raw_source_cache,
+                    selected_news_provenance=selected_news_provenance,
                 )
             ):
                 categories.add("news")

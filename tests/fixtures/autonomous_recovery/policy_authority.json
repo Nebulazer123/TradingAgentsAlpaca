@@ -4,7 +4,8 @@
     "qty": "0.320946047",
     "avg_entry_price": "83.37",
     "current_price": "69.00",
-    "unrealized_pl": "-4.52",
-    "unrealized_plpc": "-0.1690"
+    "unrealized_pl": "-4.61",
+    "unrealized_plpc": "-0.1723641597697013314141777618",
+    "opened_at": "2026-07-13T15:00:00+00:00"
   }
 }

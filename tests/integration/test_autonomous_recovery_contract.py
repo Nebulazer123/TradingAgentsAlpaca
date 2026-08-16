@@ -206,11 +206,18 @@ def _genuine_policy_authority(position: dict, *, supervisor_path: Path) -> dict:
         hourly_packet_path=supervisor_path,
         hourly_packet=hourly_packet,
         provider_result=TickerProviderResearchResult(symbol=supervisor["symbol"]),
-        entry_context={"symbol": supervisor["symbol"], "account": "live"},
+        entry_context={
+            "symbol": supervisor["symbol"],
+            "account": "live",
+            "submitted_at": position["opened_at"],
+        },
     )
     return {
         "supervisor_review_authority": supervisor,
         "advisory_analysis": evidence.payload["advisory_analysis"],
+        "hourly_packet": hourly_packet,
+        "entry_context": evidence.payload["entry_context"],
+        "next_action": evidence.payload["next_action"],
     }
 
 
@@ -301,11 +308,22 @@ def _build_fixture_recovery_request(
         tmp_path / "results" / "loss_review_evidence" / "latest.json"
     )
     evidence["packet_path"] = str(evidence_path.resolve())
-    evidence["payload"].update(copy.deepcopy(authority))
+    evidence["payload"].update(
+        {
+            "supervisor_review_authority": copy.deepcopy(
+                authority["supervisor_review_authority"]
+            ),
+            "advisory_analysis": copy.deepcopy(authority["advisory_analysis"]),
+            "entry_context": copy.deepcopy(authority["entry_context"]),
+            "next_action": authority["next_action"],
+        }
+    )
+    evidence["entry_context"] = copy.deepcopy(authority["entry_context"])
+    evidence["next_action"] = authority["next_action"]
 
     _write_json(
         supervisor_path,
-        authority["supervisor_review_authority"],
+        authority["hourly_packet"],
     )
     _write_json(advisory_path, authority["advisory_analysis"])
     _write_json(evidence_path, evidence)
@@ -439,6 +457,18 @@ def _build_fixture_recovery_request(
         "reconciliation_packet_paths": [str(reconciliation_path)],
         "supervisor_record": authority["supervisor_review_authority"],
         "advisory_record": authority["advisory_analysis"],
+        "current_position_snapshot": {
+            "source_identity": "hourly_supervisor.portfolio.live.position",
+            "packet_path": str(supervisor_path),
+            "sha256": _sha256(supervisor_path),
+            "size_bytes": supervisor_path.stat().st_size,
+            "opened_at": _load_fixture("policy_authority.json")["position"][
+                "opened_at"
+            ],
+            "entry_packet_path": str(evidence_path),
+            "entry_packet_sha256": _sha256(evidence_path),
+            "entry_packet_size_bytes": evidence_path.stat().st_size,
+        },
     }
     request = build_production_recovery_request(
         {

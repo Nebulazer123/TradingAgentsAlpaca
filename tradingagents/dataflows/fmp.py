@@ -195,7 +195,6 @@ def fetch_fmp_earning_call_transcript(
     *,
     year: int,
     quarter: int,
-    published_at: str | None = None,
     api_key: str | None = None,
     session: Any | None = None,
 ) -> Any:
@@ -220,8 +219,15 @@ def fetch_fmp_earning_call_transcript(
         )
     packet.freshness["read_only"] = True
     packet.freshness["route"] = "dataflow:fmp"
-    provider_published_at = published_at or next(
-        (str(item.get("date") or item.get("publishedDate") or "") for item in transcript_items if item.get("date") or item.get("publishedDate")),
+    # Only a timestamp carried by the fetched transcript itself proves when
+    # FMP published/held the event.  A caller's collection clock and a
+    # fiscal-period label are not interchangeable with that provider fact.
+    provider_published_at = next(
+        (
+            str(item.get("publishedDate") or item.get("date") or "")
+            for item in transcript_items
+            if item.get("publishedDate") or item.get("date")
+        ),
         "",
     )
     if not provider_published_at:
@@ -286,12 +292,11 @@ def fetch_fmp_latest_earning_call_transcript(
         raise DataUnavailableError(
             f"FMP returned no earnings transcript dates for {ticker}"
         )
-    latest_date, latest_year, latest_quarter = sorted(dated_candidates, reverse=True)[0]
+    _latest_date, latest_year, latest_quarter = sorted(dated_candidates, reverse=True)[0]
     return fetch_fmp_earning_call_transcript(
         ticker,
         year=latest_year,
         quarter=latest_quarter,
-        published_at=latest_date,
         api_key=api_key,
         session=session,
     )

@@ -1382,6 +1382,7 @@ def _policy_exit_review(**overrides):
         "estimated_realized_loss": "-4.52",
         "unrealized_pl": "-4.52",
         "unrealized_plpc": "-0.172364159769701331414177762",
+        "opened_at": "2026-05-20T15:00:00+00:00",
     }
     if is_time_stop:
         position.update(
@@ -1390,6 +1391,7 @@ def _policy_exit_review(**overrides):
                 "current_price": "94.00",
                 "unrealized_plpc": "-0.06",
                 "holding_period_trading_days": 20,
+                "opened_at": "2026-05-06T15:00:00+00:00",
             }
         )
     enriched = apply_exit_policy_to_position(position, generated_at=generated_at)
@@ -1439,9 +1441,9 @@ def _policy_exit_gate_result(
         try:
             current_price = Decimal(str(review.get("current_price")))
             average_entry_price = Decimal(str(review.get("average_entry_price")))
-            unrealized_plpc = Decimal(str(review.get("unrealized_plpc"))) / Decimal("100")
             if current_price <= 0 or average_entry_price <= 0:
                 raise ValueError
+            unrealized_plpc = (current_price - average_entry_price) / average_entry_price
         except Exception:
             current_price = Decimal("69.00")
             average_entry_price = Decimal("83.37")
@@ -1526,6 +1528,40 @@ def test_live_gate_denies_policy_review_when_current_broker_position_conflicts(t
 
     assert result.allowed is False
     assert any("policy" in issue.reason.lower() for issue in result.issues)
+
+
+def test_live_gate_denies_policy_review_when_broker_return_conflicts(tmp_path):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(),
+        live_position_overrides={"unrealized_plpc": "-0.10"},
+    )
+
+    assert result.allowed is False
+    assert any("policy" in issue.reason.lower() for issue in result.issues)
+
+
+def test_live_gate_denies_policy_review_when_opened_at_and_holding_days_conflict(tmp_path):
+    review = _policy_exit_review(
+        opened_at="2026-05-27T15:00:00+00:00",
+        holding_period_trading_days=20,
+    )
+
+    result = _policy_exit_gate_result(tmp_path, review)
+
+    assert result.allowed is False
+    assert any("policy" in issue.reason.lower() for issue in result.issues)
+
+
+def test_live_gate_denies_policy_review_when_action_limit_conflicts(tmp_path):
+    result = _policy_exit_gate_result(
+        tmp_path,
+        _policy_exit_review(),
+        action_overrides={"limit_price": Decimal("68.78")},
+    )
+
+    assert result.allowed is False
+    assert any("limit" in issue.reason.lower() for issue in result.issues)
 
 
 @pytest.mark.parametrize("reason", [["policy_stop_floor"], {"reason": "policy_stop_floor"}])

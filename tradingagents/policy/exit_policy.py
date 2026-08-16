@@ -286,16 +286,23 @@ def verify_pre_registered_exit_policy_review(
 ) -> ExitPolicyDecision | None:
     """Verify a persisted mechanical review against current broker facts.
 
-    The producer may self-check a review before it leaves the supervisor.  The
-    final submit gate must additionally supply the independently captured
-    current broker position and current clock.  In that mode, a persisted
-    review cannot substitute for live price, entry, quantity, or holding facts.
+    This is an authority-bearing verifier.  A detached persisted review is
+    deliberately not a valid input: callers must independently capture both
+    the current position and a timezone-aware authority clock.  Producer-side
+    inspection belongs to :func:`verify_pre_registered_exit_policy`, which
+    only evaluates the position supplied to that producer and cannot grant
+    final submit authority.
     """
     policy = policy or DEFAULT_EXIT_POLICY
-    if current_position is not None and now is None:
+    if (
+        not isinstance(current_position, Mapping)
+        or not isinstance(now, datetime.datetime)
+        or now.tzinfo is None
+        or now.utcoffset() is None
+    ):
         return None
     generated_at = _review_generated_at(review.get("evidence_generated_at"))
-    evaluation_at = _review_generated_at(now.isoformat()) if now is not None else generated_at
+    evaluation_at = now.astimezone(UTC)
     current_price = _finite_decimal(review.get("current_price"))
     average_entry_price = _finite_decimal(review.get("average_entry_price"))
     unrealized_pct = _finite_decimal(review.get("unrealized_plpc"))
@@ -311,85 +318,91 @@ def verify_pre_registered_exit_policy_review(
         or unrealized_pct is None
     ):
         return None
-    if policy_loss_pct is not None:
-        if policy_loss_pct <= 0:
-            return None
-        if unrealized_pct != (-policy_loss_pct).quantize(
-            Decimal("0.01"), rounding=ROUND_DOWN
+    live_symbol = str(current_position.get("symbol") or "").upper()
+    review_symbol = str(review.get("symbol") or "").upper()
+    live_current_price = _finite_decimal(current_position.get("current_price"))
+    live_average_entry = _finite_decimal(
+        current_position.get("avg_entry_price")
+        if current_position.get("avg_entry_price") not in (None, "")
+        else current_position.get("average_entry_price")
+    )
+    live_quantity = _finite_decimal(
+        current_position.get("qty")
+        if current_position.get("qty") not in (None, "")
+        else current_position.get("quantity")
+    )
+    review_quantity = _finite_decimal(review.get("quantity"))
+    review_opened_at = _review_opened_at(review.get("opened_at"))
+    live_opened_at = _position_opened_at(current_position)
+    if (
+        not live_symbol
+        or live_symbol != review_symbol
+        or live_current_price is None
+        or live_average_entry is None
+        or live_quantity is None
+        or live_current_price <= 0
+        or live_average_entry <= 0
+        or live_quantity <= 0
+        or review_quantity is None
+        or review_quantity <= 0
+        or current_price != live_current_price
+        or average_entry_price != live_average_entry
+        or review_quantity != live_quantity
+        or holding_days is None
+        or review_opened_at is None
+        or review_opened_at != live_opened_at
+    ):
+        return None
+    recomputed_holding_days = _holding_trading_days(
+        {"opened_at": live_opened_at}, generated_at=evaluation_at
+    )
+    if recomputed_holding_days is None or holding_days != recomputed_holding_days:
+        return None
+    supplied_holding_days = current_position.get("holding_period_trading_days")
+    if supplied_holding_days not in (None, "") and _review_holding_days(
+        supplied_holding_days
+    ) != recomputed_holding_days:
+        return None
+
+    # Recompute the loss from broker price/entry rather than accepting a
+    # persisted percentage.  The two-decimal percent is the receipt format;
+    # any broker scalar is checked against a bounded canonical fraction to
+    # tolerate harmless vendor precision differences without accepting a
+    # different return.
+    recomputed_unrealized_plpc = (
+        live_current_price - live_average_entry
+    ) / live_average_entry
+    supplied_unrealized_plpc = current_position.get("unrealized_plpc")
+    if supplied_unrealized_plpc not in (None, ""):
+        broker_unrealized_plpc = _finite_decimal(supplied_unrealized_plpc)
+        if (
+            broker_unrealized_plpc is None
+            or _canonical_unrealized_plpc(broker_unrealized_plpc)
+            != _canonical_unrealized_plpc(recomputed_unrealized_plpc)
         ):
             return None
-        unrealized_plpc = -policy_loss_pct / Decimal("100")
-    else:
-        unrealized_plpc = unrealized_pct / Decimal("100")
+    recomputed_unrealized_pct = (recomputed_unrealized_plpc * Decimal("100")).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN
+    )
+    if unrealized_pct != recomputed_unrealized_pct:
+        return None
+    if (
+        policy_loss_pct is None
+        or policy_loss_pct <= 0
+        or _canonical_unrealized_plpc(-policy_loss_pct / Decimal("100"))
+        != _canonical_unrealized_plpc(recomputed_unrealized_plpc)
+    ):
+        return None
     position = {
-        "unrealized_plpc": unrealized_plpc,
-        "current_price": str(current_price),
+        "unrealized_plpc": str(recomputed_unrealized_plpc),
+        "current_price": str(live_current_price),
+        "opened_at": live_opened_at,
         "allowed_exit_reason": review.get("allowed_exit_reason"),
         "allowed_exit_reason_source": review.get("allowed_exit_reason_source"),
         "exit_policy_rule": review.get("exit_policy_rule"),
         "exit_policy_rationale": review.get("exit_policy_rationale"),
         "exit_policy_limit_price": review.get("proposed_limit_price"),
     }
-    if holding_days is not None:
-        position["holding_period_trading_days"] = holding_days
-    if current_position is not None:
-        live_symbol = str(current_position.get("symbol") or "").upper()
-        review_symbol = str(review.get("symbol") or "").upper()
-        live_current_price = _finite_decimal(current_position.get("current_price"))
-        live_average_entry = _finite_decimal(
-            current_position.get("avg_entry_price")
-            if current_position.get("avg_entry_price") not in (None, "")
-            else current_position.get("average_entry_price")
-        )
-        live_quantity = _finite_decimal(
-            current_position.get("qty")
-            if current_position.get("qty") not in (None, "")
-            else current_position.get("quantity")
-        )
-        review_quantity = _finite_decimal(review.get("quantity"))
-        if (
-            not live_symbol
-            or live_symbol != review_symbol
-            or live_current_price is None
-            or live_average_entry is None
-            or live_quantity is None
-            or live_current_price <= 0
-            or live_average_entry <= 0
-            or live_quantity <= 0
-            or review_quantity is None
-            or review_quantity <= 0
-            or current_price != live_current_price
-            or average_entry_price != live_average_entry
-            or review_quantity != live_quantity
-        ):
-            return None
-        live_holding_days = _review_holding_days(
-            current_position.get("holding_period_trading_days")
-        )
-        review_opened_at = _review_opened_at(review.get("opened_at"))
-        live_opened_at = _position_opened_at(current_position)
-        if holding_days != live_holding_days or review_opened_at != live_opened_at:
-            return None
-        # Recompute the loss from broker price/entry rather than accepting a
-        # persisted percentage.  The unrounded value drives the rule/rationale;
-        # the persisted percentage remains the fixed-format receipt.
-        recomputed_unrealized_pct = (
-            (live_current_price - live_average_entry) / live_average_entry
-            * Decimal("100")
-        ).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-        if unrealized_pct != recomputed_unrealized_pct:
-            return None
-        position = {
-            **position,
-            "current_price": str(live_current_price),
-            "unrealized_plpc": str(
-                (live_current_price - live_average_entry) / live_average_entry
-            ),
-        }
-        if live_holding_days is not None:
-            position["holding_period_trading_days"] = live_holding_days
-        else:
-            position.pop("holding_period_trading_days", None)
     return verify_pre_registered_exit_policy(
         position,
         generated_at=evaluation_at,
@@ -422,6 +435,11 @@ def _finite_decimal(value: object) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return None
     return parsed if parsed.is_finite() else None
+
+
+def _canonical_unrealized_plpc(value: Decimal) -> Decimal:
+    """Return the fixed broker-return precision used for live binding."""
+    return value.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
 
 def _review_generated_at(value: object) -> datetime.datetime | None:

@@ -1061,6 +1061,31 @@ def test_fmp_missing_transcript_text_and_dates_are_unavailable():
         )
 
 
+def test_fmp_transcript_requires_provider_event_time_and_never_uses_fiscal_period_end():
+    with pytest.raises(DataUnavailableError, match="provider publication timestamp"):
+        fmp.fetch_fmp_earning_call_transcript(
+            "AAPL",
+            year=2026,
+            quarter=1,
+            api_key="fmp-secret",
+            session=FakeSession(
+                [{"symbol": "AAPL", "content": "Management lowered guidance by 12%."}]
+            ),
+        )
+
+    with pytest.raises(DataUnavailableError, match="provider publication timestamp"):
+        fmp.fetch_fmp_latest_earning_call_transcript(
+            "AAPL",
+            api_key="fmp-secret",
+            session=SequentialFakeSession(
+                [
+                    [{"year": 2026, "quarter": 1, "fiscalDateEnding": "2026-06-30"}],
+                    [{"symbol": "AAPL", "content": "Management lowered guidance by 12%."}],
+                ]
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("symbol", "quarter", "message"),
     [

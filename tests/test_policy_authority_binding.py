@@ -86,7 +86,7 @@ def _write_valid_evidence(tmp_path: Path, review: dict) -> tuple[Path, Path]:
         ("policy_time_stop", "time_stop"),
     ],
 )
-def test_valid_policy_authority_survives_full_compact_and_board(
+def test_compact_policy_review_remains_non_authorizing_without_current_broker_facts(
     tmp_path, reason, rule
 ):
     hourly_dir, evidence_dir = _write_valid_evidence(
@@ -98,8 +98,8 @@ def test_valid_policy_authority_survives_full_compact_and_board(
 
     assert board["loss_review_evidence"]["matches_review_window"] is True
     assert board["loss_review_evidence"]["source_binding"]["matched"] is True
-    assert board["loss_review_evidence"]["review_allowed"] is True
-    assert not any(item["type"] == "loss_review_evidence_pending" for item in board["warnings"])
+    assert board["loss_review_evidence"]["review_allowed"] is False
+    assert any(item["type"] == "loss_review_evidence_pending" for item in board["warnings"])
 
 
 @pytest.mark.parametrize(

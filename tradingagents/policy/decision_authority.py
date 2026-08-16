@@ -7,6 +7,7 @@ it performs no network, broker, or model calls.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
@@ -190,6 +191,54 @@ def _invalid_policy_verdict(reason: str) -> ExitAuthorityVerdict:
     )
 
 
+def parse_pre_registered_exit_policy_candidate(
+    supervisor_review: Mapping[str, Any] | Any,
+) -> dict[str, str] | None:
+    """Parse a review-only mechanical-policy *candidate*, never authority.
+
+    Research and recovery evidence sometimes need to preserve the stated
+    policy rule for lineage.  They must not call :func:`resolve_exit_authority`
+    with a detached review just to obtain an ``allowed`` result: final
+    authorization additionally binds a fresh broker position and clock.  This
+    helper deliberately returns only static candidate facts and has no
+    ``allowed`` field.
+    """
+    review = _mapping(supervisor_review)
+    reason = _text(review.get("allowed_exit_reason"))
+    if (
+        review.get("allowed") is not True
+        or review.get("policy_rule_exit") is not True
+        or reason not in POLICY_EXIT_RULE_IDS
+    ):
+        return None
+    if any(
+        not _text(review.get(field))
+        for field in (
+            "symbol",
+            "decision_id",
+            "allowed_exit_reason_source",
+            "exit_policy_rule",
+            "exit_policy_rationale",
+        )
+    ):
+        return None
+    if _policy_blockers(review) is not None or _source_packet_ids_issue(review) is not None:
+        return None
+    rule = _text(review.get("exit_policy_rule"))
+    if rule not in POLICY_EXIT_RULE_IDS[reason]:
+        return None
+    return {
+        "symbol": _text(review.get("symbol")).upper(),
+        "decision_id": _text(review.get("decision_id")),
+        "allowed_exit_reason": reason,
+        "allowed_exit_reason_source": _text(
+            review.get("allowed_exit_reason_source")
+        ),
+        "exit_policy_rule": rule,
+        "exit_policy_rationale": _text(review.get("exit_policy_rationale")),
+    }
+
+
 def _requires_board_decision(advisory: Mapping[str, Any]) -> bool:
     if advisory.get("requires_board_decision") is True:
         return True
@@ -246,6 +295,15 @@ def resolve_exit_authority(
         if rule not in POLICY_EXIT_RULE_IDS[reason]:
             return _invalid_policy_verdict(
                 f"pre-registered policy reason {reason} does not match rule {rule or 'missing'}"
+            )
+        if (
+            not isinstance(current_position, Mapping)
+            or not isinstance(now, datetime.datetime)
+            or now.tzinfo is None
+            or now.utcoffset() is None
+        ):
+            return _invalid_policy_verdict(
+                "pre-registered policy exit requires a current broker position and current clock"
             )
         if verify_pre_registered_exit_policy_review(
             review,

@@ -229,16 +229,30 @@ def loss_exit_review_packet(
         "blocked_reasons": blockers,
         "blockers": blockers,
     }
-    authority = resolve_exit_authority(
-        supervisor_review=review,
-        advisory_analysis=None,
-    )
+    if policy_rule_exit:
+        # This producer has just evaluated its supplied position, but it has
+        # not independently captured the final broker position or submit-time
+        # clock.  Keep the packet a candidate; only the live gate may call the
+        # public authority resolver with those current facts.
+        authority_allowed = not blockers
+        authority_source = "pre_registered_policy_rule_candidate"
+        requires_additional_decision = False
+        decision_owner = "execution_operator"
+    else:
+        authority = resolve_exit_authority(
+            supervisor_review=review,
+            advisory_analysis=None,
+        )
+        authority_allowed = authority.allowed
+        authority_source = authority.authority_source
+        requires_additional_decision = authority.requires_additional_decision
+        decision_owner = authority.decision_owner
     return {
         **review,
-        "allowed": authority.allowed,
-        "authority_source": authority.authority_source,
-        "requires_additional_decision": authority.requires_additional_decision,
-        "decision_owner": authority.decision_owner,
+        "allowed": authority_allowed,
+        "authority_source": authority_source,
+        "requires_additional_decision": requires_additional_decision,
+        "decision_owner": decision_owner,
     }
 
 

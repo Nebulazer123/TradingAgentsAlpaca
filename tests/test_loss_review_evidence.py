@@ -6,13 +6,16 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from cli.main import app
+from tradingagents.dataflows import fmp as fmp_dataflow
 from tradingagents.dataflows._official_common import evidence_packet
 from tradingagents.policy.loss_board_decision import record_autonomous_loss_board_decision
 from tradingagents.policy.packets import write_research_packet
 from tradingagents.research import loss_review_evidence as loss_evidence
+from tradingagents.research import provider_orchestrator as orchestrator
 from tradingagents.research.loss_review_evidence import (
     DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS,
     build_loss_review_evidence_packet,
+    build_loss_review_provider_research,
     find_latest_loss_review_packet,
     find_prior_live_entry_context,
 )
@@ -99,9 +102,9 @@ def test_loss_normalizer_publishes_canonical_vendor_event_times_but_keeps_raw_pa
     fmp = evidence_packet(
         source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL",
         source_ref="https://example.test/fmp",
-        payload={"symbol": "ORCL", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]},
+        payload={"symbol": "ORCL", "published_at": "2026-08-12T21:00:00+00:00", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]},
         quality="high", as_of="2026-08-13", tool_route="fmp_api",
-    )
+    ).model_copy(update={"generated_at": "2026-08-13T00:00:00+00:00"})
     normalized_fmp = loss_evidence._normalize_provider_packet(
         packet=fmp, stored=fmp.model_dump(), symbol="ORCL"
     )
@@ -152,6 +155,54 @@ def test_configured_fmp_substance_keeps_provider_event_time_separate_from_captur
         )
         is None
     )
+
+
+def test_configured_fmp_substance_requires_provider_event_time_and_rejects_stale_event():
+    now = datetime.fromisoformat("2026-08-13T14:55:00+00:00")
+
+    def packet(payload):
+        return evidence_packet(
+            source_name="fmp",
+            evidence_type="earnings_transcripts",
+            subject="ORCL",
+            symbol="ORCL",
+            source_ref="https://example.test/fmp/ORCL",
+            payload=payload,
+            quality="high",
+            as_of="2026-08-12T21:00:00+00:00",
+            tool_route="fmp_api",
+        ).model_copy(update={"generated_at": now.isoformat()})
+
+    missing_event = packet(
+        {
+            "symbol": "ORCL",
+            "transcript_items": [
+                {"content": "Management lowered revenue guidance by 12%."}
+            ],
+        }
+    )
+    stale_event = packet(
+        {
+            "symbol": "ORCL",
+            "published_at": "2026-08-01T21:00:00+00:00",
+            "transcript_items": [
+                {"content": "Management lowered revenue guidance by 12%."}
+            ],
+        }
+    )
+
+    assert loss_evidence._normalize_provider_packet(
+        packet=missing_event,
+        stored=missing_event.model_dump(),
+        symbol="ORCL",
+        now=now,
+    ) is None
+    assert loss_evidence._normalize_provider_packet(
+        packet=stale_event,
+        stored=stale_event.model_dump(),
+        symbol="ORCL",
+        now=now,
+    ) is None
 
 
 def _hourly_packet(symbol: str = "TSM") -> dict:
@@ -272,9 +323,9 @@ def _configured_shape_provider_result(symbol: str = "ORCL") -> TickerProviderRes
             evidence_packet(
                 source_name="fmp", evidence_type="earnings_transcripts", subject=symbol, symbol=symbol,
                 source_ref="https://financialmodelingprep.com/api/v3/earning-call-transcript/ORCL",
-                payload={"symbol": symbol, "year": 2026, "quarter": 1, "transcript_items": [{"content": "Management lowered full-year revenue guidance by 12% because of the contract loss."}]},
+                payload={"symbol": symbol, "year": 2026, "quarter": 1, "published_at": "2026-08-12T21:00:00+00:00", "transcript_items": [{"content": "Management lowered full-year revenue guidance by 12% because of the contract loss."}]},
                 quality="high", as_of="2026-08-13T14:55:00+00:00", tool_route="fmp_api",
-            ),
+            ).model_copy(update={"generated_at": "2026-08-13T14:55:00+00:00"}),
         ],
     )
 
@@ -426,8 +477,8 @@ def test_native_news_types_share_one_real_run_clock_and_stale_diagnostics_stay_n
     transcript = evidence_packet(
         source_name="fmp", evidence_type="earnings_transcripts", subject=symbol, symbol=symbol,
         source_ref="https://test/transcript", quality="high", as_of="2026-08-13T14:55:00+00:00",
-        payload={"symbol": symbol, "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, tool_route="fmp_api",
-    )
+        payload={"symbol": symbol, "published_at": "2026-08-12T21:00:00+00:00", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, tool_route="fmp_api",
+    ).model_copy(update={"generated_at": run_now.isoformat()})
     provider = TickerProviderResearchResult(symbol, [
         quote("ORCL", 91, 100), quote("SPY", 650, 648), quote("QQQ", 580, 578), quote("XLK", 260, 259), stale, fresh, transcript,
     ])
@@ -619,8 +670,8 @@ def test_loss_board_selects_one_configured_priority_news_source_from_native_dupl
     transcript = evidence_packet(
         source_name="fmp", evidence_type="earnings_transcripts", subject=symbol, symbol=symbol,
         source_ref="https://test/transcript", quality="high", as_of="2026-08-13T14:55:00+00:00",
-        payload={"symbol": symbol, "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, tool_route="fmp_api",
-    )
+        payload={"symbol": symbol, "published_at": "2026-08-12T21:00:00+00:00", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, tool_route="fmp_api",
+    ).model_copy(update={"generated_at": run_now.isoformat()})
     provider = TickerProviderResearchResult(symbol, [
         quote(symbol, 91, 100), quote("SPY", 650, 648), quote("QQQ", 580, 578), quote("XLK", 260, 259), alpaca, finnhub, fmp_news, transcript,
     ])
@@ -641,6 +692,89 @@ def test_loss_board_selects_one_configured_priority_news_source_from_native_dupl
         now=run_now,
     ).decision
     assert decision.decision == "SELL", decision.evidence_gaps
+
+    def raw_provenance(source):
+        raw_path = paths[source.packet_id]
+        raw = raw_path.read_bytes()
+        stored = json.loads(raw)
+        return {
+            "raw_packet_path": raw_path.relative_to(tmp_path).as_posix(),
+            "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_packet_id": source.packet_id,
+            "raw_evidence_type": source.evidence_type,
+            "raw_source_name": source.source_name,
+            "raw_symbol": source.symbol,
+            "raw_subject": source.subject,
+            "raw_as_of": source.as_of,
+            "raw_quality": source.quality,
+            "raw_generated_at": str(stored["generated_at"]),
+        }
+
+    # All included raw bytes and descriptor hashes remain valid.  The forged
+    # normalized winner is FMP, while the authoritative raw manifest still
+    # contains the higher-priority, eligible Alpaca event.  A self-declared
+    # normalized subset must never hide that candidate.
+    fmp_raw = json.loads(paths[fmp_news.packet_id].read_text(encoding="utf-8"))
+    replayed = loss_evidence.replay_normalized_loss_review_source(
+        raw_packet=fmp_raw, symbol=symbol, now=run_now
+    )
+    assert replayed is not None
+    replayed_type, replayed_payload, replayed_as_of = replayed
+    assert replayed_type == "company_news"
+    fmp_provenance = raw_provenance(fmp_news)
+    forged_normalized = {
+        "packet_id": f"normalized-{fmp_news.packet_id}-company_news",
+        "source_name": fmp_news.source_name,
+        "evidence_type": "company_news",
+        "subject": symbol,
+        "symbol": symbol,
+        "as_of": replayed_as_of,
+        "quality": fmp_news.quality,
+        "provenance": {
+            **fmp_provenance,
+            "selection_policy": "configured_provider_priority_then_newest_event_then_packet_id",
+            "candidate_raw_packets": [fmp_provenance],
+        },
+        "payload": replayed_payload,
+    }
+    forged_raw = json.dumps(
+        forged_normalized, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    forged_path = (
+        tmp_path
+        / "normalized_loss_review_evidence"
+        / f"{fmp_news.packet_id}-company_news-forged.json"
+    )
+    forged_path.write_bytes(forged_raw)
+    tampered_loss = json.loads(loss_path.read_text(encoding="utf-8"))
+    for descriptor in tampered_loss["payload"]["accepted_sources"]:
+        if descriptor["evidence_type"] == "company_news":
+            descriptor.update(
+                {
+                    "path": forged_path.relative_to(tmp_path).as_posix(),
+                    "sha256": hashlib.sha256(forged_raw).hexdigest(),
+                    "size_bytes": len(forged_raw),
+                    "packet_id": forged_normalized["packet_id"],
+                    "source_name": "fmp",
+                    "as_of": replayed_as_of,
+                    "quality": "medium",
+                }
+            )
+    tampered_loss["payload"]["raw_source_packet_manifest"] = [
+        raw_provenance(source) for source in provider.packets
+    ]
+    tampered_loss["payload"]["news_candidate_manifest"] = [fmp_provenance]
+    loss_path.write_text(json.dumps(tampered_loss), encoding="utf-8")
+
+    omitted_priority = record_autonomous_loss_board_decision(
+        supervisor_packet_path=hourly_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="6" * 40,
+        ledger_root=tmp_path / "ledger-omitted-priority",
+        evidence_root=tmp_path,
+        now=run_now,
+    ).decision
+    assert omitted_priority.decision == "HOLD", omitted_priority.evidence_gaps
 
 
 def test_loss_board_chooses_newest_distinct_event_within_one_provider_deterministically(tmp_path):
@@ -719,12 +853,12 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
                                     "url": "https://issuer.test/adverse"}]},
                 quality="medium", as_of=now, tool_route="finnhub_api",
             ),
-            evidence_packet(
-                source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL",
-                source_ref="https://fmp.test/transcript/ORCL",
-                payload={"symbol": "ORCL", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]},
-                quality="high", as_of=now, tool_route="fmp_api",
-            ),
+                evidence_packet(
+                    source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL",
+                    source_ref="https://fmp.test/transcript/ORCL",
+                    payload={"symbol": "ORCL", "published_at": "2026-08-12T21:00:00+00:00", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]},
+                    quality="high", as_of=now, tool_route="fmp_api",
+                ).model_copy(update={"generated_at": now}),
         ],
     )
     source_paths = {
@@ -753,6 +887,173 @@ def test_real_configured_individual_quote_route_builds_bound_current_review_and_
     assert recorded.decision.can_submit_orders is False
 
 
+def test_configured_builder_and_real_fmp_adapter_produce_sell_decision_only(monkeypatch, tmp_path):
+    """Exercise configured collection through the real FMP adapter, locally."""
+    run_now = datetime.now(tz=__import__("datetime").timezone.utc).replace(
+        microsecond=0
+    )
+    event_at = (run_now - __import__("datetime").timedelta(days=1)).isoformat()
+    now_text = run_now.isoformat()
+    symbol = "ORCL"
+    config_path = tmp_path / "configured-fallbacks.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "policy": {"forbidden_effects": []},
+                "fallbacks": {
+                    "quote_price_context": [
+                        {
+                            "source_name": "finnhub",
+                            "route": "dataflow:finnhub",
+                            "cost_tier": "free_limited",
+                            "priority": 1,
+                        }
+                    ],
+                    "market_news": [
+                        {
+                            "source_name": "finnhub",
+                            "route": "dataflow:finnhub",
+                            "cost_tier": "free_limited",
+                            "priority": 1,
+                        }
+                    ],
+                    "fundamentals_profile": [],
+                    "earnings_transcripts": [
+                        {
+                            "source_name": "fmp",
+                            "route": "dataflow:fmp",
+                            "cost_tier": "free_limited",
+                            "priority": 1,
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def quote(ticker):
+        return evidence_packet(
+            source_name="finnhub",
+            evidence_type="quote_price_context",
+            subject=ticker,
+            symbol=ticker,
+            source_ref=f"https://issuer.test/quote/{ticker}",
+            payload={"c": 91 if ticker == symbol else 100, "pc": 100},
+            quality="high",
+            as_of=now_text,
+            tool_route="finnhub_api",
+        )
+
+    def company_news(_ticker, **_kwargs):
+        return evidence_packet(
+            source_name="finnhub",
+            evidence_type="company_news",
+            subject=symbol,
+            symbol=symbol,
+            source_ref="https://issuer.test/news/ORCL",
+            payload={
+                "data": [
+                    {
+                        "datetime": int(run_now.timestamp()),
+                        "headline": "Oracle cuts revenue guidance",
+                        "summary": "Oracle lowered revenue guidance by 8%.",
+                        "url": "https://issuer.test/news/orcl-guidance",
+                    }
+                ]
+            },
+            quality="medium",
+            as_of=now_text,
+            tool_route="finnhub_api",
+        )
+
+    class Response:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class TranscriptSession:
+        def __init__(self):
+            self.responses = [
+                [{"date": event_at, "year": run_now.year, "quarter": 2}],
+                [
+                    {
+                        "symbol": symbol,
+                        "date": event_at,
+                        "content": "Management lowered revenue guidance by 12%.",
+                    }
+                ],
+            ]
+
+        def get(self, _url, **_kwargs):
+            return Response(self.responses.pop(0))
+
+    def fmp_transcript(ticker):
+        return fmp_dataflow.fetch_fmp_latest_earning_call_transcript(
+            ticker,
+            api_key="local-test-key",
+            session=TranscriptSession(),
+        )
+
+    monkeypatch.setattr(orchestrator, "fetch_finnhub_quote", quote)
+    monkeypatch.setattr(orchestrator, "fetch_finnhub_company_news", company_news)
+    monkeypatch.setattr(
+        orchestrator, "fetch_fmp_latest_earning_call_transcript", fmp_transcript
+    )
+    provider = build_loss_review_provider_research(
+        symbol,
+        provider_config_path=config_path,
+        cache_dir=tmp_path / "cache",
+        now=run_now,
+        authority_now=run_now,
+    )
+    fmp_packet = next(packet for packet in provider.packets if packet.source_name == "fmp")
+    assert fmp_packet.payload["published_at"] == event_at
+    assert fmp_packet.payload["published_at"] != fmp_packet.generated_at
+
+    hourly = _hourly_packet(symbol)
+    hourly["evidence"]["loss_exit_review"].update(
+        {
+            "decision_id": "configured-builder-fmp",
+            "current_price": "91",
+            "average_entry_price": "100",
+            "blockers": [],
+            "blocked_reasons": [],
+        }
+    )
+    hourly_path = tmp_path / "hourly.json"
+    hourly_path.write_text(json.dumps(hourly), encoding="utf-8")
+    source_paths = {
+        item.packet_id: write_research_packet(item, tmp_path / "raw")
+        for item in provider.packets
+    }
+    loss_packet = build_loss_review_evidence_packet(
+        hourly_packet_path=hourly_path,
+        hourly_packet=hourly,
+        provider_result=provider,
+        source_packet_paths=source_paths,
+        decision_evidence_root=tmp_path,
+        market_clock=_clock(now_text),
+        now=run_now,
+    )
+    loss_path = write_research_packet(loss_packet, tmp_path / "loss")
+    decision = record_autonomous_loss_board_decision(
+        supervisor_packet_path=hourly_path,
+        loss_evidence_packet_path=loss_path,
+        source_revision="7" * 40,
+        ledger_root=tmp_path / "ledger",
+        evidence_root=tmp_path,
+        now=run_now,
+    ).decision
+    assert decision.decision == "SELL", decision.evidence_gaps
+    assert decision.can_submit_orders is False
+
+
 def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_path):
     """The present exchange clock, not the old hourly label, controls session state."""
     now = "2026-08-13T14:55:00+00:00"
@@ -772,7 +1073,23 @@ def test_closed_current_clock_allows_decision_only_sell_but_not_execution(tmp_pa
             payload={"data": [{"datetime": 1786632840, "headline": "Oracle cuts guidance", "summary": "Lowered guidance by 8%", "url": "https://issuer.test/x"}]},
             quality="medium", as_of=now, tool_route="test",
         ),
-        evidence_packet(source_name="fmp", evidence_type="earnings_transcripts", subject="ORCL", symbol="ORCL", source_ref="https://test/transcript", payload={"symbol": "ORCL", "transcript_items": [{"content": "Management lowered revenue guidance by 12%."}]}, quality="high", as_of=now, tool_route="test"),
+            evidence_packet(
+                source_name="fmp",
+                evidence_type="earnings_transcripts",
+                subject="ORCL",
+                symbol="ORCL",
+                source_ref="https://test/transcript",
+                payload={
+                    "symbol": "ORCL",
+                    "published_at": "2026-08-12T21:00:00+00:00",
+                    "transcript_items": [
+                        {"content": "Management lowered revenue guidance by 12%."}
+                    ],
+                },
+                quality="high",
+                as_of=now,
+                tool_route="test",
+            ).model_copy(update={"generated_at": now}),
     ])
     paths = {item.packet_id: write_research_packet(item, tmp_path / "raw") for item in provider.packets}
     closed = build_loss_review_evidence_packet(hourly_packet_path=hourly_path, hourly_packet=hourly, provider_result=provider, source_packet_paths=paths, decision_evidence_root=tmp_path, market_clock=_clock(now, is_open=False), now=datetime.fromisoformat(now))

@@ -231,6 +231,19 @@ def _write_bound_board_compact(tmp_path: Path, fixture: dict) -> Path:
     )
 
 
+def _current_broker_position(*, symbol: str = "NFLX") -> dict:
+    """Fake a separately captured broker position, not a review replay."""
+    return {
+        "symbol": symbol,
+        "qty": "0.320946047",
+        "avg_entry_price": "83.37",
+        "current_price": "69.00",
+        "unrealized_pl": "-4.61",
+        "unrealized_plpc": "-0.1723641597697013314141777618",
+        "opened_at": "2026-07-13T15:00:00+00:00",
+    }
+
+
 def _loss_review_source_packet(
     *,
     symbol: str = "NFLX",
@@ -238,14 +251,7 @@ def _loss_review_source_packet(
     packet_path: str = "/tmp/loss-review-evidence.json",
     hourly_packet_path: str = "/tmp/hourly-supervisor.json",
 ) -> dict:
-    position = {
-        "symbol": symbol,
-        "qty": "0.320946047",
-        "avg_entry_price": "83.37",
-        "current_price": "69.00",
-        "unrealized_pl": "-4.52",
-        "unrealized_plpc": "-0.1690",
-    }
+    position = _current_broker_position(symbol=symbol)
     enriched = apply_exit_policy_to_position(position, generated_at=NOW)
     supervisor = loss_exit_review_packet(
         enriched,
@@ -255,8 +261,8 @@ def _loss_review_source_packet(
     )
     advisory = {
         "symbol": symbol,
-        "review_allowed_after_refresh": True,
-        "authority_source": "pre_registered_policy_rule",
+        "review_allowed_after_refresh": False,
+        "authority_source": "pre_registered_policy_rule_candidate",
         "requires_board_decision": False,
         "decision_owner": "execution_operator",
         "loss_exit_candidate": {
@@ -266,9 +272,10 @@ def _loss_review_source_packet(
             "confidence_tier": "pre_registered_policy",
             "reason_summary": supervisor["exit_policy_rationale"],
             "drivers": [
-                "pre-registered exit rule remains authoritative: policy_stop_floor"
+                "pre-registered exit rule is a review-only candidate until the "
+                "live gate binds a current broker position and clock"
             ],
-            "approval_effect": "preserves_pre_registered_policy_approval",
+            "approval_effect": "preserves_pre_registered_policy_candidate",
             "requires_board_decision": False,
             "requires_tradeable_session": True,
             "can_submit_orders": False,
@@ -318,10 +325,14 @@ def _loss_review_source_packet(
             "hourly_decision": "loss-review",
             "review_allowed": True,
             "supervisor_review_authority": supervisor,
-            "entry_context": {"symbol": symbol, "account": account},
+            "entry_context": {
+                "symbol": symbol,
+                "account": account,
+                "submitted_at": position["opened_at"],
+            },
             "entry_context_found": True,
             "advisory_analysis": advisory,
-            "next_action": "pre_registered_policy_approval_preserved",
+            "next_action": "autonomous_hold",
             "analysis_only": True,
             "execution_authority": "none",
             "forbidden_effects": [
@@ -341,14 +352,18 @@ def _loss_review_source_packet(
         "hourly_decision": "loss-review",
         "review_allowed": True,
         "entry_context_found": True,
-        "entry_context": {"symbol": symbol, "account": account},
+        "entry_context": {
+            "symbol": symbol,
+            "account": account,
+            "submitted_at": position["opened_at"],
+        },
         "evidence_needs": ["company_specific_news"],
         "evidence_coverage_by_need": {"company_specific_news": True},
         "remaining_blockers_before_refresh_count": 1,
         "resolved_blockers_by_refresh": ["company-specific news check"],
         "remaining_blocker_count": 0,
         "resolved_blocker_count": 1,
-        "next_action": "pre_registered_policy_approval_preserved",
+        "next_action": "autonomous_hold",
         "source_packet_count": 1,
         "source_packet_paths": {
             f"provider-{symbol.lower()}": f"/tmp/provider-{symbol.lower()}.json"
@@ -892,7 +907,10 @@ def _current_like_tournament_report() -> dict:
 
 
 def _production_recovery_harness(
-    tmp_path: Path, *, fail_phase: str | None = None
+    tmp_path: Path,
+    *,
+    fail_phase: str | None = None,
+    include_current_position_snapshot: bool = True,
 ) -> tuple[dict, Path, list[list[str]], object]:
     evidence = _loss_review_source_packet(
         account="paper",
@@ -901,17 +919,28 @@ def _production_recovery_harness(
     )
     supervisor_path = tmp_path / "results" / "hourly_supervisor" / "supervisor.json"
     advisory_path = tmp_path / "results" / "hourly_supervisor" / "advisory.json"
+    evidence_path = Path(evidence["packet_path"])
     hourly_dir = tmp_path / "results" / "hourly_supervisor"
     report_path = tmp_path / "results" / "paper_strategy_tournament" / "latest.json"
     state_path = tmp_path / "results" / "policy" / "promotion_state.json"
     envelope_path = tmp_path / "config" / "risk_envelope.yaml"
     reconciliation_path = tmp_path / "results" / "alpaca_reconciliation" / "latest.json"
+    current_position = _current_broker_position()
+    hourly_packet = {
+        "generated_at": NOW.isoformat(),
+        "decision": "loss-review",
+        "evidence": {
+            "loss_exit_review": evidence["payload"]["supervisor_review_authority"]
+        },
+        "portfolio": {"live": {"positions": [current_position]}},
+    }
     for path, content in (
         (
             supervisor_path,
-            json.dumps(evidence["payload"]["supervisor_review_authority"]),
+            json.dumps(hourly_packet),
         ),
         (advisory_path, json.dumps(evidence["payload"]["advisory_analysis"])),
+        (evidence_path, json.dumps(evidence)),
         (report_path, json.dumps(_current_like_tournament_report())),
         (state_path, json.dumps(_promotion_source_packet()["state"], indent=2)),
         (
@@ -1131,6 +1160,24 @@ def _production_recovery_harness(
         "reconciliation_packet_paths": [str(reconciliation_path)],
         "supervisor_record": evidence["payload"]["supervisor_review_authority"],
         "advisory_record": evidence["payload"]["advisory_analysis"],
+        **(
+            {
+                "current_position_snapshot": {
+                    "source_identity": "hourly_supervisor.portfolio.live.position",
+                    "packet_path": str(supervisor_path),
+                    "sha256": hashlib.sha256(supervisor_path.read_bytes()).hexdigest(),
+                    "size_bytes": supervisor_path.stat().st_size,
+                    "opened_at": current_position["opened_at"],
+                    "entry_packet_path": str(evidence_path),
+                    "entry_packet_sha256": hashlib.sha256(
+                        evidence_path.read_bytes()
+                    ).hexdigest(),
+                    "entry_packet_size_bytes": evidence_path.stat().st_size,
+                }
+            }
+            if include_current_position_snapshot
+            else {}
+        ),
     }
     request = build_production_recovery_request(
         {
@@ -1196,6 +1243,77 @@ def test_production_focused_adapter_uses_the_canonical_integrity_owner(
 
     assert result["packet"]["verifier_role_id"] == "integrity_verifier"
     assert calls == [ActionClass.VERIFY]
+
+
+def test_production_recovery_authority_requires_hash_bound_current_position(
+    tmp_path,
+):
+    request, _state_path, _invocations, _broker_spy = _production_recovery_harness(
+        tmp_path,
+        include_current_position_snapshot=False,
+    )
+
+    result = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority", "generated_at": NOW.isoformat()}
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["failure_type"] == "permanent"
+    assert "current broker position snapshot" in result["detail"]
+
+
+def test_production_recovery_authority_requires_coordinator_clock(tmp_path):
+    request, _state_path, _invocations, _broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+
+    result = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority"}
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["failure_type"] == "permanent"
+    assert "recovery clock" in result["detail"]
+
+
+def test_production_recovery_authority_rejects_replaced_current_snapshot(
+    tmp_path,
+):
+    request, _state_path, _invocations, _broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    snapshot_path = tmp_path / "results" / "hourly_supervisor" / "supervisor.json"
+    snapshot_path.write_text('{"replaced": true}', encoding="utf-8")
+
+    result = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority", "generated_at": NOW.isoformat()}
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["failure_type"] == "permanent"
+    assert "current broker position snapshot" in result["detail"]
+
+
+def test_production_recovery_authority_rejects_replaced_entry_open_time(
+    tmp_path,
+):
+    request, _state_path, _invocations, _broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    entry_path = tmp_path / "results" / "loss_review_evidence" / "latest.json"
+    entry_packet = json.loads(entry_path.read_text(encoding="utf-8"))
+    entry_packet["payload"]["entry_context"]["submitted_at"] = (
+        "2026-07-01T15:00:00+00:00"
+    )
+    entry_path.write_text(json.dumps(entry_packet), encoding="utf-8")
+
+    result = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority", "generated_at": NOW.isoformat()}
+    )
+
+    assert result["outcome"] == "failed"
+    assert result["failure_type"] == "permanent"
+    assert "current broker position snapshot" in result["detail"]
 
 
 def test_promotion_validation_requires_hash_bound_focused_proof(tmp_path):
@@ -4237,6 +4355,7 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
         symbol="NFLX",
         account="live",
     )["payload"]["supervisor_review_authority"]
+    current_position = _current_broker_position()
     advisory = {
         "symbol": "NFLX",
         "requires_board_decision": False,
@@ -4248,6 +4367,7 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
                 "generated_at": NOW.isoformat(),
                 "decision": "loss-review",
                 "evidence": {"loss_exit_review": supervisor},
+                "portfolio": {"live": {"positions": [current_position]}},
             }
         ),
         encoding="utf-8",
@@ -4264,7 +4384,11 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
                 "symbol": "NFLX",
                 "payload": {
                     "symbol": "NFLX",
-                    "entry_context": {"symbol": "NFLX", "account": "live"},
+                    "entry_context": {
+                        "symbol": "NFLX",
+                        "account": "live",
+                        "submitted_at": current_position["opened_at"],
+                    },
                     "hourly_packet_path": str(hourly_path.relative_to(tmp_path)),
                     "supervisor_review_authority": supervisor,
                     "advisory_analysis": advisory,
@@ -4352,7 +4476,7 @@ def test_real_loss_review_envelope_derives_nested_account_and_fixed_adapters(
     assert request["ready"] is True
     assert request["bindings"]["broker_account"] == "live"
     authority = request["adapters"]["resolve_authority"](
-        {"phase": "resolve_authority"}
+        {"phase": "resolve_authority", "generated_at": NOW.isoformat()}
     )
     assert authority["packet"]["authority_source"] == "pre_registered_policy_rule"
     for phase in (

@@ -14,8 +14,8 @@ from typing import Any
 
 from tradingagents.dataflows._official_common import evidence_packet, request_hash
 from tradingagents.policy.decision_authority import (
-    ExitAuthorityVerdict,
     bounded_exit_authority_record,
+    parse_pre_registered_exit_policy_candidate,
     resolve_exit_authority,
 )
 from tradingagents.research.provider_orchestrator import (
@@ -71,6 +71,10 @@ def loss_review_sector_proxy(symbol: str) -> str:
     return DEFAULT_LOSS_REVIEW_SECTOR_PROXY
 
 
+def _current_post_fetch_authority_now() -> datetime:
+    return datetime.now(tz=UTC).replace(microsecond=0)
+
+
 def build_loss_review_provider_research(
     symbol: str,
     *,
@@ -88,6 +92,9 @@ def build_loss_review_provider_research(
     target = str(symbol).strip().upper()
     proxy = str(sector_proxy or loss_review_sector_proxy(target)).strip().upper()
     target_needs = tuple(kwargs.pop("evidence_needs", DEFAULT_LOSS_REVIEW_EVIDENCE_NEEDS))
+    post_fetch_authority_now = kwargs.pop("authority_now", None)
+    if post_fetch_authority_now is None:
+        post_fetch_authority_now = _current_post_fetch_authority_now
     requested = (target, "SPY", "QQQ", proxy)
     packets: list[SourceEvidencePacket] = []
     attempts: list[dict[str, Any]] = []
@@ -110,6 +117,9 @@ def build_loss_review_provider_research(
             # Only a production-shaped transcript route with an issuer event
             # time and fresh capture can clear the loss-board substance slot.
             require_admissible_loss_substance=True,
+            # Resolve this callable only after each source read.  Tests may
+            # supply a fixed aware instant for deterministic admission.
+            authority_now=post_fetch_authority_now,
             **kwargs,
         )
         packets.extend(result.packets)
@@ -312,10 +322,11 @@ def _float_value(value: Any) -> float | None:
 
 
 def _source_packet_ids(provider_result: TickerProviderResearchResult) -> list[str]:
-    ids = [packet.packet_id for packet in provider_result.packets]
-    if provider_result.summary_packet is not None:
-        ids.append(provider_result.summary_packet.packet_id)
-    return ids
+    # The BOARD authenticates direct provider packets through their local raw
+    # descriptors.  The orchestrator summary is separately named in the loss
+    # payload but has no raw-provider descriptor, so it is not part of this
+    # exact source manifest contract.
+    return [packet.packet_id for packet in provider_result.packets]
 
 
 def _coverage_by_need(provider_result: TickerProviderResearchResult) -> dict[str, int]:
@@ -366,13 +377,33 @@ def _provider_packet_refs(provider_result: TickerProviderResearchResult) -> list
     return refs
 
 
+def _raw_provider_packet_provenance(
+    packet: SourceEvidencePacket,
+    relative: Path,
+    raw: bytes,
+) -> dict[str, Any]:
+    """Preserve one exact raw identity for authoritative later replay."""
+    return {
+        "raw_packet_path": relative.as_posix(),
+        "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
+        "raw_packet_id": packet.packet_id,
+        "raw_evidence_type": packet.evidence_type,
+        "raw_source_name": packet.source_name,
+        "raw_symbol": packet.symbol,
+        "raw_subject": packet.subject,
+        "raw_as_of": packet.as_of,
+        "raw_quality": packet.quality,
+        "raw_generated_at": str(packet.generated_at),
+    }
+
+
 def _accepted_source_descriptors(
     provider_result: TickerProviderResearchResult,
     *,
     source_packet_paths: Mapping[str, str | Path] | None,
     evidence_root: str | Path | None,
     now: datetime | None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Bind written provider packets exactly for the downstream BOARD recorder.
 
     Missing, outside-root, unreadable, or malformed source files are omitted.
@@ -380,33 +411,16 @@ def _accepted_source_descriptors(
     HOLD rather than allowing a source's self-description to clear a blocker.
     """
     if not source_packet_paths or evidence_root is None:
-        return []
+        return [], [], []
     run_now = now or datetime.now(tz=UTC)
     if run_now.tzinfo is None or run_now.utcoffset() is None:
-        return []
+        return [], [], []
     root = _safe_root(evidence_root)
     result: list[dict[str, Any]] = []
+    raw_source_manifest: list[dict[str, Any]] = []
     quote_components: dict[str, dict[str, Any]] = {}
     news_candidates: list[dict[str, Any]] = []
 
-    def raw_packet_provenance(
-        packet: SourceEvidencePacket,
-        relative: Path,
-        raw: bytes,
-    ) -> dict[str, Any]:
-        """Preserve the exact raw identity needed for later no-follow replay."""
-        return {
-            "raw_packet_path": relative.as_posix(),
-            "raw_packet_sha256": hashlib.sha256(raw).hexdigest(),
-            "raw_packet_id": packet.packet_id,
-            "raw_evidence_type": packet.evidence_type,
-            "raw_source_name": packet.source_name,
-            "raw_symbol": packet.symbol,
-            "raw_subject": packet.subject,
-            "raw_as_of": packet.as_of,
-            "raw_quality": packet.quality,
-            "raw_generated_at": str(packet.generated_at),
-        }
     for packet in provider_result.packets:
         supplied = source_packet_paths.get(packet.packet_id)
         if supplied is None:
@@ -429,6 +443,8 @@ def _accepted_source_descriptors(
             or stored.get("quality") != packet.quality
         ):
             continue
+        raw_provenance = _raw_provider_packet_provenance(packet, relative, raw)
+        raw_source_manifest.append(raw_provenance)
         components = _configured_quote_components(
             source_name=packet.source_name,
             evidence_type=packet.evidence_type,
@@ -470,6 +486,7 @@ def _accepted_source_descriptors(
                     "packet": packet,
                     "relative": relative,
                     "raw": raw,
+                    "raw_provenance": raw_provenance,
                     "normalized_payload": normalized_payload,
                     "normalized_as_of": normalized_as_of,
                 }
@@ -485,7 +502,7 @@ def _accepted_source_descriptors(
             "as_of": normalized_as_of,
             "quality": packet.quality,
             "provenance": {
-                **raw_packet_provenance(packet, relative, raw),
+                **raw_provenance,
             },
             "payload": normalized_payload,
         }
@@ -532,17 +549,8 @@ def _accepted_source_descriptors(
             "as_of": normalized_as_of,
             "quality": packet.quality,
             "provenance": {
-                **raw_packet_provenance(packet, relative, raw),
+                **selected["raw_provenance"],
                 "selection_policy": "configured_provider_priority_then_newest_event_then_packet_id",
-                "candidate_raw_packets": [
-                    raw_packet_provenance(
-                        candidate["packet"], candidate["relative"], candidate["raw"]
-                    )
-                    for candidate in sorted(
-                        news_candidates,
-                        key=lambda candidate: str(candidate["packet"].packet_id),
-                    )
-                ],
             },
             "payload": normalized_payload,
         }
@@ -667,7 +675,17 @@ def _accepted_source_descriptors(
                         "quality": normalized_packet["quality"],
                     }
                 )
-    return result
+    return (
+        result,
+        sorted(raw_source_manifest, key=lambda item: str(item["raw_packet_id"])),
+        [
+            candidate["raw_provenance"]
+            for candidate in sorted(
+                news_candidates,
+                key=lambda candidate: str(candidate["packet"].packet_id),
+            )
+        ],
+    )
 
 
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -863,8 +881,13 @@ def _normalize_provider_packet(
         # event time separately from its fresh collection timestamp.  The
         # latter controls BOARD freshness; the former proves the event was not
         # fabricated from local wall-clock time.
-        if packet.source_name == "fmp" and raw_payload.get("published_at") not in (None, ""):
-            event_at = canonical_provider_timestamp(raw_payload.get("published_at"))
+        if packet.source_name == "fmp":
+            provider_event_at = raw_payload.get("published_at")
+            if provider_event_at in (None, ""):
+                provider_event_at = raw_payload.get("event_at")
+            # A wrapper's ``generated_at`` is capture evidence only.  It may
+            # never fill in for a missing provider publication/event time.
+            event_at = canonical_provider_timestamp(provider_event_at)
             captured_at = canonical_provider_timestamp(packet.generated_at)
             if event_at is None or captured_at is None:
                 return None
@@ -1469,18 +1492,21 @@ def _infer_loss_exit_candidate(
 
 def _pre_registered_policy_candidate(
     review: Mapping[str, Any],
-    authority: ExitAuthorityVerdict,
 ) -> dict[str, Any] | None:
-    if authority.authority_source != "pre_registered_policy_rule":
+    parsed = parse_pre_registered_exit_policy_candidate(review)
+    if parsed is None:
         return None
     return {
-        "allowed_exit_reason_candidate": review.get("allowed_exit_reason"),
-        "allowed_exit_reason_source": review.get("allowed_exit_reason_source"),
+        "allowed_exit_reason_candidate": parsed["allowed_exit_reason"],
+        "allowed_exit_reason_source": parsed["allowed_exit_reason_source"],
         "confidence": None,
         "confidence_tier": "pre_registered_policy",
-        "reason_summary": review.get("exit_policy_rationale"),
-        "drivers": [authority.reason],
-        "approval_effect": "preserves_pre_registered_policy_approval",
+        "reason_summary": parsed["exit_policy_rationale"],
+        "drivers": [
+            "pre-registered exit rule is a review-only candidate until the "
+            "live gate binds a current broker position and clock"
+        ],
+        "approval_effect": "preserves_pre_registered_policy_candidate",
         "requires_board_decision": False,
         "requires_tradeable_session": True,
         "can_submit_orders": False,
@@ -1591,13 +1617,38 @@ def _build_advisory_analysis(
         "review_allowed_after_refresh": False,
         "forbidden_effects": list(LOSS_REVIEW_FORBIDDEN_EFFECTS),
     }
+    policy_candidate = _pre_registered_policy_candidate(review)
+    if policy_candidate is not None:
+        advisory_analysis["loss_exit_candidate"] = policy_candidate
+        advisory_analysis["review_allowed_after_refresh"] = False
+        advisory_analysis["authority_source"] = (
+            "pre_registered_policy_rule_candidate"
+        )
+        advisory_analysis["requires_board_decision"] = False
+        advisory_analysis["decision_owner"] = "execution_operator"
+        advisory_analysis["policy_rule_conflict"] = False
+        return advisory_analysis
+
+    policy_claimed = (
+        review.get("policy_rule_exit") is True
+        or str(review.get("allowed_exit_reason") or "")
+        in {"policy_stop_floor", "policy_time_stop"}
+    )
+    if policy_claimed:
+        # A structurally invalid policy claim is not rescued by advisory
+        # evidence.  It stays a BOARD-owned HOLD/review input.
+        advisory_analysis["authority_source"] = (
+            "invalid_pre_registered_policy_rule_candidate"
+        )
+        advisory_analysis["requires_board_decision"] = True
+        advisory_analysis["decision_owner"] = "portfolio_executive"
+        advisory_analysis["policy_rule_conflict"] = True
+        return advisory_analysis
+
     authority = resolve_exit_authority(
         supervisor_review=review,
         advisory_analysis=advisory_analysis,
     )
-    policy_candidate = _pre_registered_policy_candidate(review, authority)
-    if policy_candidate is not None:
-        advisory_analysis["loss_exit_candidate"] = policy_candidate
     advisory_analysis["review_allowed_after_refresh"] = authority.allowed
     advisory_analysis["authority_source"] = authority.authority_source
     advisory_analysis["requires_board_decision"] = authority.requires_additional_decision
@@ -1690,7 +1741,7 @@ def build_loss_review_evidence_packet(
         raise ValueError("hourly packet does not contain evidence.loss_exit_review")
     symbol = str(review.get("symbol") or provider_result.symbol).strip().upper()
     source_ids = _source_packet_ids(provider_result)
-    accepted_sources = _accepted_source_descriptors(
+    accepted_sources, raw_source_manifest, news_candidate_manifest = _accepted_source_descriptors(
         provider_result,
         source_packet_paths=source_packet_paths,
         evidence_root=decision_evidence_root,
@@ -1730,7 +1781,10 @@ def build_loss_review_evidence_packet(
     # a failed discretionary BOARD refresh must not erase that existing policy
     # candidate.  Conversely, an advisory candidate can never create or
     # upgrade a policy exit.
-    if advisory_analysis.get("authority_source") != "pre_registered_policy_rule":
+    if advisory_analysis.get("authority_source") not in {
+        "pre_registered_policy_rule",
+        "pre_registered_policy_rule_candidate",
+    }:
         advisory_analysis["current_thesis_status_candidate"] = current_loss_review[
             "current_thesis_status"
         ]
@@ -1786,6 +1840,12 @@ def build_loss_review_evidence_packet(
         "supervisor_review_authority": bounded_exit_authority_record(review),
         "supervisor_review_source_packet_ids": _strings(review.get("source_packet_ids")),
         "source_packet_ids": source_ids,
+        # The complete direct-provider manifest is independent of the
+        # normalized winner.  BOARD replays every native-news source from it,
+        # then requires this eligible-candidate list to be exact before it
+        # accepts the normalized company-news packet.
+        "raw_source_packet_manifest": raw_source_manifest,
+        "news_candidate_manifest": news_candidate_manifest,
         "accepted_sources": accepted_sources,
         "provider_summary_packet_id": (
             provider_result.summary_packet.packet_id
@@ -1810,14 +1870,7 @@ def build_loss_review_evidence_packet(
             "unrealized_pnl_percent": review.get("unrealized_pnl_percent"),
             "market_session": review.get("market_session"),
         },
-        "next_action": (
-            "pre_registered_policy_approval_preserved"
-            if advisory_analysis.get("authority_source")
-            == "pre_registered_policy_rule"
-            else (
-                "autonomous_hold"
-            )
-        ),
+        "next_action": "autonomous_hold",
         "analysis_only": True,
         "execution_authority": "none",
         "can_submit_orders": False,

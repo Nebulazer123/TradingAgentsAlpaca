@@ -159,6 +159,8 @@ def test_advisory_refresh_cannot_revoke_preregistered_policy_exit():
             "requires_board_decision": True,
             "approval_effect": "board_review_input_not_loss_exit_approval",
         },
+        current_position=_current_position_for_review(_valid_policy_review()),
+        now=NOW,
     )
 
     assert verdict.allowed is True
@@ -186,6 +188,7 @@ def _valid_policy_review():
         "market_value": "45.50",
         "unrealized_pl": "-4.50",
         "unrealized_plpc": "-0.09",
+        "opened_at": "2026-07-01T15:00:00+00:00",
     }
     enriched = apply_exit_policy_to_position(position, generated_at=NOW)
     return loss_exit_review_packet(
@@ -193,6 +196,78 @@ def _valid_policy_review():
         generated_at=NOW,
         proposed_limit_price=enriched["exit_policy_limit_price"],
     )
+
+
+def _current_position_for_review(review):
+    current = {
+        "symbol": review["symbol"],
+        "qty": review["quantity"],
+        "avg_entry_price": review["average_entry_price"],
+        "current_price": review["current_price"],
+        "unrealized_plpc": "-0.09",
+        "opened_at": review["opened_at"],
+    }
+    if review.get("holding_period_trading_days") is not None:
+        current["holding_period_trading_days"] = review["holding_period_trading_days"]
+    return current
+
+
+def test_public_policy_resolver_requires_current_position_and_current_clock():
+    review = _valid_policy_review()
+    current = _current_position_for_review(review)
+
+    for kwargs in ({}, {"current_position": current}, {"now": NOW}):
+        verdict = resolve_exit_authority(
+            supervisor_review=review,
+            advisory_analysis=None,
+            **kwargs,
+        )
+
+        assert verdict.allowed is False
+        assert verdict.authority_source == "invalid_pre_registered_policy_rule"
+
+    verified = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+        current_position=current,
+        now=NOW,
+    )
+    assert verified.allowed is True
+
+
+def test_public_policy_resolver_rejects_mismatched_live_broker_return():
+    review = _valid_policy_review()
+    current = _current_position_for_review(review)
+    current["unrealized_plpc"] = "-0.08"
+
+    verdict = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+        current_position=current,
+        now=NOW,
+    )
+
+    assert verdict.allowed is False
+
+
+def test_public_policy_resolver_recomputes_opened_at_holding_days():
+    review = _valid_policy_review()
+    review.update(
+        {
+            "opened_at": "2026-07-10T15:00:00+00:00",
+            "holding_period_trading_days": 20,
+        }
+    )
+    current = _current_position_for_review(review)
+
+    verdict = resolve_exit_authority(
+        supervisor_review=review,
+        advisory_analysis=None,
+        current_position=current,
+        now=NOW,
+    )
+
+    assert verdict.allowed is False
 
 
 def test_string_booleans_cannot_authorize_policy_exit():

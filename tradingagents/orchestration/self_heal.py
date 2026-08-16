@@ -36,7 +36,10 @@ from tradingagents.orchestration.recovery import (
     rearm_after_verified_recovery,
 )
 from tradingagents.orchestration.work_packets import build_packet_id
-from tradingagents.policy.decision_authority import resolve_exit_authority
+from tradingagents.policy.decision_authority import (
+    parse_pre_registered_exit_policy_candidate,
+    resolve_exit_authority,
+)
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.live_control import (
     _write_live_control_state_locked,
@@ -1964,11 +1967,15 @@ def _valid_preserved_policy_authority(
     advisory: Mapping[str, Any],
     symbol: str,
 ) -> bool:
+    """Validate a review-only policy candidate without authorizing it.
+
+    The regenerated evidence phase proves that its immutable inputs are
+    internally coherent.  It must not turn a detached loss review into live
+    exit authority; the later production authority adapter binds separate
+    current broker facts and the recovery clock.
+    """
     candidate = advisory.get("loss_exit_candidate")
-    verdict = resolve_exit_authority(
-        supervisor_review=supervisor,
-        advisory_analysis=advisory,
-    )
+    parsed_candidate = parse_pre_registered_exit_policy_candidate(supervisor)
     forbidden_effects = [
         "create_trade_intent",
         "size_position",
@@ -1994,16 +2001,14 @@ def _valid_preserved_policy_authority(
         and supervisor.get("source_identity")
         == "hourly_supervisor.loss_exit_review"
         and supervisor.get("requires_additional_decision") in (None, False)
-        and verdict.allowed is True
-        and verdict.authority_source == "pre_registered_policy_rule"
-        and verdict.requires_additional_decision is False
-        and verdict.decision_owner == "execution_operator"
+        and parsed_candidate is not None
         and advisory.get("symbol") == symbol
-        and advisory.get("review_allowed_after_refresh") is True
-        and advisory.get("authority_source") == verdict.authority_source
+        and advisory.get("review_allowed_after_refresh") is False
+        and advisory.get("authority_source")
+        == "pre_registered_policy_rule_candidate"
         and advisory.get("requires_board_decision") is False
         and advisory.get("requires_additional_decision") in (None, False)
-        and advisory.get("decision_owner") == verdict.decision_owner
+        and advisory.get("decision_owner") == "execution_operator"
         and advisory.get("forbidden_effects") == forbidden_effects
         and isinstance(candidate, Mapping)
         and candidate.get("allowed_exit_reason_candidate")
@@ -2015,16 +2020,14 @@ def _valid_preserved_policy_authority(
         and _nonempty_recovery_string(candidate.get("reason_summary"))
         and _packet_string_list(candidate.get("drivers"), nonempty=True)
         and candidate.get("approval_effect")
-        == "preserves_pre_registered_policy_approval"
+        == "preserves_pre_registered_policy_candidate"
         and candidate.get("requires_board_decision") is False
         and candidate.get("requires_tradeable_session") is True
         and candidate.get("can_submit_orders") is False
         and payload.get("review_allowed") is True
-        and payload.get("next_action")
-        == "pre_registered_policy_approval_preserved"
+        and payload.get("next_action") == "autonomous_hold"
         and packet.get("review_allowed") is True
-        and packet.get("next_action")
-        == "pre_registered_policy_approval_preserved"
+        and packet.get("next_action") == "autonomous_hold"
     )
 
 
@@ -3425,6 +3428,134 @@ def build_production_recovery_request(
         path = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
         return path if _path_under(path, root) else None
 
+    def current_position_snapshot() -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Re-capture the current broker-derived portfolio position by hash.
+
+        A recovery context may preserve a policy *candidate*, but it may not
+        replay its review scalars as fresh facts.  The snapshot descriptor is
+        bound to the exact hourly packet bytes, and the position is extracted
+        from that packet's broker-derived ``portfolio.live.positions`` rather
+        than from ``evidence.loss_exit_review``.
+        """
+        descriptor = context.get("current_position_snapshot")
+        if not isinstance(descriptor, Mapping):
+            return None
+        if descriptor.get("source_identity") != "hourly_supervisor.portfolio.live.position":
+            return None
+        raw_path = descriptor.get("packet_path")
+        expected_digest = descriptor.get("sha256")
+        expected_size = descriptor.get("size_bytes")
+        entry_raw_path = descriptor.get("entry_packet_path")
+        entry_expected_digest = descriptor.get("entry_packet_sha256")
+        entry_expected_size = descriptor.get("entry_packet_size_bytes")
+        opened_at = _parse_aware_recovery_time(descriptor.get("opened_at"))
+        if (
+            not isinstance(raw_path, str)
+            or not _valid_recovery_digest(expected_digest)
+            or type(expected_size) is not int
+            or expected_size < 1
+            or not isinstance(entry_raw_path, str)
+            or not _valid_recovery_digest(entry_expected_digest)
+            or type(entry_expected_size) is not int
+            or entry_expected_size < 1
+            or opened_at is None
+        ):
+            return None
+        raw_candidate = Path(raw_path)
+        path = (
+            raw_candidate.resolve()
+            if raw_candidate.is_absolute()
+            else (root / raw_candidate).resolve()
+        )
+        if not _path_under(path, root):
+            return None
+        if not path.is_file():
+            return None
+        try:
+            raw = path.read_bytes()
+            packet = json.loads(raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if (
+            len(raw) != expected_size
+            or hashlib.sha256(raw).hexdigest() != expected_digest
+            or not isinstance(packet, Mapping)
+            or _parse_aware_recovery_time(packet.get("generated_at")) is None
+        ):
+            return None
+        entry_candidate = Path(entry_raw_path)
+        entry_path = (
+            entry_candidate.resolve()
+            if entry_candidate.is_absolute()
+            else (root / entry_candidate).resolve()
+        )
+        if not _path_under(entry_path, root) or not entry_path.is_file():
+            return None
+        try:
+            entry_raw = entry_path.read_bytes()
+            entry_packet = json.loads(entry_raw)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        entry_payload = (
+            entry_packet.get("payload")
+            if isinstance(entry_packet, Mapping)
+            else None
+        )
+        entry_context = (
+            entry_payload.get("entry_context")
+            if isinstance(entry_payload, Mapping)
+            else None
+        )
+        entry_opened_at = next(
+            (
+                entry_context.get(key)
+                for key in ("opened_at", "filled_at", "submitted_at", "created_at")
+                if isinstance(entry_context, Mapping)
+                and entry_context.get(key) not in (None, "")
+            ),
+            None,
+        )
+        if (
+            len(entry_raw) != entry_expected_size
+            or hashlib.sha256(entry_raw).hexdigest() != entry_expected_digest
+            or not isinstance(entry_context, Mapping)
+            or entry_packet.get("schema_version") != "1.0.0"
+            or entry_packet.get("source_name") != "loss_review_evidence"
+            or entry_packet.get("evidence_type") != "loss_review_evidence"
+            or str(entry_packet.get("symbol") or "").strip().upper() != symbol
+            or str(entry_context.get("symbol") or "").strip().upper() != symbol
+            or str(entry_context.get("account") or "").strip()
+            != bindings["broker_account"]
+            or _parse_aware_recovery_time(entry_opened_at) != opened_at
+        ):
+            return None
+        portfolio = packet.get("portfolio")
+        live = portfolio.get("live") if isinstance(portfolio, Mapping) else None
+        positions = live.get("positions") if isinstance(live, Mapping) else None
+        if not isinstance(positions, list):
+            return None
+        matches = [
+            position
+            for position in positions
+            if isinstance(position, Mapping)
+            and str(position.get("symbol") or "").strip().upper() == symbol
+        ]
+        if len(matches) != 1:
+            return None
+        position = dict(matches[0])
+        position["opened_at"] = opened_at.isoformat(timespec="seconds")
+        return position, {
+            "source_identity": descriptor["source_identity"],
+            "packet_path": str(path),
+            "sha256": expected_digest,
+            "size_bytes": expected_size,
+            "opened_at": position["opened_at"],
+            "entry_packet_path": str(entry_path),
+            "entry_packet_sha256": entry_expected_digest,
+            "entry_packet_size_bytes": entry_expected_size,
+            "captured_at": packet["generated_at"],
+        }
+
     def run_json(phase: str, argv: list[str]) -> dict[str, Any]:
         try:
             result = command_runner(argv, cwd=str(root), capture_output=True, text=True, timeout=120)
@@ -3438,13 +3569,30 @@ def build_production_recovery_request(
             return unavailable(phase, "canonical command did not emit JSON")
         return {"packet": payload} if isinstance(payload, dict) else unavailable(phase, "canonical command emitted non-object JSON")
 
-    def authority(_arguments: Mapping[str, Any]) -> dict[str, Any]:
+    def authority(arguments: Mapping[str, Any]) -> dict[str, Any]:
         supervisor_path, advisory_path = context_path("supervisor_path"), context_path("advisory_path")
         supervisor = context.get("supervisor_record") if isinstance(context.get("supervisor_record"), Mapping) else (_read_json(supervisor_path) if supervisor_path else {})
         advisory = context.get("advisory_record") if isinstance(context.get("advisory_record"), Mapping) else (_read_json(advisory_path) if advisory_path else {})
         if not supervisor_path or not advisory_path or not supervisor or not advisory:
             return unavailable("resolve_authority", "canonical supervisor/advisory packets are unavailable")
-        verdict = resolve_exit_authority(supervisor_review=supervisor, advisory_analysis=advisory)
+        authority_now = _parse_aware_recovery_time(arguments.get("generated_at"))
+        snapshot = current_position_snapshot()
+        if authority_now is None or snapshot is None:
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": (
+                    "canonical exit authority requires a hash-bound current "
+                    "broker position snapshot and the recovery clock"
+                ),
+            }
+        current_position, snapshot_record = snapshot
+        verdict = resolve_exit_authority(
+            supervisor_review=supervisor,
+            advisory_analysis=advisory,
+            current_position=current_position,
+            now=authority_now,
+        )
         if verdict.allowed is not True or verdict.requires_additional_decision is True:
             return {"outcome": "failed", "failure_type": "permanent", "detail": "canonical exit authority is not internally allowed"}
         return {
@@ -3455,6 +3603,8 @@ def build_production_recovery_request(
                 "requires_additional_decision": False,
                 "authority_source": verdict.authority_source,
                 "decision_owner": verdict.decision_owner,
+                "current_position_snapshot": snapshot_record,
+                "authority_now": authority_now.isoformat(timespec="seconds"),
             }
         }
 
@@ -4284,6 +4434,60 @@ def derive_production_recovery_context(
     signal_account = str(
         signal.get("broker_account") or signal.get("account") or ""
     ).strip()
+
+    def hourly_current_position_snapshot(
+        *,
+        hourly_packet: Path,
+        hourly: Mapping[str, Any],
+        entry_packet: Path,
+        entry_context: Mapping[str, Any],
+        symbol: str,
+    ) -> dict[str, Any] | None:
+        """Bind the current portfolio snapshot separately from loss review.
+
+        The hourly serializer records broker-read positions under
+        ``portfolio.live.positions``.  That is the only source this recovery
+        path accepts for current price, quantity, and entry price; the policy
+        review itself is deliberately excluded.  Opening time comes from the
+        recorded entry context and must be an actual timestamp, never a packet
+        capture-time substitute.
+        """
+        portfolio = hourly.get("portfolio")
+        live = portfolio.get("live") if isinstance(portfolio, Mapping) else None
+        positions = live.get("positions") if isinstance(live, Mapping) else None
+        matches = [
+            position
+            for position in positions
+            if isinstance(position, Mapping)
+            and str(position.get("symbol") or "").strip().upper() == symbol
+        ] if isinstance(positions, list) else []
+        opened_at = next(
+            (
+                entry_context.get(key)
+                for key in ("opened_at", "filled_at", "submitted_at", "created_at")
+                if entry_context.get(key) not in (None, "")
+            ),
+            None,
+        )
+        parsed_opened_at = _parse_aware_recovery_time(opened_at)
+        if len(matches) != 1 or parsed_opened_at is None:
+            return None
+        try:
+            raw = hourly_packet.read_bytes()
+            entry_raw = entry_packet.read_bytes()
+        except OSError:
+            return None
+        return {
+            "source_identity": "hourly_supervisor.portfolio.live.position",
+            "packet_path": str(hourly_packet),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+            "opened_at": parsed_opened_at.isoformat(timespec="seconds"),
+            "entry_packet_path": str(entry_packet),
+            "entry_packet_sha256": hashlib.sha256(entry_raw).hexdigest(),
+            "entry_packet_size_bytes": len(entry_raw),
+        }
+
     selected: dict[str, Any] | None = None
     seen_candidates: set[Path] = set()
     for candidate in candidates:
@@ -4375,6 +4579,13 @@ def derive_production_recovery_context(
             account != expected_account for account in account_values
         ):
             continue
+        current_position_snapshot = hourly_current_position_snapshot(
+            hourly_packet=hourly_packet,
+            hourly=hourly,
+            entry_packet=evidence_path,
+            entry_context=entry_context,
+            symbol=symbol,
+        )
         selected = {
             "evidence_path": evidence_path,
             "envelope": envelope,
@@ -4384,6 +4595,7 @@ def derive_production_recovery_context(
             "hourly_packet": hourly_packet,
             "symbol": symbol,
             "account": expected_account,
+            "current_position_snapshot": current_position_snapshot,
         }
         break
     if selected is None:
@@ -4394,6 +4606,7 @@ def derive_production_recovery_context(
     hourly_packet = selected["hourly_packet"]
     symbol = selected["symbol"]
     account = selected["account"]
+    current_position_snapshot = selected["current_position_snapshot"]
 
     required_paths = {
         "hourly_dir": hourly_packet.parent,
@@ -4426,6 +4639,11 @@ def derive_production_recovery_context(
         "envelope_path": str(required_paths["envelope_path"]),
         "promotion_state_path": str(required_paths["promotion_state_path"]),
         "reconciliation_packet_paths": [str(hourly_packet)],
+        **(
+            {"current_position_snapshot": current_position_snapshot}
+            if current_position_snapshot is not None
+            else {}
+        ),
         "owner_action_attestation_paths": [
             str(path.resolve())
             for path in sorted(
