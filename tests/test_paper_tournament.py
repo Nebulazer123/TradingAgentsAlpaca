@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.main import app
+from tradingagents.brokers import paper_tournament
 from tradingagents.brokers.paper_tournament import (
     COMPACT_LEDGER_FILE,
     LEDGER_FILE,
@@ -571,14 +572,27 @@ def _write_bound_active_selection(tournament_dir, *, strategy_id="pullback-suppo
     return report
 
 
-def test_bound_preexpiry_selection_remains_loadable_after_tournament_window(tmp_path):
+def test_bound_preexpiry_selection_is_rejected_after_tournament_window(tmp_path):
     report = _write_bound_active_selection(tmp_path)
 
-    selection = load_live_strategy_selection(tmp_path)
+    preexpiry_selection = load_live_strategy_selection(
+        tmp_path,
+        now=datetime.datetime(2026, 6, 6, 20, 10, tzinfo=datetime.timezone.utc),
+    )
+    expired_selection = load_live_strategy_selection(
+        tmp_path,
+        now=datetime.datetime(2026, 7, 2, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+    future_selection = load_live_strategy_selection(
+        tmp_path,
+        now=datetime.datetime(2026, 6, 5, 20, 10, tzinfo=datetime.timezone.utc),
+    )
 
-    assert selection is not None
-    assert selection["strategy_id"] == report["live_strategy_candidate"]["strategy_id"]
-    assert selection["source_report"]["tournament_id"] == report["tournament_id"]
+    assert preexpiry_selection is not None
+    assert preexpiry_selection["strategy_id"] == report["live_strategy_candidate"]["strategy_id"]
+    assert preexpiry_selection["source_report"]["tournament_id"] == report["tournament_id"]
+    assert expired_selection is None
+    assert future_selection is None
 
 
 def test_loader_rejects_missing_or_mismatched_selection_source_metadata(tmp_path):
@@ -609,6 +623,28 @@ def test_loader_rejects_missing_or_mismatched_selection_source_metadata(tmp_path
     assert load_live_strategy_selection(missing_dir) is None
     assert load_live_strategy_selection(mismatched_dir) is None
     assert load_live_strategy_selection(top_level_mismatch_dir) is None
+
+
+def test_loader_rejects_ledger_top_level_identity_or_expiry_mismatch(tmp_path):
+    id_mismatch_dir = tmp_path / "ledger_id_mismatch"
+    id_mismatch_dir.mkdir()
+    _write_bound_active_selection(id_mismatch_dir)
+    id_ledger_path = id_mismatch_dir / LEDGER_FILE
+    id_ledger = json.loads(id_ledger_path.read_text(encoding="utf-8"))
+    id_ledger["tournament_id"] = "paper-tournament-forged"
+    id_ledger_path.write_text(json.dumps(id_ledger), encoding="utf-8")
+
+    expiry_mismatch_dir = tmp_path / "ledger_expiry_mismatch"
+    expiry_mismatch_dir.mkdir()
+    _write_bound_active_selection(expiry_mismatch_dir)
+    expiry_ledger_path = expiry_mismatch_dir / LEDGER_FILE
+    expiry_ledger = json.loads(expiry_ledger_path.read_text(encoding="utf-8"))
+    expiry_ledger["ends_at"] = "2026-07-03T18:00:00+00:00"
+    expiry_ledger_path.write_text(json.dumps(expiry_ledger), encoding="utf-8")
+
+    before_expiry = datetime.datetime(2026, 6, 6, 20, 10, tzinfo=datetime.timezone.utc)
+    assert load_live_strategy_selection(id_mismatch_dir, now=before_expiry) is None
+    assert load_live_strategy_selection(expiry_mismatch_dir, now=before_expiry) is None
 
 
 def test_tournament_report_includes_popular_strategy_scorecards_with_authority_boundaries():
@@ -673,6 +709,11 @@ def test_supervisor_ignores_top_level_mismatched_live_strategy_selection(monkeyp
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
     selection["strategy_id"] = STRATEGY_CURRENT_AGGRESSIVE
     selection_path.write_text(json.dumps(selection), encoding="utf-8")
+    monkeypatch.setattr(
+        paper_tournament,
+        "_now",
+        lambda: datetime.datetime(2026, 6, 6, 20, 10, tzinfo=datetime.timezone.utc),
+    )
     monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
     monkeypatch.setattr(cli_main, "market_session_label", lambda: "regular")
     monkeypatch.setattr(
@@ -712,6 +753,56 @@ def test_supervisor_ignores_top_level_mismatched_live_strategy_selection(monkeyp
     assert payload["actions"][0]["account"] == "live"
     assert payload["actions"][0]["execution_mode"] == "tiny_live"
     assert "controlled dip" in payload["actions"][0]["reason"]
+    assert "live_strategy_selection" not in payload["evidence"]
+    assert payload["evidence"]["live_sleeve_resolution"]["signals_adapted"] is False
+
+
+def test_supervisor_ignores_expired_live_strategy_selection(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    live_client = _FakePaperClient()
+    live_client.paper = False
+    live_client.positions = []
+    tournament_dir = tmp_path / "tournament"
+    tournament_dir.mkdir()
+    _write_bound_active_selection(tournament_dir)
+    monkeypatch.setattr(
+        paper_tournament,
+        "_now",
+        lambda: datetime.datetime(2026, 7, 2, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+    monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
+    monkeypatch.setattr(cli_main, "market_session_label", lambda: "regular")
+    monkeypatch.setattr(
+        cli_main,
+        "_fetch_aggressive_candidate_market_data",
+        lambda: {
+            "MSFT": {
+                "current_price": "490",
+                "previous_close": "495",
+                "volume_ratio": "1.0",
+                "tradable": True,
+            }
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "supervise-hourly",
+            "--dry-run",
+            "--json-output",
+            "--log-dir",
+            str(tmp_path / "hourly"),
+            "--paper-tournament-log-dir",
+            str(tournament_dir),
+            "--execution-board-dir",
+            str(tmp_path / "execution_board"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
     assert "live_strategy_selection" not in payload["evidence"]
     assert payload["evidence"]["live_sleeve_resolution"]["signals_adapted"] is False
 
@@ -835,6 +926,11 @@ def test_supervisor_binds_selection_with_live_enabled_promotion_record(monkeypat
     tournament_dir = tmp_path / "tournament"
     tournament_dir.mkdir()
     _write_bound_active_selection(tournament_dir)
+    monkeypatch.setattr(
+        paper_tournament,
+        "_now",
+        lambda: datetime.datetime(2026, 6, 6, 20, 10, tzinfo=datetime.timezone.utc),
+    )
     promotion_path = tmp_path / "promotion_state.json"
     promotion_path.write_text(
         json.dumps(

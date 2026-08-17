@@ -1207,6 +1207,7 @@ def _report_sha256(report: Mapping) -> str | None:
 def _selection_source_for_report(report: Mapping) -> dict | None:
     candidate = report.get("live_strategy_candidate")
     tournament_id = report.get("tournament_id")
+    started_at = _parse_timestamp(report.get("started_at"))
     generated_at = _parse_timestamp(report.get("generated_at"))
     ends_at = _parse_timestamp(report.get("ends_at"))
     if (
@@ -1215,8 +1216,10 @@ def _selection_source_for_report(report: Mapping) -> dict | None:
         or candidate.get("strategy_id") not in STRATEGY_IDS
         or not isinstance(tournament_id, str)
         or not tournament_id
+        or started_at is None
         or generated_at is None
         or ends_at is None
+        or started_at > generated_at
         or generated_at >= ends_at
     ):
         return None
@@ -1230,6 +1233,11 @@ def _selection_source_for_report(report: Mapping) -> dict | None:
         "candidate_status": "candidate",
         "candidate_strategy_id": candidate["strategy_id"],
         "report_sha256": report_sha256,
+        "ledger_identity": {
+            "tournament_id": tournament_id,
+            "started_at": _iso(started_at),
+            "ends_at": _iso(ends_at),
+        },
     }
 
 
@@ -1275,9 +1283,16 @@ def maybe_write_live_strategy_selection(
     return selection_path
 
 
-def load_live_strategy_selection(log_dir: str | Path) -> dict | None:
+def load_live_strategy_selection(
+    log_dir: str | Path,
+    *,
+    now: datetime.datetime | None = None,
+) -> dict | None:
     selection_path = Path(log_dir) / LIVE_SELECTION_FILE
     ledger_path = Path(log_dir) / LEDGER_FILE
+    now_timestamp = _normalize_timestamp(now or _now())
+    if now_timestamp is None:
+        return None
     if not selection_path.exists():
         return None
     try:
@@ -1308,10 +1323,20 @@ def load_live_strategy_selection(log_dir: str | Path) -> dict | None:
     authoritative_report = ledger.get("latest_report")
     if not isinstance(authoritative_report, Mapping):
         return None
+    for field in ("tournament_id", "started_at", "ends_at"):
+        ledger_value = ledger.get(field)
+        report_value = authoritative_report.get(field)
+        if not isinstance(ledger_value, str) or ledger_value != report_value:
+            return None
+    strategies = ledger.get("strategies")
+    if not isinstance(strategies, Mapping):
+        return None
     expected_source = _selection_source_for_report(authoritative_report)
     if expected_source is None or dict(source_report) != expected_source:
         return None
     if selection["strategy_id"] != source_report.get("candidate_strategy_id"):
+        return None
+    if source_report["candidate_strategy_id"] not in strategies:
         return None
     selected_at = _parse_timestamp(selection.get("selected_at"))
     report_generated_at = _parse_timestamp(source_report.get("report_generated_at"))
@@ -1322,6 +1347,8 @@ def load_live_strategy_selection(log_dir: str | Path) -> dict | None:
         or ends_at is None
         or report_generated_at > selected_at
         or selected_at >= ends_at
+        or selected_at > now_timestamp
+        or now_timestamp >= ends_at
     ):
         return None
     return selection
