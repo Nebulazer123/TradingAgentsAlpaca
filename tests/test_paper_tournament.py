@@ -15,6 +15,7 @@ from tradingagents.brokers.paper_tournament import (
     build_tournament_report,
     compact_tournament_ledger_payload,
     initialize_tournament,
+    maybe_write_live_strategy_selection,
     write_tournament_ledger,
     write_tournament_packet,
 )
@@ -289,7 +290,7 @@ def test_paper_tournament_run_submits_strategy_prefixed_paper_orders(monkeypatch
     assert any(item.startswith("ta-paperbot-current-aggressive") for item in client_ids)
     assert any(item.startswith("ta-paperbot-pullback-support") for item in client_ids)
     assert any(item.startswith("ta-paperbot-catalyst") for item in client_ids)
-    assert payload["report"]["live_strategy_candidate"]["status"] == "pending"
+    assert payload["report"]["live_strategy_candidate"]["status"] == "expired"
 
 
 def test_paper_tournament_alphainsider_watch_writes_paper_only_packet(monkeypatch, tmp_path):
@@ -481,6 +482,45 @@ def test_paper_tournament_report_identifies_live_candidate_after_enough_days():
         "strategy_id": "catalyst-relative-strength",
         "reason": "best positive paper strategy after 5 tracked day(s)",
     }
+
+
+def test_expired_tournament_report_is_ineligible_and_cannot_write_live_selection(tmp_path):
+    ledger = initialize_tournament(
+        paper_account={"status": "ACTIVE", "equity": "100000"},
+        paper_positions=[],
+        capital_per_strategy=Decimal("10000"),
+        now=datetime.datetime(2026, 5, 31, 18, 0, tzinfo=datetime.timezone.utc),
+        duration_days=5,
+    )
+    ledger["strategies"][STRATEGY_CURRENT_AGGRESSIVE]["equity_history"] = [
+        {
+            "generated_at": f"2026-06-0{day}T20:05:00+00:00",
+            "equity": str(Decimal("10000") + Decimal(day * 25)),
+        }
+        for day in range(1, 6)
+    ]
+
+    report = build_tournament_report(
+        ledger,
+        market_data={},
+        now=datetime.datetime(2026, 6, 6, 20, 10, tzinfo=datetime.timezone.utc),
+        min_promotion_days=5,
+    )
+
+    assert report["live_strategy_candidate"] == {
+        "status": "expired",
+        "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+        "reason": "tournament ended before this report; strategy is not eligible for selection",
+    }
+    forged_candidate_report = {
+        **report,
+        "live_strategy_candidate": {
+            "status": "candidate",
+            "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+        },
+    }
+    assert maybe_write_live_strategy_selection(forged_candidate_report, tmp_path) is None
+    assert not (tmp_path / "live-strategy-selection.json").exists()
 
 
 def test_tournament_report_includes_popular_strategy_scorecards_with_authority_boundaries():
