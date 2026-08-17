@@ -22,6 +22,7 @@ from tradingagents.orchestration.self_heal import (
     build_production_recovery_request,
     coordinate_verified_recovery,
 )
+from tradingagents.policy.decision_authority import bounded_exit_authority_record
 from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.live_control import (
     load_live_control_state,
@@ -192,11 +193,13 @@ def _genuine_policy_authority(position: dict, *, supervisor_path: Path) -> dict:
                 "positions": [
                     {
                         "symbol": supervisor["symbol"],
+                        "account": "live",
                         "qty": position["qty"],
                         "current_price": position["current_price"],
                         "avg_entry_price": position["avg_entry_price"],
                         "unrealized_pl": position["unrealized_pl"],
                         "unrealized_plpc": position["unrealized_plpc"],
+                        "opened_at": position["opened_at"],
                     }
                 ]
             }
@@ -213,7 +216,9 @@ def _genuine_policy_authority(position: dict, *, supervisor_path: Path) -> dict:
         },
     )
     return {
-        "supervisor_review_authority": supervisor,
+        "supervisor_review_authority": copy.deepcopy(
+            evidence.payload["supervisor_review_authority"]
+        ),
         "advisory_analysis": evidence.payload["advisory_analysis"],
         "hourly_packet": hourly_packet,
         "entry_context": evidence.payload["entry_context"],
@@ -320,6 +325,11 @@ def _build_fixture_recovery_request(
     )
     evidence["entry_context"] = copy.deepcopy(authority["entry_context"])
     evidence["next_action"] = authority["next_action"]
+    assert authority["supervisor_review_authority"] == (
+        bounded_exit_authority_record(
+            authority["hourly_packet"]["evidence"]["loss_exit_review"]
+        )
+    )
 
     _write_json(
         supervisor_path,
@@ -462,12 +472,14 @@ def _build_fixture_recovery_request(
             "packet_path": str(supervisor_path),
             "sha256": _sha256(supervisor_path),
             "size_bytes": supervisor_path.stat().st_size,
-            "opened_at": _load_fixture("policy_authority.json")["position"][
-                "opened_at"
-            ],
+            "opened_at": authority["hourly_packet"]["portfolio"]["live"][
+                "positions"
+            ][0]["opened_at"],
             "entry_packet_path": str(evidence_path),
             "entry_packet_sha256": _sha256(evidence_path),
             "entry_packet_size_bytes": evidence_path.stat().st_size,
+            "captured_at": NOW.isoformat(),
+            "review_evidence_generated_at": NOW.isoformat(),
         },
     }
     request = build_production_recovery_request(
@@ -1193,5 +1205,37 @@ def test_mismatched_broker_evidence_keeps_nflx_owned_and_frozen(tmp_path):
         path: _sha256(path)
         for path in harness["immutable_inputs"]
     } == harness["immutable_inputs"]
+    assert _snapshot_fixtures() == harness["fixture_hashes"]
+    assert _snapshot_production_authority() == production_before
+
+
+def test_tampered_current_authority_facts_freeze_before_recovery(tmp_path):
+    production_before = _snapshot_production_authority()
+    focused_runs: list[dict] = []
+    harness = _build_fixture_recovery_request(
+        tmp_path,
+        focused_gate_records=focused_runs,
+    )
+    request = harness["request"]
+    broker = harness["broker"]
+    authority = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority", "generated_at": NOW.isoformat()}
+    )
+    assert authority.get("packet") is not None
+    snapshot_path = tmp_path / "results" / "hourly_supervisor" / "supervisor.json"
+    snapshot_path.write_text('{"tampered":true}', encoding="utf-8")
+
+    result = coordinate_verified_recovery(
+        **_coordinator_args(request),
+        control_path=_frozen_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+
+    assert result["status"] == "frozen"
+    assert result["phase"] == "resolve_authority"
+    assert broker.read_calls == []
+    assert broker.write_calls == []
     assert _snapshot_fixtures() == harness["fixture_hashes"]
     assert _snapshot_production_authority() == production_before
