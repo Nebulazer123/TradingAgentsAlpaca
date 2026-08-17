@@ -214,6 +214,27 @@ def _iso(value: datetime.datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="seconds")
 
 
+def _parse_timestamp(value: object) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _tournament_expired(ends_at: object, *, now: datetime.datetime) -> bool:
+    ends_at_timestamp = _parse_timestamp(ends_at)
+    if ends_at_timestamp is None:
+        return False
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return now.astimezone(UTC) >= ends_at_timestamp
+
+
 def _now() -> datetime.datetime:
     return datetime.datetime.now(tz=UTC)
 
@@ -880,7 +901,14 @@ def build_tournament_report(
         reverse=True,
     )
     top = rankings[0] if rankings else None
-    if top and top["tracked_days"] >= min_promotion_days and _as_decimal(top["total_return"]) > 0:
+    tournament_expired = _tournament_expired(ledger.get("ends_at"), now=now)
+    if tournament_expired:
+        live_candidate = {
+            "status": "expired",
+            "strategy_id": top["strategy_id"] if top else None,
+            "reason": "tournament ended before this report; strategy is not eligible for selection",
+        }
+    elif top and top["tracked_days"] >= min_promotion_days and _as_decimal(top["total_return"]) > 0:
         live_candidate = {
             "status": "candidate",
             "strategy_id": top["strategy_id"],
@@ -1163,6 +1191,10 @@ def maybe_write_live_strategy_selection(
     if candidate.get("status") != "candidate" or not candidate.get("strategy_id"):
         return None
     now = now or _now()
+    if _tournament_expired(report.get("ends_at"), now=now):
+        return None
+    if _parse_timestamp(report.get("ends_at")) is None:
+        return None
     selection = {
         "status": "active",
         "strategy_id": candidate["strategy_id"],
