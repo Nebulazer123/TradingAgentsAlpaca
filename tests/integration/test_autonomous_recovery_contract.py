@@ -46,6 +46,10 @@ PRODUCTION_AUTHORITY_PATHS = (
     REPO_ROOT / "config" / "risk_envelope.yaml",
     REPO_ROOT / "config" / "research_integrations.json",
 )
+INERT_COORDINATION_LOCK_PATHS = (
+    REPO_ROOT / "results" / "policy" / ".live_control.json.control.lock",
+    REPO_ROOT / "results" / "policy" / ".promotion_state.json.recovery.lock",
+)
 SECRET_SUFFIXES = (
     ".secret",
     ".secrets",
@@ -110,7 +114,26 @@ def _is_bounded_credential_surface(relative: Path) -> bool:
     return False
 
 
-def _authority_fingerprint(path: Path) -> str:
+def _is_inert_coordination_lock(
+    path: Path,
+    *,
+    inert_lock_paths: tuple[Path, ...],
+) -> bool:
+    if path not in inert_lock_paths or path.is_symlink() or not path.is_file():
+        return False
+    try:
+        return path.stat().st_size == 0
+    except OSError:
+        return False
+
+
+def _authority_fingerprint(
+    path: Path,
+    *,
+    inert_lock_paths: tuple[Path, ...] = INERT_COORDINATION_LOCK_PATHS,
+) -> str:
+    if _is_inert_coordination_lock(path, inert_lock_paths=inert_lock_paths):
+        return "absent"
     if path.is_symlink():
         return "non-file:symlink"
     if path.is_file():
@@ -122,12 +145,20 @@ def _authority_fingerprint(path: Path) -> str:
     return "absent"
 
 
-def _snapshot_production_authority() -> dict[str, str]:
+def _snapshot_production_authority(
+    *,
+    root: Path = REPO_ROOT,
+    authority_paths: tuple[Path, ...] = PRODUCTION_AUTHORITY_PATHS,
+    inert_lock_paths: tuple[Path, ...] = INERT_COORDINATION_LOCK_PATHS,
+) -> dict[str, str]:
     snapshot = {
-        str(path.relative_to(REPO_ROOT)): _authority_fingerprint(path)
-        for path in PRODUCTION_AUTHORITY_PATHS
+        str(path.relative_to(root)): _authority_fingerprint(
+            path,
+            inert_lock_paths=inert_lock_paths,
+        )
+        for path in authority_paths
     }
-    for current_root, directory_names, file_names in os.walk(REPO_ROOT):
+    for current_root, directory_names, file_names in os.walk(root):
         retained_directories = [
             name
             for name in directory_names
@@ -137,14 +168,55 @@ def _snapshot_production_authority() -> dict[str, str]:
         current = Path(current_root)
         for entry_name in (*retained_directories, *file_names):
             path = current / entry_name
-            relative = path.relative_to(REPO_ROOT)
+            relative = path.relative_to(root)
             if any(
                 part in SNAPSHOT_EXCLUDED_PARTS for part in relative.parts
             ):
                 continue
             if _is_bounded_credential_surface(relative):
-                snapshot[str(relative)] = _authority_fingerprint(path)
+                snapshot[str(relative)] = _authority_fingerprint(
+                    path,
+                    inert_lock_paths=inert_lock_paths,
+                )
     return dict(sorted(snapshot.items()))
+
+
+def test_production_authority_snapshot_ignores_only_inert_control_lock(
+    tmp_path,
+):
+    root = tmp_path / "authority-root"
+    control_path = root / "results" / "policy" / "live_control.json"
+    lock_path = root / "results" / "policy" / ".live_control.json.control.lock"
+    control_path.parent.mkdir(parents=True)
+    control_path.write_text('{"frozen": true}', encoding="utf-8")
+    authority_paths = (control_path, lock_path)
+
+    before = _snapshot_production_authority(
+        root=root,
+        authority_paths=authority_paths,
+        inert_lock_paths=(lock_path,),
+    )
+    lock_path.touch()
+    assert _snapshot_production_authority(
+        root=root,
+        authority_paths=authority_paths,
+        inert_lock_paths=(lock_path,),
+    ) == before
+
+    lock_path.write_text("tampered", encoding="utf-8")
+    assert _snapshot_production_authority(
+        root=root,
+        authority_paths=authority_paths,
+        inert_lock_paths=(lock_path,),
+    ) != before
+
+    lock_path.unlink()
+    control_path.write_text('{"frozen": false}', encoding="utf-8")
+    assert _snapshot_production_authority(
+        root=root,
+        authority_paths=authority_paths,
+        inert_lock_paths=(lock_path,),
+    ) != before
 
 
 def _snapshot_fixtures() -> dict[str, str]:
