@@ -37,6 +37,7 @@ from tradingagents.orchestration.self_heal import (
     coordinate_verified_recovery,
     recovery_recipe,
 )
+from tradingagents.policy.decision_authority import bounded_exit_authority_record
 from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.live_control import load_live_control_state, write_live_control_state
 from tradingagents.policy.live_gate import evaluate_go_live_guard
@@ -324,7 +325,7 @@ def _loss_review_source_packet(
             "hourly_packet_path": hourly_packet_path,
             "hourly_decision": "loss-review",
             "review_allowed": True,
-            "supervisor_review_authority": supervisor,
+            "supervisor_review_authority": bounded_exit_authority_record(supervisor),
             "entry_context": {
                 "symbol": symbol,
                 "account": account,
@@ -662,6 +663,16 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                 entry_path = authority_dir / "entry-evidence.json"
                 snapshot_path = authority_dir / "hourly-snapshot.json"
                 position = _current_broker_position()
+                authority_evidence = _loss_review_source_packet(
+                    account=BINDINGS["broker_account"],
+                    packet_path=str(entry_path),
+                    hourly_packet_path=str(snapshot_path),
+                )
+                supervisor_review = authority_evidence["payload"][
+                    "supervisor_review_authority"
+                ]
+                supervisor_review["evidence_generated_at"] = generated_at
+                advisory_analysis = authority_evidence["payload"]["advisory_analysis"]
                 entry_path.write_text(
                     json.dumps(
                         {
@@ -674,7 +685,9 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                                     "symbol": BINDINGS["symbol"],
                                     "account": BINDINGS["broker_account"],
                                     "submitted_at": position["opened_at"],
-                                }
+                                },
+                                "supervisor_review_authority": supervisor_review,
+                                "advisory_analysis": advisory_analysis,
                             },
                         }
                     ),
@@ -685,10 +698,7 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                         {
                             "generated_at": generated_at,
                             "evidence": {
-                                "loss_exit_review": {
-                                    "symbol": BINDINGS["symbol"],
-                                    "evidence_generated_at": generated_at,
-                                }
+                                "loss_exit_review": supervisor_review
                             },
                             "portfolio": {"live": {"positions": [position]}},
                         }
@@ -975,6 +985,8 @@ def _production_recovery_harness(
     include_current_position_snapshot: bool = True,
     snapshot_generated_at: dt.datetime | None = None,
     review_evidence_generated_at: dt.datetime | None = None,
+    entry_review_evidence_generated_at: dt.datetime | None = None,
+    actual_review: str | None = None,
 ) -> tuple[dict, Path, list[list[str]], object]:
     evidence = _loss_review_source_packet(
         account="paper",
@@ -991,11 +1003,23 @@ def _production_recovery_harness(
     reconciliation_path = tmp_path / "results" / "alpaca_reconciliation" / "latest.json"
     current_position = _current_broker_position()
     hourly_generated_at = snapshot_generated_at or NOW
-    hourly_review = json.loads(
+    entry_review = json.loads(
         json.dumps(evidence["payload"]["supervisor_review_authority"])
     )
+    entry_review["evidence_generated_at"] = (
+        entry_review_evidence_generated_at or NOW
+    ).isoformat()
+    if actual_review == "blocked":
+        entry_review["blockers"] = ["actual review blocks the exit"]
+        entry_review["blocked_reasons"] = ["actual review blocks the exit"]
+    elif actual_review == "position_conflict":
+        entry_review["current_price"] = "70.00"
+    elif actual_review is not None:
+        raise ValueError(f"unsupported actual review fixture: {actual_review}")
+    evidence["payload"]["supervisor_review_authority"] = entry_review
+    hourly_review = json.loads(json.dumps(entry_review))
     hourly_review["evidence_generated_at"] = (
-        review_evidence_generated_at or NOW
+        review_evidence_generated_at or entry_review_evidence_generated_at or NOW
     ).isoformat()
     hourly_packet = {
         "generated_at": hourly_generated_at.isoformat(),
@@ -1373,6 +1397,27 @@ def test_production_recovery_authority_rejects_expired_snapshot_or_review_eviden
     assert result["outcome"] == "failed"
     assert result["failure_type"] == "permanent"
     assert "current broker position snapshot" in result["detail"]
+    assert broker_spy.read_calls == []
+    assert broker_spy.write_calls == []
+
+
+def test_production_recovery_authority_rejects_current_hourly_with_stale_entry_review(
+    tmp_path,
+):
+    request, _state_path, _invocations, broker_spy = _production_recovery_harness(
+        tmp_path,
+        snapshot_generated_at=NOW,
+        review_evidence_generated_at=NOW,
+        entry_review_evidence_generated_at=NOW - dt.timedelta(minutes=16),
+    )
+
+    result = request["adapters"]["resolve_authority"](
+        {"phase": "resolve_authority", "generated_at": NOW.isoformat()}
+    )
+
+    assert result.get("outcome") == "failed"
+    assert result.get("failure_type") == "permanent"
+    assert "current broker position snapshot" in result.get("detail", "")
     assert broker_spy.read_calls == []
     assert broker_spy.write_calls == []
 
@@ -3147,6 +3192,95 @@ def test_orphan_authority_cannot_adopt_missing_or_forged_current_facts(
                 "decision_owner": "execution_operator",
                 **BINDINGS,
                 **current_facts,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(calls),
+        now=NOW + dt.timedelta(seconds=30),
+    )
+
+    assert result["status"] == "frozen"
+    assert result["failure"]["kind"] == "permanent_integrity"
+    assert calls == ["resolve_authority"]
+
+
+def _production_orphan_current_facts(tmp_path: Path) -> dict:
+    snapshot_path = (
+        tmp_path / "results" / "hourly_supervisor" / "supervisor.json"
+    ).resolve()
+    entry_path = (
+        tmp_path / "results" / "loss_review_evidence" / "latest.json"
+    ).resolve()
+    snapshot_packet = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    position = snapshot_packet["portfolio"]["live"]["positions"][0]
+    review = snapshot_packet["evidence"]["loss_exit_review"]
+    snapshot_bytes = snapshot_path.read_bytes()
+    entry_bytes = entry_path.read_bytes()
+    return {
+        "authority_now": NOW.isoformat(),
+        "current_position_snapshot": {
+            "source_identity": "hourly_supervisor.portfolio.live.position",
+            "packet_path": str(snapshot_path),
+            "sha256": hashlib.sha256(snapshot_bytes).hexdigest(),
+            "size_bytes": len(snapshot_bytes),
+            "opened_at": position["opened_at"],
+            "entry_packet_path": str(entry_path),
+            "entry_packet_sha256": hashlib.sha256(entry_bytes).hexdigest(),
+            "entry_packet_size_bytes": len(entry_bytes),
+            "captured_at": snapshot_packet["generated_at"],
+            "review_evidence_generated_at": review["evidence_generated_at"],
+        },
+    }
+
+
+@pytest.mark.parametrize("actual_review", ["blocked", "position_conflict"])
+def test_orphan_authority_recomputes_authenticated_review_before_adoption(
+    tmp_path,
+    actual_review,
+):
+    _production_recovery_harness(tmp_path, actual_review=actual_review)
+    calls: list[str] = []
+    first = _run(
+        tmp_path,
+        calls,
+        adapters=_adapters(
+            calls,
+            fail={"phase": "resolve_authority", "failure_type": "transient"},
+        ),
+    )
+    assert first["status"] == "frozen"
+    orphan = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / BINDINGS["incident_id"]
+        / "recovery-nflx-1"
+        / "packets"
+        / "resolve_authority.json"
+    )
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_text(
+        json.dumps(
+            {
+                "schema_version": "tradingagents.recovery_phase.v1",
+                "kind": "recovery_authority",
+                "phase": "resolve_authority",
+                "generated_at": NOW.isoformat(),
+                "recovery_run_id": "recovery-nflx-1",
+                "owner_run_id": "repair-nflx-1",
+                "owner_role": "reliability_controller",
+                "allowed": True,
+                "requires_additional_decision": False,
+                "authority_source": "pre_registered_policy_rule",
+                "decision_owner": "execution_operator",
+                **BINDINGS,
+                **_production_orphan_current_facts(tmp_path),
             }
         ),
         encoding="utf-8",

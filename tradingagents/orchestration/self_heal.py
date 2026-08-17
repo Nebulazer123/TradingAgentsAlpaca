@@ -37,6 +37,7 @@ from tradingagents.orchestration.recovery import (
 )
 from tradingagents.orchestration.work_packets import build_packet_id
 from tradingagents.policy.decision_authority import (
+    bounded_exit_authority_record,
     parse_pre_registered_exit_policy_candidate,
     resolve_exit_authority,
 )
@@ -3054,7 +3055,7 @@ def _current_position_snapshot_from_bound_files(
     descriptor: Mapping[str, Any],
     bindings: Mapping[str, str],
     authority_now: dt.datetime,
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]] | None:
     """Re-open and freshness-bind the broker position used by authority.
 
     The descriptor does not itself authorize anything.  It must identify the
@@ -3147,6 +3148,21 @@ def _current_position_snapshot_from_bound_files(
         if isinstance(entry_payload, Mapping)
         else None
     )
+    entry_supervisor_review = (
+        entry_payload.get("supervisor_review_authority")
+        if isinstance(entry_payload, Mapping)
+        else None
+    )
+    entry_advisory_analysis = (
+        entry_payload.get("advisory_analysis")
+        if isinstance(entry_payload, Mapping)
+        else None
+    )
+    entry_review_evidence_generated_at = (
+        _parse_aware_recovery_time(entry_supervisor_review.get("evidence_generated_at"))
+        if isinstance(entry_supervisor_review, Mapping)
+        else None
+    )
     entry_opened_at = next(
         (
             entry_context.get(key)
@@ -3158,6 +3174,8 @@ def _current_position_snapshot_from_bound_files(
     )
     if (
         not isinstance(entry_context, Mapping)
+        or not isinstance(entry_supervisor_review, Mapping)
+        or not isinstance(entry_advisory_analysis, Mapping)
         or entry_packet.get("schema_version") != "1.0.0"
         or entry_packet.get("source_name") != "loss_review_evidence"
         or entry_packet.get("evidence_type") != "loss_review_evidence"
@@ -3168,6 +3186,12 @@ def _current_position_snapshot_from_bound_files(
         or str(entry_context.get("account") or "").strip()
         != bindings["broker_account"]
         or _parse_aware_recovery_time(entry_opened_at) != opened_at
+        or str(entry_supervisor_review.get("symbol") or "").strip().upper()
+        != bindings["symbol"]
+        or entry_review_evidence_generated_at is None
+        or entry_review_evidence_generated_at > authority_now
+        or authority_now - entry_review_evidence_generated_at > maximum_age
+        or dict(entry_supervisor_review) != bounded_exit_authority_record(review)
     ):
         return None
     portfolio = packet.get("portfolio")
@@ -3209,7 +3233,12 @@ def _current_position_snapshot_from_bound_files(
         supplied = descriptor.get(field)
         if supplied is not None and _parse_aware_recovery_time(supplied) != expected:
             return None
-    return position, snapshot
+    return (
+        position,
+        snapshot,
+        dict(entry_supervisor_review),
+        dict(entry_advisory_analysis),
+    )
 
 
 def _valid_recovery_authority_phase_packet(
@@ -3250,9 +3279,25 @@ def _valid_recovery_authority_phase_packet(
         bindings=bindings,
         authority_now=authority_now,
     )
+    if resolved is None or resolved[1] != packet.get("current_position_snapshot"):
+        return False
+    current_position, _snapshot, supervisor_review, advisory_analysis = resolved
+    try:
+        verdict = resolve_exit_authority(
+            supervisor_review=supervisor_review,
+            advisory_analysis=advisory_analysis,
+            current_position=current_position,
+            now=authority_now,
+        )
+    except Exception:
+        # A malformed authenticated packet must invalidate recovery, not escape
+        # validation and let a persisted allowed flag authorize downstream work.
+        return False
     return (
-        resolved is not None
-        and resolved[1] == packet.get("current_position_snapshot")
+        verdict.allowed is True
+        and verdict.requires_additional_decision is False
+        and verdict.authority_source == packet.get("authority_source")
+        and verdict.decision_owner == packet.get("decision_owner")
     )
 
 
@@ -3670,7 +3715,7 @@ def build_production_recovery_request(
 
     def current_position_snapshot(
         authority_now: dt.datetime,
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]] | None:
         """Re-capture the current broker-derived portfolio position by hash.
 
         A recovery context may preserve a policy *candidate*, but it may not
@@ -3717,11 +3762,6 @@ def build_production_recovery_request(
         return {"packet": payload} if isinstance(payload, dict) else unavailable(phase, "canonical command emitted non-object JSON")
 
     def authority(arguments: Mapping[str, Any]) -> dict[str, Any]:
-        supervisor_path, advisory_path = context_path("supervisor_path"), context_path("advisory_path")
-        supervisor = context.get("supervisor_record") if isinstance(context.get("supervisor_record"), Mapping) else (_read_json(supervisor_path) if supervisor_path else {})
-        advisory = context.get("advisory_record") if isinstance(context.get("advisory_record"), Mapping) else (_read_json(advisory_path) if advisory_path else {})
-        if not supervisor_path or not advisory_path or not supervisor or not advisory:
-            return unavailable("resolve_authority", "canonical supervisor/advisory packets are unavailable")
         authority_now = _parse_aware_recovery_time(arguments.get("generated_at"))
         snapshot = (
             current_position_snapshot(authority_now)
@@ -3737,10 +3777,15 @@ def build_production_recovery_request(
                     "broker position snapshot and the recovery clock"
                 ),
             }
-        current_position, snapshot_record = snapshot
+        (
+            current_position,
+            snapshot_record,
+            supervisor_review,
+            advisory_analysis,
+        ) = snapshot
         verdict = resolve_exit_authority(
-            supervisor_review=supervisor,
-            advisory_analysis=advisory,
+            supervisor_review=supervisor_review,
+            advisory_analysis=advisory_analysis,
             current_position=current_position,
             now=authority_now,
         )
