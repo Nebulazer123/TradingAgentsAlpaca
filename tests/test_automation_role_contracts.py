@@ -8,6 +8,8 @@ record as deployment proof.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 from pathlib import Path
 
 from tradingagents.evals.automation_health_audit import evaluate_schedule_contract
@@ -15,6 +17,41 @@ from tradingagents.evals.automation_health_audit import evaluate_schedule_contra
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = REPO_ROOT / "config" / "automation_schedule_contract.json"
 AUTOMATION_ROOT = Path.home() / ".codex" / "automations"
+FROZEN_OBSERVER_ACTIVE_IDS = frozenset(
+    {
+        "tradingagents-overnight-research",
+        "tradingagents-preopen-validation",
+        "tradingagents-autonomous-self-healer",
+        "tradingagents-autonomous-safety-sentinel",
+        "tradingagents-autonomous-execution-board",
+        "tradingagents-paper-tournament",
+        "tradingagents-daily-report",
+    }
+)
+FROZEN_OBSERVER_PAUSED_IDS = frozenset(
+    {
+        "tradingagents-market-supervisor",
+        "tradingagents-automation-wake-controller",
+        "tradingagents-automation-sleep-controller",
+    }
+)
+
+
+def _copy_automation_records(destination: Path) -> Path:
+    root = destination / "automations"
+    shutil.copytree(AUTOMATION_ROOT, root)
+    return root
+
+
+def _set_automation_status(root: Path, automation_id: str, status: str) -> None:
+    path = root / automation_id / "automation.toml"
+    updated = re.sub(
+        r'^status = ".*"$',
+        f'status = "{status}"',
+        path.read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    path.write_text(updated, encoding="utf-8")
 
 
 def test_current_external_records_are_checked_against_the_versioned_contract():
@@ -58,7 +95,7 @@ def test_current_external_records_are_checked_against_the_versioned_contract():
         "tradingagents-automation-wake-controller": {"rrule"},
         "tradingagents-autonomous-execution-board": {"rrule"},
         "tradingagents-autonomous-safety-sentinel": {"rrule"},
-        "tradingagents-autonomous-self-healer": {"rrule", "prompt_semantic"},
+        "tradingagents-autonomous-self-healer": {"rrule", "prompt_sha256", "prompt_semantic"},
         "tradingagents-daily-report": {"rrule"},
         "tradingagents-market-supervisor": {"rrule"},
         "tradingagents-overnight-research": {"rrule"},
@@ -156,6 +193,14 @@ def test_contract_rejects_relaxed_no_submit_deployment_policy_and_dependencies(t
     assert no_submit["status"] == "invalid_contract"
     assert no_submit["issues"] == ["contract_no_submit"]
 
+    active_no_submit = write_contract(
+        "active-no-submit.json",
+        lambda contract: contract["automations"]["tradingagents-overnight-research"].update(
+            no_submit=False
+        ),
+    )
+    assert active_no_submit["issues"] == ["contract_no_submit"]
+
     weakened_policy = write_contract(
         "policy.json",
         lambda contract: contract["deployment_policy"].update(safe_statuses=[]),
@@ -217,3 +262,90 @@ def test_contract_rejects_relaxed_no_submit_deployment_policy_and_dependencies(t
         ),
     )
     assert dependency_cycle["issues"] == ["contract_dependency_cycle"]
+
+
+def test_schedule_contract_supports_predeployment_and_frozen_observer_phases(tmp_path):
+    automation_root = _copy_automation_records(tmp_path)
+
+    predeployment = evaluate_schedule_contract(
+        contract_path=CONTRACT_PATH,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+    )
+
+    assert predeployment["safe_predeployment"] is True
+    assert {row["automation_id"] for row in predeployment["automations"]} == (
+        FROZEN_OBSERVER_ACTIVE_IDS | FROZEN_OBSERVER_PAUSED_IDS
+    )
+    assert {
+        row["automation_id"]
+        for row in predeployment["automations"]
+        if any(item["field"] == "deployment_phase_status" for item in row["mismatches"])
+    } == set()
+
+    for automation_id in FROZEN_OBSERVER_ACTIVE_IDS:
+        _set_automation_status(automation_root, automation_id, "ACTIVE")
+
+    frozen_observer = evaluate_schedule_contract(
+        contract_path=CONTRACT_PATH,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+        deployment_phase="frozen_observer",
+    )
+
+    assert frozen_observer["safe_predeployment"] is False
+    assert {
+        row["automation_id"]
+        for row in frozen_observer["automations"]
+        if any(item["field"] == "deployment_phase_status" for item in row["mismatches"])
+    } == set()
+
+
+def test_schedule_contract_rejects_invalid_frozen_observer_active_set_and_phase(tmp_path):
+    automation_root = _copy_automation_records(tmp_path)
+    _set_automation_status(
+        automation_root,
+        "tradingagents-market-supervisor",
+        "ACTIVE",
+    )
+
+    result = evaluate_schedule_contract(
+        contract_path=CONTRACT_PATH,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+        deployment_phase="frozen_observer",
+    )
+
+    supervisor = next(
+        row
+        for row in result["automations"]
+        if row["automation_id"] == "tradingagents-market-supervisor"
+    )
+    assert {
+        item["field"]: item
+        for item in supervisor["mismatches"]
+    }["deployment_phase_status"] == {
+        "field": "deployment_phase_status",
+        "expected": "PAUSED",
+        "actual": "ACTIVE",
+    }
+
+    invalid_phase = evaluate_schedule_contract(
+        contract_path=CONTRACT_PATH,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+        deployment_phase="not-a-real-phase",
+    )
+    assert invalid_phase["issues"] == ["deployment_phase_invalid"]
+
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    del contract["deployment_policy"]["deployment_phases"]["frozen_observer"]
+    path = tmp_path / "missing-phase-contract.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+
+    missing_phase = evaluate_schedule_contract(
+        contract_path=path,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+    )
+    assert missing_phase["issues"] == ["contract_deployment_phases"]

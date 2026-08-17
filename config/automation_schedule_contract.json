@@ -5,6 +5,39 @@
   "deployment_policy": {
     "allowed_status_phase": "predeployment_paused",
     "safe_statuses": ["PAUSED"],
+    "deployment_phases": {
+      "predeployment_paused": {
+        "active_automation_ids": [],
+        "paused_automation_ids": [
+          "tradingagents-automation-sleep-controller",
+          "tradingagents-automation-wake-controller",
+          "tradingagents-autonomous-execution-board",
+          "tradingagents-autonomous-safety-sentinel",
+          "tradingagents-autonomous-self-healer",
+          "tradingagents-daily-report",
+          "tradingagents-market-supervisor",
+          "tradingagents-overnight-research",
+          "tradingagents-paper-tournament",
+          "tradingagents-preopen-validation"
+        ]
+      },
+      "frozen_observer": {
+        "active_automation_ids": [
+          "tradingagents-overnight-research",
+          "tradingagents-preopen-validation",
+          "tradingagents-autonomous-self-healer",
+          "tradingagents-autonomous-safety-sentinel",
+          "tradingagents-autonomous-execution-board",
+          "tradingagents-paper-tournament",
+          "tradingagents-daily-report"
+        ],
+        "paused_automation_ids": [
+          "tradingagents-market-supervisor",
+          "tradingagents-automation-wake-controller",
+          "tradingagents-automation-sleep-controller"
+        ]
+      }
+    },
     "deployment_proof_requires": [
       "contract_match",
       "api_returned_next_run_central_and_utc",
@@ -77,7 +110,7 @@
       "model": "gpt-5.6-terra",
       "reasoning_effort": "high",
       "notification_policy": "failed_runs_only",
-      "prompt_sha256": "8e338f8a0721513c60a6a1b119494c2fb5c782a891cffa9314203332706138ae",
+      "prompt_sha256": "e03f8a7fbf3fd13fa4423291e87a7ff0b951c332db7a4f39605bca11d8882910",
       "required_prompt_phrases": ["weekday market-session reliability and recovery controller", "fail closed"],
       "forbidden_prompt_phrases": ["24/7 doomsday-capable"],
       "expected_artifact_patterns": ["results/self_heal/self-heal-handoff-*.json", "results/self_heal/plans/self-heal-plan-*.json"],

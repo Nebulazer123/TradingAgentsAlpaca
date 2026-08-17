@@ -170,6 +170,27 @@ SCHEDULE_DEPLOYMENT_PROOF_REQUIREMENTS = {
     "current_artifact_health",
 }
 
+PREDEPLOYMENT_PAUSED_PHASE = "predeployment_paused"
+FROZEN_OBSERVER_PHASE = "frozen_observer"
+SCHEDULE_DEPLOYMENT_PHASES = {
+    PREDEPLOYMENT_PAUSED_PHASE,
+    FROZEN_OBSERVER_PHASE,
+}
+FROZEN_OBSERVER_ACTIVE_AUTOMATION_IDS = {
+    "tradingagents-overnight-research",
+    "tradingagents-preopen-validation",
+    "tradingagents-autonomous-self-healer",
+    "tradingagents-autonomous-safety-sentinel",
+    "tradingagents-autonomous-execution-board",
+    "tradingagents-paper-tournament",
+    "tradingagents-daily-report",
+}
+FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS = {
+    "tradingagents-market-supervisor",
+    "tradingagents-automation-wake-controller",
+    "tradingagents-automation-sleep-controller",
+}
+
 SENTINEL_ID = "tradingagents-autonomous-safety-sentinel"
 SUPERVISOR_ID = "tradingagents-market-supervisor"
 BOARD_ID = "tradingagents-autonomous-execution-board"
@@ -210,7 +231,7 @@ def _schedule_contract_issues(contract: Any) -> list[str]:
     if not isinstance(policy, Mapping):
         return ["contract_deployment_policy"]
     if (
-        policy.get("allowed_status_phase") != "predeployment_paused"
+        policy.get("allowed_status_phase") != PREDEPLOYMENT_PAUSED_PHASE
         or policy.get("safe_statuses") != ["PAUSED"]
         or policy.get("paused_is_safe_but_not_deployed") is not True
         or not isinstance(policy.get("deployment_proof_requires"), list)
@@ -260,6 +281,37 @@ def _schedule_contract_issues(contract: Any) -> list[str]:
         return sorted(set(issues))
 
     automation_ids = set(automations)
+    phases = policy.get("deployment_phases")
+    if not isinstance(phases, Mapping) or set(phases) != SCHEDULE_DEPLOYMENT_PHASES:
+        return ["contract_deployment_phases"]
+    phase_ids: dict[str, tuple[set[str], set[str]]] = {}
+    for phase_name in SCHEDULE_DEPLOYMENT_PHASES:
+        phase = phases.get(phase_name)
+        if not isinstance(phase, Mapping):
+            return ["contract_deployment_phases"]
+        active_ids = phase.get("active_automation_ids")
+        paused_ids = phase.get("paused_automation_ids")
+        if not all(
+            isinstance(ids, list) and all(isinstance(item, str) and item for item in ids)
+            for ids in (active_ids, paused_ids)
+        ):
+            return ["contract_deployment_phases"]
+        active_set = set(cast(list[str], active_ids))
+        paused_set = set(cast(list[str], paused_ids))
+        if (
+            len(active_set) != len(active_ids)
+            or len(paused_set) != len(paused_ids)
+            or active_set & paused_set
+            or active_set | paused_set != automation_ids
+        ):
+            return ["contract_deployment_phases"]
+        phase_ids[phase_name] = (active_set, paused_set)
+    if (
+        phase_ids[PREDEPLOYMENT_PAUSED_PHASE] != (set(), automation_ids)
+        or phase_ids[FROZEN_OBSERVER_PHASE]
+        != (FROZEN_OBSERVER_ACTIVE_AUTOMATION_IDS, FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS)
+    ):
+        return ["contract_deployment_phases"]
     if (
         SUPERVISOR_ID not in automation_ids
         or SENTINEL_ID not in automation_ids
@@ -350,12 +402,15 @@ def evaluate_schedule_contract(
     contract_path: str | Path,
     automation_root: str | Path | None = None,
     role_contract_path: str | Path | None = None,
+    deployment_phase: str = PREDEPLOYMENT_PAUSED_PHASE,
 ) -> dict[str, Any]:
     """Compare the ten external TOMLs to the versioned CT schedule contract.
 
     This is a source-only read.  It deliberately does not infer deployment or
     health from a paused record: next-run API evidence, fresh no-submit shadow
-    evidence, and current artifacts remain separate activation gates.
+    evidence, and current artifacts remain separate activation gates.  The
+    optional phase verifies the configured PAUSED/ACTIVE status contract only;
+    it never proves deployment or changes an external record.
     """
 
     source = Path(contract_path)
@@ -366,6 +421,14 @@ def evaluate_schedule_contract(
     issues = _schedule_contract_issues(contract)
     if issues:
         return _schedule_contract_failure(issues[0])
+
+    phases = cast(
+        Mapping[str, Mapping[str, list[str]]],
+        cast(Mapping[str, Any], contract["deployment_policy"])["deployment_phases"],
+    )
+    if deployment_phase not in phases:
+        return _schedule_contract_failure("deployment_phase_invalid")
+    active_automation_ids = set(phases[deployment_phase]["active_automation_ids"])
 
     records = cast(Mapping[str, Mapping[str, Any]], contract["automations"])
     root = Path(automation_root) if automation_root is not None else default_automation_root()
@@ -393,6 +456,16 @@ def evaluate_schedule_contract(
             configured_count += 1
             if _is_paused_config(actual):
                 paused_count += 1
+            expected_status = "ACTIVE" if automation_id in active_automation_ids else "PAUSED"
+            actual_status = str(actual.get("status") or "").upper()
+            if actual_status != expected_status:
+                mismatches.append(
+                    {
+                        "field": "deployment_phase_status",
+                        "expected": expected_status,
+                        "actual": actual.get("status"),
+                    }
+                )
             for field in ("rrule", "model", "reasoning_effort", "notification_policy"):
                 if actual.get(field) != expected[field]:
                     mismatches.append(
@@ -425,7 +498,11 @@ def evaluate_schedule_contract(
                             },
                         }
                     )
-            if expected["no_submit"] and str(actual.get("status") or "").upper() != "PAUSED":
+            if (
+                deployment_phase == PREDEPLOYMENT_PAUSED_PHASE
+                and expected["no_submit"]
+                and actual_status != "PAUSED"
+            ):
                 mismatches.append(
                     {
                         "field": "no_submit_predeployment_status",
@@ -463,7 +540,11 @@ def evaluate_schedule_contract(
         "automation_count": len(rows),
         "configured_count": configured_count,
         "paused_count": paused_count,
-        "safe_predeployment": configured_count == len(rows) and paused_count == len(rows),
+        "safe_predeployment": (
+            deployment_phase == PREDEPLOYMENT_PAUSED_PHASE
+            and configured_count == len(rows)
+            and paused_count == len(rows)
+        ),
         "deployment_proven": False,
         "issues": sorted(set(issues)),
         "unexpected_automation_ids": unexpected_ids,

@@ -9,9 +9,16 @@ a scheduler configuration change have different review and activation gates.
 
 ## Current state
 
-All ten external records are intentionally `PAUSED`.  That is a safe
-predeployment state, but it is **not** evidence that the schedule is deployed
-or healthy.  A schedule is deployable only after all of the following exist:
+The contract has two status phases.  `predeployment_paused` requires all ten
+external records to be `PAUSED`; that is the current safe predeployment state,
+but it is **not** evidence that the schedule is deployed or healthy.
+`frozen_observer` permits only overnight research, preopen validation,
+self-healer, safety sentinel, execution BOARD, paper tournament, and daily
+report to be `ACTIVE`.  Market supervisor plus wake and sleep controllers must
+remain `PAUSED`, and every active role remains contractually `no_submit`.
+
+Neither phase proves a schedule is deployed or healthy.  A schedule is
+deployable only after all of the following exist:
 
 1. The external TOML matches the versioned contract.
 2. The automation API returns the next scheduled run in both Central and UTC.
@@ -34,7 +41,9 @@ Each exact automation ID has:
 - a role mapped to `config/automation_roles.json`;
 - a SHA-256 prompt fingerprint plus semantic required/forbidden phrases;
 - expected artifact patterns and ordering dependencies;
-- a `no_submit` predeployment invariant.
+- a `no_submit` invariant for every phase, including all frozen-observer active
+  roles;
+- exact `PAUSED`/`ACTIVE` membership for both named deployment phases.
 
 The prompt digest catches unreviewed prompt changes.  The semantic clauses
 catch known safety requirements that a digest alone cannot describe.  In
@@ -71,5 +80,7 @@ PYTHONDONTWRITEBYTECODE=1 /Users/corbinfloyd/Documents/TradingAgents/.venv/bin/p
 ```
 
 The evaluator lives in `tradingagents/evals/automation_health_audit.py` as
-`evaluate_schedule_contract`.  It performs source reads only and must never be
+`evaluate_schedule_contract`.  Its optional `deployment_phase` argument
+defaults to `predeployment_paused`; pass `frozen_observer` only when evaluating
+that exact status contract.  It performs source reads only and must never be
 used to activate, pause, update, re-arm, or otherwise mutate an automation.
