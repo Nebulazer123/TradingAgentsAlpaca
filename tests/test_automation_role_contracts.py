@@ -54,6 +54,23 @@ def _set_automation_status(root: Path, automation_id: str, status: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
+def _replace_automation_toml_line(
+    root: Path,
+    automation_id: str,
+    field: str,
+    replacement: str,
+) -> None:
+    path = root / automation_id / "automation.toml"
+    updated, replacement_count = re.subn(
+        rf"^{re.escape(field)} = .*$",
+        replacement,
+        path.read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    assert replacement_count == 1
+    path.write_text(updated, encoding="utf-8")
+
+
 def test_current_external_records_are_checked_against_the_versioned_contract():
     """Known predeployment drift is explicit rather than a false green."""
 
@@ -172,7 +189,7 @@ def test_missing_contract_fails_closed_without_claiming_deployment(tmp_path):
     }
 
 
-def test_contract_rejects_relaxed_no_submit_deployment_policy_and_dependencies(tmp_path):
+def test_contract_requires_no_submit_for_active_observers_and_dependencies(tmp_path):
     def write_contract(name, mutate):
         contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
         mutate(contract)
@@ -184,14 +201,18 @@ def test_contract_rejects_relaxed_no_submit_deployment_policy_and_dependencies(t
             role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
         )
 
-    no_submit = write_contract(
-        "no-submit.json",
+    paused_order_capable_supervisor = write_contract(
+        "paused-order-capable-supervisor.json",
         lambda contract: contract["automations"]["tradingagents-market-supervisor"].update(
             no_submit=False
         ),
     )
-    assert no_submit["status"] == "invalid_contract"
-    assert no_submit["issues"] == ["contract_no_submit"]
+    assert paused_order_capable_supervisor["contract_status"] == "pass"
+    assert next(
+        row
+        for row in paused_order_capable_supervisor["automations"]
+        if row["automation_id"] == "tradingagents-market-supervisor"
+    )["no_submit"] is False
 
     active_no_submit = write_contract(
         "active-no-submit.json",
@@ -199,7 +220,7 @@ def test_contract_rejects_relaxed_no_submit_deployment_policy_and_dependencies(t
             no_submit=False
         ),
     )
-    assert active_no_submit["issues"] == ["contract_no_submit"]
+    assert active_no_submit["issues"] == ["contract_frozen_observer_active_no_submit"]
 
     weakened_policy = write_contract(
         "policy.json",
@@ -301,34 +322,49 @@ def test_schedule_contract_supports_predeployment_and_frozen_observer_phases(tmp
     } == set()
 
 
-def test_schedule_contract_rejects_invalid_frozen_observer_active_set_and_phase(tmp_path):
+def test_schedule_contract_rejects_each_protected_frozen_observer_activation(tmp_path):
+    for automation_id in FROZEN_OBSERVER_PAUSED_IDS:
+        automation_root = _copy_automation_records(tmp_path / automation_id)
+        _set_automation_status(automation_root, automation_id, "ACTIVE")
+
+        result = evaluate_schedule_contract(
+            contract_path=CONTRACT_PATH,
+            automation_root=automation_root,
+            role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+            deployment_phase="frozen_observer",
+        )
+
+        row = next(
+            item for item in result["automations"] if item["automation_id"] == automation_id
+        )
+        assert {
+            item["field"]: item for item in row["mismatches"]
+        }["deployment_phase_status"] == {
+            "field": "deployment_phase_status",
+            "expected": "PAUSED",
+            "actual": "ACTIVE",
+        }
+
+        contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        phase = contract["deployment_policy"]["deployment_phases"]["frozen_observer"]
+        phase["active_automation_ids"].remove("tradingagents-overnight-research")
+        phase["active_automation_ids"].append(automation_id)
+        phase["paused_automation_ids"].remove(automation_id)
+        phase["paused_automation_ids"].append("tradingagents-overnight-research")
+        contract_path = tmp_path / f"{automation_id}-active.json"
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+
+        contract_result = evaluate_schedule_contract(
+            contract_path=contract_path,
+            automation_root=automation_root,
+            role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+            deployment_phase="frozen_observer",
+        )
+        assert contract_result["issues"] == ["contract_deployment_phases"]
+
+
+def test_schedule_contract_rejects_invalid_frozen_observer_phase_and_contract(tmp_path):
     automation_root = _copy_automation_records(tmp_path)
-    _set_automation_status(
-        automation_root,
-        "tradingagents-market-supervisor",
-        "ACTIVE",
-    )
-
-    result = evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
-        automation_root=automation_root,
-        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
-        deployment_phase="frozen_observer",
-    )
-
-    supervisor = next(
-        row
-        for row in result["automations"]
-        if row["automation_id"] == "tradingagents-market-supervisor"
-    )
-    assert {
-        item["field"]: item
-        for item in supervisor["mismatches"]
-    }["deployment_phase_status"] == {
-        "field": "deployment_phase_status",
-        "expected": "PAUSED",
-        "actual": "ACTIVE",
-    }
 
     invalid_phase = evaluate_schedule_contract(
         contract_path=CONTRACT_PATH,
@@ -349,3 +385,42 @@ def test_schedule_contract_rejects_invalid_frozen_observer_active_set_and_phase(
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
     assert missing_phase["issues"] == ["contract_deployment_phases"]
+
+
+def test_schedule_contract_rejects_identity_drift_in_both_deployment_phases(tmp_path):
+    automation_id = "tradingagents-overnight-research"
+    identity_drift = {
+        "name": 'name = "Incorrect automation name"',
+        "target": 'target = { type = "project", project_id = "wrong-project" }',
+        "cwds": 'cwds = ["/tmp/not-tradingagents"]',
+        "execution_environment": 'execution_environment = "remote"',
+    }
+
+    for deployment_phase in ("predeployment_paused", "frozen_observer"):
+        for field, replacement in identity_drift.items():
+            automation_root = _copy_automation_records(
+                tmp_path / deployment_phase / field
+            )
+            if deployment_phase == "frozen_observer":
+                for active_id in FROZEN_OBSERVER_ACTIVE_IDS:
+                    _set_automation_status(automation_root, active_id, "ACTIVE")
+            _replace_automation_toml_line(
+                automation_root,
+                automation_id,
+                field,
+                replacement,
+            )
+
+            result = evaluate_schedule_contract(
+                contract_path=CONTRACT_PATH,
+                automation_root=automation_root,
+                role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+                deployment_phase=deployment_phase,
+            )
+
+            row = next(
+                item
+                for item in result["automations"]
+                if item["automation_id"] == automation_id
+            )
+            assert field in {item["field"] for item in row["mismatches"]}

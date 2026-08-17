@@ -49,6 +49,10 @@
   "automations": {
     "tradingagents-automation-sleep-controller": {
       "role": "schedule_controller",
+      "name": "TradingAgents automation sleep controller",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=16;BYMINUTE=45;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-luna",
@@ -63,6 +67,10 @@
     },
     "tradingagents-automation-wake-controller": {
       "role": "schedule_controller",
+      "name": "TradingAgents automation wake controller",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=6;BYMINUTE=45;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-luna",
@@ -77,6 +85,10 @@
     },
     "tradingagents-autonomous-execution-board": {
       "role": "portfolio_executive",
+      "name": "TradingAgents autonomous execution BOARD",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=8,9,10,11,12,13,14;BYMINUTE=50;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-terra",
@@ -91,6 +103,10 @@
     },
     "tradingagents-autonomous-safety-sentinel": {
       "role": "integrity_verifier",
+      "name": "TradingAgents autonomous safety sentinel",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=8,9,10,11,12,13,14;BYMINUTE=20;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-luna",
@@ -105,6 +121,10 @@
     },
     "tradingagents-autonomous-self-healer": {
       "role": "reliability_controller",
+      "name": "TradingAgents autonomous self-healer",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=7,9,11,13,15;BYMINUTE=03;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-terra",
@@ -119,6 +139,10 @@
     },
     "tradingagents-daily-report": {
       "role": "reporting_utility",
+      "name": "TradingAgents daily report",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=15;BYMINUTE=30;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-luna",
@@ -133,6 +157,10 @@
     },
     "tradingagents-market-supervisor": {
       "role": "execution_operator",
+      "name": "TradingAgents market supervisor",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=8,9,10,11,12,13,14;BYMINUTE=35;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-terra",
@@ -143,10 +171,14 @@
       "forbidden_prompt_phrases": [],
       "expected_artifact_patterns": ["results/hourly_supervisor/hourly-supervisor-*.json"],
       "depends_on": ["tradingagents-autonomous-safety-sentinel"],
-      "no_submit": true
+      "no_submit": false
     },
     "tradingagents-overnight-research": {
       "role": "strategy_learning",
+      "name": "TradingAgents overnight research",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=3;BYMINUTE=30;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-terra",
@@ -161,6 +193,10 @@
     },
     "tradingagents-paper-tournament": {
       "role": "strategy_learning",
+      "name": "TradingAgents paper tournament",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=9;BYMINUTE=10;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-terra",
@@ -175,6 +211,10 @@
     },
     "tradingagents-preopen-validation": {
       "role": "integrity_verifier",
+      "name": "TradingAgents preopen validation",
+      "target": {"type": "project", "project_id": "local-ff251fa82e4af49ee0cc0bfe9a35ec11"},
+      "cwds": ["/Users/corbinfloyd/Documents/TradingAgents"],
+      "execution_environment": "local",
       "allowed_status_phase": "predeployment_paused",
       "rrule": "RRULE:FREQ=WEEKLY;BYHOUR=8;BYMINUTE=10;BYDAY=MO,TU,WE,TH,FR",
       "model": "gpt-5.6-terra",

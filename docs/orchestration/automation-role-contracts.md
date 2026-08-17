@@ -16,6 +16,9 @@ but it is **not** evidence that the schedule is deployed or healthy.
 self-healer, safety sentinel, execution BOARD, paper tournament, and daily
 report to be `ACTIVE`.  Market supervisor plus wake and sleep controllers must
 remain `PAUSED`, and every active role remains contractually `no_submit`.
+The market supervisor is deliberately `no_submit: false`: its scheduled command
+is order-capable and remains safe in these phases only because it is required to
+stay `PAUSED`.
 
 Neither phase proves a schedule is deployed or healthy.  A schedule is
 deployable only after all of the following exist:
@@ -38,11 +41,14 @@ Each exact automation ID has:
 - `timezone`: the global `America/Chicago` schedule interpretation;
 - the intended `rrule`, model, reasoning effort, and `failed_runs_only`
   notification policy;
+- the exact display name, local project target, cwd list, and execution
+  environment recorded by the external TOML;
 - a role mapped to `config/automation_roles.json`;
 - a SHA-256 prompt fingerprint plus semantic required/forbidden phrases;
 - expected artifact patterns and ordering dependencies;
-- a `no_submit` invariant for every phase, including all frozen-observer active
-  roles;
+- a `no_submit` invariant for every frozen-observer active role; an
+  order-capable record is permitted only when every no-submit observer phase
+  requires it to stay paused;
 - exact `PAUSED`/`ACTIVE` membership for both named deployment phases.
 
 The prompt digest catches unreviewed prompt changes.  The semantic clauses

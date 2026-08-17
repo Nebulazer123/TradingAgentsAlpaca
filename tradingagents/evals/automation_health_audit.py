@@ -150,6 +150,10 @@ def default_automation_root() -> Path:
 
 SCHEDULE_CONTRACT_REQUIRED_FIELDS = {
     "role",
+    "name",
+    "target",
+    "cwds",
+    "execution_environment",
     "allowed_status_phase",
     "rrule",
     "model",
@@ -258,6 +262,8 @@ def _schedule_contract_issues(contract: Any) -> list[str]:
             isinstance(record.get(field), str) and record[field]
             for field in (
                 "role",
+                "name",
+                "execution_environment",
                 "allowed_status_phase",
                 "rrule",
                 "model",
@@ -270,10 +276,25 @@ def _schedule_contract_issues(contract: Any) -> list[str]:
         if not all(
             isinstance(record.get(field), list)
             and all(isinstance(item, str) and item for item in record[field])
-            for field in ("required_prompt_phrases", "forbidden_prompt_phrases", "expected_artifact_patterns", "depends_on")
+            for field in (
+                "cwds",
+                "required_prompt_phrases",
+                "forbidden_prompt_phrases",
+                "expected_artifact_patterns",
+                "depends_on",
+            )
         ):
             issues.append("contract_automation_lists")
-        if not isinstance(record.get("no_submit"), bool) or record["no_submit"] is not True:
+        target = record.get("target")
+        if (
+            not isinstance(target, Mapping)
+            or set(target) != {"type", "project_id"}
+            or target.get("type") != "project"
+            or not isinstance(target.get("project_id"), str)
+            or not target["project_id"]
+        ):
+            issues.append("contract_automation_target")
+        if not isinstance(record.get("no_submit"), bool):
             issues.append("contract_no_submit")
         if record.get("allowed_status_phase") != "predeployment_paused":
             issues.append("contract_status_phase")
@@ -312,6 +333,20 @@ def _schedule_contract_issues(contract: Any) -> list[str]:
         != (FROZEN_OBSERVER_ACTIVE_AUTOMATION_IDS, FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS)
     ):
         return ["contract_deployment_phases"]
+    frozen_observer_active_ids, _frozen_observer_paused_ids = phase_ids[
+        FROZEN_OBSERVER_PHASE
+    ]
+    if any(not automations[automation_id]["no_submit"] for automation_id in frozen_observer_active_ids):
+        return ["contract_frozen_observer_active_no_submit"]
+    if any(
+        not record["no_submit"]
+        and any(
+            automation_id not in phase_ids[phase_name][1]
+            for phase_name in SCHEDULE_DEPLOYMENT_PHASES
+        )
+        for automation_id, record in automations.items()
+    ):
+        return ["contract_order_capable_phase"]
     if (
         SUPERVISOR_ID not in automation_ids
         or SENTINEL_ID not in automation_ids
@@ -466,7 +501,16 @@ def evaluate_schedule_contract(
                         "actual": actual.get("status"),
                     }
                 )
-            for field in ("rrule", "model", "reasoning_effort", "notification_policy"):
+            for field in (
+                "name",
+                "target",
+                "cwds",
+                "execution_environment",
+                "rrule",
+                "model",
+                "reasoning_effort",
+                "notification_policy",
+            ):
                 if actual.get(field) != expected[field]:
                     mismatches.append(
                         {"field": field, "expected": expected[field], "actual": actual.get(field)}
