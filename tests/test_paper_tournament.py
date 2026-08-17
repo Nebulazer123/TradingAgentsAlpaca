@@ -1,6 +1,7 @@
 import datetime
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
@@ -30,7 +31,12 @@ runner = CliRunner()
 class _FakePaperClient:
     def __init__(self):
         self.paper = True
+        self.settings = SimpleNamespace(
+            paper=True,
+            base_url="https://paper-api.alpaca.markets",
+        )
         self.submitted = []
+        self.orders = []
         self.positions = [
             {
                 "symbol": "GOOGL",
@@ -59,14 +65,27 @@ class _FakePaperClient:
         return self.positions
 
     def list_orders(self, status="open"):
-        return []
+        if status == "open":
+            return [
+                order
+                for order in self.orders
+                if order.get("status", "").lower()
+                not in {"filled", "canceled", "expired", "rejected"}
+            ]
+        return list(self.orders)
+
+    def list_calendar(self, *, start, end):
+        assert start == end
+        return [{"date": start}]
 
     def list_open_client_order_ids(self):
         return set()
 
     def submit_order(self, order):
         self.submitted.append(order)
-        return {"id": f"paper-{len(self.submitted)}", **order}
+        response = {"id": f"paper-{len(self.submitted)}", "status": "filled", **order}
+        self.orders.append(response)
+        return response
 
 
 def test_initialize_tournament_marks_existing_bot_from_now():
@@ -242,7 +261,7 @@ def test_paper_tournament_run_submits_strategy_prefixed_paper_orders(monkeypatch
         paper_account=paper_client.get_account(),
         paper_positions=[],
         capital_per_strategy=Decimal("10000"),
-        now=datetime.datetime(2026, 5, 31, 18, 0, tzinfo=datetime.timezone.utc),
+        now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
     )
     write_tournament_ledger(ledger, tmp_path)
 
@@ -255,11 +274,16 @@ def test_paper_tournament_run_submits_strategy_prefixed_paper_orders(monkeypatch
     monkeypatch.setattr(cli_main, "market_session_label", lambda: "regular")
     monkeypatch.setattr(
         cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+    monkeypatch.setattr(
+        cli_main,
         "_fetch_aggressive_candidate_market_data",
         lambda: {
             "NVDA": {
-                "current_price": "220",
-                "previous_close": "214",
+                "current_price": "218",
+                "previous_close": "220",
                 "volume_ratio": "2.0",
                 "tradable": True,
             },
@@ -279,6 +303,7 @@ def test_paper_tournament_run_submits_strategy_prefixed_paper_orders(monkeypatch
             "paper-tournament",
             "run",
             "--all",
+            "--submit-actions",
             "--json-output",
             "--log-dir",
             str(tmp_path),
@@ -294,7 +319,254 @@ def test_paper_tournament_run_submits_strategy_prefixed_paper_orders(monkeypatch
     assert any(item.startswith("ta-paperbot-current-aggressive") for item in client_ids)
     assert any(item.startswith("ta-paperbot-pullback-support") for item in client_ids)
     assert any(item.startswith("ta-paperbot-catalyst") for item in client_ids)
-    assert payload["report"]["live_strategy_candidate"]["status"] == "expired"
+    assert payload["report"]["live_strategy_candidate"]["status"] == "pending"
+
+
+def _current_trial_ledger(paper_client, *, max_submission_market_days=5):
+    return initialize_tournament(
+        paper_account=paper_client.get_account(),
+        paper_positions=[],
+        capital_per_strategy=Decimal("10000"),
+        now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+        duration_days=31,
+        max_submission_market_days=max_submission_market_days,
+    )
+
+
+def _configure_current_submit(monkeypatch, paper_client):
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_clients",
+        lambda: (_ for _ in ()).throw(AssertionError("live client should not be used")),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+    monkeypatch.setattr(cli_main, "market_session_label", lambda: "regular")
+    monkeypatch.setattr(
+        cli_main,
+        "_fetch_aggressive_candidate_market_data",
+        lambda: {
+            "NVDA": {
+                "current_price": "218",
+                "previous_close": "220",
+                "volume_ratio": "2.0",
+                "tradable": True,
+            }
+        },
+    )
+
+
+def test_initialize_tournament_records_bounded_submission_lease():
+    ledger = _current_trial_ledger(_FakePaperClient(), max_submission_market_days=5)
+
+    assert ledger["authorized_market_day_limit"] == 5
+    assert ledger["submitted_market_dates"] == []
+    assert ledger["submission_window_status"] == "open"
+    assert ledger["ledger_type"] == "qualification_paper_trial"
+    assert ledger["submission_lease_evidence"]
+
+
+def test_paper_tournament_init_bounds_submission_window_options(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "init", "--duration-days", "0",
+            "--max-submission-market-days", "32", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert not (tmp_path / LEDGER_FILE).exists()
+
+
+def test_paper_tournament_run_defaults_to_dry_run(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+
+    result = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE, "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["dry_run"] is True
+    assert payload["submitted_count"] == 0
+    assert paper_client.submitted == []
+
+
+def test_paper_tournament_submit_requires_exact_paper_mode_and_endpoint(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    paper_client.settings = SimpleNamespace(paper=False, base_url="https://api.alpaca.markets")
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert paper_client.submitted == []
+    assert "paper" in result.output.lower()
+
+
+def test_paper_tournament_submit_records_current_regular_central_date_and_suppresses_selection(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert updated["submitted_market_dates"] == ["2026-06-02"]
+    assert not (tmp_path / "live-strategy-selection.json").exists()
+
+
+def test_paper_tournament_submit_rejects_reused_or_exhausted_market_day(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client, max_submission_market_days=5)
+    ledger["submitted_market_dates"] = ["2026-06-02"]
+    write_tournament_ledger(ledger, tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+
+    duplicate = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert duplicate.exit_code != 0
+    assert paper_client.submitted == []
+    assert "already" in duplicate.output.lower()
+
+    ledger["submitted_market_dates"] = [
+        "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29", "2026-06-01",
+    ]
+    write_tournament_ledger(ledger, tmp_path)
+    exhausted = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert exhausted.exit_code != 0
+    assert paper_client.submitted == []
+    assert "capacity" in exhausted.output.lower()
+
+
+def test_paper_tournament_submit_rejects_stale_or_future_lease_before_transport(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    _configure_current_submit(monkeypatch, paper_client)
+    ledger = _current_trial_ledger(paper_client)
+    ledger["ends_at"] = "2026-06-02T17:59:59+00:00"
+    write_tournament_ledger(ledger, tmp_path)
+
+    expired = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert expired.exit_code != 0
+    assert paper_client.submitted == []
+
+    ledger = _current_trial_ledger(paper_client)
+    ledger["started_at"] = "2026-06-03T18:00:00+00:00"
+    write_tournament_ledger(ledger, tmp_path)
+    future = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert future.exit_code != 0
+    assert paper_client.submitted == []
+
+
+def test_paper_tournament_finalize_closes_lease_and_rejects_future_submission(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+    submitted = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+    assert submitted.exit_code == 0, submitted.output
+
+    finalized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "finalize", "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert finalized.exit_code == 0, finalized.output
+    assert json.loads(finalized.stdout)["submission_window_status"] == "finalized"
+    assert len(paper_client.submitted) == 1
+
+    rejected = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert rejected.exit_code != 0
+    assert len(paper_client.submitted) == 1
+
+
+def test_paper_tournament_finalize_rejects_open_tournament_orders(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+    submitted = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+    assert submitted.exit_code == 0, submitted.output
+    paper_client.orders[0]["status"] = "new"
+
+    finalized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "finalize", "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert finalized.exit_code != 0
+    assert "open" in finalized.output.lower()
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert updated["submission_window_status"] == "open"
 
 
 def test_paper_tournament_alphainsider_watch_writes_paper_only_packet(monkeypatch, tmp_path):

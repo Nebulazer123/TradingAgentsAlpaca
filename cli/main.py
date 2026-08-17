@@ -9862,6 +9862,13 @@ def alpaca_pullback_support_paper(
 @paper_tournament_app.command("init")
 def alpaca_paper_tournament_init(
     capital_per_strategy: float = typer.Option(10000.0, "--capital-per-strategy"),
+    duration_days: int = typer.Option(31, "--duration-days", min=1, max=31),
+    max_submission_market_days: int = typer.Option(
+        31,
+        "--max-submission-market-days",
+        min=1,
+        max=31,
+    ),
     json_output: bool = typer.Option(False, "--json-output"),
     log_dir: Path = typer.Option(
         Path("results/paper_strategy_tournament"),
@@ -9879,6 +9886,8 @@ def alpaca_paper_tournament_init(
         paper_positions=paper_positions,
         capital_per_strategy=Decimal(str(capital_per_strategy)),
         now=now,
+        duration_days=duration_days,
+        max_submission_market_days=max_submission_market_days,
     )
     market_data = {}
     record_equity_snapshot(ledger, market_data=market_data, now=now)
@@ -9979,7 +9988,7 @@ def alpaca_paper_tournament_alphainsider_watch(
 def alpaca_paper_tournament_run(
     all_strategies: bool = typer.Option(False, "--all", help="Run all tournament strategies."),
     strategy: str | None = typer.Option(None, "--strategy", help="Run one strategy id."),
-    dry_run: bool = typer.Option(False, "--dry-run/--submit-actions"),
+    dry_run: bool = typer.Option(True, "--dry-run/--submit-actions"),
     json_output: bool = typer.Option(False, "--json-output"),
     log_dir: Path = typer.Option(
         Path("results/paper_strategy_tournament"),
@@ -9989,6 +9998,11 @@ def alpaca_paper_tournament_run(
     min_promotion_days: int = typer.Option(5, "--min-promotion-days"),
 ):
     """Run one paper-only tournament tick and optionally submit paper orders."""
+    from tradingagents.brokers.paper_tournament import (
+        record_submitted_market_date,
+        validate_submission_lease,
+    )
+
     if not all_strategies and not strategy:
         raise typer.BadParameter("use --all or --strategy STRATEGY_ID")
     strategy_ids = list(STRATEGY_IDS) if all_strategies else [str(strategy)]
@@ -9999,6 +10013,16 @@ def alpaca_paper_tournament_run(
     paper_client = _alpaca_paper_client()
     ledger = load_tournament_ledger(log_dir)
     now = _alpaca_policy_now()
+    submission_market_date = None
+    if not dry_run:
+        try:
+            submission_market_date = validate_submission_lease(
+                ledger,
+                paper_client=paper_client,
+                now=now,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
     try:
         paper_orders = paper_client.list_orders(status="all")
     except Exception:
@@ -10032,7 +10056,9 @@ def alpaca_paper_tournament_run(
                     **response,
                 }
             )
-        record_submitted_orders(ledger, submitted, now=now)
+        if submitted:
+            record_submitted_orders(ledger, submitted, now=now)
+            record_submitted_market_date(ledger, str(submission_market_date))
     record_equity_snapshot(ledger, market_data=market_data, now=now)
     report = build_tournament_report(
         ledger,
@@ -10041,7 +10067,7 @@ def alpaca_paper_tournament_run(
         min_promotion_days=min_promotion_days,
     )
     selection_path = None
-    if not dry_run:
+    if not dry_run and ledger.get("ledger_type") != "qualification_paper_trial":
         selection = maybe_write_live_strategy_selection(report, log_dir, now=now)
         selection_path = str(selection) if selection else None
         if selection_path:
@@ -10080,6 +10106,50 @@ def alpaca_paper_tournament_run(
     console.print(f"Submitted paper orders: {len(submitted)}")
     if report["rankings"]:
         console.print(f"Leader: {report['rankings'][0]['strategy_id']}")
+
+
+@paper_tournament_app.command("finalize")
+def alpaca_paper_tournament_finalize(
+    json_output: bool = typer.Option(False, "--json-output"),
+    log_dir: Path = typer.Option(
+        Path("results/paper_strategy_tournament"),
+        "--log-dir",
+        help="Directory for paper strategy tournament ledger and packets.",
+    ),
+):
+    """Reconcile tournament paper orders and permanently close its submit lease."""
+    from tradingagents.brokers.paper_tournament import finalize_submission_lease
+
+    paper_client = _alpaca_paper_client()
+    ledger = load_tournament_ledger(log_dir)
+    now = _alpaca_policy_now()
+    try:
+        paper_orders = paper_client.list_orders(status="all")
+    except Exception as exc:
+        raise typer.BadParameter("paper finalization requires complete paper-order reconciliation") from exc
+    try:
+        finalization = finalize_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            paper_orders=paper_orders,
+            now=now,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    ledger_path = write_tournament_ledger(ledger, log_dir)
+    packet = {
+        "kind": "paper_tournament_finalize",
+        "generated_at": now.isoformat(timespec="seconds"),
+        "ledger_path": str(ledger_path),
+        "submission_window_status": ledger.get("submission_window_status"),
+        "finalization": finalization,
+    }
+    packet_path = write_tournament_packet(packet, log_dir, prefix="paper-tournament-finalize")
+    packet["packet_path"] = str(packet_path)
+    if json_output:
+        typer.echo(json.dumps(packet, indent=2))
+        return
+    console.print(f"[green]Paper tournament submission lease finalized at {ledger_path}[/green]")
 
 
 @paper_tournament_app.command("report")

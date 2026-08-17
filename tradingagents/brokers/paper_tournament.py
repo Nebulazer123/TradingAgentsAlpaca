@@ -15,7 +15,9 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
+from tradingagents.brokers.alpaca import PAPER_BASE_URL
 from tradingagents.brokers.alpaca_supervisor import CandidateSignal
 
 UTC = datetime.timezone.utc
@@ -27,6 +29,9 @@ STRATEGY_CURRENT_AGGRESSIVE = "current-aggressive"
 STRATEGY_PULLBACK_SUPPORT = "pullback-support"
 STRATEGY_CATALYST_ROTATION = "catalyst-relative-strength"
 ALPHAINSIDER_PAPER_WATCH_ID = "alphainsider-popular-paper"
+QUALIFICATION_TRIAL_LEDGER_TYPE = "qualification_paper_trial"
+SUBMISSION_WINDOW_OPEN = "open"
+SUBMISSION_WINDOW_FINALIZED = "finalized"
 DEFAULT_TOURNAMENT_RESERVED_BUDGET = Decimal("30000")
 STRATEGY_IDS = (
     STRATEGY_CURRENT_AGGRESSIVE,
@@ -249,6 +254,183 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(tz=UTC)
 
 
+def _submission_lease_evidence(ledger: Mapping) -> str:
+    """Hash the immutable part of the bounded paper-submission lease."""
+
+    evidence = {
+        "ledger_type": ledger.get("ledger_type"),
+        "tournament_id": ledger.get("tournament_id"),
+        "started_at": ledger.get("started_at"),
+        "ends_at": ledger.get("ends_at"),
+        "authorized_market_day_limit": ledger.get("authorized_market_day_limit"),
+    }
+    canonical = json.dumps(evidence, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _central_market_date(now: datetime.datetime) -> str | None:
+    normalized = _normalize_timestamp(now)
+    if normalized is None:
+        return None
+    return normalized.astimezone(ZoneInfo("America/Chicago")).date().isoformat()
+
+
+def _validate_exact_paper_client(paper_client: object) -> None:
+    """Prove that the only possible submission transport is Alpaca paper."""
+
+    assert_expected_mode = getattr(paper_client, "assert_expected_mode", None)
+    if not callable(assert_expected_mode):
+        raise ValueError("paper client does not provide exact mode enforcement")
+    try:
+        assert_expected_mode(paper=True)
+    except Exception as exc:
+        raise ValueError("paper client is not configured for exact paper mode") from exc
+    settings = getattr(paper_client, "settings", None)
+    if (
+        settings is None
+        or getattr(settings, "paper", None) is not True
+        or getattr(settings, "base_url", None) != PAPER_BASE_URL
+    ):
+        raise ValueError("paper client endpoint is not the exact Alpaca paper endpoint")
+
+
+def validate_submission_lease(
+    ledger: Mapping,
+    *,
+    paper_client: object,
+    now: datetime.datetime,
+) -> str:
+    """Validate every condition required before a paper order can be posted."""
+
+    _validate_exact_paper_client(paper_client)
+    now_timestamp = _normalize_timestamp(now)
+    if now_timestamp is None or not isinstance(ledger, Mapping):
+        raise ValueError("paper submission lease is malformed")
+    if ledger.get("ledger_type") != QUALIFICATION_TRIAL_LEDGER_TYPE:
+        raise ValueError("paper submission lease has an unsupported ledger type")
+    if (
+        not isinstance(ledger.get("tournament_id"), str)
+        or not ledger.get("tournament_id")
+        or not isinstance(ledger.get("started_at"), str)
+        or not isinstance(ledger.get("ends_at"), str)
+    ):
+        raise ValueError("paper submission lease is malformed")
+    if ledger.get("submission_window_status") != SUBMISSION_WINDOW_OPEN:
+        raise ValueError("paper submission lease is closed or finalized")
+    if not isinstance(ledger.get("submission_lease_evidence"), str) or (
+        ledger.get("submission_lease_evidence") != _submission_lease_evidence(ledger)
+    ):
+        raise ValueError("paper submission lease evidence does not match ledger")
+    started_at = _parse_timestamp(ledger.get("started_at"))
+    ends_at = _parse_timestamp(ledger.get("ends_at"))
+    if started_at is None or ends_at is None or started_at >= ends_at:
+        raise ValueError("paper submission lease timestamps are malformed")
+    if now_timestamp < started_at:
+        raise ValueError("paper submission lease has not started")
+    if now_timestamp >= ends_at:
+        raise ValueError("paper submission lease has expired")
+    limit = ledger.get("authorized_market_day_limit")
+    submitted_dates = ledger.get("submitted_market_dates")
+    if (
+        type(limit) is not int
+        or not 1 <= limit <= 31
+        or not isinstance(submitted_dates, list)
+        or any(type(value) is not str for value in submitted_dates)
+        or any(_submitted_market_date_is_malformed(value) for value in submitted_dates)
+        or len(set(submitted_dates)) != len(submitted_dates)
+        or len(submitted_dates) > limit
+    ):
+        raise ValueError("paper submission lease market-date ledger is malformed")
+    market_date = _central_market_date(now_timestamp)
+    if market_date is None:
+        raise ValueError("paper submission lease has no Central market date")
+    if now_timestamp.astimezone(ZoneInfo("America/Chicago")).weekday() >= 5:
+        raise ValueError("paper submission lease requires a regular Central market date")
+    list_calendar = getattr(paper_client, "list_calendar", None)
+    if not callable(list_calendar):
+        raise ValueError("paper submission lease cannot verify the broker market calendar")
+    try:
+        calendar = list_calendar(start=market_date, end=market_date)
+    except Exception as exc:
+        raise ValueError("paper submission lease broker calendar check failed") from exc
+    if not isinstance(calendar, Sequence) or not any(
+        isinstance(item, Mapping) and str(item.get("date", "")) == market_date
+        for item in calendar
+    ):
+        raise ValueError("paper submission lease requires a regular Central market date")
+    if market_date in submitted_dates:
+        raise ValueError("paper submission lease already used this Central market date")
+    if len(submitted_dates) >= limit:
+        raise ValueError("paper submission lease market-day capacity is exhausted")
+    return market_date
+
+
+def _submitted_market_date_is_malformed(value: str) -> bool:
+    try:
+        return datetime.date.fromisoformat(value).isoformat() != value
+    except ValueError:
+        return True
+
+
+def record_submitted_market_date(ledger: dict, market_date: str) -> None:
+    """Consume one lease day only after at least one paper order was posted."""
+
+    submitted_dates = ledger.get("submitted_market_dates")
+    if not isinstance(submitted_dates, list) or market_date in submitted_dates:
+        raise ValueError("paper submission lease market-date recording failed")
+    submitted_dates.append(market_date)
+
+
+def finalize_submission_lease(
+    ledger: dict,
+    *,
+    paper_client: object,
+    paper_orders: Iterable[Mapping],
+    now: datetime.datetime,
+) -> dict:
+    """Close a bounded lease after fully reconciling only tournament paper orders."""
+
+    _validate_exact_paper_client(paper_client)
+    if ledger.get("ledger_type") != QUALIFICATION_TRIAL_LEDGER_TYPE:
+        raise ValueError("paper finalization has an unsupported ledger type")
+    if ledger.get("submission_window_status") != SUBMISSION_WINDOW_OPEN:
+        raise ValueError("paper submission lease is already closed or finalized")
+    if ledger.get("submission_lease_evidence") != _submission_lease_evidence(ledger):
+        raise ValueError("paper submission lease evidence does not match ledger")
+    local_orders = {
+        str(order.get("client_order_id")): order
+        for strategy in (ledger.get("strategies") or {}).values()
+        if isinstance(strategy, Mapping)
+        for order in (strategy.get("orders") or [])
+        if isinstance(order, Mapping) and str(order.get("client_order_id", "")).startswith("ta-paperbot-")
+    }
+    remote_orders = [
+        order
+        for order in paper_orders
+        if isinstance(order, Mapping) and str(order.get("client_order_id", "")).startswith("ta-paperbot-")
+    ]
+    remote_by_client_id = {str(order.get("client_order_id")): order for order in remote_orders}
+    if len(remote_by_client_id) != len(remote_orders) or set(local_orders) != set(remote_by_client_id):
+        raise ValueError("paper finalization is incomplete because tournament orders are ambiguous")
+    terminal_statuses = {"filled", "canceled", "expired", "rejected"}
+    unresolved = [
+        client_order_id
+        for client_order_id, order in remote_by_client_id.items()
+        if str(order.get("status", "")).lower() not in terminal_statuses
+    ]
+    if unresolved:
+        raise ValueError("paper finalization is incomplete because tournament orders remain open")
+    reconcile_tournament_orders(ledger, remote_orders, now=now)
+    finalized_at = _iso(now)
+    ledger["submission_window_status"] = SUBMISSION_WINDOW_FINALIZED
+    ledger["submission_finalization"] = {
+        "finalized_at": finalized_at,
+        "reconciled_order_count": len(remote_orders),
+        "status": SUBMISSION_WINDOW_FINALIZED,
+    }
+    return dict(ledger["submission_finalization"])
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
@@ -294,7 +476,12 @@ def initialize_tournament(
     capital_per_strategy: Decimal,
     now: datetime.datetime | None = None,
     duration_days: int = 31,
+    max_submission_market_days: int = 31,
 ) -> dict:
+    if type(duration_days) is not int or not 1 <= duration_days <= 31:
+        raise ValueError("duration_days must be an integer from 1 through 31")
+    if type(max_submission_market_days) is not int or not 1 <= max_submission_market_days <= 31:
+        raise ValueError("max_submission_market_days must be an integer from 1 through 31")
     now = now or _now()
     started_at = _iso(now)
     ends_at = _iso(now + datetime.timedelta(days=duration_days))
@@ -343,11 +530,15 @@ def initialize_tournament(
     current_strategy["baseline_imported_value"] = _money(imported_value)
     current_strategy["cash"] = _money(max(Decimal("0"), capital - imported_value))
 
-    return {
+    ledger = {
         "version": 1,
+        "ledger_type": QUALIFICATION_TRIAL_LEDGER_TYPE,
         "tournament_id": f"paper-tournament-{now.strftime('%Y%m%d-%H%M%S')}",
         "started_at": started_at,
         "ends_at": ends_at,
+        "authorized_market_day_limit": max_submission_market_days,
+        "submitted_market_dates": [],
+        "submission_window_status": SUBMISSION_WINDOW_OPEN,
         "capital_per_strategy": _money(capital),
         "paper_account_baseline": {
             "status": paper_account.get("status"),
@@ -362,6 +553,8 @@ def initialize_tournament(
             "reason": "not enough tournament evidence yet",
         },
     }
+    ledger["submission_lease_evidence"] = _submission_lease_evidence(ledger)
+    return ledger
 
 
 def compact_tournament_ledger_payload(
