@@ -598,8 +598,17 @@ def test_loader_rejects_missing_or_mismatched_selection_source_metadata(tmp_path
     mismatched_selection["source_report"]["candidate_strategy_id"] = STRATEGY_CURRENT_AGGRESSIVE
     mismatched_path.write_text(json.dumps(mismatched_selection), encoding="utf-8")
 
+    top_level_mismatch_dir = tmp_path / "top_level_mismatch"
+    top_level_mismatch_dir.mkdir()
+    _write_bound_active_selection(top_level_mismatch_dir)
+    top_level_mismatch_path = top_level_mismatch_dir / "live-strategy-selection.json"
+    top_level_mismatch_selection = json.loads(top_level_mismatch_path.read_text(encoding="utf-8"))
+    top_level_mismatch_selection["strategy_id"] = STRATEGY_CURRENT_AGGRESSIVE
+    top_level_mismatch_path.write_text(json.dumps(top_level_mismatch_selection), encoding="utf-8")
+
     assert load_live_strategy_selection(missing_dir) is None
     assert load_live_strategy_selection(mismatched_dir) is None
+    assert load_live_strategy_selection(top_level_mismatch_dir) is None
 
 
 def test_tournament_report_includes_popular_strategy_scorecards_with_authority_boundaries():
@@ -652,7 +661,7 @@ def test_tournament_report_includes_popular_strategy_scorecards_with_authority_b
     assert report["popular_strategy_scorecards"] == build_popular_strategy_scorecards(ledger, report=report)
 
 
-def test_supervisor_ignores_stale_preexisting_live_strategy_selection(monkeypatch, tmp_path):
+def test_supervisor_ignores_top_level_mismatched_live_strategy_selection(monkeypatch, tmp_path):
     paper_client = _FakePaperClient()
     live_client = _FakePaperClient()
     live_client.paper = False
@@ -662,7 +671,7 @@ def test_supervisor_ignores_stale_preexisting_live_strategy_selection(monkeypatc
     _write_bound_active_selection(tournament_dir)
     selection_path = tournament_dir / "live-strategy-selection.json"
     selection = json.loads(selection_path.read_text(encoding="utf-8"))
-    selection["selected_at"] = selection["source_report"]["ends_at"]
+    selection["strategy_id"] = STRATEGY_CURRENT_AGGRESSIVE
     selection_path.write_text(json.dumps(selection), encoding="utf-8")
     monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
     monkeypatch.setattr(cli_main, "market_session_label", lambda: "regular")
@@ -704,6 +713,7 @@ def test_supervisor_ignores_stale_preexisting_live_strategy_selection(monkeypatc
     assert payload["actions"][0]["execution_mode"] == "tiny_live"
     assert "controlled dip" in payload["actions"][0]["reason"]
     assert "live_strategy_selection" not in payload["evidence"]
+    assert payload["evidence"]["live_sleeve_resolution"]["signals_adapted"] is False
 
 
 def test_daily_report_includes_paper_tournament_leader(monkeypatch, tmp_path):

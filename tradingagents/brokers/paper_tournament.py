@@ -1311,6 +1311,8 @@ def load_live_strategy_selection(log_dir: str | Path) -> dict | None:
     expected_source = _selection_source_for_report(authoritative_report)
     if expected_source is None or dict(source_report) != expected_source:
         return None
+    if selection["strategy_id"] != source_report.get("candidate_strategy_id"):
+        return None
     selected_at = _parse_timestamp(selection.get("selected_at"))
     report_generated_at = _parse_timestamp(source_report.get("report_generated_at"))
     ends_at = _parse_timestamp(source_report.get("ends_at"))
