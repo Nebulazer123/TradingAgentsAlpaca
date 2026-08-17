@@ -7,6 +7,7 @@ local virtual ledger that attributes orders and performance to each strategy.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import time
@@ -21,6 +22,7 @@ UTC = datetime.timezone.utc
 LEDGER_FILE = "paper-tournament-ledger.json"
 COMPACT_LEDGER_FILE = "paper-tournament-ledger.compact.json"
 LIVE_SELECTION_FILE = "live-strategy-selection.json"
+LIVE_SELECTION_SCHEMA_VERSION = 1
 STRATEGY_CURRENT_AGGRESSIVE = "current-aggressive"
 STRATEGY_PULLBACK_SUPPORT = "pullback-support"
 STRATEGY_CATALYST_ROTATION = "catalyst-relative-strength"
@@ -219,20 +221,28 @@ def _parse_timestamp(value: object) -> datetime.datetime | None:
         return None
     try:
         parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+
+
+def _normalize_timestamp(value: datetime.datetime) -> datetime.datetime | None:
+    try:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
+        return None
 
 
 def _tournament_expired(ends_at: object, *, now: datetime.datetime) -> bool:
     ends_at_timestamp = _parse_timestamp(ends_at)
     if ends_at_timestamp is None:
         return False
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=UTC)
-    return now.astimezone(UTC) >= ends_at_timestamp
+    now_timestamp = _normalize_timestamp(now)
+    return now_timestamp is None or now_timestamp >= ends_at_timestamp
 
 
 def _now() -> datetime.datetime:
@@ -1181,6 +1191,48 @@ def write_tournament_packet(packet: Mapping, output_dir: str | Path, *, prefix: 
     return packet_path
 
 
+def _report_sha256(report: Mapping) -> str | None:
+    try:
+        canonical = json.dumps(
+            report,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _selection_source_for_report(report: Mapping) -> dict | None:
+    candidate = report.get("live_strategy_candidate")
+    tournament_id = report.get("tournament_id")
+    generated_at = _parse_timestamp(report.get("generated_at"))
+    ends_at = _parse_timestamp(report.get("ends_at"))
+    if (
+        not isinstance(candidate, Mapping)
+        or candidate.get("status") != "candidate"
+        or candidate.get("strategy_id") not in STRATEGY_IDS
+        or not isinstance(tournament_id, str)
+        or not tournament_id
+        or generated_at is None
+        or ends_at is None
+        or generated_at >= ends_at
+    ):
+        return None
+    report_sha256 = _report_sha256(report)
+    if report_sha256 is None:
+        return None
+    return {
+        "tournament_id": tournament_id,
+        "report_generated_at": _iso(generated_at),
+        "ends_at": _iso(ends_at),
+        "candidate_status": "candidate",
+        "candidate_strategy_id": candidate["strategy_id"],
+        "report_sha256": report_sha256,
+    }
+
+
 def maybe_write_live_strategy_selection(
     report: Mapping,
     output_dir: str | Path,
@@ -1191,17 +1243,30 @@ def maybe_write_live_strategy_selection(
     if candidate.get("status") != "candidate" or not candidate.get("strategy_id"):
         return None
     now = now or _now()
-    if _tournament_expired(report.get("ends_at"), now=now):
+    now_timestamp = _normalize_timestamp(now)
+    source_report = _selection_source_for_report(report)
+    if (
+        now_timestamp is None
+        or source_report is None
+        or _tournament_expired(report.get("ends_at"), now=now)
+    ):
         return None
-    if _parse_timestamp(report.get("ends_at")) is None:
+    report_generated_at = _parse_timestamp(source_report["report_generated_at"])
+    ends_at = _parse_timestamp(source_report["ends_at"])
+    if (
+        report_generated_at is None
+        or ends_at is None
+        or now_timestamp < report_generated_at
+        or now_timestamp >= ends_at
+    ):
         return None
     selection = {
+        "schema_version": LIVE_SELECTION_SCHEMA_VERSION,
         "status": "active",
         "strategy_id": candidate["strategy_id"],
-        "selected_at": _iso(now),
+        "selected_at": _iso(now_timestamp),
         "reason": candidate.get("reason", ""),
-        "source_tournament_id": report.get("tournament_id"),
-        "source_report_generated_at": report.get("generated_at"),
+        "source_report": source_report,
     }
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
@@ -1212,13 +1277,50 @@ def maybe_write_live_strategy_selection(
 
 def load_live_strategy_selection(log_dir: str | Path) -> dict | None:
     selection_path = Path(log_dir) / LIVE_SELECTION_FILE
+    ledger_path = Path(log_dir) / LEDGER_FILE
     if not selection_path.exists():
         return None
     try:
         selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if selection.get("status") != "active" or selection.get("strategy_id") not in STRATEGY_IDS:
+    if not isinstance(selection, Mapping) or not isinstance(ledger, Mapping):
+        return None
+    if set(selection) != {
+        "schema_version",
+        "status",
+        "strategy_id",
+        "selected_at",
+        "reason",
+        "source_report",
+    }:
+        return None
+    if (
+        selection.get("schema_version") != LIVE_SELECTION_SCHEMA_VERSION
+        or selection.get("status") != "active"
+        or selection.get("strategy_id") not in STRATEGY_IDS
+        or not isinstance(selection.get("reason"), str)
+        or not isinstance(selection.get("source_report"), Mapping)
+    ):
+        return None
+    source_report = selection["source_report"]
+    authoritative_report = ledger.get("latest_report")
+    if not isinstance(authoritative_report, Mapping):
+        return None
+    expected_source = _selection_source_for_report(authoritative_report)
+    if expected_source is None or dict(source_report) != expected_source:
+        return None
+    selected_at = _parse_timestamp(selection.get("selected_at"))
+    report_generated_at = _parse_timestamp(source_report.get("report_generated_at"))
+    ends_at = _parse_timestamp(source_report.get("ends_at"))
+    if (
+        selected_at is None
+        or report_generated_at is None
+        or ends_at is None
+        or report_generated_at > selected_at
+        or selected_at >= ends_at
+    ):
         return None
     return selection
 
