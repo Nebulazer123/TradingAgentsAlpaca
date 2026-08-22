@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
 import inspect
@@ -159,6 +160,54 @@ def _configure_environment(
         "contract": contract,
         "roles": roles,
         "automation_root": automation_root,
+    }
+
+
+def _bound_sentinel_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict, dict]:
+    """Build producer-real sentinel evidence plus its admitted source bindings."""
+
+    from tradingagents.evals.safety_sentinel import build_safety_sentinel_packet
+
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    preopen_path = tmp_path / "preopen.json"
+    _write_json(
+        preopen_path,
+        {
+            "kind": "tradingagents_preopen_validation",
+            "generated_at": "2026-08-21T14:00:00+00:00",
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "overall_status": "pass",
+            "submitted_count": 0,
+            "failed_check_ids": [],
+        },
+    )
+    broker_snapshot = _healthy_broker_snapshot(
+        date="2026-08-21",
+        account_id="live-account",
+    )
+    broker_snapshot["captured_at"] = "2026-08-21T14:00:00+00:00"
+    broker_snapshot["clock"]["timestamp"] = "2026-08-21T14:00:00+00:00"
+    packet = build_safety_sentinel_packet(
+        live_control_path=environment["control"],
+        preopen_validation_path=preopen_path,
+        schedule_contract_path=environment["contract"],
+        automation_root=environment["automation_root"],
+        role_contract_path=environment["roles"],
+        broker_snapshot=broker_snapshot,
+        now=_moment("2026-08-21", 14),
+    )
+    start_payload = _payload(start)
+    return packet, {
+        "live_control": start_payload["live_control"],
+        "schedule_configuration": start_payload["schedule"]["source_manifest"],
+        "schedule_check": start_payload["schedule"]["result"],
+        "preopen_validation": shadow_trial._artifact_binding(preopen_path),
     }
 
 
@@ -406,6 +455,33 @@ def _complete_daily_chain(
             )
         _write_json(path, packet)
         stages[name] = path
+    sentinel = json.loads(stages["safety_sentinel"].read_text(encoding="utf-8"))
+    preopen_binding = shadow_trial._artifact_binding(stages["preopen_validation"])
+
+    def captured_source(binding: dict) -> dict:
+        return {
+            "path": binding["path"],
+            "status": binding["status"],
+            "sha256": binding["sha256"],
+            "size_bytes": binding["size_bytes"],
+            "captured_at": generated_at,
+            "freshness": {
+                "status": "fresh",
+                "rule": "direct_capture_current_audit",
+            },
+        }
+
+    sentinel["schedule_check"] = shadow_trial._plain_json(
+        payload["schedule"]["result"]
+    )
+    sentinel["evidence"] = {
+        "live_control": captured_source(payload["live_control"]),
+        "preopen_validation": captured_source(preopen_binding),
+        "schedule_configuration": shadow_trial._plain_json(
+            payload["schedule"]["source_manifest"]
+        ),
+    }
+    _write_json(stages["safety_sentinel"], sentinel)
     manifest, manifest_path = shadow_trial.create_shadow_day_manifest(
         start_object_id=start.envelope.object_id,
         stages=stages,
@@ -1391,23 +1467,82 @@ def test_hourly_stage_requires_explicit_persisted_dry_run_marker():
     ) == []
 
 
-def test_safety_sentinel_rejects_extra_reason_or_missing_observer_proof(tmp_path):
-    artifacts = _artifacts(
-        tmp_path,
-        run_id="run-2026-08-21",
-        date="2026-08-21",
-    )
-    sentinel = json.loads(artifacts["safety_sentinel"].read_text(encoding="utf-8"))
+def test_safety_sentinel_rejects_extra_reason_or_missing_observer_proof(
+    tmp_path,
+    monkeypatch,
+):
+    sentinel, source_bindings = _bound_sentinel_shape(tmp_path, monkeypatch)
 
-    assert shadow_trial._stage_semantic_reasons("safety_sentinel", sentinel) == []
+    assert shadow_trial._stage_semantic_reasons(
+        "safety_sentinel",
+        sentinel,
+        sentinel_source_bindings=source_bindings,
+    ) == []
     assert "safety_sentinel_stage_failure_reason_present" in shadow_trial._stage_semantic_reasons(
         "safety_sentinel",
         {**sentinel, "reasons": ["frozen_control", "preopen_validation_stale"]},
+        sentinel_source_bindings=source_bindings,
     )
     missing_broker = dict(sentinel)
     missing_broker.pop("broker_snapshot")
     assert "safety_sentinel_stage_broker_proof_invalid" in shadow_trial._stage_semantic_reasons(
-        "safety_sentinel", missing_broker
+        "safety_sentinel",
+        missing_broker,
+        sentinel_source_bindings=source_bindings,
+    )
+
+
+def test_safety_sentinel_accepts_only_real_shape_bound_to_admitted_sources(
+    tmp_path,
+    monkeypatch,
+):
+    sentinel, source_bindings = _bound_sentinel_shape(tmp_path, monkeypatch)
+
+    assert shadow_trial._stage_semantic_reasons(
+        "safety_sentinel",
+        sentinel,
+        sentinel_source_bindings=source_bindings,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "mutation,expected_reason",
+    [
+        ("wrong_automation_id", "safety_sentinel_stage_schedule_proof_invalid"),
+        ("active_automation", "safety_sentinel_stage_schedule_proof_invalid"),
+        ("wrong_exact_counts", "safety_sentinel_stage_schedule_proof_invalid"),
+        ("alternate_live_control", "safety_sentinel_stage_source_proof_invalid"),
+        ("alternate_preopen", "safety_sentinel_stage_source_proof_invalid"),
+        ("alternate_schedule_contract", "safety_sentinel_stage_source_proof_invalid"),
+    ],
+)
+def test_safety_sentinel_false_clean_roster_and_source_identities_fail_closed(
+    tmp_path,
+    monkeypatch,
+    mutation,
+    expected_reason,
+):
+    sentinel, source_bindings = _bound_sentinel_shape(tmp_path, monkeypatch)
+    forged = copy.deepcopy(sentinel)
+    if mutation == "wrong_automation_id":
+        forged["schedule_check"]["automations"][0]["automation_id"] = "wrong-id"
+    elif mutation == "active_automation":
+        forged["schedule_check"]["automations"][0]["config_status"] = "ACTIVE"
+    elif mutation == "wrong_exact_counts":
+        forged["schedule_check"]["paused_count"] = 9
+    elif mutation == "alternate_live_control":
+        forged["evidence"]["live_control"]["path"] = "/tmp/alternate-live-control.json"
+    elif mutation == "alternate_preopen":
+        forged["evidence"]["preopen_validation"]["path"] = "/tmp/alternate-preopen.json"
+    else:
+        forged["evidence"]["schedule_configuration"]["contract"]["path"] = (
+            "/tmp/alternate-schedule-contract.json"
+        )
+
+    assert expected_reason in shadow_trial._stage_semantic_reasons(
+        "safety_sentinel",
+        forged,
+        sentinel_source_bindings=source_bindings,
     )
 
 

@@ -31,9 +31,13 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from tradingagents.evals.automation_health_audit import (
+    FROZEN_OBSERVER_ACTIVE_AUTOMATION_IDS,
+    FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS,
     PREDEPLOYMENT_PAUSED_PHASE,
+    capture_schedule_contract_snapshot,
     default_automation_root,
     evaluate_schedule_contract,
+    schedule_contract_snapshot_manifest,
 )
 from tradingagents.evals.safety_sentinel import broker_snapshot_shape_reasons
 from tradingagents.strategy._immutable_evidence_store import (
@@ -139,14 +143,150 @@ def _captured_source_is_valid(value: object) -> bool:
     return (
         isinstance(value, Mapping)
         and value.get("status") == "captured"
-        and isinstance(value.get("sha256"), str)
-        and len(value["sha256"]) == 64
+        and isinstance(value.get("path"), str)
+        and bool(value["path"])
+        and Path(value["path"]).is_absolute()
+        and _is_sha256(value.get("sha256"))
         and type(value.get("size_bytes")) is int
         and value["size_bytes"] > 0
     )
 
 
-def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[str]:
+def _captured_source_matches(value: object, expected: object) -> bool:
+    return (
+        _captured_source_is_valid(value)
+        and isinstance(value, Mapping)
+        and isinstance(expected, Mapping)
+        and value.get("path") == expected.get("path")
+        and value.get("sha256") == expected.get("sha256")
+        and value.get("size_bytes") == expected.get("size_bytes")
+    )
+
+
+_SCHEDULE_TOML_IDENTITY_KEYS = (
+    "automation_id",
+    "automation_root",
+    "relative_path",
+    "path",
+    "status",
+    "sha256",
+    "size_bytes",
+    "descriptor_relative",
+    "file_kind",
+    "symlink",
+    "root_identity",
+    "file_identity",
+)
+
+
+def _schedule_configuration_identity(value: object) -> dict[str, object] | None:
+    """Project stable source identities from one trusted schedule capture manifest."""
+
+    value = _plain_json(value)
+    if (
+        not isinstance(value, Mapping)
+        or value.get("provenance") != "direct_current_configuration_capture"
+        or value.get("capture_issues") not in ([], ())
+        or _parse_timestamp(value.get("captured_at")) is None
+    ):
+        return None
+    freshness = value.get("freshness")
+    if not isinstance(freshness, Mapping) or (
+        freshness.get("status") != "not_applicable"
+        or freshness.get("rule") != "static_configuration_captured_this_audit"
+    ):
+        return None
+    contract = value.get("contract")
+    role_contract = value.get("role_contract")
+    rows = value.get("automation_tomls")
+    if (
+        not _captured_source_is_valid(contract)
+        or not _captured_source_is_valid(role_contract)
+        or not isinstance(rows, list)
+        or len(rows) != len(EXPECTED_AUTOMATION_IDS)
+    ):
+        return None
+    row_ids = [row.get("automation_id") for row in rows if isinstance(row, Mapping)]
+    if (
+        len(row_ids) != len(rows)
+        or len(set(row_ids)) != len(rows)
+        or set(row_ids) != EXPECTED_AUTOMATION_IDS
+    ):
+        return None
+    projected_rows: list[dict[str, object]] = []
+    for row in rows:
+        if (
+            not _captured_source_is_valid(row)
+            or row.get("relative_path") != f"{row.get('automation_id')}/automation.toml"
+            or row.get("descriptor_relative") is not True
+            or row.get("file_kind") != "regular"
+            or row.get("symlink") is not False
+            or not isinstance(row.get("root_identity"), Mapping)
+            or not isinstance(row.get("file_identity"), Mapping)
+        ):
+            return None
+        projected_rows.append(
+            {key: _plain_json(row.get(key)) for key in _SCHEDULE_TOML_IDENTITY_KEYS}
+        )
+    source_paths = [
+        contract.get("path"),
+        role_contract.get("path"),
+        *(row.get("path") for row in rows),
+    ]
+    if len(source_paths) != len(set(source_paths)):
+        return None
+    return {
+        "contract": {
+            key: contract.get(key)
+            for key in ("path", "status", "sha256", "size_bytes")
+        },
+        "role_contract": {
+            key: role_contract.get(key)
+            for key in ("path", "status", "sha256", "size_bytes")
+        },
+        "automation_tomls": sorted(
+            projected_rows,
+            key=lambda row: str(row["automation_id"]),
+        ),
+    }
+
+
+def _sentinel_sources_match(
+    evidence: object,
+    schedule_check: object,
+    bindings: object,
+) -> bool:
+    if not isinstance(evidence, Mapping) or not isinstance(bindings, Mapping):
+        return False
+    expected_schedule = bindings.get("schedule_check")
+    observed_configuration = _schedule_configuration_identity(
+        evidence.get("schedule_configuration")
+    )
+    expected_configuration = _schedule_configuration_identity(
+        bindings.get("schedule_configuration")
+    )
+    return (
+        _captured_source_matches(
+            evidence.get("live_control"),
+            bindings.get("live_control"),
+        )
+        and _captured_source_matches(
+            evidence.get("preopen_validation"),
+            bindings.get("preopen_validation"),
+        )
+        and observed_configuration is not None
+        and observed_configuration == expected_configuration
+        and isinstance(expected_schedule, Mapping)
+        and _plain_json(schedule_check) == _plain_json(expected_schedule)
+    )
+
+
+def _stage_semantic_reasons(
+    stage: str,
+    payload: Mapping[str, object],
+    *,
+    sentinel_source_bindings: Mapping[str, object] | None = None,
+) -> list[str]:
     """Validate real producer shapes without pretending they share one schema.
 
     The daily observer chain deliberately binds persisted output from several
@@ -284,23 +424,49 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
         if sentinel_reasons != ["frozen_control"]:
             reasons.append("safety_sentinel_stage_failure_reason_present")
         schedule_check = payload.get("schedule_check")
-        if not isinstance(schedule_check, Mapping) or (
-            schedule_check.get("deployment_phase") != PREDEPLOYMENT_PAUSED_PHASE
+        schedule_rows = (
+            schedule_check.get("automations")
+            if isinstance(schedule_check, Mapping)
+            else None
+        )
+        schedule_ids = (
+            [row.get("automation_id") for row in schedule_rows if isinstance(row, Mapping)]
+            if isinstance(schedule_rows, list)
+            else []
+        )
+        if (
+            not isinstance(schedule_check, Mapping)
+            or schedule_check.get("deployment_phase") != PREDEPLOYMENT_PAUSED_PHASE
             or schedule_check.get("contract_status") != "pass"
             or schedule_check.get("safe_predeployment") is not True
+            or schedule_check.get("deployment_proven") is not False
             or schedule_check.get("issues") not in ([], ())
-            or not isinstance(schedule_check.get("automations"), list)
-            or len(schedule_check["automations"]) != 10
+            or type(schedule_check.get("automation_count")) is not int
+            or schedule_check["automation_count"] != len(EXPECTED_AUTOMATION_IDS)
+            or type(schedule_check.get("configured_count")) is not int
+            or schedule_check["configured_count"] != len(EXPECTED_AUTOMATION_IDS)
+            or type(schedule_check.get("paused_count")) is not int
+            or schedule_check["paused_count"] != len(EXPECTED_AUTOMATION_IDS)
+            or not isinstance(schedule_rows, list)
+            or len(schedule_rows) != len(EXPECTED_AUTOMATION_IDS)
+            or len(schedule_ids) != len(schedule_rows)
+            or len(set(schedule_ids)) != len(schedule_rows)
+            or set(schedule_ids) != EXPECTED_AUTOMATION_IDS
             or any(
-                not isinstance(row, Mapping) or row.get("status") != "match"
-                for row in schedule_check["automations"]
+                not isinstance(row, Mapping)
+                or row.get("status") != "match"
+                or row.get("config_status") != "PAUSED"
+                or row.get("mismatches") not in ([], ())
+                for row in schedule_rows
             )
         ):
             reasons.append("safety_sentinel_stage_schedule_proof_invalid")
         evidence = payload.get("evidence")
-        if not isinstance(evidence, Mapping) or not _captured_source_is_valid(
-            evidence.get("live_control")
-        ) or not _captured_source_is_valid(evidence.get("preopen_validation")):
+        if not _sentinel_sources_match(
+            evidence,
+            schedule_check,
+            sentinel_source_bindings,
+        ):
             reasons.append("safety_sentinel_stage_source_proof_invalid")
         if payload.get("actions_taken") not in ([], ()) or not _broker_observer_snapshot_is_valid(
             payload.get("broker_snapshot")
@@ -381,18 +547,8 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
             reasons.append("paper_tournament_stage_submissions_invalid")
     return reasons
 EXPECTED_AUTOMATION_IDS = frozenset(
-    {
-        "tradingagents-automation-sleep-controller",
-        "tradingagents-automation-wake-controller",
-        "tradingagents-autonomous-execution-board",
-        "tradingagents-autonomous-safety-sentinel",
-        "tradingagents-autonomous-self-healer",
-        "tradingagents-daily-report",
-        "tradingagents-market-supervisor",
-        "tradingagents-overnight-research",
-        "tradingagents-paper-tournament",
-        "tradingagents-preopen-validation",
-    }
+    FROZEN_OBSERVER_ACTIVE_AUTOMATION_IDS
+    | FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS
 )
 _START_FIELDS = frozenset(
     {
@@ -456,6 +612,7 @@ _SCHEDULE_FIELDS = frozenset(
         "automation_root",
         "role_contract_path",
         "result",
+        "source_manifest",
         "canonical_sha256",
     }
 )
@@ -1464,24 +1621,37 @@ def _valid_control_binding(value: object, *, now: dt.datetime) -> bool:
     )
 
 
-def _schedule_binding() -> tuple[dict[str, object], bool]:
+def _schedule_binding(
+    *,
+    captured_at: dt.datetime | None = None,
+) -> tuple[dict[str, object], bool]:
     contract = _absolute(_canonical_schedule_contract_path())
     roles = _absolute(_canonical_role_contract_path())
     automations = _absolute(_canonical_automation_root())
     try:
-        result = evaluate_schedule_contract(
+        snapshot = capture_schedule_contract_snapshot(
             contract_path=contract,
             automation_root=automations,
             role_contract_path=roles,
-            deployment_phase=PREDEPLOYMENT_PAUSED_PHASE,
+            captured_at=captured_at,
         )
+        result = dict(
+            evaluate_schedule_contract(
+                deployment_phase=PREDEPLOYMENT_PAUSED_PHASE,
+                captured_snapshot=snapshot,
+            )
+        )
+        result["deployment_phase"] = PREDEPLOYMENT_PAUSED_PHASE
+        source_manifest = schedule_contract_snapshot_manifest(snapshot)
     except Exception as exc:  # noqa: BLE001 - source-read failure is an unsafe schedule proof.
         result = {"error": f"schedule evaluator failed: {type(exc).__name__}"}
+        source_manifest = schedule_contract_snapshot_manifest(None)
     binding: dict[str, object] = {
         "contract_path": str(contract),
         "automation_root": str(automations),
         "role_contract_path": str(roles),
         "result": dict(result) if isinstance(result, Mapping) else {"error": "invalid evaluator result"},
+        "source_manifest": source_manifest,
         "canonical_sha256": canonical_json_sha256(result),
     }
     return binding, _valid_schedule_binding(binding)
@@ -1497,8 +1667,32 @@ def _valid_schedule_binding(value: object) -> bool:
         or binding["role_contract_path"] != str(_absolute(_canonical_role_contract_path()))
         or binding["automation_root"] != str(_absolute(_canonical_automation_root()))
         or not isinstance(binding["result"], Mapping)
+        or _schedule_configuration_identity(binding["source_manifest"]) is None
         or not _is_sha256(binding["canonical_sha256"])
         or binding["canonical_sha256"] != canonical_json_sha256(binding["result"])
+    ):
+        return False
+    source_identity = _schedule_configuration_identity(binding["source_manifest"])
+    if source_identity is None:
+        return False
+    automation_root = str(_absolute(_canonical_automation_root()))
+    source_rows = source_identity["automation_tomls"]
+    if (
+        not isinstance(source_rows, list)
+        or source_identity["contract"].get("path") != binding["contract_path"]
+        or source_identity["role_contract"].get("path") != binding["role_contract_path"]
+        or any(
+            row.get("automation_root") != automation_root
+            or row.get("path")
+            != str(
+                _absolute(
+                    Path(automation_root)
+                    / str(row.get("automation_id"))
+                    / "automation.toml"
+                )
+            )
+            for row in source_rows
+        )
     ):
         return False
     result = _plain_json(binding["result"])
@@ -1509,15 +1703,19 @@ def _valid_schedule_binding(value: object) -> bool:
         return False
     row_ids = [row.get("automation_id") for row in rows if isinstance(row, Mapping)]
     return (
-        result.get("contract_status") == "pass"
+        result.get("deployment_phase") == PREDEPLOYMENT_PAUSED_PHASE
+        and result.get("contract_status") == "pass"
         and result.get("safe_predeployment") is True
         and result.get("deployment_proven") is False
-        and result.get("automation_count") == 10
-        and result.get("configured_count") == 10
-        and result.get("paused_count") == 10
+        and type(result.get("automation_count")) is int
+        and result["automation_count"] == len(EXPECTED_AUTOMATION_IDS)
+        and type(result.get("configured_count")) is int
+        and result["configured_count"] == len(EXPECTED_AUTOMATION_IDS)
+        and type(result.get("paused_count")) is int
+        and result["paused_count"] == len(EXPECTED_AUTOMATION_IDS)
         and result.get("issues") == []
-        and len(rows) == 10
-        and len(row_ids) == 10
+        and len(rows) == len(EXPECTED_AUTOMATION_IDS)
+        and len(row_ids) == len(EXPECTED_AUTOMATION_IDS)
         and set(row_ids) == EXPECTED_AUTOMATION_IDS
         and len(set(row_ids)) == 10
         and all(
@@ -1691,7 +1889,7 @@ def create_shadow_day_manifest(
         raise ValueError("daily-chain stages must use distinct artifact paths")
     bindings = {name: _artifact_binding(stages[name]) for name in DAILY_CHAIN_STAGES}
     control, _ = _control_binding(now)
-    schedule, _ = _schedule_binding()
+    schedule, _ = _schedule_binding(captured_at=now)
     paper_payload = bindings["paper_tournament"].get("payload")
     reconciliation_payload = bindings["broker_reconciliation"].get("payload")
     if not isinstance(paper_payload, Mapping):
@@ -1760,11 +1958,30 @@ def _manifest_reasons(
     schedule = manifest["schedule"]
     if not _valid_control_binding(control, now=now) or not isinstance(control, Mapping) or control.get("sha256") != start_payload["live_control"].get("sha256"):
         failed.append("daily_chain_manifest_live_control_invalid")
-    if not _valid_schedule_binding(schedule) or not isinstance(schedule, Mapping) or schedule.get("canonical_sha256") != start_payload["schedule"].get("canonical_sha256"):
+    if (
+        not _valid_schedule_binding(schedule)
+        or not isinstance(schedule, Mapping)
+        or schedule.get("canonical_sha256")
+        != start_payload["schedule"].get("canonical_sha256")
+        or _schedule_configuration_identity(schedule.get("source_manifest"))
+        != _schedule_configuration_identity(
+            start_payload["schedule"].get("source_manifest")
+        )
+    ):
         failed.append("daily_chain_manifest_schedule_invalid")
     stages = manifest["stages"]
     if not isinstance(stages, Mapping) or set(stages) != set(DAILY_CHAIN_STAGES):
         return [*failed, "daily_chain_manifest_stage_roster_invalid"], incomplete
+    sentinel_source_bindings: dict[str, object] = {
+        "live_control": control,
+        "schedule_configuration": (
+            schedule.get("source_manifest") if isinstance(schedule, Mapping) else None
+        ),
+        "schedule_check": (
+            schedule.get("result") if isinstance(schedule, Mapping) else None
+        ),
+        "preopen_validation": stages["preopen_validation"],
+    }
     for stage in DAILY_CHAIN_STAGES:
         value = stages[stage]
         try:
@@ -1792,7 +2009,15 @@ def _manifest_reasons(
         # Existing persisted producers are intentionally not force-shaped into
         # a synthetic common packet.  Require the native safe semantics for
         # each role, including explicit dry-run evidence for hourly work.
-        failed.extend(_stage_semantic_reasons(stage, stage_payload))
+        failed.extend(
+            _stage_semantic_reasons(
+                stage,
+                stage_payload,
+                sentinel_source_bindings=(
+                    sentinel_source_bindings if stage == "safety_sentinel" else None
+                ),
+            )
+        )
         stage_status = stage_payload.get("status")
         if stage_status is not None and (type(stage_status) is not str or not stage_status.strip()):
             failed.append(f"{stage}_stage_status_invalid")
@@ -1982,7 +2207,15 @@ def _evaluate_day_payload(
     schedule = payload["schedule"]
     if not _valid_schedule_binding(schedule):
         failed.append("schedule_contract_not_exact_ten_paused")
-    elif not isinstance(schedule, Mapping) or schedule.get("canonical_sha256") != start_payload["schedule"].get("canonical_sha256"):
+    elif (
+        not isinstance(schedule, Mapping)
+        or schedule.get("canonical_sha256")
+        != start_payload["schedule"].get("canonical_sha256")
+        or _schedule_configuration_identity(schedule.get("source_manifest"))
+        != _schedule_configuration_identity(
+            start_payload["schedule"].get("source_manifest")
+        )
+    ):
         failed.append("schedule_evaluation_hash_changed")
     if not _valid_calendar_binding(payload["calendar"], market_date=market_date, now=now):
         incomplete.append("calendar_evidence_unavailable_or_invalid")
@@ -2247,7 +2480,7 @@ def create_shadow_day_start_manifest(
     control, control_valid = _control_binding(now)
     if not control_valid:
         raise ValueError("live control gate failed")
-    schedule, schedule_valid = _schedule_binding()
+    schedule, schedule_valid = _schedule_binding(captured_at=now)
     if not schedule_valid:
         raise ValueError("schedule gate failed")
     calendar = _calendar_binding(
@@ -2461,7 +2694,7 @@ def adjudicate_shadow_day(
     if _current_central_date(now) != market_date:
         raise ValueError("shadow day must be adjudicated on its current Central date")
     control, _ = _control_binding(now)
-    schedule, _ = _schedule_binding()
+    schedule, _ = _schedule_binding(captured_at=now)
     calendar = _calendar_binding(
         _capture_calendar_evidence(market_date),
         market_date=market_date,

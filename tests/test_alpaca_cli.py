@@ -1,6 +1,8 @@
 import datetime
 import inspect
 import json
+import re
+import shlex
 import sys
 import threading
 from decimal import Decimal
@@ -1632,71 +1634,82 @@ def test_alpaca_supervise_hourly_material_dry_run_never_writes_outbox(monkeypatc
     assert "outbox_path" not in raw_payload
 
 
-def test_clean_day_runbook_cli_options_exist_without_executing_runtime():
-    expected_options = {
-        ("research", "shadow-day-start"): {
-            "--run-id", "--market-date", "--json-output",
-        },
-        ("research", "safety-sentinel-audit"): {
-            "--shadow-start-object-id", "--require-paused", "--preopen-validation-path",
-            "--output-dir", "--json-output",
-        },
-        ("alpaca", "plan-overnight"): {
-            "--full-graph-tickers", "--per-ticker-timeout-minutes", "--time-budget-minutes",
-            "--overnight-graph-profile", "--overnight-max-completion-tokens",
-            "--overnight-llm-timeout-seconds", "--overnight-llm-max-retries",
-            "--no-research-context", "--no-agent-intelligence", "--top-provider-bundle-count",
-            "--no-agent-ledger", "--no-write-latest", "--log-dir", "--json-output",
-        },
-        ("alpaca", "premarket-brief"): {
-            "--overnight-log-dir", "--log-dir", "--no-write-latest", "--json-output",
-        },
-        ("alpaca", "preopen-validation"): {
-            "--overnight-log-dir", "--premarket-brief-log-dir", "--log-dir",
-            "--no-write-latest", "--json-output",
-        },
-        ("alpaca", "supervise-hourly"): {
-            "--dry-run", "--no-write-outbox", "--notification-policy", "--overnight-log-dir",
-            "--premarket-brief-log-dir", "--preopen-validation-dir", "--log-dir", "--json-output",
-        },
-        ("alpaca", "reconcile-observer"): {
-            "--shadow-start-object-id", "--output-dir", "--json-output",
-        },
-        ("research", "loss-review-evidence"): {
-            "--hourly-dir", "--output-dir", "--json-output",
-        },
-        ("research", "execution-board-review"): {
-            "--hourly-dir", "--output-dir", "--json-output",
-        },
-        ("research", "self-heal-handoff"): {"--output-dir", "--json-output"},
-        ("research", "self-heal-plan"): {
-            "--no-execute-safe", "--output-dir", "--json-output",
-        },
-        ("alpaca", "supervisor-daily-report"): {
-            "--no-write-outbox", "--log-dir", "--daily-report-log-dir",
-            "--compact-json-output", "--json-output",
-        },
-        ("alpaca", "paper-tournament", "init"): {
-            "--duration-days", "--max-submission-market-days", "--log-dir", "--json-output",
-        },
-        ("alpaca", "paper-tournament", "run"): {
-            "--all", "--dry-run", "--submit-actions", "--shadow-start-object-id",
-            "--log-dir", "--json-output",
-        },
-        ("research", "shadow-day-manifest"): {
-            "--start-object-id", "--stage", "--json-output",
-        },
-        ("research", "shadow-day-adjudicate"): {
-            "--start-object-id", "--safety-sentinel", "--paper-tournament",
-            "--daily-chain-manifest", "--json-output",
-        },
-        ("alpaca", "paper-tournament", "finalize"): {"--log-dir", "--json-output"},
-    }
+def test_clean_day_runbook_exact_commands_exist_without_executing_runtime():
+    report_path = (
+        Path(__file__).resolve().parents[1]
+        / ".superpowers"
+        / "sdd"
+        / "2026-08-17-clean-day-qualification-and-five-day-paper-trial"
+        / "task-4-report.md"
+    )
+    logical_lines = re.sub(
+        r"\\\s*\n\s*",
+        " ",
+        report_path.read_text(encoding="utf-8"),
+    ).splitlines()
+    documented_commands = [
+        shlex.split(line.strip())
+        for line in logical_lines
+        if line.strip().startswith("TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main ")
+    ]
+    prefix = ["TA_LIVE_SUBMIT=0", ".venv/bin/python", "-m", "cli.main"]
+    expected_handoff = [
+        *prefix,
+        "research",
+        "self-heal-handoff",
+        "--no-refresh-context",
+        "--output-dir",
+        "results/self_heal/observer-<run-id>",
+        "--json-output",
+    ]
+    expected_plan = [
+        *prefix,
+        "research",
+        "self-heal-plan",
+        "--no-execute-safe",
+        "--no-refresh-context",
+        "--output-dir",
+        "results/self_heal/plans/observer-<run-id>",
+        "--json-output",
+    ]
+    expected_streak = [
+        *prefix,
+        "research",
+        "shadow-streak-report",
+        "--json-output",
+    ]
+    assert expected_handoff in documented_commands
+    assert expected_plan in documented_commands
+    assert expected_streak in documented_commands
+
+    def command_index(command_path: tuple[str, ...]) -> int:
+        return next(
+            index
+            for index, command in enumerate(documented_commands)
+            if tuple(command[4 : 4 + len(command_path)]) == command_path
+        )
+
+    assert command_index(("research", "shadow-day-adjudicate")) < command_index(
+        ("alpaca", "paper-tournament", "finalize")
+    ) < command_index(("research", "shadow-streak-report"))
+
+    # Derive the option gate from every exact documented argv instead of a
+    # hand-maintained subset that can silently omit a required negative flag.
     root_command = typer.main.get_command(app)
-    for path, expected in expected_options.items():
+    for argv in documented_commands:
+        assert argv[:4] == prefix
         command = root_command
-        for component in path:
+        remaining = argv[4:]
+        command_depth = 0
+        while (
+            command_depth < len(remaining)
+            and hasattr(command, "commands")
+            and remaining[command_depth] in command.commands
+        ):
+            component = remaining[command_depth]
             command = command.commands[component]
+            command_depth += 1
+        assert command_depth > 0
         actual = {
             option
             for parameter in command.params
@@ -1705,7 +1718,15 @@ def test_clean_day_runbook_cli_options_exist_without_executing_runtime():
                 *getattr(parameter, "secondary_opts", ()),
             )
         }
-        assert expected <= actual, f"{' '.join(path)} missing {sorted(expected - actual)}"
+        documented_options = {
+            token.split("=", 1)[0]
+            for token in remaining[command_depth:]
+            if token.startswith("--")
+        }
+        assert documented_options <= actual, (
+            f"{' '.join(remaining[:command_depth])} missing "
+            f"{sorted(documented_options - actual)}"
+        )
 
 
 def test_alpaca_supervise_hourly_compact_json_output_points_to_raw_packet(monkeypatch, tmp_path):
