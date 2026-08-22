@@ -150,7 +150,7 @@ def _stored_utc_or_none(value: str | datetime.datetime | None) -> datetime.datet
         return None
     try:
         return _as_utc(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
