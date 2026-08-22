@@ -614,7 +614,7 @@ def _capture_descriptor_relative_toml(
 
 
 def _discover_descriptor_relative_automation_ids(root_descriptor: int | None) -> set[str]:
-    """Find direct TradingAgents TOMLs without following directory or file symlinks."""
+    """Find direct TradingAgents namespace entries from the opened root descriptor."""
 
     if root_descriptor is None:
         return set()
@@ -626,29 +626,7 @@ def _discover_descriptor_relative_automation_ids(root_descriptor: int | None) ->
     for name in names:
         if not _valid_automation_id(name) or not name.startswith("tradingagents-"):
             continue
-        try:
-            entry = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
-        except OSError:
-            discovered.add(name)
-            continue
-        if stat.S_ISLNK(entry.st_mode):
-            discovered.add(name)
-            continue
-        if not stat.S_ISDIR(entry.st_mode):
-            continue
-        try:
-            candidate = os.stat(
-                f"{name}/automation.toml",
-                dir_fd=root_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            continue
-        except OSError:
-            discovered.add(name)
-            continue
-        if stat.S_ISREG(candidate.st_mode) or stat.S_ISLNK(candidate.st_mode):
-            discovered.add(name)
+        discovered.add(name)
     return discovered
 
 

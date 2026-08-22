@@ -551,6 +551,39 @@ def test_captured_schedule_snapshot_rejects_hidden_unexpected_automation(tmp_pat
     assert result["issues"] == ["captured_snapshot_invalid"]
 
 
+def test_captured_schedule_snapshot_rejects_unexpected_regular_file_automation_entry(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    unexpected_entry = automation_root / "tradingagents-unexpected-file"
+    unexpected_entry.write_text("not an automation directory\n", encoding="utf-8")
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    result = evaluate_schedule_contract(captured_snapshot=snapshot)
+
+    assert result["issues"] == ["captured_snapshot_invalid"]
+
+
+def test_captured_schedule_snapshot_rejects_unexpected_automation_directory_without_toml(
+    tmp_path,
+):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    (automation_root / "tradingagents-unexpected-directory").mkdir()
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    result = evaluate_schedule_contract(captured_snapshot=snapshot)
+
+    assert result["issues"] == ["captured_snapshot_invalid"]
+
+
 def test_captured_schedule_snapshot_rejects_extra_and_symlinked_automation_tomls(tmp_path):
     contract, roles, automation_root = _write_schedule_fixture(tmp_path / "extra")
     unexpected_id = "tradingagents-unexpected-observer"
