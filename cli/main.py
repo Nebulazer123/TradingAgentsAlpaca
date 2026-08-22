@@ -9447,42 +9447,40 @@ def _shadow_calendar_evidence(market_date: str) -> dict[str, Any]:
 @research_app.command("shadow-day-start")
 def research_shadow_day_start(
     run_id: str = typer.Option(..., "--run-id", help="Opaque manual observer run identifier."),
-    ledger_id: str = typer.Option(..., "--ledger-id", help="Opaque immutable manual-trial ledger identifier."),
     market_date: str = typer.Option(..., "--market-date", help="Current Central regular-market date."),
-    live_control_path: Path = typer.Option(
-        Path("results/policy/live_control.json"),
-        "--live-control-path",
-        help="Existing live-control evidence to read without changing it.",
+    predecessor_object_id: str | None = typer.Option(
+        None,
+        "--predecessor-object-id",
+        help="Authenticated prior shadow day object identity, when the ledger requires one.",
     ),
-    phase: str = typer.Option("qualification_pending", "--phase"),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Capture start-state evidence only; this command has no authority effects."""
 
-    from tradingagents.evals.shadow_trial import create_shadow_day_start_manifest, write_shadow_trial_packet
+    from tradingagents.evals.shadow_trial import (
+        admitted_shadow_record_view,
+        create_shadow_day_start_manifest,
+    )
 
     try:
-        manifest = create_shadow_day_start_manifest(
+        admission = create_shadow_day_start_manifest(
             run_id=run_id,
-            ledger_id=ledger_id,
             market_date=market_date,
-            live_control_path=live_control_path,
             calendar_evidence=_shadow_calendar_evidence(market_date),
-            phase=phase,
+            predecessor_object_id=predecessor_object_id,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    manifest_path = write_shadow_trial_packet(manifest)
-    payload = {**manifest, "manifest_path": str(manifest_path)}
+    payload = admitted_shadow_record_view(admission)
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
-    console.print(f"Shadow-day start manifest: {manifest_path}")
+    console.print(f"Shadow-day start record: {admission.path}")
 
 
 @research_app.command("shadow-day-adjudicate")
 def research_shadow_day_adjudicate(
-    start_manifest: Path = typer.Option(..., "--start-manifest", help="Prior immutable start manifest."),
+    start_object_id: str = typer.Option(..., "--start-object-id", help="Authenticated pending shadow start object identity."),
     safety_sentinel: Path = typer.Option(..., "--safety-sentinel", help="Same-run sentinel artifact."),
     paper_tournament: Path = typer.Option(..., "--paper-tournament", help="Same-run paper artifact."),
     json_output: bool = typer.Option(False, "--json-output"),
@@ -9491,53 +9489,44 @@ def research_shadow_day_adjudicate(
 
     from tradingagents.evals.shadow_trial import (
         adjudicate_shadow_day,
+        admitted_shadow_record_view,
         load_shadow_record,
-        write_shadow_trial_packet,
     )
 
     try:
-        start = load_shadow_record(start_manifest, expected_kind="shadow_day_start")
-        decision = adjudicate_shadow_day(
-            start_manifest_path=start_manifest,
+        start = load_shadow_record(start_object_id, expected_kind="manual-shadow-day-start")
+        admission = adjudicate_shadow_day(
+            start_object_id=start_object_id,
             artifacts={"safety_sentinel": safety_sentinel, "paper_tournament": paper_tournament},
-            calendar_evidence=_shadow_calendar_evidence(str(start["market_date"])),
+            calendar_evidence=_shadow_calendar_evidence(str(start.payload["market_date"])),
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    decision_path = write_shadow_trial_packet(decision)
-    payload = {**decision, "decision_path": str(decision_path)}
+    payload = admitted_shadow_record_view(admission)
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
-    console.print(f"Shadow-day adjudication: {decision['status']}")
-    console.print(f"Decision: {decision_path}")
+    console.print(f"Shadow-day adjudication: {admission.envelope.payload['status']}")
+    console.print(f"Decision: {admission.path}")
 
 
 @research_app.command("shadow-streak-report")
 def research_shadow_streak_report(
-    day_record: list[Path] = typer.Option([], "--day-record", help="Immutable adjudication record; repeat once per day."),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Build a non-authorizing readiness report from supplied day records only."""
+    """Replay the complete pinned ledger into a non-authorizing readiness report."""
 
-    from tradingagents.evals.shadow_trial import (
-        build_shadow_streak_report,
-        write_shadow_trial_packet,
-    )
+    from tradingagents.evals.shadow_trial import build_shadow_streak_report
 
     try:
-        report = build_shadow_streak_report(
-            day_record,
-        )
+        report = build_shadow_streak_report()
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    report_path = write_shadow_trial_packet(report)
-    payload = {**report, "report_path": str(report_path)}
     if json_output:
-        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        typer.echo(json.dumps(report, indent=2, sort_keys=True))
         return
     console.print(f"Shadow-trial readiness: {report['status']}")
-    console.print(f"Report: {report_path}")
+    console.print(f"Report: {report.get('record_path', 'already admitted ledger report')}")
 
 
 def _write_reconciliation_packet(

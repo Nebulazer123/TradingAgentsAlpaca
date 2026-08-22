@@ -30,6 +30,9 @@ NORMAL_LIVE_ACTIVATION_PREPARE_KIND = "normal-live-activation-prepare"
 NORMAL_LIVE_ACTIVATION_RECEIPT_KIND = "normal-live-activation-receipt"
 NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND = "normal-live-broker-submit-prepare"
 NORMAL_LIVE_BROKER_SUBMIT_RECEIPT_KIND = "normal-live-broker-submit-receipt"
+MANUAL_SHADOW_DAY_START_KIND = "manual-shadow-day-start"
+MANUAL_SHADOW_DAY_RESULT_KIND = "manual-shadow-day-result"
+MANUAL_SHADOW_FINAL_REPORT_KIND = "manual-shadow-final-report"
 
 _UTC = dt.timezone.utc
 _ZERO_HASH = "0" * 64
@@ -52,6 +55,9 @@ _ALLOWED_KINDS = frozenset(
         NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
         NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
         NORMAL_LIVE_BROKER_SUBMIT_RECEIPT_KIND,
+        MANUAL_SHADOW_DAY_START_KIND,
+        MANUAL_SHADOW_DAY_RESULT_KIND,
+        MANUAL_SHADOW_FINAL_REPORT_KIND,
     }
 )
 _STAGED_POINTER_NAME = re.compile(
