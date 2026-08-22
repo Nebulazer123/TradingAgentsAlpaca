@@ -329,3 +329,49 @@ Read-only inventory of the ten TradingAgents records under `/Users/corbinfloyd/.
 - The frozen live-control file remains byte-identical at SHA-256 `a3fc5ddb2b300596833c48c1554fad088ecb43d46bd70aeeac074531d6e9fb07`. The ten records under `/Users/corbinfloyd/.codex/automations` remain exactly the previously inventoried records with `status = "PAUSED"`; no automation API/TOML update or schedule activation occurred.
 - The current continuation produced no runtime qualification or paper-trial evidence. Ignored `results/` artifacts remain preserved and excluded from qualification manifests; no broker/provider/network transport, email, promotion, rearm, live order, or paper submission occurred.
 - Task 5 remains the only unchecked plan section. Runtime work is intentionally deferred to a future confirmed regular U.S. equities market day and will still require the one-day clean qualifier before any five-day paper streak. The goal remains active.
+
+## Ox Alpha schedule-clock source checkpoint
+
+- Ox Alpha implemented the bounded schedule-clock correction in isolated worktree
+  `/Users/corbinfloyd/.codex/worktrees/tradingagents-schedule-clock-semantics-20260822`,
+  branch `codex/schedule-clock-semantics-20260822`, as commit `3c95e2f`
+  (`Fail schedule contract evaluation closed on actual TOML rrule drift`). The
+  reviewed change was cherry-picked onto canonical `master` as `93ec604`.
+- The source change adds an explicit `expected_central_schedules` map for all ten
+  TradingAgents records, pinned to `America/Chicago`, and compares that map with
+  the exact captured external TOML RRULEs inside `evaluate_schedule_contract`.
+  An exact one-hour Eastern-stored signature emits
+  `contract_expected_central_schedule_eastern_stored`; any other drift emits
+  `contract_expected_central_schedule_mismatch`. Missing, unsafe, changed, or
+  malformed captured sources still fail through the trusted snapshot manifest
+  before schedule evaluation. No scheduler/API next-run proof was fabricated or
+  inferred from this source map.
+- Fresh Ox Alpha review of `3c95e2f` against `8ce7b7d`: P0=0, P1=0, P2=1,
+  P3=1, verdict `Cherry-pick: YES`. A second final review of integrated `93ec604`
+  against `8ce7b7d`: P0=0, P1=0, P2=4, verdict `APPROVE — integrate`. The
+  non-blocking notes concern diagnostic specificity/redundancy only; they do not
+  weaken the fail-closed result.
+- RED-GREEN/source verification: the focused role-contract and health-audit
+  suites passed `52`; the affected/dependent suite passed `414`; the full
+  repository suite passed `3922 passed, 1 skipped, 11 warnings, 75 subtests` in
+  `402.14s`. The only skip remains the existing DeepSeek live-API test because
+  `DEEPSEEK_API_KEY` is not configured. Ruff, compileall, `git diff --check`, and
+  `zsh -n scripts/mac/ta_job.sh` all passed.
+- The canonical code graph was re-indexed at `93ec604`: `12,250` nodes and
+  `74,716` edges, zero skipped files, and the same unrelated parse-partial
+  archived MiroFish Dockerfile range. Excluded docs/results/scripts remain direct
+  evidence lanes rather than graph completeness claims.
+- Post-suite ignored-results inventory: `15,197` files under `results/`; eight
+  files were created or refreshed during this continuation after the noon
+  checkpoint—six `research_evidence` packets marked `analysis_only=true` and two
+  `manual_alpaca_submit` refusal packets with `submitted_count=0`. They are
+  preserved, excluded from qualification evidence, and were not deleted.
+- Frozen live-control SHA-256 remains
+  `a3fc5ddb2b300596833c48c1554fad088ecb43d46bd70aeeac074531d6e9fb07`.
+  All ten automation records remain `PAUSED` with the previously inventoried
+  hashes. No automation API/TOML update, schedule activation, broker/provider
+  transport, paper submission, email, promotion, rearm, unfreeze, or live order
+  occurred.
+- Saturday `2026-08-22` is not a regular U.S. equities market day. Qualification
+  and the five-day trial remain unstarted; Task 5 remains the next runtime gate
+  for a future confirmed market day, with all schedules paused.
