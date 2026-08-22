@@ -89,7 +89,10 @@ DAILY_CHAIN_STAGE_KINDS = {
     "broker_reconciliation": "broker_reconciliation_observer",
     "paper_tournament": "paper_tournament_run",
 }
-SHADOW_DAY_STOP_STAGES = ("day_start", *DAILY_CHAIN_STAGES)
+# ``manifest_written`` is deliberately not a daily-chain producer stage.  It
+# names the interruption window after the chain manifest is sealed but before
+# its one permitted adjudication.
+SHADOW_DAY_STOP_STAGES = ("day_start", *DAILY_CHAIN_STAGES, "manifest_written")
 
 
 def _has_nonempty_error(value: object) -> bool:
@@ -3037,7 +3040,9 @@ def expire_pending_shadow_day() -> EvidenceAdmission | None:
     """
 
     now, effective_at = _now_stamp()
-    prior = _store_envelopes()
+    # A no-op expiry probe is observational only: unlike admission, it must
+    # not create the anchor lock or initialize an empty ledger.
+    prior = _store_envelopes_readonly()
     days, pending, _last_day, report = _LedgerState(prior, now=now)
     if report is not None or pending is None:
         return None
@@ -3192,5 +3197,4 @@ def build_shadow_streak_report(*, final_no_go: bool = False) -> dict[str, object
         now=now,
         effective_at=effective_at,
     )
-    return _record_view(admission.envelope, path=admission.path)
     return _record_view(admission.envelope, path=admission.path)

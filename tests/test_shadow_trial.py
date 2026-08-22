@@ -2035,7 +2035,17 @@ def test_red_expire_leaves_same_date_pending_untouched(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("stage", ["day_start", *list(shadow_trial.DAILY_CHAIN_STAGES)])
+def test_red_expire_empty_ledger_is_observationally_pure(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+
+    before = _ledger_surface_snapshot(results_parent)
+    assert shadow_trial.expire_pending_shadow_day() is None
+    assert before == _ledger_surface_snapshot(results_parent)
+    assert not (results_parent / ".manual-shadow-trusted-head.lock").exists()
+
+
+@pytest.mark.parametrize("stage", list(shadow_trial.SHADOW_DAY_STOP_STAGES))
 def test_red_abort_interruption_matrix_admits_one_non_clean_result_per_stage(tmp_path, monkeypatch, stage):
     _environment = _configure_environment(monkeypatch, tmp_path)
     start = _start(monkeypatch, date="2026-08-21")
