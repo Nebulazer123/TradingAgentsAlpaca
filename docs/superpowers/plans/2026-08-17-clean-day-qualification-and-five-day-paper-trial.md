@@ -32,13 +32,13 @@
 - `alpaca paper-tournament run` defaults to `--dry-run`; `--submit-actions` is the only paper-write route.
 - `alpaca paper-tournament finalize --log-dir PATH --json-output` performs a paper-only reconciliation and closes the lease without canceling or liquidating orders.
 
-- [ ] Write RED tests for default dry-run, exact paper endpoint, current/regular Central market date, duplicate date, sixth date, expired/future lease, selection suppression, and finalization.
-- [ ] Run the selected tests and record the expected failures.
-- [ ] Add ledger validation before any paper submit; reject all invalid leases before transport.
-- [ ] Record one Central market date only after a successful paper submit; never write a live-strategy selection for this trial type.
-- [ ] Implement finalization: reconcile only `ta-paperbot-*` orders, reject unresolved open/ambiguous orders as HOLD, otherwise close the submission window and preserve positions.
-- [ ] Run focused paper tests, the paper/authority/supervisor dependent tests, Ruff, and `git diff --check`.
-- [ ] Commit the bounded paper lease.
+- [x] Write RED tests for default dry-run, exact paper endpoint, current/regular Central market date, duplicate date, sixth date, expired/future lease, selection suppression, and finalization.
+- [x] Run the selected tests and record the expected failures.
+- [x] Add ledger validation before any paper submit; reject all invalid leases before transport.
+- [x] Record one Central market date only after a successful paper submit; never write a live-strategy selection for this trial type.
+- [x] Implement finalization: reconcile only `ta-paperbot-*` orders, reject unresolved open/ambiguous orders as HOLD, otherwise close the submission window and preserve positions.
+- [x] Run focused paper tests, the paper/authority/supervisor dependent tests, Ruff, and `git diff --check`.
+- [x] Commit the bounded paper lease.
 
 ### Task 2: Add a deterministic read-only safety-sentinel command
 
@@ -51,12 +51,12 @@
 - `build_safety_sentinel_packet(...) -> dict` returns schema version, `status` (`CLEAR`, `HOLD`, or `FROZEN`), exact evidence paths/digests, `analysis_only=true`, `execution_authority="none"`, and `can_submit_orders=false`.
 - `research safety-sentinel-audit --json-output` captures live account/positions/open orders/clock through read-only adapters and writes `results/safety_sentinel/safety-sentinel-*.json`.
 
-- [ ] Write RED tests with a complete read-only broker fake: frozen control returns `FROZEN`, missing/stale/corrupt evidence returns `HOLD`, and no write/cancel/rearm method is invoked.
-- [ ] Run the selected tests and record RED.
-- [ ] Implement deterministic packet construction, SHA-256 file capture, schedule-contract checking in `predeployment_paused`, and strict read-only broker snapshots.
-- [ ] Add the CLI command without any `freeze-live`, automation-update, submit, or cancel path.
-- [ ] Run focused sentinel/authority tests, Ruff, compileall, and `git diff --check`.
-- [ ] Commit the sentinel command.
+- [x] Write RED tests with a complete read-only broker fake: frozen control returns `FROZEN`, missing/stale/corrupt evidence returns `HOLD`, and no write/cancel/rearm method is invoked.
+- [x] Run the selected tests and record RED.
+- [x] Implement deterministic packet construction, SHA-256 file capture, schedule-contract checking in `predeployment_paused`, and strict read-only broker snapshots.
+- [x] Add the CLI command without any `freeze-live`, automation-update, submit, or cancel path.
+- [x] Run focused sentinel/authority tests, Ruff, compileall, and `git diff --check`.
+- [x] Commit the sentinel command.
 
 ### Task 3: Persist and adjudicate the clean-day trial state
 
@@ -71,12 +71,12 @@
 - `build_shadow_streak_report(...) -> dict` enforces a clean qualification followed by five distinct current regular market days; any failed/incomplete day resets the streak.
 - `research shadow-day-start`, `research shadow-day-adjudicate`, and `research shadow-streak-report` write ignored, immutable evidence under `results/manual_shadow/` and remain non-authorizing.
 
-- [ ] Write RED tests for duplicate dates, non-market dates, missing/stale/cross-run/mutated artifact hashes, unpaused schedules, live-control hash changes, a valid HOLD, failed-day reset, and five clean trial days after qualification.
-- [ ] Run the selected tests and record RED.
-- [ ] Implement canonical JSON/hash validation and the explicit phase machine: `qualification_pending`, `qualification_clean`, `repair_required`, `repair_in_progress`, `five_day_trial`, `trial_complete`, `readiness_no_go`, and `readiness_candidate`.
-- [ ] Implement the three analysis-only CLI commands; reject unknown/extra artifact keys and never infer a success from absent evidence.
-- [ ] Run focused shadow/sentinel/paper tests and dependent recovery/schedule tests, then Ruff, compileall, and `git diff --check`.
-- [ ] Commit the trial evidence state machine.
+- [x] Write RED tests for duplicate dates, non-market dates, missing/stale/cross-run/mutated artifact hashes, unpaused schedules, live-control hash changes, a valid HOLD, failed-day reset, and five clean trial days after qualification.
+- [x] Run the selected tests and record RED.
+- [x] Implement canonical JSON/hash validation and the explicit phase machine: `qualification_pending`, `qualification_clean`, `repair_required`, `repair_in_progress`, `five_day_trial`, `trial_complete`, `readiness_no_go`, and `readiness_candidate`.
+- [x] Implement the three analysis-only CLI commands; reject unknown/extra artifact keys and never infer a success from absent evidence.
+- [x] Run focused shadow/sentinel/paper tests and dependent recovery/schedule tests, then Ruff, compileall, and `git diff --check`.
+- [x] Commit the trial evidence state machine.
 
 ### Task 4: Integrate, independently review, and prepare the manual runbook
 
@@ -101,10 +101,10 @@
 - [x] Produce a manual, on-demand runbook in this plan’s report that names the exact capped overnight command, preopen/hourly dry-run commands, sentinel, BOARD, self-heal analysis, local-only daily report, paper command, and adjudication command.
 - [x] Bind the authority-sensitive sentinel, paper-run, and reconciliation packets to
   the admitted start; require an exact hash-bound twelve-stage daily-chain manifest.
-- [ ] Verify all ten automation TOMLs are paused before any runtime step; this is a hard prerequisite, not a change request.
-- [ ] Run the declared focused suite, full pytest, Ruff, compileall, wrapper syntax, and authority inventory.
-- [ ] Obtain task-scoped specification and quality reviews after each task and a fresh whole-branch authority/security review after Task 4.
-- [ ] Commit the runbook/report update if it changes tracked documentation.
+- [x] Verify all ten automation TOMLs are paused before any runtime step; this is a hard prerequisite, not a change request.
+- [x] Run the declared focused suite, full pytest, Ruff, compileall, wrapper syntax, and authority inventory.
+- [x] Obtain task-scoped specification and quality reviews after each task and a fresh whole-branch authority/security review after Task 4.
+- [x] Commit the runbook/report update if it changes tracked documentation.
 
 ### Task 5: Execute the runtime state machine only after source review is clean
 
