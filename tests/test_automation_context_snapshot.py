@@ -543,8 +543,9 @@ def test_installed_execution_board_prompt_owns_decision_but_not_execution():
     assert "Never freeze, refresh, re-arm, or unfreeze live control" in prompt
     assert "freeze live trading" not in prompt
     assert automation["notification_policy"] == "failed_runs_only"
+    # The installed paused record must match the versioned Central-time contract.
     assert automation["rrule"] == (
-        "RRULE:FREQ=WEEKLY;BYHOUR=9,10,11,12,13,14,15;BYMINUTE=50;BYDAY=MO,TU,WE,TH,FR"
+        "RRULE:FREQ=WEEKLY;BYHOUR=8,9,10,11,12,13,14;BYMINUTE=50;BYDAY=MO,TU,WE,TH,FR"
     )
 
 
