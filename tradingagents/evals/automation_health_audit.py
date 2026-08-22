@@ -614,7 +614,7 @@ def _capture_descriptor_relative_toml(
 
 
 def _discover_descriptor_relative_automation_ids(root_descriptor: int | None) -> set[str]:
-    """Find direct automation TOMLs without following directory or file symlinks."""
+    """Find direct TradingAgents TOMLs without following directory or file symlinks."""
 
     if root_descriptor is None:
         return set()
@@ -624,7 +624,7 @@ def _discover_descriptor_relative_automation_ids(root_descriptor: int | None) ->
     except OSError:
         return discovered
     for name in names:
-        if not _valid_automation_id(name):
+        if not _valid_automation_id(name) or not name.startswith("tradingagents-"):
             continue
         try:
             entry = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
@@ -995,12 +995,13 @@ def evaluate_schedule_contract(
     snapshot = _trusted_capture_payload(captured_snapshot)
     if snapshot is None:
         return _schedule_contract_failure("captured_snapshot_invalid")
+    contract_source = snapshot.get("contract")
+    contract = _captured_json(contract_source) if isinstance(contract_source, Mapping) else None
+    if contract is None:
+        return _schedule_contract_failure("contract_unreadable")
     manifest = _schedule_contract_snapshot_manifest_from_payload(snapshot)
     if manifest["capture_issues"]:
         return _schedule_contract_failure("captured_snapshot_invalid")
-    contract = _captured_json(cast(Mapping[str, Any], snapshot["contract"]))
-    if contract is None:
-        return _schedule_contract_failure("contract_unreadable")
     issues = _schedule_contract_issues(contract)
     if issues:
         return _schedule_contract_failure(issues[0])

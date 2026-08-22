@@ -72,7 +72,7 @@ def _replace_automation_toml_line(
 
 
 def test_current_external_records_are_checked_against_the_versioned_contract():
-    """Known predeployment drift is explicit rather than a false green."""
+    """Current predeployment configuration is checked without proving deployment."""
 
     result = evaluate_schedule_contract(
         contract_path=CONTRACT_PATH,
@@ -104,40 +104,9 @@ def test_current_external_records_are_checked_against_the_versioned_contract():
         "role" not in {item["field"] for item in row["mismatches"]}
         for row in by_id.values()
     )
-    assert {
-        row["automation_id"]: {item["field"] for item in row["mismatches"]}
-        for row in by_id.values()
-    } == {
-        "tradingagents-automation-sleep-controller": {"rrule"},
-        "tradingagents-automation-wake-controller": {"rrule"},
-        "tradingagents-autonomous-execution-board": {"rrule"},
-        "tradingagents-autonomous-safety-sentinel": {"rrule"},
-        "tradingagents-autonomous-self-healer": {"rrule", "prompt_sha256", "prompt_semantic"},
-        "tradingagents-daily-report": {"rrule"},
-        "tradingagents-market-supervisor": {"rrule"},
-        "tradingagents-overnight-research": {"rrule"},
-        "tradingagents-paper-tournament": {"rrule"},
-        "tradingagents-preopen-validation": {"rrule"},
-    }
-
-    overnight = by_id["tradingagents-overnight-research"]
-    assert overnight["status"] == "mismatch"
-    assert overnight["deployment_status"] == "not_deployed"
-    assert {
-        item["field"] for item in overnight["mismatches"]
-    } == {"rrule"}
-    assert overnight["mismatches"][0]["expected"].startswith(
-        "RRULE:FREQ=WEEKLY;BYHOUR=3;BYMINUTE=30"
-    )
-    assert overnight["mismatches"][0]["actual"].startswith(
-        "RRULE:FREQ=WEEKLY;BYHOUR=4;BYMINUTE=30"
-    )
-
-    self_healer = by_id["tradingagents-autonomous-self-healer"]
-    assert self_healer["status"] == "mismatch"
-    assert "prompt_semantic" in {
-        item["field"] for item in self_healer["mismatches"]
-    }
+    assert all(row["mismatches"] == [] for row in by_id.values())
+    assert all(row["status"] == "match" for row in by_id.values())
+    assert all(row["deployment_status"] == "not_deployed" for row in by_id.values())
 
 
 def test_contract_rejects_model_effort_notification_and_prompt_drift(tmp_path):
@@ -153,6 +122,7 @@ def test_contract_rejects_model_effort_notification_and_prompt_drift(tmp_path):
     result = evaluate_schedule_contract(
         contract_path=path,
         automation_root=AUTOMATION_ROOT,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
 
     row = next(
@@ -166,7 +136,6 @@ def test_contract_rejects_model_effort_notification_and_prompt_drift(tmp_path):
         "reasoning_effort",
         "notification_policy",
         "prompt_sha256",
-        "rrule",
     }
 
 

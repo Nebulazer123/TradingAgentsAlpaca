@@ -516,6 +516,24 @@ def test_safety_sentinel_holds_nested_malformed_broker_values(tmp_path, field, v
     assert reason in packet["reasons"]
 
 
+def test_automatic_schedule_capture_ignores_unrelated_automation_namespace(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    unrelated_toml = automation_root / "weekly-review" / "automation.toml"
+    unrelated_toml.parent.mkdir(parents=True)
+    unrelated_toml.write_text('name = "unrelated"\nstatus = "ACTIVE"\n', encoding="utf-8")
+
+    result = evaluate_schedule_contract(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+    )
+
+    assert result["contract_status"] == "pass"
+    assert {row["automation_id"] for row in result["automations"]} == set(
+        json.loads(contract.read_text(encoding="utf-8"))["automations"]
+    )
+
+
 def test_captured_schedule_snapshot_rejects_hidden_unexpected_automation(tmp_path):
     contract, roles, automation_root = _write_schedule_fixture(tmp_path)
     unexpected_id = "tradingagents-unexpected-observer"
