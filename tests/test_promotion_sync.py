@@ -1,5 +1,8 @@
+import datetime
 import json
 from decimal import Decimal
+
+import pytest
 
 from tradingagents.brokers.alpaca_supervisor import (
     LIVE_AGGRESSIVE_SLEEVE,
@@ -9,6 +12,8 @@ from tradingagents.policy.promotion_sync import (
     sync_promotion_state_file,
     sync_promotion_state_from_tournament,
 )
+
+SYNC_NOW = datetime.datetime(2026, 6, 22, 12, 0, 0, tzinfo=datetime.timezone.utc)
 
 
 def _ranking(
@@ -43,8 +48,8 @@ def _report(candidate="pullback-support"):
                 "current-aggressive",
                 total_return="-1225.06",
                 total_return_pct="-12.25",
-                max_drawdown_pct="-15.30",
-                win_rate_pct="14.28",
+                max_drawdown_pct="-3.00",
+                win_rate_pct="55.71",
                 equity="8774.94",
             ),
             _ranking(
@@ -85,6 +90,35 @@ def _incumbent_state():
     }
 
 
+def _fresh_report():
+    """Report whose incumbent evidence is positive, floor-clean, and fresh."""
+
+    return {
+        "generated_at": "2026-06-20T21:12:35+00:00",
+        "tournament_id": "paper-tournament-20260531-080741",
+        "rankings": [
+            _ranking("pullback-support"),
+            _ranking("current-aggressive", total_return="120.00"),
+        ],
+        "live_strategy_candidate": {
+            "status": "candidate",
+            "strategy_id": "pullback-support",
+            "reason": "best positive paper strategy after 11 tracked day(s)",
+        },
+    }
+
+
+def _sync_incumbent(report, *, now=SYNC_NOW):
+    return sync_promotion_state_from_tournament(
+        report,
+        _incumbent_state(),
+        tiny_live_tranche_usd=Decimal("25"),
+        arm_live=True,
+        ci_green=True,
+        now=now,
+    )
+
+
 def test_sync_promotes_candidate_and_demotes_negative_incumbent():
     result = sync_promotion_state_from_tournament(
         _report(),
@@ -92,6 +126,7 @@ def test_sync_promotes_candidate_and_demotes_negative_incumbent():
         tiny_live_tranche_usd=Decimal("25"),
         arm_live=True,
         ci_green=True,
+        now=datetime.datetime(2026, 6, 21, 12, 0, 0, tzinfo=datetime.timezone.utc),
     )
     assert result.promoted == ["pullback-support"]
     assert result.demoted == ["current-aggressive"]
@@ -220,6 +255,97 @@ def test_sync_result_preserves_issues_for_every_sleeve():
     assert result.state["sleeves"]["current-aggressive"]["issues"] == [
         "incumbent evidence requires review"
     ]
+
+
+def test_sync_demotes_live_incumbent_when_ranking_absent():
+    report = _fresh_report()
+    report["rankings"] = [
+        ranking
+        for ranking in report["rankings"]
+        if ranking["strategy_id"] != "current-aggressive"
+    ]
+
+    result = _sync_incumbent(report)
+
+    assert result.demoted == ["current-aggressive"]
+    record = result.state["sleeves"]["current-aggressive"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert record["demoted_at"] == "2026-06-22T12:00:00+00:00"
+    assert "ranking" in record["demotion_reason"]
+    assert record["validation_report_ref"] == (
+        "results/paper_strategy_tournament/latest.json"
+    )
+    assert "current-aggressive" not in result.unchanged
+
+
+def test_sync_demotes_live_incumbent_when_report_generated_at_stale():
+    now = datetime.datetime(2026, 6, 30, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    assert now - datetime.datetime(
+        2026, 6, 20, 21, 12, 35, tzinfo=datetime.timezone.utc
+    ) > datetime.timedelta(days=7)
+
+    result = _sync_incumbent(_fresh_report(), now=now)
+
+    assert result.demoted == ["current-aggressive"]
+    record = result.state["sleeves"]["current-aggressive"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert "stale" in record["demotion_reason"]
+    assert "turned negative" not in record["demotion_reason"]
+
+
+def test_sync_demotes_live_incumbent_when_report_generated_at_invalid():
+    report = _fresh_report()
+    report["generated_at"] = "not-a-timestamp"
+
+    result = _sync_incumbent(report)
+
+    assert result.demoted == ["current-aggressive"]
+    record = result.state["sleeves"]["current-aggressive"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert "invalid" in record["demotion_reason"]
+    assert "turned negative" not in record["demotion_reason"]
+
+
+def test_sync_demotes_live_incumbent_when_report_generated_at_future():
+    report = _fresh_report()
+    report["generated_at"] = "2026-06-23T00:00:00+00:00"
+
+    result = _sync_incumbent(report)
+
+    assert result.demoted == ["current-aggressive"]
+    record = result.state["sleeves"]["current-aggressive"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert "future" in record["demotion_reason"]
+    assert "turned negative" not in record["demotion_reason"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "metric"),
+    [
+        ({"tracked_days": 4}, "tracked_days"),
+        ({"max_drawdown_pct": "-10.50"}, "max_drawdown_pct"),
+        ({"win_rate_pct": "49.99"}, "win_rate_pct"),
+    ],
+)
+def test_sync_demotes_quality_floor_breaching_incumbent(overrides, metric):
+    report = _fresh_report()
+    for ranking in report["rankings"]:
+        if ranking["strategy_id"] == "current-aggressive":
+            ranking.update(overrides)
+
+    result = _sync_incumbent(report)
+
+    assert result.demoted == ["current-aggressive"]
+    record = result.state["sleeves"]["current-aggressive"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert "quality floor" in record["demotion_reason"]
+    assert metric in record["demotion_reason"]
+    assert "turned negative" not in record["demotion_reason"]
 
 
 def test_resolve_live_sleeve_prefers_backed_selection():

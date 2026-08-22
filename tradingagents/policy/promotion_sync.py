@@ -40,6 +40,7 @@ from tradingagents.policy.promotion import (
     SleevePromotionEvidence,
     evaluate_sleeve_promotion,
 )
+from tradingagents.policy.strategy_promotion import INTERNAL_EVIDENCE_MAX_AGE_SECONDS
 
 UTC = datetime.timezone.utc
 
@@ -243,12 +244,37 @@ def build_tournament_promotion_evidence(
     )
 
 
+def _report_evidence_age_issue(
+    report: Mapping, *, now: datetime.datetime
+) -> str | None:
+    """Return a demotion-grade freshness complaint about the report, if any."""
+
+    raw = report.get("generated_at")
+    if type(raw) is not str or not raw:
+        return "tournament report generated_at is missing"
+    try:
+        moment = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return f"tournament report generated_at is invalid: {raw!r}"
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    if moment > now:
+        return f"tournament report generated_at {raw} is in the future"
+    if now - moment >= datetime.timedelta(seconds=INTERNAL_EVIDENCE_MAX_AGE_SECONDS):
+        return (
+            f"tournament report generated_at {raw} is stale: older than the "
+            f"{INTERNAL_EVIDENCE_MAX_AGE_SECONDS}-second internal-evidence ceiling"
+        )
+    return None
+
+
 def _demoted_record(
     existing: Mapping,
     ranking: Mapping,
     *,
     now_iso: str,
     validation_report_ref: str,
+    demotion_reason: str | None = None,
 ) -> dict:
     record = dict(existing)
     record["stage"] = "paper_only"
@@ -256,12 +282,15 @@ def _demoted_record(
     record["benchmark_gate_passed"] = False
     record["recent_alpha_gate_passed"] = False
     record["demoted_at"] = now_iso
-    record["demotion_reason"] = (
-        "tournament evidence turned negative: total_return "
-        f"{ranking.get('total_return')} ({ranking.get('total_return_pct')}%) "
-        f"over {ranking.get('tracked_days')} tracked day(s) with win rate "
-        f"{ranking.get('win_rate_pct')}%"
-    )
+    if demotion_reason is None:
+        record["demotion_reason"] = (
+            "tournament evidence turned negative: total_return "
+            f"{ranking.get('total_return')} ({ranking.get('total_return_pct')}%) "
+            f"over {ranking.get('tracked_days')} tracked day(s) with win rate "
+            f"{ranking.get('win_rate_pct')}%"
+        )
+    else:
+        record["demotion_reason"] = demotion_reason
     record["validation_report_ref"] = validation_report_ref
     return record
 
@@ -486,7 +515,8 @@ def sync_promotion_state_from_tournament(
     risk_envelope_ref: str = DEFAULT_RISK_ENVELOPE_REF,
     now: datetime.datetime | None = None,
 ) -> PromotionSyncResult:
-    now_iso = _now_iso(now)
+    now_moment = now or datetime.datetime.now(tz=UTC)
+    now_iso = _now_iso(now_moment)
     existing_sleeves: dict[str, dict] = {}
     if isinstance(current_state, Mapping):
         raw = current_state.get("sleeves")
@@ -517,20 +547,40 @@ def sync_promotion_state_from_tournament(
     unchanged: list[str] = []
     issues_by_sleeve: dict[str, list[str]] = {}
 
-    # 1. Demote live-enabled sleeves whose own evidence turned negative.
+    # 1. Demote live-enabled sleeves whose own evidence is missing, stale,
+    #    invalid, quality-floor-breaching, or turned negative.
+    evidence_issue = _report_evidence_age_issue(report, now=now_moment)
     for sleeve_id, record in existing_sleeves.items():
         ranking = _ranking_for(report, sleeve_id)
-        if (
-            record.get("live_enabled") is True
-            and ranking is not None
-            and int(ranking.get("tracked_days") or 0) >= MIN_TRACKED_DAYS
-            and _as_decimal(ranking.get("total_return")) < 0
-        ):
+        demote = False
+        demotion_reason: str | None = None
+        if record.get("live_enabled") is True:
+            if ranking is None:
+                demote = True
+                demotion_reason = (
+                    "tournament evidence missing: no ranking for this sleeve "
+                    "in the tournament report"
+                )
+            elif evidence_issue is not None:
+                demote = True
+                demotion_reason = f"tournament evidence rejected: {evidence_issue}"
+            else:
+                quality_issues = _quality_gate_issues(ranking)
+                if quality_issues:
+                    demote = True
+                    demotion_reason = (
+                        "tournament evidence breached quality floor(s): "
+                        + "; ".join(quality_issues)
+                    )
+                else:
+                    demote = _as_decimal(ranking.get("total_return")) < 0
+        if demote:
             new_sleeves[sleeve_id] = _demoted_record(
                 record,
-                ranking,
+                ranking or {},
                 now_iso=now_iso,
                 validation_report_ref=validation_report_ref,
+                demotion_reason=demotion_reason,
             )
             demoted.append(sleeve_id)
         else:
