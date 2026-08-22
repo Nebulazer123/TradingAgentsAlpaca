@@ -702,6 +702,7 @@ def write_hourly_decision_packet(
     output_dir: str | Path = "results/hourly_supervisor",
     recent_packets: Sequence[Mapping[str, Any]] = (),
     alert_throttle_window: datetime.timedelta = DEFAULT_ALERT_THROTTLE_WINDOW,
+    packet_metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -714,6 +715,11 @@ def write_hourly_decision_packet(
             alert_throttle_window=alert_throttle_window,
         )
     )
+    # The supervisor has a normal submit-capable mode.  Callers that need
+    # observer-only evidence must persist their explicit dry-run contract in
+    # the raw packet rather than asking later validators to infer it.
+    if packet_metadata:
+        packet.update(dict(packet_metadata))
     packet_text = json.dumps(packet, indent=2)
     compact = compact_hourly_supervisor_payload(packet, packet_path)
     compact_text = json.dumps(compact, indent=2)

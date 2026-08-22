@@ -12326,8 +12326,27 @@ def alpaca_supervise_hourly(
         decision,
         output_dir=log_dir,
         recent_packets=recent_packets,
+        packet_metadata=(
+            {
+                "shadow_dry_run": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
+            if dry_run
+            else None
+        ),
     )
     payload = serialize_hourly_decision(decision, recent_packets=recent_packets)
+    if dry_run:
+        payload.update(
+            {
+                "shadow_dry_run": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
+        )
     payload["packet_path"] = str(packet_path)
     policy_notify = should_notify_supervisor(
         decision,

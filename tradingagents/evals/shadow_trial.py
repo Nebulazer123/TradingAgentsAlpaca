@@ -82,6 +82,171 @@ DAILY_CHAIN_STAGE_KINDS = {
     "broker_reconciliation": "broker_reconciliation_observer",
     "paper_tournament": "paper_tournament_run",
 }
+
+
+def _has_nonempty_error(value: object) -> bool:
+    """Return true only for an explicit, populated failure channel.
+
+    Observer producers carry useful ordinary strings such as ``reason`` and
+    ``warnings``.  Those are not errors by themselves.  A result packet may
+    count toward a clean day only when its explicit error channels are empty.
+    """
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = str(key).strip().lower()
+            if normalized in {"error", "errors", "exception", "exceptions"} and item not in (None, "", [], {}, ()):
+                return True
+            if _has_nonempty_error(item):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_has_nonempty_error(item) for item in value)
+    return False
+
+
+def _no_submissions(payload: Mapping[str, object]) -> bool:
+    submitted = payload.get("submitted")
+    submitted_count = payload.get("submitted_count")
+    return (
+        (submitted is None or submitted in ([], ()))
+        and (submitted_count is None or submitted_count == 0)
+    )
+
+
+def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[str]:
+    """Validate real producer shapes without pretending they share one schema.
+
+    The daily observer chain deliberately binds persisted output from several
+    existing writers.  Some of those legacy packets predate the common
+    ``kind``/authority fields.  This validator therefore checks their native
+    safe predicates instead of accepting test-only uniform envelopes.
+    """
+
+    reasons: list[str] = []
+    expected_kind = DAILY_CHAIN_STAGE_KINDS[stage]
+    supplied_kind = payload.get("kind")
+    if supplied_kind is not None and supplied_kind != expected_kind:
+        reasons.append(f"{stage}_stage_kind_invalid")
+    if _has_nonempty_error(payload):
+        reasons.append(f"{stage}_stage_error_present")
+
+    if stage == "overnight_research":
+        quality = payload.get("overnight_quality")
+        if payload.get("analysis_only") is not True or not _no_submissions(payload):
+            reasons.append("overnight_research_stage_authority_invalid")
+        if not isinstance(quality, Mapping):
+            reasons.append("overnight_research_stage_quality_missing")
+        else:
+            if str(quality.get("completion_status") or "").lower() != "complete":
+                reasons.append("overnight_research_stage_incomplete")
+            for key in (
+                "graph_failure_count",
+                "graph_attempt_failure_count",
+                "top_provider_bundle_error_count",
+            ):
+                if quality.get(key) != 0:
+                    reasons.append("overnight_research_stage_provider_or_graph_failure")
+                    break
+            if quality.get("tradable_count") != 1:
+                reasons.append("overnight_research_stage_not_single_ticker")
+            if (
+                type(quality.get("per_ticker_timeout_minutes")) not in {int, float}
+                or float(quality["per_ticker_timeout_minutes"]) > 2
+                or type(quality.get("time_budget_minutes")) not in {int, float}
+                or float(quality["time_budget_minutes"]) > 3
+            ):
+                reasons.append("overnight_research_stage_bounds_invalid")
+    elif stage == "premarket_brief":
+        if payload.get("analysis_only") is not True or not _no_submissions(payload):
+            reasons.append("premarket_brief_stage_authority_invalid")
+        if payload.get("stale_warnings") not in ([], ()) or payload.get("unresolved_blockers") not in ([], ()):
+            reasons.append("premarket_brief_stage_stale_or_blocked")
+    elif stage == "preopen_validation":
+        if not _is_non_authorizing(payload) or payload.get("submitted_count") != 0:
+            reasons.append("preopen_validation_stage_authority_invalid")
+        if payload.get("overall_status") not in {"pass", "pass_with_warnings"}:
+            reasons.append("preopen_validation_stage_not_complete")
+        if payload.get("failed_check_ids") not in ([], ()):
+            reasons.append("preopen_validation_stage_failed_check")
+    elif stage == "hourly_supervisor":
+        # Only the explicit CLI dry-run metadata turns a normal supervisor
+        # packet into observer-chain evidence.  Submit-capable normal packets
+        # remain unchanged and cannot qualify accidentally.
+        if payload.get("shadow_dry_run") is not True or not _no_submissions(payload):
+            reasons.append("hourly_supervisor_stage_not_dry_run")
+        if payload.get("outbox_path"):
+            reasons.append("hourly_supervisor_stage_outbox_forbidden")
+        if str(payload.get("decision") or "").lower() not in {"hold", "blocked", "none"}:
+            reasons.append("hourly_supervisor_stage_decision_invalid")
+    elif stage == "safety_sentinel":
+        if not _is_non_authorizing(payload) or payload.get("status") not in {"FROZEN", "HOLD"}:
+            reasons.append("safety_sentinel_stage_semantics_invalid")
+    elif stage == "loss_review":
+        nested = payload.get("payload")
+        freshness = payload.get("freshness")
+        if (
+            payload.get("evidence_type") != "loss_review_evidence"
+            or not isinstance(nested, Mapping)
+            or not isinstance(freshness, Mapping)
+        ):
+            reasons.append("loss_review_stage_schema_invalid")
+        elif (
+            not _is_non_authorizing(nested)
+            or freshness.get("read_only") is not True
+            or freshness.get("can_submit_orders") is not False
+            or nested.get("next_action") != "autonomous_hold"
+            or nested.get("submitted_order_count") != 0
+        ):
+            reasons.append("loss_review_stage_authority_invalid")
+    elif stage == "execution_board":
+        metrics = payload.get("metrics")
+        if not _is_non_authorizing(payload) or not isinstance(metrics, Mapping):
+            reasons.append("execution_board_stage_authority_invalid")
+        elif metrics.get("submitted_order_count") != 0:
+            reasons.append("execution_board_stage_submission_present")
+    elif stage in {"self_heal_handoff", "self_heal_plan"}:
+        if not _is_non_authorizing(payload):
+            reasons.append(f"{stage}_stage_authority_invalid")
+        if stage == "self_heal_plan" and payload.get("executed_count", 0) not in (0, None):
+            reasons.append("self_heal_plan_stage_execution_forbidden")
+    elif stage == "daily_report":
+        if payload.get("outbox_path"):
+            reasons.append("daily_report_stage_outbox_forbidden")
+        if payload.get("packet_count") is None or payload.get("portfolio") is None:
+            reasons.append("daily_report_stage_schema_invalid")
+    elif stage == "broker_reconciliation":
+        live = payload.get("live")
+        paper = payload.get("paper")
+        if (
+            not _is_non_authorizing(payload)
+            or payload.get("status") != "COMPLETE"
+            or payload.get("read_only") is not True
+            or payload.get("submitted_count") != 0
+            or payload.get("cancelled_count") != 0
+            or not isinstance(live, Mapping)
+            or not isinstance(paper, Mapping)
+            or _has_nonempty_error(live)
+            or _has_nonempty_error(paper)
+            or not isinstance(live.get("account"), Mapping)
+            or not isinstance(paper.get("account"), Mapping)
+            or not isinstance(live.get("positions"), list)
+            or not isinstance(paper.get("positions"), list)
+            or not isinstance(live.get("open_orders"), list)
+            or not isinstance(paper.get("open_orders"), list)
+            or not isinstance(live.get("clock"), Mapping)
+            or not isinstance(paper.get("clock"), Mapping)
+        ):
+            reasons.append("broker_reconciliation_stage_semantics_invalid")
+    elif stage == "paper_tournament":
+        if not _is_non_authorizing(payload) or payload.get("status") not in {"HOLD", "NO_PAPER_SIGNAL", "COMPLETE"}:
+            reasons.append("paper_tournament_stage_semantics_invalid")
+        if (
+            not isinstance(payload.get("submitted_count"), int)
+            or not isinstance(payload.get("submitted"), list)
+            or len(payload["submitted"]) != payload["submitted_count"]
+        ):
+            reasons.append("paper_tournament_stage_submissions_invalid")
+    return reasons
 EXPECTED_AUTOMATION_IDS = frozenset(
     {
         "tradingagents-automation-sleep-controller",
@@ -1491,11 +1656,10 @@ def _manifest_reasons(
         stage_time = _parse_timestamp(stage_record["generated_at"])
         if stage_time is None or stage_time < start_at or stage_time > now:
             incomplete.append(f"{stage}_stage_timestamp_invalid")
-        expected_kind = DAILY_CHAIN_STAGE_KINDS[stage]
-        if stage_payload.get("kind") != expected_kind:
-            failed.append(f"{stage}_stage_kind_invalid")
-        if not _is_non_authorizing(stage_payload):
-            failed.append(f"{stage}_stage_authority_invalid")
+        # Existing persisted producers are intentionally not force-shaped into
+        # a synthetic common packet.  Require the native safe semantics for
+        # each role, including explicit dry-run evidence for hourly work.
+        failed.extend(_stage_semantic_reasons(stage, stage_payload))
         stage_status = stage_payload.get("status")
         if stage_status is not None and (type(stage_status) is not str or not stage_status.strip()):
             failed.append(f"{stage}_stage_status_invalid")

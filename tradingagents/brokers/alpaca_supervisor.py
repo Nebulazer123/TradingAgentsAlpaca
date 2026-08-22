@@ -10,6 +10,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from tradingagents.brokers.alpaca import AlpacaExecutionConfig, OrderIssue
@@ -1945,6 +1946,7 @@ def write_hourly_decision_packet(
     output_dir: str | Path = "results/hourly_supervisor",
     recent_packets: Sequence[Mapping] = (),
     alert_throttle_window: datetime.timedelta = DEFAULT_ALERT_THROTTLE_WINDOW,
+    packet_metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     return _write_hourly_decision_packet(
         decision,
@@ -1952,4 +1954,5 @@ def write_hourly_decision_packet(
         output_dir=output_dir,
         recent_packets=recent_packets,
         alert_throttle_window=alert_throttle_window,
+        packet_metadata=packet_metadata,
     )

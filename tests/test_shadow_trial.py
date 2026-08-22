@@ -257,6 +257,47 @@ def _complete_daily_chain(
             "execution_authority": "none",
             "can_submit_orders": False,
         }
+        # These intentionally mirror the native persisted producer shapes,
+        # rather than a synthetic one-size-fits-all test envelope.
+        if name == "overnight_research":
+            packet.update(
+                {
+                    "submitted": [],
+                    "overnight_quality": {
+                        "completion_status": "complete",
+                        "graph_failure_count": 0,
+                        "graph_attempt_failure_count": 0,
+                        "top_provider_bundle_error_count": 0,
+                        "tradable_count": 1,
+                        "per_ticker_timeout_minutes": 2,
+                        "time_budget_minutes": 3,
+                    },
+                }
+            )
+        elif name == "premarket_brief":
+            packet.update({"stale_warnings": [], "unresolved_blockers": []})
+        elif name == "preopen_validation":
+            packet.update({"overall_status": "pass", "submitted_count": 0, "failed_check_ids": []})
+        elif name == "hourly_supervisor":
+            packet.update({"decision": "hold", "submitted": [], "shadow_dry_run": True})
+        elif name == "loss_review":
+            packet.update(
+                {
+                    "evidence_type": "loss_review_evidence",
+                    "payload": {
+                        "analysis_only": True,
+                        "execution_authority": "none",
+                        "can_submit_orders": False,
+                        "next_action": "autonomous_hold",
+                        "submitted_order_count": 0,
+                    },
+                    "freshness": {"read_only": True, "can_submit_orders": False},
+                }
+            )
+        elif name == "execution_board":
+            packet.update({"metrics": {"submitted_order_count": 0}})
+        elif name == "daily_report":
+            packet.update({"packet_count": 0, "portfolio": {}})
         if name == "broker_reconciliation":
             packet.update(
                 {
@@ -267,6 +308,9 @@ def _complete_daily_chain(
                     "read_only": True,
                     "submitted_count": 0,
                     "cancelled_count": 0,
+                    "status": "COMPLETE",
+                    "live": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
+                    "paper": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
                 }
             )
         _write_json(path, packet)
@@ -391,6 +435,64 @@ def test_bound_sentinel_cli_derives_start_identity_and_requires_paused(tmp_path,
     assert payload["run_id"] == _payload(start)["run_id"]
     assert payload["market_date"] == "2026-08-21"
     assert payload["analysis_only"] is True and payload["can_submit_orders"] is False
+
+
+def test_bound_reconciliation_and_public_manifest_cli_use_authenticated_start(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    class Broker:
+        def get_account(self): return {"id": "observer", "status": "ACTIVE"}
+        def list_positions(self): return []
+        def list_orders(self, *, status): return []
+        def get_clock(self): return {"is_open": False, "timestamp": "2026-08-21T14:00:00+00:00"}
+        def __getattr__(self, name):
+            if name in {"submit_order", "cancel_order", "replace_order"}:
+                raise AssertionError(f"forbidden write {name}")
+            raise AttributeError(name)
+
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", Broker)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", Broker)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2026-08-21", 14))
+    reconcile = runner.invoke(
+        app,
+        [
+            "alpaca", "reconcile-observer", "--shadow-start-object-id", start.envelope.object_id,
+            "--output-dir", str(tmp_path / "reconcile"), "--json-output",
+        ],
+    )
+    assert reconcile.exit_code == 0, reconcile.output
+    reconcile_payload = json.loads(reconcile.stdout)
+    assert reconcile_payload["shadow_start_object_id"] == start.envelope.object_id
+    assert reconcile_payload["status"] == "COMPLETE"
+
+    artifacts = _artifacts(
+        tmp_path,
+        run_id=_payload(start)["run_id"],
+        date="2026-08-21",
+        start_object_id=start.envelope.object_id,
+    )
+    _complete_daily_chain(tmp_path, start=start, artifacts=artifacts)
+    stage_paths = {
+        name: (
+            artifacts["safety_sentinel"] if name == "safety_sentinel"
+            else artifacts["paper_tournament"] if name == "paper_tournament"
+            else tmp_path / "artifacts" / f"{name}-2026-08-21.json"
+        )
+        for name in shadow_trial.DAILY_CHAIN_STAGES
+    }
+    manifest = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-manifest", "--start-object-id", start.envelope.object_id,
+            *[item for name, path in stage_paths.items() for item in ("--stage", f"{name}={path}")],
+            "--output-dir", str(tmp_path / "public-manifest"), "--json-output",
+        ],
+    )
+    assert manifest.exit_code == 0, manifest.output
+    manifest_payload = json.loads(manifest.stdout)
+    assert manifest_payload["shadow_start_object_id"] == start.envelope.object_id
+    assert set(manifest_payload["stages"]) == set(shadow_trial.DAILY_CHAIN_STAGES)
 
 
 def test_red_generic_self_sealed_files_never_load_or_become_candidate(tmp_path, monkeypatch):
@@ -999,6 +1101,78 @@ def test_red_clean_hold_and_zero_submission_are_valid_only_with_complete_bound_e
     assert payload["status"] == "clean"
     assert payload["phase"] == "qualification_clean"
     assert payload["artifacts"]["paper_tournament"]["payload"]["submitted_count"] == 0
+
+
+def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_broker_errors():
+    overnight = {
+        "generated_at": "2026-08-21T15:00:00+00:00",
+        "analysis_only": True,
+        "submitted": [],
+        "overnight_quality": {
+            "completion_status": "complete",
+            "graph_failure_count": 0,
+            "graph_attempt_failure_count": 0,
+            "top_provider_bundle_error_count": 0,
+            "tradable_count": 1,
+            "per_ticker_timeout_minutes": 2,
+            "time_budget_minutes": 3,
+        },
+    }
+    assert shadow_trial._stage_semantic_reasons("overnight_research", overnight) == []
+    broken_overnight = {
+        **overnight,
+        "overnight_quality": {**overnight["overnight_quality"], "graph_failure_count": 1},
+    }
+    assert "overnight_research_stage_provider_or_graph_failure" in shadow_trial._stage_semantic_reasons(
+        "overnight_research", broken_overnight
+    )
+
+    reconciliation = {
+        "kind": "broker_reconciliation_observer",
+        "status": "COMPLETE",
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "read_only": True,
+        "submitted_count": 0,
+        "cancelled_count": 0,
+        "live": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
+        "paper": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
+    }
+    assert shadow_trial._stage_semantic_reasons("broker_reconciliation", reconciliation) == []
+    broken_reconciliation = {
+        **reconciliation,
+        "live": {**reconciliation["live"], "errors": {"orders": "timeout"}},
+    }
+    assert "broker_reconciliation_stage_semantics_invalid" in shadow_trial._stage_semantic_reasons(
+        "broker_reconciliation", broken_reconciliation
+    )
+
+    loss_review = {
+        "evidence_type": "loss_review_evidence",
+        "payload": {
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "next_action": "autonomous_hold",
+            "submitted_order_count": 0,
+        },
+        "freshness": {"read_only": True, "can_submit_orders": False},
+    }
+    assert shadow_trial._stage_semantic_reasons("loss_review", loss_review) == []
+    assert "loss_review_stage_schema_invalid" in shadow_trial._stage_semantic_reasons(
+        "loss_review", {**loss_review, "evidence_type": "provider_summary"}
+    )
+
+
+def test_hourly_stage_requires_explicit_persisted_dry_run_marker():
+    hourly = {"kind": "hourly_supervisor", "decision": "hold", "submitted": []}
+    assert "hourly_supervisor_stage_not_dry_run" in shadow_trial._stage_semantic_reasons(
+        "hourly_supervisor", hourly
+    )
+    assert shadow_trial._stage_semantic_reasons(
+        "hourly_supervisor", {**hourly, "shadow_dry_run": True}
+    ) == []
 
 
 def test_daily_chain_manifest_rejects_missing_stage_and_replaced_stage_file(tmp_path, monkeypatch):

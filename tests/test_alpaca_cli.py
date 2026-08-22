@@ -1542,8 +1542,16 @@ def test_alpaca_supervise_hourly_dry_run_logs_without_submitting(monkeypatch, tm
     assert payload["portfolio"]["live"]["positions"][0]["symbol"] == "GOOGL"
     assert payload["evidence"]["risk_posture"]["name"] == "balanced"
     assert payload["evidence"]["risk_posture"]["live_gate_relaxation_allowed"] is False
+    assert payload["shadow_dry_run"] is True
+    assert payload["analysis_only"] is True
+    assert payload["execution_authority"] == "none"
+    assert payload["can_submit_orders"] is False
     assert live_client.submitted == []
-    assert list(tmp_path.glob("hourly-supervisor-*.json"))
+    raw_packets = [path for path in tmp_path.glob("hourly-supervisor-*.json") if not path.name.endswith(".compact.json")]
+    assert raw_packets
+    raw_payload = json.loads(raw_packets[0].read_text(encoding="utf-8"))
+    assert raw_payload["shadow_dry_run"] is True
+    assert raw_payload["can_submit_orders"] is False
 
 
 def test_alpaca_supervise_hourly_compact_json_output_points_to_raw_packet(monkeypatch, tmp_path):
