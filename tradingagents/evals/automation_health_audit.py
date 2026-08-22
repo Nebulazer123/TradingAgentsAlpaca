@@ -432,12 +432,178 @@ def _contract_local_occurrences(rrule: str) -> list[tuple[int, int]]:
     )
 
 
-def evaluate_schedule_contract(
+SCHEDULE_CAPTURE_SCHEMA_VERSION = "schedule_contract_capture_v1"
+
+
+def _capture_schedule_source(path_value: str | Path, *, captured_at: str) -> dict[str, Any]:
+    """Capture one source through one descriptor and detect an in-read change."""
+
+    path = Path(path_value).absolute()
+    captured: dict[str, Any] = {
+        "path": str(path),
+        "status": "missing",
+        "sha256": None,
+        "size_bytes": None,
+        "captured_at": captured_at,
+        "_bytes": None,
+    }
+    try:
+        with path.open("rb") as source:
+            before = os.fstat(source.fileno())
+            raw = source.read()
+            after = os.fstat(source.fileno())
+    except OSError:
+        return captured
+    captured.update(
+        {
+            "status": (
+                "changed"
+                if (before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_ino, after.st_size, after.st_mtime_ns)
+                else "captured"
+            ),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+            "_bytes": raw,
+        }
+    )
+    return captured
+
+
+def _captured_json(source: Mapping[str, Any]) -> dict[str, Any] | None:
+    raw = source.get("_bytes")
+    if source.get("status") != "captured" or not isinstance(raw, bytes):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _captured_toml(source: Mapping[str, Any]) -> dict[str, Any]:
+    raw = source.get("_bytes")
+    if source.get("status") != "captured" or not isinstance(raw, bytes):
+        return {}
+    try:
+        payload = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return {}
+    return cast(dict[str, Any], payload) if isinstance(payload, dict) else {}
+
+
+def _schedule_source_is_intact(source: Any) -> bool:
+    if not isinstance(source, Mapping):
+        return False
+    raw = source.get("_bytes")
+    return (
+        source.get("status") == "captured"
+        and isinstance(raw, bytes)
+        and source.get("size_bytes") == len(raw)
+        and source.get("sha256") == hashlib.sha256(raw).hexdigest()
+        and isinstance(source.get("path"), str)
+        and bool(source["path"])
+        and isinstance(source.get("captured_at"), str)
+        and bool(source["captured_at"])
+    )
+
+
+def capture_schedule_contract_snapshot(
     *,
     contract_path: str | Path,
     automation_root: str | Path | None = None,
     role_contract_path: str | Path | None = None,
+    captured_at: dt.datetime | None = None,
+) -> dict[str, Any]:
+    """Capture every source a schedule evaluation may inspect, without evaluating it."""
+
+    capture_time = _now_iso(captured_at or dt.datetime.now(tz=UTC))
+    source = Path(contract_path)
+    root = Path(automation_root) if automation_root is not None else default_automation_root()
+    contract = _capture_schedule_source(source, captured_at=capture_time)
+    contract_document = _captured_json(contract)
+    role_path = Path(role_contract_path) if role_contract_path is not None else source.parent / "automation_roles.json"
+    role_contract = _capture_schedule_source(role_path, captured_at=capture_time)
+    expected_ids = (
+        set(contract_document.get("automations") or {})
+        if isinstance(contract_document, Mapping)
+        and isinstance(contract_document.get("automations"), Mapping)
+        else set()
+    )
+    discovered_paths = sorted(root.glob("tradingagents-*/automation.toml"))
+    discovered_by_id = {path.parent.name: path for path in discovered_paths}
+    automation_tomls: list[dict[str, Any]] = []
+    for automation_id in sorted(expected_ids | set(discovered_by_id)):
+        config_path = discovered_by_id.get(automation_id, root / automation_id / "automation.toml")
+        captured = _capture_schedule_source(config_path, captured_at=capture_time)
+        captured["automation_id"] = automation_id
+        automation_tomls.append(captured)
+    return {
+        "schema_version": SCHEDULE_CAPTURE_SCHEMA_VERSION,
+        "captured_at": capture_time,
+        "automation_root": str(root.absolute()),
+        "contract": contract,
+        "role_contract": role_contract,
+        "automation_tomls": automation_tomls,
+        "discovered_automation_ids": sorted(discovered_by_id),
+    }
+
+
+def schedule_contract_snapshot_manifest(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return packet-safe provenance for the exact bytes retained in a snapshot."""
+
+    def public(source: Any) -> dict[str, Any]:
+        if not isinstance(source, Mapping):
+            return {"status": "invalid_capture"}
+        return {
+            key: source.get(key)
+            for key in ("automation_id", "path", "status", "sha256", "size_bytes", "captured_at")
+            if key in source
+        }
+
+    sources = [snapshot.get("contract"), snapshot.get("role_contract")]
+    tomls = snapshot.get("automation_tomls")
+    if isinstance(tomls, list):
+        sources.extend(tomls)
+    capture_issues = []
+    if snapshot.get("schema_version") != SCHEDULE_CAPTURE_SCHEMA_VERSION:
+        capture_issues.append("schema_invalid")
+    if any(
+        not isinstance(source, Mapping)
+        or source.get("status") == "changed"
+        or (source.get("status") == "captured" and not _schedule_source_is_intact(source))
+        for source in sources
+    ):
+        capture_issues.append("source_missing_malformed_or_changed")
+    paths = [str(source.get("path")) for source in sources if isinstance(source, Mapping)]
+    automation_ids = [
+        str(source.get("automation_id"))
+        for source in tomls or []
+        if isinstance(source, Mapping)
+    ]
+    if len(paths) != len(set(paths)) or len(automation_ids) != len(set(automation_ids)):
+        capture_issues.append("duplicate_source")
+    return {
+        "captured_at": snapshot.get("captured_at"),
+        "provenance": "direct_current_configuration_capture",
+        "freshness": {
+            "status": "not_applicable",
+            "rule": "static_configuration_captured_this_audit",
+        },
+        "contract": public(snapshot.get("contract")),
+        "role_contract": public(snapshot.get("role_contract")),
+        "automation_tomls": [public(source) for source in tomls or [] if isinstance(source, Mapping)],
+        "capture_issues": sorted(set(capture_issues)),
+    }
+
+
+def evaluate_schedule_contract(
+    *,
+    contract_path: str | Path | None = None,
+    automation_root: str | Path | None = None,
+    role_contract_path: str | Path | None = None,
     deployment_phase: str = PREDEPLOYMENT_PAUSED_PHASE,
+    captured_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compare the ten external TOMLs to the versioned CT schedule contract.
 
@@ -448,10 +614,19 @@ def evaluate_schedule_contract(
     it never proves deployment or changes an external record.
     """
 
-    source = Path(contract_path)
-    try:
-        contract = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    if captured_snapshot is None:
+        if contract_path is None:
+            return _schedule_contract_failure("contract_unreadable")
+        captured_snapshot = capture_schedule_contract_snapshot(
+            contract_path=contract_path,
+            automation_root=automation_root,
+            role_contract_path=role_contract_path,
+        )
+    manifest = schedule_contract_snapshot_manifest(captured_snapshot)
+    if manifest["capture_issues"]:
+        return _schedule_contract_failure("captured_snapshot_invalid")
+    contract = _captured_json(cast(Mapping[str, Any], captured_snapshot["contract"]))
+    if contract is None:
         return _schedule_contract_failure("contract_unreadable")
     issues = _schedule_contract_issues(contract)
     if issues:
@@ -466,22 +641,24 @@ def evaluate_schedule_contract(
     active_automation_ids = set(phases[deployment_phase]["active_automation_ids"])
 
     records = cast(Mapping[str, Mapping[str, Any]], contract["automations"])
-    root = Path(automation_root) if automation_root is not None else default_automation_root()
-    role_path = Path(role_contract_path) if role_contract_path is not None else source.parent / "automation_roles.json"
-    try:
-        role_document = json.loads(role_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        role_document = {}
+    role_document = _captured_json(cast(Mapping[str, Any], captured_snapshot["role_contract"])) or {}
     assignments = role_document.get("automations") if isinstance(role_document, Mapping) else {}
     if not isinstance(assignments, Mapping):
         assignments = {}
     rows: list[dict[str, Any]] = []
     configured_count = 0
     paused_count = 0
+    captured_tomls = captured_snapshot.get("automation_tomls")
+    if not isinstance(captured_tomls, list):
+        return _schedule_contract_failure("captured_snapshot_invalid")
+    tomls_by_id = {
+        str(source.get("automation_id")): source
+        for source in captured_tomls
+        if isinstance(source, Mapping)
+    }
     for automation_id in sorted(records):
         expected = records[automation_id]
-        config_path = root / automation_id / "automation.toml"
-        actual = _read_toml(config_path)
+        actual = _captured_toml(tomls_by_id.get(automation_id, {}))
         mismatches: list[dict[str, Any]] = []
         if not actual:
             mismatches.append(
@@ -574,7 +751,7 @@ def evaluate_schedule_contract(
             }
         )
     known_ids = set(records)
-    discovered_ids = {path.parent.name for path in root.glob("tradingagents-*/automation.toml")}
+    discovered_ids = set(cast(list[str], captured_snapshot.get("discovered_automation_ids") or []))
     unexpected_ids = sorted(discovered_ids - known_ids)
     if unexpected_ids:
         issues.append("unexpected_automation_ids")

@@ -1,16 +1,26 @@
 import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.main import app
 from tradingagents.evals import safety_sentinel
-from tradingagents.evals.safety_sentinel import build_safety_sentinel_packet
+from tradingagents.evals.automation_health_audit import (
+    capture_schedule_contract_snapshot,
+    evaluate_schedule_contract,
+)
+from tradingagents.evals.safety_sentinel import (
+    build_safety_sentinel_packet,
+    write_safety_sentinel_packet,
+)
 
 UTC = dt.timezone.utc
 runner = CliRunner()
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _ReadOnlyBrokerFake:
@@ -60,83 +70,41 @@ def _write_schedule_fixture(root: Path) -> tuple[Path, Path, Path]:
     contract = root / "schedule-contract.json"
     roles = root / "automation-roles.json"
     automation_root = root / "automations"
-    automation_id = "tradingagents-autonomous-safety-sentinel"
-    prompt = "deterministic verification escalate uncertain diagnosis to the self-healer fail closed"
-    import hashlib
-
-    _write_json(
-        contract,
-        {
-            "schema_version": 1,
-            "kind": "tradingagents_automation_schedule_contract",
-            "timezone": "America/Chicago",
-            "deployment_policy": {
-                "allowed_status_phase": "predeployment_paused",
-                "safe_statuses": ["PAUSED"],
-                "paused_is_safe_but_not_deployed": True,
-                "deployment_proof_requires": [
-                    "contract_match",
-                    "api_returned_next_run_central_and_utc",
-                    "current_no_submit_shadow_evidence",
-                    "current_artifact_health",
-                ],
-                "deployment_phases": {
-                    "predeployment_paused": {
-                        "active_automation_ids": [],
-                        "paused_automation_ids": [automation_id],
-                    },
-                    "frozen_observer": {
-                        "active_automation_ids": [],
-                        "paused_automation_ids": [automation_id],
-                    },
-                },
-            },
-            "automations": {
-                automation_id: {
-                    "role": "integrity_verifier",
-                    "name": "Safety sentinel",
-                    "target": {"type": "project", "project_id": "test-project"},
-                    "cwds": ["/tmp/tradingagents"],
-                    "execution_environment": "local",
-                    "allowed_status_phase": "predeployment_paused",
-                    "rrule": "RRULE:FREQ=DAILY;BYHOUR=8;BYMINUTE=20",
-                    "model": "test-model",
-                    "reasoning_effort": "medium",
-                    "notification_policy": "failed_runs_only",
-                    "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-                    "required_prompt_phrases": [
-                        "deterministic verification",
-                        "escalate uncertain diagnosis to the self-healer",
-                        "fail closed",
-                    ],
-                    "forbidden_prompt_phrases": [],
-                    "expected_artifact_patterns": ["results/safety_sentinel/safety-sentinel-*.json"],
-                    "depends_on": [],
-                    "no_submit": True,
-                }
-            },
-        },
+    contract_payload = json.loads(
+        (REPO_ROOT / "config" / "automation_schedule_contract.json").read_text(encoding="utf-8")
     )
-    _write_json(roles, {"automations": {automation_id: "integrity_verifier"}})
-    toml_path = automation_root / automation_id / "automation.toml"
-    toml_path.parent.mkdir(parents=True, exist_ok=True)
-    toml_path.write_text(
-        "\n".join(
-            [
-                'name = "Safety sentinel"',
-                f'prompt = "{prompt}"',
-                'status = "PAUSED"',
-                'target = { type = "project", project_id = "test-project" }',
-                'cwds = ["/tmp/tradingagents"]',
-                'execution_environment = "local"',
-                'rrule = "RRULE:FREQ=DAILY;BYHOUR=8;BYMINUTE=20"',
-                'model = "test-model"',
-                'reasoning_effort = "medium"',
-                'notification_policy = "failed_runs_only"',
-            ]
-        ),
-        encoding="utf-8",
+    roles_payload = json.loads(
+        (REPO_ROOT / "config" / "automation_roles.json").read_text(encoding="utf-8")
     )
+    for automation_id, record in contract_payload["automations"].items():
+        prompt = " ".join(record["required_prompt_phrases"])
+        record["prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        toml_path = automation_root / automation_id / "automation.toml"
+        toml_path.parent.mkdir(parents=True, exist_ok=True)
+        toml_path.write_text(
+            "\n".join(
+                [
+                    f"name = {json.dumps(record['name'])}",
+                    f"prompt = {json.dumps(prompt)}",
+                    'status = "PAUSED"',
+                    (
+                        "target = { "
+                        f"type = {json.dumps(record['target']['type'])}, "
+                        f"project_id = {json.dumps(record['target']['project_id'])} "
+                        "}"
+                    ),
+                    f"cwds = {json.dumps(record['cwds'])}",
+                    f"execution_environment = {json.dumps(record['execution_environment'])}",
+                    f"rrule = {json.dumps(record['rrule'])}",
+                    f"model = {json.dumps(record['model'])}",
+                    f"reasoning_effort = {json.dumps(record['reasoning_effort'])}",
+                    f"notification_policy = {json.dumps(record['notification_policy'])}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    _write_json(contract, contract_payload)
+    _write_json(roles, roles_payload)
     return contract, roles, automation_root
 
 
@@ -189,6 +157,8 @@ def _packet(
             "open_orders": [],
             "clock": {"is_open": False},
             "errors": {},
+            "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+            "captured_at": "2026-08-21T13:30:00+00:00",
         },
         now=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
         max_evidence_age_minutes=max_evidence_age_minutes,
@@ -206,6 +176,82 @@ def test_safety_sentinel_frozen_control_is_frozen_and_remains_non_authorizing(tm
     assert packet["evidence"]["live_control"]["sha256"]
     assert packet["schedule_check"]["deployment_phase"] == "predeployment_paused"
     assert "frozen_control" in packet["reasons"]
+
+
+def test_safety_sentinel_captures_and_evaluates_complete_schedule_snapshot(tmp_path):
+    packet = _packet(tmp_path)
+
+    assert packet["status"] == "CLEAR"
+    schedule_evidence = packet["evidence"]["schedule_configuration"]
+    assert schedule_evidence["provenance"] == "direct_current_configuration_capture"
+    assert schedule_evidence["freshness"]["status"] == "not_applicable"
+    assert schedule_evidence["captured_at"] == "2026-08-21T13:30:00+00:00"
+    assert len(schedule_evidence["automation_tomls"]) == 10
+    assert all(
+        entry["status"] == "captured"
+        and entry["sha256"]
+        and entry["size_bytes"] > 0
+        and Path(entry["path"]).is_absolute()
+        for entry in schedule_evidence["automation_tomls"]
+    )
+    assert all(row["status"] == "match" for row in packet["schedule_check"]["automations"])
+
+
+def test_captured_schedule_snapshot_evaluates_without_rereading_paths_and_rejects_tampering(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    contract.unlink()
+    roles.unlink()
+
+    result = evaluate_schedule_contract(captured_snapshot=snapshot)
+
+    assert result["contract_status"] == "pass"
+    assert all(row["status"] == "match" for row in result["automations"])
+    snapshot["contract"]["sha256"] = "0" * 64
+    tampered = evaluate_schedule_contract(captured_snapshot=snapshot)
+    assert tampered["issues"] == ["captured_snapshot_invalid"]
+
+
+def test_safety_sentinel_holds_missing_or_changed_schedule_capture(tmp_path, monkeypatch):
+    control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path / "missing")
+    roles.unlink()
+    missing = build_safety_sentinel_packet(
+        live_control_path=control,
+        preopen_validation_path=preopen,
+        schedule_contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        broker_snapshot={
+            "account": {},
+            "positions": [],
+            "open_orders": [],
+            "clock": {},
+            "errors": {},
+            "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+            "captured_at": "2026-08-21T13:30:00+00:00",
+        },
+        now=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path / "changed")
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    snapshot["automation_tomls"][0]["status"] = "changed"
+    monkeypatch.setattr(safety_sentinel, "capture_schedule_contract_snapshot", lambda **_kwargs: snapshot)
+    changed = _packet(tmp_path / "changed-packet")
+
+    assert missing["status"] == "HOLD"
+    assert "schedule_configuration_capture_invalid" in missing["reasons"]
+    assert changed["status"] == "HOLD"
+    assert "schedule_configuration_capture_invalid" in changed["reasons"]
 
 
 def test_safety_sentinel_missing_stale_and_corrupt_evidence_hold(tmp_path):
@@ -235,18 +281,7 @@ def test_safety_sentinel_cli_uses_only_narrow_read_only_broker_adapter(tmp_path,
     control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
     client = _ReadOnlyBrokerFake()
     output_dir = tmp_path / "safety-sentinel-output"
-    monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (object(), client))
-    monkeypatch.setattr(
-        safety_sentinel,
-        "evaluate_schedule_contract",
-        lambda **kwargs: {
-            "status": "not_deployed",
-            "contract_status": "pass",
-            "safe_predeployment": True,
-            "issues": [],
-            "deployment_proven": False,
-        },
-    )
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: client)
     monkeypatch.setattr(
         cli_main,
         "_alpaca_policy_now",
@@ -288,3 +323,51 @@ def test_safety_sentinel_cli_uses_only_narrow_read_only_broker_adapter(tmp_path,
         ("list_orders", "open"),
         ("get_clock", None),
     ]
+
+
+def test_safety_sentinel_holds_malformed_broker_values_even_when_all_keys_exist(tmp_path):
+    control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
+
+    packet = build_safety_sentinel_packet(
+        live_control_path=control,
+        preopen_validation_path=preopen,
+        schedule_contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        broker_snapshot={
+            "account": None,
+            "positions": "not-a-list",
+            "open_orders": {},
+            "clock": [],
+            "errors": {},
+            "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+            "captured_at": "2026-08-21T13:30:00+00:00",
+        },
+        now=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    assert packet["status"] == "HOLD"
+    assert set(packet["reasons"]) >= {
+        "broker_snapshot_account_invalid",
+        "broker_snapshot_positions_invalid",
+        "broker_snapshot_open_orders_invalid",
+        "broker_snapshot_clock_invalid",
+    }
+
+
+def test_safety_sentinel_writer_refuses_collision_and_failed_publication(tmp_path, monkeypatch):
+    packet = _packet(tmp_path / "packet")
+    output_dir = tmp_path / "output"
+    first = write_safety_sentinel_packet(packet, output_dir=output_dir)
+    original = first.read_bytes()
+
+    with pytest.raises(FileExistsError):
+        write_safety_sentinel_packet(packet, output_dir=output_dir)
+    assert first.read_bytes() == original
+
+    failed_dir = tmp_path / "failed-publication"
+    monkeypatch.setattr(safety_sentinel.os, "link", lambda *_args: (_ for _ in ()).throw(OSError("fail")))
+    with pytest.raises(OSError, match="fail"):
+        write_safety_sentinel_packet(packet, output_dir=failed_dir)
+    assert list(failed_dir.glob("safety-sentinel-*.json")) == []
+    assert list(failed_dir.glob(".*.tmp")) == []

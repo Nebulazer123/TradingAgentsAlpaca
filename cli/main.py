@@ -9388,9 +9388,12 @@ def research_safety_sentinel_audit(
         write_safety_sentinel_packet,
     )
 
+    generated_at = _alpaca_policy_now()
     try:
-        _, live_client = _alpaca_clients()
-        broker_snapshot = capture_read_only_broker_snapshot(live_client)
+        broker_snapshot = capture_read_only_broker_snapshot(
+            _alpaca_live_client(),
+            captured_at=generated_at,
+        )
     except Exception as exc:  # noqa: BLE001 - preserve client setup failures in a HOLD packet.
         broker_snapshot = {
             "account": {},
@@ -9399,6 +9402,7 @@ def research_safety_sentinel_audit(
             "clock": {},
             "errors": {"client": f"live client initialization failed: {exc}"},
             "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+            "captured_at": generated_at.isoformat(timespec="seconds"),
         }
     packet = build_safety_sentinel_packet(
         live_control_path=live_control_path,
@@ -9407,7 +9411,7 @@ def research_safety_sentinel_audit(
         automation_root=automation_root,
         role_contract_path=role_contract_path,
         broker_snapshot=broker_snapshot,
-        now=_alpaca_policy_now(),
+        now=generated_at,
         max_evidence_age_minutes=max_evidence_age_minutes,
     )
     packet_path = write_safety_sentinel_packet(packet, output_dir=output_dir)

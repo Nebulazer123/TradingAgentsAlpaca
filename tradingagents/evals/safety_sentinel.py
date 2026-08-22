@@ -8,15 +8,20 @@ other authority surface.
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from tradingagents.evals.automation_health_audit import (
     PREDEPLOYMENT_PAUSED_PHASE,
+    capture_schedule_contract_snapshot,
     evaluate_schedule_contract,
+    schedule_contract_snapshot_manifest,
 )
 
 UTC = dt.timezone.utc
@@ -54,11 +59,21 @@ def _parse_timestamp(value: Any) -> dt.datetime | None:
     return parsed.astimezone(UTC)
 
 
-def _capture_json_evidence(path_value: str | Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def _capture_json_evidence(
+    path_value: str | Path,
+    *,
+    captured_at: dt.datetime,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Capture exact source bytes and parse one JSON input without mutation."""
 
-    path = Path(path_value)
-    evidence: dict[str, Any] = {"path": str(path), "sha256": None, "size_bytes": None}
+    path = Path(path_value).absolute()
+    evidence: dict[str, Any] = {
+        "path": str(path),
+        "sha256": None,
+        "size_bytes": None,
+        "captured_at": captured_at.isoformat(timespec="seconds"),
+        "freshness": {"status": "fresh", "rule": "direct_capture_current_audit"},
+    }
     try:
         raw = path.read_bytes()
     except OSError:
@@ -78,27 +93,11 @@ def _capture_json_evidence(path_value: str | Path) -> tuple[dict[str, Any], dict
     return evidence, payload
 
 
-def _capture_file_evidence(path_value: str | Path) -> dict[str, Any]:
-    """Capture an exact digest for a non-JSON schedule input."""
-
-    path = Path(path_value)
-    evidence: dict[str, Any] = {"path": str(path), "sha256": None, "size_bytes": None}
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        evidence["status"] = "missing"
-        return evidence
-    evidence.update(
-        {
-            "status": "captured",
-            "sha256": hashlib.sha256(raw).hexdigest(),
-            "size_bytes": len(raw),
-        }
-    )
-    return evidence
-
-
-def capture_read_only_broker_snapshot(client: Any) -> dict[str, Any]:
+def capture_read_only_broker_snapshot(
+    client: Any,
+    *,
+    captured_at: dt.datetime | None = None,
+) -> dict[str, Any]:
     """Read the four permitted Alpaca resources and retain failures as evidence."""
 
     snapshot: dict[str, Any] = {
@@ -108,6 +107,7 @@ def capture_read_only_broker_snapshot(client: Any) -> dict[str, Any]:
         "clock": {},
         "errors": {},
         "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+        "captured_at": _as_utc(captured_at).isoformat(timespec="seconds"),
     }
     readers = (
         ("account", "get_account", {}, lambda method: method()),
@@ -168,15 +168,25 @@ def build_safety_sentinel_packet(
     """Build a non-authorizing observer packet from immutable read evidence."""
 
     generated_at = _as_utc(now)
-    live_control_evidence, live_control = _capture_json_evidence(live_control_path)
-    preopen_evidence, preopen = _capture_json_evidence(preopen_validation_path)
-    schedule_evidence = _capture_file_evidence(schedule_contract_path)
-    role_evidence = _capture_file_evidence(role_contract_path)
+    live_control_evidence, live_control = _capture_json_evidence(
+        live_control_path,
+        captured_at=generated_at,
+    )
+    preopen_evidence, preopen = _capture_json_evidence(
+        preopen_validation_path,
+        captured_at=generated_at,
+    )
+    schedule_snapshot = capture_schedule_contract_snapshot(
+        contract_path=schedule_contract_path,
+        automation_root=automation_root,
+        role_contract_path=role_contract_path,
+        captured_at=generated_at,
+    )
+    schedule_evidence = schedule_contract_snapshot_manifest(schedule_snapshot)
     evidence = {
         "live_control": live_control_evidence,
         "preopen_validation": preopen_evidence,
-        "schedule_contract": schedule_evidence,
-        "role_contract": role_evidence,
+        "schedule_configuration": schedule_evidence,
     }
 
     reasons: list[str] = []
@@ -204,17 +214,20 @@ def build_safety_sentinel_packet(
         )
 
     schedule_check = evaluate_schedule_contract(
-        contract_path=schedule_contract_path,
-        automation_root=automation_root,
-        role_contract_path=role_contract_path,
         deployment_phase=PREDEPLOYMENT_PAUSED_PHASE,
+        captured_snapshot=schedule_snapshot,
     )
     schedule_check = dict(schedule_check)
     schedule_check["deployment_phase"] = PREDEPLOYMENT_PAUSED_PHASE
-    if schedule_evidence["status"] != "captured":
-        reasons.append("schedule_contract_missing")
-    if role_evidence["status"] != "captured":
-        reasons.append("role_contract_missing")
+    if schedule_evidence["capture_issues"] or any(
+        source.get("status") != "captured"
+        for source in (
+            schedule_evidence["contract"],
+            schedule_evidence["role_contract"],
+            *schedule_evidence["automation_tomls"],
+        )
+    ):
+        reasons.append("schedule_configuration_capture_invalid")
     if (
         schedule_check.get("contract_status") != "pass"
         or schedule_check.get("safe_predeployment") is not True
@@ -234,9 +247,26 @@ def build_safety_sentinel_packet(
         broker_errors = {"errors": "invalid"}
     if broker_errors:
         reasons.append("broker_read_failed")
-    for key in ("account", "positions", "open_orders", "clock"):
-        if key not in snapshot:
-            reasons.append(f"broker_snapshot_{key}_missing")
+    expected_read_methods = ["get_account", "list_positions", "list_orders", "get_clock"]
+    if snapshot.get("read_methods") != expected_read_methods:
+        reasons.append("broker_snapshot_read_methods_invalid")
+    snapshot_captured_at = _parse_timestamp(snapshot.get("captured_at"))
+    if snapshot_captured_at is None:
+        reasons.append("broker_snapshot_captured_at_invalid")
+    elif snapshot_captured_at > generated_at + dt.timedelta(minutes=5):
+        reasons.append("broker_snapshot_timestamp_in_future")
+    elif generated_at - snapshot_captured_at > dt.timedelta(minutes=max_evidence_age_minutes):
+        reasons.append("broker_snapshot_stale")
+    if not isinstance(snapshot.get("account"), Mapping):
+        reasons.append("broker_snapshot_account_invalid")
+    if not isinstance(snapshot.get("positions"), list):
+        reasons.append("broker_snapshot_positions_invalid")
+    if not isinstance(snapshot.get("open_orders"), list):
+        reasons.append("broker_snapshot_open_orders_invalid")
+    if not isinstance(snapshot.get("clock"), Mapping):
+        reasons.append("broker_snapshot_clock_invalid")
+    if not all(isinstance(key, str) and isinstance(value, str) for key, value in broker_errors.items()):
+        reasons.append("broker_snapshot_errors_invalid")
 
     status = "FROZEN" if frozen_control else ("HOLD" if reasons else "CLEAR")
     return {
@@ -259,8 +289,29 @@ def build_safety_sentinel_packet(
             "clock": snapshot.get("clock", {}),
             "errors": dict(broker_errors),
             "read_methods": snapshot.get("read_methods", []),
+            "captured_at": snapshot.get("captured_at"),
         },
     }
+
+
+def _fsync_directory(path: Path) -> None:
+    """Durably record a successful publication when the platform supports it."""
+
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)}
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def write_safety_sentinel_packet(
@@ -275,13 +326,29 @@ def write_safety_sentinel_packet(
     generated_at = _parse_timestamp(packet.get("generated_at")) or dt.datetime.now(tz=UTC)
     stem = generated_at.strftime("safety-sentinel-%Y%m%d-%H%M%S-%f")
     output_path = root / f"{stem}.json"
-    for index in range(1, 1000):
-        if not output_path.exists():
-            break
-        output_path = root / f"{stem}-{index:03d}.json"
-    else:
-        raise RuntimeError("could not allocate a safety-sentinel packet path")
     payload = dict(packet)
     payload["packet_path"] = str(output_path)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    canonical_json = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=root,
+        prefix=f".{stem}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    published = False
+    try:
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(canonical_json)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.link(temporary_path, output_path)
+        published = True
+        _fsync_directory(root)
+    except Exception:
+        if published:
+            output_path.unlink(missing_ok=True)
+            _fsync_directory(root)
+        raise
+    finally:
+        temporary_path.unlink(missing_ok=True)
     return output_path
