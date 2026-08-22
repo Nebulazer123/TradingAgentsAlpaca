@@ -3503,6 +3503,11 @@ def research_execution_board_review(
         max=200,
         help="Maximum recent hourly packets to review.",
     ),
+    loss_review_evidence_dir: Path = typer.Option(
+        Path("results/loss_review_evidence"),
+        "--loss-review-evidence-dir",
+        help="Directory containing refreshed loss-review evidence packets.",
+    ),
     output_dir: Path = typer.Option(
         Path("results/execution_board"),
         "--output-dir",
@@ -3514,6 +3519,7 @@ def research_execution_board_review(
     review = build_execution_board_review(
         hourly_dir=hourly_dir,
         max_packets=max_packets,
+        loss_review_evidence_dir=loss_review_evidence_dir,
         decision_ledger_root=CANONICAL_BOARD_LEDGER_ROOT,
         decision_evidence_root=CANONICAL_BOARD_EVIDENCE_ROOT,
     )
