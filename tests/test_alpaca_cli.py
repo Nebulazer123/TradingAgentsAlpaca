@@ -1749,6 +1749,12 @@ def test_clean_day_runbook_exact_commands_exist_without_executing_runtime():
         "results/self_heal/plans/observer-<run-id>",
         "--json-output",
     ]
+    expected_status = [
+        *prefix,
+        "research",
+        "shadow-streak-status",
+        "--json-output",
+    ]
     expected_streak = [
         *prefix,
         "research",
@@ -1757,7 +1763,16 @@ def test_clean_day_runbook_exact_commands_exist_without_executing_runtime():
     ]
     assert expected_handoff in documented_commands
     assert expected_plan in documented_commands
+    assert expected_status in documented_commands
     assert expected_streak in documented_commands
+    streak_documentations = [
+        command for command in documented_commands if command[4:] == expected_streak[4:]
+    ]
+    assert len(streak_documentations) == 1
+    status_documentations = [
+        command for command in documented_commands if command[4:] == expected_status[4:]
+    ]
+    assert len(status_documentations) == 1
     runbook_text = re.sub(r"\s+", " ", report_path.read_text(encoding="utf-8"))
     assert "explicit paper submission is permitted only after broker clock proves regular session open" in runbook_text
 
@@ -1770,7 +1785,12 @@ def test_clean_day_runbook_exact_commands_exist_without_executing_runtime():
 
     assert command_index(("research", "shadow-day-adjudicate")) < command_index(
         ("alpaca", "paper-tournament", "finalize")
-    ) < command_index(("research", "shadow-streak-report"))
+    )
+    assert (
+        command_index(("alpaca", "paper-tournament", "finalize"))
+        < command_index(("research", "shadow-streak-status"))
+        < command_index(("research", "shadow-streak-report"))
+    )
 
     # Derive the option gate from every exact documented argv instead of a
     # hand-maintained subset that can silently omit a required negative flag.

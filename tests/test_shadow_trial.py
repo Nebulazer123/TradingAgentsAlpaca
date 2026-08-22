@@ -580,7 +580,14 @@ def test_red_production_cli_exposes_only_pinned_non_authorizing_inputs(tmp_path,
     streak_help = runner.invoke(app, ["research", "shadow-streak-report", "--help"])
     assert streak_help.exit_code == 0
     assert "--day-record" not in streak_help.output
-    assert not inspect.signature(shadow_trial.build_shadow_streak_report).parameters
+    assert "--final-no-go" in streak_help.output
+    status_help = runner.invoke(app, ["research", "shadow-streak-status", "--help"])
+    assert status_help.exit_code == 0
+    assert not inspect.signature(shadow_trial.shadow_streak_status).parameters
+    report_parameters = inspect.signature(shadow_trial.build_shadow_streak_report).parameters
+    assert list(report_parameters) == ["final_no_go"]
+    assert report_parameters["final_no_go"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert report_parameters["final_no_go"].default is False
 
     result = runner.invoke(
         app,
@@ -1354,7 +1361,9 @@ def test_red_artifact_bindings_reject_bool_submission_unknown_and_missing_proof(
         "daily_chain_manifest",
     }
     assert all("sha256" in binding for binding in decision_payload["artifacts"].values())
-    report = shadow_trial.build_shadow_streak_report()
+    with pytest.raises(ValueError, match="terminal|trial_complete|final-no-go|refuses"):
+        shadow_trial.build_shadow_streak_report()
+    report = shadow_trial.build_shadow_streak_report(final_no_go=True)
     assert report["phase"] == "readiness_no_go"
 
 
@@ -1948,3 +1957,348 @@ def test_red_cli_predecessor_transitions_allow_trial_repair_and_fresh_qualificat
     requalification = runner.invoke(app, ["research", "shadow-day-start", "--run-id", "q2", "--market-date", "2026-08-20", "--predecessor-object-id", repair_day.envelope.object_id, "--json-output"])
     assert requalification.exit_code == 0, requalification.output
     assert json.loads(requalification.stdout)["role"] == "qualification"
+
+
+def test_red_shadow_streak_status_is_read_only_non_authorizing_and_admissible(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    _set_clock(monkeypatch, "2026-08-21")
+
+    def ledger_state():
+        journal = environment["manual_root"] / "events.jsonl"
+        objects = sorted(
+            str(path.relative_to(environment["manual_root"]))
+            for path in environment["manual_root"].rglob("*")
+            if path.is_file()
+        ) if environment["manual_root"].exists() else []
+        return (
+            journal.read_bytes() if journal.exists() else b"",
+            tuple(objects),
+        )
+
+    empty = shadow_trial.shadow_streak_status()
+    assert empty["analysis_only"] is True
+    assert empty["execution_authority"] == "none"
+    assert empty["can_submit_orders"] is False
+    assert empty["phase"] == "qualification_pending"
+    assert empty["last_result"] is None
+    assert empty["pending_start"] is None
+    assert empty["predecessor_object_id"] is None
+    assert empty["clean_trial_streak"] == 0
+    assert empty["required_clean_trial_days"] == 5
+    assert empty["can_start_next_day"] is True
+
+    start = _start(monkeypatch, date="2026-08-21")
+    pending_before = ledger_state()
+    assert pending_before[0]
+    pending_status = shadow_trial.shadow_streak_status()
+    after = ledger_state()
+    assert pending_before == after
+    assert pending_status["analysis_only"] is True
+    assert pending_status["can_submit_orders"] is False
+    assert pending_status["phase"] == "qualification_pending"
+    assert pending_status["pending_start"]["object_id"] == start.envelope.object_id
+    assert pending_status["pending_start"]["market_date"] == "2026-08-21"
+    assert pending_status["can_start_next_day"] is False
+    assert pending_status["predecessor_object_id"] is None
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    qualified = shadow_trial.shadow_streak_status()
+    assert qualified["phase"] == "five_day_trial"
+    assert qualified["pending_start"] is None
+    assert qualified["last_result"]["object_id"] == day.envelope.object_id
+    assert qualified["last_result"]["status"] == "clean"
+    assert qualified["last_result"]["phase"] == "qualification_clean"
+    assert qualified["last_result"]["market_date"] == "2026-08-21"
+    assert qualified["clean_trial_streak"] == 0
+    assert qualified["predecessor_object_id"] == day.envelope.object_id
+    assert qualified["can_start_next_day"] is True
+
+
+def test_red_status_after_clean_qualification_does_not_block_trial_day_1(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    calendar = _CalendarFake({"2026-08-21", "2026-08-22"})
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: calendar)
+    qualification_start = _start(monkeypatch, date="2026-08-21")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-21")
+
+    status = shadow_trial.shadow_streak_status()
+    assert status["phase"] == "five_day_trial"
+    report_objects = environment["manual_root"] / "objects" / "manual-shadow-final-report"
+    assert not report_objects.exists()
+
+    _set_clock(monkeypatch, "2026-08-22")
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        trial_start = shadow_trial.create_shadow_day_start_manifest(
+            run_id="trial-day-1",
+            market_date="2026-08-22",
+            predecessor_object_id=qualification.envelope.object_id,
+        )
+    assert _payload(trial_start)["role"] == "trial"
+    assert _payload(trial_start)["phase"] == "five_day_trial"
+    trial_day = _day(tmp_path, monkeypatch, trial_start, date="2026-08-22")
+    assert _payload(trial_day)["status"] == "clean"
+
+    progress = shadow_trial.shadow_streak_status()
+    assert progress["clean_trial_streak"] == 1
+    assert progress["last_result"]["phase"] == "five_day_trial"
+    assert progress["can_start_next_day"] is True
+    assert not (environment["manual_root"] / "objects" / "manual-shadow-final-report").exists()
+
+
+def test_red_terminal_report_refuses_before_clean_trial_complete_unless_final_no_go(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    failed_start = _start(monkeypatch, date="2026-08-21")
+    failed_day = _day(
+        tmp_path,
+        monkeypatch,
+        failed_start,
+        date="2026-08-21",
+        artifacts={
+            "safety_sentinel": tmp_path / "missing-sentinel",
+            "paper_tournament": tmp_path / "missing-paper",
+        },
+    )
+    assert _payload(failed_day)["status"] in {"failed", "incomplete"}
+    with pytest.raises(ValueError, match="terminal|trial_complete|final-no-go|refuses"):
+        shadow_trial.build_shadow_streak_report()
+
+    _configure_environment(monkeypatch, tmp_path / "midtrial")
+    qualification_start = _start(monkeypatch, date="2026-08-21")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-21")
+    trial_start = _start(
+        monkeypatch,
+        date="2026-08-22",
+        predecessor_object_id=qualification.envelope.object_id,
+    )
+    _day(tmp_path, monkeypatch, trial_start, date="2026-08-22")
+    with pytest.raises(ValueError, match="terminal|trial_complete|final-no-go|refuses"):
+        shadow_trial.build_shadow_streak_report()
+    no_go = shadow_trial.build_shadow_streak_report(final_no_go=True)
+    assert no_go["phase"] == "readiness_no_go"
+    assert no_go["status"] == "no_go"
+
+
+def test_red_cli_status_is_read_only_and_report_requires_clean_trial_or_flag(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    calendar = _CalendarFake({"2026-08-21"})
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: calendar)
+    _set_clock(monkeypatch, "2026-08-21")
+
+    refused_empty = runner.invoke(app, ["research", "shadow-streak-report"])
+    assert refused_empty.exit_code != 0
+
+    started = runner.invoke(
+        app,
+        ["research", "shadow-day-start", "--run-id", "cli-status", "--market-date", "2026-08-21", "--json-output"],
+    )
+    assert started.exit_code == 0, started.output
+    start_id = json.loads(started.stdout)["object_id"]
+    start_record = shadow_trial.load_shadow_record(start_id, expected_kind="manual-shadow-day-start")
+
+    status_result = runner.invoke(app, ["research", "shadow-streak-status", "--json-output"])
+    assert status_result.exit_code == 0, status_result.output
+    status_payload = json.loads(status_result.stdout)
+    assert status_payload["analysis_only"] is True
+    assert status_payload["execution_authority"] == "none"
+    assert status_payload["can_submit_orders"] is False
+    assert status_payload["pending_start"]["object_id"] == start_id
+    assert status_payload["can_start_next_day"] is False
+
+    refused = runner.invoke(app, ["research", "shadow-streak-report"])
+    assert refused.exit_code != 0
+
+    qualification = _day(
+        tmp_path,
+        monkeypatch,
+        type("Admission", (), {"envelope": start_record})(),
+        date="2026-08-21",
+    )
+    status_after = runner.invoke(app, ["research", "shadow-streak-status", "--json-output"])
+    assert status_after.exit_code == 0, status_after.output
+    after_payload = json.loads(status_after.stdout)
+    assert after_payload["phase"] == "five_day_trial"
+    assert after_payload["last_result"]["object_id"] == qualification.envelope.object_id
+    assert after_payload["clean_trial_streak"] == 0
+    assert after_payload["can_start_next_day"] is True
+
+    refused_after = runner.invoke(app, ["research", "shadow-streak-report"])
+    assert refused_after.exit_code != 0
+    final_no_go = runner.invoke(
+        app,
+        ["research", "shadow-streak-report", "--final-no-go", "--json-output"],
+    )
+    assert final_no_go.exit_code == 0, final_no_go.output
+    no_go_payload = json.loads(final_no_go.stdout)
+    assert no_go_payload["phase"] == "readiness_no_go"
+    assert no_go_payload["execution_authority"] == "none"
+
+
+def _ledger_surface_snapshot(root_parent: Path) -> dict[str, object]:
+    """Capture every file name, digest, mode, size, and mtime under one parent."""
+
+    if not root_parent.exists():
+        return {"exists": False}
+    entries: dict[str, object] = {}
+    for path in sorted(root_parent.rglob("*")):
+        meta = path.lstat()
+        if path.is_file() and not path.is_symlink():
+            entries[str(path.relative_to(root_parent))] = (
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                meta.st_mode,
+                meta.st_size,
+                meta.st_mtime_ns,
+            )
+        else:
+            entries[str(path.relative_to(root_parent))] = ("non-regular", meta.st_mode)
+    return {"exists": True, "entries": entries}
+
+
+def test_red_status_never_creates_repairs_or_mutates_ledger_surfaces(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+    anchor_path = results_parent / ".manual-shadow-trusted-head.json"
+    lock_path = results_parent / ".manual-shadow-trusted-head.lock"
+
+    empty_before = _ledger_surface_snapshot(results_parent)
+    assert shadow_trial.shadow_streak_status()["phase"] == "qualification_pending"
+    assert empty_before == _ledger_surface_snapshot(results_parent)
+
+    qualification_start = _start(monkeypatch, date="2026-08-21")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-21")
+    assert _payload(qualification)["status"] == "clean"
+    assert lock_path.is_file()
+    lock_path.unlink()
+
+    clean_before = _ledger_surface_snapshot(results_parent)
+    clean_status = shadow_trial.shadow_streak_status()
+    clean_after = _ledger_surface_snapshot(results_parent)
+    assert clean_before == clean_after
+    assert clean_status["phase"] == "five_day_trial"
+    assert clean_status["last_result"]["object_id"] == qualification.envelope.object_id
+
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    committed = dict(anchor["committed_head"])
+    anchor["pending_next"] = {
+        "prior_head": committed,
+        "sequence": committed["sequence"] + 1,
+        "kind": "manual-shadow-day-start",
+        "object_id": f"manual-shadow-day-start-{'a' * 64}",
+        "retry_material_sha256": "a" * 64,
+        "admission_route": anchor["ledger_id"],
+    }
+    anchor_path.write_text(
+        json.dumps(
+            anchor,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    recover_before = _ledger_surface_snapshot(results_parent)
+    with pytest.raises(ValueError, match="unresolved|pending"):
+        shadow_trial.shadow_streak_status()
+    recover_after = _ledger_surface_snapshot(results_parent)
+    assert recover_before == recover_after
+
+    _set_clock(monkeypatch, "2026-08-22")
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        trial = shadow_trial.create_shadow_day_start_manifest(
+            run_id="trial-day-1",
+            market_date="2026-08-22",
+            predecessor_object_id=qualification.envelope.object_id,
+        )
+    pending_before = _ledger_surface_snapshot(results_parent)
+    pending_status = shadow_trial.shadow_streak_status()
+    pending_after = _ledger_surface_snapshot(results_parent)
+    assert pending_before == pending_after
+    assert pending_status["phase"] == "five_day_trial"
+    assert pending_status["pending_start"]["object_id"] == trial.envelope.object_id
+    assert pending_status["can_start_next_day"] is False
+
+
+def test_red_status_fails_closed_on_any_unresolved_pending_next(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+    anchor_path = results_parent / ".manual-shadow-trusted-head.json"
+
+    qualification_start = _start(monkeypatch, date="2026-08-21")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-21")
+    assert _payload(qualification)["status"] == "clean"
+
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    committed = dict(anchor["committed_head"])
+    anchor["pending_next"] = {
+        "prior_head": committed,
+        "sequence": committed["sequence"] + 1,
+        "kind": "manual-shadow-day-start",
+        "object_id": f"manual-shadow-day-start-{'a' * 64}",
+        "retry_material_sha256": "a" * 64,
+        "admission_route": anchor["ledger_id"],
+    }
+    anchor_path.write_text(
+        json.dumps(
+            anchor,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    equal_head_before = _ledger_surface_snapshot(results_parent)
+    with pytest.raises(ValueError, match="unresolved|pending"):
+        shadow_trial.shadow_streak_status()
+    assert equal_head_before == _ledger_surface_snapshot(results_parent)
+
+    lines = (environment["manual_root"] / "events.jsonl").read_bytes().splitlines()
+
+    def head_of(line: bytes, sequence: int) -> dict[str, object]:
+        event = json.loads(line)
+        return {
+            "sequence": sequence,
+            "kind": event["kind"],
+            "object_id": event["object_id"],
+            "event_sha256": hashlib.sha256(line).hexdigest(),
+            "admission_route": event["admission_route"],
+        }
+
+    prior_head = head_of(lines[-2], len(lines) - 1)
+    last_event = json.loads(lines[-1])
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    anchor["committed_head"] = prior_head
+    anchor["pending_next"] = {
+        "prior_head": prior_head,
+        "sequence": len(lines),
+        "kind": last_event["kind"],
+        "object_id": last_event["object_id"],
+        "retry_material_sha256": last_event["retry_material_sha256"],
+        "admission_route": last_event["admission_route"],
+    }
+    anchor_path.write_text(
+        json.dumps(
+            anchor,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    advanced_before = _ledger_surface_snapshot(results_parent)
+    with pytest.raises(ValueError, match="advanced|unresolved|pending"):
+        shadow_trial.shadow_streak_status()
+    assert advanced_before == _ledger_surface_snapshot(results_parent)

@@ -206,17 +206,30 @@ TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main research shadow-day-adjudicate \
   --paper-tournament <bound-paper-run> --daily-chain-manifest <manifest> --json-output
 TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main alpaca paper-tournament finalize \
   --log-dir results/paper_strategy_tournament/qualifier-<run-id> --json-output
-TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main research shadow-streak-report --json-output
+TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main research shadow-streak-status --json-output
 ```
 
 Run `paper-tournament finalize` only after the preceding qualifier adjudication is
-`clean`, then render the post-adjudication streak report. After a clean qualifier,
-initialize a **new**, distinct five-day root with
+`clean`, then inspect progress only with the read-only `shadow-streak-status`. That
+command appends nothing to the pinned ledger and never blocks Trial Day 1. Never call
+the terminal `research shadow-streak-report` after qualification or after Trial Days
+1–4: it admits a terminal readiness record that permanently closes the ledger. After a
+clean qualifier, initialize a **new**, distinct five-day root with
 `init --duration-days 5 --max-submission-market-days 5 --log-dir
 results/paper_strategy_tournament/trial-<run-id>`. On each trial day repeat the same
 start/sentinel-first observer sequence and bind the trial-root paper packet. Do not
 finalize ordinary trial days; finalize only after the clean Day 5 adjudication, then
-prove the closed lease rejects any future submission. Never overwrite a qualifier
+prove the closed lease rejects any future submission, and only then emit the terminal
+readiness record exactly once:
+
+```zsh
+# Terminal program record — valid only after the clean Day 5 adjudication and
+# trial-root finalization, or as an explicit owner-decided final NO-GO via
+# `research shadow-streak-report --final-no-go`. Never run it earlier.
+TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main research shadow-streak-report --json-output
+```
+
+Never overwrite a qualifier
 ledger with a trial ledger, invoke outbox delivery, activate schedules, or turn this
 non-authorizing readiness evidence into live execution authority.
 

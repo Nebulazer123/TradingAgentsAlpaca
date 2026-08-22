@@ -1607,6 +1607,42 @@ def _open_anchored_ledger(
     return anchor, envelopes, events, head
 
 
+def _peek_anchored_ledger(
+    parent_fd: int,
+) -> tuple[
+    dict[str, object],
+    tuple[EvidenceEnvelope, ...],
+    tuple[EvidenceEvent, ...],
+    EvidenceJournalHead,
+] | None:
+    """Validate and replay the anchored ledger without creating or repairing."""
+
+    anchor = _read_anchor(parent_fd)
+    if anchor is None:
+        root_state = _ledger_entry_state(
+            parent_fd,
+            _manual_shadow_root().name,
+            label="manual-shadow ledger root",
+        )
+        if root_state is not None:
+            raise ValueError("manual-shadow ledger exists without its trusted-head anchor")
+        return None
+    if anchor["pending_next"] is not None:
+        raise ValueError(
+            "manual-shadow ledger has an unresolved trusted-head pending append"
+        )
+    ledger_id = anchor["ledger_id"]
+    if not isinstance(ledger_id, str):
+        raise ValueError("trusted-head ledger identity is invalid")
+    envelopes, events, head = _replay_manual_shadow_ledger(
+        parent_fd,
+        ledger_id=ledger_id,
+    )
+    if not _head_matches(anchor["committed_head"], head):
+        raise ValueError("manual-shadow ledger rollback or head mismatch")
+    return anchor, envelopes, events, head
+
+
 def _store_envelopes(*, initialize: bool = False) -> tuple[EvidenceEnvelope, ...]:
     with _locked_anchor_parent() as parent_fd:
         opened = _open_anchored_ledger(parent_fd, initialize=initialize)
@@ -1614,6 +1650,49 @@ def _store_envelopes(*, initialize: bool = False) -> tuple[EvidenceEnvelope, ...
             return ()
         _anchor, envelopes, _events, _head = opened
         return envelopes
+
+
+def _store_envelopes_readonly() -> tuple[EvidenceEnvelope, ...]:
+    """Replay without O_CREAT, anchor repair, or any journal/object/anchor write.
+
+    The admission lock is honored only when it already exists; a missing lock
+    proves no admission transaction ever started against this trusted head.
+    """
+
+    anchor_path = _absolute(_manual_shadow_anchor_path())
+    lock_path = _absolute(_manual_shadow_anchor_lock_path())
+    if anchor_path.parent != lock_path.parent:
+        raise ValueError("trusted-head paths do not share one parent")
+    _reject_symlink_components(anchor_path.parent)
+    try:
+        parent_fd = os.open(anchor_path.parent, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+    except OSError as exc:
+        raise ValueError("trusted-head parent is missing or unsafe") from exc
+    lock_fd: int | None = None
+    try:
+        try:
+            lock_fd = os.open(lock_path.name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_fd)
+        except FileNotFoundError:
+            lock_fd = None
+        except OSError as exc:
+            raise ValueError("trusted-head lock could not be inspected safely") from exc
+        try:
+            if lock_fd is not None:
+                _require_anchor_file_state(os.fstat(lock_fd), label="trusted-head lock")
+                fcntl.flock(lock_fd, fcntl.LOCK_SH)
+            opened = _peek_anchored_ledger(parent_fd)
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+    finally:
+        os.close(parent_fd)
+    if opened is None:
+        return ()
+    _anchor, envelopes, _events, _head = opened
+    return envelopes
 
 
 def _control_binding(now: dt.datetime) -> tuple[dict[str, object], bool]:
@@ -2929,9 +3008,100 @@ def adjudicate_shadow_day(
         raise ValueError(f"shadow ledger admission failed: {exc}") from exc
 
 
-def build_shadow_streak_report() -> dict[str, object]:
-    """Replay the complete pinned ledger and admit one terminal non-authorizing report."""
+def _clean_trial_streak(days: tuple[EvidenceEnvelope, ...]) -> int:
+    """Count trailing clean trial-role days; qualification/repair never count."""
 
+    streak = 0
+    for day in reversed(days):
+        payload = day.payload
+        if payload.get("status") == "clean" and payload.get("role") == "trial":
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def shadow_streak_status() -> dict[str, object]:
+    """Read-only progress inspection; never appends to the pinned ledger."""
+
+    now, _effective_at = _now_stamp()
+    envelopes = _store_envelopes_readonly()
+    days, pending, last_day, report = _LedgerState(envelopes, now=now)
+    try:
+        next_phase, _next_role, expected_predecessor = _start_spec(last_day)
+    except ValueError:
+        next_phase, _next_role, expected_predecessor = None, None, None
+
+    phase: object
+    head_object_id: str | None
+    report_payload: Mapping[str, object] | None = None
+    pending_view: dict[str, object] | None = None
+    predecessor_view: str | None
+    if report is not None:
+        report_payload = report.payload
+        phase = report_payload.get("phase")
+        head_object_id = report.object_id
+        predecessor_view = None
+    elif pending is not None:
+        pending_payload = pending.payload
+        phase = pending_payload.get("phase")
+        head_object_id = pending.object_id
+        predecessor_view = None
+    else:
+        phase = next_phase
+        head_object_id = last_day.object_id if last_day is not None else None
+        predecessor_view = expected_predecessor if next_phase is not None else None
+
+    last_result: dict[str, object] | None = None
+    if last_day is not None:
+        day_payload = last_day.payload
+        last_result = {
+            "object_id": last_day.object_id,
+            "run_id": day_payload["run_id"],
+            "market_date": day_payload["market_date"],
+            "role": day_payload["role"],
+            "status": day_payload["status"],
+            "phase": day_payload["phase"],
+            "reasons": list(day_payload["reasons"]),
+        }
+    if pending is not None:
+        pending_payload = pending.payload
+        pending_view = {
+            "object_id": pending.object_id,
+            "run_id": pending_payload["run_id"],
+            "market_date": pending_payload["market_date"],
+            "role": pending_payload["role"],
+            "phase": pending_payload["phase"],
+        }
+
+    return {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "ledger_head_object_id": head_object_id,
+        "phase": phase,
+        "last_result": last_result,
+        "clean_trial_streak": _clean_trial_streak(days),
+        "required_clean_trial_days": 5,
+        "terminal_report_present": report is not None,
+        "pending_start": pending_view,
+        "predecessor_object_id": predecessor_view,
+        "can_start_next_day": (
+            report is None and pending is None and type(next_phase) is str
+        ),
+    }
+
+
+def build_shadow_streak_report(*, final_no_go: bool = False) -> dict[str, object]:
+    """Admit exactly one terminal non-authorizing readiness report.
+
+    This operation closes the ledger permanently.  It refuses to run before a
+    clean ``trial_complete`` chain unless the caller explicitly terminates the
+    whole program as a final NO-GO with ``final_no_go=True``.
+    """
+
+    if type(final_no_go) is not bool:
+        raise ValueError("final_no_go must be an exact boolean")
     now, effective_at = _now_stamp()
     prior = _store_envelopes()
     days, pending, _last_day, existing_report = _LedgerState(prior, now=now)
@@ -2940,6 +3110,12 @@ def build_shadow_streak_report() -> dict[str, object]:
     if pending is not None or not days:
         raise ValueError("shadow ledger has no terminal day chain")
     candidate, streak = _candidate_state(days)
+    if not candidate and not final_no_go:
+        raise ValueError(
+            "shadow-streak-report is terminal and refuses to run before a clean "
+            "trial_complete; inspect progress with shadow-streak-status or pass "
+            "--final-no-go only to terminate the program as a final NO-GO"
+        )
     payload: dict[str, object] = {
         "payload_schema": REPORT_SCHEMA,
         "ledger_head_object_id": days[-1].object_id,

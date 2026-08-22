@@ -9685,16 +9685,41 @@ def research_shadow_day_manifest(
     console.print(f"Shadow daily-chain manifest: {packet_path}")
 
 
+@research_app.command("shadow-streak-status")
+def research_shadow_streak_status(
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Read-only shadow-trial progress inspection; never writes the pinned ledger."""
+
+    from tradingagents.evals.shadow_trial import shadow_streak_status
+
+    try:
+        payload = shadow_streak_status()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Shadow-trial phase: {payload['phase']}")
+    console.print(f"Clean trial streak: {payload['clean_trial_streak']}")
+    console.print(f"Next start admissible: {payload['can_start_next_day']}")
+
+
 @research_app.command("shadow-streak-report")
 def research_shadow_streak_report(
     json_output: bool = typer.Option(False, "--json-output"),
+    final_no_go: bool = typer.Option(
+        False,
+        "--final-no-go/--no-final-no-go",
+        help="Explicitly terminate the whole program as a final NO-GO before a clean trial_complete.",
+    ),
 ):
-    """Replay the complete pinned ledger into a non-authorizing readiness report."""
+    """Admit exactly one terminal non-authorizing readiness report."""
 
     from tradingagents.evals.shadow_trial import build_shadow_streak_report
 
     try:
-        report = build_shadow_streak_report()
+        report = build_shadow_streak_report(final_no_go=final_no_go)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
     if json_output:
