@@ -240,3 +240,15 @@ non-authorizing readiness evidence into live execution authority.
 - GREEN: updated only that installed-record assertion to the versioned contract value and documented the contract relationship in the test.
 - Verification: `tests/test_automation_context_snapshot.py` — `45 passed`; Ruff on the changed test, `compileall -q` on the changed test, and `git diff --check` — all passed.
 - This was a test baseline correction only. No automation API or TOML change, schedule activation, runtime/control mutation, provider/broker request, or live-control/results access occurred.
+
+## Final source-gate evidence
+
+- Final integrated source HEAD: `269cc134f542e6d83c2efc06136ec30baed41b3d` (`fix: recheck paper clock after calendar`).
+- Independent Sol review: approved with P0=0 and P1=0; one non-blocking P2 remains about `started_at` labeling the validation-boundary sample rather than the exact durable-write instant.
+- Full repository suite: `3905 passed, 1 skipped, 11 warnings, 75 subtests passed in 405.21s (0:06:45)`. The single skip is the existing DeepSeek live-API test because `DEEPSEEK_API_KEY` is not configured. Warnings are existing model-name/runtime warnings and the authority-inventory source-parser warnings.
+- Static/source checks: `ruff check cli tradingagents scripts tests` passed; `compileall -q cli tradingagents scripts` passed; `git diff --check master...HEAD` passed; `zsh -n scripts/mac/ta_job.sh` passed.
+- Canonical `master` remained clean at `6a68cecb79c9af07b05676d60dfd266babfa97fb`; the feature worktree remained clean at the reviewed HEAD. No merge has been performed yet.
+- Frozen live-control SHA-256 remained `a3fc5ddb2b300596833c48c1554fad088ecb43d46bd70aeeac074531d6e9fb07`; no refresh, rearm, unfreeze, or write occurred.
+- All ten TradingAgents automation records retained their preflight SHA-256 values and `status = "PAUSED"`; no automation API/TOML update or schedule activation occurred.
+- The isolated worktree contains 122 ignored `results/` files from prior/test-only activity: 60 `manual_alpaca_submit`, 51 `research_evidence`, one `policy` lock, one `safety_sentinel`, plus the ignored `_context` index. These were inventoried and preserved, not treated as qualification evidence and not deleted. No qualification or five-day runtime trial has run.
+- Runtime rollout remains unstarted. Task 5 stays blocked until a future regular market day is explicitly chosen for the manual one-day qualification; schedules remain paused, live control remains frozen, and no live or paper transport was invoked by the source gate.
