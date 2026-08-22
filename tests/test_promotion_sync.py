@@ -12,8 +12,13 @@ from tradingagents.policy.promotion_sync import (
     sync_promotion_state_file,
     sync_promotion_state_from_tournament,
 )
+from tradingagents.policy.strategy_promotion import INTERNAL_EVIDENCE_MAX_AGE_SECONDS
 
 SYNC_NOW = datetime.datetime(2026, 6, 22, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+def _iso(moment):
+    return moment.isoformat(timespec="seconds")
 
 
 def _ranking(
@@ -153,6 +158,7 @@ def test_sync_without_arm_live_stays_fail_closed():
         tiny_live_tranche_usd=Decimal("25"),
         arm_live=False,
         ci_green=True,
+        now=SYNC_NOW,
     )
     promoted = result.state["sleeves"]["pullback-support"]
     assert promoted["stage"] == "tiny_live_eligible"
@@ -169,6 +175,7 @@ def test_sync_quality_gates_block_weak_candidate():
         tiny_live_tranche_usd=Decimal("25"),
         arm_live=True,
         ci_green=True,
+        now=SYNC_NOW,
     )
     assert result.promoted == []
     record = result.state["sleeves"]["pullback-support"]
@@ -184,6 +191,7 @@ def test_sync_requires_ci_attestation():
         tiny_live_tranche_usd=Decimal("25"),
         arm_live=True,
         ci_green=False,
+        now=SYNC_NOW,
     )
     assert result.promoted == []
     record = result.state["sleeves"]["pullback-support"]
@@ -203,6 +211,7 @@ def test_sync_promotion_state_file_roundtrip(tmp_path):
         tiny_live_tranche_usd=Decimal("25"),
         arm_live=True,
         ci_green=True,
+        now=SYNC_NOW,
     )
     assert result.promoted == ["pullback-support"]
     written = json.loads(state_path.read_text(encoding="utf-8"))
@@ -226,6 +235,7 @@ def test_sync_promotion_state_file_can_stage_without_mutating_canonical(tmp_path
         tiny_live_tranche_usd=Decimal("25"),
         arm_live=True,
         ci_green=True,
+        now=SYNC_NOW,
     )
 
     assert result.promoted == ["pullback-support"]
@@ -246,6 +256,7 @@ def test_sync_result_preserves_issues_for_every_sleeve():
         tiny_live_tranche_usd=Decimal("25"),
         arm_live=True,
         ci_green=True,
+        now=SYNC_NOW,
     )
 
     assert result.issues_by_sleeve == {
@@ -321,6 +332,98 @@ def test_sync_demotes_live_incumbent_when_report_generated_at_future():
     assert record["live_enabled"] is False
     assert "future" in record["demotion_reason"]
     assert "turned negative" not in record["demotion_reason"]
+
+
+def test_sync_accepts_fresh_canonical_generated_at():
+    result = _sync_incumbent(_fresh_report())
+
+    assert result.promoted == ["pullback-support"]
+    assert result.demoted == []
+    promoted = result.state["sleeves"]["pullback-support"]
+    assert promoted["stage"] == "tiny_live_eligible"
+    assert promoted["live_enabled"] is True
+    assert result.state["sleeves"]["current-aggressive"]["live_enabled"] is True
+
+
+def test_sync_accepts_report_one_second_inside_evidence_ceiling():
+    report = _fresh_report()
+    report["generated_at"] = _iso(
+        SYNC_NOW
+        - datetime.timedelta(seconds=INTERNAL_EVIDENCE_MAX_AGE_SECONDS)
+        + datetime.timedelta(seconds=1)
+    )
+
+    result = _sync_incumbent(report)
+
+    assert result.promoted == ["pullback-support"]
+    assert result.demoted == []
+
+
+@pytest.mark.parametrize(
+    ("case", "generated_at", "expected_fragment"),
+    [
+        ("missing", None, "generated_at is missing"),
+        ("invalid", "not-a-timestamp", "generated_at is invalid"),
+        ("naive", "2026-06-20T21:12:35", "timezone-naive"),
+        ("future", _iso(SYNC_NOW + datetime.timedelta(seconds=1)), "in the future"),
+        (
+            "stale_exact_boundary",
+            _iso(SYNC_NOW - datetime.timedelta(seconds=INTERNAL_EVIDENCE_MAX_AGE_SECONDS)),
+            "is stale",
+        ),
+        # Python >=3.10 support: a Z suffix may parse as non-canonical UTC
+        # (3.11+) or fail fromisoformat outright (3.10); both are rejections.
+        ("z_suffix", "2026-06-20T21:12:35Z", ("generated_at is invalid", "not canonical UTC")),
+        ("fractional_seconds", "2026-06-20T21:12:35.250000+00:00", "not canonical UTC"),
+        ("non_utc_offset", "2026-06-20T16:12:35-05:00", "not canonical UTC"),
+    ],
+)
+def test_sync_rejects_non_canonical_generated_at(case, generated_at, expected_fragment):
+    report = _fresh_report()
+    if generated_at is None:
+        report.pop("generated_at")
+    else:
+        report["generated_at"] = generated_at
+
+    result = _sync_incumbent(report)
+
+    assert result.promoted == []
+    assert result.demoted == ["current-aggressive"]
+
+    candidate = result.state["sleeves"]["pullback-support"]
+    assert candidate["stage"] == "paper_only"
+    assert candidate["live_enabled"] is False
+    assert any(
+        issue.startswith("tournament evidence rejected:")
+        for issue in candidate["issues"]
+    )
+    fragments = (
+        expected_fragment if isinstance(expected_fragment, tuple) else (expected_fragment,)
+    )
+    assert any(
+        any(fragment in issue for fragment in fragments)
+        for issue in candidate["issues"]
+    )
+
+    incumbent = result.state["sleeves"]["current-aggressive"]
+    assert incumbent["stage"] == "paper_only"
+    assert incumbent["live_enabled"] is False
+    assert "tournament evidence rejected:" in incumbent["demotion_reason"]
+
+
+def test_sync_stale_incumbent_demotes_and_blocks_candidate_in_same_call():
+    report = _fresh_report()
+    report["generated_at"] = _iso(SYNC_NOW - datetime.timedelta(days=8))
+
+    result = _sync_incumbent(report)
+
+    assert result.demoted == ["current-aggressive"]
+    assert result.promoted == []
+    assert result.state["sleeves"]["current-aggressive"]["stage"] == "paper_only"
+    candidate = result.state["sleeves"]["pullback-support"]
+    assert candidate["stage"] == "paper_only"
+    assert candidate["live_enabled"] is False
+    assert any("stale" in issue for issue in candidate["issues"])
 
 
 @pytest.mark.parametrize(

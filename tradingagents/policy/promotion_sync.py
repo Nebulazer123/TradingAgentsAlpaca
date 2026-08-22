@@ -121,6 +121,11 @@ _PROMOTION_RECORD_SOURCE_KEYS = frozenset(
         "candidate_reason",
     }
 )
+
+#: Public mirror of the authoritative persisted paper_tournament provenance
+#: schema for consumers (policy.live_gate) that must fail closed on any
+#: deviation from the writer-side source requirements.
+PAPER_TOURNAMENT_RECORD_SOURCE_KEYS = _PROMOTION_RECORD_SOURCE_KEYS
 _PROMOTION_EVIDENCE_METRIC_KEYS = frozenset(
     {
         "total_return",
@@ -247,7 +252,13 @@ def build_tournament_promotion_evidence(
 def _report_evidence_age_issue(
     report: Mapping, *, now: datetime.datetime
 ) -> str | None:
-    """Return a demotion-grade freshness complaint about the report, if any."""
+    """Return a demotion-grade freshness complaint about the report, if any.
+
+    The tournament ``generated_at`` stamp must already be strict canonical
+    UTC evidence: missing, malformed, timezone-naive, non-UTC-offset,
+    Z-suffixed, sub-second, future-dated, or reports at or beyond the
+    internal-evidence age ceiling are all rejected outright.
+    """
 
     raw = report.get("generated_at")
     if type(raw) is not str or not raw:
@@ -256,8 +267,21 @@ def _report_evidence_age_issue(
         moment = datetime.datetime.fromisoformat(raw)
     except ValueError:
         return f"tournament report generated_at is invalid: {raw!r}"
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return (
+            f"tournament report generated_at {raw} is timezone-naive and is "
+            "not canonical UTC evidence"
+        )
+    if (
+        moment.utcoffset() != datetime.timedelta(0)
+        or moment.microsecond
+        or moment.isoformat(timespec="seconds") != raw
+    ):
+        return (
+            f"tournament report generated_at {raw} is not canonical UTC: it "
+            "must already be tz-aware UTC at second precision with an exact "
+            "+00:00 isoformat round trip"
+        )
     if moment > now:
         return f"tournament report generated_at {raw} is in the future"
     if now - moment >= datetime.timedelta(seconds=INTERNAL_EVIDENCE_MAX_AGE_SECONDS):
@@ -606,7 +630,12 @@ def sync_promotion_state_from_tournament(
             )
             state = dict(decision.state)
             all_issues = list(decision.issues) + quality_issues
-            if quality_issues:
+            if evidence_issue is not None:
+                all_issues.append(f"tournament evidence rejected: {evidence_issue}")
+            # Rejected evidence may persist an explicit paper_only record with
+            # its issue, but it can never promote the candidate or grant any
+            # live authority.
+            if quality_issues or evidence_issue is not None:
                 state["stage"] = "paper_only"
                 state["live_enabled"] = False
             state["issues"] = all_issues

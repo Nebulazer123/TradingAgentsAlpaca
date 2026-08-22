@@ -90,6 +90,11 @@ def test_live_gate_never_treats_uncapped_as_live_budget(tmp_path):
     assert any("live_budget_mode" in issue.reason for issue in result.issues)
 
 
+#: Fresh for every gate clock used in this module (2026-06-01/03) while
+#: staying strictly canonical UTC whole-second +00:00.
+_LEGACY_FIXTURE_REPORT_STAMP = "2026-05-30T00:00:00+00:00"
+
+
 def _promotion_record(**overrides):
     record = {
         "stage": "tiny_live_eligible",
@@ -103,6 +108,13 @@ def _promotion_record(**overrides):
         "capacity_gate_passed": True,
         "validation_report_ref": "results/validation/pullback-support.json",
         "risk_envelope_ref": "config/risk_envelope.yaml",
+        "source": {
+            "kind": "paper_tournament",
+            "tournament_id": "paper-tournament-freshness",
+            "report_generated_at": _LEGACY_FIXTURE_REPORT_STAMP,
+            "candidate_reason": "positive paper strategy",
+        },
+        "evidence_metrics": _persisted_evidence_metrics(),
     }
     record.update(overrides)
     return record
@@ -1912,6 +1924,212 @@ def test_live_gate_rejects_incomplete_promotion_record(tmp_path):
     assert "preregistered" in reasons
     assert "benchmark_gate_passed" in reasons
     assert "validation_report_ref" in reasons
+
+
+def _promotion_record_with_tournament_source(report_generated_at):
+    source = {
+        "kind": "paper_tournament",
+        "tournament_id": "paper-tournament-freshness",
+        "candidate_reason": "positive paper strategy",
+    }
+    if report_generated_at is not None:
+        source["report_generated_at"] = report_generated_at
+    return _promotion_record(
+        source=source,
+        evidence_metrics=_persisted_evidence_metrics(),
+    )
+
+
+def _legacy_gate_result(tmp_path, record):
+    envelope_path = tmp_path / "risk_envelope.yaml"
+    promotion_path = tmp_path / "promotion.json"
+    control_path = tmp_path / "live_control.json"
+    _write_envelope(envelope_path)
+    _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
+    promotion_path.write_text(
+        json.dumps({"sleeves": {"pullback-support": record}}),
+        encoding="utf-8",
+    )
+    return evaluate_go_live_guard(
+        actions=[_tiny_live_action()],
+        risk_envelope_path=envelope_path,
+        promotion_state_path=promotion_path,
+        control_state_path=control_path,
+        live_buying_power=Decimal("100.00"),
+        now=datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc),
+    )
+
+
+def test_live_gate_allows_persisted_fresh_paper_tournament_source(tmp_path):
+    result = _legacy_gate_result(
+        tmp_path,
+        _promotion_record_with_tournament_source("2026-06-02T21:12:35+00:00"),
+    )
+
+    assert result.allowed is True
+    assert result.issues == []
+
+
+def test_live_gate_allows_paper_tournament_source_one_second_inside_ceiling(
+    tmp_path,
+):
+    result = _legacy_gate_result(
+        tmp_path,
+        _promotion_record_with_tournament_source("2026-05-27T15:00:01+00:00"),
+    )
+
+    assert result.allowed is True
+    assert result.issues == []
+
+
+@pytest.mark.parametrize(
+    ("case", "report_generated_at", "expected_fragment"),
+    [
+        ("missing", None, "report_generated_at is missing"),
+        ("invalid", "not-a-timestamp", "report_generated_at is invalid"),
+        ("naive", "2026-06-02T21:12:35", "timezone-naive"),
+        ("future", "2026-06-05T15:00:00+00:00", "in the future"),
+        ("stale_exact_boundary", "2026-05-27T15:00:00+00:00", "is stale"),
+        (
+            "z_suffix",
+            "2026-06-02T21:12:35Z",
+            ("report_generated_at is invalid", "not canonical UTC"),
+        ),
+        (
+            "fractional_seconds",
+            "2026-06-02T21:12:35.250000+00:00",
+            "not canonical UTC",
+        ),
+        ("non_utc_offset", "2026-06-02T16:12:35-05:00", "not canonical UTC"),
+    ],
+)
+def test_live_gate_rejects_persisted_stale_or_invalid_tournament_source(
+    tmp_path, case, report_generated_at, expected_fragment
+):
+    result = _legacy_gate_result(
+        tmp_path,
+        _promotion_record_with_tournament_source(report_generated_at),
+    )
+
+    assert result.allowed is False
+    assert result.checks["promotion"] is False
+    fragments = (
+        expected_fragment if isinstance(expected_fragment, tuple) else (expected_fragment,)
+    )
+    assert any(
+        any(fragment in issue.reason for fragment in fragments)
+        for issue in result.issues
+    )
+
+
+_FRESH_CANONICAL_REPORT_STAMP = "2026-06-02T21:12:35+00:00"
+
+
+def _paper_tournament_source(**overrides):
+    source = {
+        "kind": "paper_tournament",
+        "tournament_id": "paper-tournament-freshness",
+        "report_generated_at": _FRESH_CANONICAL_REPORT_STAMP,
+        "candidate_reason": "positive paper strategy",
+    }
+    source.update(overrides)
+    return source
+
+
+def _source_missing(key):
+    source = _paper_tournament_source()
+    del source[key]
+    return source
+
+
+@pytest.mark.parametrize(
+    ("case", "source", "expected_fragment"),
+    [
+        ("non_mapping_source", "paper-tournament", "source must be a JSON object"),
+        (
+            "missing_kind",
+            _source_missing("kind"),
+            "source.kind must be paper_tournament",
+        ),
+        (
+            "unknown_kind",
+            _paper_tournament_source(kind="spreadsheet"),
+            "source.kind must be paper_tournament",
+        ),
+        (
+            "missing_tournament_id",
+            _source_missing("tournament_id"),
+            "source.tournament_id is missing",
+        ),
+        (
+            "mistyped_tournament_id",
+            _paper_tournament_source(tournament_id=123),
+            "source.tournament_id must be a non-empty string",
+        ),
+        (
+            "mistyped_candidate_reason",
+            _paper_tournament_source(candidate_reason=None),
+            "source.candidate_reason must be a non-empty string",
+        ),
+        (
+            "extra_source_field",
+            _paper_tournament_source(protected_authority="unknown"),
+            "unexpected extra fields",
+        ),
+    ],
+)
+def test_live_gate_fails_closed_on_unusable_legacy_promotion_source(
+    tmp_path, case, source, expected_fragment
+):
+    record = _promotion_record(
+        source=source,
+        evidence_metrics=_persisted_evidence_metrics(),
+    )
+
+    result = _legacy_gate_result(tmp_path, record)
+
+    assert result.allowed is False
+    assert result.checks["promotion"] is False
+    assert any(expected_fragment in issue.reason for issue in result.issues)
+
+
+def test_live_gate_fails_closed_on_sourceless_legacy_promotion_record(tmp_path):
+    """A fully flag-complete legacy record without provenance must fail closed."""
+
+    record = _promotion_record()
+    record.pop("source", None)
+    record.pop("evidence_metrics", None)
+    assert "source" not in record
+
+    result = _legacy_gate_result(tmp_path, record)
+
+    assert result.allowed is False
+    assert result.checks["promotion"] is False
+    assert any("source is missing" in issue.reason for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    "immutable_report_generated_at",
+    [None, "2020-01-01T00:00:00+00:00"],
+)
+def test_live_gate_retains_immutable_strategy_evidence_exemption(
+    tmp_path, immutable_report_generated_at
+):
+    source = {
+        "kind": "immutable_strategy_evidence",
+        "promotion_evidence_id": "promotion-evidence-" + "0" * 64,
+    }
+    if immutable_report_generated_at is not None:
+        source["report_generated_at"] = immutable_report_generated_at
+    record = _promotion_record(
+        source=source,
+        evidence_metrics=_persisted_evidence_metrics(),
+    )
+
+    result = _legacy_gate_result(tmp_path, record)
+
+    assert result.allowed is True
+    assert result.issues == []
 
 
 def test_live_gate_account_hard_ceiling_blocks_capped_mode(tmp_path):

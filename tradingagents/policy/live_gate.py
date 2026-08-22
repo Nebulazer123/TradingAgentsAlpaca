@@ -24,6 +24,7 @@ from tradingagents.policy.live_control import (
     verify_pending_normal_live_submission_commitment,
 )
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
+from tradingagents.policy.promotion_sync import PAPER_TOURNAMENT_RECORD_SOURCE_KEYS
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
 from tradingagents.policy.strategy_promotion_sync import (
     NormalLiveActivationReceipt,
@@ -136,7 +137,87 @@ def _read_promotion_state(path: Path) -> tuple[dict[str, Any], list[str]]:
     return parsed, []
 
 
-def _promotion_issues(action: Any, promotion_state: dict[str, Any]) -> list[str]:
+def _legacy_guard_clock(now: datetime.datetime | None) -> datetime.datetime:
+    if now is None:
+        return datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        return now.replace(tzinfo=datetime.timezone.utc)
+    return now.astimezone(datetime.timezone.utc)
+
+
+def _legacy_tournament_source_issue(
+    record: Mapping[str, Any],
+    *,
+    now: datetime.datetime,
+) -> str | None:
+    """Independently reject legacy promotion records whose ``source`` is
+    unusable and legacy paper_tournament evidence whose provenance deviates
+    from the exact writer-side schema (PAPER_TOURNAMENT_RECORD_SOURCE_KEYS:
+    kind, nonempty tournament_id and candidate_reason, plus a strict canonical
+    fresh ``report_generated_at``) or whose stamp is missing, malformed,
+    timezone-naive, not already canonical UTC (tz-aware zero-offset
+    second-precision ``+00:00``), future-dated, or stale against the guard
+    clock. A present source must be either ``paper_tournament`` (strictly
+    validated here) or ``immutable_strategy_evidence`` (verified by its own
+    authority chain and untouched here); anything else fails closed."""
+
+    if "source" not in record:
+        return "source is missing"
+    source = record["source"]
+    if not isinstance(source, Mapping):
+        return "source must be a JSON object when present"
+    kind = source.get("kind")
+    if kind == "immutable_strategy_evidence":
+        return None
+    if kind != "paper_tournament":
+        return (
+            "source.kind must be paper_tournament (strict "
+            "report_generated_at freshness applies) or "
+            f"immutable_strategy_evidence; got {kind!r}"
+        )
+    for name in ("tournament_id", "candidate_reason"):
+        if name not in source:
+            return f"source.{name} is missing"
+        value = source[name]
+        if type(value) is not str or not value:
+            return f"source.{name} must be a non-empty string"
+    unexpected = sorted(
+        frozenset(source) - PAPER_TOURNAMENT_RECORD_SOURCE_KEYS
+    )
+    if unexpected:
+        return f"source has unexpected extra fields: {unexpected}"
+    raw = source.get("report_generated_at")
+    if type(raw) is not str or not raw:
+        return "source.report_generated_at is missing"
+    try:
+        moment = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return f"source.report_generated_at is invalid: {raw!r}"
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return f"source.report_generated_at is timezone-naive: {raw}"
+    if (
+        moment.utcoffset() != datetime.timedelta(0)
+        or moment.microsecond
+        or moment.isoformat(timespec="seconds") != raw
+    ):
+        return f"source.report_generated_at is not canonical UTC: {raw}"
+    reference = now.astimezone(datetime.timezone.utc)
+    if moment > reference:
+        return f"source.report_generated_at {raw} is in the future"
+    if reference - moment >= _AUTONOMOUS_PROMOTION_MAX_AGE:
+        return (
+            f"source.report_generated_at {raw} is stale: older than the "
+            f"{int(_AUTONOMOUS_PROMOTION_MAX_AGE.total_seconds())}-second ceiling"
+        )
+    return None
+
+
+def _promotion_issues(
+    action: Any,
+    promotion_state: dict[str, Any],
+    *,
+    now: datetime.datetime | None = None,
+) -> list[str]:
     sleeve = str(_action_value(action, "sleeve", "")).strip()
     if not sleeve:
         return ["live action has no sleeve identity for promotion gate"]
@@ -170,6 +251,11 @@ def _promotion_issues(action: Any, promotion_state: dict[str, Any]) -> list[str]
         issues.append(f"sleeve {sleeve} validation_report_ref is missing")
     if not state.get("risk_envelope_ref"):
         issues.append(f"sleeve {sleeve} risk_envelope_ref is missing")
+    source_issue = _legacy_tournament_source_issue(
+        state, now=_legacy_guard_clock(now)
+    )
+    if source_issue:
+        issues.append(f"sleeve {sleeve} {source_issue}")
     return issues
 
 
@@ -945,7 +1031,9 @@ def evaluate_go_live_guard(
             total_buy_notional = projected_buy_notional
 
         if promotion_state:
-            action_promotion_issues = _promotion_issues(action, promotion_state)
+            action_promotion_issues = _promotion_issues(
+                action, promotion_state, now=now
+            )
             if action_promotion_issues:
                 checks["promotion"] = False
                 issues.extend(OrderIssue(_action_symbol(action), issue) for issue in action_promotion_issues)
