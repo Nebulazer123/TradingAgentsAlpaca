@@ -387,6 +387,35 @@ def _configure_current_submit(monkeypatch, paper_client):
     )
 
 
+def _persist_interrupted_submission(paper_client, output_dir):
+    ledger = _current_trial_ledger(paper_client)
+    payload = {
+        "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+        "symbol": "NVDA",
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": "218.43",
+        "notional": "1000.00",
+        "extended_hours": False,
+        "client_order_id": "ta-paperbot-current-aggressive-interrupted-20260602",
+        "reason": "simulated accepted post before process loss",
+    }
+    now = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_tournament.begin_submission_transaction(
+        ledger,
+        market_date="2026-06-02",
+        payloads=[payload],
+        now=now,
+    )
+    write_tournament_ledger(ledger, output_dir)
+    response = paper_client.submit_order(
+        {key: value for key, value in payload.items() if key not in {"strategy_id", "reason"}}
+    )
+    assert response["client_order_id"] == payload["client_order_id"]
+    return json.loads((output_dir / LEDGER_FILE).read_text(encoding="utf-8"))
+
+
 def test_initialize_tournament_records_bounded_submission_lease():
     ledger = _current_trial_ledger(_FakePaperClient(), max_submission_market_days=5)
 
@@ -427,6 +456,26 @@ def test_paper_tournament_run_defaults_to_dry_run(monkeypatch, tmp_path):
     payload = json.loads(result.stdout)
     assert payload["dry_run"] is True
     assert payload["submitted_count"] == 0
+    assert paper_client.submitted == []
+
+
+def test_trial_dry_run_removes_a_preexisting_live_strategy_selection(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    selection_path = tmp_path / "live-strategy-selection.json"
+    selection_path.write_text('{"status": "active"}', encoding="utf-8")
+    _configure_current_submit(monkeypatch, paper_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not selection_path.exists()
     assert paper_client.submitted == []
 
 
@@ -681,6 +730,52 @@ def test_paper_tournament_submit_persists_partial_post_evidence_and_blocks_retry
 
     assert retry.exit_code != 0
     assert paper_client.submit_attempts == 2
+
+
+def test_interrupted_submission_transaction_blocks_retry_before_transport(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    persisted = _persist_interrupted_submission(paper_client, tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+
+    retry = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert retry.exit_code != 0
+    assert len(paper_client.submitted) == 1
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert updated["submission_window_status"] == "open"
+    assert updated["submission_transaction"] == persisted["submission_transaction"]
+
+
+def test_interrupted_submission_transaction_blocks_finalization(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    persisted = _persist_interrupted_submission(paper_client, tmp_path)
+    paper_client.orders.clear()
+    paper_client.list_order_calls = 0
+    original_list_orders = paper_client.list_orders
+
+    def tracked_list_orders(*args, **kwargs):
+        paper_client.list_order_calls += 1
+        return original_list_orders(*args, **kwargs)
+
+    paper_client.list_orders = tracked_list_orders
+    _configure_current_submit(monkeypatch, paper_client)
+
+    finalized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "finalize", "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert finalized.exit_code != 0
+    assert paper_client.list_order_calls == 0
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert updated["submission_window_status"] == "open"
+    assert updated["submission_transaction"] == persisted["submission_transaction"]
 
 
 def test_trial_report_removes_and_never_writes_live_strategy_selection(monkeypatch, tmp_path):
@@ -1096,6 +1191,18 @@ def _write_bound_active_selection(tournament_dir, *, strategy_id="pullback-suppo
     )
     assert selection_path is not None
     return report
+
+
+def test_nontrial_tournament_selection_behavior_remains_compatible(tmp_path):
+    report = _write_bound_active_selection(tmp_path)
+
+    selection = load_live_strategy_selection(
+        tmp_path,
+        now=datetime.datetime(2026, 6, 5, 20, 11, tzinfo=datetime.timezone.utc),
+    )
+
+    assert selection is not None
+    assert selection["strategy_id"] == report["live_strategy_candidate"]["strategy_id"]
 
 
 def test_bound_preexpiry_selection_is_rejected_after_tournament_window(tmp_path):

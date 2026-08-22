@@ -10083,7 +10083,7 @@ def alpaca_paper_tournament_run(
             min_promotion_days=min_promotion_days,
         )
         selection_path = None
-        if not dry_run:
+        if not dry_run or report.get("ledger_type") == "qualification_paper_trial":
             selection = maybe_write_live_strategy_selection(report, log_dir, now=now)
             selection_path = str(selection) if selection else None
             if selection_path:
@@ -10138,6 +10138,7 @@ def alpaca_paper_tournament_finalize(
         _validate_exact_paper_client,
         finalize_submission_lease,
         tournament_submission_lock,
+        validate_submission_transaction_state,
     )
 
     paper_client = _alpaca_paper_client()
@@ -10145,6 +10146,7 @@ def alpaca_paper_tournament_finalize(
         ledger = load_tournament_ledger(log_dir)
         try:
             _validate_exact_paper_client(paper_client)
+            validate_submission_transaction_state(ledger)
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
         now = _alpaca_policy_now()

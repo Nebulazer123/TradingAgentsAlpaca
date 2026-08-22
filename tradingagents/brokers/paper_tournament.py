@@ -318,6 +318,42 @@ def _validate_exact_paper_client(paper_client: object) -> None:
         raise ValueError("paper client endpoint is not the exact Alpaca paper endpoint")
 
 
+def validate_submission_transaction_state(ledger: Mapping) -> None:
+    """Reject every durable submission reservation that is not proven complete."""
+
+    if "submission_transaction" not in ledger:
+        return
+    transaction = ledger["submission_transaction"]
+    if not isinstance(transaction, Mapping) or transaction.get("status") != "completed":
+        raise ValueError("paper submission lease recovery is required for an incomplete transaction")
+    market_date = transaction.get("market_date")
+    pending = transaction.get("pending_client_order_ids")
+    successful = transaction.get("successful_submissions")
+    if (
+        type(market_date) is not str
+        or _submitted_market_date_is_malformed(market_date)
+        or not isinstance(pending, list)
+        or pending
+        or not isinstance(successful, list)
+        or not successful
+        or _parse_timestamp(transaction.get("started_at")) is None
+        or _parse_timestamp(transaction.get("completed_at")) is None
+        or not isinstance(ledger.get("submitted_market_dates"), list)
+        or market_date not in ledger["submitted_market_dates"]
+    ):
+        raise ValueError("paper submission lease recovery is required for an incomplete transaction")
+    for submission in successful:
+        if (
+            not isinstance(submission, Mapping)
+            or type(submission.get("client_order_id")) is not str
+            or not submission.get("client_order_id")
+            or submission.get("market_date") != market_date
+            or _parse_timestamp(submission.get("recorded_at")) is None
+            or not isinstance(submission.get("response"), Mapping)
+        ):
+            raise ValueError("paper submission lease recovery is required for an incomplete transaction")
+
+
 def validate_submission_lease(
     ledger: Mapping,
     *,
@@ -365,6 +401,7 @@ def validate_submission_lease(
         or len(submitted_dates) > limit
     ):
         raise ValueError("paper submission lease market-date ledger is malformed")
+    validate_submission_transaction_state(ledger)
     market_date = _central_market_date(now_timestamp)
     if market_date is None:
         raise ValueError("paper submission lease has no Central market date")
@@ -414,6 +451,7 @@ def begin_submission_transaction(
 ) -> None:
     """Persist the exact intended paper order identities before the first POST."""
 
+    validate_submission_transaction_state(ledger)
     client_order_ids: list[str] = []
     for payload in payloads:
         strategy_id = payload.get("strategy_id")
@@ -551,6 +589,7 @@ def finalize_submission_lease(
         raise ValueError("paper submission lease is already closed or finalized")
     if ledger.get("submission_lease_evidence") != _submission_lease_evidence(ledger):
         raise ValueError("paper submission lease evidence does not match ledger")
+    validate_submission_transaction_state(ledger)
     strategies = ledger.get("strategies")
     if not isinstance(strategies, Mapping) or not isinstance(paper_orders, list):
         raise ValueError("paper finalization has malformed order evidence")
