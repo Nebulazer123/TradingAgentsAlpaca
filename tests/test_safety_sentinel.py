@@ -368,6 +368,7 @@ def test_safety_sentinel_missing_stale_and_corrupt_evidence_hold(tmp_path):
 
 def test_safety_sentinel_cli_uses_only_narrow_read_only_broker_adapter(tmp_path, monkeypatch):
     control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
+    _write_json(control, {"frozen": True, "reason": "qualification remains frozen"})
     client = _ReadOnlyBrokerFake()
     output_dir = tmp_path / "safety-sentinel-output"
     monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: client)
@@ -400,12 +401,19 @@ def test_safety_sentinel_cli_uses_only_narrow_read_only_broker_adapter(tmp_path,
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert payload["status"] == "CLEAR"
+    assert payload["status"] == "FROZEN"
+    assert payload["reasons"] == ["frozen_control"]
     assert payload["analysis_only"] is True
     assert payload["execution_authority"] == "none"
     assert payload["can_submit_orders"] is False
     assert Path(payload["packet_path"]).parent == output_dir
     assert Path(payload["packet_path"]).exists()
+    assert payload["broker_snapshot"]["account"]["id"] == "account-1"
+    assert payload["broker_snapshot"]["clock"] == {
+        "is_open": False,
+        "timestamp": "2026-08-21T13:00:00Z",
+    }
+    assert payload["broker_snapshot"]["errors"] == {}
     assert client.calls == [
         ("get_account", None),
         ("list_positions", None),

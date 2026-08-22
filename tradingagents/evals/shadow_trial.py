@@ -35,6 +35,7 @@ from tradingagents.evals.automation_health_audit import (
     default_automation_root,
     evaluate_schedule_contract,
 )
+from tradingagents.evals.safety_sentinel import broker_snapshot_shape_reasons
 from tradingagents.strategy._immutable_evidence_store import (
     MANUAL_SHADOW_DAY_RESULT_KIND,
     MANUAL_SHADOW_DAY_START_KIND,
@@ -113,6 +114,38 @@ def _no_submissions(payload: Mapping[str, object]) -> bool:
     )
 
 
+_BROKER_OBSERVER_READ_METHODS = [
+    "get_account",
+    "list_positions",
+    "list_orders",
+    "get_clock",
+]
+
+
+def _broker_observer_snapshot_is_valid(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    errors = value.get("errors")
+    return (
+        isinstance(errors, Mapping)
+        and not errors
+        and value.get("read_methods") == _BROKER_OBSERVER_READ_METHODS
+        and _parse_timestamp(value.get("captured_at")) is not None
+        and not broker_snapshot_shape_reasons(value)
+    )
+
+
+def _captured_source_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and value.get("status") == "captured"
+        and isinstance(value.get("sha256"), str)
+        and len(value["sha256"]) == 64
+        and type(value.get("size_bytes")) is int
+        and value["size_bytes"] > 0
+    )
+
+
 def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[str]:
     """Validate real producer shapes without pretending they share one schema.
 
@@ -158,8 +191,10 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
                 "full_graph_success_count",
             )
             if (
-                quality.get("requested_full_graph_limit") != 1
-                or quality.get("full_graph_limit") != 1
+                type(quality.get("requested_full_graph_limit")) is not int
+                or quality["requested_full_graph_limit"] != 1
+                or type(quality.get("full_graph_limit")) is not int
+                or quality["full_graph_limit"] != 1
                 or any(
                     type(quality.get(key)) is not int
                     or quality[key] < 0
@@ -172,13 +207,50 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
                 reasons.append("overnight_research_stage_graph_cap_invalid")
             if type(quality.get("tradable_count")) is not int or quality["tradable_count"] < 0:
                 reasons.append("overnight_research_stage_tradable_count_invalid")
+            ticker_timeout = quality.get("per_ticker_timeout_minutes")
+            total_budget = quality.get("time_budget_minutes")
             if (
-                type(quality.get("per_ticker_timeout_minutes")) not in {int, float}
-                or float(quality["per_ticker_timeout_minutes"]) > 2
-                or type(quality.get("time_budget_minutes")) not in {int, float}
-                or float(quality["time_budget_minutes"]) > 3
+                type(ticker_timeout) not in {int, float}
+                or not 0 < float(ticker_timeout) <= 2
+                or type(total_budget) not in {int, float}
+                or not 0 < float(total_budget) <= 3
             ):
                 reasons.append("overnight_research_stage_bounds_invalid")
+            graph_config = quality.get("graph_config")
+            if not isinstance(graph_config, Mapping) or (
+                graph_config.get("graph_profile") != "market-only"
+                or graph_config.get("selected_analysts") != ["market"]
+                or graph_config.get("tool_free_analysts") != ["market"]
+                or type(graph_config.get("max_output_tokens")) is not int
+                or graph_config["max_output_tokens"] != 800
+                or type(graph_config.get("max_completion_tokens")) is not int
+                or graph_config["max_completion_tokens"] != 800
+                or type(graph_config.get("llm_timeout_seconds")) not in {int, float}
+                or float(graph_config["llm_timeout_seconds"]) != 30.0
+                or type(graph_config.get("llm_max_retries")) is not int
+                or graph_config["llm_max_retries"] != 0
+                or type(graph_config.get("max_debate_rounds")) is not int
+                or graph_config["max_debate_rounds"] != 0
+                or type(graph_config.get("max_risk_discuss_rounds")) is not int
+                or graph_config["max_risk_discuss_rounds"] != 0
+            ):
+                reasons.append("overnight_research_stage_graph_config_invalid")
+            disabled_features = (
+                "research_context_enabled",
+                "agent_intelligence_enabled",
+                "agent_ledger_append_enabled",
+            )
+            zero_counts = (
+                "research_context_packet_count",
+                "research_context_blocked_count",
+                "top_provider_bundle_requested_count",
+                "top_provider_bundle_count",
+            )
+            if any(quality.get(key) is not False for key in disabled_features) or any(
+                type(quality.get(key)) is not int or quality[key] != 0
+                for key in zero_counts
+            ):
+                reasons.append("overnight_research_stage_expansion_enabled")
     elif stage == "premarket_brief":
         if payload.get("analysis_only") is not True or not _no_submissions(payload):
             reasons.append("premarket_brief_stage_authority_invalid")
@@ -197,13 +269,43 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
         # remain unchanged and cannot qualify accidentally.
         if payload.get("shadow_dry_run") is not True or not _no_submissions(payload):
             reasons.append("hourly_supervisor_stage_not_dry_run")
-        if payload.get("outbox_path"):
+        if (
+            payload.get("outbox_path")
+            or payload.get("outbox_suppressed") is not True
+            or payload.get("outbox_write_allowed") is not False
+        ):
             reasons.append("hourly_supervisor_stage_outbox_forbidden")
         if payload.get("issues") not in (None, [], ()):
             reasons.append("hourly_supervisor_stage_issue_present")
     elif stage == "safety_sentinel":
-        if not _is_non_authorizing(payload) or payload.get("status") not in {"FROZEN", "HOLD"}:
+        if not _is_non_authorizing(payload) or payload.get("status") != "FROZEN":
             reasons.append("safety_sentinel_stage_semantics_invalid")
+        sentinel_reasons = payload.get("reasons")
+        if sentinel_reasons != ["frozen_control"]:
+            reasons.append("safety_sentinel_stage_failure_reason_present")
+        schedule_check = payload.get("schedule_check")
+        if not isinstance(schedule_check, Mapping) or (
+            schedule_check.get("deployment_phase") != PREDEPLOYMENT_PAUSED_PHASE
+            or schedule_check.get("contract_status") != "pass"
+            or schedule_check.get("safe_predeployment") is not True
+            or schedule_check.get("issues") not in ([], ())
+            or not isinstance(schedule_check.get("automations"), list)
+            or len(schedule_check["automations"]) != 10
+            or any(
+                not isinstance(row, Mapping) or row.get("status") != "match"
+                for row in schedule_check["automations"]
+            )
+        ):
+            reasons.append("safety_sentinel_stage_schedule_proof_invalid")
+        evidence = payload.get("evidence")
+        if not isinstance(evidence, Mapping) or not _captured_source_is_valid(
+            evidence.get("live_control")
+        ) or not _captured_source_is_valid(evidence.get("preopen_validation")):
+            reasons.append("safety_sentinel_stage_source_proof_invalid")
+        if payload.get("actions_taken") not in ([], ()) or not _broker_observer_snapshot_is_valid(
+            payload.get("broker_snapshot")
+        ):
+            reasons.append("safety_sentinel_stage_broker_proof_invalid")
     elif stage == "loss_review":
         nested = payload.get("payload")
         freshness = payload.get("freshness")
@@ -264,14 +366,8 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
             or not isinstance(paper, Mapping)
             or _has_nonempty_error(live)
             or _has_nonempty_error(paper)
-            or not isinstance(live.get("account"), Mapping)
-            or not isinstance(paper.get("account"), Mapping)
-            or not isinstance(live.get("positions"), list)
-            or not isinstance(paper.get("positions"), list)
-            or not isinstance(live.get("open_orders"), list)
-            or not isinstance(paper.get("open_orders"), list)
-            or not isinstance(live.get("clock"), Mapping)
-            or not isinstance(paper.get("clock"), Mapping)
+            or not _broker_observer_snapshot_is_valid(live)
+            or not _broker_observer_snapshot_is_valid(paper)
         ):
             reasons.append("broker_reconciliation_stage_semantics_invalid")
     elif stage == "paper_tournament":

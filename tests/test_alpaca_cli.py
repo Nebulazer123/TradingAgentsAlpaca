@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from cli import main as cli_main
@@ -1552,6 +1553,159 @@ def test_alpaca_supervise_hourly_dry_run_logs_without_submitting(monkeypatch, tm
     raw_payload = json.loads(raw_packets[0].read_text(encoding="utf-8"))
     assert raw_payload["shadow_dry_run"] is True
     assert raw_payload["can_submit_orders"] is False
+    assert raw_payload["outbox_suppressed"] is True
+    assert raw_payload["outbox_write_allowed"] is False
+
+
+def test_alpaca_supervise_hourly_material_dry_run_never_writes_outbox(monkeypatch, tmp_path):
+    paper_client = _FakeCliClient(paper=True)
+    live_client = _FakeCliClient(paper=False)
+    live_client.positions = [
+        {
+            "symbol": "NVDA",
+            "unrealized_plpc": "0.062",
+            "market_value": "52.50",
+            "qty": "0.232",
+            "current_price": "226",
+        }
+    ]
+    monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
+    monkeypatch.setattr(cli_main, "_fetch_aggressive_candidate_market_data", lambda: {})
+    monkeypatch.setattr(cli_main, "market_session_label", lambda: "regular")
+    monkeypatch.setenv(
+        "TRADINGAGENTS_PROMOTION_STATE_PATH",
+        str(tmp_path / "missing-promotion-state.json"),
+    )
+
+    def forbidden_outbox(*_args, **_kwargs):
+        raise AssertionError("hourly dry-run attempted an outbox write")
+
+    monkeypatch.setattr(
+        "tradingagents.notifications.outbox.write_outbox_message",
+        forbidden_outbox,
+    )
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "supervise-hourly",
+            "--dry-run",
+            "--no-write-outbox",
+            "--notification-policy",
+            "every-check",
+            "--json-output",
+            "--log-dir",
+            str(tmp_path / "hourly"),
+            "--overnight-log-dir",
+            str(tmp_path / "overnight"),
+            "--paper-tournament-log-dir",
+            str(tmp_path / "paper"),
+            "--premarket-brief-log-dir",
+            str(tmp_path / "premarket"),
+            "--preopen-validation-dir",
+            str(tmp_path / "preopen"),
+            "--execution-board-dir",
+            str(tmp_path / "board"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["decision"] == "profit-take"
+    assert payload["material"] is True
+    assert payload["notify"] is True
+    assert payload["submitted"] == []
+    assert payload["outbox_suppressed"] is True
+    assert payload["outbox_write_allowed"] is False
+    assert "outbox_path" not in payload
+    assert live_client.submitted == paper_client.submitted == []
+    raw_path = next(
+        path
+        for path in (tmp_path / "hourly").glob("hourly-supervisor-*.json")
+        if not path.name.endswith(".compact.json")
+    )
+    raw_payload = json.loads(raw_path.read_text(encoding="utf-8"))
+    assert raw_payload["decision"] == "profit-take"
+    assert raw_payload["shadow_dry_run"] is True
+    assert raw_payload["outbox_suppressed"] is True
+    assert raw_payload["outbox_write_allowed"] is False
+    assert "outbox_path" not in raw_payload
+
+
+def test_clean_day_runbook_cli_options_exist_without_executing_runtime():
+    expected_options = {
+        ("research", "shadow-day-start"): {
+            "--run-id", "--market-date", "--json-output",
+        },
+        ("research", "safety-sentinel-audit"): {
+            "--shadow-start-object-id", "--require-paused", "--preopen-validation-path",
+            "--output-dir", "--json-output",
+        },
+        ("alpaca", "plan-overnight"): {
+            "--full-graph-tickers", "--per-ticker-timeout-minutes", "--time-budget-minutes",
+            "--overnight-graph-profile", "--overnight-max-completion-tokens",
+            "--overnight-llm-timeout-seconds", "--overnight-llm-max-retries",
+            "--no-research-context", "--no-agent-intelligence", "--top-provider-bundle-count",
+            "--no-agent-ledger", "--no-write-latest", "--log-dir", "--json-output",
+        },
+        ("alpaca", "premarket-brief"): {
+            "--overnight-log-dir", "--log-dir", "--no-write-latest", "--json-output",
+        },
+        ("alpaca", "preopen-validation"): {
+            "--overnight-log-dir", "--premarket-brief-log-dir", "--log-dir",
+            "--no-write-latest", "--json-output",
+        },
+        ("alpaca", "supervise-hourly"): {
+            "--dry-run", "--no-write-outbox", "--notification-policy", "--overnight-log-dir",
+            "--premarket-brief-log-dir", "--preopen-validation-dir", "--log-dir", "--json-output",
+        },
+        ("alpaca", "reconcile-observer"): {
+            "--shadow-start-object-id", "--output-dir", "--json-output",
+        },
+        ("research", "loss-review-evidence"): {
+            "--hourly-dir", "--output-dir", "--json-output",
+        },
+        ("research", "execution-board-review"): {
+            "--hourly-dir", "--output-dir", "--json-output",
+        },
+        ("research", "self-heal-handoff"): {"--output-dir", "--json-output"},
+        ("research", "self-heal-plan"): {
+            "--no-execute-safe", "--output-dir", "--json-output",
+        },
+        ("alpaca", "supervisor-daily-report"): {
+            "--no-write-outbox", "--log-dir", "--daily-report-log-dir",
+            "--compact-json-output", "--json-output",
+        },
+        ("alpaca", "paper-tournament", "init"): {
+            "--duration-days", "--max-submission-market-days", "--log-dir", "--json-output",
+        },
+        ("alpaca", "paper-tournament", "run"): {
+            "--all", "--dry-run", "--submit-actions", "--shadow-start-object-id",
+            "--log-dir", "--json-output",
+        },
+        ("research", "shadow-day-manifest"): {
+            "--start-object-id", "--stage", "--json-output",
+        },
+        ("research", "shadow-day-adjudicate"): {
+            "--start-object-id", "--safety-sentinel", "--paper-tournament",
+            "--daily-chain-manifest", "--json-output",
+        },
+        ("alpaca", "paper-tournament", "finalize"): {"--log-dir", "--json-output"},
+    }
+    root_command = typer.main.get_command(app)
+    for path, expected in expected_options.items():
+        command = root_command
+        for component in path:
+            command = command.commands[component]
+        actual = {
+            option
+            for parameter in command.params
+            for option in (
+                *getattr(parameter, "opts", ()),
+                *getattr(parameter, "secondary_opts", ()),
+            )
+        }
+        assert expected <= actual, f"{' '.join(path)} missing {sorted(expected - actual)}"
 
 
 def test_alpaca_supervise_hourly_compact_json_output_points_to_raw_packet(monkeypatch, tmp_path):
@@ -3391,6 +3545,11 @@ def test_plan_overnight_passes_overnight_graph_config_to_guarded(monkeypatch, tm
             "45",
             "--overnight-llm-max-retries",
             "1",
+            "--no-research-context",
+            "--no-agent-intelligence",
+            "--no-agent-ledger",
+            "--top-provider-bundle-count",
+            "0",
         ],
     )
 
@@ -3436,6 +3595,13 @@ def test_plan_overnight_passes_overnight_graph_config_to_guarded(monkeypatch, tm
     assert payload["overnight_quality"]["graph_config"]["max_output_tokens"] == 220
     assert payload["overnight_quality"]["graph_config"]["llm_timeout_seconds"] == 45.0
     assert payload["overnight_quality"]["graph_config"]["llm_max_retries"] == 1
+    assert payload["overnight_quality"]["research_context_enabled"] is False
+    assert payload["overnight_quality"]["research_context_packet_count"] == 0
+    assert payload["overnight_quality"]["research_context_blocked_count"] == 0
+    assert payload["overnight_quality"]["agent_intelligence_enabled"] is False
+    assert payload["overnight_quality"]["agent_ledger_append_enabled"] is False
+    assert payload["overnight_quality"]["top_provider_bundle_requested_count"] == 0
+    assert payload["overnight_quality"]["top_provider_bundle_count"] == 0
     assert payload["overnight_quality"]["graph_config"]["quick_context_window_tokens"] == 1_000_000
     assert payload["overnight_quality"]["graph_config"]["deep_context_window_tokens"] == 1_000_000
     assert payload["original_tradingagents_graph"]["bounds"]["graph_profile"] == "compact"
@@ -6460,6 +6626,24 @@ def test_alpaca_reconcile_observer_uses_read_only_clients_only(monkeypatch, tmp_
     assert payload["execution_authority"] == "none"
     assert payload["can_submit_orders"] is False
     assert payload["submitted_count"] == payload["cancelled_count"] == 0
+    assert payload["status"] == "COMPLETE"
+    for account_scope, account_id in (("live", "live"), ("paper", "paper")):
+        snapshot = payload[account_scope]
+        assert snapshot["account"] == {"id": account_id, "status": "ACTIVE"}
+        assert snapshot["positions"] == []
+        assert snapshot["open_orders"] == []
+        assert snapshot["clock"] == {
+            "is_open": False,
+            "timestamp": "2026-08-21T13:30:00+00:00",
+        }
+        assert snapshot["errors"] == {}
+        assert snapshot["read_methods"] == [
+            "get_account",
+            "list_positions",
+            "list_orders",
+            "get_clock",
+        ]
+        assert snapshot["captured_at"] == "2026-08-21T13:30:00+00:00"
     assert live.calls == paper.calls == ["get_account", "list_positions", "list_orders:open", "get_clock"]
     assert Path(payload["json_path"]).exists()
 

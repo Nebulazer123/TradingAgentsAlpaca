@@ -193,11 +193,12 @@ def _artifacts(
     date: str,
     start_object_id: str | None = None,
     submitted_count: object = 0,
-    sentinel_status: str = "HOLD",
+    sentinel_status: str = "FROZEN",
 ) -> dict[str, Path]:
     sentinel = root / "artifacts" / f"sentinel-{date}.json"
     paper = root / "artifacts" / f"paper-{date}.json"
     generated_at = f"{date}T15:00:00+00:00"
+    broker_snapshot = _healthy_broker_snapshot(date=date, account_id="live-account")
     _write_json(
         sentinel,
         {
@@ -207,10 +208,34 @@ def _artifacts(
             **({"shadow_start_object_id": start_object_id} if start_object_id else {}),
             "generated_at": generated_at,
             "status": sentinel_status,
+            "reasons": ["frozen_control"],
             "analysis_only": True,
             "execution_authority": "none",
             "can_submit_orders": False,
             "actions_taken": [],
+            "evidence": {
+                "live_control": {
+                    "status": "captured",
+                    "sha256": "a" * 64,
+                    "size_bytes": 1,
+                },
+                "preopen_validation": {
+                    "status": "captured",
+                    "sha256": "b" * 64,
+                    "size_bytes": 1,
+                },
+            },
+            "schedule_check": {
+                "deployment_phase": "predeployment_paused",
+                "contract_status": "pass",
+                "safe_predeployment": True,
+                "issues": [],
+                "automations": [
+                    {"automation_id": f"automation-{index}", "status": "match"}
+                    for index in range(10)
+                ],
+            },
+            "broker_snapshot": broker_snapshot,
         },
     )
     _write_json(
@@ -231,6 +256,18 @@ def _artifacts(
         },
     )
     return {"safety_sentinel": sentinel, "paper_tournament": paper}
+
+
+def _healthy_broker_snapshot(*, date: str, account_id: str) -> dict[str, object]:
+    return {
+        "account": {"id": account_id, "status": "ACTIVE"},
+        "positions": [],
+        "open_orders": [],
+        "clock": {"is_open": True, "timestamp": f"{date}T15:00:00+00:00"},
+        "errors": {},
+        "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+        "captured_at": f"{date}T15:00:00+00:00",
+    }
 
 
 def _complete_daily_chain(
@@ -276,6 +313,24 @@ def _complete_daily_chain(
                         "tradable_count": 1,
                         "per_ticker_timeout_minutes": 2,
                         "time_budget_minutes": 3,
+                        "graph_config": {
+                            "graph_profile": "market-only",
+                            "selected_analysts": ["market"],
+                            "tool_free_analysts": ["market"],
+                            "max_output_tokens": 800,
+                            "max_completion_tokens": 800,
+                            "llm_timeout_seconds": 30,
+                            "llm_max_retries": 0,
+                            "max_debate_rounds": 0,
+                            "max_risk_discuss_rounds": 0,
+                        },
+                        "research_context_enabled": False,
+                        "research_context_packet_count": 0,
+                        "research_context_blocked_count": 0,
+                        "agent_intelligence_enabled": False,
+                        "agent_ledger_append_enabled": False,
+                        "top_provider_bundle_requested_count": 0,
+                        "top_provider_bundle_count": 0,
                     },
                 }
             )
@@ -290,6 +345,8 @@ def _complete_daily_chain(
                     "submitted": [],
                     "issues": [],
                     "shadow_dry_run": True,
+                    "outbox_suppressed": True,
+                    "outbox_write_allowed": False,
                 }
             )
         elif name == "loss_review":
@@ -339,8 +396,12 @@ def _complete_daily_chain(
                     "submitted_count": 0,
                     "cancelled_count": 0,
                     "status": "COMPLETE",
-                    "live": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
-                    "paper": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
+                    "live": _healthy_broker_snapshot(
+                        date=payload["market_date"], account_id="live-account"
+                    ),
+                    "paper": _healthy_broker_snapshot(
+                        date=payload["market_date"], account_id="paper-account"
+                    ),
                 }
             )
         _write_json(path, packet)
@@ -1153,6 +1214,24 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
             "tradable_count": 4,
             "per_ticker_timeout_minutes": 2,
             "time_budget_minutes": 3,
+            "graph_config": {
+                "graph_profile": "market-only",
+                "selected_analysts": ["market"],
+                "tool_free_analysts": ["market"],
+                "max_output_tokens": 800,
+                "max_completion_tokens": 800,
+                "llm_timeout_seconds": 30,
+                "llm_max_retries": 0,
+                "max_debate_rounds": 0,
+                "max_risk_discuss_rounds": 0,
+            },
+            "research_context_enabled": False,
+            "research_context_packet_count": 0,
+            "research_context_blocked_count": 0,
+            "agent_intelligence_enabled": False,
+            "agent_ledger_append_enabled": False,
+            "top_provider_bundle_requested_count": 0,
+            "top_provider_bundle_count": 0,
         },
     }
     assert shadow_trial._stage_semantic_reasons("overnight_research", overnight) == []
@@ -1167,9 +1246,33 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
         "overnight_research",
         {"overnight_quality": {**overnight["overnight_quality"], "full_graph_attempt_count": 2}},
     )
+    for key in ("requested_full_graph_limit", "full_graph_limit"):
+        assert "overnight_research_stage_graph_cap_invalid" in shadow_trial._stage_semantic_reasons(
+            "overnight_research",
+            {
+                **overnight,
+                "overnight_quality": {**overnight["overnight_quality"], key: True},
+            },
+        )
+    for key in ("per_ticker_timeout_minutes", "time_budget_minutes"):
+        assert "overnight_research_stage_bounds_invalid" in shadow_trial._stage_semantic_reasons(
+            "overnight_research",
+            {
+                **overnight,
+                "overnight_quality": {**overnight["overnight_quality"], key: 0},
+            },
+        )
+    missing_graph_config = dict(overnight["overnight_quality"])
+    missing_graph_config.pop("graph_config")
+    assert "overnight_research_stage_graph_config_invalid" in shadow_trial._stage_semantic_reasons(
+        "overnight_research",
+        {**overnight, "overnight_quality": missing_graph_config},
+    )
 
     hourly = {
         "shadow_dry_run": True,
+        "outbox_suppressed": True,
+        "outbox_write_allowed": False,
         "decision": "profit-take",
         "submitted": [],
         "issues": [],
@@ -1188,8 +1291,8 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
         "read_only": True,
         "submitted_count": 0,
         "cancelled_count": 0,
-        "live": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
-        "paper": {"account": {}, "positions": [], "open_orders": [], "clock": {}, "errors": {}},
+        "live": _healthy_broker_snapshot(date="2026-08-21", account_id="live-account"),
+        "paper": _healthy_broker_snapshot(date="2026-08-21", account_id="paper-account"),
     }
     assert shadow_trial._stage_semantic_reasons("broker_reconciliation", reconciliation) == []
     broken_reconciliation = {
@@ -1198,6 +1301,17 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
     }
     assert "broker_reconciliation_stage_semantics_invalid" in shadow_trial._stage_semantic_reasons(
         "broker_reconciliation", broken_reconciliation
+    )
+    empty_snapshot = {
+        **reconciliation,
+        "live": {
+            **reconciliation["live"],
+            "account": {},
+            "clock": {},
+        },
+    }
+    assert "broker_reconciliation_stage_semantics_invalid" in shadow_trial._stage_semantic_reasons(
+        "broker_reconciliation", empty_snapshot
     )
 
     loss_review = {
@@ -1267,8 +1381,34 @@ def test_hourly_stage_requires_explicit_persisted_dry_run_marker():
         "hourly_supervisor", hourly
     )
     assert shadow_trial._stage_semantic_reasons(
-        "hourly_supervisor", {**hourly, "shadow_dry_run": True}
+        "hourly_supervisor",
+        {
+            **hourly,
+            "shadow_dry_run": True,
+            "outbox_suppressed": True,
+            "outbox_write_allowed": False,
+        },
     ) == []
+
+
+def test_safety_sentinel_rejects_extra_reason_or_missing_observer_proof(tmp_path):
+    artifacts = _artifacts(
+        tmp_path,
+        run_id="run-2026-08-21",
+        date="2026-08-21",
+    )
+    sentinel = json.loads(artifacts["safety_sentinel"].read_text(encoding="utf-8"))
+
+    assert shadow_trial._stage_semantic_reasons("safety_sentinel", sentinel) == []
+    assert "safety_sentinel_stage_failure_reason_present" in shadow_trial._stage_semantic_reasons(
+        "safety_sentinel",
+        {**sentinel, "reasons": ["frozen_control", "preopen_validation_stale"]},
+    )
+    missing_broker = dict(sentinel)
+    missing_broker.pop("broker_snapshot")
+    assert "safety_sentinel_stage_broker_proof_invalid" in shadow_trial._stage_semantic_reasons(
+        "safety_sentinel", missing_broker
+    )
 
 
 def test_daily_chain_manifest_rejects_missing_stage_and_replaced_stage_file(tmp_path, monkeypatch):

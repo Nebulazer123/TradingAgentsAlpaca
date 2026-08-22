@@ -140,6 +140,12 @@ def _broker_snapshot_shape_reasons(snapshot: Mapping[str, Any]) -> list[str]:
     return reasons
 
 
+def broker_snapshot_shape_reasons(snapshot: Mapping[str, Any]) -> list[str]:
+    """Expose the sentinel's minimum broker-observer schema to peer evaluators."""
+
+    return _broker_snapshot_shape_reasons(snapshot)
+
+
 def _capture_json_evidence(
     path_value: str | Path,
     *,

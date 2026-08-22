@@ -11057,6 +11057,12 @@ def alpaca_plan_overnight(
             "graph_config": graph_config,
             "research_context_packet_count": research_context.get("packet_count", 0),
             "research_context_blocked_count": len(research_context.get("blocked_packets", [])),
+            "research_context_enabled": include_research_context,
+            "agent_intelligence_enabled": (
+                include_research_context and include_agent_intelligence
+            ),
+            "agent_ledger_append_enabled": write_agent_ledger,
+            "top_provider_bundle_requested_count": top_provider_bundle_count,
             "top_provider_bundle_count": top_provider_bundles.get("bundle_count", 0),
             "top_provider_bundle_symbols": top_provider_bundles.get("symbols", []),
             "top_provider_bundle_gap_count": top_provider_bundles.get("gap_packet_count", 0),
@@ -11802,6 +11808,14 @@ def alpaca_supervise_hourly(
         "--notification-policy",
         help="material-only, every-check, daily-digest, or urgent-exceptions.",
     ),
+    write_outbox: bool = typer.Option(
+        True,
+        "--write-outbox/--no-write-outbox",
+        help=(
+            "Allow local notification outbox writes for non-dry-run ticks. "
+            "Dry-run ticks always suppress the outbox."
+        ),
+    ),
     overnight_log_dir: Path = typer.Option(
         Path("results/overnight_plans"),
         "--overnight-log-dir",
@@ -12322,22 +12336,33 @@ def alpaca_supervise_hourly(
         ),
     )
 
-    packet_path = write_hourly_decision_packet(
-        decision,
-        output_dir=log_dir,
-        recent_packets=recent_packets,
-        packet_metadata=(
+    outbox_write_allowed = bool(write_outbox and not dry_run)
+    packet_metadata = {
+        "outbox_suppressed": not outbox_write_allowed,
+        "outbox_write_allowed": outbox_write_allowed,
+    }
+    if dry_run:
+        packet_metadata.update(
             {
                 "shadow_dry_run": True,
                 "analysis_only": True,
                 "execution_authority": "none",
                 "can_submit_orders": False,
             }
-            if dry_run
-            else None
-        ),
+        )
+    packet_path = write_hourly_decision_packet(
+        decision,
+        output_dir=log_dir,
+        recent_packets=recent_packets,
+        packet_metadata=packet_metadata,
     )
     payload = serialize_hourly_decision(decision, recent_packets=recent_packets)
+    payload.update(
+        {
+            "outbox_suppressed": not outbox_write_allowed,
+            "outbox_write_allowed": outbox_write_allowed,
+        }
+    )
     if dry_run:
         payload.update(
             {
@@ -12354,7 +12379,7 @@ def alpaca_supervise_hourly(
     )
     payload["notification_policy_notify"] = policy_notify
     payload["notify"] = bool(payload.get("alert", {}).get("notify", policy_notify))
-    if payload["notify"]:
+    if payload["notify"] and outbox_write_allowed:
         alert_email = payload.get("alert_email")
         if isinstance(alert_email, Mapping) and alert_email.get("body"):
             from tradingagents.notifications.outbox import write_outbox_message
