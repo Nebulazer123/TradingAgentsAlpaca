@@ -959,6 +959,39 @@ def test_resolve_with_quality_defers_extreme_timestamp_overflow():
     assert reports[0].defer_reason == DEFER_INVALID_FORECAST_TIMESTAMPS
 
 
+def test_summarize_agent_scores_skips_extreme_resolved_at_overflow_and_keeps_labels():
+    base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0]
+    healthy = replace(
+        base,
+        forecast_id="af-summary-ttr-healthy",
+        agent="trader",
+        resolved=True,
+        outcome=True,
+        brier_score="0.1156",
+        agent_score_delta="0.16",
+        relative_return="8.00",
+        label_quality=LABEL_QUALITY_HIGH,
+        created_at="2026-06-01T00:00:00+00:00",
+        resolve_after="2026-06-08T00:00:00+00:00",
+        resolved_at="2026-06-09T00:00:00+00:00",
+    )
+    extreme = replace(
+        healthy,
+        forecast_id="af-summary-ttr-extreme-overflow",
+        agent="market_analyst",
+        resolved_at="9999-12-31T23:59:59-14:00",
+    )
+
+    summary = summarize_agent_scores([healthy, extreme])
+
+    assert summary["outcome_counts"] == {"useful": 2}
+    assert summary["label_quality_counts"] == {"high": 2}
+    assert summary["agents"]["trader"]["average_time_to_resolution_days"] == "8.00"
+    extreme_stats = summary["agents"]["market_analyst"]
+    assert extreme_stats["average_time_to_resolution_days"] == "0.00"
+    assert extreme_stats["score_delta_total"] == "0.16"
+
+
 def test_audit_resolved_forecasts_flags_unparseable_timestamps_as_suspect():
     forecast = _drifted_timestamp_forecast(
         resolved=True,
