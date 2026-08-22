@@ -934,6 +934,31 @@ def test_resolve_with_quality_defers_unparseable_forecast_timestamps():
     assert healthy_report.status == "not_mature"
 
 
+def test_resolve_with_quality_defers_extreme_timestamp_overflow():
+    base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0]
+    extreme = replace(
+        base,
+        forecast_id="af-extreme-overflow",
+        resolve_after="9999-12-31T23:59:59-14:00",
+    )
+
+    def window_lookup(symbol, start_date, end_date):
+        raise AssertionError("window lookup must not run for overflow timestamps")
+
+    resolved, reports = resolve_forecasts_with_quality(
+        [extreme],
+        window_lookup=window_lookup,
+        now=datetime.datetime(2026, 6, 5, tzinfo=datetime.timezone.utc),
+    )
+
+    assert resolved[0].forecast_id == "af-extreme-overflow"
+    assert resolved[0].resolved is False
+    assert resolved[0].resolution_note.startswith("deferred: ")
+    assert len(reports) == 1
+    assert reports[0].status == "deferred"
+    assert reports[0].defer_reason == DEFER_INVALID_FORECAST_TIMESTAMPS
+
+
 def test_audit_resolved_forecasts_flags_unparseable_timestamps_as_suspect():
     forecast = _drifted_timestamp_forecast(
         resolved=True,
