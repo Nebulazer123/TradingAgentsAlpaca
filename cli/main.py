@@ -9653,7 +9653,7 @@ def research_shadow_day_abort(
     stopped_at_stage: str = typer.Option(
         ...,
         "--stopped-at-stage",
-        help="Interruption stage key: day_start or one of the fixed daily-chain stage keys.",
+        help="Interruption stage key: day_start, one of the fixed daily-chain stage keys, or manifest_written (after the sealed manifest, before adjudication).",
     ),
     notes: str = typer.Option(
         ...,
