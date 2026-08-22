@@ -278,3 +278,20 @@ non-authorizing readiness evidence into live execution authority.
 - The audit rechecked the safety boundary: the sentinel remains observer-only and writes its packet before a `--require-paused` failure; the paper lease remains exact-paper-endpoint, Central-session, current-ledger, date-capacity, and per-submit-clock bound; qualification/trial ledgers cannot write live-strategy selections; the twelve-stage manifest and anchored adjudication reverify paths, hashes, same-day identity, frozen-control continuity, and all-ten-paused evidence.
 - Hermetic verification in the feature worktree used the canonical interpreter with the feature source first on `PYTHONPATH`: `tests/test_paper_tournament.py tests/test_safety_sentinel.py tests/test_shadow_trial.py tests/test_alpaca_cli.py` — `261 passed`; Ruff and `git diff --check` passed. No runtime, broker, network, schedule, control, paper, or email action was invoked.
 - Ox found no concrete bounded source defect relevant to preventing unsafe or misleading qualification/trial evidence, so no source change was made. Task 5 is therefore a real market-day evidence boundary, not an unresolved source implementation defect.
+
+## Current paused-automation inventory
+
+Read-only inventory of the ten TradingAgents records under `/Users/corbinfloyd/.codex/automations` after the Ox audit; every record is still `PAUSED`:
+
+| Record | SHA-256 |
+| --- | --- |
+| `tradingagents-automation-wake-controller` | `001f1084c86fb6da2a3e7b09e5d34c443ad45f7240d7ecda313618cf930a7fcf` |
+| `tradingagents-automation-sleep-controller` | `16a187f5c54239139986c959378a5ed69b49f8190a7f6de81611eb361f0b7a98` |
+| `tradingagents-overnight-research` | `4c2ffc7a45183563d39683564536171dd9a12a51bf10ec126ac18587964c7428` |
+| `tradingagents-autonomous-execution-board` | `537b58c6430e4cd61ae0f2c6ca8a81ceb870ab1a42e847b01648f37f2fc6d00e` |
+| `tradingagents-daily-report` | `55934c5740307d4e4703a0eb51cf7244f07160a4531340d966e65a51ec37d32b` |
+| `tradingagents-market-supervisor` | `607b6961f31c164361b2d00b20baeecd9e73370acbc994b5773161caddc3fea8` |
+| `tradingagents-autonomous-self-healer` | `77c9c9472cb32c1f3f168c3618c05e27676fe8a2fd084a71b6151fd6081a1672` |
+| `tradingagents-paper-tournament` | `db226476f71c9a49ef694b25cdb5c649d50ab45773b570a1c70ec47cb7a41ea9` |
+| `tradingagents-preopen-validation` | `dcb7c28a0f1e329434c097cb741ebf68d9e60b622673bf45d4e61ebdb90901c9` |
+| `tradingagents-autonomous-safety-sentinel` | `df5928810a2c53c8af96d72778f2de4093c56f836141ec1ac14f4141f7504579` |
