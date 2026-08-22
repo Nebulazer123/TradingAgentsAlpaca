@@ -1285,11 +1285,13 @@ def summarize_agent_scores(forecasts: Sequence[AgentForecast]) -> dict[str, Any]
             bucket["probability_total"] += probability
             bucket["cost_total"] += _decimal(forecast.cost_usd)
             if forecast.resolved_at:
-                try:
-                    elapsed = _as_utc(forecast.resolved_at) - _as_utc(forecast.created_at)
-                    bucket["time_to_resolution_days_total"] += Decimal(str(elapsed.total_seconds())) / Decimal("86400")
-                except (TypeError, ValueError):
-                    pass
+                created = _stored_utc_or_none(forecast.created_at)
+                resolved = _stored_utc_or_none(forecast.resolved_at)
+                if created is not None and resolved is not None:
+                    elapsed = resolved - created
+                    bucket["time_to_resolution_days_total"] += (
+                        Decimal(str(elapsed.total_seconds())) / Decimal("86400")
+                    )
             actual_return = _decimal(forecast.actual_return)
             threshold = _decimal("0")
             directional_outcome = (

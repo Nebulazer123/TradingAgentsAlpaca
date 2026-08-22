@@ -28,6 +28,7 @@ from typing import Any
 from tradingagents.evals.agent_intelligence_ledger import (
     DEFAULT_LEDGER_PATH,
     LEDGER_FORBIDDEN_EFFECTS,
+    _stored_utc_or_none,
     load_ledger_with_stats,
     summarize_agent_scores,
 )
@@ -120,9 +121,8 @@ def _maturity_radar(
     for forecast in forecasts:
         if forecast.resolved:
             continue
-        try:
-            matures = _as_utc(forecast.resolve_after)
-        except (TypeError, ValueError):
+        matures = _stored_utc_or_none(forecast.resolve_after)
+        if matures is None:
             unparseable += 1
             continue
         if matures <= now_dt:

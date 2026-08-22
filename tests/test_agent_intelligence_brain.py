@@ -259,6 +259,31 @@ def test_brain_marks_malformed_sources_without_raising(tmp_path):
     assert brain["influence"]["weights"] == {}
 
 
+def test_brain_radar_fails_closed_on_extreme_maturity_overflow(tmp_path):
+    paths = _brain_paths(tmp_path)
+    write_ledger(
+        [
+            _forecast("af-due-ok", resolve_after="2026-06-10T20:00:00+00:00"),
+            _forecast(
+                "af-extreme-maturity-overflow",
+                resolve_after="9999-12-31T23:59:59-14:00",
+            ),
+        ],
+        path=paths["ledger_path"],
+    )
+
+    brain = build_agent_intelligence_brain(**paths, now=NOW)
+
+    radar = brain["maturity_radar"]
+    assert radar["unparseable_maturity_count"] == 1
+    assert radar["due_unresolved_count"] == 1
+    assert radar["due_dates"] == {}
+    assert radar["beyond_horizon_pending_count"] == 0
+    assert radar["next_maturity_date"] is None
+    assert brain["ledger"]["forecast_count"] == 2
+    assert brain["ledger"]["pending_forecast_count"] == 2
+
+
 def test_brain_surfaces_supported_priors(tmp_path):
     paths = _write_full_state(tmp_path, hypothesis_status="supported")
     brain = build_agent_intelligence_brain(**paths, now=NOW)
