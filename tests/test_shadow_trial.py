@@ -504,6 +504,29 @@ def _complete_daily_chain(
     return {**artifacts, "daily_chain_manifest": manifest_path}
 
 
+def _rebind_daily_chain_manifest(
+    root: Path,
+    *,
+    start,
+    artifacts: dict[str, Path],
+) -> Path:
+    market_date = _payload(start)["market_date"]
+    stages = {
+        name: (
+            artifacts[name]
+            if name in artifacts
+            else root / "artifacts" / f"{name}-{market_date}.json"
+        )
+        for name in shadow_trial.DAILY_CHAIN_STAGES
+    }
+    _, manifest_path = shadow_trial.create_shadow_day_manifest(
+        start_object_id=start.envelope.object_id,
+        stages=stages,
+        output_dir=root / "rebound-manifests",
+    )
+    return manifest_path
+
+
 def _day(
     root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1761,6 +1784,66 @@ def test_daily_chain_manifest_rejects_missing_stage_and_replaced_stage_file(tmp_
     decision = _day(tmp_path / "replacement", monkeypatch, second, date="2026-08-21", artifacts=replacement)
     assert _payload(decision)["status"] == "failed"
     assert "safety_sentinel_stage_hash_or_path_changed" in _payload(decision)["reasons"]
+
+
+def test_stale_safety_sentinel_with_rebound_manifest_yields_non_clean_timestamp_reason(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    artifacts = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=_payload(start)["run_id"],
+            date="2026-08-21",
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    stale = json.loads(artifacts["safety_sentinel"].read_text(encoding="utf-8"))
+    stale["generated_at"] = "2026-08-20T15:00:00+00:00"
+    _write_json(artifacts["safety_sentinel"], stale)
+    rebound = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=artifacts)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date="2026-08-21",
+        artifacts={**artifacts, "daily_chain_manifest": rebound},
+    )
+    payload = _payload(decision)
+    assert payload["status"] in {"failed", "incomplete"}
+    assert "safety_sentinel_timestamp_out_of_window" in payload["reasons"]
+    assert "safety_sentinel_stage_timestamp_invalid" in payload["reasons"]
+    assert "safety_sentinel_stage_hash_or_path_changed" not in payload["reasons"]
+
+
+def test_malformed_paper_tournament_with_rebound_manifest_yields_non_clean_unreadable_reason(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    artifacts = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=_payload(start)["run_id"],
+            date="2026-08-21",
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    artifacts["paper_tournament"].write_text('{"kind": "paper_tournament_run"', encoding="utf-8")
+    rebound = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=artifacts)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date="2026-08-21",
+        artifacts={**artifacts, "daily_chain_manifest": rebound},
+    )
+    payload = _payload(decision)
+    assert payload["status"] in {"failed", "incomplete"}
+    assert "paper_tournament_unreadable_or_unbound" in payload["reasons"]
+    assert "paper_tournament_stage_unreadable" in payload["reasons"]
+    assert "paper_tournament_stage_hash_or_path_changed" not in payload["reasons"]
 
 
 def test_red_full_ledger_replay_requires_repair_then_fresh_qualification_and_five_days(tmp_path, monkeypatch):
