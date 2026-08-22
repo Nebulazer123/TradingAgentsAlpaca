@@ -318,6 +318,17 @@ def _parse_broker_clock_timestamp(value: object) -> datetime.datetime | None:
         return None
 
 
+def _normalize_aware_policy_timestamp(value: object) -> datetime.datetime | None:
+    """Reject a policy clock unless it is an aware datetime value."""
+
+    if not isinstance(value, datetime.datetime) or value.tzinfo is None:
+        return None
+    try:
+        return value.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
 def _validate_regular_paper_broker_clock(
     paper_client: object,
     *,
@@ -336,7 +347,7 @@ def _validate_regular_paper_broker_clock(
     if not isinstance(clock, Mapping) or clock.get("is_open") is not True:
         raise ValueError("paper submission lease requires an open broker clock")
     clock_timestamp = _parse_broker_clock_timestamp(clock.get("timestamp"))
-    now_timestamp = _normalize_timestamp(now)
+    now_timestamp = _normalize_aware_policy_timestamp(now)
     if clock_timestamp is None or now_timestamp is None:
         raise ValueError("paper submission lease broker clock is malformed")
     if clock_timestamp > now_timestamp:
@@ -344,11 +355,18 @@ def _validate_regular_paper_broker_clock(
     if (now_timestamp - clock_timestamp).total_seconds() > MAX_BROKER_CLOCK_SKEW_SECONDS:
         raise ValueError("paper submission lease broker clock is stale")
     clock_central = clock_timestamp.astimezone(CENTRAL)
-    if clock_central.date().isoformat() != market_date:
+    policy_central = now_timestamp.astimezone(CENTRAL)
+    if (
+        policy_central.date().isoformat() != market_date
+        or clock_central.date().isoformat() != market_date
+    ):
         raise ValueError("paper submission lease broker clock has the wrong Central market date")
     regular_open = datetime.time(hour=8, minute=30)
     regular_close = datetime.time(hour=15)
-    if not regular_open <= clock_central.timetz().replace(tzinfo=None) < regular_close:
+    if not (
+        regular_open <= policy_central.timetz().replace(tzinfo=None) < regular_close
+        and regular_open <= clock_central.timetz().replace(tzinfo=None) < regular_close
+    ):
         raise ValueError("paper submission lease broker clock is outside the regular session")
 
 
@@ -407,16 +425,17 @@ def validate_submission_transaction_state(ledger: Mapping) -> None:
             raise ValueError("paper submission lease recovery is required for an incomplete transaction")
 
 
-def validate_submission_lease(
+def _validate_submission_lease(
     ledger: Mapping,
     *,
     paper_client: object,
     now: datetime.datetime,
+    allow_submitting_transaction: bool,
 ) -> str:
     """Validate every condition required before a paper order can be posted."""
 
     _validate_exact_paper_client(paper_client)
-    now_timestamp = _normalize_timestamp(now)
+    now_timestamp = _normalize_aware_policy_timestamp(now)
     if now_timestamp is None or not isinstance(ledger, Mapping):
         raise ValueError("paper submission lease is malformed")
     if ledger.get("ledger_type") != QUALIFICATION_TRIAL_LEDGER_TYPE:
@@ -454,7 +473,21 @@ def validate_submission_lease(
         or len(submitted_dates) > limit
     ):
         raise ValueError("paper submission lease market-date ledger is malformed")
-    validate_submission_transaction_state(ledger)
+    active_submission_market_date = None
+    if allow_submitting_transaction:
+        transaction = ledger.get("submission_transaction")
+        if isinstance(transaction, Mapping) and transaction.get("status") == "submitting":
+            transaction_market_date = transaction.get("market_date")
+            if type(transaction_market_date) is str and not _submitted_market_date_is_malformed(
+                transaction_market_date
+            ):
+                active_submission_market_date = transaction_market_date
+            else:
+                raise ValueError("paper submission lease recovery is required for an incomplete transaction")
+        elif transaction is not None:
+            validate_submission_transaction_state(ledger)
+    else:
+        validate_submission_transaction_state(ledger)
     market_date = _central_market_date(now_timestamp)
     if market_date is None:
         raise ValueError("paper submission lease has no Central market date")
@@ -472,9 +505,10 @@ def validate_submission_lease(
         for item in calendar
     ):
         raise ValueError("paper submission lease requires a regular Central market date")
-    if market_date in submitted_dates:
+    consuming_active_submission_date = active_submission_market_date == market_date
+    if market_date in submitted_dates and not consuming_active_submission_date:
         raise ValueError("paper submission lease already used this Central market date")
-    if len(submitted_dates) >= limit:
+    if len(submitted_dates) >= limit and not consuming_active_submission_date:
         raise ValueError("paper submission lease market-day capacity is exhausted")
     _validate_regular_paper_broker_clock(
         paper_client,
@@ -482,6 +516,41 @@ def validate_submission_lease(
         market_date=market_date,
     )
     return market_date
+
+
+def validate_submission_lease(
+    ledger: Mapping,
+    *,
+    paper_client: object,
+    now: datetime.datetime,
+) -> str:
+    """Validate every condition required before a paper submission starts."""
+
+    return _validate_submission_lease(
+        ledger,
+        paper_client=paper_client,
+        now=now,
+        allow_submitting_transaction=False,
+    )
+
+
+def validate_submission_runtime_boundary(
+    ledger: Mapping,
+    *,
+    paper_client: object,
+    now: datetime.datetime,
+    expected_market_date: str,
+) -> None:
+    """Revalidate the exact paper submission boundary immediately before a POST."""
+
+    market_date = _validate_submission_lease(
+        ledger,
+        paper_client=paper_client,
+        now=now,
+        allow_submitting_transaction=True,
+    )
+    if market_date != expected_market_date:
+        raise ValueError("paper submission lease Central market date changed")
 
 
 def _submitted_market_date_is_malformed(value: str) -> bool:

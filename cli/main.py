@@ -10368,6 +10368,7 @@ def alpaca_paper_tournament_run(
         remove_trial_live_strategy_selection,
         tournament_submission_lock,
         validate_submission_lease,
+        validate_submission_runtime_boundary,
     )
 
     if not all_strategies and not strategy:
@@ -10425,14 +10426,32 @@ def alpaca_paper_tournament_run(
         submitted = []
         if not dry_run and payloads:
             try:
+                transaction_now = _alpaca_policy_now()
+                transaction_market_date = validate_submission_lease(
+                    ledger,
+                    paper_client=paper_client,
+                    now=transaction_now,
+                )
+                if transaction_market_date != submission_market_date:
+                    raise ValueError("paper submission lease Central market date changed")
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+            try:
                 begin_submission_transaction(
                     ledger,
                     market_date=str(submission_market_date),
                     payloads=payloads,
-                    now=now,
+                    now=transaction_now,
                 )
                 write_tournament_ledger(ledger, log_dir)
                 for payload in payloads:
+                    post_now = _alpaca_policy_now()
+                    validate_submission_runtime_boundary(
+                        ledger,
+                        paper_client=paper_client,
+                        now=post_now,
+                        expected_market_date=str(submission_market_date),
+                    )
                     order_payload = {
                         key: value
                         for key, value in payload.items()
@@ -10445,7 +10464,7 @@ def alpaca_paper_tournament_run(
                             payload=payload,
                             response=response,
                             market_date=str(submission_market_date),
-                            now=now,
+                            now=post_now,
                         )
                     )
                     write_tournament_ledger(ledger, log_dir)
