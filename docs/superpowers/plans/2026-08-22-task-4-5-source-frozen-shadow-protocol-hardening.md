@@ -68,9 +68,11 @@ Focused: the increment's named test functions. Dependent: the owning modules' fu
 
 **Tests:** interruption after every daily stage including immediately post-start, post-paper persistence, post-manifest, pre-adjudication; abort refuses wrong object id, non-today dates, existing successor; expire refuses same-date pending; both fail closed on anchor/journal damage; aborted/expired days reset streak and force repair→requalification transitions through `_start_spec`.
 
-- [ ] RED interruption-matrix and guard tests; record failures.
-- [ ] Implement both facades + CLI; prove every pending start has exactly one recoverable path to an immutable non-clean result.
-- [ ] Focused shadow tests + recovery suites + static checks; commit.
+- [x] RED interruption-matrix and guard tests; record failures.
+- [x] Implement both facades + CLI; prove every pending start has exactly one recoverable path to an immutable non-clean result.
+- [x] Focused shadow tests + recovery suites + static checks; commit.
+
+**Implementation record (2026-08-22):** Day payloads gained `closure_kind`, `stopped_at_stage`, and `notes` (exact-field schema). `SHADOW_DAY_STOP_STAGES` is `("day_start", *DAILY_CHAIN_STAGES)`. Abort forces reason `shadow_day_aborted_by_operator`; expiry forces `pending_day_expired_without_adjudication`; both derive `phase="repair_required"` through the unchanged `_day_phase`. Replay validation now admits a late day result only for `closure_kind="pending_expired"` recorded on a strictly later Central date. The three prior inline anchored-write blocks were extracted verbatim into the shared `_admit_shadow_envelope` transaction used by start, adjudicate, report, abort, and expire alike. CLI gained read-surface-only `research shadow-day-abort` (start id, stop stage, required notes, optional present-artifact paths) and argument-free `research shadow-day-expire-pending` (`expired: false` JSON when nothing qualifies). No runtime identity capture was added in this increment.
 
 ## Increment 3: Bind runtime identity
 

@@ -1855,6 +1855,412 @@ def test_malformed_paper_tournament_with_rebound_manifest_yields_non_clean_unrea
     assert "paper_tournament_stage_hash_or_path_changed" not in payload["reasons"]
 
 
+def test_red_abort_shadow_day_closes_pending_terminal_failed_and_blocks_duplicates(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    artifacts = _artifacts(
+        tmp_path,
+        run_id=_payload(start)["run_id"],
+        date="2026-08-21",
+        start_object_id=start.envelope.object_id,
+    )
+
+    admission = shadow_trial.abort_shadow_day(
+        start_object_id=start.envelope.object_id,
+        stopped_at_stage="paper_tournament",
+        notes="process interrupted after paper persistence",
+        artifacts=artifacts,
+    )
+    payload = _payload(admission)
+    assert payload["status"] == "failed"
+    assert payload["status"] != "clean"
+    assert payload["phase"] == "repair_required"
+    assert payload["closure_kind"] == "operator_abort"
+    assert payload["stopped_at_stage"] == "paper_tournament"
+    assert payload["notes"] == "process interrupted after paper persistence"
+    assert "shadow_day_aborted_by_operator" in payload["reasons"]
+    assert "daily_chain_manifest_unreadable_or_unbound" in payload["reasons"]
+    assert payload["start_object_id"] == start.envelope.object_id
+    assert payload["run_id"] == _payload(start)["run_id"]
+    assert payload["market_date"] == "2026-08-21"
+    assert payload["role"] == "qualification"
+    assert payload["artifacts"]["safety_sentinel"]["status"] == "captured"
+    assert payload["artifacts"]["paper_tournament"]["status"] == "captured"
+    assert payload["artifacts"]["daily_chain_manifest"]["status"] == "missing"
+    assert admission.envelope.analysis_only is True
+    assert admission.envelope.execution_authority == "none"
+    assert admission.envelope.can_submit_orders is False
+
+    with pytest.raises(ValueError, match="pending|abort"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="duplicate closure attempt",
+        )
+    with pytest.raises(ValueError, match="admissible pending"):
+        shadow_trial.adjudicate_shadow_day(start_object_id=start.envelope.object_id, artifacts={})
+
+    status = shadow_trial.shadow_streak_status()
+    assert status["clean_trial_streak"] == 0
+    assert status["last_result"]["object_id"] == admission.envelope.object_id
+    assert status["last_result"]["status"] == "failed"
+    assert status["last_result"]["phase"] == "repair_required"
+    assert status["pending_start"] is None
+    assert status["can_start_next_day"] is True
+    assert status["predecessor_object_id"] == admission.envelope.object_id
+
+    _set_clock(monkeypatch, "2026-08-22")
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        repair_start = shadow_trial.create_shadow_day_start_manifest(
+            run_id="repair-after-abort",
+            market_date="2026-08-22",
+            predecessor_object_id=admission.envelope.object_id,
+        )
+    repair_payload = _payload(repair_start)
+    assert repair_payload["role"] == "repair"
+    assert repair_payload["phase"] == "repair_in_progress"
+    assert repair_payload["predecessor_object_id"] == admission.envelope.object_id
+
+
+def test_red_abort_refuses_wrong_identity_stale_date_and_nonpending_ledger(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    wrong_identity = "manual-shadow-day-start-" + "0" * 64
+    with pytest.raises(ValueError, match="pending"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=wrong_identity,
+            stopped_at_stage="day_start",
+            notes="wrong identity must be refused",
+        )
+    with pytest.raises(ValueError, match="stage"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="not-a-real-stage",
+            notes="unknown stage key must be refused",
+        )
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    assert _payload(day)["status"] == "clean"
+    with pytest.raises(ValueError, match="pending"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="already adjudicated ledger has no pending abort",
+        )
+
+
+def test_red_abort_refuses_when_market_date_is_no_longer_current(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    _set_clock(monkeypatch, "2026-08-22", 15)
+    with pytest.raises(ValueError, match="Central"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="stale abort must be refused; expire-pending owns this state",
+        )
+    admission = shadow_trial.expire_pending_shadow_day()
+    assert admission is not None
+    assert _payload(admission)["closure_kind"] == "pending_expired"
+
+
+def test_red_expire_pending_converts_stale_start_to_immutable_incomplete(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    _set_clock(monkeypatch, "2026-08-22", 14)
+    admission = shadow_trial.expire_pending_shadow_day()
+    assert admission is not None
+    payload = _payload(admission)
+    assert payload["status"] == "incomplete"
+    assert payload["phase"] == "repair_required"
+    assert payload["closure_kind"] == "pending_expired"
+    assert payload["stopped_at_stage"] is None
+    assert payload["notes"] is None
+    assert "pending_day_expired_without_adjudication" in payload["reasons"]
+    assert "current_central_date_mismatch" in payload["reasons"]
+    assert set(payload["artifacts"]) == set(shadow_trial.ARTIFACT_KEYS)
+    assert all(item["status"] == "missing" for item in payload["artifacts"].values())
+    assert payload["start_object_id"] == start.envelope.object_id
+    assert admission.envelope.analysis_only is True
+    assert admission.envelope.execution_authority == "none"
+    assert admission.envelope.can_submit_orders is False
+
+    assert shadow_trial.expire_pending_shadow_day() is None
+    with pytest.raises(ValueError, match="admissible pending"):
+        shadow_trial.adjudicate_shadow_day(start_object_id=start.envelope.object_id, artifacts={})
+
+    status = shadow_trial.shadow_streak_status()
+    assert status["clean_trial_streak"] == 0
+    assert status["last_result"]["object_id"] == admission.envelope.object_id
+    assert status["last_result"]["status"] == "incomplete"
+    assert status["can_start_next_day"] is True
+    assert status["predecessor_object_id"] == admission.envelope.object_id
+
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        repair_start = shadow_trial.create_shadow_day_start_manifest(
+            run_id="repair-after-expiry",
+            market_date="2026-08-22",
+            predecessor_object_id=admission.envelope.object_id,
+        )
+    assert _payload(repair_start)["role"] == "repair"
+    assert not (environment["manual_root"] / "objects" / "manual-shadow-final-report").exists()
+
+
+def test_red_expire_leaves_same_date_pending_untouched(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+    start = _start(monkeypatch, date="2026-08-21")
+
+    before = _ledger_surface_snapshot(results_parent)
+    assert shadow_trial.expire_pending_shadow_day() is None
+    assert before == _ledger_surface_snapshot(results_parent)
+    assert (
+        shadow_trial.load_shadow_record(
+            start.envelope.object_id,
+            expected_kind="manual-shadow-day-start",
+        ).object_id
+        == start.envelope.object_id
+    )
+
+
+@pytest.mark.parametrize("stage", ["day_start", *list(shadow_trial.DAILY_CHAIN_STAGES)])
+def test_red_abort_interruption_matrix_admits_one_non_clean_result_per_stage(tmp_path, monkeypatch, stage):
+    _environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    admission = shadow_trial.abort_shadow_day(
+        start_object_id=start.envelope.object_id,
+        stopped_at_stage=stage,
+        notes=f"interruption drill immediately after {stage}",
+    )
+    payload = _payload(admission)
+    assert payload["status"] == "failed"
+    assert payload["phase"] == "repair_required"
+    assert payload["stopped_at_stage"] == stage
+    assert "shadow_day_aborted_by_operator" in payload["reasons"]
+    assert all(item["status"] == "missing" for item in payload["artifacts"].values())
+    assert admission.envelope.can_submit_orders is False
+
+    journal_lines = (
+        _environment["manual_root"] / "events.jsonl"
+    ).read_bytes().splitlines()
+    assert len(journal_lines) == 2
+
+    _set_clock(monkeypatch, "2026-08-22")
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        recovery = shadow_trial.create_shadow_day_start_manifest(
+            run_id=f"recover-{stage}",
+            market_date="2026-08-22",
+            predecessor_object_id=admission.envelope.object_id,
+        )
+    assert _payload(recovery)["predecessor_object_id"] == admission.envelope.object_id
+    assert shadow_trial.shadow_streak_status()["can_start_next_day"] is False
+
+
+def test_red_closure_facades_fail_closed_on_anchor_or_journal_damage(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+    anchor_path = results_parent / ".manual-shadow-trusted-head.json"
+
+    qualification_start = _start(monkeypatch, date="2026-08-21")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-21")
+    stranded = _start(
+        monkeypatch,
+        date="2026-08-22",
+        predecessor_object_id=qualification.envelope.object_id,
+    )
+    _set_clock(monkeypatch, "2026-08-22", 18)
+
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    lines = (environment["manual_root"] / "events.jsonl").read_bytes().splitlines()
+
+    def head_of(line: bytes, sequence: int) -> dict[str, object]:
+        event = json.loads(line)
+        return {
+            "sequence": sequence,
+            "kind": event["kind"],
+            "object_id": event["object_id"],
+            "event_sha256": hashlib.sha256(line).hexdigest(),
+            "admission_route": event["admission_route"],
+        }
+
+    prior_head = head_of(lines[-2], len(lines) - 1)
+    last_event = json.loads(lines[-1])
+    anchor["committed_head"] = prior_head
+    anchor["pending_next"] = {
+        "prior_head": prior_head,
+        "sequence": len(lines),
+        "kind": last_event["kind"],
+        "object_id": last_event["object_id"],
+        "retry_material_sha256": last_event["retry_material_sha256"],
+        "admission_route": last_event["admission_route"],
+    }
+    anchor_path.write_text(
+        json.dumps(
+            anchor,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    damaged_before = _ledger_surface_snapshot(results_parent)
+    with pytest.raises(ValueError, match="advanced|unresolved|pending"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=stranded.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="anchor damage must fail closed",
+        )
+    with pytest.raises(ValueError, match="advanced|unresolved|pending"):
+        shadow_trial.expire_pending_shadow_day()
+    assert damaged_before == _ledger_surface_snapshot(results_parent)
+
+    anchor["committed_head"] = head_of(lines[-1], len(lines) - 1)
+    anchor["pending_next"] = None
+    anchor_path.write_text(
+        json.dumps(
+            anchor,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    object_path = (
+        environment["manual_root"]
+        / "objects"
+        / "manual-shadow-day-start"
+        / f"{stranded.envelope.object_id}.json"
+    )
+    object_path.unlink()
+    journal_before = _ledger_surface_snapshot(results_parent)
+    with pytest.raises(ValueError):
+        shadow_trial.abort_shadow_day(
+            start_object_id=stranded.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="journal damage must fail closed",
+        )
+    with pytest.raises(ValueError):
+        shadow_trial.expire_pending_shadow_day()
+    assert journal_before == _ledger_surface_snapshot(results_parent)
+
+
+def test_red_cli_closure_commands_are_pinned_fail_closed_and_non_authorizing(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    calendar = _CalendarFake({"2026-08-21"})
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: calendar)
+    _set_clock(monkeypatch, "2026-08-21")
+
+    abort_help = runner.invoke(app, ["research", "shadow-day-abort", "--help"])
+    assert abort_help.exit_code == 0
+    for forbidden in (
+        "--now",
+        "--ledger-id",
+        "--live-control-path",
+        "--schedule-contract-path",
+        "--automation-root",
+        "--force",
+        "--dry-run",
+        "--market-date",
+    ):
+        assert forbidden not in abort_help.output
+    assert "--stopped-at-stage" in abort_help.output
+    assert "--notes" in abort_help.output
+    expire_help = runner.invoke(app, ["research", "shadow-day-expire-pending", "--help"])
+    assert expire_help.exit_code == 0
+    assert "--now" not in expire_help.output
+
+    abort_parameters = inspect.signature(shadow_trial.abort_shadow_day).parameters
+    assert list(abort_parameters) == ["start_object_id", "stopped_at_stage", "notes", "artifacts"]
+    assert all(item.kind is inspect.Parameter.KEYWORD_ONLY for item in abort_parameters.values())
+    assert abort_parameters["notes"].default is inspect.Parameter.empty
+    assert abort_parameters["artifacts"].default is None
+    assert not inspect.signature(shadow_trial.expire_pending_shadow_day).parameters
+
+    started = runner.invoke(
+        app,
+        ["research", "shadow-day-start", "--run-id", "cli-abort-drill", "--market-date", "2026-08-21", "--json-output"],
+    )
+    assert started.exit_code == 0, started.output
+    start_id = json.loads(started.stdout)["object_id"]
+    calendar_calls_after_start = list(calendar.calls)
+
+    same_date_expire = runner.invoke(app, ["research", "shadow-day-expire-pending", "--json-output"])
+    assert same_date_expire.exit_code == 0, same_date_expire.output
+    assert json.loads(same_date_expire.stdout)["expired"] is False
+
+    bad_stage = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-abort",
+            "--start-object-id", start_id,
+            "--stopped-at-stage", "not-a-real-stage",
+            "--notes", "bad stage",
+        ],
+    )
+    assert bad_stage.exit_code != 0
+
+    aborted = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-abort",
+            "--start-object-id", start_id,
+            "--stopped-at-stage", "safety_sentinel",
+            "--notes", "cli interruption drill",
+            "--json-output",
+        ],
+    )
+    assert aborted.exit_code == 0, aborted.output
+    aborted_payload = json.loads(aborted.stdout)
+    assert aborted_payload["status"] == "failed"
+    assert aborted_payload["phase"] == "repair_required"
+    assert aborted_payload["closure_kind"] == "operator_abort"
+    assert aborted_payload["stopped_at_stage"] == "safety_sentinel"
+    assert aborted_payload["execution_authority"] == "none"
+    assert aborted_payload["can_submit_orders"] is False
+    assert calendar.calls == calendar_calls_after_start + [("2026-08-21", "2026-08-21")]
+
+    duplicate = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-abort",
+            "--start-object-id", start_id,
+            "--stopped-at-stage", "day_start",
+            "--notes", "duplicate closure attempt",
+        ],
+    )
+    assert duplicate.exit_code != 0
+
+    stale_second_start = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-start",
+            "--run-id", "cli-repair-without-predecessor",
+            "--market-date", "2026-08-21",
+        ],
+    )
+    assert stale_second_start.exit_code != 0
+
+
 def test_red_full_ledger_replay_requires_repair_then_fresh_qualification_and_five_days(tmp_path, monkeypatch):
     _configure_environment(monkeypatch, tmp_path)
     qualification_start = _start(monkeypatch, date="2026-08-14")

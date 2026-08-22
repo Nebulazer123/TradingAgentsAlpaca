@@ -9647,6 +9647,95 @@ def research_shadow_day_adjudicate(
     console.print(f"Decision: {admission.path}")
 
 
+@research_app.command("shadow-day-abort")
+def research_shadow_day_abort(
+    start_object_id: str = typer.Option(..., "--start-object-id", help="Authenticated pending shadow start object identity."),
+    stopped_at_stage: str = typer.Option(
+        ...,
+        "--stopped-at-stage",
+        help="Interruption stage key: day_start or one of the fixed daily-chain stage keys.",
+    ),
+    notes: str = typer.Option(
+        ...,
+        "--notes",
+        help="Short operator explanation recorded inside the immutable closure result.",
+    ),
+    safety_sentinel: Path | None = typer.Option(None, "--safety-sentinel", help="Present sentinel artifact, when one exists."),
+    paper_tournament: Path | None = typer.Option(None, "--paper-tournament", help="Present paper artifact, when one exists."),
+    daily_chain_manifest: Path | None = typer.Option(None, "--daily-chain-manifest", help="Present observer-chain manifest, when one exists."),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Crash-safe closure of today's stranded pending shadow day; terminal and non-authorizing."""
+
+    from tradingagents.evals.shadow_trial import (
+        abort_shadow_day,
+        admitted_shadow_record_view,
+        load_shadow_record,
+    )
+
+    supplied: dict[str, Path] = {
+        key: value
+        for key, value in (
+            ("safety_sentinel", safety_sentinel),
+            ("paper_tournament", paper_tournament),
+            ("daily_chain_manifest", daily_chain_manifest),
+        )
+        if value is not None
+    }
+    try:
+        load_shadow_record(start_object_id, expected_kind="manual-shadow-day-start")
+        admission = abort_shadow_day(
+            start_object_id=start_object_id,
+            stopped_at_stage=stopped_at_stage,
+            notes=notes,
+            artifacts=supplied,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = admitted_shadow_record_view(admission)
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Shadow-day abort recorded: {payload['status']}")
+    console.print(f"Decision: {admission.path}")
+
+
+@research_app.command("shadow-day-expire-pending")
+def research_shadow_day_expire_pending(
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Close a pending shadow day whose Central market date has already passed."""
+
+    from tradingagents.evals.shadow_trial import (
+        admitted_shadow_record_view,
+        expire_pending_shadow_day,
+    )
+
+    try:
+        admission = expire_pending_shadow_day()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    envelope = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    if admission is None:
+        result = {**envelope, "expired": False, "record": None}
+        if json_output:
+            typer.echo(json.dumps(result, indent=2, sort_keys=True))
+            return
+        console.print("No expired pending shadow day.")
+        return
+    record = admitted_shadow_record_view(admission)
+    result = {**envelope, "expired": True, "record": record}
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
+    console.print(f"Expired pending shadow day closed: {record['status']}")
+    console.print(f"Decision: {admission.path}")
+
+
 @research_app.command("shadow-day-manifest")
 def research_shadow_day_manifest(
     start_object_id: str = typer.Option(..., "--start-object-id", help="Authenticated pending shadow start object identity."),
