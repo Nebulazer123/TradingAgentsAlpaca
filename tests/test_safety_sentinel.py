@@ -1,3 +1,4 @@
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -33,7 +34,7 @@ class _ReadOnlyBrokerFake:
 
     def get_account(self) -> dict:
         self.calls.append(("get_account", None))
-        return {"status": "ACTIVE", "buying_power": "100", "equity": "100"}
+        return {"id": "account-1", "status": "ACTIVE", "buying_power": "100", "equity": "100"}
 
     def list_positions(self) -> list[dict]:
         self.calls.append(("list_positions", None))
@@ -152,10 +153,10 @@ def _packet(
         automation_root=automation_root,
         role_contract_path=roles,
         broker_snapshot={
-            "account": {"status": "ACTIVE"},
+            "account": {"id": "account-1", "status": "ACTIVE"},
             "positions": [],
             "open_orders": [],
-            "clock": {"is_open": False},
+            "clock": {"is_open": False, "timestamp": "2026-08-21T13:30:00+00:00"},
             "errors": {},
             "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
             "captured_at": "2026-08-21T13:30:00+00:00",
@@ -192,6 +193,12 @@ def test_safety_sentinel_captures_and_evaluates_complete_schedule_snapshot(tmp_p
         and entry["sha256"]
         and entry["size_bytes"] > 0
         and Path(entry["path"]).is_absolute()
+        and entry["automation_root"] == str(Path(entry["path"]).parents[1])
+        and entry["relative_path"] == f"{entry['automation_id']}/automation.toml"
+        and entry["descriptor_relative"] is True
+        and entry["file_kind"] == "regular"
+        and entry["symlink"] is False
+        and entry["file_identity"]
         for entry in schedule_evidence["automation_tomls"]
     )
     assert all(row["status"] == "match" for row in packet["schedule_check"]["automations"])
@@ -353,6 +360,174 @@ def test_safety_sentinel_holds_malformed_broker_values_even_when_all_keys_exist(
         "broker_snapshot_open_orders_invalid",
         "broker_snapshot_clock_invalid",
     }
+
+
+def test_safety_sentinel_accepts_the_minimum_well_formed_populated_broker_snapshot(tmp_path):
+    control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
+
+    packet = build_safety_sentinel_packet(
+        live_control_path=control,
+        preopen_validation_path=preopen,
+        schedule_contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        broker_snapshot={
+            "account": {"id": "account-1", "status": "ACTIVE"},
+            "positions": [{"symbol": "AAPL", "qty": "1"}],
+            "open_orders": [
+                {
+                    "id": "order-1",
+                    "symbol": "MSFT",
+                    "side": "buy",
+                    "qty": "2",
+                    "status": "new",
+                }
+            ],
+            "clock": {"is_open": False, "timestamp": "2026-08-21T13:30:00+00:00"},
+            "errors": {},
+            "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+            "captured_at": "2026-08-21T13:30:00+00:00",
+        },
+        now=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    assert packet["status"] == "CLEAR"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("account", {"id": [], "status": "ACTIVE"}, "broker_snapshot_account_invalid"),
+        ("positions", [None], "broker_snapshot_position_0_invalid"),
+        ("open_orders", ["not-an-order"], "broker_snapshot_open_order_0_invalid"),
+        (
+            "clock",
+            {"is_open": "false", "timestamp": []},
+            "broker_snapshot_clock_invalid",
+        ),
+    ],
+)
+def test_safety_sentinel_holds_nested_malformed_broker_values(tmp_path, field, value, reason):
+    control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
+    snapshot = {
+        "account": {"id": "account-1", "status": "ACTIVE"},
+        "positions": [],
+        "open_orders": [],
+        "clock": {"is_open": False, "timestamp": "2026-08-21T13:30:00+00:00"},
+        "errors": {},
+        "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+        "captured_at": "2026-08-21T13:30:00+00:00",
+    }
+    snapshot[field] = value
+
+    packet = build_safety_sentinel_packet(
+        live_control_path=control,
+        preopen_validation_path=preopen,
+        schedule_contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        broker_snapshot=snapshot,
+        now=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    assert packet["status"] == "HOLD"
+    assert reason in packet["reasons"]
+
+
+def test_captured_schedule_snapshot_rejects_hidden_unexpected_automation(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    unexpected_id = "tradingagents-unexpected-observer"
+    unexpected_toml = automation_root / unexpected_id / "automation.toml"
+    unexpected_toml.parent.mkdir(parents=True)
+    unexpected_toml.write_text('name = "unexpected"\nstatus = "PAUSED"\n', encoding="utf-8")
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    mutated = copy.deepcopy(snapshot)
+    mutated["automation_tomls"] = [
+        source for source in mutated["automation_tomls"] if source["automation_id"] != unexpected_id
+    ]
+    mutated["discovered_automation_ids"].remove(unexpected_id)
+
+    result = evaluate_schedule_contract(captured_snapshot=mutated)
+
+    assert result["issues"] == ["captured_snapshot_invalid"]
+
+
+def test_captured_schedule_snapshot_rejects_extra_and_symlinked_automation_tomls(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path / "extra")
+    unexpected_id = "tradingagents-unexpected-observer"
+    unexpected_toml = automation_root / unexpected_id / "automation.toml"
+    unexpected_toml.parent.mkdir(parents=True)
+    unexpected_toml.write_text('name = "unexpected"\nstatus = "PAUSED"\n', encoding="utf-8")
+    extra = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    assert evaluate_schedule_contract(captured_snapshot=extra)["issues"] == [
+        "captured_snapshot_invalid"
+    ]
+
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path / "symlink")
+    automation_id = next(iter(json.loads(contract.read_text(encoding="utf-8"))["automations"]))
+    toml_path = automation_root / automation_id / "automation.toml"
+    outside_toml = tmp_path / "outside.toml"
+    outside_toml.write_bytes(toml_path.read_bytes())
+    toml_path.unlink()
+    toml_path.symlink_to(outside_toml)
+    symlinked = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    assert evaluate_schedule_contract(captured_snapshot=symlinked)["issues"] == [
+        "captured_snapshot_invalid"
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "duplicate", "root_escape", "mismatched_id", "substituted", "unauthenticated"],
+)
+def test_captured_schedule_snapshot_rejects_each_topology_mutation(tmp_path, mutation):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    mutated = copy.deepcopy(snapshot)
+    source = mutated["automation_tomls"][0]
+    if mutation == "missing":
+        mutated["automation_tomls"].pop(0)
+        mutated["discovered_automation_ids"].remove(source["automation_id"])
+    elif mutation == "duplicate":
+        mutated["automation_tomls"].append(copy.deepcopy(source))
+    elif mutation == "root_escape":
+        source["path"] = str(tmp_path / "outside-root" / "automation.toml")
+    elif mutation == "mismatched_id":
+        source["automation_id"] = mutated["automation_tomls"][1]["automation_id"]
+    elif mutation == "substituted":
+        replacement = mutated["automation_tomls"][1]
+        source["_bytes"] = replacement["_bytes"]
+        source["sha256"] = replacement["sha256"]
+        source["size_bytes"] = replacement["size_bytes"]
+        source["file_identity"] = replacement["file_identity"]
+    else:
+        mutated.pop("_capture_authentication")
+
+    result = evaluate_schedule_contract(captured_snapshot=mutated)
+
+    assert result["issues"] == ["captured_snapshot_invalid"]
 
 
 def test_safety_sentinel_writer_refuses_collision_and_failed_publication(tmp_path, monkeypatch):

@@ -14,6 +14,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,86 @@ def _parse_timestamp(value: Any) -> dt.datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(UTC)
+
+
+def _nonempty_string(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _finite_quantity(value: Any, *, allow_zero: bool = False) -> bool:
+    """Accept Alpaca's numeric-string values, never booleans or nested values."""
+
+    if isinstance(value, (bool, Mapping, list, tuple, set)):
+        return False
+    if not isinstance(value, (str, int, float, Decimal)):
+        return False
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return False
+    return parsed.is_finite() and (parsed >= 0 if allow_zero else parsed > 0)
+
+
+def _account_snapshot_is_valid(account: Any) -> bool:
+    return isinstance(account, Mapping) and _nonempty_string(account.get("id")) and _nonempty_string(
+        account.get("status")
+    )
+
+
+def _position_snapshot_is_valid(position: Any) -> bool:
+    return (
+        isinstance(position, Mapping)
+        and _nonempty_string(position.get("symbol"))
+        and _finite_quantity(position.get("qty"))
+    )
+
+
+def _open_order_snapshot_is_valid(order: Any) -> bool:
+    return (
+        isinstance(order, Mapping)
+        and _nonempty_string(order.get("id"))
+        and _nonempty_string(order.get("symbol"))
+        and order.get("side") in {"buy", "sell"}
+        and _finite_quantity(order.get("qty"))
+        and _nonempty_string(order.get("status"))
+    )
+
+
+def _clock_snapshot_is_valid(clock: Any) -> bool:
+    return (
+        isinstance(clock, Mapping)
+        and type(clock.get("is_open")) is bool
+        and _parse_timestamp(clock.get("timestamp")) is not None
+    )
+
+
+def _broker_snapshot_shape_reasons(snapshot: Mapping[str, Any]) -> list[str]:
+    """Validate the minimal observer schema before a packet can be CLEAR."""
+
+    reasons: list[str] = []
+    account = snapshot.get("account")
+    if not _account_snapshot_is_valid(account):
+        reasons.append("broker_snapshot_account_invalid")
+
+    positions = snapshot.get("positions")
+    if not isinstance(positions, list):
+        reasons.append("broker_snapshot_positions_invalid")
+    else:
+        for index, position in enumerate(positions):
+            if not _position_snapshot_is_valid(position):
+                reasons.append(f"broker_snapshot_position_{index}_invalid")
+
+    open_orders = snapshot.get("open_orders")
+    if not isinstance(open_orders, list):
+        reasons.append("broker_snapshot_open_orders_invalid")
+    else:
+        for index, order in enumerate(open_orders):
+            if not _open_order_snapshot_is_valid(order):
+                reasons.append(f"broker_snapshot_open_order_{index}_invalid")
+
+    if not _clock_snapshot_is_valid(snapshot.get("clock")):
+        reasons.append("broker_snapshot_clock_invalid")
+    return reasons
 
 
 def _capture_json_evidence(
@@ -257,14 +338,7 @@ def build_safety_sentinel_packet(
         reasons.append("broker_snapshot_timestamp_in_future")
     elif generated_at - snapshot_captured_at > dt.timedelta(minutes=max_evidence_age_minutes):
         reasons.append("broker_snapshot_stale")
-    if not isinstance(snapshot.get("account"), Mapping):
-        reasons.append("broker_snapshot_account_invalid")
-    if not isinstance(snapshot.get("positions"), list):
-        reasons.append("broker_snapshot_positions_invalid")
-    if not isinstance(snapshot.get("open_orders"), list):
-        reasons.append("broker_snapshot_open_orders_invalid")
-    if not isinstance(snapshot.get("clock"), Mapping):
-        reasons.append("broker_snapshot_clock_invalid")
+    reasons.extend(_broker_snapshot_shape_reasons(snapshot))
     if not all(isinstance(key, str) and isinstance(value, str) for key, value in broker_errors.items()):
         reasons.append("broker_snapshot_errors_invalid")
 

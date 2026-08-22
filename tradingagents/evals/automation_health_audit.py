@@ -7,6 +7,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -433,6 +435,8 @@ def _contract_local_occurrences(rrule: str) -> list[tuple[int, int]]:
 
 
 SCHEDULE_CAPTURE_SCHEMA_VERSION = "schedule_contract_capture_v1"
+_AUTOMATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_CAPTURE_AUTHENTICATIONS: dict[str, str] = {}
 
 
 def _capture_schedule_source(path_value: str | Path, *, captured_at: str) -> dict[str, Any]:
@@ -508,6 +512,266 @@ def _schedule_source_is_intact(source: Any) -> bool:
     )
 
 
+def _valid_automation_id(value: Any) -> bool:
+    return isinstance(value, str) and bool(_AUTOMATION_ID_RE.fullmatch(value))
+
+
+def _file_identity(metadata: os.stat_result) -> dict[str, int]:
+    return {"device": metadata.st_dev, "inode": metadata.st_ino}
+
+
+def _capture_descriptor_relative_toml(
+    root_descriptor: int | None,
+    *,
+    root_path: Path,
+    root_identity: Mapping[str, int] | None,
+    automation_id: str,
+    captured_at: str,
+) -> dict[str, Any]:
+    """Capture one expected TOML without following an automation-dir or file symlink."""
+
+    relative_path = f"{automation_id}/automation.toml"
+    captured: dict[str, Any] = {
+        "automation_id": automation_id,
+        "automation_root": str(root_path),
+        "relative_path": relative_path,
+        "path": str(root_path / automation_id / "automation.toml"),
+        "status": "missing",
+        "sha256": None,
+        "size_bytes": None,
+        "captured_at": captured_at,
+        "descriptor_relative": True,
+        "file_kind": "regular",
+        "symlink": False,
+        "root_identity": dict(root_identity) if root_identity is not None else None,
+        "file_identity": None,
+        "_bytes": None,
+    }
+    if root_descriptor is None:
+        return captured
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory_descriptor = os.open(automation_id, directory_flags, dir_fd=root_descriptor)
+    except OSError:
+        captured["status"] = "unsafe"
+        return captured
+    try:
+        directory_metadata = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(directory_metadata.st_mode):
+            captured["status"] = "unsafe"
+            return captured
+        try:
+            descriptor = os.open("automation.toml", file_flags, dir_fd=directory_descriptor)
+        except FileNotFoundError:
+            return captured
+        except OSError:
+            captured["status"] = "unsafe"
+            return captured
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                captured["status"] = "unsafe"
+                return captured
+            raw = b""
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                raw += chunk
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory_descriptor)
+    captured.update(
+        {
+            "status": (
+                "changed"
+                if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+                else "captured"
+            ),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size_bytes": len(raw),
+            "file_identity": _file_identity(before),
+            "_bytes": raw,
+        }
+    )
+    return captured
+
+
+def _discover_descriptor_relative_automation_ids(root_descriptor: int | None) -> set[str]:
+    """Find direct automation TOMLs without following directory or file symlinks."""
+
+    if root_descriptor is None:
+        return set()
+    discovered: set[str] = set()
+    try:
+        names = os.listdir(root_descriptor)
+    except OSError:
+        return discovered
+    for name in names:
+        if not _valid_automation_id(name):
+            continue
+        try:
+            entry = os.stat(name, dir_fd=root_descriptor, follow_symlinks=False)
+        except OSError:
+            discovered.add(name)
+            continue
+        if stat.S_ISLNK(entry.st_mode):
+            discovered.add(name)
+            continue
+        if not stat.S_ISDIR(entry.st_mode):
+            continue
+        try:
+            candidate = os.stat(
+                f"{name}/automation.toml",
+                dir_fd=root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError:
+            discovered.add(name)
+            continue
+        if stat.S_ISREG(candidate.st_mode) or stat.S_ISLNK(candidate.st_mode):
+            discovered.add(name)
+    return discovered
+
+
+def _snapshot_authentication_payload(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the complete immutable binding for a locally captured snapshot."""
+
+    def source_binding(source: Any) -> Any:
+        if not isinstance(source, Mapping):
+            return {"invalid": type(source).__name__}
+        raw = source.get("_bytes")
+        return {
+            key: source.get(key)
+            for key in (
+                "automation_id",
+                "automation_root",
+                "relative_path",
+                "path",
+                "status",
+                "sha256",
+                "size_bytes",
+                "captured_at",
+                "descriptor_relative",
+                "file_kind",
+                "symlink",
+                "root_identity",
+                "file_identity",
+            )
+        } | {"raw_sha256": hashlib.sha256(raw).hexdigest() if isinstance(raw, bytes) else None}
+
+    tomls = snapshot.get("automation_tomls")
+    return {
+        "schema_version": snapshot.get("schema_version"),
+        "captured_at": snapshot.get("captured_at"),
+        "automation_root": snapshot.get("automation_root"),
+        "automation_root_identity": snapshot.get("automation_root_identity"),
+        "expected_automation_ids": snapshot.get("expected_automation_ids"),
+        "discovered_automation_ids": snapshot.get("discovered_automation_ids"),
+        "contract": source_binding(snapshot.get("contract")),
+        "role_contract": source_binding(snapshot.get("role_contract")),
+        "automation_tomls": [source_binding(source) for source in tomls]
+        if isinstance(tomls, list)
+        else {"invalid": type(tomls).__name__},
+    }
+
+
+def _snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        _snapshot_authentication_payload(snapshot),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=repr,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _snapshot_authentication_valid(snapshot: Mapping[str, Any]) -> bool:
+    token = snapshot.get("_capture_authentication")
+    return isinstance(token, str) and _CAPTURE_AUTHENTICATIONS.get(token) == _snapshot_fingerprint(snapshot)
+
+
+def _capture_topology_issues(snapshot: Mapping[str, Any]) -> list[str]:
+    """Reject any unbound, incomplete, or unsafe automation source topology."""
+
+    issues: list[str] = []
+    root_value = snapshot.get("automation_root")
+    root = Path(root_value) if isinstance(root_value, str) else None
+    root_identity = snapshot.get("automation_root_identity")
+    if (
+        root is None
+        or not root.is_absolute()
+        or str(root) != str(root.absolute())
+        or not isinstance(root_identity, Mapping)
+        or not all(
+            isinstance(root_identity.get(key), int) and not isinstance(root_identity.get(key), bool)
+            for key in ("device", "inode")
+        )
+    ):
+        issues.append("automation_root_invalid")
+    contract_source = snapshot.get("contract")
+    contract = _captured_json(contract_source) if isinstance(contract_source, Mapping) else None
+    records = contract.get("automations") if isinstance(contract, Mapping) else None
+    contract_ids = set(records) if isinstance(records, Mapping) else set()
+    expected_ids = snapshot.get("expected_automation_ids")
+    discovered_ids = snapshot.get("discovered_automation_ids")
+    tomls = snapshot.get("automation_tomls")
+    for ids, label in ((expected_ids, "expected"), (discovered_ids, "discovered")):
+        if (
+            not isinstance(ids, list)
+            or any(not _valid_automation_id(item) for item in ids)
+            or ids != sorted(set(ids))
+        ):
+            issues.append(f"{label}_automation_ids_invalid")
+    if not isinstance(tomls, list):
+        return [*issues, "automation_tomls_invalid"]
+    toml_ids = [source.get("automation_id") for source in tomls if isinstance(source, Mapping)]
+    if len(toml_ids) != len(tomls) or any(not _valid_automation_id(item) for item in toml_ids):
+        issues.append("toml_automation_ids_invalid")
+    elif len(toml_ids) != len(set(toml_ids)):
+        issues.append("toml_automation_ids_duplicate")
+    expected_set = set(expected_ids) if isinstance(expected_ids, list) else set()
+    discovered_set = set(discovered_ids) if isinstance(discovered_ids, list) else set()
+    toml_set = set(toml_ids)
+    if expected_set != contract_ids or discovered_set != contract_ids or toml_set != contract_ids:
+        issues.append("automation_topology_incomplete_or_unexpected")
+    if root is not None and root.is_absolute():
+        expected_root_identity = dict(root_identity) if isinstance(root_identity, Mapping) else None
+        for source in tomls:
+            if not isinstance(source, Mapping):
+                issues.append("toml_source_invalid")
+                continue
+            automation_id = source.get("automation_id")
+            expected_path = (
+                str(root / automation_id / "automation.toml")
+                if _valid_automation_id(automation_id)
+                else None
+            )
+            if (
+                source.get("automation_root") != str(root)
+                or source.get("relative_path") != f"{automation_id}/automation.toml"
+                or source.get("path") != expected_path
+                or source.get("descriptor_relative") is not True
+                or source.get("file_kind") != "regular"
+                or source.get("symlink") is not False
+                or source.get("root_identity") != expected_root_identity
+                or not isinstance(source.get("file_identity"), Mapping)
+                or not all(
+                    isinstance(source["file_identity"].get(key), int)
+                    and not isinstance(source["file_identity"].get(key), bool)
+                    for key in ("device", "inode")
+                )
+            ):
+                issues.append("toml_source_topology_invalid")
+    return sorted(set(issues))
+
+
 def capture_schedule_contract_snapshot(
     *,
     contract_path: str | Path,
@@ -519,7 +783,7 @@ def capture_schedule_contract_snapshot(
 
     capture_time = _now_iso(captured_at or dt.datetime.now(tz=UTC))
     source = Path(contract_path)
-    root = Path(automation_root) if automation_root is not None else default_automation_root()
+    root = (Path(automation_root) if automation_root is not None else default_automation_root()).absolute()
     contract = _capture_schedule_source(source, captured_at=capture_time)
     contract_document = _captured_json(contract)
     role_path = Path(role_contract_path) if role_contract_path is not None else source.parent / "automation_roles.json"
@@ -530,23 +794,69 @@ def capture_schedule_contract_snapshot(
         and isinstance(contract_document.get("automations"), Mapping)
         else set()
     )
-    discovered_paths = sorted(root.glob("tradingagents-*/automation.toml"))
-    discovered_by_id = {path.parent.name: path for path in discovered_paths}
+    root_descriptor: int | None = None
+    root_identity: dict[str, int] | None = None
+    try:
+        root_descriptor = os.open(
+            root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        root_metadata = os.fstat(root_descriptor)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            os.close(root_descriptor)
+            root_descriptor = None
+        else:
+            root_identity = _file_identity(root_metadata)
+    except OSError:
+        root_descriptor = None
+    discovered_ids = _discover_descriptor_relative_automation_ids(root_descriptor)
     automation_tomls: list[dict[str, Any]] = []
-    for automation_id in sorted(expected_ids | set(discovered_by_id)):
-        config_path = discovered_by_id.get(automation_id, root / automation_id / "automation.toml")
-        captured = _capture_schedule_source(config_path, captured_at=capture_time)
-        captured["automation_id"] = automation_id
-        automation_tomls.append(captured)
-    return {
+    try:
+        for automation_id in sorted(expected_ids | discovered_ids, key=str):
+            if not _valid_automation_id(automation_id):
+                captured = {
+                    "automation_id": automation_id,
+                    "automation_root": str(root),
+                    "relative_path": None,
+                    "path": None,
+                    "status": "unsafe",
+                    "sha256": None,
+                    "size_bytes": None,
+                    "captured_at": capture_time,
+                    "descriptor_relative": False,
+                    "file_kind": None,
+                    "symlink": None,
+                    "root_identity": root_identity,
+                    "file_identity": None,
+                    "_bytes": None,
+                }
+            else:
+                captured = _capture_descriptor_relative_toml(
+                    root_descriptor,
+                    root_path=root,
+                    root_identity=root_identity,
+                    automation_id=automation_id,
+                    captured_at=capture_time,
+                )
+            automation_tomls.append(captured)
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+    snapshot: dict[str, Any] = {
         "schema_version": SCHEDULE_CAPTURE_SCHEMA_VERSION,
         "captured_at": capture_time,
-        "automation_root": str(root.absolute()),
+        "automation_root": str(root),
+        "automation_root_identity": root_identity,
+        "expected_automation_ids": sorted(expected_ids, key=str),
         "contract": contract,
         "role_contract": role_contract,
         "automation_tomls": automation_tomls,
-        "discovered_automation_ids": sorted(discovered_by_id),
+        "discovered_automation_ids": sorted(discovered_ids),
     }
+    authentication = secrets.token_urlsafe(32)
+    snapshot["_capture_authentication"] = authentication
+    _CAPTURE_AUTHENTICATIONS[authentication] = _snapshot_fingerprint(snapshot)
+    return snapshot
 
 
 def schedule_contract_snapshot_manifest(snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -557,7 +867,21 @@ def schedule_contract_snapshot_manifest(snapshot: Mapping[str, Any]) -> dict[str
             return {"status": "invalid_capture"}
         return {
             key: source.get(key)
-            for key in ("automation_id", "path", "status", "sha256", "size_bytes", "captured_at")
+            for key in (
+                "automation_id",
+                "automation_root",
+                "relative_path",
+                "path",
+                "status",
+                "sha256",
+                "size_bytes",
+                "captured_at",
+                "descriptor_relative",
+                "file_kind",
+                "symlink",
+                "root_identity",
+                "file_identity",
+            )
             if key in source
         }
 
@@ -568,10 +892,14 @@ def schedule_contract_snapshot_manifest(snapshot: Mapping[str, Any]) -> dict[str
     capture_issues = []
     if snapshot.get("schema_version") != SCHEDULE_CAPTURE_SCHEMA_VERSION:
         capture_issues.append("schema_invalid")
+    if not _snapshot_authentication_valid(snapshot):
+        capture_issues.append("capture_authentication_invalid")
+    if _capture_topology_issues(snapshot):
+        capture_issues.append("automation_topology_invalid")
     if any(
         not isinstance(source, Mapping)
-        or source.get("status") == "changed"
-        or (source.get("status") == "captured" and not _schedule_source_is_intact(source))
+        or source.get("status") != "captured"
+        or not _schedule_source_is_intact(source)
         for source in sources
     ):
         capture_issues.append("source_missing_malformed_or_changed")
