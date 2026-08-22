@@ -35,7 +35,6 @@ from tradingagents.evals.automation_health_audit import (
     FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS,
     PREDEPLOYMENT_PAUSED_PHASE,
     capture_schedule_contract_snapshot,
-    default_automation_root,
     evaluate_schedule_contract,
     schedule_contract_snapshot_manifest,
 )
@@ -737,7 +736,7 @@ def _canonical_role_contract_path() -> Path:
 
 
 def _canonical_automation_root() -> Path:
-    return default_automation_root()
+    return Path("/Users/corbinfloyd/.codex/automations")
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:

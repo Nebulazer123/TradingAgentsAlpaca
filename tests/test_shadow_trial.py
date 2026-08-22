@@ -1121,6 +1121,68 @@ def test_red_start_api_has_no_caller_controlled_authority_paths_or_phase(tmp_pat
         )
 
 
+def test_red_schedule_binding_ignores_caller_controlled_codex_home(
+    tmp_path,
+    monkeypatch,
+):
+    codex_home = tmp_path / "caller-controlled-codex-home"
+    contract, roles, alternate_root = _write_schedule_fixture(codex_home)
+    captured_at = _moment("2026-08-21")
+    alternate_snapshot = shadow_trial.capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=alternate_root,
+        role_contract_path=roles,
+        captured_at=captured_at,
+    )
+    observed_roots: list[Path] = []
+
+    def capture_only_alternate_root(**kwargs):
+        observed_root = Path(kwargs["automation_root"])
+        observed_roots.append(observed_root)
+        if observed_root == alternate_root.resolve():
+            return alternate_snapshot
+        raise FileNotFoundError("canonical production root is absent from this fixture")
+
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(
+        shadow_trial,
+        "_canonical_schedule_contract_path",
+        lambda: contract,
+    )
+    monkeypatch.setattr(
+        shadow_trial,
+        "_canonical_role_contract_path",
+        lambda: roles,
+    )
+    monkeypatch.setattr(
+        shadow_trial,
+        "capture_schedule_contract_snapshot",
+        capture_only_alternate_root,
+    )
+
+    binding, valid = shadow_trial._schedule_binding(captured_at=captured_at)
+
+    assert binding["automation_root"] == "/Users/corbinfloyd/.codex/automations"
+    assert binding["automation_root"] != str(alternate_root.resolve())
+    assert observed_roots == [Path("/Users/corbinfloyd/.codex/automations")]
+    assert valid is False
+
+
+def test_private_automation_root_seam_preserves_positive_schedule_fixture(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "ignored-codex-home"))
+    environment = _configure_environment(monkeypatch, tmp_path)
+
+    binding, valid = shadow_trial._schedule_binding(
+        captured_at=_moment("2026-08-21"),
+    )
+
+    assert valid is True
+    assert binding["automation_root"] == str(environment["automation_root"].resolve())
+
+
 def test_red_live_control_validation_uses_the_exact_captured_bytes(tmp_path, monkeypatch):
     environment = _configure_environment(monkeypatch, tmp_path)
     _set_clock(monkeypatch, "2026-08-21")
