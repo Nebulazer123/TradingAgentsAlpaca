@@ -1,7 +1,9 @@
 import hashlib
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
@@ -14,6 +16,12 @@ from tradingagents.evals.execution_board import (
 from tradingagents.policy.decision_authority import bounded_exit_authority_record
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tests_from_repository_cwd(tmp_path, monkeypatch):
+    """Resolve every production-relative default inside the test's tmp_path."""
+    monkeypatch.chdir(tmp_path)
 
 
 def _write_packet(directory, name, payload):
@@ -375,6 +383,8 @@ def test_execution_board_loader_ignores_compact_and_latest_sidecars(tmp_path):
 
 def test_execution_board_allows_clean_separate_profit_and_dip_packets(tmp_path):
     hourly = tmp_path / "hourly"
+    empty_evidence_dir = tmp_path / "empty_loss_review_evidence"
+    empty_evidence_dir.mkdir()
     _write_packet(
         hourly,
         "hourly-supervisor-20260602-140000.json",
@@ -414,7 +424,10 @@ def test_execution_board_allows_clean_separate_profit_and_dip_packets(tmp_path):
         },
     )
 
-    review = build_execution_board_review(hourly)
+    review = build_execution_board_review(
+        hourly,
+        loss_review_evidence_dir=empty_evidence_dir,
+    )
 
     assert review["analysis_only"] is True
     assert review["can_submit_orders"] is False
@@ -1006,6 +1019,8 @@ def test_execution_board_allows_probation_after_clean_streak(tmp_path):
 
 def test_execution_board_writer_and_cli_write_compact_artifacts(tmp_path):
     hourly = tmp_path / "hourly"
+    empty_evidence_dir = tmp_path / "empty_loss_review_evidence"
+    empty_evidence_dir.mkdir()
     _write_packet(
         hourly,
         "hourly-supervisor-20260602-180000.json",
@@ -1017,7 +1032,7 @@ def test_execution_board_writer_and_cli_write_compact_artifacts(tmp_path):
             "portfolio": {"live": {"unrealized_pl": "0.00"}},
         },
     )
-    review = build_execution_board_review(hourly)
+    review = build_execution_board_review(hourly, loss_review_evidence_dir=empty_evidence_dir)
     json_path, md_path = write_execution_board_review(review, tmp_path / "board")
 
     assert json_path.exists()
@@ -1041,6 +1056,8 @@ def test_execution_board_writer_and_cli_write_compact_artifacts(tmp_path):
             "execution-board-review",
             "--hourly-dir",
             str(hourly),
+            "--loss-review-evidence-dir",
+            str(empty_evidence_dir),
             "--output-dir",
             str(tmp_path / "cli-board"),
             "--json-output",
@@ -1054,6 +1071,46 @@ def test_execution_board_writer_and_cli_write_compact_artifacts(tmp_path):
     assert payload["recommendation"] == "no_action_needed"
     assert payload["json_path"].endswith(".json")
     assert (tmp_path / "cli-board" / "latest-compact.json").exists()
+
+
+def test_execution_board_cli_reads_custom_nonempty_evidence_dir_without_autonomous_decision(tmp_path):
+    hourly, evidence_dir, _hourly_path, loss_path = _write_exact_incomplete_loss_evidence(tmp_path)
+    loss = json.loads(loss_path.read_text(encoding="utf-8"))
+    loss["payload"]["supervisor_review_authority"]["symbol"] = "ORCL"
+    loss_path.write_text(json.dumps(loss), encoding="utf-8")
+    ledger_events = Path(__file__).resolve().parents[1] / "state" / "decision_ledger" / "events.jsonl"
+    ledger_before = ledger_events.read_bytes() if ledger_events.exists() else None
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "execution-board-review",
+            "--hourly-dir",
+            str(hourly),
+            "--loss-review-evidence-dir",
+            str(evidence_dir),
+            "--output-dir",
+            str(tmp_path / "cli-board"),
+            "--json-output",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["kind"] == "execution_board_review"
+    assert payload["analysis_only"] is True
+    assert payload["execution_authority"] == "none"
+    assert payload["can_submit_orders"] is False
+    evidence = payload["loss_review_evidence"]
+    assert evidence["evidence_path"] == str(evidence_dir / "loss.json")
+    assert evidence["matches_review_window"] is False
+    assert evidence["source_binding"]["matched"] is False
+    assert evidence["review_allowed"] is False
+    assert "autonomous_loss_decision" not in payload
+    assert "loss_review_evidence_pending" in {item["type"] for item in payload["warnings"]}
+    ledger_after = ledger_events.read_bytes() if ledger_events.exists() else None
+    assert ledger_after == ledger_before
 
 
 def test_compact_execution_board_review_keeps_latest_review_and_counts(tmp_path):
