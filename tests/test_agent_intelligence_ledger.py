@@ -9,8 +9,10 @@ from typer.testing import CliRunner
 import cli.main as cli_main
 from cli.main import app
 from tradingagents.evals.agent_intelligence_ledger import (
+    DEFER_INVALID_FORECAST_TIMESTAMPS,
     agent_influence_weights,
     append_forecasts,
+    audit_resolved_forecasts,
     calibrated_rating_probabilities_from_packet,
     forecasts_from_creator_workflow_packet,
     forecasts_from_mirofish_handoff_packet,
@@ -19,6 +21,7 @@ from tradingagents.evals.agent_intelligence_ledger import (
     load_ledger,
     render_agent_influence_context,
     resolve_forecasts,
+    resolve_forecasts_with_quality,
     summarize_agent_scores,
 )
 from tradingagents.evals.learning_availability import LearningAvailabilityLedger
@@ -891,3 +894,82 @@ def test_ledger_quality_audit_cli_annotates_resolved_rows_and_backs_up(
     assert by_ticker["MSFT"].label_quality == LABEL_QUALITY_SUSPECT
     assert "reaudit_outcome_mismatch" in by_ticker["MSFT"].quality_flags
     assert by_ticker["MSFT"].outcome is True  # annotated, never rewritten
+
+
+def _drifted_timestamp_forecast(**overrides):
+    base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0]
+    return replace(
+        base,
+        forecast_id="af-drifted-timestamps",
+        created_at="",
+        resolve_after="",
+        **overrides,
+    )
+
+
+def test_resolve_with_quality_defers_unparseable_forecast_timestamps():
+    drifted = _drifted_timestamp_forecast()
+    healthy = replace(
+        forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[-1],
+        forecast_id="af-healthy",
+    )
+
+    def window_lookup(symbol, start_date, end_date):
+        raise AssertionError("window lookup must not run for drifted timestamps")
+
+    resolved, reports = resolve_forecasts_with_quality(
+        [drifted, healthy],
+        window_lookup=window_lookup,
+        now=datetime.datetime(2026, 6, 5, tzinfo=datetime.timezone.utc),
+    )
+
+    by_id = {forecast.forecast_id: forecast for forecast in resolved}
+    assert by_id["af-drifted-timestamps"].resolved is False
+    assert by_id["af-drifted-timestamps"].resolution_note.startswith("deferred: ")
+    assert by_id["af-healthy"].resolved is False
+    drifted_report = next(report for report in reports if report.forecast_id == "af-drifted-timestamps")
+    assert drifted_report.status == "deferred"
+    assert drifted_report.defer_reason == DEFER_INVALID_FORECAST_TIMESTAMPS
+    healthy_report = next(report for report in reports if report.forecast_id == "af-healthy")
+    assert healthy_report.status == "not_mature"
+
+
+def test_audit_resolved_forecasts_flags_unparseable_timestamps_as_suspect():
+    forecast = _drifted_timestamp_forecast(
+        resolved=True,
+        outcome=True,
+        relative_return="8.00",
+        label_quality=LABEL_QUALITY_HIGH,
+    )
+
+    def window_lookup(symbol, start_date, end_date):
+        raise AssertionError("window lookup must not run for drifted timestamps")
+
+    audited, reports = audit_resolved_forecasts(
+        [forecast],
+        window_lookup=window_lookup,
+        now=datetime.datetime(2026, 6, 12, tzinfo=datetime.timezone.utc),
+    )
+
+    assert audited[0].outcome is True  # stored labels are never rewritten
+    assert audited[0].label_quality == LABEL_QUALITY_SUSPECT
+    assert "window_unverifiable" in audited[0].quality_flags
+    assert audited[0].resolution_window is None
+    assert reports[0].label_quality == LABEL_QUALITY_SUSPECT
+    assert "unparseable" in reports[0].note
+
+
+def test_resolve_forecasts_legacy_path_leaves_unparseable_timestamps_unresolved():
+    forecast = _drifted_timestamp_forecast()
+
+    def price_lookup(symbol, start_date, end_date):
+        raise AssertionError("price lookup must not run for drifted timestamps")
+
+    resolved = resolve_forecasts(
+        [forecast],
+        price_lookup=price_lookup,
+        now=datetime.datetime(2026, 6, 12, tzinfo=datetime.timezone.utc),
+    )
+
+    assert resolved[0].resolved is False
+    assert "unparseable" in (resolved[0].resolution_note or "")

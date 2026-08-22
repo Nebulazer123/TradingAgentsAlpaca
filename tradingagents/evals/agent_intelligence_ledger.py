@@ -23,6 +23,7 @@ from tradingagents.evals.resolution_quality import (
     LABEL_QUALITY_DEGRADED,
     LABEL_QUALITY_HIGH,
     LABEL_QUALITY_SUSPECT,
+    STATUS_DEFERRED,
     STATUS_RESOLVABLE,
     ResolutionQualityReport,
     WindowLookup,
@@ -36,6 +37,7 @@ DEFAULT_RATING_CALIBRATION_PATH = Path("results/agent_intelligence/rating_calibr
 DEFAULT_BENCHMARK = "SPY"
 DEFAULT_AGENT_WEIGHT_FLOOR = Decimal("0.50")
 DEFAULT_AGENT_WEIGHT_CEILING = Decimal("1.50")
+DEFER_INVALID_FORECAST_TIMESTAMPS = "invalid_forecast_timestamps"
 LEDGER_FORBIDDEN_EFFECTS = (
     "submit_order",
     "waive_live_gate",
@@ -141,6 +143,15 @@ def _as_utc(value: str | datetime.datetime | None = None) -> datetime.datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=UTC)
     return dt.astimezone(UTC)
+
+
+def _stored_utc_or_none(value: str | datetime.datetime | None) -> datetime.datetime | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        return _as_utc(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _add_trading_days(start: datetime.datetime, days: int) -> datetime.datetime:
@@ -892,9 +903,33 @@ def resolve_forecasts_with_quality(
         if forecast.resolved:
             updated.append(forecast)
             continue
-        start_date = _as_utc(forecast.created_at).date().isoformat()
-        end_date = _as_utc(forecast.resolve_after).date().isoformat()
-        mature = _as_utc(forecast.resolve_after) <= current
+        created = _stored_utc_or_none(forecast.created_at)
+        resolve_after = _stored_utc_or_none(forecast.resolve_after)
+        if created is None or resolve_after is None:
+            reports.append(
+                ResolutionQualityReport(
+                    forecast_id=forecast.forecast_id,
+                    ticker=forecast.ticker,
+                    benchmark=forecast.benchmark,
+                    status=STATUS_DEFERRED,
+                    label_quality=None,
+                    quality_flags=(DEFER_INVALID_FORECAST_TIMESTAMPS,),
+                    defer_reason=DEFER_INVALID_FORECAST_TIMESTAMPS,
+                    window=None,
+                    note="created_at/resolve_after are missing or unparseable",
+                )
+            )
+            updated.append(
+                replace(
+                    forecast,
+                    defer_reason=DEFER_INVALID_FORECAST_TIMESTAMPS,
+                    resolution_note="deferred: unparseable forecast timestamps",
+                )
+            )
+            continue
+        start_date = created.date().isoformat()
+        end_date = resolve_after.date().isoformat()
+        mature = resolve_after <= current
         if not mature:
             updated.append(forecast)
             reports.append(
@@ -1006,8 +1041,32 @@ def audit_resolved_forecasts(
         if not forecast.resolved:
             updated.append(forecast)
             continue
-        start_date = _as_utc(forecast.created_at).date().isoformat()
-        end_date = _as_utc(forecast.resolve_after).date().isoformat()
+        created = _stored_utc_or_none(forecast.created_at)
+        resolve_after = _stored_utc_or_none(forecast.resolve_after)
+        if created is None or resolve_after is None:
+            report = ResolutionQualityReport(
+                forecast_id=forecast.forecast_id,
+                ticker=forecast.ticker,
+                benchmark=forecast.benchmark,
+                status=STATUS_RESOLVABLE,
+                label_quality=LABEL_QUALITY_SUSPECT,
+                quality_flags=("window_unverifiable",),
+                defer_reason=None,
+                window=None,
+                note="stored label kept but unparseable timestamps prevent window verification",
+            )
+            reports.append(report)
+            updated.append(
+                replace(
+                    forecast,
+                    label_quality=LABEL_QUALITY_SUSPECT,
+                    quality_flags=["window_unverifiable"],
+                    resolution_window=None,
+                )
+            )
+            continue
+        start_date = created.date().isoformat()
+        end_date = resolve_after.date().isoformat()
         ticker_window = window_lookup(forecast.ticker, start_date, end_date)
         benchmark_window = window_lookup(forecast.benchmark, start_date, end_date)
         report = audit_resolution_window(
@@ -1101,11 +1160,21 @@ def resolve_forecasts(
         if forecast.resolved:
             resolved.append(forecast)
             continue
-        if _as_utc(forecast.resolve_after) > current:
+        created = _stored_utc_or_none(forecast.created_at)
+        resolve_after = _stored_utc_or_none(forecast.resolve_after)
+        if created is None or resolve_after is None:
+            resolved.append(
+                replace(
+                    forecast,
+                    resolution_note="unparseable forecast timestamps; forecast remains unresolved",
+                )
+            )
+            continue
+        if resolve_after > current:
             resolved.append(forecast)
             continue
-        start_date = _as_utc(forecast.created_at).date().isoformat()
-        end_date = _as_utc(forecast.resolve_after).date().isoformat()
+        start_date = created.date().isoformat()
+        end_date = resolve_after.date().isoformat()
         ticker_prices = price_lookup(forecast.ticker, start_date, end_date)
         benchmark_prices = price_lookup(forecast.benchmark, start_date, end_date)
         if ticker_prices is None or benchmark_prices is None:
