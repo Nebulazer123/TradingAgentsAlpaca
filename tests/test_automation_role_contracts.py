@@ -12,7 +12,10 @@ import re
 import shutil
 from pathlib import Path
 
-from tradingagents.evals.automation_health_audit import evaluate_schedule_contract
+from tradingagents.evals.automation_health_audit import (
+    _contract_local_occurrences,
+    evaluate_schedule_contract,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = REPO_ROOT / "config" / "automation_schedule_contract.json"
@@ -354,6 +357,273 @@ def test_schedule_contract_rejects_invalid_frozen_observer_phase_and_contract(tm
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
     assert missing_phase["issues"] == ["contract_deployment_phases"]
+
+
+def _write_mutated_contract(tmp_path: Path, name: str, mutate) -> Path:
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    mutate(contract)
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    return path
+
+
+def _evaluate_mutated_contract(tmp_path: Path, name: str, mutate) -> dict:
+    return evaluate_schedule_contract(
+        contract_path=_write_mutated_contract(tmp_path, name, mutate),
+        automation_root=AUTOMATION_ROOT,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+    )
+
+
+def test_expected_central_schedules_encode_current_contract_rrules_in_central_time():
+    """The explicit Central schedule section matches every captured rrule occurrence."""
+
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    expected_schedules = contract["expected_central_schedules"]
+
+    assert set(expected_schedules) == set(contract["automations"])
+    for automation_id, record in contract["automations"].items():
+        entry = expected_schedules[automation_id]
+        assert entry["timezone"] == "America/Chicago"
+        occurrences = {
+            (item["weekday"], item["hour"], item["minute"])
+            for item in entry["occurrences"]
+        }
+        assert len(occurrences) == len(entry["occurrences"])
+        weekday_index_to_token = dict(enumerate(("MO", "TU", "WE", "TH", "FR", "SA", "SU")))
+        expected_set = {
+            (weekday_index_to_token[weekday], minute_of_day // 60, minute_of_day % 60)
+            for weekday, minute_of_day in _contract_local_occurrences(record["rrule"])
+        }
+        assert occurrences == expected_set
+
+
+def test_current_paused_tomls_pass_with_expected_central_schedules_enforced(tmp_path):
+    automation_root = _copy_automation_records(tmp_path)
+
+    result = evaluate_schedule_contract(
+        contract_path=CONTRACT_PATH,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+    )
+
+    assert result["status"] == "not_deployed"
+    assert result["contract_status"] == "pass"
+    assert result["safe_predeployment"] is True
+    assert result["deployment_proven"] is False
+    assert all(row["mismatches"] == [] and row["status"] == "match" for row in result["automations"])
+
+    for automation_id in FROZEN_OBSERVER_ACTIVE_IDS:
+        _set_automation_status(automation_root, automation_id, "ACTIVE")
+
+    frozen_observer = evaluate_schedule_contract(
+        contract_path=CONTRACT_PATH,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+        deployment_phase="frozen_observer",
+    )
+    assert frozen_observer["contract_status"] == "pass"
+
+
+def test_missing_or_malformed_expected_central_schedules_fail_closed(tmp_path):
+    def delete_section(contract):
+        del contract["expected_central_schedules"]
+
+    def non_mapping_section(contract):
+        contract["expected_central_schedules"] = []
+
+    def unexpected_key(contract):
+        contract["expected_central_schedules"]["tradingagents-not-managed"] = (
+            contract["expected_central_schedules"]["tradingagents-daily-report"]
+        )
+
+    def missing_entry(contract):
+        del contract["expected_central_schedules"]["tradingagents-daily-report"]
+
+    def malformed_hour(contract):
+        contract["expected_central_schedules"]["tradingagents-daily-report"]["occurrences"][0][
+            "hour"
+        ] = 24
+
+    def malformed_minute(contract):
+        contract["expected_central_schedules"]["tradingagents-daily-report"]["occurrences"][0][
+            "minute"
+        ] = 60
+
+    def malformed_weekday(contract):
+        contract["expected_central_schedules"]["tradingagents-daily-report"]["occurrences"][0][
+            "weekday"
+        ] = "XX"
+
+    def empty_occurrences(contract):
+        contract["expected_central_schedules"]["tradingagents-daily-report"]["occurrences"] = []
+
+    def entry_extra_field(contract):
+        contract["expected_central_schedules"]["tradingagents-daily-report"]["extra"] = True
+
+    def duplicate_occurrence(contract):
+        entry = contract["expected_central_schedules"]["tradingagents-daily-report"]
+        entry["occurrences"].append(dict(entry["occurrences"][0]))
+
+    cases = [
+        ("deleted-section", delete_section, ["contract_expected_central_schedules"]),
+        ("non-mapping-section", non_mapping_section, ["contract_expected_central_schedules"]),
+        ("unexpected-key", unexpected_key, ["contract_expected_central_schedules"]),
+        (
+            "missing-entry",
+            missing_entry,
+            ["contract_expected_central_schedule_missing_entry"],
+        ),
+        ("malformed-hour", malformed_hour, ["contract_expected_central_schedules"]),
+        ("malformed-minute", malformed_minute, ["contract_expected_central_schedules"]),
+        ("malformed-weekday", malformed_weekday, ["contract_expected_central_schedules"]),
+        ("empty-occurrences", empty_occurrences, ["contract_expected_central_schedules"]),
+        ("entry-extra-field", entry_extra_field, ["contract_expected_central_schedules"]),
+        (
+            "duplicate-occurrence",
+            duplicate_occurrence,
+            ["contract_expected_central_schedules"],
+        ),
+    ]
+    for name, mutate, expected_issues in cases:
+        result = _evaluate_mutated_contract(tmp_path / name, f"{name}.json", mutate)
+
+        assert result["status"] == "invalid_contract", name
+        assert result["contract_status"] == "fail", name
+        assert result["issues"] == expected_issues, name
+        assert result["deployment_proven"] is False, name
+        assert result["safe_predeployment"] is False, name
+        assert result["automations"] == [], name
+
+
+def test_eastern_stored_one_hour_signature_is_flagged(tmp_path):
+    def shift_wake_one_hour(contract):
+        contract["automations"]["tradingagents-automation-wake-controller"]["rrule"] = (
+            "RRULE:FREQ=WEEKLY;BYHOUR=7;BYMINUTE=45;BYDAY=MO,TU,WE,TH,FR"
+        )
+
+    def shift_self_healer_hours_one_hour(contract):
+        contract["automations"]["tradingagents-autonomous-self-healer"]["rrule"] = (
+            "RRULE:FREQ=WEEKLY;BYHOUR=8,10,12,14,16;BYMINUTE=03;BYDAY=MO,TU,WE,TH,FR"
+        )
+
+    wake_shifted = _evaluate_mutated_contract(
+        tmp_path / "wake", "wake-eastern.json", shift_wake_one_hour
+    )
+    healer_shifted = _evaluate_mutated_contract(
+        tmp_path / "healer", "healer-eastern.json", shift_self_healer_hours_one_hour
+    )
+
+    assert wake_shifted["status"] == "invalid_contract"
+    assert wake_shifted["issues"] == ["contract_expected_central_schedule_eastern_stored"]
+    assert healer_shifted["issues"] == ["contract_expected_central_schedule_eastern_stored"]
+
+
+def test_arbitrary_central_schedule_drift_is_flagged_as_mismatch(tmp_path):
+    def drift_daily_report_minute(contract):
+        contract["automations"]["tradingagents-daily-report"]["rrule"] = (
+            "RRULE:FREQ=WEEKLY;BYHOUR=15;BYMINUTE=31;BYDAY=MO,TU,WE,TH,FR"
+        )
+
+    def drop_friday_from_overnight(contract):
+        contract["automations"]["tradingagents-overnight-research"]["rrule"] = (
+            "RRULE:FREQ=WEEKLY;BYHOUR=3;BYMINUTE=30;BYDAY=MO,TU,WE,TH"
+        )
+
+    def partial_one_hour_shift_on_self_healer(contract):
+        contract["automations"]["tradingagents-autonomous-self-healer"]["rrule"] = (
+            "RRULE:FREQ=WEEKLY;BYHOUR=8,9,11,13,15;BYMINUTE=03;BYDAY=MO,TU,WE,TH,FR"
+        )
+
+    minute_drift = _evaluate_mutated_contract(
+        tmp_path / "minute", "minute-drift.json", drift_daily_report_minute
+    )
+    weekday_drift = _evaluate_mutated_contract(
+        tmp_path / "weekday", "weekday-drift.json", drop_friday_from_overnight
+    )
+    partial_shift = _evaluate_mutated_contract(
+        tmp_path / "partial", "partial-shift.json", partial_one_hour_shift_on_self_healer
+    )
+
+    assert minute_drift["status"] == "invalid_contract"
+    assert minute_drift["issues"] == ["contract_expected_central_schedule_mismatch"]
+    assert weekday_drift["issues"] == ["contract_expected_central_schedule_mismatch"]
+    assert partial_shift["issues"] == ["contract_expected_central_schedule_mismatch"]
+
+
+def _evaluate_mutated_actual_toml(
+    tmp_path: Path,
+    automation_id: str,
+    rrule_value: str,
+) -> dict:
+    automation_root = _copy_automation_records(tmp_path)
+    _replace_automation_toml_line(
+        automation_root,
+        automation_id,
+        "rrule",
+        f"rrule = {json.dumps(rrule_value)}",
+    )
+    return evaluate_schedule_contract(
+        contract_path=CONTRACT_PATH,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+    )
+
+
+def test_actual_toml_plus_one_hour_storage_fails_closed_with_eastern_issue(tmp_path):
+    """Actual +1h drift fails closed even while the versioned contract is unchanged."""
+
+    eastern_wake = _evaluate_mutated_actual_toml(
+        tmp_path / "wake",
+        "tradingagents-automation-wake-controller",
+        "RRULE:FREQ=WEEKLY;BYHOUR=7;BYMINUTE=45;BYDAY=MO,TU,WE,TH,FR",
+    )
+    eastern_healer = _evaluate_mutated_actual_toml(
+        tmp_path / "healer",
+        "tradingagents-autonomous-self-healer",
+        "RRULE:FREQ=WEEKLY;BYHOUR=8,10,12,14,16;BYMINUTE=03;BYDAY=MO,TU,WE,TH,FR",
+    )
+
+    for name, result in (("wake", eastern_wake), ("healer", eastern_healer)):
+        assert result["status"] == "invalid_contract", name
+        assert result["contract_status"] == "fail", name
+        assert result["issues"] == [
+            "contract_expected_central_schedule_eastern_stored"
+        ], name
+        assert result["safe_predeployment"] is False, name
+        assert result["deployment_proven"] is False, name
+
+
+def test_actual_toml_arbitrary_rrule_drift_fails_closed_with_mismatch_issue(tmp_path):
+    minute_drift = _evaluate_mutated_actual_toml(
+        tmp_path / "minute",
+        "tradingagents-daily-report",
+        "RRULE:FREQ=WEEKLY;BYHOUR=15;BYMINUTE=31;BYDAY=MO,TU,WE,TH,FR",
+    )
+    weekday_drift = _evaluate_mutated_actual_toml(
+        tmp_path / "weekday",
+        "tradingagents-overnight-research",
+        "RRULE:FREQ=WEEKLY;BYHOUR=3;BYMINUTE=30;BYDAY=MO,TU,WE,TH",
+    )
+    partial_shift = _evaluate_mutated_actual_toml(
+        tmp_path / "partial",
+        "tradingagents-autonomous-self-healer",
+        "RRULE:FREQ=WEEKLY;BYHOUR=7,10,11,13,15;BYMINUTE=03;BYDAY=MO,TU,WE,TH,FR",
+    )
+
+    for name, result in (
+        ("minute", minute_drift),
+        ("weekday", weekday_drift),
+        ("partial", partial_shift),
+    ):
+        assert result["status"] == "invalid_contract", name
+        assert result["contract_status"] == "fail", name
+        assert result["issues"] == [
+            "contract_expected_central_schedule_mismatch"
+        ], name
+        assert result["safe_predeployment"] is False, name
+        assert result["deployment_proven"] is False, name
 
 
 def test_schedule_contract_rejects_identity_drift_in_both_deployment_phases(tmp_path):

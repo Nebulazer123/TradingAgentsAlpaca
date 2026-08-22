@@ -227,5 +227,217 @@
       "depends_on": ["tradingagents-overnight-research"],
       "no_submit": true
     }
+  },
+  "expected_central_schedules": {
+    "tradingagents-automation-sleep-controller": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 16, "minute": 45},
+        {"weekday": "TU", "hour": 16, "minute": 45},
+        {"weekday": "WE", "hour": 16, "minute": 45},
+        {"weekday": "TH", "hour": 16, "minute": 45},
+        {"weekday": "FR", "hour": 16, "minute": 45}
+      ]
+    },
+    "tradingagents-automation-wake-controller": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 6, "minute": 45},
+        {"weekday": "TU", "hour": 6, "minute": 45},
+        {"weekday": "WE", "hour": 6, "minute": 45},
+        {"weekday": "TH", "hour": 6, "minute": 45},
+        {"weekday": "FR", "hour": 6, "minute": 45}
+      ]
+    },
+    "tradingagents-autonomous-execution-board": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 8, "minute": 50},
+        {"weekday": "MO", "hour": 9, "minute": 50},
+        {"weekday": "MO", "hour": 10, "minute": 50},
+        {"weekday": "MO", "hour": 11, "minute": 50},
+        {"weekday": "MO", "hour": 12, "minute": 50},
+        {"weekday": "MO", "hour": 13, "minute": 50},
+        {"weekday": "MO", "hour": 14, "minute": 50},
+        {"weekday": "TU", "hour": 8, "minute": 50},
+        {"weekday": "TU", "hour": 9, "minute": 50},
+        {"weekday": "TU", "hour": 10, "minute": 50},
+        {"weekday": "TU", "hour": 11, "minute": 50},
+        {"weekday": "TU", "hour": 12, "minute": 50},
+        {"weekday": "TU", "hour": 13, "minute": 50},
+        {"weekday": "TU", "hour": 14, "minute": 50},
+        {"weekday": "WE", "hour": 8, "minute": 50},
+        {"weekday": "WE", "hour": 9, "minute": 50},
+        {"weekday": "WE", "hour": 10, "minute": 50},
+        {"weekday": "WE", "hour": 11, "minute": 50},
+        {"weekday": "WE", "hour": 12, "minute": 50},
+        {"weekday": "WE", "hour": 13, "minute": 50},
+        {"weekday": "WE", "hour": 14, "minute": 50},
+        {"weekday": "TH", "hour": 8, "minute": 50},
+        {"weekday": "TH", "hour": 9, "minute": 50},
+        {"weekday": "TH", "hour": 10, "minute": 50},
+        {"weekday": "TH", "hour": 11, "minute": 50},
+        {"weekday": "TH", "hour": 12, "minute": 50},
+        {"weekday": "TH", "hour": 13, "minute": 50},
+        {"weekday": "TH", "hour": 14, "minute": 50},
+        {"weekday": "FR", "hour": 8, "minute": 50},
+        {"weekday": "FR", "hour": 9, "minute": 50},
+        {"weekday": "FR", "hour": 10, "minute": 50},
+        {"weekday": "FR", "hour": 11, "minute": 50},
+        {"weekday": "FR", "hour": 12, "minute": 50},
+        {"weekday": "FR", "hour": 13, "minute": 50},
+        {"weekday": "FR", "hour": 14, "minute": 50}
+      ]
+    },
+    "tradingagents-autonomous-safety-sentinel": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 8, "minute": 20},
+        {"weekday": "MO", "hour": 9, "minute": 20},
+        {"weekday": "MO", "hour": 10, "minute": 20},
+        {"weekday": "MO", "hour": 11, "minute": 20},
+        {"weekday": "MO", "hour": 12, "minute": 20},
+        {"weekday": "MO", "hour": 13, "minute": 20},
+        {"weekday": "MO", "hour": 14, "minute": 20},
+        {"weekday": "TU", "hour": 8, "minute": 20},
+        {"weekday": "TU", "hour": 9, "minute": 20},
+        {"weekday": "TU", "hour": 10, "minute": 20},
+        {"weekday": "TU", "hour": 11, "minute": 20},
+        {"weekday": "TU", "hour": 12, "minute": 20},
+        {"weekday": "TU", "hour": 13, "minute": 20},
+        {"weekday": "TU", "hour": 14, "minute": 20},
+        {"weekday": "WE", "hour": 8, "minute": 20},
+        {"weekday": "WE", "hour": 9, "minute": 20},
+        {"weekday": "WE", "hour": 10, "minute": 20},
+        {"weekday": "WE", "hour": 11, "minute": 20},
+        {"weekday": "WE", "hour": 12, "minute": 20},
+        {"weekday": "WE", "hour": 13, "minute": 20},
+        {"weekday": "WE", "hour": 14, "minute": 20},
+        {"weekday": "TH", "hour": 8, "minute": 20},
+        {"weekday": "TH", "hour": 9, "minute": 20},
+        {"weekday": "TH", "hour": 10, "minute": 20},
+        {"weekday": "TH", "hour": 11, "minute": 20},
+        {"weekday": "TH", "hour": 12, "minute": 20},
+        {"weekday": "TH", "hour": 13, "minute": 20},
+        {"weekday": "TH", "hour": 14, "minute": 20},
+        {"weekday": "FR", "hour": 8, "minute": 20},
+        {"weekday": "FR", "hour": 9, "minute": 20},
+        {"weekday": "FR", "hour": 10, "minute": 20},
+        {"weekday": "FR", "hour": 11, "minute": 20},
+        {"weekday": "FR", "hour": 12, "minute": 20},
+        {"weekday": "FR", "hour": 13, "minute": 20},
+        {"weekday": "FR", "hour": 14, "minute": 20}
+      ]
+    },
+    "tradingagents-autonomous-self-healer": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 7, "minute": 3},
+        {"weekday": "MO", "hour": 9, "minute": 3},
+        {"weekday": "MO", "hour": 11, "minute": 3},
+        {"weekday": "MO", "hour": 13, "minute": 3},
+        {"weekday": "MO", "hour": 15, "minute": 3},
+        {"weekday": "TU", "hour": 7, "minute": 3},
+        {"weekday": "TU", "hour": 9, "minute": 3},
+        {"weekday": "TU", "hour": 11, "minute": 3},
+        {"weekday": "TU", "hour": 13, "minute": 3},
+        {"weekday": "TU", "hour": 15, "minute": 3},
+        {"weekday": "WE", "hour": 7, "minute": 3},
+        {"weekday": "WE", "hour": 9, "minute": 3},
+        {"weekday": "WE", "hour": 11, "minute": 3},
+        {"weekday": "WE", "hour": 13, "minute": 3},
+        {"weekday": "WE", "hour": 15, "minute": 3},
+        {"weekday": "TH", "hour": 7, "minute": 3},
+        {"weekday": "TH", "hour": 9, "minute": 3},
+        {"weekday": "TH", "hour": 11, "minute": 3},
+        {"weekday": "TH", "hour": 13, "minute": 3},
+        {"weekday": "TH", "hour": 15, "minute": 3},
+        {"weekday": "FR", "hour": 7, "minute": 3},
+        {"weekday": "FR", "hour": 9, "minute": 3},
+        {"weekday": "FR", "hour": 11, "minute": 3},
+        {"weekday": "FR", "hour": 13, "minute": 3},
+        {"weekday": "FR", "hour": 15, "minute": 3}
+      ]
+    },
+    "tradingagents-daily-report": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 15, "minute": 30},
+        {"weekday": "TU", "hour": 15, "minute": 30},
+        {"weekday": "WE", "hour": 15, "minute": 30},
+        {"weekday": "TH", "hour": 15, "minute": 30},
+        {"weekday": "FR", "hour": 15, "minute": 30}
+      ]
+    },
+    "tradingagents-market-supervisor": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 8, "minute": 35},
+        {"weekday": "MO", "hour": 9, "minute": 35},
+        {"weekday": "MO", "hour": 10, "minute": 35},
+        {"weekday": "MO", "hour": 11, "minute": 35},
+        {"weekday": "MO", "hour": 12, "minute": 35},
+        {"weekday": "MO", "hour": 13, "minute": 35},
+        {"weekday": "MO", "hour": 14, "minute": 35},
+        {"weekday": "TU", "hour": 8, "minute": 35},
+        {"weekday": "TU", "hour": 9, "minute": 35},
+        {"weekday": "TU", "hour": 10, "minute": 35},
+        {"weekday": "TU", "hour": 11, "minute": 35},
+        {"weekday": "TU", "hour": 12, "minute": 35},
+        {"weekday": "TU", "hour": 13, "minute": 35},
+        {"weekday": "TU", "hour": 14, "minute": 35},
+        {"weekday": "WE", "hour": 8, "minute": 35},
+        {"weekday": "WE", "hour": 9, "minute": 35},
+        {"weekday": "WE", "hour": 10, "minute": 35},
+        {"weekday": "WE", "hour": 11, "minute": 35},
+        {"weekday": "WE", "hour": 12, "minute": 35},
+        {"weekday": "WE", "hour": 13, "minute": 35},
+        {"weekday": "WE", "hour": 14, "minute": 35},
+        {"weekday": "TH", "hour": 8, "minute": 35},
+        {"weekday": "TH", "hour": 9, "minute": 35},
+        {"weekday": "TH", "hour": 10, "minute": 35},
+        {"weekday": "TH", "hour": 11, "minute": 35},
+        {"weekday": "TH", "hour": 12, "minute": 35},
+        {"weekday": "TH", "hour": 13, "minute": 35},
+        {"weekday": "TH", "hour": 14, "minute": 35},
+        {"weekday": "FR", "hour": 8, "minute": 35},
+        {"weekday": "FR", "hour": 9, "minute": 35},
+        {"weekday": "FR", "hour": 10, "minute": 35},
+        {"weekday": "FR", "hour": 11, "minute": 35},
+        {"weekday": "FR", "hour": 12, "minute": 35},
+        {"weekday": "FR", "hour": 13, "minute": 35},
+        {"weekday": "FR", "hour": 14, "minute": 35}
+      ]
+    },
+    "tradingagents-overnight-research": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 3, "minute": 30},
+        {"weekday": "TU", "hour": 3, "minute": 30},
+        {"weekday": "WE", "hour": 3, "minute": 30},
+        {"weekday": "TH", "hour": 3, "minute": 30},
+        {"weekday": "FR", "hour": 3, "minute": 30}
+      ]
+    },
+    "tradingagents-paper-tournament": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 9, "minute": 10},
+        {"weekday": "TU", "hour": 9, "minute": 10},
+        {"weekday": "WE", "hour": 9, "minute": 10},
+        {"weekday": "TH", "hour": 9, "minute": 10},
+        {"weekday": "FR", "hour": 9, "minute": 10}
+      ]
+    },
+    "tradingagents-preopen-validation": {
+      "timezone": "America/Chicago",
+      "occurrences": [
+        {"weekday": "MO", "hour": 8, "minute": 10},
+        {"weekday": "TU", "hour": 8, "minute": 10},
+        {"weekday": "WE", "hour": 8, "minute": 10},
+        {"weekday": "TH", "hour": 8, "minute": 10},
+        {"weekday": "FR", "hour": 8, "minute": 10}
+      ]
+    }
   }
 }

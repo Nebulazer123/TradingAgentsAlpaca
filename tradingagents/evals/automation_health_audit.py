@@ -207,6 +207,13 @@ EXECUTION_DEPENDENCY_MAX_GAP_MINUTES = {
     (SUPERVISOR_ID, BOARD_ID): 30,
 }
 
+WEEKDAY_INDEX_BY_TOKEN = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+EXPECTED_CENTRAL_SCHEDULES_KEY = "expected_central_schedules"
+ISSUE_EXPECTED_CENTRAL_SCHEDULES_INVALID = "contract_expected_central_schedules"
+ISSUE_EXPECTED_CENTRAL_SCHEDULE_MISSING_ENTRY = "contract_expected_central_schedule_missing_entry"
+ISSUE_EXPECTED_CENTRAL_SCHEDULE_EASTERN_STORED = "contract_expected_central_schedule_eastern_stored"
+ISSUE_EXPECTED_CENTRAL_SCHEDULE_MISMATCH = "contract_expected_central_schedule_mismatch"
+
 
 def _schedule_contract_failure(issue: str) -> dict[str, Any]:
     """Return an explicitly non-authorizing contract evaluation result."""
@@ -413,6 +420,30 @@ def _schedule_contract_issues(contract: Any) -> list[str]:
                     )
                 ):
                     issues.append("contract_dependency_order")
+        expected_schedules = contract.get(EXPECTED_CENTRAL_SCHEDULES_KEY)
+        if not isinstance(expected_schedules, Mapping) or not set(
+            expected_schedules
+        ).issubset(automation_ids):
+            issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULES_INVALID)
+        else:
+            for automation_id in sorted(automation_ids):
+                if automation_id not in expected_schedules:
+                    issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULE_MISSING_ENTRY)
+                    continue
+                entry = expected_schedules[automation_id]
+                if _expected_central_schedule_entry_is_malformed(entry):
+                    issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULES_INVALID)
+                    continue
+                expected_occurrences = _expected_central_occurrence_set(entry)
+                actual_occurrences = set(scheduled_occurrences[automation_id])
+                if actual_occurrences == expected_occurrences:
+                    continue
+                if actual_occurrences == _shift_occurrences_plus_one_hour(
+                    expected_occurrences
+                ):
+                    issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULE_EASTERN_STORED)
+                else:
+                    issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULE_MISMATCH)
     return sorted(set(issues))
 
 
@@ -433,6 +464,104 @@ def _contract_local_occurrences(rrule: str) -> list[tuple[int, int]]:
             for minute in minutes
         }
     )
+
+
+def _expected_central_schedule_entry_is_malformed(entry: Any) -> bool:
+    """Structurally validate one expected_central_schedules entry."""
+
+    if not isinstance(entry, Mapping):
+        return True
+    if set(entry) != {"timezone", "occurrences"}:
+        return True
+    if entry["timezone"] != "America/Chicago":
+        return True
+    occurrences = entry["occurrences"]
+    if not isinstance(occurrences, list) or not occurrences:
+        return True
+    seen: set[tuple[str, int, int]] = set()
+    for item in occurrences:
+        if not isinstance(item, Mapping) or set(item) != {"weekday", "hour", "minute"}:
+            return True
+        weekday = item["weekday"]
+        hour = item["hour"]
+        minute = item["minute"]
+        if (
+            not isinstance(weekday, str)
+            or weekday not in WEEKDAY_INDEX_BY_TOKEN
+            or isinstance(hour, bool)
+            or not isinstance(hour, int)
+            or not 0 <= hour <= 23
+            or isinstance(minute, bool)
+            or not isinstance(minute, int)
+            or not 0 <= minute <= 59
+        ):
+            return True
+        if (weekday, hour, minute) in seen:
+            return True
+        seen.add((weekday, hour, minute))
+    return False
+
+
+def _expected_central_occurrence_set(entry: Mapping[str, Any]) -> set[tuple[int, int]]:
+    """Convert a validated entry to the same (weekday, minute-of-day) form as rrules."""
+
+    return {
+        (WEEKDAY_INDEX_BY_TOKEN[item["weekday"]], item["hour"] * 60 + item["minute"])
+        for item in entry["occurrences"]
+    }
+
+
+def _shift_occurrences_plus_one_hour(
+    occurrences: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    """Shift every occurrence by exactly 60 minutes, rolling across midnight."""
+
+    shifted: set[tuple[int, int]] = set()
+    for weekday, minute_of_day in occurrences:
+        total = minute_of_day + 60
+        shifted.add(((weekday + total // (24 * 60)) % 7, total % (24 * 60)))
+    return shifted
+
+
+def _captured_actual_schedule_issues(
+    contract: Mapping[str, Any],
+    captured_tomls: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Compare each captured actual TOML rrule to the versioned expected map.
+
+    The versioned contract's own declared rrules are validated separately by
+    :func:`_schedule_contract_issues`; this check closes the remaining gap where
+    an external automation TOML drifts while that contract stays unchanged.
+    """
+
+    issues: list[str] = []
+    automations = contract.get("automations")
+    expected_schedules = contract.get(EXPECTED_CENTRAL_SCHEDULES_KEY)
+    if not isinstance(automations, Mapping) or not isinstance(expected_schedules, Mapping):
+        return [ISSUE_EXPECTED_CENTRAL_SCHEDULES_INVALID]
+    for automation_id in sorted(automations):
+        entry = expected_schedules.get(automation_id)
+        if not isinstance(entry, Mapping) or _expected_central_schedule_entry_is_malformed(
+            entry
+        ):
+            issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULES_INVALID)
+            continue
+        actual = _captured_toml(captured_tomls.get(automation_id) or {})
+        if not actual:
+            continue
+        rrule = actual.get("rrule")
+        if not isinstance(rrule, str) or not rrule:
+            issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULE_MISMATCH)
+            continue
+        expected_occurrences = _expected_central_occurrence_set(entry)
+        actual_occurrences = set(_contract_local_occurrences(rrule))
+        if actual_occurrences == expected_occurrences:
+            continue
+        if actual_occurrences == _shift_occurrences_plus_one_hour(expected_occurrences):
+            issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULE_EASTERN_STORED)
+        else:
+            issues.append(ISSUE_EXPECTED_CENTRAL_SCHEDULE_MISMATCH)
+    return sorted(set(issues))
 
 
 SCHEDULE_CAPTURE_SCHEMA_VERSION = "schedule_contract_capture_v1"
@@ -1008,6 +1137,11 @@ def evaluate_schedule_contract(
         for source in captured_tomls
         if isinstance(source, Mapping)
     }
+    actual_schedule_issues = _captured_actual_schedule_issues(contract, tomls_by_id)
+    if actual_schedule_issues:
+        failure = _schedule_contract_failure(actual_schedule_issues[0])
+        failure["issues"] = actual_schedule_issues
+        return failure
     for automation_id in sorted(records):
         expected = records[automation_id]
         actual = _captured_toml(tomls_by_id.get(automation_id, {}))
@@ -1419,10 +1553,13 @@ def _int_list(value: str | None, default: tuple[int, ...]) -> list[int]:
 
 
 def _weekday_list(value: str | None) -> set[int]:
-    mapping = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
     if not value:
         return set(range(7))
-    return {mapping[piece] for piece in value.split(",") if piece in mapping}
+    return {
+        WEEKDAY_INDEX_BY_TOKEN[piece]
+        for piece in value.split(",")
+        if piece in WEEKDAY_INDEX_BY_TOKEN
+    }
 
 
 def _due_times(

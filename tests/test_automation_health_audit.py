@@ -6,7 +6,10 @@ from pathlib import Path
 import tradingagents.evals.automation_health_audit as automation_health_audit
 from tradingagents.evals.automation_health_audit import (
     _collect_run_ids,
+    _expected_central_occurrence_set,
+    _expected_central_schedule_entry_is_malformed,
     _run_id_for_path,
+    _shift_occurrences_plus_one_hour,
     build_automation_health_audit,
     build_compact_automation_health_audit,
     write_automation_health_audit,
@@ -1707,3 +1710,37 @@ def test_compact_automation_health_keeps_timely_self_heal_overlap_out_of_problem
     assert compact["problem_automation_ids"] == []
     assert compact["attention_automation_ids"] == ["tradingagents-self-heal-monitor"]
     assert compact["self_heal_timeliness"]["timely"] is True
+
+
+def test_expected_central_schedule_entry_validation_and_one_hour_shift():
+    entry = {
+        "timezone": "America/Chicago",
+        "occurrences": [
+            {"weekday": "MO", "hour": 16, "minute": 45},
+            {"weekday": "FR", "hour": 6, "minute": 45},
+        ],
+    }
+
+    assert _expected_central_schedule_entry_is_malformed(entry) is False
+    assert _expected_central_occurrence_set(entry) == {(0, 16 * 60 + 45), (4, 6 * 60 + 45)}
+
+    assert (
+        _expected_central_schedule_entry_is_malformed(
+            {**entry, "timezone": "America/New_York"}
+        )
+        is True
+    )
+    bad_hour = {**entry, "occurrences": [{"weekday": "MO", "hour": 24, "minute": 0}]}
+    assert _expected_central_schedule_entry_is_malformed(bad_hour) is True
+    bool_hour = {**entry, "occurrences": [{"weekday": "MO", "hour": True, "minute": 0}]}
+    assert _expected_central_schedule_entry_is_malformed(bool_hour) is True
+    duplicate = {
+        **entry,
+        "occurrences": [dict(entry["occurrences"][0]), dict(entry["occurrences"][0])],
+    }
+    assert _expected_central_schedule_entry_is_malformed(duplicate) is True
+    assert _expected_central_schedule_entry_is_malformed("not-a-mapping") is True
+
+    friday_late = {(4, 23 * 60 + 30)}
+    assert _shift_occurrences_plus_one_hour(friday_late) == {(5, 30)}
+    assert _shift_occurrences_plus_one_hour(set()) == set()
