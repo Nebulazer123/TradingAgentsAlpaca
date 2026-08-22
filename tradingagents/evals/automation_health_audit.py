@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hashlib
 import json
 import os
 import re
-import secrets
 import stat
+import weakref
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -436,7 +437,18 @@ def _contract_local_occurrences(rrule: str) -> list[tuple[int, int]]:
 
 SCHEDULE_CAPTURE_SCHEMA_VERSION = "schedule_contract_capture_v1"
 _AUTOMATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_CAPTURE_AUTHENTICATIONS: dict[str, str] = {}
+
+
+class _TrustedScheduleContractSnapshot:
+    """Opaque handle for canonical schedule bytes owned by this evaluator module."""
+
+    __slots__ = ("__weakref__",)
+
+
+_TRUSTED_CAPTURE_BYTES: weakref.WeakKeyDictionary[_TrustedScheduleContractSnapshot, bytes] = (
+    weakref.WeakKeyDictionary()
+)
+_CAPTURE_BYTES_MARKER = "__tradingagents_captured_bytes_b64__"
 
 
 def _capture_schedule_source(path_value: str | Path, *, captured_at: str) -> dict[str, Any]:
@@ -640,61 +652,74 @@ def _discover_descriptor_relative_automation_ids(root_descriptor: int | None) ->
     return discovered
 
 
-def _snapshot_authentication_payload(snapshot: Mapping[str, Any]) -> dict[str, Any]:
-    """Return the complete immutable binding for a locally captured snapshot."""
+def _capture_json_value(value: Any) -> Any:
+    """Encode the captured payload into a canonical JSON-safe representation."""
 
-    def source_binding(source: Any) -> Any:
-        if not isinstance(source, Mapping):
-            return {"invalid": type(source).__name__}
-        raw = source.get("_bytes")
-        return {
-            key: source.get(key)
-            for key in (
-                "automation_id",
-                "automation_root",
-                "relative_path",
-                "path",
-                "status",
-                "sha256",
-                "size_bytes",
-                "captured_at",
-                "descriptor_relative",
-                "file_kind",
-                "symlink",
-                "root_identity",
-                "file_identity",
-            )
-        } | {"raw_sha256": hashlib.sha256(raw).hexdigest() if isinstance(raw, bytes) else None}
-
-    tomls = snapshot.get("automation_tomls")
-    return {
-        "schema_version": snapshot.get("schema_version"),
-        "captured_at": snapshot.get("captured_at"),
-        "automation_root": snapshot.get("automation_root"),
-        "automation_root_identity": snapshot.get("automation_root_identity"),
-        "expected_automation_ids": snapshot.get("expected_automation_ids"),
-        "discovered_automation_ids": snapshot.get("discovered_automation_ids"),
-        "contract": source_binding(snapshot.get("contract")),
-        "role_contract": source_binding(snapshot.get("role_contract")),
-        "automation_tomls": [source_binding(source) for source in tomls]
-        if isinstance(tomls, list)
-        else {"invalid": type(tomls).__name__},
-    }
+    if isinstance(value, bytes):
+        return {_CAPTURE_BYTES_MARKER: base64.b64encode(value).decode("ascii")}
+    if isinstance(value, Mapping):
+        return {str(key): _capture_json_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_capture_json_value(item) for item in value]
+    return value
 
 
-def _snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
-    encoded = json.dumps(
-        _snapshot_authentication_payload(snapshot),
+def _restore_capture_json_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_restore_capture_json_value(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if set(value) == {_CAPTURE_BYTES_MARKER}:
+        encoded = value[_CAPTURE_BYTES_MARKER]
+        if not isinstance(encoded, str):
+            raise ValueError("captured bytes marker is invalid")
+        return base64.b64decode(encoded.encode("ascii"), validate=True)
+    return {key: _restore_capture_json_value(item) for key, item in value.items()}
+
+
+def _trusted_capture(snapshot: Mapping[str, Any]) -> _TrustedScheduleContractSnapshot:
+    """Freeze a deep canonical byte copy; no mutable caller mapping is retained."""
+
+    canonical_bytes = json.dumps(
+        _capture_json_value(snapshot),
         sort_keys=True,
         separators=(",", ":"),
-        default=repr,
+        ensure_ascii=True,
     ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    trusted = _TrustedScheduleContractSnapshot()
+    _TRUSTED_CAPTURE_BYTES[trusted] = canonical_bytes
+    return trusted
 
 
-def _snapshot_authentication_valid(snapshot: Mapping[str, Any]) -> bool:
-    token = snapshot.get("_capture_authentication")
-    return isinstance(token, str) and _CAPTURE_AUTHENTICATIONS.get(token) == _snapshot_fingerprint(snapshot)
+def _trusted_capture_payload(snapshot: Any) -> dict[str, Any] | None:
+    """Decode evaluator-owned immutable bytes into a fresh private working copy."""
+
+    if type(snapshot) is not _TrustedScheduleContractSnapshot:
+        return None
+    canonical_bytes = _TRUSTED_CAPTURE_BYTES.get(snapshot)
+    if not isinstance(canonical_bytes, bytes):
+        return None
+    try:
+        decoded = _restore_capture_json_value(json.loads(canonical_bytes))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _trusted_capture_store_size() -> int:
+    """Expose weak-store cardinality only for local lifecycle verification."""
+
+    return len(_TRUSTED_CAPTURE_BYTES)
+
+
+def _capture_timestamp_is_valid(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def _capture_topology_issues(snapshot: Mapping[str, Any]) -> list[str]:
@@ -778,7 +803,7 @@ def capture_schedule_contract_snapshot(
     automation_root: str | Path | None = None,
     role_contract_path: str | Path | None = None,
     captured_at: dt.datetime | None = None,
-) -> dict[str, Any]:
+) -> _TrustedScheduleContractSnapshot:
     """Capture every source a schedule evaluation may inspect, without evaluating it."""
 
     capture_time = _now_iso(captured_at or dt.datetime.now(tz=UTC))
@@ -853,13 +878,10 @@ def capture_schedule_contract_snapshot(
         "automation_tomls": automation_tomls,
         "discovered_automation_ids": sorted(discovered_ids),
     }
-    authentication = secrets.token_urlsafe(32)
-    snapshot["_capture_authentication"] = authentication
-    _CAPTURE_AUTHENTICATIONS[authentication] = _snapshot_fingerprint(snapshot)
-    return snapshot
+    return _trusted_capture(snapshot)
 
 
-def schedule_contract_snapshot_manifest(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def _schedule_contract_snapshot_manifest_from_payload(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Return packet-safe provenance for the exact bytes retained in a snapshot."""
 
     def public(source: Any) -> dict[str, Any]:
@@ -892,8 +914,8 @@ def schedule_contract_snapshot_manifest(snapshot: Mapping[str, Any]) -> dict[str
     capture_issues = []
     if snapshot.get("schema_version") != SCHEDULE_CAPTURE_SCHEMA_VERSION:
         capture_issues.append("schema_invalid")
-    if not _snapshot_authentication_valid(snapshot):
-        capture_issues.append("capture_authentication_invalid")
+    if not _capture_timestamp_is_valid(snapshot.get("captured_at")):
+        capture_issues.append("captured_at_invalid")
     if _capture_topology_issues(snapshot):
         capture_issues.append("automation_topology_invalid")
     if any(
@@ -925,13 +947,33 @@ def schedule_contract_snapshot_manifest(snapshot: Mapping[str, Any]) -> dict[str
     }
 
 
+def schedule_contract_snapshot_manifest(snapshot: Any) -> dict[str, Any]:
+    """Project evidence from evaluator-owned immutable capture bytes only."""
+
+    payload = _trusted_capture_payload(snapshot)
+    if payload is not None:
+        return _schedule_contract_snapshot_manifest_from_payload(payload)
+    return {
+        "captured_at": None,
+        "provenance": "direct_current_configuration_capture",
+        "freshness": {
+            "status": "not_applicable",
+            "rule": "static_configuration_captured_this_audit",
+        },
+        "contract": {"status": "invalid_capture"},
+        "role_contract": {"status": "invalid_capture"},
+        "automation_tomls": [],
+        "capture_issues": ["capture_not_trusted"],
+    }
+
+
 def evaluate_schedule_contract(
     *,
     contract_path: str | Path | None = None,
     automation_root: str | Path | None = None,
     role_contract_path: str | Path | None = None,
     deployment_phase: str = PREDEPLOYMENT_PAUSED_PHASE,
-    captured_snapshot: Mapping[str, Any] | None = None,
+    captured_snapshot: _TrustedScheduleContractSnapshot | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compare the ten external TOMLs to the versioned CT schedule contract.
 
@@ -950,10 +992,13 @@ def evaluate_schedule_contract(
             automation_root=automation_root,
             role_contract_path=role_contract_path,
         )
-    manifest = schedule_contract_snapshot_manifest(captured_snapshot)
+    snapshot = _trusted_capture_payload(captured_snapshot)
+    if snapshot is None:
+        return _schedule_contract_failure("captured_snapshot_invalid")
+    manifest = _schedule_contract_snapshot_manifest_from_payload(snapshot)
     if manifest["capture_issues"]:
         return _schedule_contract_failure("captured_snapshot_invalid")
-    contract = _captured_json(cast(Mapping[str, Any], captured_snapshot["contract"]))
+    contract = _captured_json(cast(Mapping[str, Any], snapshot["contract"]))
     if contract is None:
         return _schedule_contract_failure("contract_unreadable")
     issues = _schedule_contract_issues(contract)
@@ -969,14 +1014,14 @@ def evaluate_schedule_contract(
     active_automation_ids = set(phases[deployment_phase]["active_automation_ids"])
 
     records = cast(Mapping[str, Mapping[str, Any]], contract["automations"])
-    role_document = _captured_json(cast(Mapping[str, Any], captured_snapshot["role_contract"])) or {}
+    role_document = _captured_json(cast(Mapping[str, Any], snapshot["role_contract"])) or {}
     assignments = role_document.get("automations") if isinstance(role_document, Mapping) else {}
     if not isinstance(assignments, Mapping):
         assignments = {}
     rows: list[dict[str, Any]] = []
     configured_count = 0
     paused_count = 0
-    captured_tomls = captured_snapshot.get("automation_tomls")
+    captured_tomls = snapshot.get("automation_tomls")
     if not isinstance(captured_tomls, list):
         return _schedule_contract_failure("captured_snapshot_invalid")
     tomls_by_id = {
@@ -1079,7 +1124,7 @@ def evaluate_schedule_contract(
             }
         )
     known_ids = set(records)
-    discovered_ids = set(cast(list[str], captured_snapshot.get("discovered_automation_ids") or []))
+    discovered_ids = set(cast(list[str], snapshot.get("discovered_automation_ids") or []))
     unexpected_ids = sorted(discovered_ids - known_ids)
     if unexpected_ids:
         issues.append("unexpected_automation_ids")

@@ -1,5 +1,5 @@
-import copy
 import datetime as dt
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import tradingagents.evals.automation_health_audit as automation_health_audit
 from cli import main as cli_main
 from cli.main import app
 from tradingagents.evals import safety_sentinel
@@ -219,9 +220,81 @@ def test_captured_schedule_snapshot_evaluates_without_rereading_paths_and_reject
 
     assert result["contract_status"] == "pass"
     assert all(row["status"] == "match" for row in result["automations"])
-    snapshot["contract"]["sha256"] = "0" * 64
-    tampered = evaluate_schedule_contract(captured_snapshot=snapshot)
+    assert not isinstance(snapshot, dict)
+    tampered = evaluate_schedule_contract(captured_snapshot={"captured_at": "2026-08-21T13:30:00+00:00"})
     assert tampered["issues"] == ["captured_snapshot_invalid"]
+
+
+def test_captured_schedule_snapshot_consumes_immutable_bytes_after_manifest_check(tmp_path, monkeypatch):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    automation_id = next(iter(json.loads(contract.read_text(encoding="utf-8"))["automations"]))
+    toml_path = automation_root / automation_id / "automation.toml"
+    valid_toml = toml_path.read_bytes()
+    toml_path.write_bytes(valid_toml.replace(b'status = "PAUSED"', b'status = "ACTIVE"'))
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+    toml_path.write_bytes(valid_toml)
+    original_manifest = automation_health_audit.schedule_contract_snapshot_manifest
+    assert original_manifest(snapshot)["capture_issues"] == []
+    with pytest.raises(AttributeError):
+        snapshot.automation_tomls = []
+
+    def authenticate_then_attempt_mutation(captured):
+        manifest = original_manifest(captured)
+        if isinstance(captured, dict):
+            source = captured["automation_tomls"][0]
+            source["_bytes"] = valid_toml
+            source["sha256"] = hashlib.sha256(valid_toml).hexdigest()
+            source["size_bytes"] = len(valid_toml)
+        return manifest
+
+    monkeypatch.setattr(
+        automation_health_audit,
+        "schedule_contract_snapshot_manifest",
+        authenticate_then_attempt_mutation,
+    )
+
+    result = evaluate_schedule_contract(captured_snapshot=snapshot)
+
+    row = next(item for item in result["automations"] if item["automation_id"] == automation_id)
+    assert row["status"] == "mismatch"
+    assert "deployment_phase_status" in {item["field"] for item in row["mismatches"]}
+
+
+def test_captured_schedule_snapshot_rejects_malformed_top_level_capture_time(tmp_path, monkeypatch):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    monkeypatch.setattr(automation_health_audit, "_now_iso", lambda _now: "not-a-timestamp")
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=contract,
+        automation_root=automation_root,
+        role_contract_path=roles,
+        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    result = evaluate_schedule_contract(captured_snapshot=snapshot)
+
+    assert result["issues"] == ["captured_snapshot_invalid"]
+
+
+def test_trusted_schedule_capture_lifecycle_does_not_accumulate_global_state(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
+    baseline = automation_health_audit._trusted_capture_store_size()
+    for _ in range(12):
+        snapshot = capture_schedule_contract_snapshot(
+            contract_path=contract,
+            automation_root=automation_root,
+            role_contract_path=roles,
+            captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+        )
+        assert evaluate_schedule_contract(captured_snapshot=snapshot)["contract_status"] == "pass"
+    del snapshot
+    gc.collect()
+
+    assert automation_health_audit._trusted_capture_store_size() == baseline
 
 
 def test_safety_sentinel_holds_missing_or_changed_schedule_capture(tmp_path, monkeypatch):
@@ -245,14 +318,23 @@ def test_safety_sentinel_holds_missing_or_changed_schedule_capture(tmp_path, mon
         now=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
     )
     control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path / "changed")
-    snapshot = capture_schedule_contract_snapshot(
+    automation_id = next(iter(json.loads(contract.read_text(encoding="utf-8"))["automations"]))
+    toml_path = automation_root / automation_id / "automation.toml"
+    outside_toml = tmp_path / "changed-outside.toml"
+    outside_toml.write_bytes(toml_path.read_bytes())
+    toml_path.unlink()
+    toml_path.symlink_to(outside_toml)
+    changed_snapshot = capture_schedule_contract_snapshot(
         contract_path=contract,
         automation_root=automation_root,
         role_contract_path=roles,
         captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
     )
-    snapshot["automation_tomls"][0]["status"] = "changed"
-    monkeypatch.setattr(safety_sentinel, "capture_schedule_contract_snapshot", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(
+        safety_sentinel,
+        "capture_schedule_contract_snapshot",
+        lambda **_kwargs: changed_snapshot,
+    )
     changed = _packet(tmp_path / "changed-packet")
 
     assert missing["status"] == "HOLD"
@@ -446,13 +528,7 @@ def test_captured_schedule_snapshot_rejects_hidden_unexpected_automation(tmp_pat
         role_contract_path=roles,
         captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
     )
-    mutated = copy.deepcopy(snapshot)
-    mutated["automation_tomls"] = [
-        source for source in mutated["automation_tomls"] if source["automation_id"] != unexpected_id
-    ]
-    mutated["discovered_automation_ids"].remove(unexpected_id)
-
-    result = evaluate_schedule_contract(captured_snapshot=mutated)
+    result = evaluate_schedule_contract(captured_snapshot=snapshot)
 
     assert result["issues"] == ["captured_snapshot_invalid"]
 
@@ -494,38 +570,16 @@ def test_captured_schedule_snapshot_rejects_extra_and_symlinked_automation_tomls
 
 
 @pytest.mark.parametrize(
-    "mutation",
-    ["missing", "duplicate", "root_escape", "mismatched_id", "substituted", "unauthenticated"],
+    "hand_built",
+    [
+        {},
+        {"captured_at": "2026-08-21T13:30:00+00:00", "automation_tomls": []},
+        {"automation_root": "/outside-root", "discovered_automation_ids": []},
+        {"automation_tomls": [{"automation_id": "mismatched-id", "_bytes": b"substituted"}]},
+    ],
 )
-def test_captured_schedule_snapshot_rejects_each_topology_mutation(tmp_path, mutation):
-    contract, roles, automation_root = _write_schedule_fixture(tmp_path)
-    snapshot = capture_schedule_contract_snapshot(
-        contract_path=contract,
-        automation_root=automation_root,
-        role_contract_path=roles,
-        captured_at=dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
-    )
-    mutated = copy.deepcopy(snapshot)
-    source = mutated["automation_tomls"][0]
-    if mutation == "missing":
-        mutated["automation_tomls"].pop(0)
-        mutated["discovered_automation_ids"].remove(source["automation_id"])
-    elif mutation == "duplicate":
-        mutated["automation_tomls"].append(copy.deepcopy(source))
-    elif mutation == "root_escape":
-        source["path"] = str(tmp_path / "outside-root" / "automation.toml")
-    elif mutation == "mismatched_id":
-        source["automation_id"] = mutated["automation_tomls"][1]["automation_id"]
-    elif mutation == "substituted":
-        replacement = mutated["automation_tomls"][1]
-        source["_bytes"] = replacement["_bytes"]
-        source["sha256"] = replacement["sha256"]
-        source["size_bytes"] = replacement["size_bytes"]
-        source["file_identity"] = replacement["file_identity"]
-    else:
-        mutated.pop("_capture_authentication")
-
-    result = evaluate_schedule_contract(captured_snapshot=mutated)
+def test_captured_schedule_snapshot_rejects_each_hand_built_or_mutable_mapping(hand_built):
+    result = evaluate_schedule_contract(captured_snapshot=hand_built)
 
     assert result["issues"] == ["captured_snapshot_invalid"]
 
