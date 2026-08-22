@@ -9341,6 +9341,84 @@ def alpaca_check():
     console.print(table)
 
 
+@research_app.command("safety-sentinel-audit")
+def research_safety_sentinel_audit(
+    output_dir: Path = typer.Option(
+        Path("results/safety_sentinel"),
+        "--output-dir",
+        help="Directory for immutable read-only safety-sentinel packets.",
+    ),
+    live_control_path: Path = typer.Option(
+        Path("results/policy/live_control.json"),
+        "--live-control-path",
+        help="Live-control state to inspect without refreshing it.",
+    ),
+    preopen_validation_path: Path = typer.Option(
+        Path("results/preopen_validation/latest.json"),
+        "--preopen-validation-path",
+        help="Exact pre-open validation packet to capture and verify.",
+    ),
+    schedule_contract_path: Path = typer.Option(
+        Path("config/automation_schedule_contract.json"),
+        "--schedule-contract-path",
+        help="Versioned schedule contract to evaluate read-only.",
+    ),
+    automation_root: Path = typer.Option(
+        default_automation_root(),
+        "--automation-root",
+        help="Codex automation root to inspect without changing records.",
+    ),
+    role_contract_path: Path = typer.Option(
+        Path("config/automation_roles.json"),
+        "--role-contract-path",
+        help="Versioned role contract to capture and verify.",
+    ),
+    max_evidence_age_minutes: float = typer.Option(
+        90.0,
+        "--max-evidence-age-minutes",
+        min=0.1,
+        help="Maximum accepted age for the exact pre-open validation packet.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Capture a deterministic observer-only safety packet with read-only Alpaca state."""
+    from tradingagents.evals.safety_sentinel import (
+        build_safety_sentinel_packet,
+        capture_read_only_broker_snapshot,
+        write_safety_sentinel_packet,
+    )
+
+    try:
+        _, live_client = _alpaca_clients()
+        broker_snapshot = capture_read_only_broker_snapshot(live_client)
+    except Exception as exc:  # noqa: BLE001 - preserve client setup failures in a HOLD packet.
+        broker_snapshot = {
+            "account": {},
+            "positions": [],
+            "open_orders": [],
+            "clock": {},
+            "errors": {"client": f"live client initialization failed: {exc}"},
+            "read_methods": ["get_account", "list_positions", "list_orders", "get_clock"],
+        }
+    packet = build_safety_sentinel_packet(
+        live_control_path=live_control_path,
+        preopen_validation_path=preopen_validation_path,
+        schedule_contract_path=schedule_contract_path,
+        automation_root=automation_root,
+        role_contract_path=role_contract_path,
+        broker_snapshot=broker_snapshot,
+        now=_alpaca_policy_now(),
+        max_evidence_age_minutes=max_evidence_age_minutes,
+    )
+    packet_path = write_safety_sentinel_packet(packet, output_dir=output_dir)
+    payload = {**packet, "packet_path": str(packet_path)}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Safety sentinel: {packet['status']}")
+    console.print(f"Packet: {packet_path}")
+
+
 def _write_reconciliation_packet(
     output_dir: Path,
     *,
