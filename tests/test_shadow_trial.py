@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import inspect
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -172,12 +173,17 @@ def _start(
     predecessor_object_id: str | None = None,
 ) -> object:
     _set_clock(monkeypatch, date)
-    return shadow_trial.create_shadow_day_start_manifest(
-        run_id=f"run-{date}",
-        market_date=date,
-        calendar_evidence=_calendar(date),
-        predecessor_object_id=predecessor_object_id,
-    )
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        return shadow_trial.create_shadow_day_start_manifest(
+            run_id=f"run-{date}",
+            market_date=date,
+            predecessor_object_id=predecessor_object_id,
+        )
 
 
 def _artifacts(
@@ -234,11 +240,20 @@ def _day(
 ) -> object:
     _set_clock(monkeypatch, date, 16)
     start_payload = _payload(start)
-    return shadow_trial.adjudicate_shadow_day(
-        start_object_id=start.envelope.object_id,
-        artifacts=artifacts or _artifacts(root, run_id=start_payload["run_id"], date=date),
-        calendar_evidence=_calendar(date, observed_at=f"{date}T15:59:00+00:00"),
-    )
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(
+                market_date,
+                observed_at=f"{market_date}T15:59:00+00:00",
+            ),
+        )
+        return shadow_trial.adjudicate_shadow_day(
+            start_object_id=start.envelope.object_id,
+            artifacts=artifacts
+            or _artifacts(root, run_id=start_payload["run_id"], date=date),
+        )
 
 
 def test_red_production_cli_exposes_only_pinned_non_authorizing_inputs(tmp_path, monkeypatch):
@@ -342,17 +357,206 @@ def test_red_generic_manual_injection_cannot_create_a_reportable_shadow_ledger(t
 
 
 def test_red_task3_ledger_route_is_not_a_generic_store_or_callback_escape(tmp_path, monkeypatch):
-    _configure_environment(monkeypatch, tmp_path)
-    ledger = shadow_trial._store()
-    assert not isinstance(ledger, ImmutableStrategyEvidenceStore)
-    assert not hasattr(ledger, "admit_checked")
-    assert "clock" not in inspect.signature(shadow_trial._store).parameters
-    assert "validate" not in inspect.signature(ledger.admit).parameters
-    reserved_open = inspect.signature(
-        evidence_store_module._open_reserved_manual_shadow_store
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    assert not hasattr(shadow_trial, "_store")
+    anchor = json.loads(
+        (environment["manual_root"].parent / ".manual-shadow-trusted-head.json").read_text(
+            encoding="utf-8"
+        )
     )
-    assert "clock" not in reserved_open.parameters
-    assert "validator" not in reserved_open.parameters
+    ledger_id = anchor["ledger_id"]
+    with pytest.raises(StrategyEvidenceStoreError, match="clock.*Task 3 owned"):
+        ImmutableStrategyEvidenceStore(
+            environment["manual_root"],
+            clock=lambda: _moment("2026-08-21"),
+            _manual_shadow_ledger_id=ledger_id,
+        )
+    ledger = ImmutableStrategyEvidenceStore(
+        environment["manual_root"],
+        _manual_shadow_ledger_id=ledger_id,
+    )
+    with pytest.raises(StrategyEvidenceStoreError, match="facade"):
+        ledger._admit_reserved_manual_shadow(
+            EvidenceCandidate(
+                kind=start.envelope.kind,
+                effective_at=start.envelope.effective_at,
+                payload=start.envelope.payload,
+            )
+        )
+
+
+def test_round4_generic_store_instance_mutation_cannot_admit_manual_shadow(tmp_path):
+    (tmp_path / "results").mkdir()
+    store = ImmutableStrategyEvidenceStore(
+        tmp_path / "results" / "manual_shadow",
+        clock=lambda: _moment("2026-08-21"),
+    )
+    store._managed_kinds = frozenset({"manual-shadow-day-start"})
+    store._admission_route = "manual-shadow-reserved-v1"
+
+    with pytest.raises(StrategyEvidenceStoreError, match="reserved|allowed"):
+        store.admit_checked(
+            EvidenceCandidate(
+                kind="manual-shadow-day-start",
+                effective_at="2026-08-21T14:00:00+00:00",
+                payload={"fabricated": True},
+            ),
+            validate=lambda _history, _candidate: None,
+        )
+
+
+def test_round4_rejected_reserved_factories_and_classes_are_absent():
+    for name in (
+        "_bind_reserved_manual_shadow_admission",
+        "_open_reserved_manual_shadow_store",
+        "_ReservedManualShadowBinding",
+        "_ReservedManualShadowEvidenceStore",
+    ):
+        assert not hasattr(evidence_store_module, name)
+
+
+def test_round4_direct_api_owns_calendar_capture(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    _set_clock(monkeypatch, "2026-08-21")
+    captured_dates: list[str] = []
+
+    def capture(market_date: str) -> dict:
+        captured_dates.append(market_date)
+        return _calendar(market_date)
+
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        capture,
+        raising=False,
+    )
+    start_signature = inspect.signature(
+        shadow_trial.create_shadow_day_start_manifest
+    )
+    day_signature = inspect.signature(shadow_trial.adjudicate_shadow_day)
+    assert "calendar_evidence" not in start_signature.parameters
+    assert "calendar_evidence" not in day_signature.parameters
+
+    admission = shadow_trial.create_shadow_day_start_manifest(
+        run_id="canonical-calendar",
+        market_date="2026-08-21",
+    )
+    assert captured_dates == ["2026-08-21"]
+    with pytest.raises(TypeError):
+        shadow_trial.create_shadow_day_start_manifest(  # type: ignore[call-arg]
+            run_id="caller-calendar",
+            market_date="2026-08-21",
+            calendar_evidence=_calendar("2026-08-21"),
+        )
+    assert _payload(admission)["calendar"]["market_date"] == "2026-08-21"
+
+
+def test_round4_fully_consistent_copied_reserved_ledger_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    previous = _day(
+        tmp_path,
+        monkeypatch,
+        _start(monkeypatch, date="2026-08-14"),
+        date="2026-08-14",
+    )
+    for date in (
+        "2026-08-17",
+        "2026-08-18",
+        "2026-08-19",
+        "2026-08-20",
+        "2026-08-21",
+    ):
+        previous = _day(
+            tmp_path,
+            monkeypatch,
+            _start(
+                monkeypatch,
+                date=date,
+                predecessor_object_id=previous.envelope.object_id,
+            ),
+            date=date,
+        )
+    assert shadow_trial.build_shadow_streak_report()["phase"] == "readiness_candidate"
+
+    hostile_root = tmp_path / "hostile-copy" / "manual_shadow"
+    shutil.copytree(environment["manual_root"], hostile_root)
+    monkeypatch.setattr(shadow_trial, "_manual_shadow_root", lambda: hostile_root)
+
+    with pytest.raises(ValueError, match="anchor|head|root|ledger"):
+        shadow_trial.build_shadow_streak_report()
+
+
+def test_round4_pre_failure_root_rollback_cannot_hide_later_history(
+    tmp_path,
+    monkeypatch,
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    qualification = _day(
+        tmp_path,
+        monkeypatch,
+        _start(monkeypatch, date="2026-08-19"),
+        date="2026-08-19",
+    )
+    old_root = tmp_path / "pre-failure-root"
+    shutil.copytree(environment["manual_root"], old_root)
+
+    failed_start = _start(
+        monkeypatch,
+        date="2026-08-20",
+        predecessor_object_id=qualification.envelope.object_id,
+    )
+    _day(
+        tmp_path,
+        monkeypatch,
+        failed_start,
+        date="2026-08-20",
+        artifacts={
+            "safety_sentinel": tmp_path / "missing-sentinel",
+            "paper_tournament": tmp_path / "missing-paper",
+        },
+    )
+    shutil.rmtree(environment["manual_root"])
+    shutil.copytree(old_root, environment["manual_root"])
+
+    with pytest.raises(ValueError, match="anchor|head|rollback|ledger"):
+        shadow_trial.build_shadow_streak_report()
+
+
+def test_round4_uncommitted_anchor_advance_fails_closed(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    _set_clock(monkeypatch, "2026-08-21")
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+    original_write = shadow_trial._write_anchor
+    write_count = 0
+
+    def fail_after_ledger_append(parent_fd, anchor):
+        nonlocal write_count
+        write_count += 1
+        if write_count == 3:
+            raise ValueError("simulated trusted-head commit interruption")
+        return original_write(parent_fd, anchor)
+
+    monkeypatch.setattr(shadow_trial, "_write_anchor", fail_after_ledger_append)
+    with pytest.raises(ValueError, match="commit interruption"):
+        shadow_trial.create_shadow_day_start_manifest(
+            run_id="interrupted-anchor",
+            market_date="2026-08-21",
+        )
+    assert (environment["manual_root"] / "events.jsonl").is_file()
+
+    with pytest.raises(ValueError, match="advanced|trusted head|anchor"):
+        shadow_trial.load_shadow_record(
+            "manual-shadow-day-start-" + "0" * 64,
+            expected_kind="manual-shadow-day-start",
+        )
 
 
 def test_red_legacy_generic_manual_journal_without_reserved_route_cannot_replay(tmp_path, monkeypatch):
@@ -360,7 +564,9 @@ def test_red_legacy_generic_manual_journal_without_reserved_route_cannot_replay(
     start = _start(monkeypatch, date="2026-08-21")
     journal = environment["manual_root"] / "events.jsonl"
     line = json.loads(journal.read_text(encoding="utf-8"))
-    assert line["admission_route"] == "manual-shadow-reserved-v1"
+    assert isinstance(line["admission_route"], str)
+    assert len(line["admission_route"]) == 64
+    int(line["admission_route"], 16)
     del line["admission_route"]
     journal.write_text(
         json.dumps(line, separators=(",", ":"), sort_keys=True) + "\n",
@@ -399,7 +605,7 @@ def test_red_self_written_reserved_object_without_event_blocks_replay(tmp_path, 
             evidence_store_module._payload_bytes(candidate.payload)
         ).hexdigest(),
         payload=candidate.payload,
-        admission_route="manual-shadow-reserved-v1",
+        admission_route=start.envelope.admission_route,
     )
     orphan_path = (
         environment["manual_root"]
@@ -428,7 +634,15 @@ def test_red_reserved_manual_shadow_root_rejects_symlink_escape(tmp_path, monkey
 def test_red_start_api_has_no_caller_controlled_authority_paths_or_phase(tmp_path, monkeypatch):
     _configure_environment(monkeypatch, tmp_path)
     signature = inspect.signature(shadow_trial.create_shadow_day_start_manifest)
-    for forbidden in ("ledger_id", "phase", "live_control_path", "schedule_contract_path", "role_contract_path", "automation_root"):
+    for forbidden in (
+        "ledger_id",
+        "phase",
+        "calendar_evidence",
+        "live_control_path",
+        "schedule_contract_path",
+        "role_contract_path",
+        "automation_root",
+    ):
         assert forbidden not in signature.parameters
     with pytest.raises(TypeError):
         shadow_trial.create_shadow_day_start_manifest(  # type: ignore[call-arg]
@@ -449,7 +663,15 @@ def test_red_live_control_validation_uses_the_exact_captured_bytes(tmp_path, mon
         return result
 
     monkeypatch.setattr(shadow_trial, "_read_regular_json", capture_then_replace)
-    start = shadow_trial.create_shadow_day_start_manifest(run_id="race-safe", market_date="2026-08-21", calendar_evidence=_calendar("2026-08-21"))
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+    start = shadow_trial.create_shadow_day_start_manifest(
+        run_id="race-safe",
+        market_date="2026-08-21",
+    )
     assert _payload(start)["live_control"]["frozen"] is True
     assert json.loads(environment["control"].read_text(encoding="utf-8"))["frozen"] is False
 
@@ -471,11 +693,53 @@ def test_red_exact_ten_paused_canonical_schedule_is_required(tmp_path, monkeypat
 def test_red_calendar_is_mandatory_current_and_regular(tmp_path, monkeypatch):
     _configure_environment(monkeypatch, tmp_path)
     _set_clock(monkeypatch, "2026-08-21")
-    for evidence in (None, _calendar("2026-08-21", dates=[]), _calendar("2026-08-21", observed_at="2026-08-21T14:00:01+00:00")):
-        with pytest.raises(ValueError, match="calendar"):
-            shadow_trial.create_shadow_day_start_manifest(run_id="calendar-fail", market_date="2026-08-21", calendar_evidence=evidence)
+    substituted = _calendar("2026-08-21")
+    substituted["kind"] = "caller-selected-calendar"
+    for evidence in (
+        None,
+        _calendar("2026-08-21", dates=[]),
+        _calendar("2026-08-21", dates=["2026-08-20"]),
+        _calendar("2026-08-21", observed_at="2026-08-20T14:00:00+00:00"),
+        _calendar("2026-08-21", observed_at="2026-08-21T14:00:01+00:00"),
+        substituted,
+    ):
+        with monkeypatch.context() as calendar_patch:
+            calendar_patch.setattr(
+                shadow_trial,
+                "_capture_calendar_evidence",
+                lambda _market_date, captured=evidence: captured,
+            )
+            with pytest.raises(ValueError, match="calendar"):
+                shadow_trial.create_shadow_day_start_manifest(
+                    run_id="calendar-fail",
+                    market_date="2026-08-21",
+                )
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
     with pytest.raises(ValueError, match="current Central date"):
-        shadow_trial.create_shadow_day_start_manifest(run_id="holiday", market_date="2026-08-20", calendar_evidence=_calendar("2026-08-20"))
+        shadow_trial.create_shadow_day_start_manifest(
+            run_id="holiday",
+            market_date="2026-08-20",
+        )
+
+
+def test_red_calendar_provider_failure_fails_closed(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    _set_clock(monkeypatch, "2026-08-21")
+
+    class FailingCalendar:
+        def list_calendar(self, *, start: str, end: str):
+            raise RuntimeError(f"unavailable calendar for {start} through {end}")
+
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", FailingCalendar)
+    with pytest.raises(ValueError, match="calendar"):
+        shadow_trial.create_shadow_day_start_manifest(
+            run_id="calendar-provider-failure",
+            market_date="2026-08-21",
+        )
 
 
 def test_red_repeated_adjudication_and_corrupt_or_deleted_ledger_fail_closed(tmp_path, monkeypatch):

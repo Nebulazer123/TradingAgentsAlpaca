@@ -10,11 +10,15 @@ object; a JSON file under the root is never evidence merely because it exists.
 from __future__ import annotations
 
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
 import stat
-from collections.abc import Mapping
+import threading
+import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,9 +35,10 @@ from tradingagents.strategy._immutable_evidence_store import (
     EvidenceAdmission,
     EvidenceCandidate,
     EvidenceEnvelope,
+    EvidenceJournalHead,
+    ImmutableStrategyEvidenceStore,
     StrategyEvidenceStoreError,
-    _bind_reserved_manual_shadow_admission,
-    _open_reserved_manual_shadow_store,
+    _retry_material_bytes,
 )
 
 UTC = dt.timezone.utc
@@ -145,6 +150,38 @@ _ARTIFACT_FIELDS = frozenset(
         "payload",
     }
 )
+_ANCHOR_FIELDS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "canonical_root",
+        "ledger_id",
+        "committed_head",
+        "pending_next",
+    }
+)
+_HEAD_FIELDS = frozenset(
+    {
+        "sequence",
+        "kind",
+        "object_id",
+        "event_sha256",
+        "admission_route",
+    }
+)
+_PENDING_FIELDS = frozenset(
+    {
+        "prior_head",
+        "sequence",
+        "kind",
+        "object_id",
+        "retry_material_sha256",
+        "admission_route",
+    }
+)
+_ZERO_HASH = "0" * 64
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
 
 def _utc_now() -> dt.datetime:
@@ -159,6 +196,16 @@ def _repo_root() -> Path:
 
 def _manual_shadow_root() -> Path:
     return _repo_root() / "results" / "manual_shadow"
+
+
+def _manual_shadow_anchor_path() -> Path:
+    """Durable trusted head kept outside the replaceable ledger root."""
+
+    return _manual_shadow_root().parent / ".manual-shadow-trusted-head.json"
+
+
+def _manual_shadow_anchor_lock_path() -> Path:
+    return _manual_shadow_root().parent / ".manual-shadow-trusted-head.lock"
 
 
 def _canonical_live_control_path() -> Path:
@@ -356,35 +403,384 @@ def _is_non_authorizing(payload: Mapping[str, object]) -> bool:
     )
 
 
-def _store():
-    return _open_reserved_manual_shadow_store(
-        _manual_shadow_root(),
-        binding=_bind_reserved_manual_shadow_admission(
-            clock=_utc_now,
-            validator=_validate_reserved_admission,
-        ),
+def _reject_symlink_components(path: Path) -> None:
+    absolute = _absolute(path)
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError("trusted-head path could not be inspected") from exc
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError("trusted-head path must not contain a symlink")
+
+
+def _require_anchor_file_state(metadata: os.stat_result, *, label: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"{label} must be a regular no-follow file")
+    if metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ValueError(f"{label} has an unsafe identity or mode")
+
+
+@contextmanager
+def _locked_anchor_parent() -> Iterator[int]:
+    anchor_path = _absolute(_manual_shadow_anchor_path())
+    lock_path = _absolute(_manual_shadow_anchor_lock_path())
+    if anchor_path.parent != lock_path.parent:
+        raise ValueError("trusted-head paths do not share one parent")
+    _reject_symlink_components(anchor_path.parent)
+    try:
+        parent_fd = os.open(
+            anchor_path.parent,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+        )
+    except OSError as exc:
+        raise ValueError("trusted-head parent is missing or unsafe") from exc
+    lock_fd: int | None = None
+    try:
+        try:
+            lock_fd = os.open(
+                lock_path.name,
+                os.O_RDWR | os.O_CREAT | _NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise ValueError("trusted-head lock could not be opened safely") from exc
+        _require_anchor_file_state(os.fstat(lock_fd), label="trusted-head lock")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield parent_fd
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(parent_fd)
+
+
+def _anchor_entry_state(parent_fd: int) -> os.stat_result | None:
+    try:
+        return os.stat(
+            _manual_shadow_anchor_path().name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError("trusted-head anchor could not be inspected") from exc
+
+
+def _head_mapping(head: EvidenceJournalHead) -> dict[str, object]:
+    return {
+        "sequence": head.sequence,
+        "kind": head.kind,
+        "object_id": head.object_id,
+        "event_sha256": head.event_sha256,
+        "admission_route": head.admission_route,
+    }
+
+
+def _valid_head_mapping(value: object, *, ledger_id: str) -> bool:
+    try:
+        head = _require_exact_fields(value, _HEAD_FIELDS, label="trusted head")
+    except ValueError:
+        return False
+    sequence = head["sequence"]
+    if type(sequence) is not int or sequence < 0:
+        return False
+    if sequence == 0:
+        return (
+            head["kind"] is None
+            and head["object_id"] is None
+            and head["event_sha256"] == _ZERO_HASH
+            and head["admission_route"] == ledger_id
+        )
+    return (
+        head["kind"]
+        in {
+            MANUAL_SHADOW_DAY_START_KIND,
+            MANUAL_SHADOW_DAY_RESULT_KIND,
+            MANUAL_SHADOW_FINAL_REPORT_KIND,
+        }
+        and type(head["object_id"]) is str
+        and str(head["object_id"]).startswith(f"{head['kind']}-")
+        and _is_sha256(head["event_sha256"])
+        and head["admission_route"] == ledger_id
     )
 
 
-def _store_envelopes() -> tuple[EvidenceEnvelope, ...]:
+def _head_matches(mapping: object, head: EvidenceJournalHead) -> bool:
+    return isinstance(mapping, Mapping) and dict(mapping) == _head_mapping(head)
+
+
+def _validate_anchor(value: object) -> dict[str, object]:
+    anchor = _require_exact_fields(value, _ANCHOR_FIELDS, label="trusted-head anchor")
+    plain = dict(anchor)
+    ledger_id = plain["ledger_id"]
+    if (
+        plain["schema_version"] != 1
+        or plain["kind"] != "manual-shadow-trusted-head"
+        or plain["canonical_root"] != str(_absolute(_manual_shadow_root()))
+        or not _is_sha256(ledger_id)
+        or not isinstance(ledger_id, str)
+        or not _valid_head_mapping(plain["committed_head"], ledger_id=ledger_id)
+    ):
+        raise ValueError("trusted-head anchor root or identity is invalid")
+    pending = plain["pending_next"]
+    if pending is not None:
+        pending_map = _require_exact_fields(
+            pending,
+            _PENDING_FIELDS,
+            label="trusted-head pending append",
+        )
+        committed = plain["committed_head"]
+        if not isinstance(committed, Mapping):
+            raise ValueError("trusted-head committed state is invalid")
+        sequence = pending_map["sequence"]
+        kind = pending_map["kind"]
+        retry_digest = pending_map["retry_material_sha256"]
+        if (
+            dict(pending_map["prior_head"])
+            if isinstance(pending_map["prior_head"], Mapping)
+            else None
+        ) != dict(committed) or (
+            type(sequence) is not int
+            or sequence != committed["sequence"] + 1
+            or kind
+            not in {
+                MANUAL_SHADOW_DAY_START_KIND,
+                MANUAL_SHADOW_DAY_RESULT_KIND,
+                MANUAL_SHADOW_FINAL_REPORT_KIND,
+            }
+            or not _is_sha256(retry_digest)
+            or pending_map["object_id"] != f"{kind}-{retry_digest}"
+            or pending_map["admission_route"] != ledger_id
+        ):
+            raise ValueError("trusted-head pending append is invalid")
+        plain["pending_next"] = dict(pending_map)
+    plain["committed_head"] = dict(plain["committed_head"])
+    return plain
+
+
+def _read_anchor(parent_fd: int) -> dict[str, object] | None:
+    state = _anchor_entry_state(parent_fd)
+    if state is None:
+        return None
+    _require_anchor_file_state(state, label="trusted-head anchor")
     try:
-        return _store().envelopes()
+        descriptor = os.open(
+            _manual_shadow_anchor_path().name,
+            os.O_RDONLY | _NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError("trusted-head anchor could not be opened safely") from exc
+    try:
+        descriptor_state = os.fstat(descriptor)
+        _require_anchor_file_state(descriptor_state, label="trusted-head anchor")
+        if (state.st_dev, state.st_ino) != (
+            descriptor_state.st_dev,
+            descriptor_state.st_ino,
+        ):
+            raise ValueError("trusted-head anchor changed while opening")
+        raw = b""
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > 1_048_576:
+                raise ValueError("trusted-head anchor is too large")
+    finally:
+        os.close(descriptor)
+    try:
+        decoded = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("trusted-head anchor is malformed") from exc
+    if not isinstance(decoded, Mapping) or _canonical_bytes(decoded) != raw:
+        raise ValueError("trusted-head anchor is noncanonical")
+    return _validate_anchor(decoded)
+
+
+def _write_anchor(parent_fd: int, anchor: Mapping[str, object]) -> None:
+    validated = _validate_anchor(anchor)
+    payload = _canonical_bytes(validated)
+    temp_name = (
+        f".manual-shadow-anchor.{os.getpid()}.{threading.get_ident()}."
+        f"{time.time_ns()}.tmp"
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temp_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        _require_anchor_file_state(os.fstat(descriptor), label="staged trusted-head anchor")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError("incomplete trusted-head write")
+            offset += written
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temp_name,
+            _manual_shadow_anchor_path().name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    except OSError as exc:
+        raise ValueError("trusted-head anchor could not be made durable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        with suppress(FileNotFoundError):
+            os.unlink(temp_name, dir_fd=parent_fd)
+
+
+def _initial_anchor() -> dict[str, object]:
+    canonical_root = str(_absolute(_manual_shadow_root()))
+    ledger_id = hashlib.sha256(
+        os.urandom(32) + canonical_root.encode("utf-8")
+    ).hexdigest()
+    return {
+        "schema_version": 1,
+        "kind": "manual-shadow-trusted-head",
+        "canonical_root": canonical_root,
+        "ledger_id": ledger_id,
+        "committed_head": {
+            "sequence": 0,
+            "kind": None,
+            "object_id": None,
+            "event_sha256": _ZERO_HASH,
+            "admission_route": ledger_id,
+        },
+        "pending_next": None,
+    }
+
+
+def _open_anchored_store(
+    parent_fd: int,
+    *,
+    initialize: bool,
+) -> tuple[
+    dict[str, object],
+    ImmutableStrategyEvidenceStore,
+    tuple[EvidenceEnvelope, ...],
+    EvidenceJournalHead,
+] | None:
+    anchor = _read_anchor(parent_fd)
+    if anchor is None:
+        root_state = None
+        with suppress(FileNotFoundError):
+            root_state = _manual_shadow_root().lstat()
+        if root_state is not None:
+            raise ValueError("manual-shadow ledger exists without its trusted-head anchor")
+        if not initialize:
+            return None
+        anchor = _initial_anchor()
+        _write_anchor(parent_fd, anchor)
+    ledger_id = anchor["ledger_id"]
+    if not isinstance(ledger_id, str):
+        raise ValueError("trusted-head ledger identity is invalid")
+    store = ImmutableStrategyEvidenceStore(
+        _manual_shadow_root(),
+        _manual_shadow_ledger_id=ledger_id,
+    )
+    try:
+        envelopes, head = store.verify_with_head()
     except StrategyEvidenceStoreError as exc:
         raise ValueError(f"shadow ledger is invalid: {exc}") from exc
+    pending = anchor["pending_next"]
+    committed = anchor["committed_head"]
+    if pending is not None:
+        if _head_matches(committed, head):
+            anchor["pending_next"] = None
+            _write_anchor(parent_fd, anchor)
+        else:
+            raise ValueError(
+                "manual-shadow ledger advanced without a committed trusted head"
+            )
+    if not _head_matches(anchor["committed_head"], head):
+        raise ValueError("manual-shadow ledger rollback or head mismatch")
+    return anchor, store, envelopes, head
 
 
-def _admit(
-    *,
-    kind: str,
-    effective_at: str,
-    payload: Mapping[str, object],
-) -> EvidenceAdmission:
-    try:
-        return _store().admit(
-            EvidenceCandidate(kind=kind, effective_at=effective_at, payload=payload)
-        )
-    except StrategyEvidenceStoreError as exc:
-        raise ValueError(f"shadow ledger admission failed: {exc}") from exc
+def _store_envelopes(*, initialize: bool = False) -> tuple[EvidenceEnvelope, ...]:
+    with _locked_anchor_parent() as parent_fd:
+        opened = _open_anchored_store(parent_fd, initialize=initialize)
+        if opened is None:
+            return ()
+        _anchor, _store, envelopes, _head = opened
+        return envelopes
+
+
+@contextmanager
+def _anchored_admission(
+    candidate: EvidenceCandidate,
+) -> Iterator[ImmutableStrategyEvidenceStore]:
+    with _locked_anchor_parent() as parent_fd:
+        opened = _open_anchored_store(parent_fd, initialize=True)
+        if opened is None:  # pragma: no cover - initialize=True always opens.
+            raise ValueError("trusted-head anchor initialization failed")
+        anchor, store, envelopes, head = opened
+        _LedgerState(envelopes, now=_as_utc(_utc_now()))
+        retry_digest = hashlib.sha256(
+            _retry_material_bytes(
+                kind=candidate.kind,
+                effective_at=candidate.effective_at,
+                payload=candidate.payload,
+            )
+        ).hexdigest()
+        pending = {
+            "prior_head": _head_mapping(head),
+            "sequence": head.sequence + 1,
+            "kind": candidate.kind,
+            "object_id": f"{candidate.kind}-{retry_digest}",
+            "retry_material_sha256": retry_digest,
+            "admission_route": anchor["ledger_id"],
+        }
+        anchor["pending_next"] = pending
+        _write_anchor(parent_fd, anchor)
+        try:
+            yield store
+        except BaseException:
+            try:
+                _envelopes, current_head = store.verify_with_head()
+                if _head_matches(anchor["committed_head"], current_head):
+                    anchor["pending_next"] = None
+                    _write_anchor(parent_fd, anchor)
+            except (StrategyEvidenceStoreError, ValueError):
+                pass
+            raise
+        try:
+            _envelopes, current_head = store.verify_with_head()
+        except StrategyEvidenceStoreError as exc:
+            raise ValueError(f"shadow ledger is invalid after admission: {exc}") from exc
+        if not (
+            current_head.sequence == pending["sequence"]
+            and current_head.kind == pending["kind"]
+            and current_head.object_id == pending["object_id"]
+            and current_head.admission_route == anchor["ledger_id"]
+        ):
+            raise ValueError("shadow ledger admission did not reach the anchored head")
+        anchor["committed_head"] = _head_mapping(current_head)
+        anchor["pending_next"] = None
+        _write_anchor(parent_fd, anchor)
 
 
 def _control_binding(now: dt.datetime) -> tuple[dict[str, object], bool]:
@@ -493,6 +889,34 @@ def _valid_schedule_binding(value: object) -> bool:
             for row in rows
         )
     )
+
+
+def _capture_calendar_evidence(market_date: str) -> dict[str, object]:
+    """Capture the canonical read-only calendar response inside Task 3.
+
+    Tests replace this private seam with local fakes.  Production callers do
+    not provide calendar mappings, clients, roots, clocks, or validators.
+    """
+
+    from cli.main import _alpaca_live_client
+
+    observed_at = _as_utc(_utc_now()).isoformat(timespec="seconds")
+    sessions: list[Mapping[str, object]] = []
+    try:
+        response = _alpaca_live_client().list_calendar(
+            start=market_date,
+            end=market_date,
+        )
+        if isinstance(response, list):
+            sessions = [item for item in response if isinstance(item, Mapping)]
+    except Exception:  # noqa: BLE001 - unavailable calendar evidence fails closed.
+        sessions = []
+    return {
+        "kind": "alpaca_regular_equities_calendar",
+        "market_date": market_date,
+        "observed_at": observed_at,
+        "sessions": sessions,
+    }
 
 
 def _calendar_binding(
@@ -963,7 +1387,6 @@ def create_shadow_day_start_manifest(
     *,
     run_id: str,
     market_date: str,
-    calendar_evidence: Mapping[str, object] | None,
     predecessor_object_id: str | None = None,
 ) -> EvidenceAdmission:
     """Admit a current-day start only from the canonical local source helpers."""
@@ -980,10 +1403,13 @@ def create_shadow_day_start_manifest(
     schedule, schedule_valid = _schedule_binding()
     if not schedule_valid:
         raise ValueError("schedule gate failed")
-    calendar = _calendar_binding(calendar_evidence, market_date=market_date)
+    calendar = _calendar_binding(
+        _capture_calendar_evidence(market_date),
+        market_date=market_date,
+    )
     if not _valid_calendar_binding(calendar, market_date=market_date, now=now):
         raise ValueError("calendar gate failed")
-    prior = _store_envelopes()
+    prior = _store_envelopes(initialize=True)
     days, pending, last_day, report = _LedgerState(prior, now=now)
     if pending is not None or report is not None:
         raise ValueError("shadow ledger does not allow another start")
@@ -1002,18 +1428,22 @@ def create_shadow_day_start_manifest(
         "calendar": calendar,
     }
 
-    return _admit(
+    candidate = EvidenceCandidate(
         kind=MANUAL_SHADOW_DAY_START_KIND,
         effective_at=effective_at,
         payload=payload,
     )
+    try:
+        with _anchored_admission(candidate) as store:
+            return store._admit_reserved_manual_shadow(candidate)
+    except StrategyEvidenceStoreError as exc:
+        raise ValueError(f"shadow ledger admission failed: {exc}") from exc
 
 
 def adjudicate_shadow_day(
     *,
     start_object_id: str,
     artifacts: Mapping[str, Path] | None,
-    calendar_evidence: Mapping[str, object] | None,
 ) -> EvidenceAdmission:
     """Admit exactly one current-day result for an authenticated pending start."""
 
@@ -1032,7 +1462,10 @@ def adjudicate_shadow_day(
         raise ValueError("shadow day must be adjudicated on its current Central date")
     control, _ = _control_binding(now)
     schedule, _ = _schedule_binding()
-    calendar = _calendar_binding(calendar_evidence, market_date=market_date)
+    calendar = _calendar_binding(
+        _capture_calendar_evidence(market_date),
+        market_date=market_date,
+    )
     artifact_paths = artifacts if isinstance(artifacts, Mapping) else {}
     artifact_bindings = {key: _artifact_binding(artifact_paths.get(key)) for key in ARTIFACT_KEYS}
     provisional: dict[str, object] = {
@@ -1059,11 +1492,16 @@ def adjudicate_shadow_day(
     provisional["phase"] = _day_phase(start=start, status=status, earlier_days=days)
     provisional["reasons"] = sorted(set([*failed, *incomplete]))
 
-    return _admit(
+    candidate = EvidenceCandidate(
         kind=MANUAL_SHADOW_DAY_RESULT_KIND,
         effective_at=effective_at,
         payload=provisional,
     )
+    try:
+        with _anchored_admission(candidate) as store:
+            return store._admit_reserved_manual_shadow(candidate)
+    except StrategyEvidenceStoreError as exc:
+        raise ValueError(f"shadow ledger admission failed: {exc}") from exc
 
 
 def build_shadow_streak_report() -> dict[str, object]:
@@ -1088,9 +1526,14 @@ def build_shadow_streak_report() -> dict[str, object]:
         "reasons": [] if candidate else ["full_ledger_not_terminal_candidate"],
     }
 
-    admission = _admit(
+    candidate = EvidenceCandidate(
         kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
         effective_at=effective_at,
         payload=payload,
     )
+    try:
+        with _anchored_admission(candidate) as store:
+            admission = store._admit_reserved_manual_shadow(candidate)
+    except StrategyEvidenceStoreError as exc:
+        raise ValueError(f"shadow ledger admission failed: {exc}") from exc
     return _record_view(admission.envelope, path=admission.path)

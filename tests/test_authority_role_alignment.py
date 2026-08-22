@@ -229,7 +229,11 @@ _LIVE_WRITE_CALLER_CLASSIFICATIONS = {
         ("cli/main.py", "alpaca_reconcile_symbol_incident", "_alpaca_live_client"): "hard-disabled",
         ("cli/main.py", "research_loss_review_evidence", "_alpaca_live_client"): "read-only",
         ("cli/main.py", "research_safety_sentinel_audit", "_alpaca_live_client"): "read-only",
-        ("cli/main.py", "_shadow_calendar_evidence", "_alpaca_live_client"): "read-only",
+        (
+            "tradingagents/evals/shadow_trial.py",
+            "_capture_calendar_evidence",
+            "_alpaca_live_client",
+        ): "read-only",
         ("cli/main.py", "alpaca_paper_tournament_run", "paper_client.submit_order"): "paper-only",
         ("cli/main.py", "alpaca_supervise_hourly", "paper_client.submit_order"): "paper-only",
         ("tradingagents/brokers/alpaca.py", "AlpacaRestClient.submit_order", "definition"): "exact-intent-boundary",

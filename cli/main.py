@@ -9423,27 +9423,6 @@ def research_safety_sentinel_audit(
     console.print(f"Packet: {packet_path}")
 
 
-def _shadow_calendar_evidence(market_date: str) -> dict[str, Any]:
-    """Capture the one read-only Alpaca calendar response needed by shadow evidence."""
-
-    from tradingagents.evals import shadow_trial
-
-    observed_at = shadow_trial._utc_now().isoformat(timespec="seconds")
-    sessions: list[Mapping[str, Any]] = []
-    try:
-        response = _alpaca_live_client().list_calendar(start=market_date, end=market_date)
-        if isinstance(response, list):
-            sessions = [item for item in response if isinstance(item, Mapping)]
-    except Exception:  # noqa: BLE001 - unavailable calendar evidence must remain a failed gate.
-        sessions = []
-    return {
-        "kind": "alpaca_regular_equities_calendar",
-        "market_date": market_date,
-        "observed_at": observed_at,
-        "sessions": sessions,
-    }
-
-
 @research_app.command("shadow-day-start")
 def research_shadow_day_start(
     run_id: str = typer.Option(..., "--run-id", help="Opaque manual observer run identifier."),
@@ -9466,7 +9445,6 @@ def research_shadow_day_start(
         admission = create_shadow_day_start_manifest(
             run_id=run_id,
             market_date=market_date,
-            calendar_evidence=_shadow_calendar_evidence(market_date),
             predecessor_object_id=predecessor_object_id,
         )
     except ValueError as exc:
@@ -9494,11 +9472,10 @@ def research_shadow_day_adjudicate(
     )
 
     try:
-        start = load_shadow_record(start_object_id, expected_kind="manual-shadow-day-start")
+        load_shadow_record(start_object_id, expected_kind="manual-shadow-day-start")
         admission = adjudicate_shadow_day(
             start_object_id=start_object_id,
             artifacts={"safety_sentinel": safety_sentinel, "paper_tournament": paper_tournament},
-            calendar_evidence=_shadow_calendar_evidence(str(start.payload["market_date"])),
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
