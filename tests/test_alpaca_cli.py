@@ -2315,6 +2315,58 @@ def test_alpaca_supervisor_daily_report_compact_json_writes_raw_packet(monkeypat
     assert "portfolio" not in payload
 
 
+def test_alpaca_supervisor_daily_report_no_write_outbox_keeps_report_local(monkeypatch, tmp_path):
+    paper_client = _FakeCliClient(paper=True)
+    live_client = _FakeCliClient(paper=False)
+    monkeypatch.setattr(cli_main, "_alpaca_clients", lambda: (paper_client, live_client))
+    monkeypatch.setattr(cli_main, "_fetch_aggressive_candidate_market_data", lambda: {})
+    outbox_dir = tmp_path / "outbox"
+    monkeypatch.setenv("TRADINGAGENTS_OUTBOX_DIR", str(outbox_dir))
+
+    local_report_dir = tmp_path / "local_daily_reports"
+    local_result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "supervisor-daily-report",
+            "--json-output",
+            "--compact-json-output",
+            "--no-write-outbox",
+            "--log-dir",
+            str(tmp_path / "hourly"),
+            "--daily-report-log-dir",
+            str(local_report_dir),
+        ],
+    )
+
+    assert local_result.exit_code == 0, local_result.output
+    local_payload = json.loads(local_result.stdout)
+    assert Path(local_payload["raw_packet_path"]).exists()
+    assert not outbox_dir.exists()
+    assert "outbox_path" not in local_payload
+
+    default_report_dir = tmp_path / "default_daily_reports"
+    default_result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "supervisor-daily-report",
+            "--json-output",
+            "--compact-json-output",
+            "--log-dir",
+            str(tmp_path / "hourly"),
+            "--daily-report-log-dir",
+            str(default_report_dir),
+        ],
+    )
+
+    assert default_result.exit_code == 0, default_result.output
+    default_payload = json.loads(default_result.stdout)
+    assert Path(default_payload["raw_packet_path"]).exists()
+    assert outbox_dir.exists()
+    assert list(outbox_dir.glob("*.json"))
+
+
 def test_daily_report_includes_latest_premarket_brief(monkeypatch, tmp_path):
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)

@@ -81,10 +81,16 @@
 ### Task 4: Integrate, independently review, and prepare the manual runbook
 
 **Files:**
+- Modify: `cli/main.py`
 - Modify: `docs/superpowers/plans/2026-08-17-clean-day-qualification-and-five-day-paper-trial.md`
-- Test: affected existing CLI/integration tests only as needed for Tasks 1–3
+- Test: `tests/test_alpaca_cli.py`
 
-- [ ] Produce a manual, on-demand runbook in this plan’s report that names the exact capped overnight command, preopen/hourly dry-run commands, sentinel, BOARD, self-heal analysis, local-only daily report, paper command, and adjudication command.
+**Interface:**
+- `alpaca supervisor-daily-report --write-outbox/--no-write-outbox` defaults to
+  `--write-outbox` for compatibility. `--no-write-outbox` still renders the local
+  report and JSON packet, but creates no notification-outbox record.
+
+- [x] Produce a manual, on-demand runbook in this plan’s report that names the exact capped overnight command, preopen/hourly dry-run commands, sentinel, BOARD, self-heal analysis, local-only daily report, paper command, and adjudication command.
 - [ ] Verify all ten automation TOMLs are paused before any runtime step; this is a hard prerequisite, not a change request.
 - [ ] Run the declared focused suite, full pytest, Ruff, compileall, wrapper syntax, and authority inventory.
 - [ ] Obtain task-scoped specification and quality reviews after each task and a fresh whole-branch authority/security review after Task 4.

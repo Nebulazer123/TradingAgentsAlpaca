@@ -12201,6 +12201,11 @@ def alpaca_supervisor_daily_report(
         "--compact-json-output",
         help="When used with --json-output, print compact context and write the full report packet.",
     ),
+    write_outbox: bool = typer.Option(
+        True,
+        "--write-outbox/--no-write-outbox",
+        help="Write the rendered report to the local notification outbox.",
+    ),
     log_dir: Path = typer.Option(
         Path("results/hourly_supervisor"),
         "--log-dir",
@@ -12314,11 +12319,12 @@ def alpaca_supervisor_daily_report(
         execution_board_review=execution_board_review,
         alpaca_reference_summary=alpaca_reference_summary,
     )
-    from tradingagents.notifications.outbox import write_outbox_message
+    if write_outbox:
+        from tradingagents.notifications.outbox import write_outbox_message
 
-    payload["outbox_path"] = str(
-        write_outbox_message(payload, report_type="daily", severity="ROUTINE")
-    )
+        payload["outbox_path"] = str(
+            write_outbox_message(payload, report_type="daily", severity="ROUTINE")
+        )
     if json_output:
         if compact_json_output:
             packet_path = _write_supervisor_daily_report_packet(payload, daily_report_log_dir)
