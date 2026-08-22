@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 import tradingagents.evals.automation_health_audit as automation_health_audit
 from cli import main as cli_main
 from cli.main import app
-from tradingagents.evals import safety_sentinel
+from tradingagents.evals import safety_sentinel, shadow_trial
 from tradingagents.evals.automation_health_audit import (
     capture_schedule_contract_snapshot,
     evaluate_schedule_contract,
@@ -424,6 +424,7 @@ def test_safety_sentinel_cli_uses_only_narrow_read_only_broker_adapter(tmp_path,
 
 def test_safety_sentinel_require_paused_writes_hold_then_exits_nonzero(tmp_path, monkeypatch):
     control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
+    monkeypatch.setattr(shadow_trial, "_canonical_automation_root", lambda: automation_root)
     first_toml = next(automation_root.glob("*/automation.toml"))
     first_toml.write_text(
         first_toml.read_text(encoding="utf-8").replace('status = "PAUSED"', 'status = "ACTIVE"'),
@@ -447,6 +448,78 @@ def test_safety_sentinel_require_paused_writes_hold_then_exits_nonzero(tmp_path,
     assert payload["schedule_check"]["safe_predeployment"] is False
     assert Path(payload["packet_path"]).exists()
     assert 'status = "ACTIVE"' in first_toml.read_text(encoding="utf-8")
+
+
+def test_safety_sentinel_require_paused_rejects_hostile_automation_root_override(
+    tmp_path,
+    monkeypatch,
+):
+    """A complete alternate paused tree must never satisfy qualification preflight."""
+
+    control, preopen, contract, roles, canonical_root = _write_clear_evidence(tmp_path / "canonical")
+    _, _, _, _, hostile_root = _write_clear_evidence(tmp_path / "hostile")
+    monkeypatch.setattr(shadow_trial, "_canonical_automation_root", lambda: canonical_root)
+    monkeypatch.setenv("CODEX_HOME", str(hostile_root.parent))
+    monkeypatch.setenv("HOME", str(tmp_path / "hostile-home"))
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", _ReadOnlyBrokerFake)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC),
+    )
+
+    inherited_root = runner.invoke(
+        app,
+        [
+            "research",
+            "safety-sentinel-audit",
+            "--require-paused",
+            "--json-output",
+            "--output-dir",
+            str(tmp_path / "canonical-output"),
+            "--live-control-path",
+            str(control),
+            "--preopen-validation-path",
+            str(preopen),
+            "--schedule-contract-path",
+            str(contract),
+            "--role-contract-path",
+            str(roles),
+        ],
+    )
+    assert inherited_root.exit_code == 0, inherited_root.output
+    inherited_payload = json.loads(inherited_root.stdout)
+    assert {
+        source["automation_root"]
+        for source in inherited_payload["evidence"]["schedule_configuration"]["automation_tomls"]
+    } == {str(canonical_root.absolute())}
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "safety-sentinel-audit",
+            "--require-paused",
+            "--json-output",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--live-control-path",
+            str(control),
+            "--preopen-validation-path",
+            str(preopen),
+            "--schedule-contract-path",
+            str(contract),
+            "--role-contract-path",
+            str(roles),
+            "--automation-root",
+            str(hostile_root),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Invalid value for --automation-root" in result.output
+    assert "canonical qualification root" in result.output
+    assert not (tmp_path / "output").exists()
 
 
 def test_safety_sentinel_holds_malformed_broker_values_even_when_all_keys_exist(tmp_path):

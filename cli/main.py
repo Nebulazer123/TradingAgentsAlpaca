@@ -9430,6 +9430,30 @@ def alpaca_reconcile_observer(
     console.print(f"Packet: {packet_path}")
 
 
+def _resolve_safety_sentinel_automation_root(
+    automation_root: Path | None,
+    *,
+    require_canonical_root: bool,
+) -> Path:
+    """Keep qualification preflight bound to the one canonical automation tree."""
+
+    if not require_canonical_root:
+        return automation_root if automation_root is not None else default_automation_root()
+
+    from tradingagents.evals.shadow_trial import _canonical_automation_root
+
+    canonical_root = _canonical_automation_root()
+    if automation_root is not None and (
+        automation_root.expanduser().resolve(strict=False)
+        != canonical_root.expanduser().resolve(strict=False)
+    ):
+        raise typer.BadParameter(
+            "--automation-root conflicts with the canonical qualification root",
+            param_hint="--automation-root",
+        )
+    return canonical_root
+
+
 @research_app.command("safety-sentinel-audit")
 def research_safety_sentinel_audit(
     output_dir: Path = typer.Option(
@@ -9452,10 +9476,10 @@ def research_safety_sentinel_audit(
         "--schedule-contract-path",
         help="Versioned schedule contract to evaluate read-only.",
     ),
-    automation_root: Path = typer.Option(
-        default_automation_root(),
+    automation_root: Path | None = typer.Option(
+        None,
         "--automation-root",
-        help="Codex automation root to inspect without changing records.",
+        help="Codex automation root to inspect for an unbound observer audit.",
     ),
     role_contract_path: Path = typer.Option(
         Path("config/automation_roles.json"),
@@ -9500,6 +9524,10 @@ def research_safety_sentinel_audit(
             )
         except ValueError as exc:
             raise typer.BadParameter(str(exc), param_hint="--shadow-start-object-id") from exc
+    automation_root = _resolve_safety_sentinel_automation_root(
+        automation_root,
+        require_canonical_root=require_paused or shadow_start is not None,
+    )
     generated_at = _alpaca_policy_now()
     try:
         broker_snapshot = capture_read_only_broker_snapshot(

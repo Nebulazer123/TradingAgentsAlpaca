@@ -39,6 +39,13 @@ ten-record paused contract is not proven. Stop there on any failure. The remaini
 observer chain uses the same start ID, runs only with `TA_LIVE_SUBMIT=0`, never uses
 an outbox, and preserves every emitted packet path for the one final manifest.
 
+For every run-bound or `--require-paused` sentinel invocation, the command itself
+pins schedule capture to the private canonical path
+`/Users/corbinfloyd/.codex/automations`. Do not supply `--automation-root` in this
+preflight: a conflicting override is rejected before broker reads or packet writes.
+`CODEX_HOME` and `HOME` do not select the preflight source. The option remains only
+for an unbound, non-qualifying observer inspection.
+
 1. Run one bounded one-ticker overnight probe (never retry it that day), then
    premarket brief, preopen validation, and `alpaca supervise-hourly --dry-run`.
    The persisted hourly packet must carry its explicit dry-run metadata.
