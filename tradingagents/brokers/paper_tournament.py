@@ -13,7 +13,7 @@ import json
 import os
 import threading
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
@@ -334,6 +334,7 @@ def _validate_regular_paper_broker_clock(
     *,
     now: datetime.datetime,
     market_date: str,
+    post_clock_now: Callable[[], datetime.datetime] | None = None,
 ) -> None:
     """Require a fresh, open, same-day regular-session paper broker clock."""
 
@@ -347,7 +348,8 @@ def _validate_regular_paper_broker_clock(
     if not isinstance(clock, Mapping) or clock.get("is_open") is not True:
         raise ValueError("paper submission lease requires an open broker clock")
     clock_timestamp = _parse_broker_clock_timestamp(clock.get("timestamp"))
-    now_timestamp = _normalize_aware_policy_timestamp(now)
+    observed_policy_now = post_clock_now() if post_clock_now is not None else now
+    now_timestamp = _normalize_aware_policy_timestamp(observed_policy_now)
     if clock_timestamp is None or now_timestamp is None:
         raise ValueError("paper submission lease broker clock is malformed")
     if clock_timestamp > now_timestamp:
@@ -400,6 +402,8 @@ def validate_submission_transaction_state(ledger: Mapping) -> None:
     market_date = transaction.get("market_date")
     pending = transaction.get("pending_client_order_ids")
     successful = transaction.get("successful_submissions")
+    started_at = _parse_timestamp(transaction.get("started_at"))
+    completed_at = _parse_timestamp(transaction.get("completed_at"))
     if (
         type(market_date) is not str
         or _submitted_market_date_is_malformed(market_date)
@@ -407,19 +411,23 @@ def validate_submission_transaction_state(ledger: Mapping) -> None:
         or pending
         or not isinstance(successful, list)
         or not successful
-        or _parse_timestamp(transaction.get("started_at")) is None
-        or _parse_timestamp(transaction.get("completed_at")) is None
+        or started_at is None
+        or completed_at is None
+        or completed_at < started_at
         or not isinstance(ledger.get("submitted_market_dates"), list)
         or market_date not in ledger["submitted_market_dates"]
     ):
         raise ValueError("paper submission lease recovery is required for an incomplete transaction")
     for submission in successful:
+        recorded_at = _parse_timestamp(submission.get("recorded_at")) if isinstance(submission, Mapping) else None
         if (
             not isinstance(submission, Mapping)
             or type(submission.get("client_order_id")) is not str
             or not submission.get("client_order_id")
             or submission.get("market_date") != market_date
-            or _parse_timestamp(submission.get("recorded_at")) is None
+            or recorded_at is None
+            or recorded_at < started_at
+            or recorded_at > completed_at
             or not isinstance(submission.get("response"), Mapping)
         ):
             raise ValueError("paper submission lease recovery is required for an incomplete transaction")
@@ -431,6 +439,7 @@ def _validate_submission_lease(
     paper_client: object,
     now: datetime.datetime,
     allow_submitting_transaction: bool,
+    post_clock_now: Callable[[], datetime.datetime] | None = None,
 ) -> str:
     """Validate every condition required before a paper order can be posted."""
 
@@ -514,6 +523,7 @@ def _validate_submission_lease(
         paper_client,
         now=now_timestamp,
         market_date=market_date,
+        post_clock_now=post_clock_now,
     )
     return market_date
 
@@ -523,6 +533,7 @@ def validate_submission_lease(
     *,
     paper_client: object,
     now: datetime.datetime,
+    post_clock_now: Callable[[], datetime.datetime] | None = None,
 ) -> str:
     """Validate every condition required before a paper submission starts."""
 
@@ -531,6 +542,7 @@ def validate_submission_lease(
         paper_client=paper_client,
         now=now,
         allow_submitting_transaction=False,
+        post_clock_now=post_clock_now,
     )
 
 
@@ -540,6 +552,7 @@ def validate_submission_runtime_boundary(
     paper_client: object,
     now: datetime.datetime,
     expected_market_date: str,
+    post_clock_now: Callable[[], datetime.datetime] | None = None,
 ) -> None:
     """Revalidate the exact paper submission boundary immediately before a POST."""
 
@@ -548,6 +561,7 @@ def validate_submission_runtime_boundary(
         paper_client=paper_client,
         now=now,
         allow_submitting_transaction=True,
+        post_clock_now=post_clock_now,
     )
     if market_date != expected_market_date:
         raise ValueError("paper submission lease Central market date changed")
@@ -644,6 +658,10 @@ def record_submission_response(
     transaction = ledger.get("submission_transaction")
     if not isinstance(transaction, dict) or transaction.get("status") != "submitting":
         raise ValueError("paper submission transaction is not active")
+    recorded_at = _normalize_aware_policy_timestamp(now)
+    started_at = _parse_timestamp(transaction.get("started_at"))
+    if recorded_at is None or started_at is None or recorded_at < started_at:
+        raise ValueError("paper submission response timestamp is not monotonic")
     normalized = _validate_paper_submission_response(payload, response)
     client_order_id = str(payload["client_order_id"])
     pending = transaction.get("pending_client_order_ids")
@@ -669,7 +687,7 @@ def record_submission_response(
         {
             "client_order_id": client_order_id,
             "market_date": market_date,
-            "recorded_at": _iso(now),
+            "recorded_at": _iso(recorded_at),
             "response": normalized,
         }
     )
@@ -683,8 +701,23 @@ def complete_submission_transaction(ledger: dict, *, now: datetime.datetime) -> 
         raise ValueError("paper submission transaction is not active")
     if transaction.get("pending_client_order_ids"):
         raise ValueError("paper submission transaction has unresolved requests")
+    completed_at = _normalize_aware_policy_timestamp(now)
+    started_at = _parse_timestamp(transaction.get("started_at"))
+    successful = transaction.get("successful_submissions")
+    recorded_at_values = (
+        [_parse_timestamp(item.get("recorded_at")) for item in successful]
+        if isinstance(successful, list)
+        else []
+    )
+    if (
+        completed_at is None
+        or started_at is None
+        or completed_at < started_at
+        or any(value is None or value > completed_at for value in recorded_at_values)
+    ):
+        raise ValueError("paper submission completion timestamp is not monotonic")
     transaction["status"] = "completed"
-    transaction["completed_at"] = _iso(now)
+    transaction["completed_at"] = _iso(completed_at)
 
 
 def mark_submission_recovery_required(ledger: dict, *, reason: str, now: datetime.datetime) -> None:
@@ -694,8 +727,22 @@ def mark_submission_recovery_required(ledger: dict, *, reason: str, now: datetim
     if not isinstance(transaction, dict):
         transaction = {}
         ledger["submission_transaction"] = transaction
+    failed_at = _normalize_aware_policy_timestamp(now)
+    started_at = _parse_timestamp(transaction.get("started_at"))
+    successful = transaction.get("successful_submissions")
+    recorded_at_values = (
+        [_parse_timestamp(item.get("recorded_at")) for item in successful]
+        if isinstance(successful, list)
+        else []
+    )
+    if (
+        failed_at is None
+        or (started_at is not None and failed_at < started_at)
+        or any(value is None or value > failed_at for value in recorded_at_values)
+    ):
+        raise ValueError("paper submission recovery timestamp is not monotonic")
     transaction["status"] = SUBMISSION_WINDOW_RECOVERY_REQUIRED
-    transaction["failed_at"] = _iso(now)
+    transaction["failed_at"] = _iso(failed_at)
     transaction["failure_reason"] = reason[:500]
     ledger["submission_window_status"] = SUBMISSION_WINDOW_RECOVERY_REQUIRED
 

@@ -573,7 +573,7 @@ def test_paper_tournament_submit_records_current_regular_central_date_and_suppre
     paper_client.clock = {"is_open": True, "timestamp": close_boundary.isoformat()}
     write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
     _configure_current_submit(monkeypatch, paper_client)
-    policy_times = iter([close_boundary, close_boundary, close_boundary])
+    policy_times = iter([close_boundary] * 8)
     monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: next(policy_times))
 
     result = runner.invoke(
@@ -600,7 +600,7 @@ def test_paper_tournament_submit_rechecks_clock_before_transaction_after_delayed
     paper_client.clock = {"is_open": True, "timestamp": before_close.isoformat()}
     write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
     _configure_current_submit(monkeypatch, paper_client)
-    policy_times = iter([before_close, after_close])
+    policy_times = iter([before_close, before_close, before_close, after_close])
     monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: next(policy_times))
 
     result = runner.invoke(
@@ -627,7 +627,13 @@ def test_paper_tournament_submit_rechecks_clock_immediately_before_each_post(
     paper_client.clock = {"is_open": True, "timestamp": before_close.isoformat()}
     write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
     _configure_current_submit(monkeypatch, paper_client)
-    policy_times = iter([before_close, before_close, after_close])
+    policy_times = iter(
+        [
+            before_close, before_close,  # initial lease and post-clock sample
+            before_close, before_close,  # transaction boundary and post-clock sample
+            before_close, after_close, after_close,  # post boundary, clock, recovery
+        ]
+    )
     monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: next(policy_times))
 
     result = runner.invoke(
@@ -664,6 +670,129 @@ def test_submission_lease_rejects_after_close_or_naive_policy_time():
             paper_client=paper_client,
             now=datetime.datetime(2026, 6, 2, 19, 59, 50),
         )
+
+
+def test_submission_lease_brackets_broker_clock_with_post_response_policy_time():
+    paper_client = _FakePaperClient()
+    before_clock = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {
+        "is_open": True,
+        "timestamp": (before_clock + datetime.timedelta(milliseconds=1)).isoformat(),
+    }
+    ledger = _current_trial_ledger(paper_client)
+
+    assert paper_tournament.validate_submission_lease(
+        ledger,
+        paper_client=paper_client,
+        now=before_clock,
+        post_clock_now=lambda: before_clock + datetime.timedelta(milliseconds=2),
+    ) == "2026-06-02"
+
+    paper_client.clock["timestamp"] = (
+        before_clock + datetime.timedelta(milliseconds=3)
+    ).isoformat()
+    with pytest.raises(ValueError, match="future"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=before_clock,
+            post_clock_now=lambda: before_clock + datetime.timedelta(milliseconds=2),
+        )
+
+
+def test_paper_tournament_submission_event_timestamps_are_monotonic(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    base = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": base.isoformat()}
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+    policy_times = iter(
+        [
+            base,
+            base,
+            base + datetime.timedelta(minutes=1),
+            base + datetime.timedelta(minutes=1),
+            base + datetime.timedelta(minutes=2),
+            base + datetime.timedelta(minutes=2),
+            base + datetime.timedelta(minutes=3),
+            base + datetime.timedelta(minutes=4),
+        ]
+    )
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: next(policy_times))
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    transaction = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))["submission_transaction"]
+    assert transaction["started_at"] < transaction["successful_submissions"][0]["recorded_at"]
+    assert transaction["successful_submissions"][0]["recorded_at"] < transaction["completed_at"]
+    completed_ledger = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    paper_tournament.validate_submission_transaction_state(completed_ledger)
+    completed_ledger["submission_transaction"]["completed_at"] = transaction["started_at"]
+    with pytest.raises(ValueError, match="recovery is required"):
+        paper_tournament.validate_submission_transaction_state(completed_ledger)
+
+
+def test_paper_tournament_multi_order_close_between_posts_sends_zero_additional_posts(
+    monkeypatch, tmp_path
+):
+    paper_client = _FakePaperClient()
+    before_close = datetime.datetime(2026, 6, 2, 19, 59, 50, tzinfo=datetime.timezone.utc)
+    after_close = datetime.datetime(2026, 6, 2, 20, 0, 1, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": before_close.isoformat()}
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_fetch_aggressive_candidate_market_data",
+        lambda: {
+            "NVDA": {
+                "current_price": "218",
+                "previous_close": "220",
+                "volume_ratio": "2.0",
+                "tradable": True,
+            },
+            "MSFT": {
+                "current_price": "490",
+                "previous_close": "495",
+                "volume_ratio": "1.0",
+                "tradable": True,
+            },
+        },
+    )
+    policy_times = iter(
+        [
+            before_close, before_close,  # initial lease and post-clock sample
+            before_close, before_close,  # transaction boundary and post-clock sample
+            before_close, before_close, before_close,  # first post, clock, response record
+            before_close, after_close, after_close,  # second post, clock, recovery
+        ]
+    )
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: next(policy_times))
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--all",
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert paper_client.clock_calls == 4
+    assert len(paper_client.submitted) == 1
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    transaction = updated["submission_transaction"]
+    assert updated["submission_window_status"] == "recovery_required"
+    assert transaction["status"] == "recovery_required"
+    assert len(transaction["successful_submissions"]) == 1
+    assert transaction["failed_at"] >= transaction["successful_submissions"][0]["recorded_at"]
 
 
 def test_paper_tournament_submit_rejects_reused_or_exhausted_market_day(monkeypatch, tmp_path):

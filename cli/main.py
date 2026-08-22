@@ -10404,6 +10404,7 @@ def alpaca_paper_tournament_run(
                     ledger,
                     paper_client=paper_client,
                     now=now,
+                    post_clock_now=_alpaca_policy_now,
                 )
             except ValueError as exc:
                 raise typer.BadParameter(str(exc)) from exc
@@ -10431,6 +10432,7 @@ def alpaca_paper_tournament_run(
                     ledger,
                     paper_client=paper_client,
                     now=transaction_now,
+                    post_clock_now=_alpaca_policy_now,
                 )
                 if transaction_market_date != submission_market_date:
                     raise ValueError("paper submission lease Central market date changed")
@@ -10451,6 +10453,7 @@ def alpaca_paper_tournament_run(
                         paper_client=paper_client,
                         now=post_now,
                         expected_market_date=str(submission_market_date),
+                        post_clock_now=_alpaca_policy_now,
                     )
                     order_payload = {
                         key: value
@@ -10458,20 +10461,25 @@ def alpaca_paper_tournament_run(
                         if key not in {"strategy_id", "reason"}
                     }
                     response = paper_client.submit_order(order_payload)
+                    response_now = _alpaca_policy_now()
                     submitted.append(
                         record_submission_response(
                             ledger,
                             payload=payload,
                             response=response,
                             market_date=str(submission_market_date),
-                            now=post_now,
+                            now=response_now,
                         )
                     )
                     write_tournament_ledger(ledger, log_dir)
-                complete_submission_transaction(ledger, now=now)
+                complete_submission_transaction(ledger, now=_alpaca_policy_now())
                 write_tournament_ledger(ledger, log_dir)
             except Exception as exc:
-                mark_submission_recovery_required(ledger, reason=str(exc), now=now)
+                mark_submission_recovery_required(
+                    ledger,
+                    reason=str(exc),
+                    now=_alpaca_policy_now(),
+                )
                 write_tournament_ledger(ledger, log_dir)
                 raise typer.BadParameter("paper submission recovery is required") from exc
         record_equity_snapshot(ledger, market_data=market_data, now=now)

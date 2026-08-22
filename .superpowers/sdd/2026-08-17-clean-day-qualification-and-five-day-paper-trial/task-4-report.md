@@ -170,7 +170,8 @@ date. A missing, malformed, stale, future, closed, after-hours, or wrong-date
 clock rejects before the durable submission transaction and before any paper POST.
 The CLI re-reads both policy time and the exact paper broker clock immediately
 before it persists that transaction and immediately before every POST; a delayed
-preparation or a close-boundary crossing therefore fails closed with zero posts.
+preparation fails before the transaction with zero posts. A close-boundary failure
+after a prior POST seals recovery-required evidence and makes zero additional posts.
 
 ```zsh
 TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main alpaca paper-tournament run --all \
