@@ -1,10 +1,17 @@
 """Pinned immutable evidence ledger for the non-authorizing shadow-day trial.
 
-The manual-shadow root is a single :class:`ImmutableStrategyEvidenceStore`.
-Callers can supply observation content (calendar and local artifacts), but not
-the ledger, authority-source paths, event timestamps, object identifiers, or
-state-machine phase.  Every read replays the store journal before using an
-object; a JSON file under the root is never evidence merely because it exists.
+Task 3 owns the calendar and other canonical authority-source captures, trusted
+clock, fixed ledger root, exact semantic record construction, and trusted-head
+lifecycle.  Normal callers can select only a run identifier, market date,
+predecessor record, and local artifact paths through the three semantic
+facades.  Every read replays the dedicated journal before using an object; a
+JSON file under the root is never evidence merely because it exists.
+
+The adjacent trusted-head anchor detects root-only copies and rollbacks.  It is
+not an external root of trust: a hostile process with the same filesystem-user
+authority can coherently replace both local surfaces or introspect/monkeypatch
+the running process.  Defeating that stronger attacker requires protected
+storage or a monotonic service outside this module.
 """
 
 from __future__ import annotations
@@ -33,11 +40,11 @@ from tradingagents.strategy._immutable_evidence_store import (
     MANUAL_SHADOW_DAY_START_KIND,
     MANUAL_SHADOW_FINAL_REPORT_KIND,
     EvidenceAdmission,
-    EvidenceCandidate,
     EvidenceEnvelope,
+    EvidenceEvent,
     EvidenceJournalHead,
-    ImmutableStrategyEvidenceStore,
     StrategyEvidenceStoreError,
+    _payload_bytes,
     _retry_material_bytes,
 )
 
@@ -180,6 +187,14 @@ _PENDING_FIELDS = frozenset(
     }
 )
 _ZERO_HASH = "0" * 64
+_MANUAL_SHADOW_KINDS = frozenset(
+    {
+        MANUAL_SHADOW_DAY_START_KIND,
+        MANUAL_SHADOW_DAY_RESULT_KIND,
+        MANUAL_SHADOW_FINAL_REPORT_KIND,
+    }
+)
+_MAX_LEDGER_FILE_BYTES = 1_048_576
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 
@@ -673,21 +688,359 @@ def _initial_anchor() -> dict[str, object]:
     }
 
 
-def _open_anchored_store(
+def _ledger_entry_state(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str,
+) -> os.stat_result | None:
+    if "/" in name or name in {"", ".", ".."}:
+        raise ValueError(f"{label} name is unsafe")
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"{label} could not be inspected") from exc
+
+
+def _require_ledger_directory_state(metadata: os.stat_result, *, label: str) -> None:
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"{label} must be a no-follow directory")
+
+
+def _require_ledger_file_state(metadata: os.stat_result, *, label: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"{label} must be a regular no-follow file")
+    if metadata.st_nlink != 1 or stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise ValueError(f"{label} has an unsafe identity or mode")
+
+
+def _open_ledger_directory(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str,
+    create: bool,
+) -> int | None:
+    state = _ledger_entry_state(parent_fd, name, label=label)
+    if state is None:
+        if not create:
+            return None
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise ValueError(f"{label} could not be created safely") from exc
+        state = _ledger_entry_state(parent_fd, name, label=label)
+    if state is None:
+        raise ValueError(f"{label} disappeared")
+    _require_ledger_directory_state(state, label=label)
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError(f"{label} could not be opened safely") from exc
+    descriptor_state = os.fstat(descriptor)
+    try:
+        _require_ledger_directory_state(descriptor_state, label=label)
+        if (state.st_dev, state.st_ino) != (
+            descriptor_state.st_dev,
+            descriptor_state.st_ino,
+        ):
+            raise ValueError(f"{label} changed while opening")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _open_manual_shadow_root(parent_fd: int, *, create: bool) -> int | None:
+    root = _absolute(_manual_shadow_root())
+    anchor_parent = _absolute(_manual_shadow_anchor_path()).parent
+    if root.parent != anchor_parent:
+        raise ValueError("manual-shadow ledger root is not anchor-adjacent")
+    return _open_ledger_directory(
+        parent_fd,
+        root.name,
+        label="manual-shadow ledger root",
+        create=create,
+    )
+
+
+def _read_ledger_file(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str,
+    max_bytes: int,
+) -> bytes:
+    state = _ledger_entry_state(parent_fd, name, label=label)
+    if state is None:
+        raise ValueError(f"{label} is missing")
+    _require_ledger_file_state(state, label=label)
+    try:
+        descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(f"{label} could not be opened safely") from exc
+    try:
+        descriptor_state = os.fstat(descriptor)
+        _require_ledger_file_state(descriptor_state, label=label)
+        if (state.st_dev, state.st_ino) != (
+            descriptor_state.st_dev,
+            descriptor_state.st_ino,
+        ):
+            raise ValueError(f"{label} changed while opening")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"{label} is too large")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _write_exclusive_ledger_file(
+    parent_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    label: str,
+) -> None:
+    if _ledger_entry_state(parent_fd, name, label=label) is not None:
+        raise ValueError(f"{label} already exists")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError(f"{label} could not be created safely") from exc
+    try:
+        _require_ledger_file_state(os.fstat(descriptor), label=label)
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError(f"incomplete {label} write")
+            offset += written
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise ValueError(f"{label} could not be made durable") from exc
+    finally:
+        os.close(descriptor)
+    os.fsync(parent_fd)
+
+
+def _replay_manual_shadow_ledger(
+    parent_fd: int,
+    *,
+    ledger_id: str,
+) -> tuple[
+    tuple[EvidenceEnvelope, ...],
+    tuple[EvidenceEvent, ...],
+    EvidenceJournalHead,
+]:
+    root_fd = _open_manual_shadow_root(parent_fd, create=False)
+    if root_fd is None:
+        return (
+            (),
+            (),
+            EvidenceJournalHead(
+                sequence=0,
+                kind=None,
+                object_id=None,
+                event_sha256=_ZERO_HASH,
+                admission_route=ledger_id,
+            ),
+        )
+    objects_fd: int | None = None
+    kind_fds: dict[str, int] = {}
+    try:
+        try:
+            root_entries = set(os.listdir(root_fd))
+        except OSError as exc:
+            raise ValueError("manual-shadow ledger root could not be listed") from exc
+        unknown_root = root_entries - {"events.jsonl", "objects"}
+        if unknown_root:
+            raise ValueError("manual-shadow ledger contains an unknown root entry")
+        if not root_entries:
+            return (
+                (),
+                (),
+                EvidenceJournalHead(
+                    sequence=0,
+                    kind=None,
+                    object_id=None,
+                    event_sha256=_ZERO_HASH,
+                    admission_route=ledger_id,
+                ),
+            )
+        if root_entries != {"events.jsonl", "objects"}:
+            raise ValueError("manual-shadow ledger structure is incomplete")
+
+        journal = _read_ledger_file(
+            root_fd,
+            "events.jsonl",
+            label="manual-shadow event journal",
+            max_bytes=16 * _MAX_LEDGER_FILE_BYTES,
+        )
+        if not journal or not journal.endswith(b"\n"):
+            raise ValueError("manual-shadow event journal is incomplete")
+        raw_lines = journal[:-1].split(b"\n")
+        events: list[EvidenceEvent] = []
+        expected_previous = _ZERO_HASH
+        object_ids: set[str] = set()
+        for expected_sequence, line in enumerate(raw_lines, start=1):
+            if not line or len(line) > _MAX_LEDGER_FILE_BYTES:
+                raise ValueError("manual-shadow event journal line is invalid")
+            try:
+                decoded = json.loads(
+                    line.decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_nonfinite,
+                )
+                event = EvidenceEvent.from_dict(decoded)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError(
+                    f"manual-shadow event journal line {expected_sequence} is invalid"
+                ) from exc
+            if (
+                event.canonical_json_bytes() != line
+                or event.sequence != expected_sequence
+                or event.previous_event_sha256 != expected_previous
+                or event.kind not in _MANUAL_SHADOW_KINDS
+                or event.admission_route != ledger_id
+                or event.object_id in object_ids
+            ):
+                raise ValueError("manual-shadow event journal chain is invalid")
+            events.append(event)
+            object_ids.add(event.object_id)
+            expected_previous = hashlib.sha256(line).hexdigest()
+
+        objects_fd = _open_ledger_directory(
+            root_fd,
+            "objects",
+            label="manual-shadow objects directory",
+            create=False,
+        )
+        if objects_fd is None:
+            raise ValueError("manual-shadow objects directory is missing")
+        try:
+            object_kinds = set(os.listdir(objects_fd))
+        except OSError as exc:
+            raise ValueError("manual-shadow objects directory could not be listed") from exc
+        if not object_kinds.issubset(_MANUAL_SHADOW_KINDS):
+            raise ValueError("manual-shadow ledger contains an unknown object kind")
+
+        discovered: set[str] = set()
+        for kind in sorted(object_kinds):
+            kind_fd = _open_ledger_directory(
+                objects_fd,
+                kind,
+                label="manual-shadow object kind directory",
+                create=False,
+            )
+            if kind_fd is None:
+                raise ValueError("manual-shadow object kind directory is missing")
+            kind_fds[kind] = kind_fd
+            try:
+                names = tuple(os.listdir(kind_fd))
+            except OSError as exc:
+                raise ValueError("manual-shadow object kind could not be listed") from exc
+            prefix = f"{kind}-"
+            for name in names:
+                if (
+                    not name.startswith(prefix)
+                    or not name.endswith(".json")
+                    or not _is_sha256(name[len(prefix) : -5])
+                ):
+                    raise ValueError("manual-shadow ledger contains an unknown object")
+                discovered.add(name[:-5])
+        if discovered != object_ids:
+            raise ValueError("manual-shadow ledger has unadmitted or missing objects")
+
+        envelopes: list[EvidenceEnvelope] = []
+        for event in events:
+            kind_fd = kind_fds.get(event.kind)
+            if kind_fd is None:
+                raise ValueError("manual-shadow object kind is missing")
+            raw = _read_ledger_file(
+                kind_fd,
+                f"{event.object_id}.json",
+                label="manual-shadow evidence object",
+                max_bytes=_MAX_LEDGER_FILE_BYTES,
+            )
+            try:
+                decoded = json.loads(
+                    raw.decode("utf-8"),
+                    object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_nonfinite,
+                )
+                envelope = EvidenceEnvelope.from_dict(decoded)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise ValueError("manual-shadow evidence object is invalid") from exc
+            if (
+                envelope.canonical_json_bytes() != raw
+                or hashlib.sha256(raw).hexdigest() != event.object_sha256
+                or envelope.kind != event.kind
+                or envelope.object_id != event.object_id
+                or envelope.retry_material_sha256 != event.retry_material_sha256
+                or envelope.effective_at != event.effective_at
+                or envelope.recorded_at != event.recorded_at
+                or envelope.admission_route != ledger_id
+            ):
+                raise ValueError("manual-shadow event and object binding is invalid")
+            envelopes.append(envelope)
+
+        last = events[-1]
+        return (
+            tuple(envelopes),
+            tuple(events),
+            EvidenceJournalHead(
+                sequence=last.sequence,
+                kind=last.kind,
+                object_id=last.object_id,
+                event_sha256=hashlib.sha256(last.canonical_json_bytes()).hexdigest(),
+                admission_route=last.admission_route,
+            ),
+        )
+    finally:
+        for descriptor in kind_fds.values():
+            os.close(descriptor)
+        if objects_fd is not None:
+            os.close(objects_fd)
+        os.close(root_fd)
+
+
+def _open_anchored_ledger(
     parent_fd: int,
     *,
     initialize: bool,
 ) -> tuple[
     dict[str, object],
-    ImmutableStrategyEvidenceStore,
     tuple[EvidenceEnvelope, ...],
+    tuple[EvidenceEvent, ...],
     EvidenceJournalHead,
 ] | None:
     anchor = _read_anchor(parent_fd)
     if anchor is None:
-        root_state = None
-        with suppress(FileNotFoundError):
-            root_state = _manual_shadow_root().lstat()
+        root_state = _ledger_entry_state(
+            parent_fd,
+            _manual_shadow_root().name,
+            label="manual-shadow ledger root",
+        )
         if root_state is not None:
             raise ValueError("manual-shadow ledger exists without its trusted-head anchor")
         if not initialize:
@@ -697,14 +1050,10 @@ def _open_anchored_store(
     ledger_id = anchor["ledger_id"]
     if not isinstance(ledger_id, str):
         raise ValueError("trusted-head ledger identity is invalid")
-    store = ImmutableStrategyEvidenceStore(
-        _manual_shadow_root(),
-        _manual_shadow_ledger_id=ledger_id,
+    envelopes, events, head = _replay_manual_shadow_ledger(
+        parent_fd,
+        ledger_id=ledger_id,
     )
-    try:
-        envelopes, head = store.verify_with_head()
-    except StrategyEvidenceStoreError as exc:
-        raise ValueError(f"shadow ledger is invalid: {exc}") from exc
     pending = anchor["pending_next"]
     committed = anchor["committed_head"]
     if pending is not None:
@@ -717,70 +1066,16 @@ def _open_anchored_store(
             )
     if not _head_matches(anchor["committed_head"], head):
         raise ValueError("manual-shadow ledger rollback or head mismatch")
-    return anchor, store, envelopes, head
+    return anchor, envelopes, events, head
 
 
 def _store_envelopes(*, initialize: bool = False) -> tuple[EvidenceEnvelope, ...]:
     with _locked_anchor_parent() as parent_fd:
-        opened = _open_anchored_store(parent_fd, initialize=initialize)
+        opened = _open_anchored_ledger(parent_fd, initialize=initialize)
         if opened is None:
             return ()
-        _anchor, _store, envelopes, _head = opened
+        _anchor, envelopes, _events, _head = opened
         return envelopes
-
-
-@contextmanager
-def _anchored_admission(
-    candidate: EvidenceCandidate,
-) -> Iterator[ImmutableStrategyEvidenceStore]:
-    with _locked_anchor_parent() as parent_fd:
-        opened = _open_anchored_store(parent_fd, initialize=True)
-        if opened is None:  # pragma: no cover - initialize=True always opens.
-            raise ValueError("trusted-head anchor initialization failed")
-        anchor, store, envelopes, head = opened
-        _LedgerState(envelopes, now=_as_utc(_utc_now()))
-        retry_digest = hashlib.sha256(
-            _retry_material_bytes(
-                kind=candidate.kind,
-                effective_at=candidate.effective_at,
-                payload=candidate.payload,
-            )
-        ).hexdigest()
-        pending = {
-            "prior_head": _head_mapping(head),
-            "sequence": head.sequence + 1,
-            "kind": candidate.kind,
-            "object_id": f"{candidate.kind}-{retry_digest}",
-            "retry_material_sha256": retry_digest,
-            "admission_route": anchor["ledger_id"],
-        }
-        anchor["pending_next"] = pending
-        _write_anchor(parent_fd, anchor)
-        try:
-            yield store
-        except BaseException:
-            try:
-                _envelopes, current_head = store.verify_with_head()
-                if _head_matches(anchor["committed_head"], current_head):
-                    anchor["pending_next"] = None
-                    _write_anchor(parent_fd, anchor)
-            except (StrategyEvidenceStoreError, ValueError):
-                pass
-            raise
-        try:
-            _envelopes, current_head = store.verify_with_head()
-        except StrategyEvidenceStoreError as exc:
-            raise ValueError(f"shadow ledger is invalid after admission: {exc}") from exc
-        if not (
-            current_head.sequence == pending["sequence"]
-            and current_head.kind == pending["kind"]
-            and current_head.object_id == pending["object_id"]
-            and current_head.admission_route == anchor["ledger_id"]
-        ):
-            raise ValueError("shadow ledger admission did not reach the anchored head")
-        anchor["committed_head"] = _head_mapping(current_head)
-        anchor["pending_next"] = None
-        _write_anchor(parent_fd, anchor)
 
 
 def _control_binding(now: dt.datetime) -> tuple[dict[str, object], bool]:
@@ -1294,11 +1589,11 @@ def _validate_report_envelope(
             raise ValueError("shadow report does not match complete ledger")
 
 
-def _validate_reserved_admission(
+def _validate_semantic_envelope(
     snapshot: tuple[EvidenceEnvelope, ...],
     candidate: EvidenceEnvelope,
 ) -> None:
-    """Task 3's bound validator for the store's private reserved route."""
+    """Validate one facade-constructed envelope against the complete replay."""
 
     now = _as_utc(_utc_now())
     days, pending, last_day, report = _LedgerState(snapshot, now=now)
@@ -1428,15 +1723,168 @@ def create_shadow_day_start_manifest(
         "calendar": calendar,
     }
 
-    candidate = EvidenceCandidate(
-        kind=MANUAL_SHADOW_DAY_START_KIND,
-        effective_at=effective_at,
-        payload=payload,
-    )
     try:
-        with _anchored_admission(candidate) as store:
-            return store._admit_reserved_manual_shadow(candidate)
-    except StrategyEvidenceStoreError as exc:
+        with _locked_anchor_parent() as parent_fd:
+            opened = _open_anchored_ledger(parent_fd, initialize=True)
+            if opened is None:  # pragma: no cover - initialize=True always opens.
+                raise ValueError("trusted-head anchor initialization failed")
+            anchor, envelopes, events, head = opened
+            _LedgerState(envelopes, now=now)
+            ledger_id = anchor["ledger_id"]
+            if not isinstance(ledger_id, str):
+                raise ValueError("trusted-head ledger identity is invalid")
+            retry_digest = hashlib.sha256(
+                _retry_material_bytes(
+                    kind=MANUAL_SHADOW_DAY_START_KIND,
+                    effective_at=effective_at,
+                    payload=payload,
+                )
+            ).hexdigest()
+            envelope = EvidenceEnvelope(
+                kind=MANUAL_SHADOW_DAY_START_KIND,
+                object_id=f"{MANUAL_SHADOW_DAY_START_KIND}-{retry_digest}",
+                effective_at=effective_at,
+                recorded_at=effective_at,
+                retry_material_sha256=retry_digest,
+                payload_sha256=hashlib.sha256(_payload_bytes(payload)).hexdigest(),
+                payload=payload,
+                admission_route=ledger_id,
+            )
+            # Keep admission inside this semantic facade.  A reusable
+            # candidate appender would recreate the rejected raw route.
+            _validate_semantic_envelope(envelopes, envelope)
+            envelope_bytes = envelope.canonical_json_bytes()
+            event = EvidenceEvent(
+                sequence=head.sequence + 1,
+                kind=envelope.kind,
+                object_id=envelope.object_id,
+                object_sha256=hashlib.sha256(envelope_bytes).hexdigest(),
+                retry_material_sha256=envelope.retry_material_sha256,
+                effective_at=envelope.effective_at,
+                recorded_at=envelope.recorded_at,
+                previous_event_sha256=head.event_sha256,
+                admission_route=ledger_id,
+            )
+            pending = {
+                "prior_head": _head_mapping(head),
+                "sequence": event.sequence,
+                "kind": event.kind,
+                "object_id": event.object_id,
+                "retry_material_sha256": event.retry_material_sha256,
+                "admission_route": ledger_id,
+            }
+            anchor["pending_next"] = pending
+            _write_anchor(parent_fd, anchor)
+
+            root_fd = _open_manual_shadow_root(parent_fd, create=True)
+            if root_fd is None:  # pragma: no cover - create=True always opens.
+                raise ValueError("manual-shadow ledger root could not be opened")
+            objects_fd: int | None = None
+            kind_fd: int | None = None
+            try:
+                objects_fd = _open_ledger_directory(
+                    root_fd,
+                    "objects",
+                    label="manual-shadow objects directory",
+                    create=True,
+                )
+                if objects_fd is None:  # pragma: no cover - create=True always opens.
+                    raise ValueError("manual-shadow objects directory is missing")
+                kind_fd = _open_ledger_directory(
+                    objects_fd,
+                    envelope.kind,
+                    label="manual-shadow object kind directory",
+                    create=True,
+                )
+                if kind_fd is None:  # pragma: no cover - create=True always opens.
+                    raise ValueError("manual-shadow object kind directory is missing")
+                _write_exclusive_ledger_file(
+                    kind_fd,
+                    f"{envelope.object_id}.json",
+                    envelope_bytes,
+                    label="manual-shadow evidence object",
+                )
+                line = event.canonical_json_bytes() + b"\n"
+                if len(line) - 1 > _MAX_LEDGER_FILE_BYTES:
+                    raise ValueError("manual-shadow event journal line is too large")
+                state = _ledger_entry_state(
+                    root_fd,
+                    "events.jsonl",
+                    label="manual-shadow event journal",
+                )
+                if state is not None:
+                    _require_ledger_file_state(
+                        state,
+                        label="manual-shadow event journal",
+                    )
+                journal_fd = os.open(
+                    "events.jsonl",
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                try:
+                    journal_state = os.fstat(journal_fd)
+                    _require_ledger_file_state(
+                        journal_state,
+                        label="manual-shadow event journal",
+                    )
+                    current_state = _ledger_entry_state(
+                        root_fd,
+                        "events.jsonl",
+                        label="manual-shadow event journal",
+                    )
+                    if current_state is None or (
+                        current_state.st_dev,
+                        current_state.st_ino,
+                    ) != (journal_state.st_dev, journal_state.st_ino):
+                        raise ValueError(
+                            "manual-shadow event journal changed while opening"
+                        )
+                    offset = 0
+                    while offset < len(line):
+                        written = os.write(journal_fd, line[offset:])
+                        if written <= 0:
+                            raise OSError("incomplete manual-shadow event write")
+                        offset += written
+                    os.fsync(journal_fd)
+                finally:
+                    os.close(journal_fd)
+                os.fsync(root_fd)
+            finally:
+                if kind_fd is not None:
+                    os.close(kind_fd)
+                if objects_fd is not None:
+                    os.close(objects_fd)
+                os.close(root_fd)
+
+            current, _current_events, current_head = _replay_manual_shadow_ledger(
+                parent_fd,
+                ledger_id=ledger_id,
+            )
+            _LedgerState(current, now=now)
+            if not (
+                current_head.sequence == pending["sequence"]
+                and current_head.kind == pending["kind"]
+                and current_head.object_id == pending["object_id"]
+                and current_head.admission_route == ledger_id
+            ):
+                raise ValueError("shadow ledger admission did not reach the anchored head")
+            anchor["committed_head"] = _head_mapping(current_head)
+            anchor["pending_next"] = None
+            _write_anchor(parent_fd, anchor)
+            return EvidenceAdmission(
+                envelope=envelope,
+                path=(
+                    _absolute(_manual_shadow_root())
+                    / "objects"
+                    / envelope.kind
+                    / f"{envelope.object_id}.json"
+                ),
+                event=event,
+                created=True,
+            )
+    except (OSError, StrategyEvidenceStoreError) as exc:
         raise ValueError(f"shadow ledger admission failed: {exc}") from exc
 
 
@@ -1492,15 +1940,170 @@ def adjudicate_shadow_day(
     provisional["phase"] = _day_phase(start=start, status=status, earlier_days=days)
     provisional["reasons"] = sorted(set([*failed, *incomplete]))
 
-    candidate = EvidenceCandidate(
-        kind=MANUAL_SHADOW_DAY_RESULT_KIND,
-        effective_at=effective_at,
-        payload=provisional,
-    )
     try:
-        with _anchored_admission(candidate) as store:
-            return store._admit_reserved_manual_shadow(candidate)
-    except StrategyEvidenceStoreError as exc:
+        with _locked_anchor_parent() as parent_fd:
+            opened = _open_anchored_ledger(parent_fd, initialize=True)
+            if opened is None:  # pragma: no cover - initialize=True always opens.
+                raise ValueError("trusted-head anchor initialization failed")
+            anchor, envelopes, _events, head = opened
+            _LedgerState(envelopes, now=now)
+            ledger_id = anchor["ledger_id"]
+            if not isinstance(ledger_id, str):
+                raise ValueError("trusted-head ledger identity is invalid")
+            retry_digest = hashlib.sha256(
+                _retry_material_bytes(
+                    kind=MANUAL_SHADOW_DAY_RESULT_KIND,
+                    effective_at=effective_at,
+                    payload=provisional,
+                )
+            ).hexdigest()
+            envelope = EvidenceEnvelope(
+                kind=MANUAL_SHADOW_DAY_RESULT_KIND,
+                object_id=f"{MANUAL_SHADOW_DAY_RESULT_KIND}-{retry_digest}",
+                effective_at=effective_at,
+                recorded_at=effective_at,
+                retry_material_sha256=retry_digest,
+                payload_sha256=hashlib.sha256(
+                    _payload_bytes(provisional)
+                ).hexdigest(),
+                payload=provisional,
+                admission_route=ledger_id,
+            )
+            # Keep admission inside this semantic facade.  A reusable
+            # candidate appender would recreate the rejected raw route.
+            _validate_semantic_envelope(envelopes, envelope)
+            envelope_bytes = envelope.canonical_json_bytes()
+            event = EvidenceEvent(
+                sequence=head.sequence + 1,
+                kind=envelope.kind,
+                object_id=envelope.object_id,
+                object_sha256=hashlib.sha256(envelope_bytes).hexdigest(),
+                retry_material_sha256=envelope.retry_material_sha256,
+                effective_at=envelope.effective_at,
+                recorded_at=envelope.recorded_at,
+                previous_event_sha256=head.event_sha256,
+                admission_route=ledger_id,
+            )
+            pending = {
+                "prior_head": _head_mapping(head),
+                "sequence": event.sequence,
+                "kind": event.kind,
+                "object_id": event.object_id,
+                "retry_material_sha256": event.retry_material_sha256,
+                "admission_route": ledger_id,
+            }
+            anchor["pending_next"] = pending
+            _write_anchor(parent_fd, anchor)
+
+            root_fd = _open_manual_shadow_root(parent_fd, create=True)
+            if root_fd is None:  # pragma: no cover - create=True always opens.
+                raise ValueError("manual-shadow ledger root could not be opened")
+            objects_fd: int | None = None
+            kind_fd: int | None = None
+            try:
+                objects_fd = _open_ledger_directory(
+                    root_fd,
+                    "objects",
+                    label="manual-shadow objects directory",
+                    create=True,
+                )
+                if objects_fd is None:  # pragma: no cover - create=True always opens.
+                    raise ValueError("manual-shadow objects directory is missing")
+                kind_fd = _open_ledger_directory(
+                    objects_fd,
+                    envelope.kind,
+                    label="manual-shadow object kind directory",
+                    create=True,
+                )
+                if kind_fd is None:  # pragma: no cover - create=True always opens.
+                    raise ValueError("manual-shadow object kind directory is missing")
+                _write_exclusive_ledger_file(
+                    kind_fd,
+                    f"{envelope.object_id}.json",
+                    envelope_bytes,
+                    label="manual-shadow evidence object",
+                )
+                line = event.canonical_json_bytes() + b"\n"
+                if len(line) - 1 > _MAX_LEDGER_FILE_BYTES:
+                    raise ValueError("manual-shadow event journal line is too large")
+                state = _ledger_entry_state(
+                    root_fd,
+                    "events.jsonl",
+                    label="manual-shadow event journal",
+                )
+                if state is not None:
+                    _require_ledger_file_state(
+                        state,
+                        label="manual-shadow event journal",
+                    )
+                journal_fd = os.open(
+                    "events.jsonl",
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                try:
+                    journal_state = os.fstat(journal_fd)
+                    _require_ledger_file_state(
+                        journal_state,
+                        label="manual-shadow event journal",
+                    )
+                    current_state = _ledger_entry_state(
+                        root_fd,
+                        "events.jsonl",
+                        label="manual-shadow event journal",
+                    )
+                    if current_state is None or (
+                        current_state.st_dev,
+                        current_state.st_ino,
+                    ) != (journal_state.st_dev, journal_state.st_ino):
+                        raise ValueError(
+                            "manual-shadow event journal changed while opening"
+                        )
+                    offset = 0
+                    while offset < len(line):
+                        written = os.write(journal_fd, line[offset:])
+                        if written <= 0:
+                            raise OSError("incomplete manual-shadow event write")
+                        offset += written
+                    os.fsync(journal_fd)
+                finally:
+                    os.close(journal_fd)
+                os.fsync(root_fd)
+            finally:
+                if kind_fd is not None:
+                    os.close(kind_fd)
+                if objects_fd is not None:
+                    os.close(objects_fd)
+                os.close(root_fd)
+
+            current, _current_events, current_head = _replay_manual_shadow_ledger(
+                parent_fd,
+                ledger_id=ledger_id,
+            )
+            _LedgerState(current, now=now)
+            if not (
+                current_head.sequence == pending["sequence"]
+                and current_head.kind == pending["kind"]
+                and current_head.object_id == pending["object_id"]
+                and current_head.admission_route == ledger_id
+            ):
+                raise ValueError("shadow ledger admission did not reach the anchored head")
+            anchor["committed_head"] = _head_mapping(current_head)
+            anchor["pending_next"] = None
+            _write_anchor(parent_fd, anchor)
+            return EvidenceAdmission(
+                envelope=envelope,
+                path=(
+                    _absolute(_manual_shadow_root())
+                    / "objects"
+                    / envelope.kind
+                    / f"{envelope.object_id}.json"
+                ),
+                event=event,
+                created=True,
+            )
+    except (OSError, StrategyEvidenceStoreError) as exc:
         raise ValueError(f"shadow ledger admission failed: {exc}") from exc
 
 
@@ -1526,14 +2129,167 @@ def build_shadow_streak_report() -> dict[str, object]:
         "reasons": [] if candidate else ["full_ledger_not_terminal_candidate"],
     }
 
-    candidate = EvidenceCandidate(
-        kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
-        effective_at=effective_at,
-        payload=payload,
-    )
     try:
-        with _anchored_admission(candidate) as store:
-            admission = store._admit_reserved_manual_shadow(candidate)
-    except StrategyEvidenceStoreError as exc:
+        with _locked_anchor_parent() as parent_fd:
+            opened = _open_anchored_ledger(parent_fd, initialize=True)
+            if opened is None:  # pragma: no cover - initialize=True always opens.
+                raise ValueError("trusted-head anchor initialization failed")
+            anchor, envelopes, _events, head = opened
+            _LedgerState(envelopes, now=now)
+            ledger_id = anchor["ledger_id"]
+            if not isinstance(ledger_id, str):
+                raise ValueError("trusted-head ledger identity is invalid")
+            retry_digest = hashlib.sha256(
+                _retry_material_bytes(
+                    kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
+                    effective_at=effective_at,
+                    payload=payload,
+                )
+            ).hexdigest()
+            envelope = EvidenceEnvelope(
+                kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
+                object_id=f"{MANUAL_SHADOW_FINAL_REPORT_KIND}-{retry_digest}",
+                effective_at=effective_at,
+                recorded_at=effective_at,
+                retry_material_sha256=retry_digest,
+                payload_sha256=hashlib.sha256(_payload_bytes(payload)).hexdigest(),
+                payload=payload,
+                admission_route=ledger_id,
+            )
+            # Keep admission inside this semantic facade.  A reusable
+            # candidate appender would recreate the rejected raw route.
+            _validate_semantic_envelope(envelopes, envelope)
+            envelope_bytes = envelope.canonical_json_bytes()
+            event = EvidenceEvent(
+                sequence=head.sequence + 1,
+                kind=envelope.kind,
+                object_id=envelope.object_id,
+                object_sha256=hashlib.sha256(envelope_bytes).hexdigest(),
+                retry_material_sha256=envelope.retry_material_sha256,
+                effective_at=envelope.effective_at,
+                recorded_at=envelope.recorded_at,
+                previous_event_sha256=head.event_sha256,
+                admission_route=ledger_id,
+            )
+            pending = {
+                "prior_head": _head_mapping(head),
+                "sequence": event.sequence,
+                "kind": event.kind,
+                "object_id": event.object_id,
+                "retry_material_sha256": event.retry_material_sha256,
+                "admission_route": ledger_id,
+            }
+            anchor["pending_next"] = pending
+            _write_anchor(parent_fd, anchor)
+
+            root_fd = _open_manual_shadow_root(parent_fd, create=True)
+            if root_fd is None:  # pragma: no cover - create=True always opens.
+                raise ValueError("manual-shadow ledger root could not be opened")
+            objects_fd: int | None = None
+            kind_fd: int | None = None
+            try:
+                objects_fd = _open_ledger_directory(
+                    root_fd,
+                    "objects",
+                    label="manual-shadow objects directory",
+                    create=True,
+                )
+                if objects_fd is None:  # pragma: no cover - create=True always opens.
+                    raise ValueError("manual-shadow objects directory is missing")
+                kind_fd = _open_ledger_directory(
+                    objects_fd,
+                    envelope.kind,
+                    label="manual-shadow object kind directory",
+                    create=True,
+                )
+                if kind_fd is None:  # pragma: no cover - create=True always opens.
+                    raise ValueError("manual-shadow object kind directory is missing")
+                _write_exclusive_ledger_file(
+                    kind_fd,
+                    f"{envelope.object_id}.json",
+                    envelope_bytes,
+                    label="manual-shadow evidence object",
+                )
+                line = event.canonical_json_bytes() + b"\n"
+                if len(line) - 1 > _MAX_LEDGER_FILE_BYTES:
+                    raise ValueError("manual-shadow event journal line is too large")
+                state = _ledger_entry_state(
+                    root_fd,
+                    "events.jsonl",
+                    label="manual-shadow event journal",
+                )
+                if state is not None:
+                    _require_ledger_file_state(
+                        state,
+                        label="manual-shadow event journal",
+                    )
+                journal_fd = os.open(
+                    "events.jsonl",
+                    os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW,
+                    0o600,
+                    dir_fd=root_fd,
+                )
+                try:
+                    journal_state = os.fstat(journal_fd)
+                    _require_ledger_file_state(
+                        journal_state,
+                        label="manual-shadow event journal",
+                    )
+                    current_state = _ledger_entry_state(
+                        root_fd,
+                        "events.jsonl",
+                        label="manual-shadow event journal",
+                    )
+                    if current_state is None or (
+                        current_state.st_dev,
+                        current_state.st_ino,
+                    ) != (journal_state.st_dev, journal_state.st_ino):
+                        raise ValueError(
+                            "manual-shadow event journal changed while opening"
+                        )
+                    offset = 0
+                    while offset < len(line):
+                        written = os.write(journal_fd, line[offset:])
+                        if written <= 0:
+                            raise OSError("incomplete manual-shadow event write")
+                        offset += written
+                    os.fsync(journal_fd)
+                finally:
+                    os.close(journal_fd)
+                os.fsync(root_fd)
+            finally:
+                if kind_fd is not None:
+                    os.close(kind_fd)
+                if objects_fd is not None:
+                    os.close(objects_fd)
+                os.close(root_fd)
+
+            current, _current_events, current_head = _replay_manual_shadow_ledger(
+                parent_fd,
+                ledger_id=ledger_id,
+            )
+            _LedgerState(current, now=now)
+            if not (
+                current_head.sequence == pending["sequence"]
+                and current_head.kind == pending["kind"]
+                and current_head.object_id == pending["object_id"]
+                and current_head.admission_route == ledger_id
+            ):
+                raise ValueError("shadow ledger admission did not reach the anchored head")
+            anchor["committed_head"] = _head_mapping(current_head)
+            anchor["pending_next"] = None
+            _write_anchor(parent_fd, anchor)
+            admission = EvidenceAdmission(
+                envelope=envelope,
+                path=(
+                    _absolute(_manual_shadow_root())
+                    / "objects"
+                    / envelope.kind
+                    / f"{envelope.object_id}.json"
+                ),
+                event=event,
+                created=True,
+            )
+    except (OSError, StrategyEvidenceStoreError) as exc:
         raise ValueError(f"shadow ledger admission failed: {exc}") from exc
     return _record_view(admission.envelope, path=admission.path)

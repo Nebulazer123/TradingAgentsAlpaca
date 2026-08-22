@@ -366,24 +366,17 @@ def test_red_task3_ledger_route_is_not_a_generic_store_or_callback_escape(tmp_pa
         )
     )
     ledger_id = anchor["ledger_id"]
-    with pytest.raises(StrategyEvidenceStoreError, match="clock.*Task 3 owned"):
+    with pytest.raises(TypeError, match="_manual_shadow_ledger_id"):
         ImmutableStrategyEvidenceStore(
             environment["manual_root"],
             clock=lambda: _moment("2026-08-21"),
             _manual_shadow_ledger_id=ledger_id,
         )
-    ledger = ImmutableStrategyEvidenceStore(
-        environment["manual_root"],
-        _manual_shadow_ledger_id=ledger_id,
+    assert not hasattr(
+        ImmutableStrategyEvidenceStore,
+        "_admit_reserved_manual_shadow",
     )
-    with pytest.raises(StrategyEvidenceStoreError, match="facade"):
-        ledger._admit_reserved_manual_shadow(
-            EvidenceCandidate(
-                kind=start.envelope.kind,
-                effective_at=start.envelope.effective_at,
-                payload=start.envelope.payload,
-            )
-        )
+    assert start.envelope.admission_route == ledger_id
 
 
 def test_round4_generic_store_instance_mutation_cannot_admit_manual_shadow(tmp_path):
@@ -414,6 +407,107 @@ def test_round4_rejected_reserved_factories_and_classes_are_absent():
         "_ReservedManualShadowEvidenceStore",
     ):
         assert not hasattr(evidence_store_module, name)
+
+
+def test_round5_raw_reserved_admission_surface_is_absent():
+    constructor = inspect.signature(ImmutableStrategyEvidenceStore)
+    assert "_manual_shadow_ledger_id" not in constructor.parameters
+    assert not hasattr(
+        ImmutableStrategyEvidenceStore,
+        "_admit_reserved_manual_shadow",
+    )
+    assert not hasattr(shadow_trial, "_anchored_admission")
+    assert not hasattr(shadow_trial, "_open_anchored_store")
+    assert not hasattr(shadow_trial, "_validate_reserved_admission")
+
+
+def test_round5_code_object_spoof_cannot_commit_a_fabricated_shadow_entry(
+    tmp_path,
+    monkeypatch,
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    _set_clock(monkeypatch, "2026-08-21")
+    fabricated = EvidenceCandidate(
+        kind="manual-shadow-day-start",
+        effective_at="2026-08-21T14:00:00+00:00",
+        payload={"fabricated_authority": True},
+    )
+    monkeypatch.setattr(
+        shadow_trial,
+        "_round5_fabricated_candidate",
+        fabricated,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        shadow_trial,
+        "_validate_reserved_admission",
+        lambda _history, _candidate: None,
+        raising=False,
+    )
+
+    def spoofed_facade(
+        *,
+        run_id: str,
+        market_date: str,
+        predecessor_object_id: str | None = None,
+    ):
+        del run_id, market_date, predecessor_object_id
+        with _anchored_admission(_round5_fabricated_candidate) as store:  # noqa: F821
+            return store._admit_reserved_manual_shadow(  # noqa: SLF001
+                _round5_fabricated_candidate  # noqa: F821
+            )
+
+    monkeypatch.setattr(
+        shadow_trial.create_shadow_day_start_manifest,
+        "__code__",
+        spoofed_facade.__code__,
+    )
+    with pytest.raises((AttributeError, NameError, StrategyEvidenceStoreError)):
+        shadow_trial.create_shadow_day_start_manifest(
+            run_id="spoof",
+            market_date="2026-08-21",
+        )
+
+    anchor_path = environment["manual_root"].parent / ".manual-shadow-trusted-head.json"
+    assert not anchor_path.exists()
+    assert not environment["manual_root"].exists()
+
+
+def test_round5_method_code_spoof_cannot_bypass_generic_reserved_rejection(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "results" / "manual_shadow"
+    root.parent.mkdir(parents=True)
+    store = ImmutableStrategyEvidenceStore(
+        root,
+        clock=lambda: _moment("2026-08-21"),
+    )
+    store._managed_kinds = frozenset({"manual-shadow-day-start"})
+    store._admission_route = "a" * 64
+    candidate = EvidenceCandidate(
+        kind="manual-shadow-day-start",
+        effective_at="2026-08-21T14:00:00+00:00",
+        payload={"fabricated_authority": True},
+    )
+
+    def spoofed_reserved_caller(store, candidate):
+        return store._admit_candidate(  # noqa: SLF001
+            candidate,
+            validate=lambda _history, _candidate: None,
+        )
+
+    reserved = getattr(
+        ImmutableStrategyEvidenceStore,
+        "_admit_reserved_manual_shadow",
+        None,
+    )
+    if reserved is not None:
+        monkeypatch.setattr(reserved, "__code__", spoofed_reserved_caller.__code__)
+
+    with pytest.raises(StrategyEvidenceStoreError, match="reserved|allowed"):
+        spoofed_reserved_caller(store, candidate)
+    assert not root.exists()
 
 
 def test_round4_direct_api_owns_calendar_capture(tmp_path, monkeypatch):

@@ -9,7 +9,6 @@ import json
 import os
 import re
 import stat
-import sys
 import threading
 import time
 import weakref
@@ -793,7 +792,6 @@ class ImmutableStrategyEvidenceStore:
         root: str | Path,
         *,
         clock: Callable[[], dt.datetime] | None = None,
-        _manual_shadow_ledger_id: str | None = None,
     ):
         lexical_root = Path(os.path.abspath(os.fspath(Path(root).expanduser())))
         self._reject_symlink_components(lexical_root)
@@ -801,44 +799,14 @@ class ImmutableStrategyEvidenceStore:
         if state is not None:
             self._require_directory_state(state, label="evidence root")
         self.root = lexical_root
-        if _manual_shadow_ledger_id is not None:
-            if clock is not None:
-                raise StrategyEvidenceStoreError(
-                    "reserved manual-shadow clock is Task 3 owned"
-                )
-            _require_digest(
-                _manual_shadow_ledger_id,
-                label="manual-shadow ledger identity",
-            )
-
-            def task3_clock() -> dt.datetime:
-                from tradingagents.evals import shadow_trial
-
-                return shadow_trial._utc_now()
-
-            self._clock = task3_clock
-        else:
-            self._clock = clock or (lambda: dt.datetime.now(_UTC))
+        self._clock = clock or (lambda: dt.datetime.now(_UTC))
         self._lock_path = self.root / ".strategy-evidence.lock"
         self._events_path = self.root / "events.jsonl"
         self._objects_dir = self.root / "objects"
         self._latest_dir = self.root / "latest"
-        if _manual_shadow_ledger_id is None:
-            self._managed_kinds = _ALLOWED_KINDS
-            self._staged_pointer_name = _STAGED_POINTER_NAME
-            self._admission_route: str | None = None
-        else:
-            self._managed_kinds = _RESERVED_MANUAL_SHADOW_KINDS
-            self._staged_pointer_name = re.compile(
-                r"^\.(?P<kind>"
-                + "|".join(
-                    re.escape(kind)
-                    for kind in sorted(_RESERVED_MANUAL_SHADOW_KINDS)
-                )
-                + r")\.(?P<pid>[1-9][0-9]*)\.(?P<thread>[1-9][0-9]*)"
-                r"\.(?P<nonce>[1-9][0-9]*)\.tmp$"
-            )
-            self._admission_route = _manual_shadow_ledger_id
+        self._managed_kinds = _ALLOWED_KINDS
+        self._staged_pointer_name = _STAGED_POINTER_NAME
+        self._admission_route: str | None = None
         self._transaction_state = threading.local()
 
     def admit_checked(
@@ -881,50 +849,6 @@ class ImmutableStrategyEvidenceStore:
             validate_combined=validate_combined,
         )
 
-    def _admit_reserved_manual_shadow(
-        self,
-        candidate: EvidenceCandidate,
-    ) -> EvidenceAdmission:
-        """Append only when called directly by one of Task 3's three facades.
-
-        Python does not provide an in-process security boundary.  This origin
-        check prevents ordinary import, subclass, instance-mutation, and
-        caller-selected callback/clock routes from reaching reserved append;
-        Task 3 additionally binds every append to its external trusted head.
-        """
-
-        from tradingagents.evals import shadow_trial
-
-        caller = sys._getframe(1)
-        allowed_functions = (
-            shadow_trial.create_shadow_day_start_manifest,
-            shadow_trial.adjudicate_shadow_day,
-            shadow_trial.build_shadow_streak_report,
-        )
-        if (
-            caller.f_globals is not vars(shadow_trial)
-            or caller.f_code not in {function.__code__ for function in allowed_functions}
-        ):
-            raise StrategyEvidenceStoreError(
-                "reserved manual-shadow admission is Task 3 facade only"
-            )
-        if (
-            candidate.kind not in _RESERVED_MANUAL_SHADOW_KINDS
-            or self._managed_kinds != _RESERVED_MANUAL_SHADOW_KINDS
-            or not isinstance(self._admission_route, str)
-            or _LOWER_SHA256.fullmatch(self._admission_route) is None
-            or self.root != Path(
-                os.path.abspath(os.fspath(shadow_trial._manual_shadow_root()))
-            )
-        ):
-            raise StrategyEvidenceStoreError(
-                "reserved manual-shadow store binding is invalid"
-            )
-        return self._admit_candidate(
-            candidate,
-            validate=shadow_trial._validate_reserved_admission,
-        )
-
     def _admit_candidate(
         self,
         candidate: EvidenceCandidate,
@@ -953,11 +877,7 @@ class ImmutableStrategyEvidenceStore:
             raise StrategyEvidenceStoreError(
                 "candidate must be an EvidenceCandidate"
             )
-        if (
-            candidate.kind in _RESERVED_MANUAL_SHADOW_KINDS
-            and sys._getframe(1).f_code
-            is not ImmutableStrategyEvidenceStore._admit_reserved_manual_shadow.__code__
-        ):
+        if candidate.kind in _RESERVED_MANUAL_SHADOW_KINDS:
             raise StrategyEvidenceStoreError(
                 "manual-shadow evidence kind is reserved"
             )
