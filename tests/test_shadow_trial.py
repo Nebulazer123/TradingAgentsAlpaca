@@ -12,6 +12,12 @@ from typer.testing import CliRunner
 from cli import main as cli_main
 from cli.main import app
 from tradingagents.evals import shadow_trial
+from tradingagents.strategy import _immutable_evidence_store as evidence_store_module
+from tradingagents.strategy._immutable_evidence_store import (
+    EvidenceCandidate,
+    ImmutableStrategyEvidenceStore,
+    StrategyEvidenceStoreError,
+)
 
 UTC = dt.timezone.utc
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -290,6 +296,135 @@ def test_red_store_owns_envelope_identity_and_recorded_time(tmp_path, monkeypatc
     assert loaded.object_id == start.envelope.object_id
 
 
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "manual-shadow-day-start",
+        "manual-shadow-day-result",
+        "manual-shadow-final-report",
+    ],
+)
+def test_red_generic_store_cannot_admit_reserved_manual_shadow_kinds(tmp_path, kind):
+    root = tmp_path / "results" / "manual_shadow"
+    root.parent.mkdir(parents=True)
+    store = ImmutableStrategyEvidenceStore(
+        root,
+        clock=lambda: _moment("2026-08-21"),
+    )
+    with pytest.raises(StrategyEvidenceStoreError, match="reserved|allowed"):
+        store.admit_checked(
+            EvidenceCandidate(
+                kind=kind,
+                effective_at="2026-08-21T14:00:00+00:00",
+                payload={"fabricated": True},
+            ),
+            validate=lambda _history, _candidate: None,
+        )
+
+
+def test_red_generic_manual_injection_cannot_create_a_reportable_shadow_ledger(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    store = ImmutableStrategyEvidenceStore(
+        environment["manual_root"],
+        clock=lambda: _moment("2026-08-21"),
+    )
+    with pytest.raises(StrategyEvidenceStoreError, match="reserved|allowed"):
+        store.admit_checked(
+            EvidenceCandidate(
+                kind="manual-shadow-day-start",
+                effective_at="2026-08-21T14:00:00+00:00",
+                payload={"fabricated_calendar_and_control": True},
+            ),
+            validate=lambda _history, _candidate: None,
+        )
+    with pytest.raises(ValueError, match="terminal|ledger"):
+        shadow_trial.build_shadow_streak_report()
+
+
+def test_red_task3_ledger_route_is_not_a_generic_store_or_callback_escape(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    ledger = shadow_trial._store()
+    assert not isinstance(ledger, ImmutableStrategyEvidenceStore)
+    assert not hasattr(ledger, "admit_checked")
+    assert "clock" not in inspect.signature(shadow_trial._store).parameters
+    assert "validate" not in inspect.signature(ledger.admit).parameters
+    reserved_open = inspect.signature(
+        evidence_store_module._open_reserved_manual_shadow_store
+    )
+    assert "clock" not in reserved_open.parameters
+    assert "validator" not in reserved_open.parameters
+
+
+def test_red_legacy_generic_manual_journal_without_reserved_route_cannot_replay(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    journal = environment["manual_root"] / "events.jsonl"
+    line = json.loads(journal.read_text(encoding="utf-8"))
+    assert line["admission_route"] == "manual-shadow-reserved-v1"
+    del line["admission_route"]
+    journal.write_text(
+        json.dumps(line, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ledger|event|evidence"):
+        shadow_trial.load_shadow_record(
+            start.envelope.object_id,
+            expected_kind="manual-shadow-day-start",
+        )
+
+
+def test_red_self_written_reserved_object_without_event_blocks_replay(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    payload = _payload(start)
+    payload["run_id"] = "self-written-unadmitted"
+    candidate = EvidenceCandidate(
+        kind="manual-shadow-day-start",
+        effective_at=start.envelope.effective_at,
+        payload=payload,
+    )
+    retry_material = evidence_store_module._retry_material_bytes(
+        kind=candidate.kind,
+        effective_at=candidate.effective_at,
+        payload=candidate.payload,
+    )
+    retry_sha256 = hashlib.sha256(retry_material).hexdigest()
+    orphan = evidence_store_module.EvidenceEnvelope(
+        kind=candidate.kind,
+        object_id=f"{candidate.kind}-{retry_sha256}",
+        effective_at=candidate.effective_at,
+        recorded_at=start.envelope.recorded_at,
+        retry_material_sha256=retry_sha256,
+        payload_sha256=hashlib.sha256(
+            evidence_store_module._payload_bytes(candidate.payload)
+        ).hexdigest(),
+        payload=candidate.payload,
+        admission_route="manual-shadow-reserved-v1",
+    )
+    orphan_path = (
+        environment["manual_root"]
+        / "objects"
+        / candidate.kind
+        / f"{orphan.object_id}.json"
+    )
+    orphan_path.write_bytes(orphan.canonical_json_bytes())
+    with pytest.raises(ValueError, match="unadmitted|ledger|evidence"):
+        shadow_trial.load_shadow_record(
+            start.envelope.object_id,
+            expected_kind="manual-shadow-day-start",
+        )
+
+
+def test_red_reserved_manual_shadow_root_rejects_symlink_escape(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    escaped = tmp_path / "escaped"
+    escaped.mkdir()
+    environment["manual_root"].parent.mkdir(parents=True, exist_ok=True)
+    environment["manual_root"].symlink_to(escaped, target_is_directory=True)
+    with pytest.raises(ValueError, match="ledger|evidence|root|unsafe"):
+        _start(monkeypatch, date="2026-08-21")
+
+
 def test_red_start_api_has_no_caller_controlled_authority_paths_or_phase(tmp_path, monkeypatch):
     _configure_environment(monkeypatch, tmp_path)
     signature = inspect.signature(shadow_trial.create_shadow_day_start_manifest)
@@ -407,6 +542,58 @@ def test_red_full_ledger_replay_requires_repair_then_fresh_qualification_and_fiv
     assert report["phase"] == "readiness_candidate"
     assert report["clean_trial_streak"] == 5
     assert report["record_path"].startswith(str(tmp_path / "results" / "manual_shadow"))
+
+
+def test_red_trial_count_resets_to_latest_fresh_qualification_after_failure(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    qualification_start = _start(monkeypatch, date="2026-08-10")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-10")
+    first_trial_start = _start(
+        monkeypatch,
+        date="2026-08-11",
+        predecessor_object_id=qualification.envelope.object_id,
+    )
+    first_trial = _day(tmp_path, monkeypatch, first_trial_start, date="2026-08-11")
+    failed_start = _start(
+        monkeypatch,
+        date="2026-08-12",
+        predecessor_object_id=first_trial.envelope.object_id,
+    )
+    failed = _day(
+        tmp_path,
+        monkeypatch,
+        failed_start,
+        date="2026-08-12",
+        artifacts={"safety_sentinel": tmp_path / "missing", "paper_tournament": tmp_path / "missing-paper"},
+    )
+    repair_start = _start(
+        monkeypatch,
+        date="2026-08-13",
+        predecessor_object_id=failed.envelope.object_id,
+    )
+    repair = _day(tmp_path, monkeypatch, repair_start, date="2026-08-13")
+    fresh_start = _start(
+        monkeypatch,
+        date="2026-08-14",
+        predecessor_object_id=repair.envelope.object_id,
+    )
+    previous = _day(tmp_path, monkeypatch, fresh_start, date="2026-08-14")
+
+    for date in ("2026-08-17", "2026-08-18", "2026-08-19", "2026-08-20"):
+        trial_start = _start(monkeypatch, date=date, predecessor_object_id=previous.envelope.object_id)
+        previous = _day(tmp_path, monkeypatch, trial_start, date=date)
+        assert _payload(previous)["phase"] == "five_day_trial"
+
+    fifth_start = _start(
+        monkeypatch,
+        date="2026-08-21",
+        predecessor_object_id=previous.envelope.object_id,
+    )
+    fifth = _day(tmp_path, monkeypatch, fifth_start, date="2026-08-21")
+    assert _payload(fifth)["phase"] == "trial_complete"
+    report = shadow_trial.build_shadow_streak_report()
+    assert report["phase"] == "readiness_candidate"
+    assert report["clean_trial_streak"] == 5
 
 
 def test_red_cli_predecessor_transitions_allow_trial_repair_and_fresh_qualification(tmp_path, monkeypatch):

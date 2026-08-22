@@ -31,8 +31,9 @@ from tradingagents.strategy._immutable_evidence_store import (
     EvidenceAdmission,
     EvidenceCandidate,
     EvidenceEnvelope,
-    ImmutableStrategyEvidenceStore,
     StrategyEvidenceStoreError,
+    _bind_reserved_manual_shadow_admission,
+    _open_reserved_manual_shadow_store,
 )
 
 UTC = dt.timezone.utc
@@ -355,8 +356,14 @@ def _is_non_authorizing(payload: Mapping[str, object]) -> bool:
     )
 
 
-def _store() -> ImmutableStrategyEvidenceStore:
-    return ImmutableStrategyEvidenceStore(_manual_shadow_root(), clock=_utc_now)
+def _store():
+    return _open_reserved_manual_shadow_store(
+        _manual_shadow_root(),
+        binding=_bind_reserved_manual_shadow_admission(
+            clock=_utc_now,
+            validator=_validate_reserved_admission,
+        ),
+    )
 
 
 def _store_envelopes() -> tuple[EvidenceEnvelope, ...]:
@@ -371,12 +378,10 @@ def _admit(
     kind: str,
     effective_at: str,
     payload: Mapping[str, object],
-    validate,
 ) -> EvidenceAdmission:
     try:
-        return _store().admit_checked(
-            EvidenceCandidate(kind=kind, effective_at=effective_at, payload=payload),
-            validate=validate,
+        return _store().admit(
+            EvidenceCandidate(kind=kind, effective_at=effective_at, payload=payload)
         )
     except StrategyEvidenceStoreError as exc:
         raise ValueError(f"shadow ledger admission failed: {exc}") from exc
@@ -644,12 +649,19 @@ def _day_phase(
         return "qualification_clean"
     if role == "repair":
         return "repair_in_progress"
-    trial_count = sum(
-        1
-        for day in earlier_days
-        if day.payload.get("phase") in {"five_day_trial", "trial_complete"}
-        and day.payload.get("status") == "clean"
-    )
+    trial_count = 0
+    for day in reversed(earlier_days):
+        prior = day.payload
+        if (
+            prior.get("status") == "clean"
+            and prior.get("phase") == "qualification_clean"
+        ):
+            break
+        if (
+            prior.get("status") == "clean"
+            and prior.get("phase") in {"five_day_trial", "trial_complete"}
+        ):
+            trial_count += 1
     return "trial_complete" if trial_count == 4 else "five_day_trial"
 
 
@@ -858,6 +870,42 @@ def _validate_report_envelope(
             raise ValueError("shadow report does not match complete ledger")
 
 
+def _validate_reserved_admission(
+    snapshot: tuple[EvidenceEnvelope, ...],
+    candidate: EvidenceEnvelope,
+) -> None:
+    """Task 3's bound validator for the store's private reserved route."""
+
+    now = _as_utc(_utc_now())
+    days, pending, last_day, report = _LedgerState(snapshot, now=now)
+    if candidate.kind == MANUAL_SHADOW_DAY_START_KIND:
+        if pending is not None or report is not None:
+            raise ValueError("shadow ledger does not allow another start")
+        _validate_start_envelope(candidate, now=now)
+        expected_phase, expected_role, expected_parent = _start_spec(last_day)
+        candidate_payload = candidate.payload
+        if (
+            candidate_payload["phase"] != expected_phase
+            or candidate_payload["role"] != expected_role
+            or candidate_payload["predecessor_object_id"] != expected_parent
+            or candidate_payload["market_date"]
+            in {day.payload["market_date"] for day in days}
+        ):
+            raise ValueError("shadow start transition is invalid")
+        return
+    if candidate.kind == MANUAL_SHADOW_DAY_RESULT_KIND:
+        if report is not None or pending is None:
+            raise ValueError("shadow start already has a day successor")
+        _validate_day_envelope(candidate, start=pending, earlier_days=days, now=now)
+        return
+    if candidate.kind == MANUAL_SHADOW_FINAL_REPORT_KIND:
+        if pending is not None or report is not None or not days:
+            raise ValueError("shadow ledger is not reportable")
+        _validate_report_envelope(candidate, days=days, now=now)
+        return
+    raise ValueError("reserved manual-shadow admission kind is invalid")
+
+
 def _require_known_start(envelopes: tuple[EvidenceEnvelope, ...], object_id: str) -> EvidenceEnvelope:
     for envelope in envelopes:
         if envelope.object_id == object_id and envelope.kind == MANUAL_SHADOW_DAY_START_KIND:
@@ -954,22 +1002,11 @@ def create_shadow_day_start_manifest(
         "calendar": calendar,
     }
 
-    def validate(snapshot: tuple[EvidenceEnvelope, ...], candidate: EvidenceEnvelope) -> None:
-        replay_days, replay_pending, replay_last, replay_report = _LedgerState(snapshot, now=_as_utc(_utc_now()))
-        if replay_pending is not None or replay_report is not None:
-            raise ValueError("shadow ledger does not allow another start")
-        _validate_start_envelope(candidate, now=_as_utc(_utc_now()))
-        expected_phase, expected_role, expected_parent = _start_spec(replay_last)
-        candidate_payload = candidate.payload
-        if (
-            candidate_payload["phase"] != expected_phase
-            or candidate_payload["role"] != expected_role
-            or candidate_payload["predecessor_object_id"] != expected_parent
-            or candidate_payload["market_date"] in {day.payload["market_date"] for day in replay_days}
-        ):
-            raise ValueError("shadow start transition is invalid")
-
-    return _admit(kind=MANUAL_SHADOW_DAY_START_KIND, effective_at=effective_at, payload=payload, validate=validate)
+    return _admit(
+        kind=MANUAL_SHADOW_DAY_START_KIND,
+        effective_at=effective_at,
+        payload=payload,
+    )
 
 
 def adjudicate_shadow_day(
@@ -1022,13 +1059,11 @@ def adjudicate_shadow_day(
     provisional["phase"] = _day_phase(start=start, status=status, earlier_days=days)
     provisional["reasons"] = sorted(set([*failed, *incomplete]))
 
-    def validate(snapshot: tuple[EvidenceEnvelope, ...], candidate: EvidenceEnvelope) -> None:
-        replay_days, replay_pending, _replay_last, replay_report = _LedgerState(snapshot, now=_as_utc(_utc_now()))
-        if replay_report is not None or replay_pending is None or replay_pending.object_id != start_object_id:
-            raise ValueError("shadow start already has a day successor")
-        _validate_day_envelope(candidate, start=replay_pending, earlier_days=replay_days, now=_as_utc(_utc_now()))
-
-    return _admit(kind=MANUAL_SHADOW_DAY_RESULT_KIND, effective_at=effective_at, payload=provisional, validate=validate)
+    return _admit(
+        kind=MANUAL_SHADOW_DAY_RESULT_KIND,
+        effective_at=effective_at,
+        payload=provisional,
+    )
 
 
 def build_shadow_streak_report() -> dict[str, object]:
@@ -1053,11 +1088,9 @@ def build_shadow_streak_report() -> dict[str, object]:
         "reasons": [] if candidate else ["full_ledger_not_terminal_candidate"],
     }
 
-    def validate(snapshot: tuple[EvidenceEnvelope, ...], candidate_envelope: EvidenceEnvelope) -> None:
-        replay_days, replay_pending, _replay_last, replay_report = _LedgerState(snapshot, now=_as_utc(_utc_now()))
-        if replay_pending is not None or replay_report is not None or not replay_days:
-            raise ValueError("shadow ledger is not reportable")
-        _validate_report_envelope(candidate_envelope, days=replay_days, now=_as_utc(_utc_now()))
-
-    admission = _admit(kind=MANUAL_SHADOW_FINAL_REPORT_KIND, effective_at=effective_at, payload=payload, validate=validate)
+    admission = _admit(
+        kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
+        effective_at=effective_at,
+        payload=payload,
+    )
     return _record_view(admission.envelope, path=admission.path)

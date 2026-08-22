@@ -55,14 +55,20 @@ _ALLOWED_KINDS = frozenset(
         NORMAL_LIVE_ACTIVATION_RECEIPT_KIND,
         NORMAL_LIVE_BROKER_SUBMIT_PREPARE_KIND,
         NORMAL_LIVE_BROKER_SUBMIT_RECEIPT_KIND,
+    }
+)
+_RESERVED_MANUAL_SHADOW_KINDS = frozenset(
+    {
         MANUAL_SHADOW_DAY_START_KIND,
         MANUAL_SHADOW_DAY_RESULT_KIND,
         MANUAL_SHADOW_FINAL_REPORT_KIND,
     }
 )
+_ALL_EVIDENCE_KINDS = _ALLOWED_KINDS | _RESERVED_MANUAL_SHADOW_KINDS
+_RESERVED_MANUAL_SHADOW_ADMISSION_ROUTE = "manual-shadow-reserved-v1"
 _STAGED_POINTER_NAME = re.compile(
     r"^\.(?P<kind>"
-    + "|".join(re.escape(kind) for kind in sorted(_ALLOWED_KINDS))
+    + "|".join(re.escape(kind) for kind in sorted(_ALL_EVIDENCE_KINDS))
     + r")\.(?P<pid>[1-9][0-9]*)\.(?P<thread>[1-9][0-9]*)"
     r"\.(?P<nonce>[1-9][0-9]*)\.tmp$"
 )
@@ -122,6 +128,41 @@ _POINTER_FIELDS = frozenset(
         *_AUTHORITY_FIELDS,
     }
 )
+
+
+def _fields_for_kind(
+    kind: str,
+    fields: frozenset[str],
+) -> frozenset[str]:
+    """Return the canonical serialized fields for one admitted kind.
+
+    Manual-shadow evidence has a store-owned admission-route marker.  It is
+    deliberately outside the candidate payload, so a generic caller cannot
+    supply it as self-attested observation data.
+    """
+
+    if kind in _RESERVED_MANUAL_SHADOW_KINDS:
+        return fields | {"admission_route"}
+    return fields
+
+
+def _require_admission_route(
+    kind: str,
+    route: object,
+    *,
+    label: str,
+) -> str | None:
+    if kind in _RESERVED_MANUAL_SHADOW_KINDS:
+        if route != _RESERVED_MANUAL_SHADOW_ADMISSION_ROUTE:
+            raise EvidenceCorruptionError(
+                f"{label} must be the reserved manual-shadow route"
+            )
+        return _RESERVED_MANUAL_SHADOW_ADMISSION_ROUTE
+    if route is not None:
+        raise EvidenceCorruptionError(
+            f"{label} is only valid for reserved manual-shadow evidence"
+        )
+    return None
 
 
 class StrategyEvidenceStoreError(ValueError):
@@ -197,7 +238,7 @@ def _require_schema_version(value: object, *, label: str) -> None:
 
 
 def _require_kind(value: object) -> str:
-    if not isinstance(value, str) or value not in _ALLOWED_KINDS:
+    if not isinstance(value, str) or value not in _ALL_EVIDENCE_KINDS:
         raise StrategyEvidenceStoreError("evidence kind is not allowed")
     return value
 
@@ -363,6 +404,7 @@ class EvidenceEnvelope:
     retry_material_sha256: str
     payload_sha256: str
     payload: Mapping[str, object]
+    admission_route: str | None = None
     schema_version: int = field(init=False, default=1)
     analysis_only: bool = field(init=False, default=True)
     execution_authority: str = field(init=False, default="none")
@@ -370,6 +412,11 @@ class EvidenceEnvelope:
 
     def __post_init__(self) -> None:
         kind = _require_kind(self.kind)
+        _require_admission_route(
+            kind,
+            self.admission_route,
+            label="envelope admission_route",
+        )
         _parse_canonical_utc(self.effective_at, label="effective_at")
         _parse_canonical_utc(self.recorded_at, label="recorded_at")
         retry_digest = _require_digest(
@@ -411,7 +458,17 @@ class EvidenceEnvelope:
     ) -> EvidenceEnvelope:
         if not isinstance(payload, Mapping):
             raise EvidenceCorruptionError("evidence envelope must be an object")
-        _require_exact_fields(payload, _ENVELOPE_FIELDS, label="envelope")
+        try:
+            kind = _require_kind(payload.get("kind"))
+        except StrategyEvidenceStoreError as exc:
+            raise EvidenceCorruptionError(
+                f"evidence envelope schema is invalid: {exc}"
+            ) from exc
+        _require_exact_fields(
+            payload,
+            _fields_for_kind(kind, _ENVELOPE_FIELDS),
+            label="envelope",
+        )
         _require_schema_version(payload["schema_version"], label="envelope")
         _require_authority(payload, label="envelope")
         try:
@@ -425,6 +482,7 @@ class EvidenceEnvelope:
                 ],  # type: ignore[arg-type]
                 payload_sha256=payload["payload_sha256"],  # type: ignore[arg-type]
                 payload=payload["payload"],  # type: ignore[arg-type]
+                admission_route=payload.get("admission_route"),
             )
         except StrategyEvidenceStoreError as exc:
             if isinstance(exc, EvidenceCorruptionError):
@@ -437,7 +495,7 @@ class EvidenceEnvelope:
         payload = _thaw_json(self.payload)
         if not isinstance(payload, dict):
             raise EvidenceCorruptionError("envelope payload is invalid")
-        return {
+        encoded = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "object_id": self.object_id,
@@ -448,6 +506,9 @@ class EvidenceEnvelope:
             "payload": payload,
             **_AUTHORITY_FIELDS,
         }
+        if self.admission_route is not None:
+            encoded["admission_route"] = self.admission_route
+        return encoded
 
     def canonical_json_bytes(self) -> bytes:
         return _canonical_json(self.to_dict())
@@ -478,6 +539,7 @@ class EvidenceEvent:
     effective_at: str
     recorded_at: str
     previous_event_sha256: str
+    admission_route: str | None = None
     schema_version: int = field(init=False, default=1)
     analysis_only: bool = field(init=False, default=True)
     execution_authority: str = field(init=False, default="none")
@@ -487,6 +549,11 @@ class EvidenceEvent:
         if type(self.sequence) is not int or self.sequence < 1:
             raise EvidenceCorruptionError("event sequence must be positive")
         kind = _require_kind(self.kind)
+        _require_admission_route(
+            kind,
+            self.admission_route,
+            label="event admission_route",
+        )
         retry_digest = _require_digest(
             self.retry_material_sha256,
             label="retry_material_sha256",
@@ -511,7 +578,17 @@ class EvidenceEvent:
     ) -> EvidenceEvent:
         if not isinstance(payload, Mapping):
             raise EvidenceCorruptionError("evidence event must be an object")
-        _require_exact_fields(payload, _EVENT_FIELDS, label="event")
+        try:
+            kind = _require_kind(payload.get("kind"))
+        except StrategyEvidenceStoreError as exc:
+            raise EvidenceCorruptionError(
+                f"evidence event schema is invalid: {exc}"
+            ) from exc
+        _require_exact_fields(
+            payload,
+            _fields_for_kind(kind, _EVENT_FIELDS),
+            label="event",
+        )
         _require_schema_version(payload["schema_version"], label="event")
         _require_authority(payload, label="event")
         try:
@@ -528,6 +605,7 @@ class EvidenceEvent:
                 previous_event_sha256=payload[
                     "previous_event_sha256"
                 ],  # type: ignore[arg-type]
+                admission_route=payload.get("admission_route"),
             )
         except StrategyEvidenceStoreError as exc:
             if isinstance(exc, EvidenceCorruptionError):
@@ -537,7 +615,7 @@ class EvidenceEvent:
             ) from exc
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        encoded = {
             "schema_version": self.schema_version,
             "sequence": self.sequence,
             "kind": self.kind,
@@ -549,6 +627,9 @@ class EvidenceEvent:
             "previous_event_sha256": self.previous_event_sha256,
             **_AUTHORITY_FIELDS,
         }
+        if self.admission_route is not None:
+            encoded["admission_route"] = self.admission_route
+        return encoded
 
     def canonical_json_bytes(self) -> bytes:
         return _canonical_json(self.to_dict())
@@ -562,6 +643,7 @@ class EvidencePointer:
     object_sha256: str
     event_sha256: str
     recorded_at: str
+    admission_route: str | None = None
     schema_version: int = field(init=False, default=1)
     analysis_only: bool = field(init=False, default=True)
     execution_authority: str = field(init=False, default="none")
@@ -571,6 +653,11 @@ class EvidencePointer:
         if type(self.sequence) is not int or self.sequence < 1:
             raise EvidenceCorruptionError("pointer sequence must be positive")
         kind = _require_kind(self.kind)
+        _require_admission_route(
+            kind,
+            self.admission_route,
+            label="pointer admission_route",
+        )
         object_digest = _require_digest(
             self.object_sha256,
             label="object_sha256",
@@ -594,7 +681,17 @@ class EvidencePointer:
     ) -> EvidencePointer:
         if not isinstance(payload, Mapping):
             raise EvidenceCorruptionError("evidence pointer must be an object")
-        _require_exact_fields(payload, _POINTER_FIELDS, label="pointer")
+        try:
+            kind = _require_kind(payload.get("kind"))
+        except StrategyEvidenceStoreError as exc:
+            raise EvidenceCorruptionError(
+                f"evidence pointer schema is invalid: {exc}"
+            ) from exc
+        _require_exact_fields(
+            payload,
+            _fields_for_kind(kind, _POINTER_FIELDS),
+            label="pointer",
+        )
         _require_schema_version(payload["schema_version"], label="pointer")
         _require_authority(payload, label="pointer")
         try:
@@ -605,6 +702,7 @@ class EvidencePointer:
                 object_sha256=payload["object_sha256"],  # type: ignore[arg-type]
                 event_sha256=payload["event_sha256"],  # type: ignore[arg-type]
                 recorded_at=payload["recorded_at"],  # type: ignore[arg-type]
+                admission_route=payload.get("admission_route"),
             )
         except StrategyEvidenceStoreError as exc:
             if isinstance(exc, EvidenceCorruptionError):
@@ -614,7 +712,7 @@ class EvidencePointer:
             ) from exc
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        encoded = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "sequence": self.sequence,
@@ -624,6 +722,9 @@ class EvidencePointer:
             "recorded_at": self.recorded_at,
             **_AUTHORITY_FIELDS,
         }
+        if self.admission_route is not None:
+            encoded["admission_route"] = self.admission_route
+        return encoded
 
     def canonical_json_bytes(self) -> bytes:
         return _canonical_json(self.to_dict())
@@ -693,6 +794,9 @@ class ImmutableStrategyEvidenceStore:
         self._events_path = self.root / "events.jsonl"
         self._objects_dir = self.root / "objects"
         self._latest_dir = self.root / "latest"
+        self._managed_kinds = _ALLOWED_KINDS
+        self._staged_pointer_name = _STAGED_POINTER_NAME
+        self._admission_route: str | None = None
         self._transaction_state = threading.local()
 
     def admit_checked(
@@ -733,6 +837,12 @@ class ImmutableStrategyEvidenceStore:
             raise StrategyEvidenceStoreError(
                 "validate_combined must be callable or None"
             )
+        if candidate.kind not in self._managed_kinds:
+            if candidate.kind in _RESERVED_MANUAL_SHADOW_KINDS:
+                raise StrategyEvidenceStoreError(
+                    "manual-shadow evidence kind is reserved"
+                )
+            raise StrategyEvidenceStoreError("evidence kind is not allowed")
         retry_bytes = _retry_material_bytes(
             kind=candidate.kind,
             effective_at=candidate.effective_at,
@@ -792,6 +902,7 @@ class ImmutableStrategyEvidenceStore:
                     retry_material_sha256=retry_digest,
                     payload_sha256=payload_digest,
                     payload=candidate.payload,
+                    admission_route=self._admission_route,
                 )
 
             if (
@@ -849,6 +960,7 @@ class ImmutableStrategyEvidenceStore:
                 effective_at=envelope.effective_at,
                 recorded_at=envelope.recorded_at,
                 previous_event_sha256=previous_hash,
+                admission_route=envelope.admission_route,
             )
             self._preflight_event(event)
             self._preflight_pointer(self._pointer_for(event))
@@ -1321,7 +1433,7 @@ class ImmutableStrategyEvidenceStore:
                 "objects directory could not be listed"
             ) from exc
         for kind in kind_names:
-            if kind not in _ALLOWED_KINDS:
+            if kind not in self._managed_kinds:
                 raise EvidenceCorruptionError(
                     f"unknown object kind path: {kind}"
                 )
@@ -1361,7 +1473,7 @@ class ImmutableStrategyEvidenceStore:
         transaction = self._transaction()
         if transaction.latest_fd is None:
             raise EvidenceCorruptionError("latest directory is not pinned")
-        allowed_names = {f"{kind}.json" for kind in _ALLOWED_KINDS}
+        allowed_names = {f"{kind}.json" for kind in self._managed_kinds}
         try:
             entries = tuple(os.listdir(transaction.latest_fd))
         except OSError as exc:
@@ -1384,7 +1496,7 @@ class ImmutableStrategyEvidenceStore:
                 continue
             if (
                 not recover_staged_pointers
-                or _STAGED_POINTER_NAME.fullmatch(name) is None
+                or self._staged_pointer_name.fullmatch(name) is None
             ):
                 raise EvidenceCorruptionError(
                     f"unknown latest pointer path: {name}"
@@ -2163,6 +2275,7 @@ class ImmutableStrategyEvidenceStore:
                 != envelope.retry_material_sha256
                 or event.effective_at != envelope.effective_at
                 or event.recorded_at != envelope.recorded_at
+                or event.admission_route != envelope.admission_route
             ):
                 raise EvidenceCorruptionError(
                     f"event and object binding mismatch at sequence {event.sequence}"
@@ -2182,7 +2295,7 @@ class ImmutableStrategyEvidenceStore:
         transaction = self._transaction()
         if transaction.objects_fd is None:
             raise EvidenceCorruptionError("objects directory is not pinned")
-        for kind in sorted(_ALLOWED_KINDS):
+        for kind in sorted(self._managed_kinds):
             kind_path = self._kind_directory(kind)
             state = self._entry_state(
                 transaction.objects_fd,
@@ -2307,6 +2420,7 @@ class ImmutableStrategyEvidenceStore:
                 event.canonical_json_bytes()
             ).hexdigest(),
             recorded_at=event.recorded_at,
+            admission_route=event.admission_route,
         )
 
     def _last_events(
@@ -2418,7 +2532,7 @@ class ImmutableStrategyEvidenceStore:
             label="latest directory",
         )
         expected = self._last_events(events)
-        for kind in sorted(_ALLOWED_KINDS):
+        for kind in sorted(self._managed_kinds):
             path = self._pointer_path(kind)
             state = self._path_state(path, label="latest pointer")
             event = expected.get(kind)
@@ -2464,7 +2578,7 @@ class ImmutableStrategyEvidenceStore:
             label="latest directory",
         )
         expected = self._last_events(events)
-        for kind in sorted(_ALLOWED_KINDS):
+        for kind in sorted(self._managed_kinds):
             path = self._pointer_path(kind)
             state = self._path_state(path, label="latest pointer")
             event = expected.get(kind)
@@ -2503,3 +2617,114 @@ class ImmutableStrategyEvidenceStore:
                 raise EvidenceCorruptionError(
                     f"latest pointer is stale or malformed for {kind}"
                 )
+
+
+class _ReservedManualShadowBinding:
+    """Opaque store-internal binding for Task 3's trusted admission seams."""
+
+    __slots__ = ("_clock", "_validator")
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], dt.datetime],
+        validator: Callable[
+            [tuple[EvidenceEnvelope, ...], EvidenceEnvelope],
+            None,
+        ],
+    ) -> None:
+        if not callable(clock) or not callable(validator):
+            raise StrategyEvidenceStoreError(
+                "reserved manual-shadow binding is invalid"
+            )
+        self._clock = clock
+        self._validator = validator
+
+
+def _bind_reserved_manual_shadow_admission(
+    *,
+    clock: Callable[[], dt.datetime],
+    validator: Callable[
+        [tuple[EvidenceEnvelope, ...], EvidenceEnvelope],
+        None,
+    ],
+) -> _ReservedManualShadowBinding:
+    """Bind Task 3-owned seams before opening the non-generic route.
+
+    This is intentionally private.  The route returned to callers accepts
+    only an evidence candidate, never a clock or validation callback.
+    """
+
+    return _ReservedManualShadowBinding(clock=clock, validator=validator)
+
+
+class _ReservedManualShadowEvidenceStore:
+    """Internal analysis-only admission route for the manual-shadow ledger.
+
+    This wrapper intentionally exposes neither a caller clock nor a validation
+    callback.  The public ``ImmutableStrategyEvidenceStore`` rejects these
+    kinds; only the Task 3 façade receives this private route with its trusted
+    clock and per-kind validator already bound.
+    """
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        binding: _ReservedManualShadowBinding,
+    ):
+        if not isinstance(binding, _ReservedManualShadowBinding):
+            raise StrategyEvidenceStoreError(
+                "reserved manual-shadow binding is invalid"
+            )
+        self._store = ImmutableStrategyEvidenceStore(root, clock=binding._clock)
+        self._store._managed_kinds = _RESERVED_MANUAL_SHADOW_KINDS
+        self._store._admission_route = _RESERVED_MANUAL_SHADOW_ADMISSION_ROUTE
+        self._store._staged_pointer_name = re.compile(
+            r"^\.(?P<kind>"
+            + "|".join(
+                re.escape(kind)
+                for kind in sorted(_RESERVED_MANUAL_SHADOW_KINDS)
+            )
+            + r")\.(?P<pid>[1-9][0-9]*)\.(?P<thread>[1-9][0-9]*)"
+            r"\.(?P<nonce>[1-9][0-9]*)\.tmp$"
+        )
+        self._validator = binding._validator
+        self.root = self._store.root
+
+    def admit(self, candidate: EvidenceCandidate) -> EvidenceAdmission:
+        if candidate.kind not in _RESERVED_MANUAL_SHADOW_KINDS:
+            raise StrategyEvidenceStoreError(
+                "reserved manual-shadow route received an invalid kind"
+            )
+        return self._store.admit_checked(candidate, validate=self._validator)
+
+    def envelopes(self) -> tuple[EvidenceEnvelope, ...]:
+        if self._store._root_is_absent():
+            return ()
+
+        def reject_orphans(
+            _snapshot: tuple[EvidenceEnvelope, ...],
+            orphans: tuple[EvidenceEnvelope, ...],
+            _recorded_at: str,
+        ) -> None:
+            if orphans:
+                raise EvidenceCorruptionError(
+                    "reserved manual-shadow ledger has unadmitted objects"
+                )
+
+        self._store.validate_read_only(reject_orphans)
+        return self._store.envelopes()
+
+
+def _open_reserved_manual_shadow_store(
+    root: str | Path,
+    *,
+    binding: _ReservedManualShadowBinding,
+) -> _ReservedManualShadowEvidenceStore:
+    """Create the private Task 3-only manual-shadow admission route."""
+
+    return _ReservedManualShadowEvidenceStore(
+        root,
+        binding=binding,
+    )
