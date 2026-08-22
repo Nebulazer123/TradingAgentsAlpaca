@@ -126,7 +126,7 @@ from tradingagents.brokers.paper_tournament import (
     maybe_write_live_strategy_selection,
     reconcile_tournament_orders,
     record_equity_snapshot,
-    record_submitted_orders,
+    # Submit-only helpers stay local to the command so authority inventory remains explicit.
     write_tournament_ledger,
     write_tournament_packet,
 )
@@ -9999,7 +9999,11 @@ def alpaca_paper_tournament_run(
 ):
     """Run one paper-only tournament tick and optionally submit paper orders."""
     from tradingagents.brokers.paper_tournament import (
-        record_submitted_market_date,
+        begin_submission_transaction,
+        complete_submission_transaction,
+        mark_submission_recovery_required,
+        record_submission_response,
+        tournament_submission_lock,
         validate_submission_lease,
     )
 
@@ -10011,69 +10015,81 @@ def alpaca_paper_tournament_run(
         raise typer.BadParameter(f"unknown strategy id(s): {', '.join(invalid)}")
 
     paper_client = _alpaca_paper_client()
-    ledger = load_tournament_ledger(log_dir)
-    now = _alpaca_policy_now()
-    submission_market_date = None
-    if not dry_run:
+    with tournament_submission_lock(log_dir):
+        ledger = load_tournament_ledger(log_dir)
+        now = _alpaca_policy_now()
+        submission_market_date = None
+        if not dry_run:
+            try:
+                submission_market_date = validate_submission_lease(
+                    ledger,
+                    paper_client=paper_client,
+                    now=now,
+                )
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
         try:
-            submission_market_date = validate_submission_lease(
-                ledger,
-                paper_client=paper_client,
-                now=now,
-            )
-        except ValueError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-    try:
-        paper_orders = paper_client.list_orders(status="all")
-    except Exception:
-        paper_orders = paper_client.list_orders(status="open")
-    reconcile_tournament_orders(ledger, paper_orders, now=now)
-    market_data = _fetch_aggressive_candidate_market_data()
-    candidate_signals = build_candidate_signals(market_data)
-    actions = build_tournament_actions(
-        ledger,
-        candidate_signals=candidate_signals,
-        market_session=market_session_label(),
-        strategy_ids=strategy_ids,
-    )
-    payloads = build_tournament_order_payloads(actions, now=now)
-    submitted = []
-    if not dry_run:
-        for payload in payloads:
-            strategy_id = payload["strategy_id"]
-            reason = payload["reason"]
-            order_payload = {
-                key: value
-                for key, value in payload.items()
-                if key not in {"strategy_id", "reason"}
-            }
-            response = paper_client.submit_order(order_payload)
-            submitted.append(
-                {
-                    "strategy_id": strategy_id,
-                    "reason": reason,
-                    **order_payload,
-                    **response,
-                }
-            )
-        if submitted:
-            record_submitted_orders(ledger, submitted, now=now)
-            record_submitted_market_date(ledger, str(submission_market_date))
-    record_equity_snapshot(ledger, market_data=market_data, now=now)
-    report = build_tournament_report(
-        ledger,
-        market_data=market_data,
-        now=now,
-        min_promotion_days=min_promotion_days,
-    )
-    selection_path = None
-    if not dry_run and ledger.get("ledger_type") != "qualification_paper_trial":
-        selection = maybe_write_live_strategy_selection(report, log_dir, now=now)
-        selection_path = str(selection) if selection else None
-        if selection_path:
-            ledger["live_strategy_selection"] = report["live_strategy_candidate"]
-    ledger["latest_report"] = report
-    ledger_path = write_tournament_ledger(ledger, log_dir)
+            paper_orders = paper_client.list_orders(status="all")
+        except Exception:
+            paper_orders = paper_client.list_orders(status="open")
+        reconcile_tournament_orders(ledger, paper_orders, now=now)
+        market_data = _fetch_aggressive_candidate_market_data()
+        candidate_signals = build_candidate_signals(market_data)
+        actions = build_tournament_actions(
+            ledger,
+            candidate_signals=candidate_signals,
+            market_session=market_session_label(),
+            strategy_ids=strategy_ids,
+        )
+        payloads = build_tournament_order_payloads(actions, now=now)
+        submitted = []
+        if not dry_run and payloads:
+            try:
+                begin_submission_transaction(
+                    ledger,
+                    market_date=str(submission_market_date),
+                    payloads=payloads,
+                    now=now,
+                )
+                write_tournament_ledger(ledger, log_dir)
+                for payload in payloads:
+                    order_payload = {
+                        key: value
+                        for key, value in payload.items()
+                        if key not in {"strategy_id", "reason"}
+                    }
+                    response = paper_client.submit_order(order_payload)
+                    submitted.append(
+                        record_submission_response(
+                            ledger,
+                            payload=payload,
+                            response=response,
+                            market_date=str(submission_market_date),
+                            now=now,
+                        )
+                    )
+                    write_tournament_ledger(ledger, log_dir)
+                complete_submission_transaction(ledger, now=now)
+                write_tournament_ledger(ledger, log_dir)
+            except Exception as exc:
+                mark_submission_recovery_required(ledger, reason=str(exc), now=now)
+                write_tournament_ledger(ledger, log_dir)
+                raise typer.BadParameter("paper submission recovery is required") from exc
+        record_equity_snapshot(ledger, market_data=market_data, now=now)
+        report = build_tournament_report(
+            ledger,
+            market_data=market_data,
+            now=now,
+            min_promotion_days=min_promotion_days,
+        )
+        selection_path = None
+        if not dry_run:
+            selection = maybe_write_live_strategy_selection(report, log_dir, now=now)
+            selection_path = str(selection) if selection else None
+            if selection_path:
+                ledger["live_strategy_selection"] = report["live_strategy_candidate"]
+        ledger["latest_report"] = report
+        ledger_path = write_tournament_ledger(ledger, log_dir)
     packet = {
         "kind": "paper_tournament_run",
         "generated_at": now.isoformat(timespec="seconds"),
@@ -10118,25 +10134,34 @@ def alpaca_paper_tournament_finalize(
     ),
 ):
     """Reconcile tournament paper orders and permanently close its submit lease."""
-    from tradingagents.brokers.paper_tournament import finalize_submission_lease
+    from tradingagents.brokers.paper_tournament import (
+        _validate_exact_paper_client,
+        finalize_submission_lease,
+        tournament_submission_lock,
+    )
 
     paper_client = _alpaca_paper_client()
-    ledger = load_tournament_ledger(log_dir)
-    now = _alpaca_policy_now()
-    try:
-        paper_orders = paper_client.list_orders(status="all")
-    except Exception as exc:
-        raise typer.BadParameter("paper finalization requires complete paper-order reconciliation") from exc
-    try:
-        finalization = finalize_submission_lease(
-            ledger,
-            paper_client=paper_client,
-            paper_orders=paper_orders,
-            now=now,
-        )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    ledger_path = write_tournament_ledger(ledger, log_dir)
+    with tournament_submission_lock(log_dir):
+        ledger = load_tournament_ledger(log_dir)
+        try:
+            _validate_exact_paper_client(paper_client)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        now = _alpaca_policy_now()
+        try:
+            paper_orders = paper_client.list_orders(status="all")
+        except Exception as exc:
+            raise typer.BadParameter("paper finalization requires complete paper-order reconciliation") from exc
+        try:
+            finalization = finalize_submission_lease(
+                ledger,
+                paper_client=paper_client,
+                paper_orders=paper_orders,
+                now=now,
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        ledger_path = write_tournament_ledger(ledger, log_dir)
     packet = {
         "kind": "paper_tournament_finalize",
         "generated_at": now.isoformat(timespec="seconds"),
@@ -10163,25 +10188,28 @@ def alpaca_paper_tournament_report(
     min_promotion_days: int = typer.Option(5, "--min-promotion-days"),
 ):
     """Render the paper-only strategy tournament report."""
+    from tradingagents.brokers.paper_tournament import tournament_submission_lock
+
     paper_client = _alpaca_paper_client()
-    ledger = load_tournament_ledger(log_dir)
-    now = _alpaca_policy_now()
-    try:
-        paper_orders = paper_client.list_orders(status="all")
-    except Exception:
-        paper_orders = paper_client.list_orders(status="open")
-    reconcile_tournament_orders(ledger, paper_orders, now=now)
-    market_data = _fetch_aggressive_candidate_market_data()
-    record_equity_snapshot(ledger, market_data=market_data, now=now)
-    report = build_tournament_report(
-        ledger,
-        market_data=market_data,
-        now=now,
-        min_promotion_days=min_promotion_days,
-    )
-    selection = maybe_write_live_strategy_selection(report, log_dir, now=now)
-    ledger["latest_report"] = report
-    write_tournament_ledger(ledger, log_dir)
+    with tournament_submission_lock(log_dir):
+        ledger = load_tournament_ledger(log_dir)
+        now = _alpaca_policy_now()
+        try:
+            paper_orders = paper_client.list_orders(status="all")
+        except Exception:
+            paper_orders = paper_client.list_orders(status="open")
+        reconcile_tournament_orders(ledger, paper_orders, now=now)
+        market_data = _fetch_aggressive_candidate_market_data()
+        record_equity_snapshot(ledger, market_data=market_data, now=now)
+        report = build_tournament_report(
+            ledger,
+            market_data=market_data,
+            now=now,
+            min_promotion_days=min_promotion_days,
+        )
+        selection = maybe_write_live_strategy_selection(report, log_dir, now=now)
+        ledger["latest_report"] = report
+        write_tournament_ledger(ledger, log_dir)
     packet = {
         "kind": "paper_tournament_report",
         "generated_at": now.isoformat(timespec="seconds"),

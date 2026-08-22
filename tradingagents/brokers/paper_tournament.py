@@ -7,11 +7,14 @@ local virtual ledger that attributes orders and performance to each strategy.
 from __future__ import annotations
 
 import datetime
+import fcntl
 import hashlib
 import json
 import os
+import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
 from pathlib import Path
@@ -32,12 +35,16 @@ ALPHAINSIDER_PAPER_WATCH_ID = "alphainsider-popular-paper"
 QUALIFICATION_TRIAL_LEDGER_TYPE = "qualification_paper_trial"
 SUBMISSION_WINDOW_OPEN = "open"
 SUBMISSION_WINDOW_FINALIZED = "finalized"
+SUBMISSION_WINDOW_RECOVERY_REQUIRED = "recovery_required"
 DEFAULT_TOURNAMENT_RESERVED_BUDGET = Decimal("30000")
 STRATEGY_IDS = (
     STRATEGY_CURRENT_AGGRESSIVE,
     STRATEGY_PULLBACK_SUPPORT,
     STRATEGY_CATALYST_ROTATION,
 )
+
+_LEASE_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_LEASE_THREAD_LOCKS_GUARD = threading.Lock()
 
 STRATEGY_DEFINITIONS = {
     STRATEGY_CURRENT_AGGRESSIVE: {
@@ -254,6 +261,23 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(tz=UTC)
 
 
+@contextmanager
+def tournament_submission_lock(output_dir: str | Path):
+    """Serialize every paper-submit/finalize lease transaction for one ledger."""
+
+    lock_path = Path(output_dir) / ".paper-tournament-submission.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_key = str(lock_path.resolve())
+    with _LEASE_THREAD_LOCKS_GUARD:
+        thread_lock = _LEASE_THREAD_LOCKS.setdefault(lock_key, threading.RLock())
+    with thread_lock, lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _submission_lease_evidence(ledger: Mapping) -> str:
     """Hash the immutable part of the bounded paper-submission lease."""
 
@@ -381,6 +405,136 @@ def record_submitted_market_date(ledger: dict, market_date: str) -> None:
     submitted_dates.append(market_date)
 
 
+def begin_submission_transaction(
+    ledger: dict,
+    *,
+    market_date: str,
+    payloads: Sequence[Mapping],
+    now: datetime.datetime,
+) -> None:
+    """Persist the exact intended paper order identities before the first POST."""
+
+    client_order_ids: list[str] = []
+    for payload in payloads:
+        strategy_id = payload.get("strategy_id")
+        client_order_id = payload.get("client_order_id")
+        if (
+            strategy_id not in STRATEGY_IDS
+            or type(client_order_id) is not str
+            or _strategy_from_client_order_id(client_order_id) != strategy_id
+            or client_order_id in client_order_ids
+        ):
+            raise ValueError("paper submission payload identities are malformed")
+        client_order_ids.append(client_order_id)
+    ledger["submission_transaction"] = {
+        "status": "submitting",
+        "market_date": market_date,
+        "started_at": _iso(now),
+        "pending_client_order_ids": client_order_ids,
+        "successful_submissions": [],
+    }
+
+
+def _validate_paper_submission_response(payload: Mapping, response: object) -> dict:
+    if not isinstance(response, Mapping):
+        raise ValueError("paper submission response is not a mapping")
+    normalized = dict(response)
+    try:
+        json.dumps(normalized, ensure_ascii=True, sort_keys=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("paper submission response is not durable JSON evidence") from exc
+    client_order_id = payload.get("client_order_id")
+    if normalized.get("client_order_id") != client_order_id:
+        raise ValueError("paper submission response client order identity does not match request")
+    if "strategy_id" in normalized and normalized["strategy_id"] != payload.get("strategy_id"):
+        raise ValueError("paper submission response strategy identity does not match request")
+    for field in (
+        "symbol",
+        "side",
+        "type",
+        "time_in_force",
+        "limit_price",
+        "notional",
+        "extended_hours",
+    ):
+        if field in normalized and normalized[field] != payload.get(field):
+            raise ValueError(f"paper submission response {field} does not match request")
+    if type(normalized.get("id")) is not str or not normalized["id"]:
+        raise ValueError("paper submission response has no broker order identity")
+    if type(normalized.get("status")) is not str or not normalized["status"]:
+        raise ValueError("paper submission response has no broker order status")
+    return normalized
+
+
+def record_submission_response(
+    ledger: dict,
+    *,
+    payload: Mapping,
+    response: object,
+    market_date: str,
+    now: datetime.datetime,
+) -> dict:
+    """Record one verified paper POST before the next POST may be attempted."""
+
+    transaction = ledger.get("submission_transaction")
+    if not isinstance(transaction, dict) or transaction.get("status") != "submitting":
+        raise ValueError("paper submission transaction is not active")
+    normalized = _validate_paper_submission_response(payload, response)
+    client_order_id = str(payload["client_order_id"])
+    pending = transaction.get("pending_client_order_ids")
+    if not isinstance(pending, list) or client_order_id not in pending:
+        raise ValueError("paper submission response has no pending request evidence")
+    submitted = {
+        "strategy_id": payload["strategy_id"],
+        "reason": payload["reason"],
+        **{
+            key: value
+            for key, value in payload.items()
+            if key not in {"strategy_id", "reason"}
+        },
+        **normalized,
+    }
+    record_submitted_orders(ledger, [submitted], now=now)
+    if market_date not in ledger.get("submitted_market_dates", []):
+        record_submitted_market_date(ledger, market_date)
+    successful = transaction.get("successful_submissions")
+    if not isinstance(successful, list):
+        raise ValueError("paper submission transaction evidence is malformed")
+    successful.append(
+        {
+            "client_order_id": client_order_id,
+            "market_date": market_date,
+            "recorded_at": _iso(now),
+            "response": normalized,
+        }
+    )
+    pending.remove(client_order_id)
+    return submitted
+
+
+def complete_submission_transaction(ledger: dict, *, now: datetime.datetime) -> None:
+    transaction = ledger.get("submission_transaction")
+    if not isinstance(transaction, dict) or transaction.get("status") != "submitting":
+        raise ValueError("paper submission transaction is not active")
+    if transaction.get("pending_client_order_ids"):
+        raise ValueError("paper submission transaction has unresolved requests")
+    transaction["status"] = "completed"
+    transaction["completed_at"] = _iso(now)
+
+
+def mark_submission_recovery_required(ledger: dict, *, reason: str, now: datetime.datetime) -> None:
+    """Seal an uncertain broker side effect so no same-ledger retry can duplicate it."""
+
+    transaction = ledger.get("submission_transaction")
+    if not isinstance(transaction, dict):
+        transaction = {}
+        ledger["submission_transaction"] = transaction
+    transaction["status"] = SUBMISSION_WINDOW_RECOVERY_REQUIRED
+    transaction["failed_at"] = _iso(now)
+    transaction["failure_reason"] = reason[:500]
+    ledger["submission_window_status"] = SUBMISSION_WINDOW_RECOVERY_REQUIRED
+
+
 def finalize_submission_lease(
     ledger: dict,
     *,
@@ -397,21 +551,66 @@ def finalize_submission_lease(
         raise ValueError("paper submission lease is already closed or finalized")
     if ledger.get("submission_lease_evidence") != _submission_lease_evidence(ledger):
         raise ValueError("paper submission lease evidence does not match ledger")
-    local_orders = {
-        str(order.get("client_order_id")): order
-        for strategy in (ledger.get("strategies") or {}).values()
-        if isinstance(strategy, Mapping)
-        for order in (strategy.get("orders") or [])
-        if isinstance(order, Mapping) and str(order.get("client_order_id", "")).startswith("ta-paperbot-")
-    }
-    remote_orders = [
-        order
-        for order in paper_orders
-        if isinstance(order, Mapping) and str(order.get("client_order_id", "")).startswith("ta-paperbot-")
-    ]
-    remote_by_client_id = {str(order.get("client_order_id")): order for order in remote_orders}
+    strategies = ledger.get("strategies")
+    if not isinstance(strategies, Mapping) or not isinstance(paper_orders, list):
+        raise ValueError("paper finalization has malformed order evidence")
+    local_order_items: list[tuple[str, Mapping]] = []
+    for strategy_id, strategy in strategies.items():
+        if not isinstance(strategy, Mapping) or not isinstance(strategy.get("orders", []), list):
+            raise ValueError("paper finalization has malformed local order evidence")
+        for order in strategy.get("orders", []):
+            if not isinstance(order, Mapping):
+                continue
+            client_order_id = order.get("client_order_id")
+            if type(client_order_id) is not str or not client_order_id.startswith("ta-paperbot-"):
+                continue
+            if (
+                _strategy_from_client_order_id(client_order_id) != strategy_id
+                or any(
+                    key not in order
+                    for key in (
+                        "id",
+                        "status",
+                        "symbol",
+                        "side",
+                        "type",
+                        "notional",
+                        "limit_price",
+                        "submitted_at",
+                        "reason",
+                    )
+                )
+            ):
+                raise ValueError("paper finalization has malformed local order evidence")
+            local_order_items.append((client_order_id, order))
+    local_orders = {client_order_id: order for client_order_id, order in local_order_items}
+    if len(local_orders) != len(local_order_items):
+        raise ValueError("paper finalization is incomplete because local order identities are duplicated")
+    if any(not isinstance(order, Mapping) for order in paper_orders):
+        raise ValueError("paper finalization has malformed broker order evidence")
+    remote_orders = []
+    for order in paper_orders:
+        client_order_id = order.get("client_order_id")
+        if type(client_order_id) is not str or not client_order_id.startswith("ta-paperbot-"):
+            continue
+        if (
+            type(order.get("id")) is not str
+            or not order.get("id")
+            or type(order.get("status")) is not str
+            or not order.get("status")
+        ):
+            raise ValueError("paper finalization has malformed broker order evidence")
+        remote_orders.append(order)
+    remote_by_client_id = {str(order["client_order_id"]): order for order in remote_orders}
     if len(remote_by_client_id) != len(remote_orders) or set(local_orders) != set(remote_by_client_id):
         raise ValueError("paper finalization is incomplete because tournament orders are ambiguous")
+    for client_order_id, local_order in local_orders.items():
+        remote_order = remote_by_client_id[client_order_id]
+        if local_order.get("id") != remote_order.get("id"):
+            raise ValueError("paper finalization is incomplete because order evidence does not match")
+        for field in ("symbol", "side", "type"):
+            if field in remote_order and local_order.get(field) != remote_order.get(field):
+                raise ValueError("paper finalization is incomplete because order evidence does not match")
     terminal_statuses = {"filled", "canceled", "expired", "rejected"}
     unresolved = [
         client_order_id
@@ -1125,6 +1324,7 @@ def build_tournament_report(
         }
     report = {
         "generated_at": _iso(now),
+        "ledger_type": ledger.get("ledger_type"),
         "tournament_id": ledger.get("tournament_id"),
         "started_at": ledger.get("started_at"),
         "ends_at": ledger.get("ends_at"),
@@ -1440,6 +1640,11 @@ def maybe_write_live_strategy_selection(
     *,
     now: datetime.datetime | None = None,
 ) -> Path | None:
+    path = Path(output_dir)
+    selection_path = path / LIVE_SELECTION_FILE
+    if report.get("ledger_type") == QUALIFICATION_TRIAL_LEDGER_TYPE:
+        selection_path.unlink(missing_ok=True)
+        return None
     candidate = report.get("live_strategy_candidate") or {}
     if candidate.get("status") != "candidate" or not candidate.get("strategy_id"):
         return None
@@ -1469,9 +1674,7 @@ def maybe_write_live_strategy_selection(
         "reason": candidate.get("reason", ""),
         "source_report": source_report,
     }
-    path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
-    selection_path = path / LIVE_SELECTION_FILE
     selection_path.write_text(json.dumps(selection, indent=2), encoding="utf-8")
     return selection_path
 
