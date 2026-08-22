@@ -735,6 +735,8 @@ def test_paper_tournament_submit_persists_partial_post_evidence_and_blocks_retry
 def test_interrupted_submission_transaction_blocks_retry_before_transport(monkeypatch, tmp_path):
     paper_client = _FakePaperClient()
     persisted = _persist_interrupted_submission(paper_client, tmp_path)
+    selection_path = tmp_path / "live-strategy-selection.json"
+    selection_path.write_text('{"status": "active"}', encoding="utf-8")
     _configure_current_submit(monkeypatch, paper_client)
 
     retry = runner.invoke(
@@ -747,6 +749,7 @@ def test_interrupted_submission_transaction_blocks_retry_before_transport(monkey
 
     assert retry.exit_code != 0
     assert len(paper_client.submitted) == 1
+    assert not selection_path.exists()
     updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
     assert updated["submission_window_status"] == "open"
     assert updated["submission_transaction"] == persisted["submission_transaction"]

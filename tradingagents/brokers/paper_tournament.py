@@ -1679,11 +1679,10 @@ def maybe_write_live_strategy_selection(
     *,
     now: datetime.datetime | None = None,
 ) -> Path | None:
+    if remove_trial_live_strategy_selection(report, output_dir):
+        return None
     path = Path(output_dir)
     selection_path = path / LIVE_SELECTION_FILE
-    if report.get("ledger_type") == QUALIFICATION_TRIAL_LEDGER_TYPE:
-        selection_path.unlink(missing_ok=True)
-        return None
     candidate = report.get("live_strategy_candidate") or {}
     if candidate.get("status") != "candidate" or not candidate.get("strategy_id"):
         return None
@@ -1716,6 +1715,15 @@ def maybe_write_live_strategy_selection(
     path.mkdir(parents=True, exist_ok=True)
     selection_path.write_text(json.dumps(selection, indent=2), encoding="utf-8")
     return selection_path
+
+
+def remove_trial_live_strategy_selection(ledger_or_report: Mapping, output_dir: str | Path) -> bool:
+    """Remove the selection target whenever a qualification trial owns this path."""
+
+    if ledger_or_report.get("ledger_type") != QUALIFICATION_TRIAL_LEDGER_TYPE:
+        return False
+    (Path(output_dir) / LIVE_SELECTION_FILE).unlink(missing_ok=True)
+    return True
 
 
 def load_live_strategy_selection(

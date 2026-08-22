@@ -10003,6 +10003,7 @@ def alpaca_paper_tournament_run(
         complete_submission_transaction,
         mark_submission_recovery_required,
         record_submission_response,
+        remove_trial_live_strategy_selection,
         tournament_submission_lock,
         validate_submission_lease,
     )
@@ -10017,6 +10018,7 @@ def alpaca_paper_tournament_run(
     paper_client = _alpaca_paper_client()
     with tournament_submission_lock(log_dir):
         ledger = load_tournament_ledger(log_dir)
+        remove_trial_live_strategy_selection(ledger, log_dir)
         now = _alpaca_policy_now()
         submission_market_date = None
         if not dry_run:
@@ -10190,11 +10192,15 @@ def alpaca_paper_tournament_report(
     min_promotion_days: int = typer.Option(5, "--min-promotion-days"),
 ):
     """Render the paper-only strategy tournament report."""
-    from tradingagents.brokers.paper_tournament import tournament_submission_lock
+    from tradingagents.brokers.paper_tournament import (
+        remove_trial_live_strategy_selection,
+        tournament_submission_lock,
+    )
 
     paper_client = _alpaca_paper_client()
     with tournament_submission_lock(log_dir):
         ledger = load_tournament_ledger(log_dir)
+        remove_trial_live_strategy_selection(ledger, log_dir)
         now = _alpaca_policy_now()
         try:
             paper_orders = paper_client.list_orders(status="all")
