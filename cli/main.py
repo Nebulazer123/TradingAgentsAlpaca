@@ -9423,6 +9423,153 @@ def research_safety_sentinel_audit(
     console.print(f"Packet: {packet_path}")
 
 
+def _shadow_trial_cli_time(value: str | None) -> datetime.datetime | None:
+    """Parse an optional testable observer timestamp; never infer an authority time."""
+
+    if value is None:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise typer.BadParameter("--now must be an ISO-8601 timezone-aware timestamp") from exc
+    if parsed.tzinfo is None:
+        raise typer.BadParameter("--now must be an ISO-8601 timezone-aware timestamp")
+    return parsed
+
+
+@research_app.command("shadow-day-start")
+def research_shadow_day_start(
+    run_id: str = typer.Option(..., "--run-id", help="Opaque manual observer run identifier."),
+    market_date: str = typer.Option(..., "--market-date", help="Current Central regular-market date."),
+    live_control_path: Path = typer.Option(
+        Path("results/policy/live_control.json"),
+        "--live-control-path",
+        help="Existing live-control evidence to read without changing it.",
+    ),
+    automation_evidence_path: Path = typer.Option(
+        Path("results/automation_health/latest.json"),
+        "--automation-evidence-path",
+        help="Existing paused-automation evidence to read without changing it.",
+    ),
+    phase: str = typer.Option("qualification_pending", "--phase"),
+    output_dir: Path = typer.Option(
+        Path("results/manual_shadow"),
+        "--output-dir",
+        help="Directory for immutable manual shadow-trial evidence.",
+    ),
+    now: str | None = typer.Option(None, "--now", help="Timezone-aware ISO timestamp for deterministic tests."),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Capture start-state evidence only; this command has no authority effects."""
+
+    from tradingagents.evals.shadow_trial import (
+        create_shadow_day_start_manifest,
+        write_shadow_trial_packet,
+    )
+
+    try:
+        manifest = create_shadow_day_start_manifest(
+            run_id=run_id,
+            market_date=market_date,
+            live_control_path=live_control_path,
+            automation_evidence_path=automation_evidence_path,
+            phase=phase,
+            now=_shadow_trial_cli_time(now),
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    manifest_path = write_shadow_trial_packet(manifest, output_dir=output_dir, prefix="shadow-day-start")
+    payload = {**manifest, "manifest_path": str(manifest_path)}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Shadow-day start manifest: {manifest_path}")
+
+
+@research_app.command("shadow-day-adjudicate")
+def research_shadow_day_adjudicate(
+    start_manifest: Path = typer.Option(..., "--start-manifest", help="Prior immutable start manifest."),
+    safety_sentinel: Path = typer.Option(..., "--safety-sentinel", help="Same-run sentinel artifact."),
+    paper_tournament: Path = typer.Option(..., "--paper-tournament", help="Same-run paper artifact."),
+    output_dir: Path = typer.Option(
+        Path("results/manual_shadow"),
+        "--output-dir",
+        help="Directory for immutable manual shadow-trial evidence.",
+    ),
+    max_evidence_age_minutes: float = typer.Option(
+        90.0,
+        "--max-evidence-age-minutes",
+        min=0.1,
+        help="Maximum age for the exact supplied observer artifacts.",
+    ),
+    now: str | None = typer.Option(None, "--now", help="Timezone-aware ISO timestamp for deterministic tests."),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Adjudicate supplied local evidence only; missing evidence is never a pass."""
+
+    from tradingagents.evals.shadow_trial import (
+        adjudicate_shadow_day,
+        load_shadow_json,
+        write_shadow_trial_packet,
+    )
+
+    try:
+        decision = adjudicate_shadow_day(
+            load_shadow_json(start_manifest),
+            {"safety_sentinel": safety_sentinel, "paper_tournament": paper_tournament},
+            now=_shadow_trial_cli_time(now),
+            max_evidence_age_minutes=max_evidence_age_minutes,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    decision_path = write_shadow_trial_packet(
+        decision,
+        output_dir=output_dir,
+        prefix="shadow-day-adjudication",
+    )
+    payload = {**decision, "decision_path": str(decision_path)}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Shadow-day adjudication: {decision['status']}")
+    console.print(f"Decision: {decision_path}")
+
+
+@research_app.command("shadow-streak-report")
+def research_shadow_streak_report(
+    day_record: list[Path] = typer.Option([], "--day-record", help="Immutable adjudication record; repeat once per day."),
+    output_dir: Path = typer.Option(
+        Path("results/manual_shadow"),
+        "--output-dir",
+        help="Directory for immutable manual shadow-trial evidence.",
+    ),
+    now: str | None = typer.Option(None, "--now", help="Timezone-aware ISO timestamp for deterministic tests."),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Build a non-authorizing readiness report from supplied day records only."""
+
+    from tradingagents.evals.shadow_trial import (
+        build_shadow_streak_report,
+        load_shadow_json,
+        write_shadow_trial_packet,
+    )
+
+    try:
+        report = build_shadow_streak_report(
+            [load_shadow_json(path) for path in day_record],
+            now=_shadow_trial_cli_time(now),
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    report_path = write_shadow_trial_packet(report, output_dir=output_dir, prefix="shadow-streak-report")
+    payload = {**report, "report_path": str(report_path)}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Shadow-trial readiness: {report['status']}")
+    console.print(f"Report: {report_path}")
+
+
 def _write_reconciliation_packet(
     output_dir: Path,
     *,
