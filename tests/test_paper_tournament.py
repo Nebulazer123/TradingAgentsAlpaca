@@ -14,6 +14,7 @@ from tradingagents.brokers.paper_tournament import (
     COMPACT_LEDGER_FILE,
     LEDGER_FILE,
     STRATEGY_CURRENT_AGGRESSIVE,
+    STRATEGY_PULLBACK_SUPPORT,
     _parse_timestamp,
     _tournament_expired,
     build_alphainsider_paper_watch_plan,
@@ -697,6 +698,119 @@ def test_submission_lease_brackets_broker_clock_with_post_response_policy_time()
             paper_client=paper_client,
             now=before_clock,
             post_clock_now=lambda: before_clock + datetime.timedelta(milliseconds=2),
+        )
+
+
+def test_submission_lease_uses_post_response_policy_time_for_expiry_and_clock_order():
+    paper_client = _FakePaperClient()
+    before_expiry = datetime.datetime(2026, 6, 2, 17, 59, 59, tzinfo=datetime.timezone.utc)
+    after_expiry = datetime.datetime(2026, 6, 2, 18, 0, 1, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": before_expiry.isoformat()}
+    ledger = initialize_tournament(
+        paper_account=paper_client.get_account(),
+        paper_positions=[],
+        capital_per_strategy=Decimal("10000"),
+        now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+        duration_days=1,
+        max_submission_market_days=1,
+    )
+
+    with pytest.raises(ValueError, match="expired"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=before_expiry,
+            post_clock_now=lambda: after_expiry,
+        )
+    with pytest.raises(ValueError, match="moved backwards"):
+        paper_tournament.validate_submission_lease(
+            _current_trial_ledger(paper_client),
+            paper_client=paper_client,
+            now=before_expiry,
+            post_clock_now=lambda: before_expiry - datetime.timedelta(milliseconds=1),
+        )
+
+
+def test_submission_response_and_persisted_ledger_reject_reversed_record_times():
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client)
+    started_at = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    first_payload = {
+        "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+        "symbol": "NVDA",
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": "218.43",
+        "notional": "1000.00",
+        "extended_hours": False,
+        "client_order_id": "ta-paperbot-current-aggressive-ordering-one",
+        "reason": "test",
+    }
+    second_payload = {
+        **first_payload,
+        "strategy_id": STRATEGY_PULLBACK_SUPPORT,
+        "client_order_id": "ta-paperbot-pullback-support-ordering-two",
+    }
+    paper_tournament.begin_submission_transaction(
+        ledger,
+        market_date="2026-06-02",
+        payloads=[first_payload, second_payload],
+        now=started_at,
+    )
+    paper_tournament.record_submission_response(
+        ledger,
+        payload=first_payload,
+        response={
+            "id": "paper-ordering-one",
+            "status": "filled",
+            **{key: value for key, value in first_payload.items() if key not in {"strategy_id", "reason"}},
+        },
+        market_date="2026-06-02",
+        now=started_at + datetime.timedelta(minutes=2),
+    )
+    with pytest.raises(ValueError, match="monotonic"):
+        paper_tournament.record_submission_response(
+            ledger,
+            payload=second_payload,
+            response={
+                "id": "paper-ordering-two",
+                "status": "filled",
+                **{key: value for key, value in second_payload.items() if key not in {"strategy_id", "reason"}},
+            },
+            market_date="2026-06-02",
+            now=started_at + datetime.timedelta(minutes=1),
+        )
+
+    completed = json.loads(json.dumps(ledger))
+    completed["submission_transaction"]["pending_client_order_ids"] = []
+    completed["submission_transaction"]["successful_submissions"].append(
+        {
+            "client_order_id": "ta-paperbot-pullback-support-ordering-two",
+            "market_date": "2026-06-02",
+            "recorded_at": (started_at + datetime.timedelta(minutes=1)).isoformat(),
+            "response": {"id": "paper-ordering-two", "status": "filled"},
+        }
+    )
+    completed["submission_transaction"]["status"] = "completed"
+    completed["submission_transaction"]["completed_at"] = (
+        started_at + datetime.timedelta(minutes=3)
+    ).isoformat()
+    with pytest.raises(ValueError, match="recovery is required"):
+        paper_tournament.validate_submission_transaction_state(completed)
+    submitting = json.loads(json.dumps(completed))
+    submitting["submission_transaction"]["status"] = "submitting"
+    submitting["submission_transaction"].pop("completed_at")
+    with pytest.raises(ValueError, match="monotonic"):
+        paper_tournament.complete_submission_transaction(
+            submitting,
+            now=started_at + datetime.timedelta(minutes=3),
+        )
+    with pytest.raises(ValueError, match="monotonic"):
+        paper_tournament.mark_submission_recovery_required(
+            submitting,
+            reason="test",
+            now=started_at + datetime.timedelta(minutes=3),
         )
 
 

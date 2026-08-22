@@ -168,10 +168,16 @@ timestamp within 15 minutes of the local policy time, `is_open` must be the exac
 boolean `true`, and its America/Chicago date must be the current qualifying market
 date. A missing, malformed, stale, future, closed, after-hours, or wrong-date
 clock rejects before the durable submission transaction and before any paper POST.
-The CLI re-reads both policy time and the exact paper broker clock immediately
-before it persists that transaction and immediately before every POST; a delayed
-preparation fails before the transaction with zero posts. A close-boundary failure
-after a prior POST seals recovery-required evidence and makes zero additional posts.
+The CLI brackets each exact paper broker-clock response with local policy time.
+The post-response local sample is authoritative for every time-sensitive lease
+check (start, expiry, current Central date, and day capacity); it must not move
+backward from the pre-request sample. The CLI repeats that complete boundary
+check immediately before it persists the transaction and immediately before every
+POST. A delayed preparation fails before the transaction with zero posts. A
+close-boundary failure after a prior POST seals recovery-required evidence and
+makes zero additional posts. Successful submission evidence must also have
+nondecreasing `recorded_at` values, so a persisted reverse-order response record
+is recovery-required rather than eligible for finalization.
 
 ```zsh
 TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main alpaca paper-tournament run --all \

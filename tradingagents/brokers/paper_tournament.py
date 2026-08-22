@@ -333,10 +333,9 @@ def _validate_regular_paper_broker_clock(
     paper_client: object,
     *,
     now: datetime.datetime,
-    market_date: str,
     post_clock_now: Callable[[], datetime.datetime] | None = None,
-) -> None:
-    """Require a fresh, open, same-day regular-session paper broker clock."""
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """Read an open paper clock and return its authoritative local-time bracket."""
 
     get_clock = getattr(paper_client, "get_clock", None)
     if not callable(get_clock):
@@ -347,29 +346,23 @@ def _validate_regular_paper_broker_clock(
         raise ValueError("paper submission lease broker clock check failed") from exc
     if not isinstance(clock, Mapping) or clock.get("is_open") is not True:
         raise ValueError("paper submission lease requires an open broker clock")
+    pre_clock_policy_now = _normalize_aware_policy_timestamp(now)
     clock_timestamp = _parse_broker_clock_timestamp(clock.get("timestamp"))
     observed_policy_now = post_clock_now() if post_clock_now is not None else now
-    now_timestamp = _normalize_aware_policy_timestamp(observed_policy_now)
-    if clock_timestamp is None or now_timestamp is None:
-        raise ValueError("paper submission lease broker clock is malformed")
-    if clock_timestamp > now_timestamp:
-        raise ValueError("paper submission lease broker clock is future")
-    if (now_timestamp - clock_timestamp).total_seconds() > MAX_BROKER_CLOCK_SKEW_SECONDS:
-        raise ValueError("paper submission lease broker clock is stale")
-    clock_central = clock_timestamp.astimezone(CENTRAL)
-    policy_central = now_timestamp.astimezone(CENTRAL)
+    authoritative_policy_now = _normalize_aware_policy_timestamp(observed_policy_now)
     if (
-        policy_central.date().isoformat() != market_date
-        or clock_central.date().isoformat() != market_date
+        pre_clock_policy_now is None
+        or clock_timestamp is None
+        or authoritative_policy_now is None
     ):
-        raise ValueError("paper submission lease broker clock has the wrong Central market date")
-    regular_open = datetime.time(hour=8, minute=30)
-    regular_close = datetime.time(hour=15)
-    if not (
-        regular_open <= policy_central.timetz().replace(tzinfo=None) < regular_close
-        and regular_open <= clock_central.timetz().replace(tzinfo=None) < regular_close
-    ):
-        raise ValueError("paper submission lease broker clock is outside the regular session")
+        raise ValueError("paper submission lease broker clock is malformed")
+    if authoritative_policy_now < pre_clock_policy_now:
+        raise ValueError("paper submission lease local policy clock moved backwards")
+    if clock_timestamp > authoritative_policy_now:
+        raise ValueError("paper submission lease broker clock is future")
+    if (authoritative_policy_now - clock_timestamp).total_seconds() > MAX_BROKER_CLOCK_SKEW_SECONDS:
+        raise ValueError("paper submission lease broker clock is stale")
+    return authoritative_policy_now, clock_timestamp
 
 
 def _validate_exact_paper_client(paper_client: object) -> None:
@@ -418,6 +411,7 @@ def validate_submission_transaction_state(ledger: Mapping) -> None:
         or market_date not in ledger["submitted_market_dates"]
     ):
         raise ValueError("paper submission lease recovery is required for an incomplete transaction")
+    previous_recorded_at: datetime.datetime | None = None
     for submission in successful:
         recorded_at = _parse_timestamp(submission.get("recorded_at")) if isinstance(submission, Mapping) else None
         if (
@@ -429,8 +423,10 @@ def validate_submission_transaction_state(ledger: Mapping) -> None:
             or recorded_at < started_at
             or recorded_at > completed_at
             or not isinstance(submission.get("response"), Mapping)
+            or (previous_recorded_at is not None and recorded_at < previous_recorded_at)
         ):
             raise ValueError("paper submission lease recovery is required for an incomplete transaction")
+        previous_recorded_at = recorded_at
 
 
 def _validate_submission_lease(
@@ -462,13 +458,18 @@ def _validate_submission_lease(
         ledger.get("submission_lease_evidence") != _submission_lease_evidence(ledger)
     ):
         raise ValueError("paper submission lease evidence does not match ledger")
+    authoritative_policy_now, clock_timestamp = _validate_regular_paper_broker_clock(
+        paper_client,
+        now=now_timestamp,
+        post_clock_now=post_clock_now,
+    )
     started_at = _parse_timestamp(ledger.get("started_at"))
     ends_at = _parse_timestamp(ledger.get("ends_at"))
     if started_at is None or ends_at is None or started_at >= ends_at:
         raise ValueError("paper submission lease timestamps are malformed")
-    if now_timestamp < started_at:
+    if authoritative_policy_now < started_at:
         raise ValueError("paper submission lease has not started")
-    if now_timestamp >= ends_at:
+    if authoritative_policy_now >= ends_at:
         raise ValueError("paper submission lease has expired")
     limit = ledger.get("authorized_market_day_limit")
     submitted_dates = ledger.get("submitted_market_dates")
@@ -497,10 +498,21 @@ def _validate_submission_lease(
             validate_submission_transaction_state(ledger)
     else:
         validate_submission_transaction_state(ledger)
-    market_date = _central_market_date(now_timestamp)
+    market_date = _central_market_date(authoritative_policy_now)
     if market_date is None:
         raise ValueError("paper submission lease has no Central market date")
-    if now_timestamp.astimezone(CENTRAL).weekday() >= 5:
+    policy_central = authoritative_policy_now.astimezone(CENTRAL)
+    clock_central = clock_timestamp.astimezone(CENTRAL)
+    if policy_central.date().isoformat() != market_date or clock_central.date().isoformat() != market_date:
+        raise ValueError("paper submission lease broker clock has the wrong Central market date")
+    regular_open = datetime.time(hour=8, minute=30)
+    regular_close = datetime.time(hour=15)
+    if not (
+        regular_open <= policy_central.timetz().replace(tzinfo=None) < regular_close
+        and regular_open <= clock_central.timetz().replace(tzinfo=None) < regular_close
+    ):
+        raise ValueError("paper submission lease broker clock is outside the regular session")
+    if policy_central.weekday() >= 5:
         raise ValueError("paper submission lease requires a regular Central market date")
     list_calendar = getattr(paper_client, "list_calendar", None)
     if not callable(list_calendar):
@@ -519,12 +531,6 @@ def _validate_submission_lease(
         raise ValueError("paper submission lease already used this Central market date")
     if len(submitted_dates) >= limit and not consuming_active_submission_date:
         raise ValueError("paper submission lease market-day capacity is exhausted")
-    _validate_regular_paper_broker_clock(
-        paper_client,
-        now=now_timestamp,
-        market_date=market_date,
-        post_clock_now=post_clock_now,
-    )
     return market_date
 
 
@@ -667,6 +673,24 @@ def record_submission_response(
     pending = transaction.get("pending_client_order_ids")
     if not isinstance(pending, list) or client_order_id not in pending:
         raise ValueError("paper submission response has no pending request evidence")
+    successful = transaction.get("successful_submissions")
+    if not isinstance(successful, list):
+        raise ValueError("paper submission transaction evidence is malformed")
+    previous_recorded_at: datetime.datetime | None = None
+    for existing_submission in successful:
+        existing_recorded_at = (
+            _parse_timestamp(existing_submission.get("recorded_at"))
+            if isinstance(existing_submission, Mapping)
+            else None
+        )
+        if (
+            existing_recorded_at is None
+            or (previous_recorded_at is not None and existing_recorded_at < previous_recorded_at)
+        ):
+            raise ValueError("paper submission transaction evidence is not monotonic")
+        previous_recorded_at = existing_recorded_at
+    if previous_recorded_at is not None and recorded_at < previous_recorded_at:
+        raise ValueError("paper submission response timestamp is not monotonic")
     submitted = {
         "strategy_id": payload["strategy_id"],
         "reason": payload["reason"],
@@ -680,9 +704,6 @@ def record_submission_response(
     record_submitted_orders(ledger, [submitted], now=now)
     if market_date not in ledger.get("submitted_market_dates", []):
         record_submitted_market_date(ledger, market_date)
-    successful = transaction.get("successful_submissions")
-    if not isinstance(successful, list):
-        raise ValueError("paper submission transaction evidence is malformed")
     successful.append(
         {
             "client_order_id": client_order_id,
@@ -704,11 +725,18 @@ def complete_submission_transaction(ledger: dict, *, now: datetime.datetime) -> 
     completed_at = _normalize_aware_policy_timestamp(now)
     started_at = _parse_timestamp(transaction.get("started_at"))
     successful = transaction.get("successful_submissions")
-    recorded_at_values = (
-        [_parse_timestamp(item.get("recorded_at")) for item in successful]
-        if isinstance(successful, list)
-        else []
-    )
+    recorded_at_values: list[datetime.datetime | None] = []
+    if isinstance(successful, list):
+        for item in successful:
+            recorded_at = _parse_timestamp(item.get("recorded_at")) if isinstance(item, Mapping) else None
+            if (
+                recorded_at_values
+                and recorded_at is not None
+                and recorded_at_values[-1] is not None
+                and recorded_at < recorded_at_values[-1]
+            ):
+                raise ValueError("paper submission completion timestamp is not monotonic")
+            recorded_at_values.append(recorded_at)
     if (
         completed_at is None
         or started_at is None
@@ -730,11 +758,18 @@ def mark_submission_recovery_required(ledger: dict, *, reason: str, now: datetim
     failed_at = _normalize_aware_policy_timestamp(now)
     started_at = _parse_timestamp(transaction.get("started_at"))
     successful = transaction.get("successful_submissions")
-    recorded_at_values = (
-        [_parse_timestamp(item.get("recorded_at")) for item in successful]
-        if isinstance(successful, list)
-        else []
-    )
+    recorded_at_values: list[datetime.datetime | None] = []
+    if isinstance(successful, list):
+        for item in successful:
+            recorded_at = _parse_timestamp(item.get("recorded_at")) if isinstance(item, Mapping) else None
+            if (
+                recorded_at_values
+                and recorded_at is not None
+                and recorded_at_values[-1] is not None
+                and recorded_at < recorded_at_values[-1]
+            ):
+                raise ValueError("paper submission recovery timestamp is not monotonic")
+            recorded_at_values.append(recorded_at)
     if (
         failed_at is None
         or (started_at is not None and failed_at < started_at)
