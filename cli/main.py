@@ -3430,14 +3430,12 @@ def research_self_heal_plan(
         output_dir=output_dir,
         safe_reverify_minutes=safe_reverify_minutes,
     )
-    # Owned integrity recovery is the autonomous default; `--execute-safe`
-    # additionally runs the pre-existing safe observer refreshes.
-    if execute_safe or any(
-        isinstance(signal, dict)
-        and signal.get("classification") == "recoverable_integrity"
-        and signal.get("status") == "owned_recovery_ready"
-        for signal in packet.get("signals") or []
-    ):
+    # This command is analysis-only unless the caller explicitly requests the
+    # already allowlisted safe-plane action.  In particular, an
+    # ``owned_recovery_ready`` classification is evidence for a later
+    # independently controlled recovery operation; it is not authority to
+    # coordinate recovery, rearm live control, or run an executor here.
+    if execute_safe:
         packet = execute_self_heal_plan(packet, repo_root=Path.cwd())
     json_path, markdown_path = write_self_heal_plan(packet, output_dir)
     payload = dict(packet)
@@ -9341,6 +9339,75 @@ def alpaca_check():
     console.print(table)
 
 
+@alpaca_app.command("reconcile-observer")
+def alpaca_reconcile_observer(
+    output_dir: Path = typer.Option(
+        Path("results/observer_reconciliation"),
+        "--output-dir",
+        help="Directory for immutable read-only live and paper reconciliation packets.",
+    ),
+    shadow_start_object_id: str | None = typer.Option(
+        None,
+        "--shadow-start-object-id",
+        help="Bind this reconciliation to one authenticated manual shadow-day start.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Capture broker state through observer reads only; never submit or cancel."""
+
+    from tradingagents.evals.safety_sentinel import capture_read_only_broker_snapshot
+
+    if not isinstance(shadow_start_object_id, str):
+        shadow_start_object_id = None
+    shadow_start = None
+    if shadow_start_object_id is not None:
+        from tradingagents.evals.shadow_trial import load_shadow_record
+
+        try:
+            shadow_start = load_shadow_record(
+                shadow_start_object_id,
+                expected_kind="manual-shadow-day-start",
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--shadow-start-object-id") from exc
+    generated_at = _alpaca_policy_now()
+    try:
+        live = capture_read_only_broker_snapshot(_alpaca_live_client(), captured_at=generated_at)
+    except Exception as exc:  # noqa: BLE001 - preserve an unavailable observer as evidence.
+        live = {"errors": {"client": f"live client initialization failed: {exc}"}}
+    try:
+        paper = capture_read_only_broker_snapshot(_alpaca_paper_client(), captured_at=generated_at)
+    except Exception as exc:  # noqa: BLE001 - preserve an unavailable observer as evidence.
+        paper = {"errors": {"client": f"paper client initialization failed: {exc}"}}
+    packet: dict[str, object] = {
+        "kind": "broker_reconciliation_observer",
+        "generated_at": generated_at.isoformat(timespec="seconds"),
+        "status": "HOLD" if live.get("errors") or paper.get("errors") else "COMPLETE",
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "submitted_count": 0,
+        "cancelled_count": 0,
+        "read_only": True,
+        "live": live,
+        "paper": paper,
+    }
+    if shadow_start is not None:
+        start_payload = shadow_start.payload
+        packet["shadow_start_object_id"] = shadow_start.object_id
+        packet["run_id"] = start_payload["run_id"]
+        packet["market_date"] = start_payload["market_date"]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"observer-reconciliation-{generated_at.strftime('%Y%m%d-%H%M%S-%f')}"
+    packet_path = _write_reconciliation_packet(output_dir, stem=stem, packet=packet)[0]
+    packet["packet_path"] = str(packet_path)
+    if json_output:
+        typer.echo(json.dumps(packet, indent=2, sort_keys=True))
+        return
+    console.print(f"Observer reconciliation: {packet['status']}")
+    console.print(f"Packet: {packet_path}")
+
+
 @research_app.command("safety-sentinel-audit")
 def research_safety_sentinel_audit(
     output_dir: Path = typer.Option(
@@ -9379,6 +9446,16 @@ def research_safety_sentinel_audit(
         min=0.1,
         help="Maximum accepted age for the exact pre-open validation packet.",
     ),
+    shadow_start_object_id: str | None = typer.Option(
+        None,
+        "--shadow-start-object-id",
+        help="Bind this observer packet to one authenticated manual shadow-day start.",
+    ),
+    require_paused: bool = typer.Option(
+        False,
+        "--require-paused",
+        help="Exit nonzero after writing when the exact ten-record paused contract is not proven.",
+    ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Capture a deterministic observer-only safety packet with read-only Alpaca state."""
@@ -9388,6 +9465,19 @@ def research_safety_sentinel_audit(
         write_safety_sentinel_packet,
     )
 
+    if not isinstance(shadow_start_object_id, str):
+        shadow_start_object_id = None
+    shadow_start = None
+    if shadow_start_object_id is not None:
+        from tradingagents.evals.shadow_trial import load_shadow_record
+
+        try:
+            shadow_start = load_shadow_record(
+                shadow_start_object_id,
+                expected_kind="manual-shadow-day-start",
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--shadow-start-object-id") from exc
     generated_at = _alpaca_policy_now()
     try:
         broker_snapshot = capture_read_only_broker_snapshot(
@@ -9414,13 +9504,22 @@ def research_safety_sentinel_audit(
         now=generated_at,
         max_evidence_age_minutes=max_evidence_age_minutes,
     )
+    if shadow_start is not None:
+        start_payload = shadow_start.payload
+        packet["shadow_start_object_id"] = shadow_start.object_id
+        packet["run_id"] = start_payload["run_id"]
+        packet["market_date"] = start_payload["market_date"]
     packet_path = write_safety_sentinel_packet(packet, output_dir=output_dir)
     payload = {**packet, "packet_path": str(packet_path)}
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        if require_paused and packet.get("schedule_check", {}).get("safe_predeployment") is not True:
+            raise typer.Exit(code=1)
         return
     console.print(f"Safety sentinel: {packet['status']}")
     console.print(f"Packet: {packet_path}")
+    if require_paused and packet.get("schedule_check", {}).get("safe_predeployment") is not True:
+        raise typer.Exit(code=1)
 
 
 @research_app.command("shadow-day-start")
@@ -9461,6 +9560,7 @@ def research_shadow_day_adjudicate(
     start_object_id: str = typer.Option(..., "--start-object-id", help="Authenticated pending shadow start object identity."),
     safety_sentinel: Path = typer.Option(..., "--safety-sentinel", help="Same-run sentinel artifact."),
     paper_tournament: Path = typer.Option(..., "--paper-tournament", help="Same-run paper artifact."),
+    daily_chain_manifest: Path = typer.Option(..., "--daily-chain-manifest", help="Complete authenticated observer-chain manifest."),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Adjudicate supplied local evidence only; missing evidence is never a pass."""
@@ -9475,7 +9575,11 @@ def research_shadow_day_adjudicate(
         load_shadow_record(start_object_id, expected_kind="manual-shadow-day-start")
         admission = adjudicate_shadow_day(
             start_object_id=start_object_id,
-            artifacts={"safety_sentinel": safety_sentinel, "paper_tournament": paper_tournament},
+            artifacts={
+                "safety_sentinel": safety_sentinel,
+                "paper_tournament": paper_tournament,
+                "daily_chain_manifest": daily_chain_manifest,
+            },
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
@@ -9485,6 +9589,44 @@ def research_shadow_day_adjudicate(
         return
     console.print(f"Shadow-day adjudication: {admission.envelope.payload['status']}")
     console.print(f"Decision: {admission.path}")
+
+
+@research_app.command("shadow-day-manifest")
+def research_shadow_day_manifest(
+    start_object_id: str = typer.Option(..., "--start-object-id", help="Authenticated pending shadow start object identity."),
+    stage: list[str] = typer.Option(
+        ..., "--stage", help="One exact KEY=PATH stage artifact; repeat for all required stages."
+    ),
+    output_dir: Path = typer.Option(
+        Path("results/manual_shadow/manifests"),
+        "--output-dir",
+        help="Local directory for daily-chain observer manifests.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Bind the exact complete local observer chain to an admitted start record."""
+
+    from tradingagents.evals.shadow_trial import create_shadow_day_manifest
+
+    stages: dict[str, Path] = {}
+    for item in stage:
+        key, separator, value = item.partition("=")
+        if not separator or not key or not value or key in stages:
+            raise typer.BadParameter("each --stage must be a unique nonblank KEY=PATH value")
+        stages[key] = Path(value)
+    try:
+        payload, packet_path = create_shadow_day_manifest(
+            start_object_id=start_object_id,
+            stages=stages,
+            output_dir=output_dir,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    result = {**payload, "packet_path": str(packet_path)}
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
+    console.print(f"Shadow daily-chain manifest: {packet_path}")
 
 
 @research_app.command("shadow-streak-report")
@@ -10161,6 +10303,11 @@ def alpaca_paper_tournament_run(
         help="Directory for paper strategy tournament ledger and packets.",
     ),
     min_promotion_days: int = typer.Option(5, "--min-promotion-days"),
+    shadow_start_object_id: str | None = typer.Option(
+        None,
+        "--shadow-start-object-id",
+        help="Bind this paper-only run packet to one authenticated manual shadow-day start.",
+    ),
 ):
     """Run one paper-only tournament tick and optionally submit paper orders."""
     from tradingagents.brokers.paper_tournament import (
@@ -10179,6 +10326,20 @@ def alpaca_paper_tournament_run(
     invalid = [item for item in strategy_ids if item not in STRATEGY_IDS]
     if invalid:
         raise typer.BadParameter(f"unknown strategy id(s): {', '.join(invalid)}")
+
+    if not isinstance(shadow_start_object_id, str):
+        shadow_start_object_id = None
+    shadow_start = None
+    if shadow_start_object_id is not None:
+        from tradingagents.evals.shadow_trial import load_shadow_record
+
+        try:
+            shadow_start = load_shadow_record(
+                shadow_start_object_id,
+                expected_kind="manual-shadow-day-start",
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc), param_hint="--shadow-start-object-id") from exc
 
     paper_client = _alpaca_paper_client()
     with tournament_submission_lock(log_dir):
@@ -10279,7 +10440,20 @@ def alpaca_paper_tournament_run(
         "ledger_path": str(ledger_path),
         "live_selection_path": selection_path,
         "report": report,
+        "status": (
+            "COMPLETE"
+            if submitted
+            else ("NO_PAPER_SIGNAL" if not payloads else "HOLD")
+        ),
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
     }
+    if shadow_start is not None:
+        start_payload = shadow_start.payload
+        packet["shadow_start_object_id"] = shadow_start.object_id
+        packet["run_id"] = start_payload["run_id"]
+        packet["market_date"] = start_payload["market_date"]
     packet_path = write_tournament_packet(packet, log_dir, prefix="paper-tournament-run")
     packet["packet_path"] = str(packet_path)
     if json_output:

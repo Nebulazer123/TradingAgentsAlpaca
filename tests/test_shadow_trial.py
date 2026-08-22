@@ -191,6 +191,7 @@ def _artifacts(
     *,
     run_id: str,
     date: str,
+    start_object_id: str | None = None,
     submitted_count: object = 0,
     sentinel_status: str = "HOLD",
 ) -> dict[str, Path]:
@@ -203,6 +204,7 @@ def _artifacts(
             "kind": "safety_sentinel_audit",
             "run_id": run_id,
             "market_date": date,
+            **({"shadow_start_object_id": start_object_id} if start_object_id else {}),
             "generated_at": generated_at,
             "status": sentinel_status,
             "analysis_only": True,
@@ -217,6 +219,7 @@ def _artifacts(
             "kind": "paper_tournament_run",
             "run_id": run_id,
             "market_date": date,
+            **({"shadow_start_object_id": start_object_id} if start_object_id else {}),
             "generated_at": generated_at,
             "status": "HOLD",
             "dry_run": True,
@@ -228,6 +231,53 @@ def _artifacts(
         },
     )
     return {"safety_sentinel": sentinel, "paper_tournament": paper}
+
+
+def _complete_daily_chain(
+    root: Path,
+    *,
+    start,
+    artifacts: dict[str, Path],
+) -> dict[str, Path]:
+    payload = _payload(start)
+    generated_at = f"{payload['market_date']}T15:00:00+00:00"
+    stages: dict[str, Path] = {
+        "safety_sentinel": artifacts["safety_sentinel"],
+        "paper_tournament": artifacts["paper_tournament"],
+    }
+    for name in shadow_trial.DAILY_CHAIN_STAGES:
+        if name in stages:
+            continue
+        path = root / "artifacts" / f"{name}-{payload['market_date']}.json"
+        packet: dict[str, object] = {
+            "kind": shadow_trial.DAILY_CHAIN_STAGE_KINDS[name],
+            "generated_at": generated_at,
+            "status": "HOLD",
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+        }
+        if name == "broker_reconciliation":
+            packet.update(
+                {
+                    "kind": "broker_reconciliation_observer",
+                    "run_id": payload["run_id"],
+                    "market_date": payload["market_date"],
+                    "shadow_start_object_id": start.envelope.object_id,
+                    "read_only": True,
+                    "submitted_count": 0,
+                    "cancelled_count": 0,
+                }
+            )
+        _write_json(path, packet)
+        stages[name] = path
+    manifest, manifest_path = shadow_trial.create_shadow_day_manifest(
+        start_object_id=start.envelope.object_id,
+        stages=stages,
+        output_dir=root / "manifests",
+    )
+    assert manifest["run_id"] == payload["run_id"]
+    return {**artifacts, "daily_chain_manifest": manifest_path}
 
 
 def _day(
@@ -249,10 +299,21 @@ def _day(
                 observed_at=f"{market_date}T15:59:00+00:00",
             ),
         )
+        default_artifacts = None
+        if artifacts is None:
+            default_artifacts = _artifacts(
+                root,
+                run_id=start_payload["run_id"],
+                date=date,
+                start_object_id=start.envelope.object_id,
+            )
         return shadow_trial.adjudicate_shadow_day(
             start_object_id=start.envelope.object_id,
-            artifacts=artifacts
-            or _artifacts(root, run_id=start_payload["run_id"], date=date),
+            artifacts=(
+                artifacts
+                if artifacts is not None
+                else _complete_daily_chain(root, start=start, artifacts=default_artifacts or {})
+            ),
         )
 
 
@@ -284,6 +345,52 @@ def test_red_production_cli_exposes_only_pinned_non_authorizing_inputs(tmp_path,
     assert Path(payload["record_path"]).is_relative_to(environment["manual_root"])
     assert payload["execution_authority"] == "none"
     assert payload["can_submit_orders"] is False
+
+
+def test_bound_sentinel_cli_derives_start_identity_and_requires_paused(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    _write_json(
+        tmp_path / "preopen.json",
+        {
+            "generated_at": "2026-08-21T14:00:00+00:00",
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "overall_status": "pass",
+        },
+    )
+
+    class Broker:
+        def get_account(self): return {"id": "live", "status": "ACTIVE"}
+        def list_positions(self): return []
+        def list_orders(self, *, status): return []
+        def get_clock(self): return {"is_open": False, "timestamp": "2026-08-21T14:00:00+00:00"}
+        def __getattr__(self, name):
+            if name in {"submit_order", "cancel_order"}:
+                raise AssertionError(f"forbidden write {name}")
+            raise AttributeError(name)
+
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", Broker)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2026-08-21", 14))
+    result = runner.invoke(
+        app,
+        [
+            "research", "safety-sentinel-audit", "--shadow-start-object-id", start.envelope.object_id,
+            "--require-paused", "--live-control-path", str(environment["control"]),
+            "--preopen-validation-path", str(tmp_path / "preopen.json"),
+            "--schedule-contract-path", str(environment["contract"]),
+            "--role-contract-path", str(environment["roles"]),
+            "--automation-root", str(environment["automation_root"]),
+            "--output-dir", str(tmp_path / "sentinel"), "--json-output",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["shadow_start_object_id"] == start.envelope.object_id
+    assert payload["run_id"] == _payload(start)["run_id"]
+    assert payload["market_date"] == "2026-08-21"
+    assert payload["analysis_only"] is True and payload["can_submit_orders"] is False
 
 
 def test_red_generic_self_sealed_files_never_load_or_become_candidate(tmp_path, monkeypatch):
@@ -859,12 +966,26 @@ def test_red_deleted_admitted_object_fails_pinned_ledger_replay(tmp_path, monkey
 def test_red_artifact_bindings_reject_bool_submission_unknown_and_missing_proof(tmp_path, monkeypatch):
     _configure_environment(monkeypatch, tmp_path)
     start = _start(monkeypatch, date="2026-08-21")
-    bad_artifacts = _artifacts(tmp_path, run_id=_payload(start)["run_id"], date="2026-08-21", submitted_count=False)
+    bad_artifacts = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=_payload(start)["run_id"],
+            date="2026-08-21",
+            start_object_id=start.envelope.object_id,
+            submitted_count=False,
+        ),
+    )
     decision = _day(tmp_path, monkeypatch, start, date="2026-08-21", artifacts=bad_artifacts)
     decision_payload = _payload(decision)
     assert decision_payload["status"] == "failed"
-    assert "paper_tournament_submission_count_invalid" in decision_payload["reasons"]
-    assert set(decision_payload["artifacts"]) == {"safety_sentinel", "paper_tournament"}
+    assert any("paper_tournament" in reason for reason in decision_payload["reasons"])
+    assert set(decision_payload["artifacts"]) == {
+        "safety_sentinel",
+        "paper_tournament",
+        "daily_chain_manifest",
+    }
     assert all("sha256" in binding for binding in decision_payload["artifacts"].values())
     report = shadow_trial.build_shadow_streak_report()
     assert report["phase"] == "readiness_no_go"
@@ -878,6 +999,44 @@ def test_red_clean_hold_and_zero_submission_are_valid_only_with_complete_bound_e
     assert payload["status"] == "clean"
     assert payload["phase"] == "qualification_clean"
     assert payload["artifacts"]["paper_tournament"]["payload"]["submitted_count"] == 0
+
+
+def test_daily_chain_manifest_rejects_missing_stage_and_replaced_stage_file(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    artifacts = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=_payload(start)["run_id"],
+            date="2026-08-21",
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    manifest_payload = json.loads(artifacts["daily_chain_manifest"].read_text(encoding="utf-8"))
+    manifest_payload["stages"].pop("daily_report")
+    _write_json(artifacts["daily_chain_manifest"], manifest_payload)
+    decision = _day(tmp_path, monkeypatch, start, date="2026-08-21", artifacts=artifacts)
+    assert _payload(decision)["status"] in {"failed", "incomplete"}
+    assert any("daily_chain_manifest" in reason for reason in _payload(decision)["reasons"])
+
+    _configure_environment(monkeypatch, tmp_path / "replacement")
+    second = _start(monkeypatch, date="2026-08-21")
+    replacement = _complete_daily_chain(
+        tmp_path / "replacement",
+        start=second,
+        artifacts=_artifacts(
+            tmp_path / "replacement",
+            run_id=_payload(second)["run_id"],
+            date="2026-08-21",
+            start_object_id=second.envelope.object_id,
+        ),
+    )
+    _write_json(replacement["safety_sentinel"], {"kind": "replaced"})
+    decision = _day(tmp_path / "replacement", monkeypatch, second, date="2026-08-21", artifacts=replacement)
+    assert _payload(decision)["status"] == "failed"
+    assert "safety_sentinel_stage_hash_or_path_changed" in _payload(decision)["reasons"]
 
 
 def test_red_full_ledger_replay_requires_repair_then_fresh_qualification_and_five_days(tmp_path, monkeypatch):

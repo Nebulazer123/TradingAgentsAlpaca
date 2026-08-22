@@ -6410,6 +6410,52 @@ def test_research_self_heal_plan_writes_analysis_only_packet(monkeypatch, tmp_pa
     assert (tmp_path / "latest.json").exists()
 
 
+def test_alpaca_reconcile_observer_uses_read_only_clients_only(monkeypatch, tmp_path):
+    class ReadOnlyClient:
+        def __init__(self, identifier):
+            self.identifier = identifier
+            self.calls = []
+
+        def get_account(self):
+            self.calls.append("get_account")
+            return {"id": self.identifier, "status": "ACTIVE"}
+
+        def list_positions(self):
+            self.calls.append("list_positions")
+            return []
+
+        def list_orders(self, *, status):
+            self.calls.append(f"list_orders:{status}")
+            return []
+
+        def get_clock(self):
+            self.calls.append("get_clock")
+            return {"is_open": False, "timestamp": "2026-08-21T13:30:00+00:00"}
+
+        def __getattr__(self, name):
+            if name in {"submit_order", "cancel_order", "replace_order"}:
+                raise AssertionError(f"forbidden broker write: {name}")
+            raise AttributeError(name)
+
+    live, paper = ReadOnlyClient("live"), ReadOnlyClient("paper")
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: live)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 8, 21, 13, 30, tzinfo=datetime.timezone.utc),
+    )
+    result = runner.invoke(app, ["alpaca", "reconcile-observer", "--output-dir", str(tmp_path), "--json-output"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["analysis_only"] is True
+    assert payload["execution_authority"] == "none"
+    assert payload["can_submit_orders"] is False
+    assert payload["submitted_count"] == payload["cancelled_count"] == 0
+    assert live.calls == paper.calls == ["get_account", "list_positions", "list_orders:open", "get_clock"]
+    assert Path(payload["json_path"]).exists()
+
+
 def test_research_self_heal_plan_can_execute_allowlisted_safe_refresh(monkeypatch, tmp_path):
     def fake_build(repo_root, *, max_signals, output_dir, safe_reverify_minutes=15):
         return {
@@ -6459,7 +6505,7 @@ def test_research_self_heal_plan_can_execute_allowlisted_safe_refresh(monkeypatc
     assert payload["verified_count"] == 1
 
 
-def test_research_self_heal_plan_dispatches_owned_recovery_without_execute_safe(monkeypatch, tmp_path):
+def test_research_self_heal_plan_keeps_owned_recovery_analysis_only_without_execute_safe(monkeypatch, tmp_path):
     def fake_build(repo_root, *, max_signals, output_dir, safe_reverify_minutes=15):
         return {
             "schema_version": 1,
@@ -6479,13 +6525,19 @@ def test_research_self_heal_plan_dispatches_owned_recovery_without_execute_safe(
 
     called = []
     monkeypatch.setattr(cli_main, "build_self_heal_plan", fake_build)
-    monkeypatch.setattr(cli_main, "execute_self_heal_plan", lambda packet, *, repo_root: called.append(repo_root) or {**packet, "owned_recovery_count": 1})
+    monkeypatch.setattr(
+        cli_main,
+        "execute_self_heal_plan",
+        lambda packet, *, repo_root: (_ for _ in ()).throw(AssertionError("executor must not run")),
+    )
 
     result = runner.invoke(app, ["research", "self-heal-plan", "--output-dir", str(tmp_path), "--no-refresh-context", "--json-output"])
 
     assert result.exit_code == 0, result.output
-    assert called
-    assert json.loads(result.stdout)["owned_recovery_count"] == 1
+    assert not called
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "owned_recovery_ready"
+    assert payload["execution_authority"] == "none"
 
 
 def test_research_reddit_watchlist_packet_writes_compact_policy(tmp_path):

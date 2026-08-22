@@ -414,6 +414,33 @@ def test_safety_sentinel_cli_uses_only_narrow_read_only_broker_adapter(tmp_path,
     ]
 
 
+def test_safety_sentinel_require_paused_writes_hold_then_exits_nonzero(tmp_path, monkeypatch):
+    control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
+    first_toml = next(automation_root.glob("*/automation.toml"))
+    first_toml.write_text(
+        first_toml.read_text(encoding="utf-8").replace('status = "PAUSED"', 'status = "ACTIVE"'),
+        encoding="utf-8",
+    )
+    client = _ReadOnlyBrokerFake()
+    output_dir = tmp_path / "safety-sentinel-output"
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: client)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: dt.datetime(2026, 8, 21, 13, 30, tzinfo=UTC))
+    result = runner.invoke(
+        app,
+        [
+            "research", "safety-sentinel-audit", "--require-paused", "--json-output",
+            "--output-dir", str(output_dir), "--live-control-path", str(control),
+            "--preopen-validation-path", str(preopen), "--schedule-contract-path", str(contract),
+            "--automation-root", str(automation_root), "--role-contract-path", str(roles),
+        ],
+    )
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["schedule_check"]["safe_predeployment"] is False
+    assert Path(payload["packet_path"]).exists()
+    assert 'status = "ACTIVE"' in first_toml.read_text(encoding="utf-8")
+
+
 def test_safety_sentinel_holds_malformed_broker_values_even_when_all_keys_exist(tmp_path):
     control, preopen, contract, roles, automation_root = _write_clear_evidence(tmp_path)
 

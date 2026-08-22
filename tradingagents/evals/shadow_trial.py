@@ -53,7 +53,35 @@ CENTRAL = ZoneInfo("America/Chicago")
 START_SCHEMA = "manual_shadow_day_start_v1"
 DAY_SCHEMA = "manual_shadow_day_result_v1"
 REPORT_SCHEMA = "manual_shadow_final_report_v1"
-ARTIFACT_KEYS = ("safety_sentinel", "paper_tournament")
+ARTIFACT_KEYS = ("safety_sentinel", "paper_tournament", "daily_chain_manifest")
+DAILY_CHAIN_STAGES = (
+    "overnight_research",
+    "premarket_brief",
+    "preopen_validation",
+    "hourly_supervisor",
+    "safety_sentinel",
+    "loss_review",
+    "execution_board",
+    "self_heal_handoff",
+    "self_heal_plan",
+    "daily_report",
+    "broker_reconciliation",
+    "paper_tournament",
+)
+DAILY_CHAIN_STAGE_KINDS = {
+    "overnight_research": "overnight_plan",
+    "premarket_brief": "premarket_brief",
+    "preopen_validation": "tradingagents_preopen_validation",
+    "hourly_supervisor": "hourly_supervisor",
+    "safety_sentinel": "safety_sentinel_audit",
+    "loss_review": "loss_review_evidence",
+    "execution_board": "execution_board_review",
+    "self_heal_handoff": "tradingagents_self_heal_handoff",
+    "self_heal_plan": "tradingagents_self_heal_plan",
+    "daily_report": "supervisor_daily_report",
+    "broker_reconciliation": "broker_reconciliation_observer",
+    "paper_tournament": "paper_tournament_run",
+}
 EXPECTED_AUTOMATION_IDS = frozenset(
     {
         "tradingagents-automation-sleep-controller",
@@ -155,6 +183,24 @@ _ARTIFACT_FIELDS = frozenset(
         "market_date",
         "generated_at",
         "payload",
+    }
+)
+_MANIFEST_FIELDS = frozenset(
+    {
+        "kind",
+        "generated_at",
+        "shadow_start_object_id",
+        "run_id",
+        "market_date",
+        "analysis_only",
+        "execution_authority",
+        "can_submit_orders",
+        "live_control",
+        "schedule",
+        "stages",
+        "paper_order_ids",
+        "paper_order_count",
+        "broker_reconciliation",
     }
 )
 _ANCHOR_FIELDS = frozenset(
@@ -1284,6 +1330,203 @@ def _artifact_binding(path_value: object) -> dict[str, object]:
     }
 
 
+def _write_daily_chain_manifest(payload: Mapping[str, object], *, output_dir: Path) -> Path:
+    """Publish one local observer manifest without creating a mutable alias."""
+
+    output_dir = _absolute(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generated_at = _parse_timestamp(payload.get("generated_at")) or _as_utc(_utc_now())
+    stem = generated_at.strftime("shadow-daily-chain-%Y%m%d-%H%M%S")
+    path = output_dir / f"{stem}-{time.time_ns()}.json"
+    raw = _canonical_bytes(payload)
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise ValueError("shadow daily-chain manifest could not be created") from exc
+    try:
+        offset = 0
+        while offset < len(raw):
+            written = os.write(descriptor, raw[offset:])
+            if written <= 0:
+                raise OSError("incomplete shadow daily-chain manifest write")
+            offset += written
+        os.fsync(descriptor)
+    except OSError as exc:
+        path.unlink(missing_ok=True)
+        raise ValueError("shadow daily-chain manifest could not be written") from exc
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _paper_order_ids(payload: Mapping[str, object]) -> list[str]:
+    submitted = payload.get("submitted")
+    if not isinstance(submitted, (list, tuple)):
+        return []
+    ids: list[str] = []
+    for item in submitted:
+        if isinstance(item, str):
+            ids.append(item)
+        elif isinstance(item, Mapping) and isinstance(item.get("id"), str):
+            ids.append(item["id"])
+    return ids
+
+
+def create_shadow_day_manifest(
+    *,
+    start_object_id: str,
+    stages: Mapping[str, Path],
+    output_dir: str | Path,
+) -> tuple[dict[str, object], Path]:
+    """Bind the fixed observer-chain files to an admitted pending start.
+
+    This deliberately has no caller-provided clock, root, calendar, control,
+    or automation mapping.  The manifest records exactly what was read now;
+    adjudication reads all of those files again before it can call a day clean.
+    """
+
+    start = load_shadow_record(start_object_id, expected_kind=MANUAL_SHADOW_DAY_START_KIND)
+    now, _ = _now_stamp()
+    if set(stages) != set(DAILY_CHAIN_STAGES):
+        raise ValueError("daily-chain stages must contain the exact required roster")
+    if len(set(str(path) for path in stages.values())) != len(DAILY_CHAIN_STAGES):
+        raise ValueError("daily-chain stages must use distinct artifact paths")
+    bindings = {name: _artifact_binding(stages[name]) for name in DAILY_CHAIN_STAGES}
+    control, _ = _control_binding(now)
+    schedule, _ = _schedule_binding()
+    paper_payload = bindings["paper_tournament"].get("payload")
+    reconciliation_payload = bindings["broker_reconciliation"].get("payload")
+    if not isinstance(paper_payload, Mapping):
+        paper_payload = {}
+    if not isinstance(reconciliation_payload, Mapping):
+        reconciliation_payload = {}
+    start_payload = start.payload
+    payload: dict[str, object] = {
+        "kind": "shadow_daily_chain_manifest",
+        "generated_at": now.isoformat(timespec="seconds"),
+        "shadow_start_object_id": start.object_id,
+        "run_id": start_payload["run_id"],
+        "market_date": start_payload["market_date"],
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "live_control": control,
+        "schedule": schedule,
+        "stages": bindings,
+        "paper_order_ids": _paper_order_ids(paper_payload),
+        "paper_order_count": paper_payload.get("submitted_count"),
+        "broker_reconciliation": reconciliation_payload,
+    }
+    path = _write_daily_chain_manifest(payload, output_dir=Path(output_dir))
+    return payload, path
+
+
+def _manifest_reasons(
+    binding: object,
+    *,
+    start: EvidenceEnvelope,
+    now: dt.datetime,
+) -> tuple[list[str], list[str]]:
+    """Verify the immutable wrapper and every currently reachable stage file."""
+
+    failed: list[str] = []
+    incomplete: list[str] = []
+    try:
+        record = _require_exact_fields(binding, _ARTIFACT_FIELDS, label="daily_chain_manifest artifact binding")
+    except ValueError:
+        return [], ["daily_chain_manifest_binding_invalid"]
+    payload = _plain_json(record["payload"])
+    if record["status"] != "captured" or not isinstance(payload, Mapping):
+        return [], ["daily_chain_manifest_unreadable_or_unbound"]
+    if record["canonical_sha256"] != canonical_json_sha256(payload):
+        return [], ["daily_chain_manifest_unreadable_or_unbound"]
+    try:
+        manifest = _require_exact_fields(payload, _MANIFEST_FIELDS, label="daily-chain manifest")
+    except ValueError:
+        return ["daily_chain_manifest_schema_invalid"], incomplete
+    start_payload = start.payload
+    if (
+        manifest["kind"] != "shadow_daily_chain_manifest"
+        or manifest["shadow_start_object_id"] != start.object_id
+        or manifest["run_id"] != start_payload["run_id"]
+        or manifest["market_date"] != start_payload["market_date"]
+    ):
+        failed.append("daily_chain_manifest_start_binding_invalid")
+    if not _is_non_authorizing(manifest):
+        failed.append("daily_chain_manifest_authority_invalid")
+    generated_at = _parse_timestamp(manifest["generated_at"])
+    start_at = _parse_timestamp(start.recorded_at) or now
+    if generated_at is None or generated_at < start_at or generated_at > now:
+        incomplete.append("daily_chain_manifest_timestamp_out_of_window")
+    control = manifest["live_control"]
+    schedule = manifest["schedule"]
+    if not _valid_control_binding(control, now=now) or not isinstance(control, Mapping) or control.get("sha256") != start_payload["live_control"].get("sha256"):
+        failed.append("daily_chain_manifest_live_control_invalid")
+    if not _valid_schedule_binding(schedule) or not isinstance(schedule, Mapping) or schedule.get("canonical_sha256") != start_payload["schedule"].get("canonical_sha256"):
+        failed.append("daily_chain_manifest_schedule_invalid")
+    stages = manifest["stages"]
+    if not isinstance(stages, Mapping) or set(stages) != set(DAILY_CHAIN_STAGES):
+        return [*failed, "daily_chain_manifest_stage_roster_invalid"], incomplete
+    for stage in DAILY_CHAIN_STAGES:
+        value = stages[stage]
+        try:
+            stage_record = _require_exact_fields(value, _ARTIFACT_FIELDS, label=f"{stage} stage binding")
+        except ValueError:
+            incomplete.append(f"{stage}_stage_binding_invalid")
+            continue
+        path = stage_record["path"]
+        current = _artifact_binding(path)
+        # File mtimes have one-second filesystem resolution and may advance
+        # while a manifest is being published.  Identity is the no-follow
+        # path plus exact raw/canonical hashes and size, not that incidental
+        # timestamp formatting detail.
+        identity_keys = ("path", "status", "sha256", "canonical_sha256", "size_bytes", "payload")
+        if any(current.get(key) != stage_record.get(key) for key in identity_keys):
+            failed.append(f"{stage}_stage_hash_or_path_changed")
+            continue
+        stage_payload = _plain_json(stage_record["payload"])
+        if stage_record["status"] != "captured" or not isinstance(stage_payload, Mapping):
+            incomplete.append(f"{stage}_stage_unreadable")
+            continue
+        stage_time = _parse_timestamp(stage_record["generated_at"])
+        if stage_time is None or stage_time < start_at or stage_time > now:
+            incomplete.append(f"{stage}_stage_timestamp_invalid")
+        expected_kind = DAILY_CHAIN_STAGE_KINDS[stage]
+        if stage_payload.get("kind") != expected_kind:
+            failed.append(f"{stage}_stage_kind_invalid")
+        if not _is_non_authorizing(stage_payload):
+            failed.append(f"{stage}_stage_authority_invalid")
+        stage_status = stage_payload.get("status")
+        if stage_status is not None and (type(stage_status) is not str or not stage_status.strip()):
+            failed.append(f"{stage}_stage_status_invalid")
+        # Explicitly bound producer packets are required where the run has an
+        # authority-sensitive boundary.  Other observer packets are bound by
+        # this authenticated manifest and their exact file identities.
+        if stage in {"safety_sentinel", "paper_tournament", "broker_reconciliation"} and (
+            stage_payload.get("run_id") != start_payload["run_id"]
+            or stage_payload.get("market_date") != start_payload["market_date"]
+            or stage_payload.get("shadow_start_object_id") != start.object_id
+        ):
+            failed.append(f"{stage}_stage_cross_run")
+    reconciliation = manifest["broker_reconciliation"]
+    if not isinstance(reconciliation, Mapping) or reconciliation.get("kind") != "broker_reconciliation_observer" or reconciliation.get("read_only") is not True or reconciliation.get("submitted_count") != 0 or reconciliation.get("cancelled_count") != 0 or not _is_non_authorizing(reconciliation):
+        failed.append("broker_reconciliation_invalid")
+    paper = stages.get("paper_tournament") if isinstance(stages, Mapping) else None
+    paper_payload = paper.get("payload") if isinstance(paper, Mapping) else None
+    paper_order_ids = manifest["paper_order_ids"]
+    if (
+        not isinstance(paper_payload, Mapping)
+        or type(manifest["paper_order_count"]) is not int
+        or manifest["paper_order_count"] < 0
+        or not isinstance(paper_order_ids, list)
+        or any(type(order_id) is not str or not order_id for order_id in paper_order_ids)
+        or manifest["paper_order_count"] != paper_payload.get("submitted_count")
+        or paper_order_ids != _paper_order_ids(paper_payload)
+    ):
+        failed.append("paper_order_manifest_mismatch")
+    return sorted(set(failed)), sorted(set(incomplete))
+
+
 def _artifact_reasons(
     key: str,
     binding: object,
@@ -1311,7 +1554,10 @@ def _artifact_reasons(
         or record["canonical_sha256"] != canonical_json_sha256(payload)
     ):
         return [], [f"{key}_unreadable_or_unbound"]
-    expected_kind = "safety_sentinel_audit" if key == "safety_sentinel" else "paper_tournament_run"
+    if key == "daily_chain_manifest":
+        expected_kind = "shadow_daily_chain_manifest"
+    else:
+        expected_kind = "safety_sentinel_audit" if key == "safety_sentinel" else "paper_tournament_run"
     if record["kind"] != expected_kind or payload.get("kind") != expected_kind:
         failed.append(f"{key}_kind_invalid")
     if record["run_id"] != run_id or payload.get("run_id") != run_id:
@@ -1325,6 +1571,8 @@ def _artifact_reasons(
         incomplete.append(f"{key}_timestamp_invalid")
     elif generated_at < start_at or generated_at > now or _current_central_date(generated_at) != market_date:
         incomplete.append(f"{key}_timestamp_out_of_window")
+    if key == "daily_chain_manifest":
+        return failed, incomplete
     if key == "safety_sentinel":
         if payload.get("status") not in {"FROZEN", "HOLD"}:
             failed.append("safety_sentinel_not_frozen_or_hold")
@@ -1461,6 +1709,13 @@ def _evaluate_day_payload(
                 )
                 failed.extend(item_failed)
                 incomplete.extend(item_incomplete)
+            manifest_failed, manifest_incomplete = _manifest_reasons(
+                artifacts["daily_chain_manifest"],
+                start=start,
+                now=now,
+            )
+            failed.extend(manifest_failed)
+            incomplete.extend(manifest_incomplete)
     return sorted(set(failed)), sorted(set(incomplete))
 
 

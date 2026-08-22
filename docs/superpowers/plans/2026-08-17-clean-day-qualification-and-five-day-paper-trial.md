@@ -89,8 +89,18 @@
 - `alpaca supervisor-daily-report --write-outbox/--no-write-outbox` defaults to
   `--write-outbox` for compatibility. `--no-write-outbox` still renders the local
   report and JSON packet, but creates no notification-outbox record.
+- `research safety-sentinel-audit --shadow-start-object-id ID --require-paused`
+  binds its non-authorizing packet to the admitted run and writes a packet before
+  exiting nonzero if the exact paused contract is not proven.
+- `alpaca reconcile-observer --shadow-start-object-id ID` captures only live/paper
+  account, positions, open orders, and clock reads in a non-authorizing packet.
+- `research shadow-day-manifest --start-object-id ID --stage KEY=PATH ...` requires
+  the exact twelve-stage observer roster; adjudication requires that manifest in
+  addition to its direct run-bound sentinel and paper packets.
 
 - [x] Produce a manual, on-demand runbook in this plan’s report that names the exact capped overnight command, preopen/hourly dry-run commands, sentinel, BOARD, self-heal analysis, local-only daily report, paper command, and adjudication command.
+- [x] Bind the authority-sensitive sentinel, paper-run, and reconciliation packets to
+  the admitted start; require an exact hash-bound twelve-stage daily-chain manifest.
 - [ ] Verify all ten automation TOMLs are paused before any runtime step; this is a hard prerequisite, not a change request.
 - [ ] Run the declared focused suite, full pytest, Ruff, compileall, wrapper syntax, and authority inventory.
 - [ ] Obtain task-scoped specification and quality reviews after each task and a fresh whole-branch authority/security review after Task 4.
