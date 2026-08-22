@@ -458,19 +458,10 @@ def _validate_submission_lease(
         ledger.get("submission_lease_evidence") != _submission_lease_evidence(ledger)
     ):
         raise ValueError("paper submission lease evidence does not match ledger")
-    authoritative_policy_now, clock_timestamp = _validate_regular_paper_broker_clock(
-        paper_client,
-        now=now_timestamp,
-        post_clock_now=post_clock_now,
-    )
     started_at = _parse_timestamp(ledger.get("started_at"))
     ends_at = _parse_timestamp(ledger.get("ends_at"))
     if started_at is None or ends_at is None or started_at >= ends_at:
         raise ValueError("paper submission lease timestamps are malformed")
-    if authoritative_policy_now < started_at:
-        raise ValueError("paper submission lease has not started")
-    if authoritative_policy_now >= ends_at:
-        raise ValueError("paper submission lease has expired")
     limit = ledger.get("authorized_market_day_limit")
     submitted_dates = ledger.get("submitted_market_dates")
     if (
@@ -498,12 +489,37 @@ def _validate_submission_lease(
             validate_submission_transaction_state(ledger)
     else:
         validate_submission_transaction_state(ledger)
+    calendar_market_date = _central_market_date(now_timestamp)
+    if calendar_market_date is None:
+        raise ValueError("paper submission lease has no Central market date")
+    list_calendar = getattr(paper_client, "list_calendar", None)
+    if not callable(list_calendar):
+        raise ValueError("paper submission lease cannot verify the broker market calendar")
+    try:
+        calendar = list_calendar(start=calendar_market_date, end=calendar_market_date)
+    except Exception as exc:
+        raise ValueError("paper submission lease broker calendar check failed") from exc
+    if not isinstance(calendar, Sequence) or not any(
+        isinstance(item, Mapping) and str(item.get("date", "")) == calendar_market_date
+        for item in calendar
+    ):
+        raise ValueError("paper submission lease requires a regular Central market date")
+    authoritative_policy_now, clock_timestamp = _validate_regular_paper_broker_clock(
+        paper_client,
+        now=now_timestamp,
+        post_clock_now=post_clock_now,
+    )
     market_date = _central_market_date(authoritative_policy_now)
     if market_date is None:
         raise ValueError("paper submission lease has no Central market date")
     policy_central = authoritative_policy_now.astimezone(CENTRAL)
     clock_central = clock_timestamp.astimezone(CENTRAL)
-    if policy_central.date().isoformat() != market_date or clock_central.date().isoformat() != market_date:
+    if market_date != calendar_market_date:
+        raise ValueError("paper submission lease Central market date changed during calendar check")
+    if (
+        policy_central.date().isoformat() != calendar_market_date
+        or clock_central.date().isoformat() != calendar_market_date
+    ):
         raise ValueError("paper submission lease broker clock has the wrong Central market date")
     regular_open = datetime.time(hour=8, minute=30)
     regular_close = datetime.time(hour=15)
@@ -514,18 +530,10 @@ def _validate_submission_lease(
         raise ValueError("paper submission lease broker clock is outside the regular session")
     if policy_central.weekday() >= 5:
         raise ValueError("paper submission lease requires a regular Central market date")
-    list_calendar = getattr(paper_client, "list_calendar", None)
-    if not callable(list_calendar):
-        raise ValueError("paper submission lease cannot verify the broker market calendar")
-    try:
-        calendar = list_calendar(start=market_date, end=market_date)
-    except Exception as exc:
-        raise ValueError("paper submission lease broker calendar check failed") from exc
-    if not isinstance(calendar, Sequence) or not any(
-        isinstance(item, Mapping) and str(item.get("date", "")) == market_date
-        for item in calendar
-    ):
-        raise ValueError("paper submission lease requires a regular Central market date")
+    if authoritative_policy_now < started_at:
+        raise ValueError("paper submission lease has not started")
+    if authoritative_policy_now >= ends_at:
+        raise ValueError("paper submission lease has expired")
     consuming_active_submission_date = active_submission_market_date == market_date
     if market_date in submitted_dates and not consuming_active_submission_date:
         raise ValueError("paper submission lease already used this Central market date")

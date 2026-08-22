@@ -653,6 +653,45 @@ def test_paper_tournament_submit_rechecks_clock_immediately_before_each_post(
     assert updated["submission_transaction"]["status"] == "recovery_required"
 
 
+def test_paper_tournament_calendar_delay_rechecks_final_clock_before_any_post(
+    monkeypatch, tmp_path
+):
+    paper_client = _FakePaperClient()
+    before_close = datetime.datetime(2026, 6, 2, 19, 59, 50, tzinfo=datetime.timezone.utc)
+    after_close = datetime.datetime(2026, 6, 2, 20, 0, 1, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": before_close.isoformat()}
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+    policy_time = {"value": before_close}
+    original_list_calendar = paper_client.list_calendar
+    calendar_calls = {"count": 0}
+
+    def delayed_calendar(*, start, end):
+        calendar_calls["count"] += 1
+        if calendar_calls["count"] == 3:
+            policy_time["value"] = after_close
+        return original_list_calendar(start=start, end=end)
+
+    monkeypatch.setattr(paper_client, "list_calendar", delayed_calendar)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: policy_time["value"])
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert calendar_calls["count"] == 3
+    assert paper_client.clock_calls == 3
+    assert paper_client.submitted == []
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert updated["submission_window_status"] == "recovery_required"
+    assert updated["submission_transaction"]["successful_submissions"] == []
+
+
 def test_submission_lease_rejects_after_close_or_naive_policy_time():
     paper_client = _FakePaperClient()
     before_close = datetime.datetime(2026, 6, 2, 19, 59, 50, tzinfo=datetime.timezone.utc)
@@ -812,6 +851,59 @@ def test_submission_response_and_persisted_ledger_reject_reversed_record_times()
             reason="test",
             now=started_at + datetime.timedelta(minutes=3),
         )
+
+
+def test_submission_response_timestamps_allow_equal_values_across_all_validators():
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client)
+    timestamp = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    first_payload = {
+        "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+        "symbol": "NVDA",
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": "218.43",
+        "notional": "1000.00",
+        "extended_hours": False,
+        "client_order_id": "ta-paperbot-current-aggressive-equal-one",
+        "reason": "test",
+    }
+    second_payload = {
+        **first_payload,
+        "strategy_id": STRATEGY_PULLBACK_SUPPORT,
+        "client_order_id": "ta-paperbot-pullback-support-equal-two",
+    }
+    paper_tournament.begin_submission_transaction(
+        ledger,
+        market_date="2026-06-02",
+        payloads=[first_payload, second_payload],
+        now=timestamp,
+    )
+    for index, payload in enumerate((first_payload, second_payload), start=1):
+        paper_tournament.record_submission_response(
+            ledger,
+            payload=payload,
+            response={
+                "id": f"paper-equal-{index}",
+                "status": "filled",
+                **{key: value for key, value in payload.items() if key not in {"strategy_id", "reason"}},
+            },
+            market_date="2026-06-02",
+            now=timestamp,
+        )
+    paper_tournament.complete_submission_transaction(ledger, now=timestamp)
+    paper_tournament.validate_submission_transaction_state(ledger)
+
+    recovery_ledger = json.loads(json.dumps(ledger))
+    recovery_ledger["submission_transaction"]["status"] = "submitting"
+    recovery_ledger["submission_transaction"].pop("completed_at")
+    paper_tournament.mark_submission_recovery_required(
+        recovery_ledger,
+        reason="test",
+        now=timestamp,
+    )
+    assert recovery_ledger["submission_transaction"]["failed_at"] == timestamp.isoformat()
 
 
 def test_paper_tournament_submission_event_timestamps_are_monotonic(monkeypatch, tmp_path):
