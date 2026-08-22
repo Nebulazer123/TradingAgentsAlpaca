@@ -4,6 +4,7 @@ from decimal import Decimal
 from threading import Event, Thread
 from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 from cli import main as cli_main
@@ -38,6 +39,8 @@ class _FakePaperClient:
         )
         self.submitted = []
         self.orders = []
+        self.clock = {"is_open": True, "timestamp": "2026-06-02T18:00:00+00:00"}
+        self.clock_calls = 0
         self.positions = [
             {
                 "symbol": "GOOGL",
@@ -78,6 +81,10 @@ class _FakePaperClient:
     def list_calendar(self, *, start, end):
         assert start == end
         return [{"date": start}]
+
+    def get_clock(self):
+        self.clock_calls += 1
+        return self.clock
 
     def list_open_client_order_ids(self):
         return set()
@@ -496,6 +503,68 @@ def test_paper_tournament_submit_requires_exact_paper_mode_and_endpoint(monkeypa
     assert result.exit_code != 0
     assert paper_client.submitted == []
     assert "paper" in result.output.lower()
+
+
+def test_paper_tournament_submit_rejects_unsafe_broker_clock_before_transaction_or_post(
+    monkeypatch, tmp_path
+):
+    paper_client = _FakePaperClient()
+    paper_client.clock = {"is_open": False, "timestamp": "2026-06-02T18:00:00+00:00"}
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert paper_client.clock_calls == 1
+    assert paper_client.submitted == []
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert "submission_transaction" not in updated
+    assert "clock" in result.output.lower()
+
+
+@pytest.mark.parametrize(
+    ("clock", "now"),
+    [
+        (None, "2026-06-02T18:00:00+00:00"),
+        ({"is_open": False, "timestamp": "2026-06-02T13:00:00+00:00"}, "2026-06-02T18:00:00+00:00"),
+        ({"is_open": False, "timestamp": "2026-06-02T21:00:00+00:00"}, "2026-06-02T18:00:00+00:00"),
+        ({"is_open": True, "timestamp": "2026-06-02T17:44:00+00:00"}, "2026-06-02T18:00:00+00:00"),
+        ({"is_open": True, "timestamp": "2026-06-02T18:00:01+00:00"}, "2026-06-02T18:00:00+00:00"),
+        ({"is_open": True, "timestamp": "2026-06-02T18:16:00+00:00"}, "2026-06-02T18:00:00+00:00"),
+        ({"is_open": True, "timestamp": "2026-06-02T13:00:00"}, "2026-06-02T18:00:00+00:00"),
+        ({"is_open": True, "timestamp": "2026-06-03T06:01:00+00:00"}, "2026-06-03T05:59:00+00:00"),
+    ],
+    ids=["unavailable", "preopen", "afterhours", "stale", "slightly-future", "future", "malformed", "wrong-central-date"],
+)
+def test_paper_tournament_submit_never_posts_for_an_invalid_broker_clock(
+    monkeypatch, tmp_path, clock, now
+):
+    paper_client = _FakePaperClient()
+    paper_client.clock = clock
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: datetime.datetime.fromisoformat(now))
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert paper_client.clock_calls == 1
+    assert paper_client.submitted == []
+    updated = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert "submission_transaction" not in updated
 
 
 def test_paper_tournament_submit_records_current_regular_central_date_and_suppresses_selection(monkeypatch, tmp_path):

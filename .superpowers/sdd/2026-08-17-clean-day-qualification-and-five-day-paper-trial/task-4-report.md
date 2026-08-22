@@ -162,6 +162,13 @@ If an explicit paper-only action tick is separately authorized for the future
 qualifier/trial, it replaces the dry-run paper packet **before** the one manifest
 and adjudication. It is never run on a repair day:
 
+This means explicit paper submission is permitted only after broker clock proves
+regular session open: the exact paper client must return a timezone-aware `/v2/clock`
+timestamp within 15 minutes of the local policy time, `is_open` must be the exact
+boolean `true`, and its America/Chicago date must be the current qualifying market
+date. A missing, malformed, stale, future, closed, after-hours, or wrong-date
+clock rejects before the durable submission transaction and before any paper POST.
+
 ```zsh
 TA_LIVE_SUBMIT=0 .venv/bin/python -m cli.main alpaca paper-tournament run --all \
   --submit-actions --shadow-start-object-id <start-object-id> \

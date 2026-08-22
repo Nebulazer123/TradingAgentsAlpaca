@@ -24,6 +24,8 @@ from tradingagents.brokers.alpaca import PAPER_BASE_URL
 from tradingagents.brokers.alpaca_supervisor import CandidateSignal
 
 UTC = datetime.timezone.utc
+CENTRAL = ZoneInfo("America/Chicago")
+MAX_BROKER_CLOCK_SKEW_SECONDS = 15 * 60
 LEDGER_FILE = "paper-tournament-ledger.json"
 COMPACT_LEDGER_FILE = "paper-tournament-ledger.compact.json"
 LIVE_SELECTION_FILE = "live-strategy-selection.json"
@@ -296,7 +298,58 @@ def _central_market_date(now: datetime.datetime) -> str | None:
     normalized = _normalize_timestamp(now)
     if normalized is None:
         return None
-    return normalized.astimezone(ZoneInfo("America/Chicago")).date().isoformat()
+    return normalized.astimezone(CENTRAL).date().isoformat()
+
+
+def _parse_broker_clock_timestamp(value: object) -> datetime.datetime | None:
+    """Accept only a timezone-aware timestamp from the broker clock response."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        return parsed.astimezone(UTC)
+    except (OverflowError, TypeError, ValueError):
+        return None
+
+
+def _validate_regular_paper_broker_clock(
+    paper_client: object,
+    *,
+    now: datetime.datetime,
+    market_date: str,
+) -> None:
+    """Require a fresh, open, same-day regular-session paper broker clock."""
+
+    get_clock = getattr(paper_client, "get_clock", None)
+    if not callable(get_clock):
+        raise ValueError("paper submission lease cannot verify the broker clock")
+    try:
+        clock = get_clock()
+    except Exception as exc:
+        raise ValueError("paper submission lease broker clock check failed") from exc
+    if not isinstance(clock, Mapping) or clock.get("is_open") is not True:
+        raise ValueError("paper submission lease requires an open broker clock")
+    clock_timestamp = _parse_broker_clock_timestamp(clock.get("timestamp"))
+    now_timestamp = _normalize_timestamp(now)
+    if clock_timestamp is None or now_timestamp is None:
+        raise ValueError("paper submission lease broker clock is malformed")
+    if clock_timestamp > now_timestamp:
+        raise ValueError("paper submission lease broker clock is future")
+    if (now_timestamp - clock_timestamp).total_seconds() > MAX_BROKER_CLOCK_SKEW_SECONDS:
+        raise ValueError("paper submission lease broker clock is stale")
+    clock_central = clock_timestamp.astimezone(CENTRAL)
+    if clock_central.date().isoformat() != market_date:
+        raise ValueError("paper submission lease broker clock has the wrong Central market date")
+    regular_open = datetime.time(hour=8, minute=30)
+    regular_close = datetime.time(hour=15)
+    if not regular_open <= clock_central.timetz().replace(tzinfo=None) < regular_close:
+        raise ValueError("paper submission lease broker clock is outside the regular session")
 
 
 def _validate_exact_paper_client(paper_client: object) -> None:
@@ -405,7 +458,7 @@ def validate_submission_lease(
     market_date = _central_market_date(now_timestamp)
     if market_date is None:
         raise ValueError("paper submission lease has no Central market date")
-    if now_timestamp.astimezone(ZoneInfo("America/Chicago")).weekday() >= 5:
+    if now_timestamp.astimezone(CENTRAL).weekday() >= 5:
         raise ValueError("paper submission lease requires a regular Central market date")
     list_calendar = getattr(paper_client, "list_calendar", None)
     if not callable(list_calendar):
@@ -423,6 +476,11 @@ def validate_submission_lease(
         raise ValueError("paper submission lease already used this Central market date")
     if len(submitted_dates) >= limit:
         raise ValueError("paper submission lease market-day capacity is exhausted")
+    _validate_regular_paper_broker_clock(
+        paper_client,
+        now=now_timestamp,
+        market_date=market_date,
+    )
     return market_date
 
 

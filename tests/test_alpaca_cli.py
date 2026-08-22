@@ -1758,6 +1758,8 @@ def test_clean_day_runbook_exact_commands_exist_without_executing_runtime():
     assert expected_handoff in documented_commands
     assert expected_plan in documented_commands
     assert expected_streak in documented_commands
+    runbook_text = re.sub(r"\s+", " ", report_path.read_text(encoding="utf-8"))
+    assert "explicit paper submission is permitted only after broker clock proves regular session open" in runbook_text
 
     def command_index(command_path: tuple[str, ...]) -> int:
         return next(
