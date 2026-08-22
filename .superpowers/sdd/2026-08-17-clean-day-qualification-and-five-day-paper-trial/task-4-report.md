@@ -295,3 +295,10 @@ Read-only inventory of the ten TradingAgents records under `/Users/corbinfloyd/.
 | `tradingagents-paper-tournament` | `db226476f71c9a49ef694b25cdb5c649d50ab45773b570a1c70ec47cb7a41ea9` |
 | `tradingagents-preopen-validation` | `dcb7c28a0f1e329434c097cb741ebf68d9e60b622673bf45d4e61ebdb90901c9` |
 | `tradingagents-autonomous-safety-sentinel` | `df5928810a2c53c8af96d72778f2de4093c56f836141ec1ac14f4141f7504579` |
+
+## Ox Alpha re-audit of historical manual-shadow findings
+
+- A stale Sol review of historical commits `ad76916..b4408a6` reported P0/P1 findings about caller-controlled reserved admission callbacks, route-marker/root rollback forgery, and self-attested calendar mappings. Ox Alpha re-audited the actual current feature HEAD `c216ff554f5396b2634cb82a5c04237435176dff`, including `fad8327` and `b471fbe`, rather than carrying those historical findings into the current source decision.
+- The raw callback-driven admission surface is absent; generic admission rejects all three reserved manual-shadow kinds even after instance-state mutation; the three semantic facades expose no caller-controlled route, validator, calendar, clock, root, or live-control parameters; and callback re-entry guards remain armed.
+- The route identity is anchor-owned and bound to the canonical root. Replay rejects missing/mismatched anchors, head rollback, uncommitted head advance, copied-root identity mismatch, stripped routes, and non-SHA-256 routes. The calendar is captured inside the private direct-Alpaca read seam and cannot be injected through production API signatures.
+- Verification at the exact current HEAD: `tests/test_shadow_trial.py tests/test_strategy_evidence_store.py` — `176 passed`; dependent staged-intent, promotion, attestation, and authority-alignment suites — `481 passed`; Ruff clean. No runtime, broker/network, scheduler, paper, control, or email action occurred. The prior P0/P1 report is therefore historical and not a current source blocker.
