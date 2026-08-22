@@ -147,8 +147,31 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
                 if quality.get(key) != 0:
                     reasons.append("overnight_research_stage_provider_or_graph_failure")
                     break
-            if quality.get("tradable_count") != 1:
-                reasons.append("overnight_research_stage_not_single_ticker")
+            # ``--full-graph-tickers 1`` bounds graph work, not the candidate
+            # universe.  A healthy producer can therefore report several
+            # tradable symbols while selecting or attempting at most one for
+            # the bounded graph.  Require the recorded requested/effective
+            # cap and every native graph counter to prove that constraint.
+            graph_counts = (
+                "full_graph_count",
+                "full_graph_attempt_count",
+                "full_graph_success_count",
+            )
+            if (
+                quality.get("requested_full_graph_limit") != 1
+                or quality.get("full_graph_limit") != 1
+                or any(
+                    type(quality.get(key)) is not int
+                    or quality[key] < 0
+                    or quality[key] > 1
+                    for key in graph_counts
+                )
+                or quality["full_graph_success_count"] > quality["full_graph_count"]
+                or quality["full_graph_count"] > quality["full_graph_attempt_count"]
+            ):
+                reasons.append("overnight_research_stage_graph_cap_invalid")
+            if type(quality.get("tradable_count")) is not int or quality["tradable_count"] < 0:
+                reasons.append("overnight_research_stage_tradable_count_invalid")
             if (
                 type(quality.get("per_ticker_timeout_minutes")) not in {int, float}
                 or float(quality["per_ticker_timeout_minutes"]) > 2
@@ -176,8 +199,8 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
             reasons.append("hourly_supervisor_stage_not_dry_run")
         if payload.get("outbox_path"):
             reasons.append("hourly_supervisor_stage_outbox_forbidden")
-        if str(payload.get("decision") or "").lower() not in {"hold", "blocked", "none"}:
-            reasons.append("hourly_supervisor_stage_decision_invalid")
+        if payload.get("issues") not in (None, [], ()):
+            reasons.append("hourly_supervisor_stage_issue_present")
     elif stage == "safety_sentinel":
         if not _is_non_authorizing(payload) or payload.get("status") not in {"FROZEN", "HOLD"}:
             reasons.append("safety_sentinel_stage_semantics_invalid")
@@ -204,11 +227,25 @@ def _stage_semantic_reasons(stage: str, payload: Mapping[str, object]) -> list[s
             reasons.append("execution_board_stage_authority_invalid")
         elif metrics.get("submitted_order_count") != 0:
             reasons.append("execution_board_stage_submission_present")
+        if payload.get("violations") not in ([], ()) or payload.get("warnings") not in ([], ()):
+            reasons.append("execution_board_stage_issue_present")
     elif stage in {"self_heal_handoff", "self_heal_plan"}:
         if not _is_non_authorizing(payload):
             reasons.append(f"{stage}_stage_authority_invalid")
-        if stage == "self_heal_plan" and payload.get("executed_count", 0) not in (0, None):
-            reasons.append("self_heal_plan_stage_execution_forbidden")
+        if str(payload.get("max_severity") or "").lower() not in {"none", "low"}:
+            reasons.append(f"{stage}_stage_elevated_severity_present")
+        if stage == "self_heal_handoff":
+            if type(payload.get("active_trigger_count")) is not int or payload["active_trigger_count"] != 0:
+                reasons.append("self_heal_handoff_stage_active_trigger_present")
+        else:
+            if payload.get("executed_count", 0) not in (0, None):
+                reasons.append("self_heal_plan_stage_execution_forbidden")
+            if type(payload.get("active_plan_count")) is not int or payload["active_plan_count"] != 0:
+                reasons.append("self_heal_plan_stage_active_plan_present")
+            if type(payload.get("escalation_count")) is not int or payload["escalation_count"] != 0:
+                reasons.append("self_heal_plan_stage_escalation_present")
+            if str(payload.get("status") or "").lower() not in {"quiet", "deduped"}:
+                reasons.append("self_heal_plan_stage_status_invalid")
     elif stage == "daily_report":
         if payload.get("outbox_path"):
             reasons.append("daily_report_stage_outbox_forbidden")

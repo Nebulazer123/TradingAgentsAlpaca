@@ -268,6 +268,11 @@ def _complete_daily_chain(
                         "graph_failure_count": 0,
                         "graph_attempt_failure_count": 0,
                         "top_provider_bundle_error_count": 0,
+                        "requested_full_graph_limit": 1,
+                        "full_graph_limit": 1,
+                        "full_graph_count": 1,
+                        "full_graph_attempt_count": 1,
+                        "full_graph_success_count": 1,
                         "tradable_count": 1,
                         "per_ticker_timeout_minutes": 2,
                         "time_budget_minutes": 3,
@@ -279,7 +284,14 @@ def _complete_daily_chain(
         elif name == "preopen_validation":
             packet.update({"overall_status": "pass", "submitted_count": 0, "failed_check_ids": []})
         elif name == "hourly_supervisor":
-            packet.update({"decision": "hold", "submitted": [], "shadow_dry_run": True})
+            packet.update(
+                {
+                    "decision": "hold",
+                    "submitted": [],
+                    "issues": [],
+                    "shadow_dry_run": True,
+                }
+            )
         elif name == "loss_review":
             packet.update(
                 {
@@ -295,7 +307,25 @@ def _complete_daily_chain(
                 }
             )
         elif name == "execution_board":
-            packet.update({"metrics": {"submitted_order_count": 0}})
+            packet.update(
+                {
+                    "metrics": {"submitted_order_count": 0},
+                    "violations": [],
+                    "warnings": [],
+                }
+            )
+        elif name == "self_heal_handoff":
+            packet.update({"active_trigger_count": 0, "max_severity": "none"})
+        elif name == "self_heal_plan":
+            packet.update(
+                {
+                    "active_plan_count": 0,
+                    "escalation_count": 0,
+                    "max_severity": "none",
+                    "status": "quiet",
+                    "executed_count": 0,
+                }
+            )
         elif name == "daily_report":
             packet.update({"packet_count": 0, "portfolio": {}})
         if name == "broker_reconciliation":
@@ -1113,7 +1143,14 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
             "graph_failure_count": 0,
             "graph_attempt_failure_count": 0,
             "top_provider_bundle_error_count": 0,
-            "tradable_count": 1,
+            "requested_full_graph_limit": 1,
+            "full_graph_limit": 1,
+            "full_graph_count": 1,
+            "full_graph_attempt_count": 1,
+            "full_graph_success_count": 1,
+            # The graph cap is one, but the real candidate universe may have
+            # multiple tradable symbols.  Only one is graph-selected here.
+            "tradable_count": 4,
             "per_ticker_timeout_minutes": 2,
             "time_budget_minutes": 3,
         },
@@ -1125,6 +1162,21 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
     }
     assert "overnight_research_stage_provider_or_graph_failure" in shadow_trial._stage_semantic_reasons(
         "overnight_research", broken_overnight
+    )
+    assert "overnight_research_stage_graph_cap_invalid" in shadow_trial._stage_semantic_reasons(
+        "overnight_research",
+        {"overnight_quality": {**overnight["overnight_quality"], "full_graph_attempt_count": 2}},
+    )
+
+    hourly = {
+        "shadow_dry_run": True,
+        "decision": "profit-take",
+        "submitted": [],
+        "issues": [],
+    }
+    assert shadow_trial._stage_semantic_reasons("hourly_supervisor", hourly) == []
+    assert "hourly_supervisor_stage_issue_present" in shadow_trial._stage_semantic_reasons(
+        "hourly_supervisor", {**hourly, "issues": [{"category": "lock", "reason": "stale evidence"}]}
     )
 
     reconciliation = {
@@ -1163,6 +1215,50 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
     assert "loss_review_stage_schema_invalid" in shadow_trial._stage_semantic_reasons(
         "loss_review", {**loss_review, "evidence_type": "provider_summary"}
     )
+
+    execution_board = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "metrics": {"submitted_order_count": 0},
+        "violations": [],
+        "warnings": [],
+    }
+    assert shadow_trial._stage_semantic_reasons("execution_board", execution_board) == []
+    assert "execution_board_stage_issue_present" in shadow_trial._stage_semantic_reasons(
+        "execution_board", {**execution_board, "warnings": ["stale preopen evidence"]}
+    )
+
+    self_heal_handoff = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "active_trigger_count": 0,
+        "max_severity": "none",
+    }
+    assert shadow_trial._stage_semantic_reasons("self_heal_handoff", self_heal_handoff) == []
+    assert "self_heal_handoff_stage_active_trigger_present" in shadow_trial._stage_semantic_reasons(
+        "self_heal_handoff", {**self_heal_handoff, "active_trigger_count": 1}
+    )
+
+    self_heal_plan = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "active_trigger_count": 0,
+        "active_plan_count": 0,
+        "escalation_count": 0,
+        "max_severity": "none",
+        "status": "quiet",
+        "executed_count": 0,
+    }
+    assert shadow_trial._stage_semantic_reasons("self_heal_plan", self_heal_plan) == []
+    self_heal_reasons = shadow_trial._stage_semantic_reasons(
+        "self_heal_plan",
+        {**self_heal_plan, "active_plan_count": 1, "status": "safe_plan_ready"},
+    )
+    assert "self_heal_plan_stage_active_plan_present" in self_heal_reasons
+    assert "self_heal_plan_stage_status_invalid" in self_heal_reasons
 
 
 def test_hourly_stage_requires_explicit_persisted_dry_run_marker():
