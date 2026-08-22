@@ -4814,6 +4814,10 @@ def _fetch_alpaca_latest_trade_rows(
     return {}
 
 
+class AggressiveCandidateMarketDataError(RuntimeError):
+    """The shared candidate feed failed before it could return a valid snapshot."""
+
+
 def _fetch_aggressive_candidate_market_data() -> dict[str, dict]:
     try:
         import yfinance as yf
@@ -4919,8 +4923,25 @@ def _fetch_aggressive_candidate_market_data() -> dict[str, dict]:
             except Exception:
                 continue
         return market_data
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise AggressiveCandidateMarketDataError(
+            f"aggressive candidate market data provider failed: {exc}"
+        ) from exc
+
+
+def _fetch_aggressive_candidate_market_data_result(
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Preserve valid empty snapshots while making transport failure explicit."""
+
+    try:
+        return _fetch_aggressive_candidate_market_data(), {}
+    except Exception as exc:  # noqa: BLE001 - callers must persist the failure channel.
+        return {}, {
+            "market_data": (
+                "aggressive candidate market data refresh failed: "
+                f"{_compact_cli_error_reason(exc)}"
+            )
+        }
 
 
 def _apply_mirofish_market_priors_to_market_data(
@@ -6792,6 +6813,7 @@ def _build_preopen_validation_packet(
         "market_session": market_session,
         "top_symbol": top_symbol,
         "overall_status": _preopen_overall_status(checks),
+        "errors": dict(broker_errors),
         "status_counts": status_counts,
         "checks": checks,
         "failed_check_ids": [check["id"] for check in checks if check["status"] == "fail"],
@@ -10361,7 +10383,9 @@ def alpaca_paper_tournament_run(
         except Exception:
             paper_orders = paper_client.list_orders(status="open")
         reconcile_tournament_orders(ledger, paper_orders, now=now)
-        market_data = _fetch_aggressive_candidate_market_data()
+        market_data, market_data_errors = (
+            _fetch_aggressive_candidate_market_data_result()
+        )
         candidate_signals = build_candidate_signals(market_data)
         actions = build_tournament_actions(
             ledger,
@@ -10448,6 +10472,7 @@ def alpaca_paper_tournament_run(
         "analysis_only": True,
         "execution_authority": "none",
         "can_submit_orders": False,
+        "errors": market_data_errors,
     }
     if shadow_start is not None:
         start_payload = shadow_start.payload
@@ -10546,7 +10571,9 @@ def alpaca_paper_tournament_report(
         except Exception:
             paper_orders = paper_client.list_orders(status="open")
         reconcile_tournament_orders(ledger, paper_orders, now=now)
-        market_data = _fetch_aggressive_candidate_market_data()
+        market_data, market_data_errors = (
+            _fetch_aggressive_candidate_market_data_result()
+        )
         record_equity_snapshot(ledger, market_data=market_data, now=now)
         report = build_tournament_report(
             ledger,
@@ -10562,6 +10589,7 @@ def alpaca_paper_tournament_report(
         "generated_at": now.isoformat(timespec="seconds"),
         "report": report,
         "live_selection_path": str(selection) if selection else None,
+        "errors": market_data_errors,
     }
     packet_path = write_tournament_packet(packet, log_dir, prefix="paper-tournament-report")
     packet["packet_path"] = str(packet_path)
@@ -10756,7 +10784,9 @@ def alpaca_plan_overnight(
     live_open_orders = live_client.list_orders(status="open")
     paper_open_orders = paper_client.list_orders(status="open")
     recent_packets = _latest_supervisor_packets(Path("results/hourly_supervisor"), limit=12)
-    current_market_data = _fetch_aggressive_candidate_market_data()
+    current_market_data, market_data_errors = (
+        _fetch_aggressive_candidate_market_data_result()
+    )
     research_context = {
         "analysis_only": True,
         "status": "disabled",
@@ -11094,6 +11124,7 @@ def alpaca_plan_overnight(
         "research_context": research_context,
         "top_provider_bundles": top_provider_bundles,
         "submitted": [],
+        "errors": market_data_errors,
     }
     if write_agent_ledger:
         ledger_forecasts = forecasts_from_overnight_packet(packet)
@@ -11257,11 +11288,10 @@ def alpaca_preopen_validation(
         if error:
             broker_errors["live_open_orders"] = error
 
-    try:
-        market_data = _fetch_aggressive_candidate_market_data()
-    except Exception as exc:  # noqa: BLE001 - packet should show validation gap.
-        market_data = {}
-        broker_errors["market_data"] = f"market data refresh failed: {exc}"
+    market_data, market_data_errors = (
+        _fetch_aggressive_candidate_market_data_result()
+    )
+    broker_errors.update(market_data_errors)
     held_symbols = [str(position.get("symbol", "")) for position in live_positions]
     candidate_signals = build_candidate_signals(market_data, held_symbols=held_symbols)
 
@@ -11668,29 +11698,40 @@ def alpaca_verify_overnight_system(
                 skip_reason=validation_skip_reason,
             )
         else:
-            market_data = _fetch_aggressive_candidate_market_data()
-            candidate_signals = build_candidate_signals(market_data)
-            overnight_validation = validate_overnight_plan_against_candidates(
-                overnight_packet,
-                candidate_signals,
-                now=validation_now,
+            market_data, market_data_errors = (
+                _fetch_aggressive_candidate_market_data_result()
             )
-            premarket_validation = validate_premarket_brief_against_candidates(
-                premarket_packet,
-                candidate_signals,
-                now=validation_now,
-            )
-            _verification_check(
-                checks,
-                "simulated_preopen_validation",
-                "pass" if overnight_validation.get("status") in {"confirmed", "amended"} and premarket_validation.get("status") in {"confirmed", "amended"} else "warn",
-                "Loaded latest overnight and premarket packets against fresh candidate rankings without waiting for the pre-open automation window.",
-                overnight_status=overnight_validation.get("status"),
-                premarket_status=premarket_validation.get("status"),
-                overnight_top=overnight_validation.get("overnight_top_symbol"),
-                current_top=overnight_validation.get("current_top_symbol"),
-                premarket_top=premarket_validation.get("brief_top_symbol"),
-            )
+            if market_data_errors:
+                _verification_check(
+                    checks,
+                    "simulated_preopen_validation",
+                    "fail",
+                    "Fresh aggressive-candidate market data could not be loaded.",
+                    errors=market_data_errors,
+                )
+            else:
+                candidate_signals = build_candidate_signals(market_data)
+                overnight_validation = validate_overnight_plan_against_candidates(
+                    overnight_packet,
+                    candidate_signals,
+                    now=validation_now,
+                )
+                premarket_validation = validate_premarket_brief_against_candidates(
+                    premarket_packet,
+                    candidate_signals,
+                    now=validation_now,
+                )
+                _verification_check(
+                    checks,
+                    "simulated_preopen_validation",
+                    "pass" if overnight_validation.get("status") in {"confirmed", "amended"} and premarket_validation.get("status") in {"confirmed", "amended"} else "warn",
+                    "Loaded latest overnight and premarket packets against fresh candidate rankings without waiting for the pre-open automation window.",
+                    overnight_status=overnight_validation.get("status"),
+                    premarket_status=premarket_validation.get("status"),
+                    overnight_top=overnight_validation.get("overnight_top_symbol"),
+                    current_top=overnight_validation.get("current_top_symbol"),
+                    premarket_top=premarket_validation.get("brief_top_symbol"),
+                )
 
     _verify_automation_text(
         checks,
@@ -11869,7 +11910,9 @@ def alpaca_supervise_hourly(
         recent_packets=recent_packets,
         config=config,
     )
-    market_data = _fetch_aggressive_candidate_market_data()
+    market_data, market_data_errors = (
+        _fetch_aggressive_candidate_market_data_result()
+    )
     held_symbols = [str(position.get("symbol", "")) for position in live_positions]
     candidate_signals = build_candidate_signals(
         market_data,
@@ -12340,6 +12383,7 @@ def alpaca_supervise_hourly(
     packet_metadata = {
         "outbox_suppressed": not outbox_write_allowed,
         "outbox_write_allowed": outbox_write_allowed,
+        "errors": market_data_errors,
     }
     if dry_run:
         packet_metadata.update(
@@ -12361,6 +12405,7 @@ def alpaca_supervise_hourly(
         {
             "outbox_suppressed": not outbox_write_allowed,
             "outbox_write_allowed": outbox_write_allowed,
+            "errors": market_data_errors,
         }
     )
     if dry_run:
@@ -12481,7 +12526,9 @@ def alpaca_supervisor_daily_report(
         recent_packets=recent_packets,
         config=config,
     )
-    market_data = _fetch_aggressive_candidate_market_data()
+    market_data, market_data_errors = (
+        _fetch_aggressive_candidate_market_data_result()
+    )
     candidate_signals = build_candidate_signals(
         market_data,
         held_symbols=[str(position.get("symbol", "")) for position in live_positions],
@@ -12537,6 +12584,7 @@ def alpaca_supervisor_daily_report(
         execution_board_review=execution_board_review,
         alpaca_reference_summary=alpaca_reference_summary,
     )
+    payload["errors"] = market_data_errors
     if write_outbox:
         from tradingagents.notifications.outbox import write_outbox_message
 

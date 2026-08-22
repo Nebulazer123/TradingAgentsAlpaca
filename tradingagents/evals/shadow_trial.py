@@ -488,6 +488,44 @@ def _stage_semantic_reasons(
             or nested.get("submitted_order_count") != 0
         ):
             reasons.append("loss_review_stage_authority_invalid")
+        if isinstance(nested, Mapping):
+            current_review = nested.get("current_loss_review")
+            remaining_blockers = nested.get("remaining_blockers")
+            if (
+                remaining_blockers not in ([], ())
+                or not isinstance(current_review, Mapping)
+                or current_review.get("trade_decision_allowed") is not True
+                or current_review.get("blockers") not in ([], ())
+            ):
+                reasons.append("loss_review_stage_incomplete")
+            advisory_analysis = nested.get("advisory_analysis")
+            route_summary = (
+                advisory_analysis.get("route_summary")
+                if isinstance(advisory_analysis, Mapping)
+                else None
+            )
+            provider_failure = (
+                not isinstance(route_summary, (list, tuple))
+                or not route_summary
+            )
+            if isinstance(route_summary, (list, tuple)):
+                for attempt in route_summary:
+                    if not isinstance(attempt, Mapping):
+                        provider_failure = True
+                        break
+                    status = str(attempt.get("status") or "").strip().lower()
+                    if (
+                        type(attempt.get("blocked")) is not bool
+                        or attempt.get("blocked") is True
+                        or not status
+                        or status in {"blocked", "error", "failed", "exception"}
+                        or "error" in status
+                        or "failed" in status
+                    ):
+                        provider_failure = True
+                        break
+            if provider_failure:
+                reasons.append("loss_review_stage_provider_failure")
     elif stage == "execution_board":
         metrics = payload.get("metrics")
         if not _is_non_authorizing(payload) or not isinstance(metrics, Mapping):

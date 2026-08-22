@@ -408,6 +408,19 @@ def _complete_daily_chain(
                         "can_submit_orders": False,
                         "next_action": "autonomous_hold",
                         "submitted_order_count": 0,
+                        "remaining_blockers": [],
+                        "current_loss_review": {
+                            "trade_decision_allowed": True,
+                            "blockers": [],
+                        },
+                        "advisory_analysis": {
+                            "route_summary": [
+                                {
+                                    "status": "packet_written",
+                                    "blocked": False,
+                                }
+                            ]
+                        },
                     },
                     "freshness": {"read_only": True, "can_submit_orders": False},
                 }
@@ -1460,6 +1473,19 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
             "can_submit_orders": False,
             "next_action": "autonomous_hold",
             "submitted_order_count": 0,
+            "remaining_blockers": [],
+            "current_loss_review": {
+                "trade_decision_allowed": True,
+                "blockers": [],
+            },
+            "advisory_analysis": {
+                "route_summary": [
+                    {
+                        "status": "packet_written",
+                        "blocked": False,
+                    }
+                ]
+            },
         },
         "freshness": {"read_only": True, "can_submit_orders": False},
     }
@@ -1467,6 +1493,97 @@ def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_brok
     assert "loss_review_stage_schema_invalid" in shadow_trial._stage_semantic_reasons(
         "loss_review", {**loss_review, "evidence_type": "provider_summary"}
     )
+    blocked_loss_review = {
+        **loss_review,
+        "payload": {
+            **loss_review["payload"],
+            "advisory_analysis": {
+                "route_summary": [
+                    {
+                        "status": "packet_written",
+                        "blocked": True,
+                    }
+                ]
+            },
+        },
+    }
+    blocked_reasons = shadow_trial._stage_semantic_reasons(
+        "loss_review",
+        blocked_loss_review,
+    )
+    assert "loss_review_stage_provider_failure" in blocked_reasons
+    assert "loss_review_stage_incomplete" not in blocked_reasons
+    incomplete_loss_review = {
+        **loss_review,
+        "payload": {
+            **loss_review["payload"],
+            "remaining_blockers": ["refreshed evidence is incomplete"],
+            "current_loss_review": {
+                "trade_decision_allowed": False,
+                "blockers": ["refreshed evidence is incomplete"],
+            },
+        },
+    }
+    incomplete_reasons = shadow_trial._stage_semantic_reasons(
+        "loss_review",
+        incomplete_loss_review,
+    )
+    assert "loss_review_stage_incomplete" in incomplete_reasons
+    assert "loss_review_stage_provider_failure" not in incomplete_reasons
+    error_reasons = shadow_trial._stage_semantic_reasons(
+        "loss_review",
+        {
+            **loss_review,
+            "payload": {
+                **loss_review["payload"],
+                "errors": {"provider": "transport failed"},
+            },
+        },
+    )
+    assert "loss_review_stage_error_present" in error_reasons
+
+    valid_empty_overnight = {
+        **overnight,
+        "overnight_quality": {
+            **overnight["overnight_quality"],
+            "full_graph_count": 0,
+            "full_graph_attempt_count": 0,
+            "full_graph_success_count": 0,
+            "tradable_count": 0,
+        },
+        "ranked_candidates": [],
+    }
+    clean_day_stage_examples = {
+        "overnight_research": valid_empty_overnight,
+        "preopen_validation": {
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "submitted_count": 0,
+            "overall_status": "pass",
+            "failed_check_ids": [],
+        },
+        "hourly_supervisor": hourly,
+        "daily_report": {"packet_count": 0, "portfolio": {}},
+        "paper_tournament": {
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_submit_orders": False,
+            "status": "NO_PAPER_SIGNAL",
+            "submitted": [],
+            "submitted_count": 0,
+        },
+    }
+    for stage, valid_empty_or_no_signal in clean_day_stage_examples.items():
+        assert shadow_trial._stage_semantic_reasons(stage, valid_empty_or_no_signal) == []
+        reasons = shadow_trial._stage_semantic_reasons(
+            stage,
+            {
+                **valid_empty_or_no_signal,
+                "errors": {"market_data": "provider transport failed"},
+            },
+        )
+        assert f"{stage}_stage_error_present" in reasons
 
     execution_board = {
         "analysis_only": True,

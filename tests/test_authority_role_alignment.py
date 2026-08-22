@@ -561,10 +561,10 @@ def _production_http_mutation_occurrences(
 _HTTP_MUTATION_CLASSIFICATIONS: dict[tuple[str, int, str, str], str] = {
     # These are deliberately exact source locations, rather than a module or
     # receiver allow-list.  A new raw write must get reviewed classification.
-    ("cli/main.py", 5217, "_overnight_ticker_process_main", "raw-http-put"): (
+    ("cli/main.py", 5238, "_overnight_ticker_process_main", "raw-http-put"): (
         "non-trading-local-process-result-queue"
     ),
-    ("cli/main.py", 5229, "_overnight_ticker_process_main", "raw-http-put"): (
+    ("cli/main.py", 5250, "_overnight_ticker_process_main", "raw-http-put"): (
         "non-trading-local-process-error-queue"
     ),
     ("tradingagents/brokers/alpaca.py", 70, "_AlpacaTransport.get_json", "raw-http-request"): (

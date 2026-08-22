@@ -413,6 +413,83 @@ def test_fetch_aggressive_candidate_market_data_falls_back_when_alpaca_latest_tr
     assert sample["source"] == "yfinance:1d-5m-prepost"
 
 
+def test_fetch_aggressive_candidate_market_data_raises_on_total_provider_failure(
+    monkeypatch,
+):
+    def failed_download(*_args, **_kwargs):
+        raise ConnectionError("candidate feed transport unavailable")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "yfinance",
+        SimpleNamespace(download=failed_download),
+    )
+    monkeypatch.setattr(cli_main, "market_session_label", lambda: "overnight")
+
+    with pytest.raises(
+        cli_main.AggressiveCandidateMarketDataError,
+        match="candidate feed transport unavailable",
+    ):
+        cli_main._fetch_aggressive_candidate_market_data()
+
+
+def test_candidate_market_data_result_distinguishes_empty_success_from_failure(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        cli_main,
+        "_fetch_aggressive_candidate_market_data",
+        lambda: {},
+    )
+
+    market_data, errors = cli_main._fetch_aggressive_candidate_market_data_result()
+
+    assert market_data == {}
+    assert errors == {}
+
+    def failed_fetch():
+        raise cli_main.AggressiveCandidateMarketDataError("provider timeout")
+
+    monkeypatch.setattr(
+        cli_main,
+        "_fetch_aggressive_candidate_market_data",
+        failed_fetch,
+    )
+
+    market_data, errors = cli_main._fetch_aggressive_candidate_market_data_result()
+
+    assert market_data == {}
+    assert errors == {
+        "market_data": "aggressive candidate market data refresh failed: provider timeout"
+    }
+
+
+def test_all_aggressive_candidate_market_data_callers_persist_explicit_failures():
+    caller_fragments = (
+        (cli_main.alpaca_paper_tournament_run, '"errors": market_data_errors'),
+        (cli_main.alpaca_paper_tournament_report, '"errors": market_data_errors'),
+        (cli_main.alpaca_plan_overnight, '"errors": market_data_errors'),
+        (
+            cli_main.alpaca_preopen_validation,
+            "broker_errors.update(market_data_errors)",
+        ),
+        (cli_main.alpaca_verify_overnight_system, "errors=market_data_errors"),
+        (cli_main.alpaca_supervise_hourly, '"errors": market_data_errors'),
+        (
+            cli_main.alpaca_supervisor_daily_report,
+            'payload["errors"] = market_data_errors',
+        ),
+    )
+
+    for caller, persisted_failure_fragment in caller_fragments:
+        source = inspect.getsource(caller)
+        assert "_fetch_aggressive_candidate_market_data_result()" in source
+        assert persisted_failure_fragment in source, caller.__name__
+    assert '"errors": dict(broker_errors)' in inspect.getsource(
+        cli_main._build_preopen_validation_packet
+    )
+
+
 def test_alpaca_reconcile_orcl_incident_writes_read_only_packet(monkeypatch, tmp_path):
     packet_path = tmp_path / "hourly-orcl.json"
     packet_path.write_text(
