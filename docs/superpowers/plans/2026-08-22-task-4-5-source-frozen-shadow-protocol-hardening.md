@@ -183,7 +183,9 @@ Focused: the increment's named test functions. Dependent: the owning modules' fu
 
 ## Final Task 4.5 acceptance (before any Task 5 runtime)
 
-- [ ] Increments 1–6 committed; full pytest green; Ruff/compileall/diff/wrapper checks green; mutation inventory reviewed.
-- [ ] Independent specification review and independent authority/security review with zero unresolved P0/P1 findings.
-- [ ] Fast-forwarded to clean canonical `master`; canonical graph re-indexed with coverage for every changed path.
+- [x] Increments 1–6 committed; full pytest green; Ruff/compileall/diff/wrapper checks green; mutation inventory reviewed.
+- [x] Independent specification review and independent authority/security review with zero unresolved P0/P1 findings.
+- [x] Fast-forwarded to clean canonical `master`; canonical graph re-indexed with coverage for every changed path.
 - [ ] Only then select the first real market day for Task 5A campaign admission.
+
+**Accepted integration record (2026-08-23):** All six increments are committed through `3483bce` on `codex/source-frozen-shadow-protocol-20260822`; clean canonical `master` was merged into the feature branch and fast-forwarded through `8387fa6`. The integrated gate ran with `TA_LIVE_SUBMIT=0`: **4175 passed, 1 expected DEEPSEEK credential-gated skip, 75 subtests, 11 existing warnings**; the post-integration focused gate was **526 passed**. Repo-wide Ruff, `compileall -q cli tradingagents scripts`, `zsh -n scripts/mac/ta_job.sh`, and diff checks all passed. The independent specification review and independent increment-level quality/security reviews completed with zero unresolved P0/P1 findings. Live control remained frozen at SHA-256 `a3fc5ddb2b300596833c48c1554fad088ecb43d46bd70aeeac074531d6e9fb07` and all ten TradingAgents automations remained `PAUSED` throughout. A fresh canonical codebase index named `tradingagents-canonical-master-final-20260822` was captured at `8387fa6`, with no recorded coverage issue on any changed source, test, or README path. No Task 5 activity was started: no qualification day or shadow trial has run.
