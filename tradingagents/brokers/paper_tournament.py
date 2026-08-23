@@ -39,6 +39,7 @@ QUALIFICATION_TRIAL_LEDGER_TYPE = "qualification_paper_trial"
 SUBMISSION_WINDOW_OPEN = "open"
 SUBMISSION_WINDOW_FINALIZED = "finalized"
 SUBMISSION_WINDOW_RECOVERY_REQUIRED = "recovery_required"
+SUBMISSION_WINDOW_ABORTED = "aborted"
 DEFAULT_TOURNAMENT_RESERVED_BUDGET = Decimal("30000")
 STRATEGY_IDS = (
     STRATEGY_CURRENT_AGGRESSIVE,
@@ -920,6 +921,15 @@ def complete_submission_transaction(ledger: dict, *, now: datetime.datetime) -> 
 def mark_submission_recovery_required(ledger: dict, *, reason: str, now: datetime.datetime) -> None:
     """Seal an uncertain broker side effect so no same-ledger retry can duplicate it."""
 
+    if (
+        ledger.get("submission_window_status") == SUBMISSION_WINDOW_ABORTED
+        or "submission_abortion" in ledger
+        or (
+            isinstance(ledger.get("submission_transaction"), Mapping)
+            and ledger["submission_transaction"].get("status") == SUBMISSION_WINDOW_ABORTED
+        )
+    ):
+        raise ValueError("an aborted paper submission lease is permanently retired")
     transaction = ledger.get("submission_transaction")
     if not isinstance(transaction, dict):
         transaction = {}
@@ -949,6 +959,67 @@ def mark_submission_recovery_required(ledger: dict, *, reason: str, now: datetim
     transaction["failed_at"] = _iso(failed_at)
     transaction["failure_reason"] = reason[:500]
     ledger["submission_window_status"] = SUBMISSION_WINDOW_RECOVERY_REQUIRED
+
+
+def abort_submission_lease(ledger: dict, *, reason: str, now: datetime.datetime) -> dict:
+    """Permanently retire a recovery-required root with no broker interaction.
+
+    The retired root can never submit or finalize again, and it cannot be
+    un-aborted: replacement trials must initialize a fresh root and therefore
+    a fresh tournament id.  This is a pure local ledger operation by design —
+    the caller must not touch the broker while the side effect is uncertain.
+    """
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("paper lease abortion requires a non-empty operator reason")
+    if not isinstance(ledger, dict) or ledger.get("ledger_type") != QUALIFICATION_TRIAL_LEDGER_TYPE:
+        raise ValueError("paper lease abortion has an unsupported ledger type")
+    if "submission_abortion" in ledger or ledger.get("submission_window_status") == SUBMISSION_WINDOW_ABORTED:
+        raise ValueError("an aborted paper submission lease is permanently retired")
+    if ledger.get("submission_window_status") != SUBMISSION_WINDOW_RECOVERY_REQUIRED:
+        raise ValueError(
+            "only a recovery-required paper submission lease can be aborted"
+        )
+    transaction = ledger.get("submission_transaction")
+    if (
+        not isinstance(transaction, dict)
+        or transaction.get("status") != SUBMISSION_WINDOW_RECOVERY_REQUIRED
+    ):
+        raise ValueError("paper lease abortion requires recovery-required transaction evidence")
+    failed_at = _parse_timestamp(transaction.get("failed_at"))
+    started_at = _parse_timestamp(ledger.get("started_at"))
+    successful = transaction.get("successful_submissions")
+    recorded_at_values: list[datetime.datetime | None] = []
+    if isinstance(successful, list):
+        for item in successful:
+            recorded_at = (
+                _parse_timestamp(item.get("recorded_at")) if isinstance(item, Mapping) else None
+            )
+            if (
+                recorded_at_values
+                and recorded_at is not None
+                and recorded_at_values[-1] is not None
+                and recorded_at < recorded_at_values[-1]
+            ):
+                raise ValueError("paper lease abortion timestamp is not monotonic")
+            recorded_at_values.append(recorded_at)
+    aborted_at = _normalize_aware_policy_timestamp(now)
+    if (
+        aborted_at is None
+        or (started_at is not None and aborted_at < started_at)
+        or (failed_at is not None and aborted_at < failed_at)
+        or any(value is None or value > aborted_at for value in recorded_at_values)
+    ):
+        raise ValueError("paper lease abortion timestamp is not monotonic")
+    transaction["status"] = SUBMISSION_WINDOW_ABORTED
+    ledger["submission_window_status"] = SUBMISSION_WINDOW_ABORTED
+    ledger["submission_abortion"] = {
+        "status": SUBMISSION_WINDOW_ABORTED,
+        "aborted_at": _iso(aborted_at),
+        "reason": reason.strip()[:500],
+        "failed_transaction_market_date": transaction.get("market_date"),
+    }
+    return dict(ledger["submission_abortion"])
 
 
 def finalize_submission_lease(
@@ -1286,10 +1357,65 @@ def compact_tournament_ledger_payload(
     return compact
 
 
+def _refuse_replacing_retired_root(ledger_path: Path, ledger: Mapping) -> None:
+    """Refuse any durable write that would drop a root's retirement record.
+
+    Retired roots stay retired: the only ledger that may be written over an
+    aborted one is the same ledger still carrying a structurally identical
+    (JSON-equality) ``submission_abortion`` record with the window still
+    aborted.  This is what blocks ``paper-tournament init`` or any direct
+    overwrite from reviving a retired root in place; replacement trials must
+    use fresh roots and fresh tournament ids.
+
+    Locking: this read-then-write check is race-free only inside the per-root
+    ``tournament_submission_lock``.  Every durable production writer holds it
+    across its guard read and atomic ledger write: run, finalize, report, and
+    abort hold it for their whole ledger section; init acquires it for the
+    final durable initialization write (broker/calendar reads stay outside);
+    alphainsider-watch acquires it around a fresh reload plus its plan update.
+    Direct callers of this module-level helper are responsible for their own
+    lock ownership; no internal locking is added, preserving the established
+    atomic write boundary.
+    """
+
+    if not ledger_path.exists():
+        return
+    try:
+        existing = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"existing paper tournament ledger is unreadable or invalid: {ledger_path}"
+        ) from exc
+    if not isinstance(existing, Mapping):
+        raise ValueError(
+            f"existing paper tournament ledger is unreadable or invalid: {ledger_path}"
+        )
+    existing_record = existing.get("submission_abortion")
+    if (
+        existing.get("submission_window_status") != SUBMISSION_WINDOW_ABORTED
+        and not isinstance(existing_record, Mapping)
+    ):
+        return
+    incoming_record = (
+        ledger.get("submission_abortion") if isinstance(ledger, Mapping) else None
+    )
+    if (
+        isinstance(existing_record, Mapping)
+        and incoming_record == existing_record
+        and ledger.get("submission_window_status") == SUBMISSION_WINDOW_ABORTED
+    ):
+        return
+    raise ValueError(
+        "paper tournament root is permanently retired; "
+        "replacement trials must initialize a fresh root"
+    )
+
+
 def write_tournament_ledger(ledger: Mapping, output_dir: str | Path) -> Path:
     path = Path(output_dir)
     path.mkdir(parents=True, exist_ok=True)
     ledger_path = path / LEDGER_FILE
+    _refuse_replacing_retired_root(ledger_path, ledger)
     ledger_text = json.dumps(ledger, indent=2)
     _atomic_write_text(ledger_path, ledger_text)
     _atomic_write_text(path / "latest.json", ledger_text)

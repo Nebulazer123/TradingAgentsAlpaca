@@ -3191,3 +3191,109 @@ def test_compare_alpaca_order_to_intent_flags_mismatch_or_unsafe_status():
     assert any("side mismatch" in issue for issue in issues)
     assert any("notional mismatch" in issue for issue in issues)
     assert any("limit_price mismatch" in issue for issue in issues)
+
+
+class _OrdersResponse:
+    def __init__(self, payload):
+        self.status_code = 200
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _RecordingOrdersSession:
+    """Fake session serving one scripted /v2/orders collection and recording params."""
+
+    def __init__(self, payload=None):
+        self.payload = payload if payload is not None else []
+        self.orders_calls = []
+
+    def request(self, method, url, **kwargs):
+        if method == "GET" and url.endswith("/v2/orders"):
+            self.orders_calls.append(kwargs["params"])
+            return _OrdersResponse(self.payload)
+        raise AssertionError(f"unexpected broker read: {method} {url}")
+
+
+def _paper_orders_client(session) -> AlpacaRestClient:
+    return AlpacaRestClient(
+        settings=AlpacaSettings(
+            api_key="test-key",
+            secret_key="test-secret",
+            paper=True,
+            base_url="https://paper-api.alpaca.markets",
+        ),
+        session=session,
+    )
+
+
+def test_red_list_orders_requests_documented_filters_and_limit_without_cursor():
+    session = _RecordingOrdersSession(
+        [{"id": "order-a", "client_order_id": "ta-paperbot-x-1"}]
+    )
+    client = _paper_orders_client(session)
+
+    orders = client.list_orders(
+        status="all", after="2026-08-21T05:00:00+00:00", limit=500
+    )
+
+    assert [order["id"] for order in orders] == ["order-a"]
+    assert session.orders_calls == [
+        {
+            "status": "all",
+            "after": "2026-08-21T05:00:00+00:00",
+            "limit": 500,
+        }
+    ]
+    # The documented Get All Orders contract has no cursor parameter.
+    assert all("page_token" not in params for params in session.orders_calls)
+
+
+def test_red_list_orders_valid_collection_below_limit_is_returned_complete():
+    session = _RecordingOrdersSession(
+        [{"id": f"order-{index}"} for index in range(4)]
+    )
+
+    orders = _paper_orders_client(session).list_orders(status="all", limit=5)
+
+    assert len(orders) == 4
+
+
+def test_red_list_orders_fails_closed_when_collection_reaches_the_ceiling():
+    ceiling = 5
+    session = _RecordingOrdersSession([{"id": f"order-{i}"} for i in range(ceiling)])
+
+    with pytest.raises(AlpacaExecutionError, match="completeness|ceiling"):
+        _paper_orders_client(session).list_orders(
+            status="all", after="2026-08-21T05:00:00+00:00", limit=ceiling
+        )
+
+
+@pytest.mark.parametrize("bad_limit", [0, -1, 501, "500", True, 2.5])
+def test_red_list_orders_rejects_invalid_bounds_before_transport(bad_limit):
+    session = _RecordingOrdersSession()
+
+    with pytest.raises(ValueError, match="limit"):
+        _paper_orders_client(session).list_orders(status="all", limit=bad_limit)
+
+    assert session.orders_calls == []
+
+
+def test_red_list_orders_rejects_blank_after_filter_before_transport():
+    session = _RecordingOrdersSession()
+
+    with pytest.raises(ValueError, match="after"):
+        _paper_orders_client(session).list_orders(status="all", after="   ")
+
+    assert session.orders_calls == []
+
+
+def test_red_list_orders_status_only_callers_keep_single_read_compatibility():
+    session = _RecordingOrdersSession([{"id": "open-1"}])
+
+    orders = _paper_orders_client(session).list_orders(status="open")
+
+    assert orders == [{"id": "open-1"}]
+    assert session.orders_calls == [{"status": "open"}]

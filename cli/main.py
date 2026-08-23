@@ -9368,6 +9368,13 @@ def alpaca_check():
     console.print(table)
 
 
+# Documented Get All Orders maximum limit; a bound reconciliation reads with
+# this limit so only a response strictly below the limit proves completeness,
+# while an at-limit response fails closed because completeness could not be
+# proven beyond it.
+_BOUND_RECONCILIATION_ORDER_LIMIT = 500
+
+
 @alpaca_app.command("reconcile-observer")
 def alpaca_reconcile_observer(
     output_dir: Path = typer.Option(
@@ -9405,9 +9412,34 @@ def alpaca_reconcile_observer(
     except Exception as exc:  # noqa: BLE001 - preserve an unavailable observer as evidence.
         live = {"errors": {"client": f"live client initialization failed: {exc}"}}
     try:
-        paper = capture_read_only_broker_snapshot(_alpaca_paper_client(), captured_at=generated_at)
+        paper_client = _alpaca_paper_client()
+        paper = capture_read_only_broker_snapshot(paper_client, captured_at=generated_at)
     except Exception as exc:  # noqa: BLE001 - preserve an unavailable observer as evidence.
+        paper_client = None
         paper = {"errors": {"client": f"paper client initialization failed: {exc}"}}
+    if shadow_start is not None and paper_client is not None:
+        # A bound reconciliation must observe the complete same-market-day
+        # paper order book so adjudication can prove one-to-one identity with
+        # the day's tournament packet.  This stays a read-only GET using only
+        # documented query parameters; the wrapper fails closed when the
+        # collection reaches the limit, because completeness could not be
+        # proven beyond that ceiling.
+        try:
+            market_date = str(shadow_start.payload["market_date"])
+            day_open_utc = (
+                datetime.datetime.combine(
+                    datetime.date.fromisoformat(market_date), datetime.time.min
+                )
+                .replace(tzinfo=CENTRAL)
+                .astimezone(datetime.timezone.utc)
+            )
+            paper["all_orders"] = paper_client.list_orders(
+                status="all",
+                after=day_open_utc.isoformat(),
+                limit=_BOUND_RECONCILIATION_ORDER_LIMIT,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed read must fail the day closed.
+            paper.setdefault("errors", {})["all_orders"] = f"list_orders(all) failed: {exc}"
     packet: dict[str, object] = {
         "kind": "broker_reconciliation_observer",
         "generated_at": generated_at.isoformat(timespec="seconds"),
@@ -10378,7 +10410,13 @@ def alpaca_paper_tournament_init(
     record_equity_snapshot(ledger, market_data=market_data, now=now)
     report = build_tournament_report(ledger, market_data=market_data, now=now)
     ledger["latest_report"] = report
-    ledger_path = write_tournament_ledger(ledger, log_dir)
+    from tradingagents.brokers.paper_tournament import tournament_submission_lock
+
+    # The durable initialization serializes with every other writer so an
+    # abort cannot land between the retired-root guard's disk read and this
+    # atomic write.  Broker/calendar reads deliberately stay outside the lock.
+    with tournament_submission_lock(log_dir):
+        ledger_path = write_tournament_ledger(ledger, log_dir)
     packet = {
         "kind": "paper_tournament_init",
         "ledger_path": str(ledger_path),
@@ -10456,8 +10494,20 @@ def alpaca_paper_tournament_alphainsider_watch(
         now=_alpaca_policy_now(),
     )
     if ledger is not None:
-        ledger["alphainsider_paper_watch_plan"] = plan
-        write_tournament_ledger(ledger, log_dir)
+        from tradingagents.brokers.paper_tournament import tournament_submission_lock
+
+        # The persisted update serializes under the per-root lock and operates
+        # on a fresh reload, so an interleaved abort is respected instead of
+        # overwritten by the stale pre-command snapshot.  Planning above kept
+        # its original early-snapshot inputs; only the durable write reloads.
+        with tournament_submission_lock(log_dir):
+            try:
+                fresh_ledger = load_tournament_ledger(log_dir)
+            except FileNotFoundError:
+                fresh_ledger = None
+            if fresh_ledger is not None:
+                fresh_ledger["alphainsider_paper_watch_plan"] = plan
+                write_tournament_ledger(fresh_ledger, log_dir)
     packet_path = write_tournament_packet(plan, log_dir, prefix="alphainsider-paper-watch")
     payload = {**plan, "packet_path": str(packet_path)}
     if json_output:
@@ -10726,6 +10776,52 @@ def alpaca_paper_tournament_finalize(
         typer.echo(json.dumps(packet, indent=2))
         return
     console.print(f"[green]Paper tournament submission lease finalized at {ledger_path}[/green]")
+
+
+@paper_tournament_app.command("abort-submission-lease")
+def alpaca_paper_tournament_abort_submission_lease(
+    reason: str = typer.Option(..., "--reason", help="Operator reason for retiring this root."),
+    json_output: bool = typer.Option(False, "--json-output"),
+    log_dir: Path = typer.Option(
+        Path("results/paper_strategy_tournament"),
+        "--log-dir",
+        help="Directory containing the paper strategy tournament ledger.",
+    ),
+):
+    """Permanently retire a recovery-required paper root without any broker call."""
+
+    from tradingagents.brokers.paper_tournament import (
+        abort_submission_lease,
+        load_tournament_ledger,
+        tournament_submission_lock,
+        write_tournament_ledger,
+    )
+
+    with tournament_submission_lock(log_dir):
+        ledger = load_tournament_ledger(log_dir)
+        now = _alpaca_policy_now()
+        try:
+            abortion = abort_submission_lease(ledger, reason=reason, now=now)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        ledger_path = write_tournament_ledger(ledger, log_dir)
+    packet = {
+        "kind": "paper_tournament_abort",
+        "generated_at": now.isoformat(timespec="seconds"),
+        "ledger_path": str(ledger_path),
+        "submission_window_status": ledger.get("submission_window_status"),
+        "abortion": abortion,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    packet_path = write_tournament_packet(packet, log_dir, prefix="paper-tournament-abort")
+    packet["packet_path"] = str(packet_path)
+    if json_output:
+        typer.echo(json.dumps(packet, indent=2))
+        return
+    console.print(f"[red]Paper submission lease aborted at {ledger_path}[/red]")
+    console.print("This root is permanently retired; initialize a fresh root for a replacement trial.")
 
 
 @paper_tournament_app.command("report")

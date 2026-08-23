@@ -118,13 +118,19 @@ def _write_schedule_fixture(
     return contract, roles, automation_root
 
 
-def _control(path: Path, *, frozen: bool = True, malformed: bool = False) -> Path:
+def _control(
+    path: Path,
+    *,
+    frozen: bool = True,
+    malformed: bool = False,
+    dead_man_expires_at: str = "2026-12-31T00:00:00+00:00",
+) -> Path:
     _write_json(
         path,
         ({"frozen": "true"} if malformed else {
             "frozen": frozen,
             "reason": "manual safety hold",
-            "dead_man_expires_at": "2026-12-31T00:00:00+00:00",
+            "dead_man_expires_at": dead_man_expires_at,
         }),
     )
     return path
@@ -231,12 +237,14 @@ def _configure_environment(
     malformed_control: bool = False,
     active_id: str | None = None,
     omit_id: str | None = None,
+    dead_man_expires_at: str = "2026-12-31T00:00:00+00:00",
 ) -> dict[str, Path]:
     manual_root = tmp_path / "results" / "manual_shadow"
     control = _control(
         tmp_path / "results" / "policy" / "live_control.json",
         frozen=frozen,
         malformed=malformed_control,
+        dead_man_expires_at=dead_man_expires_at,
     )
     contract, roles, automation_root = _write_schedule_fixture(
         tmp_path / "schedule",
@@ -569,9 +577,14 @@ def _complete_daily_chain(
                     "live": _healthy_broker_snapshot(
                         date=payload["market_date"], account_id="live-account"
                     ),
-                    "paper": _healthy_broker_snapshot(
-                        date=payload["market_date"], account_id="paper-account"
-                    ),
+                    "paper": {
+                        **_healthy_broker_snapshot(
+                            date=payload["market_date"], account_id="paper-account"
+                        ),
+                        # Complete order-book evidence: an empty day must prove
+                        # it holds no tournament orders.
+                        "all_orders": [],
+                    },
                 }
             )
         _write_json(path, packet)
@@ -760,17 +773,23 @@ def test_bound_reconciliation_and_public_manifest_cli_use_authenticated_start(tm
     start = _start(monkeypatch, date="2026-08-21")
 
     class Broker:
+        def __init__(self):
+            self.order_reads = []
+
         def get_account(self): return {"id": "observer", "status": "ACTIVE"}
         def list_positions(self): return []
-        def list_orders(self, *, status): return []
+        def list_orders(self, *, status, after=None, limit=None):
+            self.order_reads.append((status, after, limit))
+            return []
         def get_clock(self): return {"is_open": False, "timestamp": "2026-08-21T14:00:00+00:00"}
         def __getattr__(self, name):
             if name in {"submit_order", "cancel_order", "replace_order"}:
                 raise AssertionError(f"forbidden write {name}")
             raise AttributeError(name)
 
-    monkeypatch.setattr(cli_main, "_alpaca_live_client", Broker)
-    monkeypatch.setattr(cli_main, "_alpaca_paper_client", Broker)
+    broker = Broker()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: broker)
     monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2026-08-21", 14))
     reconcile = runner.invoke(
         app,
@@ -783,6 +802,14 @@ def test_bound_reconciliation_and_public_manifest_cli_use_authenticated_start(tm
     reconcile_payload = json.loads(reconcile.stdout)
     assert reconcile_payload["shadow_start_object_id"] == start.envelope.object_id
     assert reconcile_payload["status"] == "COMPLETE"
+    # A bound reconciliation must observe the full same-market-day paper book
+    # with the documented bounded retrieval: status=all, day-start after, limit.
+    assert broker.order_reads == [
+        ("open", None, None),
+        ("open", None, None),
+        ("all", "2026-08-21T05:00:00+00:00", 500),
+    ]
+    assert reconcile_payload["paper"]["all_orders"] == []
 
     artifacts = _artifacts(
         tmp_path,
@@ -811,6 +838,98 @@ def test_bound_reconciliation_and_public_manifest_cli_use_authenticated_start(tm
     manifest_payload = json.loads(manifest.stdout)
     assert manifest_payload["shadow_start_object_id"] == start.envelope.object_id
     assert set(manifest_payload["stages"]) == set(shadow_trial.DAILY_CHAIN_STAGES)
+
+
+def test_bound_reconciliation_records_hold_evidence_when_all_orders_read_fails(
+    tmp_path, monkeypatch
+):
+    """A failed bound all_orders read becomes HOLD errors, never silent acceptance."""
+
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    class Broker:
+        def get_account(self): return {"id": "observer", "status": "ACTIVE"}
+        def list_positions(self): return []
+        def list_orders(self, *, status, after=None, limit=None):
+            if status == "all":
+                raise RuntimeError("broker transport unavailable")
+            return []
+        def get_clock(self): return {"is_open": False, "timestamp": "2026-08-21T14:00:00+00:00"}
+        def __getattr__(self, name):
+            if name in {"submit_order", "cancel_order", "replace_order"}:
+                raise AssertionError(f"forbidden write {name}")
+            raise AttributeError(name)
+
+    broker = Broker()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2026-08-21", 14))
+    reconcile = runner.invoke(
+        app,
+        [
+            "alpaca", "reconcile-observer", "--shadow-start-object-id", start.envelope.object_id,
+            "--output-dir", str(tmp_path / "reconcile"), "--json-output",
+        ],
+    )
+    assert reconcile.exit_code == 0, reconcile.output
+    reconcile_payload = json.loads(reconcile.stdout)
+    # The failure is preserved as evidence and the packet is HOLD, not COMPLETE.
+    assert reconcile_payload["status"] == "HOLD"
+    assert reconcile_payload["paper"]["errors"]["all_orders"] == (
+        "list_orders(all) failed: broker transport unavailable"
+    )
+    assert "all_orders" not in reconcile_payload["paper"]
+    # The same evidence is non-clean-compatible downstream stage evidence.
+    assert "broker_reconciliation_stage_semantics_invalid" in (
+        shadow_trial._stage_semantic_reasons("broker_reconciliation", reconcile_payload)
+    )
+
+
+def test_bound_reconciliation_winter_market_date_uses_cst_utc_offset(
+    tmp_path, monkeypatch
+):
+    """The derived day-start bound follows the market date's UTC offset (CST 06:00Z)."""
+
+    _configure_environment(
+        monkeypatch,
+        tmp_path,
+        dead_man_expires_at="2027-12-31T00:00:00+00:00",
+    )
+    winter_start = _start(monkeypatch, date="2027-01-04")
+
+    class Broker:
+        def __init__(self):
+            self.order_reads = []
+
+        def get_account(self): return {"id": "observer", "status": "ACTIVE"}
+        def list_positions(self): return []
+        def list_orders(self, *, status, after=None, limit=None):
+            self.order_reads.append((status, after, limit))
+            return []
+        def get_clock(self): return {"is_open": False, "timestamp": "2027-01-04T14:00:00+00:00"}
+        def __getattr__(self, name):
+            if name in {"submit_order", "cancel_order", "replace_order"}:
+                raise AssertionError(f"forbidden write {name}")
+            raise AttributeError(name)
+
+    broker = Broker()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2027-01-04", 14))
+    reconcile = runner.invoke(
+        app,
+        [
+            "alpaca", "reconcile-observer", "--shadow-start-object-id", winter_start.envelope.object_id,
+            "--output-dir", str(tmp_path / "reconcile"), "--json-output",
+        ],
+    )
+    assert reconcile.exit_code == 0, reconcile.output
+    reconcile_payload = json.loads(reconcile.stdout)
+    assert reconcile_payload["status"] == "COMPLETE"
+    # 2027-01-04 is Central Standard Time (UTC-6): midnight CT is 06:00Z.
+    assert broker.order_reads[-1] == ("all", "2027-01-04T06:00:00+00:00", 500)
+    assert reconcile_payload["paper"]["all_orders"] == []
 
 
 def test_red_generic_self_sealed_files_never_load_or_become_candidate(tmp_path, monkeypatch):
@@ -1483,6 +1602,367 @@ def test_red_clean_hold_and_zero_submission_are_valid_only_with_complete_bound_e
     assert payload["status"] == "clean"
     assert payload["phase"] == "qualification_clean"
     assert payload["artifacts"]["paper_tournament"]["payload"]["submitted_count"] == 0
+
+
+def _tournament_order_fixture(
+    *,
+    client_order_id: str = "ta-paperbot-current-aggressive-2608211520-1-nvda",
+    order_id: str = "broker-order-1",
+    symbol: str = "NVDA",
+    side: str = "buy",
+    order_type: str = "limit",
+    status: str = "filled",
+    created_at: str = "2026-08-21T15:20:00+00:00",
+) -> dict:
+    return {
+        "strategy_id": "current-aggressive",
+        "reason": "shadow qualification paper tick",
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "time_in_force": "day",
+        "notional": "1000.00",
+        "limit_price": "218.43",
+        "extended_hours": False,
+        "client_order_id": client_order_id,
+        "id": order_id,
+        "status": status,
+        "created_at": created_at,
+    }
+
+
+def _write_submitted_paper_artifact(root: Path, *, start, orders: list[dict]) -> Path:
+    payload = _payload(start)
+    date = payload["market_date"]
+    packet = {
+        "kind": "paper_tournament_run",
+        "run_id": payload["run_id"],
+        "market_date": date,
+        "shadow_start_object_id": start.envelope.object_id,
+        "generated_at": "2026-08-21T15:30:00+00:00",
+        "status": "COMPLETE",
+        "dry_run": False,
+        "submitted_count": len(orders),
+        "submitted": orders,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    path = root / "artifacts" / f"paper-submitted-{date}.json"
+    _write_json(path, packet)
+    return path
+
+
+def _bound_reconciliation_packet(start, *, all_orders: list[dict], captured_at: str) -> dict:
+    payload = _payload(start)
+    healthy_live = _healthy_broker_snapshot(date=payload["market_date"], account_id="live-account")
+    healthy_paper = _healthy_broker_snapshot(date=payload["market_date"], account_id="paper-account")
+    healthy_live["captured_at"] = captured_at
+    healthy_paper["captured_at"] = captured_at
+    healthy_paper["all_orders"] = all_orders
+    return {
+        "kind": "broker_reconciliation_observer",
+        "run_id": payload["run_id"],
+        "market_date": payload["market_date"],
+        "shadow_start_object_id": start.envelope.object_id,
+        "generated_at": captured_at,
+        "status": "COMPLETE",
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "read_only": True,
+        "submitted_count": 0,
+        "cancelled_count": 0,
+        "live": healthy_live,
+        "paper": healthy_paper,
+    }
+
+
+def _adjudicate_day_with_paper_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mutate_reconciliation=None,
+    mutate_manifest=None,
+    orders: list[dict] | None = None,
+    reconciliation_all_orders: list[dict] | None = None,
+):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    payload = _payload(start)
+    date = payload["market_date"]
+    submitted_orders = [_tournament_order_fixture()] if orders is None else orders
+    observed_orders = (
+        [dict(order) for order in submitted_orders]
+        if reconciliation_all_orders is None
+        else reconciliation_all_orders
+    )
+    sentinel_path = _artifacts(
+        tmp_path,
+        run_id=payload["run_id"],
+        date=date,
+        start_object_id=start.envelope.object_id,
+    )["safety_sentinel"]
+    paper_path = _write_submitted_paper_artifact(tmp_path, start=start, orders=submitted_orders)
+    artifacts = {"safety_sentinel": sentinel_path, "paper_tournament": paper_path}
+    _complete_daily_chain(tmp_path, start=start, artifacts=artifacts)
+    reconciliation_packet = _bound_reconciliation_packet(
+        start,
+        all_orders=observed_orders,
+        captured_at="2026-08-21T15:45:00+00:00",
+    )
+    if mutate_reconciliation is not None:
+        mutate_reconciliation(reconciliation_packet)
+    recon_path = tmp_path / "artifacts" / f"broker-reconciliation-bound-{date}.json"
+    _write_json(recon_path, reconciliation_packet)
+    stage_paths = {**artifacts, "broker_reconciliation": recon_path}
+    _set_clock(monkeypatch, date, 16)
+    manifest_path = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=stage_paths)
+    if mutate_manifest is not None:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mutate_manifest(manifest_payload)
+        _write_json(manifest_path, manifest_payload)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date=date,
+        artifacts={
+            "safety_sentinel": stage_paths["safety_sentinel"],
+            "paper_tournament": stage_paths["paper_tournament"],
+            "daily_chain_manifest": manifest_path,
+        },
+    )
+    return _payload(decision)
+
+
+def test_red_clean_day_paper_orders_must_match_post_paper_reconciliation_exactly(tmp_path, monkeypatch):
+    decision_payload = _adjudicate_day_with_paper_submission(tmp_path, monkeypatch)
+    assert decision_payload["status"] == "clean"
+    assert not any(reason.startswith("broker_reconciliation_") for reason in decision_payload["reasons"])
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__(
+                "all_orders", []
+            ),
+            "broker_reconciliation_missing_tournament_order",
+            id="missing",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"].append(
+                dict(packet["paper"]["all_orders"][0])
+            ),
+            "broker_reconciliation_duplicate_tournament_order",
+            id="duplicate",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"].append(
+                _tournament_order_fixture(
+                    client_order_id="ta-paperbot-current-aggressive-2608211545-9-tsla",
+                    order_id="broker-order-9",
+                    symbol="TSLA",
+                )
+            ),
+            "broker_reconciliation_extra_tournament_order",
+            id="extra",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__(
+                "id", "broker-order-999"
+            ),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-broker-id",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__(
+                "symbol", "MSFT"
+            ),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-symbol",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__("side", "sell"),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-side",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__("type", "market"),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-type",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__(
+                "created_at", "2026-08-21T15:19:00+00:00"
+            ),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="reverse-timestamp",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__("status", "new"),
+            "broker_reconciliation_nonterminal_tournament_order",
+            id="nonterminal",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__(
+                "open_orders", [dict(packet["paper"]["all_orders"][0])]
+            ),
+            "broker_reconciliation_open_tournament_order_present",
+            id="still-open-in-open-orders",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__(
+                "captured_at", "2026-08-21T15:10:00+00:00"
+            ),
+            "broker_reconciliation_captured_before_last_paper_submission",
+            id="reconciliation-captured-before-paper",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].pop("all_orders"),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="missing-all-orders-evidence",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("all_orders", ["junk"]),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="malformed-all-orders-evidence",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].pop("open_orders"),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="absent-open-orders-evidence",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("open_orders", ["junk"]),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="malformed-open-orders-entry",
+        ),
+    ],
+)
+def test_red_broken_paper_to_reconciliation_binding_is_never_clean(
+    tmp_path, monkeypatch, mutate, expected_reason
+):
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        mutate_reconciliation=mutate,
+    )
+    assert decision_payload["status"] != "clean"
+    assert expected_reason in decision_payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda packet: packet["paper"].pop("open_orders"), id="absent"),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("open_orders", ["junk"]),
+            id="nonmapping-entry",
+        ),
+    ],
+)
+def test_red_empty_day_open_orders_defects_fail_closed_in_both_layers(
+    tmp_path, monkeypatch, mutate
+):
+    """Quiet-day open_orders defects never stay clean: stage layer fails them
+    (governing status) while the hardened binding helper adds its explicit
+    invalid evidence reason as defense in depth."""
+
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        orders=[],
+        reconciliation_all_orders=[],
+        mutate_reconciliation=mutate,
+    )
+    assert decision_payload["status"] == "failed"
+    assert "broker_reconciliation_stage_semantics_invalid" in decision_payload["reasons"]
+    assert "broker_reconciliation_tournament_evidence_invalid" in decision_payload["reasons"]
+
+
+def test_red_reconciliation_tournament_entries_require_present_mapping_lists():
+    healthy = {"all_orders": [], "open_orders": []}
+    assert (
+        shadow_trial._reconciliation_tournament_entries(healthy, "all_orders", "open_orders")
+        == []
+    )
+    observed = shadow_trial._reconciliation_tournament_entries(
+        {"open_orders": [{"client_order_id": "ta-paperbot-x-1"}]}, "open_orders"
+    )
+    assert observed == [{"client_order_id": "ta-paperbot-x-1"}]
+    # Absent named list, non-list evidence, non-mapping item, bad snapshot.
+    assert shadow_trial._reconciliation_tournament_entries({"all_orders": []}, "open_orders") is None
+    assert shadow_trial._reconciliation_tournament_entries({"open_orders": "junk"}, "open_orders") is None
+    assert shadow_trial._reconciliation_tournament_entries({"open_orders": ["x"]}, "open_orders") is None
+    assert shadow_trial._reconciliation_tournament_entries("junk", "open_orders") is None
+
+
+def test_red_stray_tournament_orders_in_reconciliation_block_an_empty_day(tmp_path, monkeypatch):
+    stray = _tournament_order_fixture(
+        client_order_id="ta-paperbot-current-aggressive-2608211520-7-amzn",
+        order_id="broker-order-7",
+        symbol="AMZN",
+    )
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        orders=[],
+        reconciliation_all_orders=[stray],
+    )
+    assert decision_payload["status"] != "clean"
+    assert "broker_reconciliation_unbound_tournament_order_present" in decision_payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda packet: packet["paper"].pop("all_orders"),
+            id="empty-day-missing-all-orders",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("all_orders", "junk"),
+            id="empty-day-malformed-all-orders",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("all_orders", ["junk"]),
+            id="empty-day-nonmapping-all-order-entry",
+        ),
+    ],
+)
+def test_red_empty_day_requires_valid_full_order_evidence_to_stay_clean(
+    tmp_path, monkeypatch, mutate
+):
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        orders=[],
+        reconciliation_all_orders=[],
+        mutate_reconciliation=mutate,
+    )
+    assert decision_payload["status"] == "incomplete"
+    assert "broker_reconciliation_tournament_evidence_invalid" in decision_payload["reasons"]
+
+
+def test_red_forged_embedded_reconciliation_cannot_launder_broken_stage_evidence(
+    tmp_path, monkeypatch
+):
+    def restore_orders_in_embedded_copy(manifest):
+        manifest["broker_reconciliation"]["paper"]["all_orders"] = [
+            _tournament_order_fixture()
+        ]
+
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        mutate_reconciliation=lambda packet: packet["paper"].__setitem__("all_orders", []),
+        mutate_manifest=restore_orders_in_embedded_copy,
+    )
+    assert decision_payload["status"] != "clean"
+    assert "broker_reconciliation_embedded_copy_mismatch" in decision_payload["reasons"]
 
 
 def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_broker_errors():

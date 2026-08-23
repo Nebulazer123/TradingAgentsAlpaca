@@ -2186,6 +2186,158 @@ def _paper_order_ids(payload: Mapping[str, object]) -> list[str]:
     return ids
 
 
+_PAPERBOT_CLIENT_ORDER_PREFIX = "ta-paperbot-"
+_RECONCILIATION_TERMINAL_ORDER_STATUSES = frozenset(
+    {"filled", "canceled", "expired", "rejected"}
+)
+
+
+def _reconciliation_tournament_entries(snapshot: object, *keys: str) -> list[Mapping] | None:
+    """Collect ta-paperbot-* order mappings from named snapshot lists.
+
+    Binding needs positive evidence: every named list must be present in the
+    snapshot mapping, be a list/tuple, and contain only Mapping items.
+    Returns None when any of that fails so callers treat it as invalid
+    evidence instead of silently assuming a proven empty set.
+    """
+
+    if not isinstance(snapshot, Mapping):
+        return None
+    collected: list[Mapping] = []
+    for key in keys:
+        if key not in snapshot:
+            return None
+        entries = snapshot[key]
+        if not isinstance(entries, (list, tuple)):
+            return None
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                return None
+            client_order_id = entry.get("client_order_id")
+            if (
+                isinstance(client_order_id, str)
+                and client_order_id.startswith(_PAPERBOT_CLIENT_ORDER_PREFIX)
+            ):
+                collected.append(entry)
+    return collected
+
+
+def _manifest_reconciliation_binding_reasons(
+    paper_payload: object,
+    reconciliation_payload: object,
+) -> list[str]:
+    """Prove one-to-one identity between paper orders and the post-paper snapshot.
+
+    Every ``ta-paperbot-*`` order in the paper packet must appear exactly once
+    in the reconciliation's full paper-order evidence with the matching broker
+    id, client order id, symbol, side, type, and creation timestamp; matched
+    orders must be terminal; and the reconciliation capture must follow the
+    last paper submission.  Any defect is incomplete — never clean.  A day
+    that legitimately produced no tournament signal stays clean only when
+    valid complete order evidence explicitly proves no tournament orders.
+    """
+
+    reasons: list[str] = []
+    if not isinstance(paper_payload, Mapping) or not isinstance(reconciliation_payload, Mapping):
+        return reasons
+    submitted = paper_payload.get("submitted")
+    packet_orders = [
+        item
+        for item in (submitted if isinstance(submitted, (list, tuple)) else ())
+        if isinstance(item, Mapping)
+        and isinstance(item.get("client_order_id"), str)
+        and item["client_order_id"].startswith(_PAPERBOT_CLIENT_ORDER_PREFIX)
+    ]
+    paper_snapshot = reconciliation_payload.get("paper")
+
+    if not packet_orders:
+        # A quiet day is clean only when complete order evidence proves that
+        # the account holds no tournament orders; missing or malformed
+        # evidence is ambiguous and therefore incomplete.
+        if not isinstance(paper_snapshot, Mapping):
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        if _parse_timestamp(paper_snapshot.get("captured_at")) is None:
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        all_orders_evidence = paper_snapshot.get("all_orders")
+        if not isinstance(all_orders_evidence, (list, tuple)) or any(
+            not isinstance(entry, Mapping) for entry in all_orders_evidence
+        ):
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        observed_all = _reconciliation_tournament_entries(paper_snapshot, "all_orders")
+        observed_open = _reconciliation_tournament_entries(paper_snapshot, "open_orders")
+        if observed_all is None or observed_open is None:
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        if observed_all or observed_open:
+            return ["broker_reconciliation_unbound_tournament_order_present"]
+        return []
+
+    invalid = "broker_reconciliation_tournament_evidence_invalid"
+    if not isinstance(paper_snapshot, Mapping):
+        return [invalid]
+    captured_at = _parse_timestamp(paper_snapshot.get("captured_at"))
+    all_orders = paper_snapshot.get("all_orders")
+    if captured_at is None or not isinstance(all_orders, (list, tuple)):
+        return [invalid]
+    for entry in all_orders:
+        if not isinstance(entry, Mapping):
+            return [invalid]
+    observed: dict[str, list[Mapping]] = {}
+    for entry in all_orders:
+        client_order_id = entry.get("client_order_id")
+        if isinstance(client_order_id, str) and client_order_id.startswith(
+            _PAPERBOT_CLIENT_ORDER_PREFIX
+        ):
+            observed.setdefault(client_order_id, []).append(entry)
+    open_entries = _reconciliation_tournament_entries(paper_snapshot, "open_orders")
+    if open_entries is None:
+        reasons.append(invalid)
+    for entries in observed.values():
+        if len(entries) > 1:
+            reasons.append("broker_reconciliation_duplicate_tournament_order")
+    if open_entries:
+        reasons.append("broker_reconciliation_open_tournament_order_present")
+    packet_ids = [str(item["client_order_id"]) for item in packet_orders]
+    if len(set(packet_ids)) != len(packet_ids):
+        reasons.append("broker_reconciliation_duplicate_paper_packet_order")
+    for client_order_id in sorted({*packet_ids}):
+        if client_order_id not in observed:
+            reasons.append("broker_reconciliation_missing_tournament_order")
+    for client_order_id in sorted(observed):
+        if client_order_id not in set(packet_ids):
+            reasons.append("broker_reconciliation_extra_tournament_order")
+    latest_submission: dt.datetime | None = None
+    timestamp_invalid = False
+    for item in packet_orders:
+        submitted_at = _parse_timestamp(item.get("created_at"))
+        if submitted_at is None:
+            timestamp_invalid = True
+            continue
+        if latest_submission is None or submitted_at > latest_submission:
+            latest_submission = submitted_at
+        matches = observed.get(str(item["client_order_id"]), [])
+        if len(matches) != 1:
+            continue
+        remote = matches[0]
+        remote_at = _parse_timestamp(remote.get("created_at"))
+        remote_status = str(remote.get("status") or "").strip().lower()
+        if remote_status not in _RECONCILIATION_TERMINAL_ORDER_STATUSES:
+            reasons.append("broker_reconciliation_nonterminal_tournament_order")
+        if (
+            remote.get("id") != item.get("id")
+            or str(remote.get("symbol") or "").upper() != str(item.get("symbol") or "").upper()
+            or str(remote.get("side") or "").lower() != str(item.get("side") or "").lower()
+            or str(remote.get("type") or "").lower() != str(item.get("type") or "").lower()
+            or remote_at is None
+            or remote_at != submitted_at
+        ):
+            reasons.append("broker_reconciliation_mismatched_tournament_order")
+    if timestamp_invalid:
+        reasons.append("broker_reconciliation_paper_submission_timestamp_invalid")
+    if latest_submission is not None and captured_at < latest_submission:
+        reasons.append("broker_reconciliation_captured_before_last_paper_submission")
+    return reasons
+
+
 def create_shadow_day_manifest(
     *,
     start_object_id: str,
@@ -2351,6 +2503,17 @@ def _manifest_reasons(
     reconciliation = manifest["broker_reconciliation"]
     if not isinstance(reconciliation, Mapping) or reconciliation.get("kind") != "broker_reconciliation_observer" or reconciliation.get("read_only") is not True or reconciliation.get("submitted_count") != 0 or reconciliation.get("cancelled_count") != 0 or not _is_non_authorizing(reconciliation):
         failed.append("broker_reconciliation_invalid")
+    # The embedded copy must equal the bound stage payload under structural
+    # JSON equality: a manifest whose embedded reconciliation diverges from
+    # the captured broker_reconciliation stage file is forged and fails closed.
+    reconciliation_stage = stages.get("broker_reconciliation")
+    reconciliation_stage_payload = (
+        reconciliation_stage.get("payload")
+        if isinstance(reconciliation_stage, Mapping)
+        else None
+    )
+    if reconciliation_stage_payload != reconciliation:
+        failed.append("broker_reconciliation_embedded_copy_mismatch")
     paper = stages.get("paper_tournament") if isinstance(stages, Mapping) else None
     paper_payload = paper.get("payload") if isinstance(paper, Mapping) else None
     paper_order_ids = manifest["paper_order_ids"]
@@ -2364,6 +2527,12 @@ def _manifest_reasons(
         or paper_order_ids != _paper_order_ids(paper_payload)
     ):
         failed.append("paper_order_manifest_mismatch")
+    incomplete.extend(
+        _manifest_reconciliation_binding_reasons(
+            paper_payload if isinstance(paper_payload, Mapping) else None,
+            reconciliation,
+        )
+    )
     return sorted(set(failed)), sorted(set(incomplete))
 
 
