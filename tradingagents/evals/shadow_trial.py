@@ -104,6 +104,35 @@ DAILY_CHAIN_STAGE_KINDS = {
 # names the interruption window after the chain manifest is sealed but before
 # its one permitted adjudication.
 SHADOW_DAY_STOP_STAGES = ("day_start", *DAILY_CHAIN_STAGES, "manifest_written")
+# Approved causal order of one shadow day, derived from the canonical frozen
+# automation schedule rather than the roster tuple above: overnight research,
+# morning brief, pre-open validation, then the sentinel bind (:20), hourly
+# dry-run (:35), loss review, BOARD (:50), self-heal handoff+plan (:03),
+# the in-session paper tick (:10), its reconciliation afterwards, and the
+# post-close daily report.  Manifest sealing and adjudication continue the
+# same nondecreasing sequence after ``daily_report``.
+DAILY_CHAIN_TEMPORAL_ORDER = (
+    "overnight_research",
+    "premarket_brief",
+    "preopen_validation",
+    "safety_sentinel",
+    "hourly_supervisor",
+    "loss_review",
+    "execution_board",
+    "self_heal_handoff",
+    "self_heal_plan",
+    "paper_tournament",
+    "broker_reconciliation",
+    "daily_report",
+)
+# Producer-precision exception: one self-healer automation run emits both
+# packets back-to-back within the same process, so identical second-resolution
+# stamps are a genuine tie.  Every other consecutive pair crosses separately
+# scheduled producers, whose equal stamps would be coincidence, not semantics.
+_DAILY_CHAIN_LEGITIMATE_TIES = frozenset({("self_heal_handoff", "self_heal_plan")})
+# Exchange wall-time zone used by the admitted calendar's HH:MM open/close
+# fields (mirrors the paper-tournament lease convention).
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
 
 
 def _has_nonempty_error(value: object) -> bool:
@@ -2338,6 +2367,121 @@ def _manifest_reconciliation_binding_reasons(
     return reasons
 
 
+def _parse_exchange_wall_time(value: object) -> dt.time | None:
+    """Accept only a strict ASCII 24-hour HH:MM exchange session wall time."""
+
+    if type(value) is not str or len(value) != 5 or value[2] != ":":
+        return None
+    hour_text, minute_text = value[:2], value[3:]
+    # ``isdigit()`` alone admits Unicode digit characters: some (superscripts)
+    # then crash ``int()``, others (Arabic-Indic) silently convert.  Only
+    # ASCII digits are exchange wall times; anything else fails closed.
+    if (
+        not hour_text.isascii()
+        or not hour_text.isdigit()
+        or not minute_text.isascii()
+        or not minute_text.isdigit()
+    ):
+        return None
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if hour > 23 or minute > 59:
+        return None
+    return dt.time(hour=hour, minute=minute)
+
+
+def _admitted_regular_session_bounds(
+    start_payload: Mapping[str, object],
+) -> tuple[dt.datetime, dt.datetime] | None:
+    """Derive the admitted regular session's UTC bounds from start-day evidence.
+
+    The window comes only from the authenticated calendar evidence captured at
+    day start (strict HH:MM exchange wall times for exactly the market date);
+    there is no fixed inferred wall-clock window.  Any absence or malformation
+    returns None so callers fail closed instead of guessing a session.
+    """
+
+    calendar = start_payload.get("calendar")
+    sessions = calendar.get("sessions") if isinstance(calendar, Mapping) else None
+    if not isinstance(sessions, (list, tuple)) or len(sessions) != 1:
+        return None
+    entry = sessions[0]
+    market_date = start_payload.get("market_date")
+    if (
+        not isinstance(entry, Mapping)
+        or not isinstance(market_date, str)
+        or entry.get("date") != market_date
+    ):
+        return None
+    open_time = _parse_exchange_wall_time(entry.get("open"))
+    close_time = _parse_exchange_wall_time(entry.get("close"))
+    if open_time is None or close_time is None or open_time >= close_time:
+        return None
+    try:
+        day = dt.date.fromisoformat(market_date)
+        open_at = dt.datetime.combine(day, open_time, tzinfo=_EXCHANGE_TZ).astimezone(UTC)
+        close_at = dt.datetime.combine(day, close_time, tzinfo=_EXCHANGE_TZ).astimezone(UTC)
+    except ValueError:
+        return None
+    return open_at, close_at
+
+
+def _stage_sequence_reasons(
+    stage_times: Mapping[str, object],
+    *,
+    manifest_at: dt.datetime | None,
+    start_payload: Mapping[str, object],
+) -> list[str]:
+    """Enforce the causal daily-chain order over captured stage timestamps.
+
+    Consecutive stages in ``DAILY_CHAIN_TEMPORAL_ORDER`` must be strictly
+    increasing except for the documented same-process self-heal producer tie;
+    the sealed manifest must not precede any bound stage; the paper tick must
+    fall inside the regular session derived from the admitted calendar; and
+    the daily report must follow that session close.  Every defect is an
+    incompleteness — the day can never be clean while one is present.
+    """
+
+    reasons: list[str] = []
+    previous_name: str | None = None
+    previous_at: dt.datetime | None = None
+    for name in DAILY_CHAIN_TEMPORAL_ORDER:
+        at = stage_times.get(name)
+        if not isinstance(at, dt.datetime):
+            previous_name, previous_at = name, None
+            continue
+        if previous_at is not None:
+            if at < previous_at:
+                reasons.append("daily_chain_stage_order_backward")
+            elif (
+                at == previous_at
+                and (previous_name, name) not in _DAILY_CHAIN_LEGITIMATE_TIES
+            ):
+                reasons.append("daily_chain_stage_order_tie_illegitimate")
+        previous_name, previous_at = name, at
+    observed_times = [
+        value for value in stage_times.values() if isinstance(value, dt.datetime)
+    ]
+    if manifest_at is not None and any(value > manifest_at for value in observed_times):
+        # The manifest seals evidence that already exists in time; a stamp
+        # earlier than any bound stage means the wrapper was backfilled.
+        # Equality stays legitimate: sealing happens immediately after the
+        # final read at second resolution.
+        reasons.append("daily_chain_manifest_precedes_stage")
+    bounds = _admitted_regular_session_bounds(start_payload)
+    if bounds is None:
+        reasons.append("daily_chain_session_window_unavailable")
+    else:
+        open_at, close_at = bounds
+        paper_at = stage_times.get("paper_tournament")
+        if isinstance(paper_at, dt.datetime) and not (open_at <= paper_at < close_at):
+            reasons.append("paper_tournament_stage_outside_regular_session")
+        report_at = stage_times.get("daily_report")
+        if isinstance(report_at, dt.datetime) and report_at < close_at:
+            reasons.append("daily_report_stage_before_session_close")
+    return reasons
+
+
 def create_shadow_day_manifest(
     *,
     start_object_id: str,
@@ -2452,6 +2596,7 @@ def _manifest_reasons(
         ),
         "preopen_validation": stages["preopen_validation"],
     }
+    stage_times: dict[str, dt.datetime] = {}
     for stage in DAILY_CHAIN_STAGES:
         value = stages[stage]
         try:
@@ -2476,6 +2621,8 @@ def _manifest_reasons(
         stage_time = _parse_timestamp(stage_record["generated_at"])
         if stage_time is None or stage_time < start_at or stage_time > now:
             incomplete.append(f"{stage}_stage_timestamp_invalid")
+        if stage_time is not None:
+            stage_times[stage] = stage_time
         # Existing persisted producers are intentionally not force-shaped into
         # a synthetic common packet.  Require the native safe semantics for
         # each role, including explicit dry-run evidence for hourly work.
@@ -2500,6 +2647,13 @@ def _manifest_reasons(
             or stage_payload.get("shadow_start_object_id") != start.object_id
         ):
             failed.append(f"{stage}_stage_cross_run")
+    incomplete.extend(
+        _stage_sequence_reasons(
+            stage_times,
+            manifest_at=generated_at,
+            start_payload=start_payload,
+        )
+    )
     reconciliation = manifest["broker_reconciliation"]
     if not isinstance(reconciliation, Mapping) or reconciliation.get("kind") != "broker_reconciliation_observer" or reconciliation.get("read_only") is not True or reconciliation.get("submitted_count") != 0 or reconciliation.get("cancelled_count") != 0 or not _is_non_authorizing(reconciliation):
         failed.append("broker_reconciliation_invalid")

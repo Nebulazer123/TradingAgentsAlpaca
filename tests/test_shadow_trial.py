@@ -34,7 +34,12 @@ class _CalendarFake:
 
     def list_calendar(self, *, start: str, end: str) -> list[dict[str, str]]:
         self.calls.append((start, end))
-        return [{"date": start}] if start == end and start in self.dates else []
+        # Producer-real entry shape: strict HH:MM exchange open/close walls.
+        return (
+            [{"date": start, "open": "09:30", "close": "16:00"}]
+            if start == end and start in self.dates
+            else []
+        )
 
     def __getattr__(self, name: str):
         raise AssertionError(f"unexpected broker method: {name}")
@@ -58,13 +63,46 @@ def _calendar(
     *,
     observed_at: str | None = None,
     dates: list[str] | None = None,
+    open_text: str = "09:30",
+    close_text: str = "16:00",
 ) -> dict:
+    # Producer-real Alpaca calendar entries carry strict HH:MM exchange
+    # (America/New_York) open/close wall times; early closes flow through data.
     return {
         "kind": "alpaca_regular_equities_calendar",
         "market_date": date,
         "observed_at": observed_at or f"{date}T13:59:00+00:00",
-        "sessions": [{"date": item} for item in (dates if dates is not None else [date])],
+        "sessions": [
+            {"date": item, "open": open_text, "close": close_text}
+            for item in (dates if dates is not None else [date])
+        ],
     }
+
+
+# One ascending producer-real UTC timeline that is valid for both a CDT and a
+# CST market date: the paper tick lands inside the 09:30-16:00 ET regular
+# session either way, and the daily report follows the session close. The
+# minutes mirror the canonical Central automation offsets (:20 sentinel,
+# :35 supervisor, :50 board, :03 self-healer, :10 paper, :30 daily report).
+def _stage_timeline(date: str) -> dict[str, str]:
+    return {
+        "overnight_research": f"{date}T14:05:00+00:00",
+        "premarket_brief": f"{date}T14:10:00+00:00",
+        "preopen_validation": f"{date}T14:15:00+00:00",
+        "safety_sentinel": f"{date}T14:20:00+00:00",
+        "hourly_supervisor": f"{date}T14:35:00+00:00",
+        "loss_review": f"{date}T14:45:00+00:00",
+        "execution_board": f"{date}T14:50:00+00:00",
+        "self_heal_handoff": f"{date}T15:03:00+00:00",
+        "self_heal_plan": f"{date}T15:04:00+00:00",
+        "paper_tournament": f"{date}T15:10:00+00:00",
+        "broker_reconciliation": f"{date}T15:45:00+00:00",
+        "daily_report": f"{date}T21:30:00+00:00",
+    }
+
+
+# Adjudication happens after the daily-report stamp on every market date.
+_DAY_CLOCK_HOUR = 22
 
 
 def _write_schedule_fixture(
@@ -336,13 +374,14 @@ def _start(
     *,
     date: str,
     predecessor_object_id: str | None = None,
+    calendar_kwargs: dict | None = None,
 ) -> object:
     _set_clock(monkeypatch, date)
     with monkeypatch.context() as calendar_patch:
         calendar_patch.setattr(
             shadow_trial,
             "_capture_calendar_evidence",
-            lambda market_date: _calendar(market_date),
+            lambda market_date: _calendar(market_date, **(calendar_kwargs or {})),
         )
         return shadow_trial.create_shadow_day_start_manifest(
             run_id=f"run-{date}",
@@ -362,7 +401,7 @@ def _artifacts(
 ) -> dict[str, Path]:
     sentinel = root / "artifacts" / f"sentinel-{date}.json"
     paper = root / "artifacts" / f"paper-{date}.json"
-    generated_at = f"{date}T15:00:00+00:00"
+    timeline = _stage_timeline(date)
     broker_snapshot = _healthy_broker_snapshot(date=date, account_id="live-account")
     _write_json(
         sentinel,
@@ -371,7 +410,7 @@ def _artifacts(
             "run_id": run_id,
             "market_date": date,
             **({"shadow_start_object_id": start_object_id} if start_object_id else {}),
-            "generated_at": generated_at,
+            "generated_at": timeline["safety_sentinel"],
             "status": sentinel_status,
             "reasons": ["frozen_control"],
             "analysis_only": True,
@@ -410,7 +449,7 @@ def _artifacts(
             "run_id": run_id,
             "market_date": date,
             **({"shadow_start_object_id": start_object_id} if start_object_id else {}),
-            "generated_at": generated_at,
+            "generated_at": timeline["paper_tournament"],
             "status": "HOLD",
             "dry_run": True,
             "submitted_count": submitted_count,
@@ -442,7 +481,7 @@ def _complete_daily_chain(
     artifacts: dict[str, Path],
 ) -> dict[str, Path]:
     payload = _payload(start)
-    generated_at = f"{payload['market_date']}T15:00:00+00:00"
+    timeline = _stage_timeline(payload["market_date"])
     stages: dict[str, Path] = {
         "safety_sentinel": artifacts["safety_sentinel"],
         "paper_tournament": artifacts["paper_tournament"],
@@ -453,7 +492,7 @@ def _complete_daily_chain(
         path = root / "artifacts" / f"{name}-{payload['market_date']}.json"
         packet: dict[str, object] = {
             "kind": shadow_trial.DAILY_CHAIN_STAGE_KINDS[name],
-            "generated_at": generated_at,
+            "generated_at": timeline[name],
             "status": "HOLD",
             "analysis_only": True,
             "execution_authority": "none",
@@ -598,7 +637,7 @@ def _complete_daily_chain(
             "status": binding["status"],
             "sha256": binding["sha256"],
             "size_bytes": binding["size_bytes"],
-            "captured_at": generated_at,
+            "captured_at": timeline["safety_sentinel"],
             "freshness": {
                 "status": "fresh",
                 "rule": "direct_capture_current_audit",
@@ -656,7 +695,7 @@ def _day(
     date: str,
     artifacts: dict[str, Path] | None = None,
 ) -> object:
-    _set_clock(monkeypatch, date, 16)
+    _set_clock(monkeypatch, date, _DAY_CLOCK_HOUR)
     start_payload = _payload(start)
     with monkeypatch.context() as calendar_patch:
         calendar_patch.setattr(
@@ -1606,13 +1645,13 @@ def test_red_clean_hold_and_zero_submission_are_valid_only_with_complete_bound_e
 
 def _tournament_order_fixture(
     *,
-    client_order_id: str = "ta-paperbot-current-aggressive-2608211520-1-nvda",
+    client_order_id: str = "ta-paperbot-current-aggressive-2608211508-1-nvda",
     order_id: str = "broker-order-1",
     symbol: str = "NVDA",
     side: str = "buy",
     order_type: str = "limit",
     status: str = "filled",
-    created_at: str = "2026-08-21T15:20:00+00:00",
+    created_at: str = "2026-08-21T15:08:00+00:00",
 ) -> dict:
     return {
         "strategy_id": "current-aggressive",
@@ -1639,7 +1678,7 @@ def _write_submitted_paper_artifact(root: Path, *, start, orders: list[dict]) ->
         "run_id": payload["run_id"],
         "market_date": date,
         "shadow_start_object_id": start.envelope.object_id,
-        "generated_at": "2026-08-21T15:30:00+00:00",
+        "generated_at": _stage_timeline(date)["paper_tournament"],
         "status": "COMPLETE",
         "dry_run": False,
         "submitted_count": len(orders),
@@ -1716,7 +1755,7 @@ def _adjudicate_day_with_paper_submission(
     recon_path = tmp_path / "artifacts" / f"broker-reconciliation-bound-{date}.json"
     _write_json(recon_path, reconciliation_packet)
     stage_paths = {**artifacts, "broker_reconciliation": recon_path}
-    _set_clock(monkeypatch, date, 16)
+    _set_clock(monkeypatch, date, _DAY_CLOCK_HOUR)
     manifest_path = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=stage_paths)
     if mutate_manifest is not None:
         manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1740,6 +1779,319 @@ def test_red_clean_day_paper_orders_must_match_post_paper_reconciliation_exactly
     decision_payload = _adjudicate_day_with_paper_submission(tmp_path, monkeypatch)
     assert decision_payload["status"] == "clean"
     assert not any(reason.startswith("broker_reconciliation_") for reason in decision_payload["reasons"])
+
+
+# Increment 6: the approved causal order of one shadow day.  The safety
+# sentinel binds (:20) before the hourly dry-run (:35); the paper tick
+# precedes its reconciliation; and the daily report follows the session
+# close — an order that deliberately differs from the stage roster tuple.
+APPROVED_DAILY_CHAIN_ORDER = (
+    "overnight_research",
+    "premarket_brief",
+    "preopen_validation",
+    "safety_sentinel",
+    "hourly_supervisor",
+    "loss_review",
+    "execution_board",
+    "self_heal_handoff",
+    "self_heal_plan",
+    "paper_tournament",
+    "broker_reconciliation",
+    "daily_report",
+)
+# Producer-precision exception: one self-healer automation run writes both
+# packets back-to-back, so identical second-resolution stamps are a genuine
+# tie.  Every other consecutive pair crosses separate scheduled producers.
+LEGITIMATE_STAGE_TIES = {("self_heal_handoff", "self_heal_plan")}
+
+
+def _adjudicate_chain_with_stage_stamps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    date: str = "2026-08-21",
+    stamps: dict[str, str] | None = None,
+    calendar_kwargs: dict | None = None,
+    dead_man_expires_at: str = "2027-06-30T00:00:00+00:00",
+) -> dict:
+    """Adjudicate one full day whose stage files carry explicit generated_at values."""
+
+    _configure_environment(
+        monkeypatch, tmp_path, dead_man_expires_at=dead_man_expires_at
+    )
+    start = _start(monkeypatch, date=date, calendar_kwargs=calendar_kwargs)
+    payload = _payload(start)
+    market_date = payload["market_date"]
+    artifacts_map = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=payload["run_id"],
+            date=market_date,
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    stage_files = {
+        "safety_sentinel": artifacts_map["safety_sentinel"],
+        "paper_tournament": artifacts_map["paper_tournament"],
+    }
+    timeline = _stage_timeline(market_date)
+    timeline.update(stamps or {})
+    for name, stamp in timeline.items():
+        path = stage_files.get(name) or (
+            tmp_path / "artifacts" / f"{name}-{market_date}.json"
+        )
+        packet = json.loads(path.read_text(encoding="utf-8"))
+        packet["generated_at"] = stamp
+        _write_json(path, packet)
+    _set_clock(monkeypatch, market_date, _DAY_CLOCK_HOUR)
+    manifest_path = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=artifacts_map)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date=market_date,
+        artifacts={**artifacts_map, "daily_chain_manifest": manifest_path},
+    )
+    return _payload(decision)
+
+
+def test_red_valid_ascending_chain_with_in_session_paper_stays_clean(tmp_path, monkeypatch):
+    payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch)
+    assert payload["status"] == "clean"
+    for reason in payload["reasons"]:
+        assert "order" not in reason
+        assert "session" not in reason
+
+
+@pytest.mark.parametrize(
+    ("earlier_stage", "later_stage"),
+    [
+        *[
+            pytest.param(a, b, id=f"{a}-after-{b}")
+            for a, b in zip(APPROVED_DAILY_CHAIN_ORDER, APPROVED_DAILY_CHAIN_ORDER[1:], strict=False)
+        ],
+        pytest.param("overnight_research", "daily_report", id="far-swap-first-last"),
+    ],
+)
+def test_red_backward_or_swapped_stage_timestamps_are_never_clean(
+    tmp_path, monkeypatch, earlier_stage, later_stage
+):
+    timeline = _stage_timeline("2026-08-21")
+    swapped = dict(timeline)
+    swapped[earlier_stage] = timeline[later_stage]
+    swapped[later_stage] = timeline[earlier_stage]
+    payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch, stamps=swapped)
+    assert payload["status"] != "clean"
+    assert "daily_chain_stage_order_backward" in payload["reasons"]
+
+
+def test_red_paper_after_reconciliation_reversal_is_never_clean(tmp_path, monkeypatch):
+    timeline = _stage_timeline("2026-08-21")
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        stamps={
+            **timeline,
+            "paper_tournament": timeline["broker_reconciliation"],
+            "broker_reconciliation": timeline["paper_tournament"],
+        },
+    )
+    assert payload["status"] != "clean"
+    assert "daily_chain_stage_order_backward" in payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("first_stage", "second_stage"),
+    [
+        pytest.param(a, b, id=f"tie-{a}-{b}")
+        for a, b in zip(APPROVED_DAILY_CHAIN_ORDER, APPROVED_DAILY_CHAIN_ORDER[1:], strict=False)
+    ],
+)
+def test_red_equal_stage_timestamps_fail_except_documented_producer_tie(
+    tmp_path, monkeypatch, first_stage, second_stage
+):
+    timeline = _stage_timeline("2026-08-21")
+    stamps = dict(timeline)
+    stamps[second_stage] = timeline[first_stage]
+    should_stay_clean = (first_stage, second_stage) in LEGITIMATE_STAGE_TIES
+    payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch, stamps=stamps)
+    if should_stay_clean:
+        assert payload["status"] == "clean"
+        assert "daily_chain_stage_order_tie_illegitimate" not in payload["reasons"]
+    else:
+        assert payload["status"] != "clean"
+        assert "daily_chain_stage_order_tie_illegitimate" in payload["reasons"]
+        assert "daily_chain_stage_order_backward" not in payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("paper_stamp", "calendar_kwargs", "expected_clean"),
+    [
+        pytest.param("2026-08-21T13:00:00+00:00", None, False, id="before-open-et"),
+        pytest.param("2026-08-21T20:30:00+00:00", None, False, id="after-close-et"),
+        pytest.param(
+            "2026-08-21T17:30:00+00:00",
+            {"close_text": "13:00"},
+            False,
+            id="after-early-close",
+        ),
+        pytest.param(
+            "2026-08-21T16:30:00+00:00",
+            {"close_text": "13:00", "reconciliation_stamp": "2026-08-21T17:10:00+00:00"},
+            True,
+            id="inside-early-close-stays-clean",
+        ),
+    ],
+)
+def test_red_paper_tick_outside_admitted_regular_session_is_never_clean(
+    tmp_path, monkeypatch, paper_stamp, calendar_kwargs, expected_clean
+):
+    timeline = _stage_timeline("2026-08-21")
+    stamps = {**timeline, "paper_tournament": paper_stamp}
+    reconciliation_stamp = (calendar_kwargs or {}).pop("reconciliation_stamp", None)
+    if reconciliation_stamp is not None:
+        stamps["broker_reconciliation"] = reconciliation_stamp
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        stamps=stamps,
+        calendar_kwargs=calendar_kwargs,
+    )
+    if expected_clean:
+        assert payload["status"] == "clean"
+        assert "paper_tournament_stage_outside_regular_session" not in payload["reasons"]
+    else:
+        assert payload["status"] != "clean"
+        assert "paper_tournament_stage_outside_regular_session" in payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("report_stamp", "calendar_kwargs", "expected_clean"),
+    [
+        pytest.param("2026-08-21T19:00:00+00:00", None, False, id="before-session-close"),
+        pytest.param(
+            "2026-08-21T16:00:00+00:00",
+            {"close_text": "13:00"},
+            False,
+            id="before-early-close",
+        ),
+        pytest.param(
+            "2026-08-21T17:00:00+00:00",
+            {"close_text": "13:00"},
+            True,
+            id="at-early-close-or-later-stays-clean",
+        ),
+    ],
+)
+def test_red_daily_report_must_follow_the_admitted_session_close(
+    tmp_path, monkeypatch, report_stamp, calendar_kwargs, expected_clean
+):
+    timeline = _stage_timeline("2026-08-21")
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        stamps={**timeline, "daily_report": report_stamp},
+        calendar_kwargs=calendar_kwargs,
+    )
+    if expected_clean:
+        assert payload["status"] == "clean"
+        assert "daily_report_stage_before_session_close" not in payload["reasons"]
+    else:
+        assert payload["status"] != "clean"
+        assert "daily_report_stage_before_session_close" in payload["reasons"]
+
+
+def test_red_winter_session_window_is_derived_from_admitted_calendar_data(tmp_path, monkeypatch):
+    # CST/EST date: 09:30-16:00 ET is 14:30-21:00 UTC, so the default ascending
+    # chain stays clean while a stamp that only a fixed CDT assumption would
+    # admit (14:11 UTC = 08:11 CST) is rejected as before the EST open.
+    clean_payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch, date="2027-01-04")
+    assert clean_payload["status"] == "clean"
+    assert "paper_tournament_stage_outside_regular_session" not in clean_payload["reasons"]
+
+    rejected_payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path / "winter-rejected",
+        monkeypatch,
+        date="2027-01-04",
+        stamps={
+            **_stage_timeline("2027-01-04"),
+            "overnight_research": "2027-01-04T14:02:00+00:00",
+            "premarket_brief": "2027-01-04T14:03:00+00:00",
+            "preopen_validation": "2027-01-04T14:04:00+00:00",
+            "safety_sentinel": "2027-01-04T14:05:00+00:00",
+            "hourly_supervisor": "2027-01-04T14:06:00+00:00",
+            "loss_review": "2027-01-04T14:07:00+00:00",
+            "execution_board": "2027-01-04T14:08:00+00:00",
+            "self_heal_handoff": "2027-01-04T14:09:00+00:00",
+            "self_heal_plan": "2027-01-04T14:10:00+00:00",
+            "paper_tournament": "2027-01-04T14:11:00+00:00",
+        },
+    )
+    assert rejected_payload["status"] != "clean"
+    assert "paper_tournament_stage_outside_regular_session" in rejected_payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("09:30", dt.time(9, 30), id="ascii-open"),
+        pytest.param("16:00", dt.time(16, 0), id="ascii-close"),
+        pytest.param("23:59", dt.time(23, 59), id="ascii-max"),
+        pytest.param("9:30", None, id="short-hour"),
+        pytest.param("09:60", None, id="minute-out-of-range"),
+        pytest.param("²²:³³", None, id="superscript-digits"),
+        pytest.param("١٦:٠٠", None, id="arabic-indic-digits"),
+        pytest.param("0٩:30", None, id="mixed-ascii-and-unicode-digit"),
+    ],
+)
+def test_red_exchange_wall_time_accepts_only_strict_ascii_digits(value, expected):
+    assert shadow_trial._parse_exchange_wall_time(value) == expected
+
+
+def test_red_unicode_digit_session_walls_fail_closed_without_raising(tmp_path, monkeypatch):
+    # A start can be admitted with non-ASCII digit session walls because the
+    # calendar binding validates the admitted date only.  Adjudication must
+    # then yield a fail-closed non-clean day with the existing
+    # daily_chain_session_window_unavailable reason — never a crash.
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        calendar_kwargs={"open_text": "²²:³³", "close_text": "¹⁶:⁰⁰"},
+    )
+    assert payload["status"] == "incomplete"
+    assert "daily_chain_session_window_unavailable" in payload["reasons"]
+
+
+def test_red_manifest_cannot_precede_its_bound_stage_evidence(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    payload = _payload(start)
+    market_date = payload["market_date"]
+    artifacts_map = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=payload["run_id"],
+            date=market_date,
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    # Seal the manifest before the daily-report evidence exists in time.
+    _set_clock(monkeypatch, market_date, 15)
+    manifest_path = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=artifacts_map)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date=market_date,
+        artifacts={**artifacts_map, "daily_chain_manifest": manifest_path},
+    )
+    result = _payload(decision)
+    assert result["status"] != "clean"
+    assert "daily_chain_manifest_precedes_stage" in result["reasons"]
 
 
 @pytest.mark.parametrize(
@@ -1815,7 +2167,7 @@ def test_red_clean_day_paper_orders_must_match_post_paper_reconciliation_exactly
         ),
         pytest.param(
             lambda packet: packet["paper"].__setitem__(
-                "captured_at", "2026-08-21T15:10:00+00:00"
+                "captured_at", "2026-08-21T15:05:00+00:00"
             ),
             "broker_reconciliation_captured_before_last_paper_submission",
             id="reconciliation-captured-before-paper",
