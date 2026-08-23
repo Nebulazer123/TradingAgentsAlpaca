@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.main import app
-from tradingagents.evals import shadow_trial
+from tradingagents.evals import runtime_identity, shadow_trial
 from tradingagents.strategy import _immutable_evidence_store as evidence_store_module
 from tradingagents.strategy._immutable_evidence_store import (
     EvidenceCandidate,
@@ -129,6 +130,99 @@ def _control(path: Path, *, frozen: bool = True, malformed: bool = False) -> Pat
     return path
 
 
+def _canonical_json_text(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _json_digest(value: object) -> str:
+    return hashlib.sha256(_canonical_json_text(value).encode("utf-8")).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _authority_file_digest(path: Path) -> str:
+    """Digest a fixture authority file; deliberately absent files stay deterministic."""
+
+    if path.exists():
+        return _file_digest(path)
+    return hashlib.sha256(f"missing:{path.as_posix()}".encode()).hexdigest()
+
+
+def _runtime_identity_fixture(
+    *,
+    control: Path,
+    contract: Path,
+    roles: Path,
+    automation_root: Path,
+) -> dict:
+    """A strict-schema flat runtime identity bound to real fixture authority files."""
+
+    schema_versions = {
+        "manual_shadow_day_start": shadow_trial.START_SCHEMA,
+        "manual_shadow_day_result": shadow_trial.DAY_SCHEMA,
+        "manual_shadow_final_report": shadow_trial.REPORT_SCHEMA,
+    }
+    overnight_route = {
+        "llm_provider": "openai",
+        "quick_think_llm": "gpt-5.4-mini",
+        "deep_think_llm": "gpt-5.4",
+    }
+    identity = {
+        "identity_schema": "runtime_identity/v1",
+        "git_commit": "f" * 40,
+        "worktree_clean": True,
+        "required_files_sha256": {
+            name: hashlib.sha256(name.encode("utf-8")).hexdigest()
+            for name in (
+                "pyproject.toml",
+                "uv.lock",
+                "requirements.txt",
+                "requirements-crawler.txt",
+            )
+        },
+        "schedule_contract_sha256": _file_digest(contract),
+        "role_contract_sha256": _file_digest(roles),
+        "live_control_sha256": _file_digest(control),
+        "automation_tomls_sha256": {
+            automation_id: _authority_file_digest(
+                automation_root / automation_id / "automation.toml"
+            )
+            for automation_id in sorted(shadow_trial.EXPECTED_AUTOMATION_IDS)
+        },
+        "provider_routes": {},
+        "provider_routes_sha256": hashlib.sha256(b"{}").hexdigest(),
+        "schema_versions": schema_versions,
+        "schema_versions_sha256": _json_digest(schema_versions),
+        "overnight_route": overnight_route,
+        "overnight_route_sha256": _json_digest(overnight_route),
+        "python_executable": "/fixture/python",
+        "package_inventory": ["fixture-package==1.0.0"],
+        "package_inventory_sha256": _json_digest(["fixture-package==1.0.0"]),
+    }
+    body = {key: value for key, value in identity.items() if key != "identity_sha256"}
+    identity["identity_sha256"] = _json_digest(body)
+    return identity
+
+
+def _recompute_identity_digests(identity: dict) -> dict:
+    """Rebuild component and whole digests so mutations stay valid captures."""
+
+    drifted = copy.deepcopy(identity)
+    drifted["provider_routes_sha256"] = _json_digest(drifted["provider_routes"])
+    drifted["schema_versions_sha256"] = _json_digest(drifted["schema_versions"])
+    route = drifted["overnight_route"]
+    drifted["overnight_route_sha256"] = None if route is None else _json_digest(route)
+    drifted["package_inventory"] = sorted(
+        {entry.strip().lower() for entry in drifted["package_inventory"]}
+    )
+    drifted["package_inventory_sha256"] = _json_digest(drifted["package_inventory"])
+    body = {key: value for key, value in drifted.items() if key != "identity_sha256"}
+    drifted["identity_sha256"] = _json_digest(body)
+    return drifted
+
+
 def _configure_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -154,12 +248,26 @@ def _configure_environment(
     monkeypatch.setattr(shadow_trial, "_canonical_schedule_contract_path", lambda: contract)
     monkeypatch.setattr(shadow_trial, "_canonical_role_contract_path", lambda: roles)
     monkeypatch.setattr(shadow_trial, "_canonical_automation_root", lambda: automation_root)
+    runtime_identity_holder = {
+        "value": _runtime_identity_fixture(
+            control=control,
+            contract=contract,
+            roles=roles,
+            automation_root=automation_root,
+        )
+    }
+    monkeypatch.setattr(
+        shadow_trial,
+        "_runtime_identity_capture",
+        lambda: copy.deepcopy(runtime_identity_holder["value"]),
+    )
     return {
         "manual_root": manual_root,
         "control": control,
         "contract": contract,
         "roles": roles,
         "automation_root": automation_root,
+        "runtime_identity": runtime_identity_holder,
     }
 
 
@@ -1983,8 +2091,7 @@ def test_red_expire_pending_converts_stale_start_to_immutable_incomplete(tmp_pat
     assert payload["closure_kind"] == "pending_expired"
     assert payload["stopped_at_stage"] is None
     assert payload["notes"] is None
-    assert "pending_day_expired_without_adjudication" in payload["reasons"]
-    assert "current_central_date_mismatch" in payload["reasons"]
+    assert list(payload["reasons"]) == ["pending_day_expired_without_adjudication"]
     assert set(payload["artifacts"]) == set(shadow_trial.ARTIFACT_KEYS)
     assert all(item["status"] == "missing" for item in payload["artifacts"].values())
     assert payload["start_object_id"] == start.envelope.object_id
@@ -2718,3 +2825,339 @@ def test_red_status_fails_closed_on_any_unresolved_pending_next(tmp_path, monkey
     with pytest.raises(ValueError, match="advanced|unresolved|pending"):
         shadow_trial.shadow_streak_status()
     assert advanced_before == _ledger_surface_snapshot(results_parent)
+
+
+def test_red_runtime_identity_fixture_matches_strict_schema(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path / "schedule")
+    control = _control(tmp_path / "results" / "policy" / "live_control.json")
+    fixture = _runtime_identity_fixture(
+        control=control,
+        contract=contract,
+        roles=roles,
+        automation_root=automation_root,
+    )
+    assert runtime_identity.validate_runtime_identity(copy.deepcopy(fixture)) == fixture
+    with pytest.raises(runtime_identity.RuntimeIdentityError):
+        runtime_identity.validate_runtime_identity(
+            {
+                "schema_version": "runtime_identity_v1",
+                **fixture,
+            }
+        )
+
+
+def test_red_start_and_day_payloads_bind_identical_runtime_identity(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    expected_identity = environment["runtime_identity"]["value"]
+
+    start = _start(monkeypatch, date="2026-08-21")
+    start_payload = _payload(start)
+    assert shadow_trial._plain_json(start_payload["runtime_identity"]) == expected_identity
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    day_payload = _payload(day)
+    assert day_payload["status"] == "clean"
+    assert shadow_trial._plain_json(day_payload["runtime_identity"]) == expected_identity
+
+
+def test_red_start_refuses_when_identity_capture_is_dirty_or_unparseable(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+
+    def dirty_capture():
+        raise runtime_identity.RuntimeIdentityError("tracked tree is dirty")
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", dirty_capture)
+    with pytest.raises(ValueError, match="dirty"):
+        _start(monkeypatch, date="2026-08-21")
+
+    def malformed_capture():
+        return {"schema_version": "runtime_identity_v1"}
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", malformed_capture)
+    with pytest.raises(ValueError):
+        _start(monkeypatch, date="2026-08-21")
+
+    manual_root = tmp_path / "results" / "manual_shadow"
+    admitted_objects = (
+        list(manual_root.glob("objects/*/*.json")) if manual_root.exists() else []
+    )
+    assert admitted_objects == []
+
+
+def test_red_midday_lockfile_drift_marks_day_failed_with_runtime_identity_mismatch(
+    tmp_path, monkeypatch
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    drifted = copy.deepcopy(environment["runtime_identity"]["value"])
+    drifted["required_files_sha256"]["uv.lock"] = "9" * 64
+    environment["runtime_identity"]["value"] = _recompute_identity_digests(drifted)
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    payload = _payload(day)
+    assert payload["status"] == "failed"
+    assert "runtime_identity_mismatch" in payload["reasons"]
+    assert payload["phase"] == "repair_required"
+
+
+def test_red_cross_day_documentation_only_commit_drift_is_hard_non_clean(
+    tmp_path, monkeypatch
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    qualification_start = _start(monkeypatch, date="2026-08-20")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-20")
+    assert _payload(qualification)["status"] == "clean"
+
+    drifted = copy.deepcopy(environment["runtime_identity"]["value"])
+    drifted["git_commit"] = "b" * 40
+    environment["runtime_identity"]["value"] = _recompute_identity_digests(drifted)
+
+    trial_start = _start(
+        monkeypatch,
+        date="2026-08-21",
+        predecessor_object_id=qualification.envelope.object_id,
+    )
+    trial_day = _day(tmp_path, monkeypatch, trial_start, date="2026-08-21")
+    payload = _payload(trial_day)
+    assert payload["status"] == "failed"
+    assert "runtime_identity_mismatch" in payload["reasons"]
+    assert payload["phase"] == "repair_required"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda identity: identity["package_inventory"].append(
+                "hostile-drift==9.9.9"
+            ),
+            id="package_inventory",
+        ),
+        pytest.param(
+            lambda identity: identity["overnight_route"].update(
+                {"deep_think_llm": "gpt-5.5-pro"}
+            ),
+            id="overnight_model_route",
+        ),
+        pytest.param(
+            lambda identity: identity["automation_tomls_sha256"].update(
+                {"tradingagents-auto-03": "7" * 64}
+            ),
+            id="automation_toml",
+        ),
+        pytest.param(
+            lambda identity: identity.update({"live_control_sha256": "6" * 64}),
+            id="live_control_bytes",
+        ),
+        pytest.param(
+            lambda identity: identity.update({"schedule_contract_sha256": "5" * 64}),
+            id="schedule_contract",
+        ),
+    ],
+)
+def test_red_identity_surface_drift_each_fails_closed(tmp_path, monkeypatch, mutate):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    drifted = copy.deepcopy(environment["runtime_identity"]["value"])
+    mutate(drifted)
+    environment["runtime_identity"]["value"] = _recompute_identity_digests(drifted)
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    payload = _payload(day)
+    assert payload["status"] == "failed"
+    assert "runtime_identity_mismatch" in payload["reasons"]
+
+
+def test_red_closure_facades_inherit_start_identity_without_recapture(
+    tmp_path, monkeypatch
+):
+    _configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+    start = _start(monkeypatch, date="2026-08-21")
+    inherited_identity = _payload(start)["runtime_identity"]
+
+    def unavailable_capture():
+        raise runtime_identity.RuntimeIdentityError(
+            "tracked tree became dirty after start"
+        )
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", unavailable_capture)
+    aborted = shadow_trial.abort_shadow_day(
+        start_object_id=start.envelope.object_id,
+        stopped_at_stage="paper_tournament",
+        notes="crashed after the paper tick; source tree became dirty",
+    )
+    abort_payload = _payload(aborted)
+    assert abort_payload["runtime_identity"] == inherited_identity
+    assert abort_payload["status"] == "failed"
+    assert "runtime_identity_mismatch" not in abort_payload["reasons"]
+
+    _configure_environment(monkeypatch, tmp_path / "fresh-expiry-root")
+    expire_start = _start(monkeypatch, date="2026-08-24")
+    expire_inherited = _payload(expire_start)["runtime_identity"]
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", unavailable_capture)
+    _set_clock(monkeypatch, "2026-08-25", 14)
+    expired = shadow_trial.expire_pending_shadow_day()
+    assert expired is not None
+    expired_payload = _payload(expired)
+    assert expired_payload["runtime_identity"] == expire_inherited
+    assert expired_payload["status"] == "incomplete"
+    assert list(expired_payload["reasons"]) == [
+        "pending_day_expired_without_adjudication"
+    ]
+    assert "runtime_identity_mismatch" not in expired_payload["reasons"]
+
+
+def test_red_runtime_identity_adjudication_refusal_admits_nothing(
+    tmp_path, monkeypatch
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+    start = _start(monkeypatch, date="2026-08-21")
+    artifacts = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=_payload(start)["run_id"],
+            date="2026-08-21",
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    results_parent = environment["manual_root"].parent
+    before = _ledger_surface_snapshot(results_parent)
+
+    def unavailable_capture():
+        raise runtime_identity.RuntimeIdentityError("tracked tree dirty midday")
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", unavailable_capture)
+    with pytest.raises(ValueError, match="runtime identity"):
+        shadow_trial.adjudicate_shadow_day(
+            start_object_id=start.envelope.object_id,
+            artifacts={
+                name: artifacts[name]
+                for name in ("safety_sentinel", "paper_tournament", "daily_chain_manifest")
+            },
+        )
+    assert before == _ledger_surface_snapshot(results_parent)
+
+
+def test_red_runtime_identity_production_seam_binds_exact_canonical_inputs(monkeypatch):
+    for environment_key in (
+        "TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER",
+        "TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM",
+        "TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM",
+    ):
+        monkeypatch.delenv(environment_key, raising=False)
+    captured_kwargs: dict[str, object] = {}
+
+    def recording_capture(**kwargs):
+        captured_kwargs.update(kwargs)
+        return {"identity_schema": "runtime_identity/v1"}
+
+    monkeypatch.setattr(shadow_trial, "capture_runtime_identity", recording_capture)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_installed_package_inventory",
+        lambda: ["fixture-package==1.0.0"],
+    )
+    identity = shadow_trial._runtime_identity_capture()
+
+    assert identity == {"identity_schema": "runtime_identity/v1"}
+    root = shadow_trial._repo_root()
+    assert captured_kwargs["repo_root"] == root
+    assert set(captured_kwargs["required_files"]) == {
+        "pyproject.toml",
+        "uv.lock",
+        "requirements.txt",
+        "requirements-crawler.txt",
+    }
+    assert all(
+        Path(path) == root / name
+        for name, path in captured_kwargs["required_files"].items()
+    )
+    assert Path(captured_kwargs["schedule_contract"]) == (
+        shadow_trial._canonical_schedule_contract_path()
+    )
+    assert Path(captured_kwargs["role_contract"]) == (
+        shadow_trial._canonical_role_contract_path()
+    )
+    assert Path(captured_kwargs["live_control"]) == (
+        shadow_trial._canonical_live_control_path()
+    )
+    automation_root = Path(
+        shadow_trial._absolute(shadow_trial._canonical_automation_root())
+    )
+    assert Path(captured_kwargs["automation_root"]) == automation_root
+    assert set(captured_kwargs["automation_tomls"]) == set(
+        shadow_trial.EXPECTED_AUTOMATION_IDS
+    )
+    assert len(captured_kwargs["automation_tomls"]) == 10
+    assert all(
+        Path(path) == automation_root / automation_id / "automation.toml"
+        for automation_id, path in captured_kwargs["automation_tomls"].items()
+    )
+    assert captured_kwargs["schema_versions"] == {
+        "manual_shadow_day_start": shadow_trial.START_SCHEMA,
+        "manual_shadow_day_result": shadow_trial.DAY_SCHEMA,
+        "manual_shadow_final_report": shadow_trial.REPORT_SCHEMA,
+    }
+    assert captured_kwargs["provider_routes"] == {}
+    assert captured_kwargs["python_executable"] == sys.executable
+    inventory = shadow_trial._installed_package_inventory()
+    assert inventory == sorted(set(inventory))
+    assert all(entry == entry.strip().lower() for entry in inventory)
+    assert all("==" in entry for entry in inventory)
+    route = shadow_trial._allowlisted_overnight_route()
+    assert set(route) == {"llm_provider", "quick_think_llm", "deep_think_llm"}
+    from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
+
+    options = MODEL_OPTIONS[route["llm_provider"].lower()]
+    assert route["quick_think_llm"] in {name for _, name in options["quick"]}
+    assert route["deep_think_llm"] in {name for _, name in options["deep"]}
+
+
+def test_red_runtime_identity_seam_refuses_non_allowlisted_route(monkeypatch):
+    monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM", "gpt-5.6-terra")
+    with pytest.raises(runtime_identity.RuntimeIdentityError, match="allowlisted"):
+        shadow_trial._allowlisted_overnight_route()
+
+
+def test_red_runtime_identity_overnight_route_binds_configured_names_only(monkeypatch):
+    for environment_key in (
+        "TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER",
+        "TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM",
+        "TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM",
+    ):
+        monkeypatch.delenv(environment_key, raising=False)
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    configured_defaults = {
+        "llm_provider": str(DEFAULT_CONFIG["llm_provider"]),
+        "quick_think_llm": str(DEFAULT_CONFIG["quick_think_llm"]),
+        "deep_think_llm": str(DEFAULT_CONFIG["deep_think_llm"]),
+    }
+    assert shadow_trial._allowlisted_overnight_route() == configured_defaults
+
+    monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM", "gpt-5.4-nano")
+    monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM", "gpt-5.5")
+    assert shadow_trial._allowlisted_overnight_route() == {
+        "llm_provider": configured_defaults["llm_provider"],
+        "quick_think_llm": "gpt-5.4-nano",
+        "deep_think_llm": "gpt-5.5",
+    }

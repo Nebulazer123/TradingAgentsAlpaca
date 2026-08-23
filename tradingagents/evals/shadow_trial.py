@@ -19,9 +19,12 @@ from __future__ import annotations
 import datetime as dt
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import os
+import re
 import stat
+import sys
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -30,6 +33,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evals.automation_health_audit import (
     FROZEN_OBSERVER_ACTIVE_AUTOMATION_IDS,
     FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS,
@@ -38,7 +42,13 @@ from tradingagents.evals.automation_health_audit import (
     evaluate_schedule_contract,
     schedule_contract_snapshot_manifest,
 )
+from tradingagents.evals.runtime_identity import (
+    RuntimeIdentityError,
+    capture_runtime_identity,
+    validate_runtime_identity,
+)
 from tradingagents.evals.safety_sentinel import broker_snapshot_shape_reasons
+from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
 from tradingagents.strategy._immutable_evidence_store import (
     MANUAL_SHADOW_DAY_RESULT_KIND,
     MANUAL_SHADOW_DAY_START_KIND,
@@ -60,6 +70,7 @@ REPORT_SCHEMA = "manual_shadow_final_report_v1"
 ARTIFACT_KEYS = ("safety_sentinel", "paper_tournament", "daily_chain_manifest")
 OPERATOR_ABORT_REASON = "shadow_day_aborted_by_operator"
 PENDING_DAY_EXPIRED_REASON = "pending_day_expired_without_adjudication"
+RUNTIME_IDENTITY_MISMATCH_REASON = "runtime_identity_mismatch"
 ABORT_NOTES_LIMIT = 500
 DAILY_CHAIN_STAGES = (
     "overnight_research",
@@ -605,6 +616,7 @@ _START_FIELDS = frozenset(
         "live_control",
         "schedule",
         "calendar",
+        "runtime_identity",
     }
 )
 _DAY_FIELDS = frozenset(
@@ -620,6 +632,7 @@ _DAY_FIELDS = frozenset(
         "live_control",
         "schedule",
         "calendar",
+        "runtime_identity",
         "artifacts",
         "reasons",
         "closure_kind",
@@ -785,6 +798,117 @@ def _canonical_role_contract_path() -> Path:
 
 def _canonical_automation_root() -> Path:
     return Path("/Users/corbinfloyd/.codex/automations")
+
+
+_RUNTIME_IDENTITY_REQUIRED_FILES = (
+    "pyproject.toml",
+    "uv.lock",
+    "requirements.txt",
+    "requirements-crawler.txt",
+)
+_OVERNIGHT_ROUTE_SOURCES: tuple[tuple[str, str, str], ...] = (
+    ("llm_provider", "TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER", "llm_provider"),
+    ("quick_think_llm", "TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM", "quick_think_llm"),
+    ("deep_think_llm", "TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM", "deep_think_llm"),
+)
+_CUSTOM_MODEL_PLACEHOLDER = "custom"
+
+
+def _installed_package_inventory() -> list[str]:
+    """Deterministically list installed distributions as normalized name==version."""
+
+    entries: set[str] = set()
+    for distribution in importlib.metadata.distributions():
+        raw_name = distribution.metadata.get("Name")
+        raw_version = distribution.version
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        if not isinstance(raw_version, str) or not raw_version.strip():
+            continue
+        normalized = re.sub(r"[-_.]+", "-", raw_name).strip().lower()
+        if not normalized:
+            continue
+        entries.add(f"{normalized}=={raw_version.strip().lower()}")
+    return sorted(entries)
+
+
+def _allowlisted_overnight_route() -> dict[str, str]:
+    """Resolve the configured overnight model route for runtime identity.
+
+    Each name follows the existing overnight routing precedence (the
+    ``TRADINGAGENTS_OVERNIGHT_*`` environment variable first, then the shared
+    default configuration) and must be a catalog allowlisted
+    provider/quick-model/deep-model name.  This binds exactly the configured
+    route: backend URLs, CLI-only argument layers, health-probed auto-Ollama
+    model overrides, and disabled-graph fallbacks are resolved execution
+    inputs that this no-argument seam cannot observe, so they are deliberately
+    not part of the stored identity.
+    """
+
+    route: dict[str, str] = {}
+    for label, env_key, config_key in _OVERNIGHT_ROUTE_SOURCES:
+        raw = os.environ.get(env_key)
+        value = raw if raw else str(DEFAULT_CONFIG.get(config_key, ""))
+        normalized = value.strip()
+        if not normalized:
+            raise RuntimeIdentityError(
+                f"overnight route {label} resolved to an empty model name"
+            )
+        route[label] = normalized
+    options = MODEL_OPTIONS.get(route["llm_provider"].lower())
+    if options is None:
+        raise RuntimeIdentityError(
+            f"overnight route provider {route['llm_provider']!r} is not allowlisted"
+        )
+    for label, mode in (
+        ("quick_think_llm", "quick"),
+        ("deep_think_llm", "deep"),
+    ):
+        allowed = {
+            name for _, name in options.get(mode, []) if name != _CUSTOM_MODEL_PLACEHOLDER
+        }
+        if route[label] not in allowed:
+            raise RuntimeIdentityError(
+                f"overnight route {label} {route[label]!r} is not allowlisted"
+            )
+    return route
+
+
+def _runtime_identity_capture() -> dict[str, object]:
+    """Private production seam capturing strict runtime identity.
+
+    Binds exactly this task worktree with its required lockfiles, the canonical
+    schedule/role contracts and frozen live control, all ten canonical
+    automation TOMLs under the external automation root boundary, the current
+    Python executable plus its normalized installed inventory, the allowlisted
+    overnight model route, and the pinned shadow-day schema constants.  Any
+    dirty, missing, symlinked, or non-allowlisted input raises
+    ``RuntimeIdentityError`` instead of producing a weaker identity.
+    """
+
+    root = _repo_root()
+    automations_root = _absolute(_canonical_automation_root())
+    return capture_runtime_identity(
+        repo_root=root,
+        required_files={name: root / name for name in _RUNTIME_IDENTITY_REQUIRED_FILES},
+        schedule_contract=_canonical_schedule_contract_path(),
+        role_contract=_canonical_role_contract_path(),
+        automation_tomls={
+            automation_id: automations_root / automation_id / "automation.toml"
+            for automation_id in sorted(EXPECTED_AUTOMATION_IDS)
+        },
+        live_control=_canonical_live_control_path(),
+        provider_routes={},
+        schema_versions={
+            "manual_shadow_day_start": START_SCHEMA,
+            "manual_shadow_day_result": DAY_SCHEMA,
+            "manual_shadow_final_report": REPORT_SCHEMA,
+        },
+        python_executable=sys.executable,
+        package_inventory=_installed_package_inventory(),
+        overnight_route=_allowlisted_overnight_route(),
+        automation_root=automations_root,
+    )
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -1854,6 +1978,74 @@ def _valid_schedule_binding(value: object) -> bool:
     )
 
 
+def _validated_stored_runtime_identity(value: object, *, label: str) -> dict[str, object]:
+    """Strictly validate a stored runtime identity without recapturing anything."""
+
+    try:
+        return validate_runtime_identity(_plain_json(value))
+    except RuntimeIdentityError as exc:
+        raise ValueError(f"{label} runtime identity is invalid: {exc}") from exc
+
+
+def _captured_runtime_identity() -> dict[str, object]:
+    """Capture one fresh strict runtime identity; any failure refuses loudly."""
+
+    try:
+        return validate_runtime_identity(_runtime_identity_capture())
+    except RuntimeIdentityError as exc:
+        raise ValueError(f"runtime identity capture refused: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - identity capture must fail closed.
+        raise ValueError(f"runtime identity capture failed: {type(exc).__name__}") from exc
+
+
+def _schedule_source_digests(schedule: object) -> dict[str, object] | None:
+    """Project raw-byte contract/role/TOML digests from one schedule binding."""
+
+    if not isinstance(schedule, Mapping):
+        return None
+    source = _schedule_configuration_identity(schedule.get("source_manifest"))
+    if source is None:
+        return None
+    return {
+        "schedule_contract_sha256": source["contract"]["sha256"],
+        "role_contract_sha256": source["role_contract"]["sha256"],
+        "automation_tomls_sha256": {
+            str(row["automation_id"]): row["sha256"]
+            for row in source["automation_tomls"]
+        },
+    }
+
+
+def _identity_binds_authority_sources(
+    identity: Mapping[str, object] | None,
+    *,
+    control: object,
+    schedule: object,
+) -> bool:
+    """True only when identity digests match these exact authority-source bindings."""
+
+    if not isinstance(control, Mapping) or not isinstance(identity, Mapping):
+        return False
+    digests = _schedule_source_digests(schedule)
+    if digests is None:
+        return False
+    automation_digests = identity.get("automation_tomls_sha256")
+    return (
+        identity.get("live_control_sha256") == control.get("sha256")
+        and identity.get("schedule_contract_sha256")
+        == digests["schedule_contract_sha256"]
+        and identity.get("role_contract_sha256") == digests["role_contract_sha256"]
+        and isinstance(automation_digests, Mapping)
+        and _plain_json(automation_digests) == digests["automation_tomls_sha256"]
+    )
+
+
+def _predecessor_runtime_identity(days: tuple[EvidenceEnvelope, ...]) -> object | None:
+    """Stored immediate predecessor-day identity; replay never recaptures."""
+
+    return days[-1].payload.get("runtime_identity") if days else None
+
+
 def _capture_calendar_evidence(market_date: str) -> dict[str, object]:
     """Capture the canonical read-only calendar response inside Task 3.
 
@@ -2304,6 +2496,47 @@ def _validate_start_envelope(envelope: EvidenceEnvelope, *, now: dt.datetime) ->
         raise ValueError("shadow start schedule proof is invalid")
     if not _valid_calendar_binding(payload["calendar"], market_date=market_date, now=recorded_at):
         raise ValueError("shadow start calendar proof is invalid")
+    identity = _validated_stored_runtime_identity(
+        payload["runtime_identity"], label="shadow start"
+    )
+    if not _identity_binds_authority_sources(
+        identity, control=payload["live_control"], schedule=payload["schedule"]
+    ):
+        raise ValueError(
+            "shadow start runtime identity does not bind the captured authority sources"
+        )
+
+
+def _evaluate_runtime_identity_binding(
+    start: EvidenceEnvelope,
+    payload: Mapping[str, object],
+    *,
+    failed: list[str],
+    closure_kind: object,
+    predecessor_identity: object,
+) -> None:
+    """Compare only stored start/day/predecessor identities; never recapture."""
+
+    identity = _validated_stored_runtime_identity(
+        payload.get("runtime_identity"), label="shadow day"
+    )
+    start_identity = _validated_stored_runtime_identity(
+        start.payload.get("runtime_identity"), label="admitted start"
+    )
+    if identity != start_identity:
+        failed.append(RUNTIME_IDENTITY_MISMATCH_REASON)
+    if predecessor_identity is not None:
+        previous = _validated_stored_runtime_identity(
+            predecessor_identity, label="predecessor day"
+        )
+        if identity != previous:
+            failed.append(RUNTIME_IDENTITY_MISMATCH_REASON)
+    if closure_kind is None and not _identity_binds_authority_sources(
+        identity,
+        control=payload.get("live_control"),
+        schedule=payload.get("schedule"),
+    ):
+        failed.append(RUNTIME_IDENTITY_MISMATCH_REASON)
 
 
 def _evaluate_day_payload(
@@ -2311,6 +2544,7 @@ def _evaluate_day_payload(
     payload: Mapping[str, object],
     *,
     now: dt.datetime,
+    predecessor_identity: object = None,
 ) -> tuple[list[str], list[str]]:
     failed: list[str] = []
     incomplete: list[str] = []
@@ -2330,6 +2564,19 @@ def _evaluate_day_payload(
     market_date = start_payload["market_date"]
     if not isinstance(market_date, str):
         return ["start_market_date_invalid"], incomplete
+    if closure_kind == "pending_expired":
+        # An expired pending day records exactly its own documented expiry
+        # fact plus any stored-predecessor identity drift.  Missing evidence
+        # stays missing in the bound payload; it is never scored as fresh
+        # incompletes because the day never had a chance to produce it.
+        _evaluate_runtime_identity_binding(
+            start,
+            payload,
+            failed=failed,
+            closure_kind=closure_kind,
+            predecessor_identity=predecessor_identity,
+        )
+        return sorted(set(failed)), sorted(set(incomplete))
     if _current_central_date(now) != market_date:
         incomplete.append("current_central_date_mismatch")
     control = payload["live_control"]
@@ -2350,6 +2597,13 @@ def _evaluate_day_payload(
         )
     ):
         failed.append("schedule_evaluation_hash_changed")
+    _evaluate_runtime_identity_binding(
+        start,
+        payload,
+        failed=failed,
+        closure_kind=closure_kind,
+        predecessor_identity=predecessor_identity,
+    )
     if not _valid_calendar_binding(payload["calendar"], market_date=market_date, now=now):
         incomplete.append("calendar_evidence_unavailable_or_invalid")
     artifacts = payload["artifacts"]
@@ -2426,7 +2680,12 @@ def _validate_day_envelope(
         raise ValueError("shadow day closure kind is invalid")
     if not isinstance(payload["reasons"], (list, tuple)) or any(type(item) is not str for item in payload["reasons"]):
         raise ValueError("shadow day reasons are invalid")
-    failed, incomplete = _evaluate_day_payload(start, payload, now=recorded_at)
+    failed, incomplete = _evaluate_day_payload(
+        start,
+        payload,
+        now=recorded_at,
+        predecessor_identity=_predecessor_runtime_identity(earlier_days),
+    )
     expected_status = "failed" if failed else ("incomplete" if incomplete else "clean")
     if payload["status"] != expected_status:
         raise ValueError("shadow day status does not match bound evidence")
@@ -2648,6 +2907,13 @@ def create_shadow_day_start_manifest(
     )
     if not _valid_calendar_binding(calendar, market_date=market_date, now=now):
         raise ValueError("calendar gate failed")
+    # Identity is captured and strictly validated before any ledger surface is
+    # initialized, so a dirty/unavailable/malformed runtime admits no object.
+    identity = _captured_runtime_identity()
+    if not _identity_binds_authority_sources(identity, control=control, schedule=schedule):
+        raise ValueError(
+            "runtime identity does not bind the captured authority sources"
+        )
     prior = _store_envelopes(initialize=True)
     days, pending, last_day, report = _LedgerState(prior, now=now)
     if pending is not None or report is not None:
@@ -2665,6 +2931,7 @@ def create_shadow_day_start_manifest(
         "live_control": control,
         "schedule": schedule,
         "calendar": calendar,
+        "runtime_identity": identity,
     }
 
     return _admit_shadow_envelope(
@@ -2880,6 +3147,7 @@ def adjudicate_shadow_day(
         _capture_calendar_evidence(market_date),
         market_date=market_date,
     )
+    identity = _captured_runtime_identity()
     artifact_paths = artifacts if isinstance(artifacts, Mapping) else {}
     artifact_bindings = {key: _artifact_binding(artifact_paths.get(key)) for key in ARTIFACT_KEYS}
     provisional: dict[str, object] = {
@@ -2894,13 +3162,19 @@ def adjudicate_shadow_day(
         "live_control": control,
         "schedule": schedule,
         "calendar": calendar,
+        "runtime_identity": identity,
         "artifacts": artifact_bindings,
         "reasons": [],
         "closure_kind": None,
         "stopped_at_stage": None,
         "notes": None,
     }
-    failed, incomplete = _evaluate_day_payload(start, provisional, now=now)
+    failed, incomplete = _evaluate_day_payload(
+        start,
+        provisional,
+        now=now,
+        predecessor_identity=_predecessor_runtime_identity(days),
+    )
     unknown_artifacts = set(artifact_paths) - set(ARTIFACT_KEYS)
     if unknown_artifacts:
         incomplete.append("unknown_artifact_keys")
@@ -2931,7 +3205,8 @@ def _closure_day_payload(
     """Build one terminal non-clean day payload bound to current local proof.
 
     Fresh control, schedule, and calendar captures are bound at closure time;
-    artifacts bind only files that actually exist right now.  Nothing is
+    artifacts bind only files that actually exist right now; and the admitted
+    start identity is inherited verbatim instead of recaptured.  Nothing is
     manufactured for stages that never produced evidence.
     """
 
@@ -2956,13 +3231,19 @@ def _closure_day_payload(
         "live_control": control,
         "schedule": schedule,
         "calendar": calendar,
+        "runtime_identity": _plain_json(start_payload["runtime_identity"]),
         "artifacts": artifact_bindings,
         "reasons": [],
         "closure_kind": closure_kind,
         "stopped_at_stage": stopped_at_stage,
         "notes": notes,
     }
-    failed, incomplete = _evaluate_day_payload(start, provisional, now=now)
+    failed, incomplete = _evaluate_day_payload(
+        start,
+        provisional,
+        now=now,
+        predecessor_identity=_predecessor_runtime_identity(days),
+    )
     unknown_artifacts = set(supplied) - set(ARTIFACT_KEYS)
     if unknown_artifacts:
         incomplete.append("unknown_artifact_keys")
