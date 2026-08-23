@@ -1,6 +1,8 @@
-<div align="center">
+<h1 align="center">
+  <img src="assets/tradingagents-wordmark.png" alt="TradingAgents" width="84%">
+</h1>
 
-# TradingAgents Alpaca
+<div align="center">
 
 **Evidence-rich multi-agent market analysis with explicit safety gates between research, paper execution, and live brokerage.**
 
