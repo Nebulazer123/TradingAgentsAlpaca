@@ -1,340 +1,192 @@
-"""Deterministic, nonsecret runtime identity capture for shadow trials.
-
-The capture freezes one exact execution context: canonical repository path,
-HEAD commit, clean tracked worktree, dependency-lock hashes, interpreter facts,
-normalized installed-package inventory digest, schedule/role/live-control
-contract hashes, the configured automation TOML hashes, the nonsecret
-overnight provider/model route, and packet schema versions. Every filesystem
-and process fact is constructor-injectable so callers can capture against
-fixtures without touching credentials, brokers, automation APIs, or runtime
-results. Any ambiguity fails closed with :class:`RuntimeIdentityError`.
-"""
+"""Fixture-only, deterministic runtime identity capture for evaluations."""
 
 from __future__ import annotations
 
-import datetime as dt
 import hashlib
 import json
 import os
-import platform
 import re
 import stat
 import subprocess
-import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
-import tomllib
-
-from tradingagents.default_config import DEFAULT_CONFIG
-
-RUNTIME_IDENTITY_SCHEMA_VERSION = "runtime_identity_v1"
-REQUIRED_SOURCE_FILES = (
-    "pyproject.toml",
-    "uv.lock",
-    "requirements.txt",
-    "requirements-crawler.txt",
-)
-SCHEDULE_CONTRACT_RELPATH = ("config", "automation_schedule_contract.json")
-ROLE_CONTRACT_RELPATH = ("config", "automation_roles.json")
-LIVE_CONTROL_RELPATH = ("results", "policy", "live_control.json")
-AUTOMATION_TOML_NAME = "automation.toml"
-
-_HEAD_COMMIT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
-_AUTOMATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_PACKAGE_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
-_PACKAGE_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+!~-]{0,127}$")
-_ROUTE_STRING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,199}$")
-_SCHEMA_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_GIT_TIMEOUT_SECONDS = 60
+_IDENTITY_SCHEMA = "runtime_identity/v1"
+_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40,64}")
+_CHUNK_SIZE_BYTES = 1 << 20
 
 
 class RuntimeIdentityError(ValueError):
-    """The requested runtime identity cannot be captured safely."""
+    """Raised when identity inputs are invalid or the worktree is not clean."""
 
 
-def _canonical_json_bytes(value: object) -> bytes:
-    try:
-        return json.dumps(
-            value,
-            ensure_ascii=True,
-            allow_nan=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise RuntimeIdentityError("runtime identity payload is not JSON-safe") from exc
+def _fail(message: str) -> NoReturn:
+    raise RuntimeIdentityError(message)
 
 
-def _capture_timestamp(now: dt.datetime | None) -> str:
-    moment = dt.datetime.now(dt.timezone.utc) if now is None else now
-    if moment.tzinfo is None or moment.utcoffset() is None:
-        raise RuntimeIdentityError("now must be timezone-aware")
-    return moment.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+def _canonical_json(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
-def _resolve_repo_root(repo_root: str | Path) -> Path:
-    try:
-        root = Path(os.fspath(repo_root)).expanduser().resolve()
-    except OSError as exc:
-        raise RuntimeIdentityError("repo_root cannot be resolved") from exc
+def _json_sha256(value: object) -> str:
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _validated_repo_root(repo_root: Path) -> Path:
+    if not isinstance(repo_root, (str, os.PathLike)):
+        _fail("repo_root must be a filesystem path")
+    root = Path(os.path.realpath(Path(repo_root)))
     if not root.is_dir():
-        raise RuntimeIdentityError("repo_root must be an existing directory")
+        _fail("repo_root must be an existing directory")
     return root
 
 
-def _default_automation_root() -> Path:
-    codex_home = os.environ.get("CODEX_HOME")
-    base = Path(codex_home) if codex_home else Path.home() / ".codex"
-    return base / "automations"
+def _validated_label(label: object, field: str) -> None:
+    if not isinstance(label, str) or not label.strip():
+        _fail(f"{field} labels must be non-empty strings")
 
 
-def _read_regular_file(path_value: str | Path, *, label: str) -> bytes:
-    """Read exact bytes from a regular, non-symlink file, rejecting drift."""
-
-    path = Path(os.fspath(path_value))
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise RuntimeIdentityError(f"{label} is missing: {path}") from exc
-    if stat.S_ISLNK(metadata.st_mode):
-        raise RuntimeIdentityError(f"{label} must not be a symlink: {path}")
-    if not stat.S_ISREG(metadata.st_mode):
-        raise RuntimeIdentityError(f"{label} must be a regular file: {path}")
-    try:
-        with path.open("rb") as handle:
-            before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode):
-                raise RuntimeIdentityError(f"{label} must be a regular file: {path}")
-            raw = handle.read()
-            after = os.fstat(handle.fileno())
-    except OSError as exc:
-        raise RuntimeIdentityError(f"{label} is unreadable: {path}") from exc
-    if (before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    ):
-        raise RuntimeIdentityError(f"{label} changed while being read: {path}")
-    return raw
+def _validated_string_mapping(values: Mapping[str, str], field: str) -> dict[str, str]:
+    if not isinstance(values, Mapping):
+        _fail(f"{field} must be a mapping of non-empty strings")
+    validated: dict[str, str] = {}
+    for label, value in values.items():
+        _validated_label(label, field)
+        if not isinstance(value, str) or not value.strip():
+            _fail(f"{field}[{label!r}] must be a non-empty string")
+        validated[label] = value
+    return dict(sorted(validated.items()))
 
 
-def _file_sha256(path_value: str | Path, *, label: str) -> str:
-    return hashlib.sha256(_read_regular_file(path_value, label=label)).hexdigest()
+def _validated_path_mapping(values: Mapping[str, Path], field: str) -> dict[str, Path]:
+    if not isinstance(values, Mapping):
+        _fail(f"{field} must be a mapping of labels to filesystem paths")
+    validated: dict[str, Path] = {}
+    for label, value in values.items():
+        _validated_label(label, field)
+        if not isinstance(value, (str, os.PathLike)):
+            _fail(f"{field}[{label!r}] must be a filesystem path")
+        validated[label] = Path(value)
+    return dict(sorted(validated.items()))
 
 
-def _source_file_record(path_value: str | Path, name: str) -> dict[str, Any]:
-    raw = _read_regular_file(path_value, label=f"required source file {name}")
-    return {"sha256": hashlib.sha256(raw).hexdigest(), "size_bytes": len(raw)}
+def _validated_optional_string(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        _fail(f"{field} must be a non-empty string when provided")
+    return value
 
 
-def _git_output(repo_root: Path, *arguments: str) -> str:
-    try:
-        completed = subprocess.run(
-            ["git", "-C", os.fspath(repo_root), *arguments],
-            capture_output=True,
-            timeout=_GIT_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeIdentityError(f"git is unavailable for {repo_root}") from exc
+def _normalized_package_inventory(inventory: Sequence[str] | None) -> list[str]:
+    if inventory is None:
+        return []
+    if isinstance(inventory, (str, bytes)) or not isinstance(inventory, Sequence):
+        _fail("package_inventory must be a sequence of strings")
+    normalized: set[str] = set()
+    for entry in inventory:
+        if not isinstance(entry, str) or not entry.strip():
+            _fail("package_inventory entries must be non-empty strings")
+        normalized.add(entry.strip().lower())
+    return sorted(normalized)
+
+
+def _run_git(root: Path, arguments: list[str]) -> str:
+    completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, text=True)
     if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", errors="replace").strip()[:200]
-        raise RuntimeIdentityError(f"git {' '.join(arguments)} failed: {detail}")
-    return completed.stdout.decode("utf-8", errors="strict")
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown failure"
+        _fail(f"git {' '.join(arguments)} failed: {detail}")
+    return completed.stdout
 
 
-def _head_commit(repo_root: Path) -> str:
-    commit = _git_output(repo_root, "rev-parse", "HEAD").strip().lower()
-    if not _HEAD_COMMIT_RE.fullmatch(commit):
-        raise RuntimeIdentityError("repository HEAD is not a resolvable commit")
-    return commit
-
-
-def _tracked_tree_is_clean(repo_root: Path) -> bool:
-    status = _git_output(repo_root, "status", "--porcelain", "--untracked-files=no")
+def _capture_git_state(root: Path) -> str:
+    head = _run_git(root, ["rev-parse", "HEAD"]).strip()
+    if not _COMMIT_PATTERN.fullmatch(head):
+        _fail("repository HEAD must resolve to an exact commit")
+    status = _run_git(root, ["status", "--porcelain"])
     if status.strip():
-        raise RuntimeIdentityError("tracked worktree is dirty")
-    return True
+        preview = "; ".join(status.splitlines()[:5])
+        _fail(f"worktree is not clean: {preview}")
+    return head
 
 
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise RuntimeIdentityError("schedule contract contains duplicate JSON keys")
-        result[key] = value
-    return result
-
-
-def _expected_automation_ids(schedule_raw: bytes) -> tuple[str, ...]:
+def _checked_regular_file(root: Path, given: Path) -> Path:
+    if not isinstance(given, (str, os.PathLike)):
+        _fail("identity file inputs must be filesystem paths")
+    candidate_path = Path(given)
+    candidate = Path(os.path.abspath(candidate_path if candidate_path.is_absolute() else root / candidate_path))
     try:
-        document = json.loads(schedule_raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeIdentityError("schedule contract is not valid JSON") from exc
-    automations = document.get("automations") if isinstance(document, dict) else None
-    if not isinstance(automations, dict) or not automations:
-        raise RuntimeIdentityError("schedule contract defines no automations")
-    identifiers: list[str] = []
-    for identifier in automations:
-        if not isinstance(identifier, str) or not _AUTOMATION_ID_RE.fullmatch(identifier):
-            raise RuntimeIdentityError("schedule contract has an invalid automation id")
-        identifiers.append(identifier)
-    return tuple(sorted(identifiers))
-
-
-def _route_string(value: object, *, field: str) -> str:
-    if not isinstance(value, str):
-        raise RuntimeIdentityError(f"{field} must be a string")
-    stripped = value.strip()
-    if not _ROUTE_STRING_RE.fullmatch(stripped):
-        raise RuntimeIdentityError(f"{field} is not a nonsecret route string")
-    return stripped
-
-
-def _overnight_route(
-    *,
-    provider: str | None,
-    quick_model: str | None,
-    deep_model: str | None,
-) -> dict[str, str]:
-    return {
-        "provider": _route_string(provider or DEFAULT_CONFIG.get("llm_provider"), field="overnight_provider"),
-        "quick_think_llm": _route_string(quick_model or DEFAULT_CONFIG.get("quick_think_llm"), field="overnight_quick_model"),
-        "deep_think_llm": _route_string(deep_model or DEFAULT_CONFIG.get("deep_think_llm"), field="overnight_deep_model"),
-    }
-
-
-def _normalize_package_name(name: object) -> str:
-    if not isinstance(name, str):
-        raise RuntimeIdentityError("package names must be strings")
-    normalized = re.sub(r"[-_.]+", "-", name.strip()).lower()
-    if not _PACKAGE_NAME_RE.fullmatch(normalized):
-        raise RuntimeIdentityError("package inventory contains an invalid name")
-    return normalized
-
-
-def _package_version(version: object) -> str:
-    if not isinstance(version, str):
-        raise RuntimeIdentityError("package versions must be strings")
-    text = version.strip()
-    if not _PACKAGE_VERSION_RE.fullmatch(text):
-        raise RuntimeIdentityError("package inventory contains an invalid version")
-    return text
-
-
-def normalized_package_inventory_sha256(
-    packages: Sequence[tuple[str, str]] | Mapping[str, str],
-) -> dict[str, int]:
-    """Digest a PEP 503-normalized, de-duplicated package inventory."""
-
-    items: list[tuple[object, object]]
-    if isinstance(packages, Mapping):
-        items = list(packages.items())
-    elif isinstance(packages, Sequence):
-        items = [(entry[0], entry[1]) for entry in packages]
-    else:
-        raise RuntimeIdentityError("installed_packages must be a sequence or mapping")
-    rows: set[tuple[str, str]] = set()
-    for name, version in items:
-        rows.add((_normalize_package_name(name), _package_version(version)))
-    text = "".join(f"{name}=={version}\n" for name, version in sorted(rows))
-    return {"inventory_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "count": len(rows)}
-
-
-def _ambient_package_inventory() -> list[tuple[str, str]]:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeIdentityError(f"{candidate_path} is outside repo_root {root}") from exc
+    if not relative.parts:
+        _fail("repo_root itself cannot serve as an identity file")
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            _fail(f"{relative} traverses a symlink at {part}")
     try:
-        import importlib.metadata
-
-        entries: list[tuple[str, str]] = []
-        for distribution in importlib.metadata.distributions():
-            name = distribution.metadata.get("Name") if distribution.metadata is not None else None
-            version = distribution.version
-            if name and version:
-                entries.append((name, version))
-        return entries
-    except Exception as exc:
-        raise RuntimeIdentityError("installed-package inventory is unavailable") from exc
+        file_mode = current.lstat().st_mode
+    except OSError as exc:
+        raise RuntimeIdentityError(f"{relative} is missing or unreadable") from exc
+    if not stat.S_ISREG(file_mode):
+        _fail(f"{relative} is missing or is not a regular file")
+    return current
 
 
-def _schema_versions(supplied: Mapping[str, object] | None) -> dict[str, Any]:
-    versions: dict[str, Any] = {"runtime_identity": RUNTIME_IDENTITY_SCHEMA_VERSION}
-    if supplied is None:
-        return versions
-    for key, value in supplied.items():
-        if not isinstance(key, str) or not _SCHEMA_KEY_RE.fullmatch(key):
-            raise RuntimeIdentityError("packet schema version keys must be simple identifiers")
-        if isinstance(value, str):
-            if not value.strip() or len(value) > 128:
-                raise RuntimeIdentityError("packet schema versions must be short strings or ints")
-        elif isinstance(value, bool) or not isinstance(value, int):
-            raise RuntimeIdentityError("packet schema versions must be short strings or ints")
-        versions[key] = value
-    return versions
+def _hash_file(root: Path, path: Path) -> str:
+    target = _checked_regular_file(root, path)
+    digest = hashlib.sha256()
+    with target.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK_SIZE_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def capture_runtime_identity(
     *,
-    repo_root: str | Path,
-    schedule_contract_path: str | Path | None = None,
-    role_contract_path: str | Path | None = None,
-    live_control_path: str | Path | None = None,
-    automation_root: str | Path | None = None,
-    now: dt.datetime | None = None,
+    repo_root: Path,
+    required_files: Mapping[str, Path],
+    schedule_contract: Path,
+    role_contract: Path,
+    automation_tomls: Mapping[str, Path],
+    live_control: Path,
+    provider_routes: Mapping[str, str],
+    schema_versions: Mapping[str, str],
     python_executable: str | None = None,
-    python_version: str | None = None,
-    installed_packages: Sequence[tuple[str, str]] | Mapping[str, str] | None = None,
-    overnight_provider: str | None = None,
-    overnight_quick_model: str | None = None,
-    overnight_deep_model: str | None = None,
-    packet_schema_versions: Mapping[str, object] | None = None,
-) -> dict[str, Any]:
-    """Capture one immutable, JSON-safe, nonsecret runtime identity snapshot."""
+    package_inventory: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Return a deterministic, JSON-safe identity built only from explicit fixture inputs."""
+    root = _validated_repo_root(repo_root)
+    required = _validated_path_mapping(required_files, "required_files")
+    automations = _validated_path_mapping(automation_tomls, "automation_tomls")
+    for single in (schedule_contract, role_contract, live_control):
+        if not isinstance(single, (str, os.PathLike)):
+            _fail("contract and control inputs must be filesystem paths")
+    routes = _validated_string_mapping(provider_routes, "provider_routes")
+    schemas = _validated_string_mapping(schema_versions, "schema_versions")
+    executable = _validated_optional_string(python_executable, "python_executable")
+    inventory = _normalized_package_inventory(package_inventory)
 
-    root = _resolve_repo_root(repo_root)
-    schedule_path = Path(schedule_contract_path) if schedule_contract_path else root.joinpath(*SCHEDULE_CONTRACT_RELPATH)
-    role_path = Path(role_contract_path) if role_contract_path else root.joinpath(*ROLE_CONTRACT_RELPATH)
-    control_path = Path(live_control_path) if live_control_path else root.joinpath(*LIVE_CONTROL_RELPATH)
-    automations_dir = Path(automation_root) if automation_root else _default_automation_root()
-
-    schedule_raw = _read_regular_file(schedule_path, label="schedule contract")
-    identity: dict[str, Any] = {
-        "schema_version": RUNTIME_IDENTITY_SCHEMA_VERSION,
-        "captured_at": _capture_timestamp(now),
-        "repo": {
-            "root": str(root),
-            "head_commit": _head_commit(root),
-            "tracked_tree_clean": _tracked_tree_is_clean(root),
-        },
-        "source_files": {name: _source_file_record(root / name, name) for name in REQUIRED_SOURCE_FILES},
-        "python": {
-            "executable": python_executable or sys.executable,
-            "version": python_version or platform.python_version(),
-        },
-        "packages": normalized_package_inventory_sha256(installed_packages if installed_packages is not None else _ambient_package_inventory()),
-        "contracts": {
-            "schedule_contract_sha256": hashlib.sha256(schedule_raw).hexdigest(),
-            "role_contract_sha256": _file_sha256(role_path, label="role contract"),
-            "live_control_sha256": _file_sha256(control_path, label="live control"),
-        },
-        "automation_tomls": {},
-        "overnight_route": _overnight_route(
-            provider=overnight_provider,
-            quick_model=overnight_quick_model,
-            deep_model=overnight_deep_model,
-        ),
-        "schema_versions": _schema_versions(packet_schema_versions),
+    commit = _capture_git_state(root)
+    payload: dict[str, Any] = {
+        "identity_schema": _IDENTITY_SCHEMA,
+        "git_commit": commit,
+        "worktree_clean": True,
+        "required_files_sha256": {label: _hash_file(root, path) for label, path in required.items()},
+        "schedule_contract_sha256": _hash_file(root, Path(schedule_contract)),
+        "role_contract_sha256": _hash_file(root, Path(role_contract)),
+        "live_control_sha256": _hash_file(root, Path(live_control)),
+        "automation_tomls_sha256": {label: _hash_file(root, path) for label, path in automations.items()},
+        "provider_routes": dict(routes),
+        "provider_routes_sha256": _json_sha256(routes),
+        "schema_versions": dict(schemas),
+        "schema_versions_sha256": _json_sha256(schemas),
+        "python_executable": executable,
+        "package_inventory": inventory,
+        "package_inventory_sha256": _json_sha256(inventory),
     }
-
-    for identifier in _expected_automation_ids(schedule_raw):
-        toml_path = automations_dir / identifier / AUTOMATION_TOML_NAME
-        raw = _read_regular_file(toml_path, label=f"automation TOML {identifier}")
-        try:
-            tomllib.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-            raise RuntimeIdentityError(f"automation TOML {identifier} is malformed") from exc
-        identity["automation_tomls"][identifier] = hashlib.sha256(raw).hexdigest()
-
-    _canonical_json_bytes(identity)
-    return identity
+    payload["identity_sha256"] = _json_sha256(payload)
+    return payload
