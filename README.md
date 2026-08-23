@@ -72,6 +72,13 @@ The Compose file also includes an Ollama profile for local models:
 docker compose --profile ollama run --rm tradingagents-ollama
 ~~~
 
+For local Ollama runs, use the eval-selected instruct quant, either directly or through the repository's 4k Modelfile alias:
+
+- `hf.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M` (base image)
+- `tradingagents-qwen3-30b-a3b-instruct-2507-q4-4k` (alias built from [scripts/ollama/tradingagents-qwen3-30b-a3b-instruct-2507-q4-4k.Modelfile](scripts/ollama/tradingagents-qwen3-30b-a3b-instruct-2507-q4-4k.Modelfile), which explains the tuning fields: context window, output cap, temperature, and penalties)
+
+Point `TRADINGAGENTS_DEEP_THINK_LLM`/`TRADINGAGENTS_QUICK_THINK_LLM` at the alias; `.env.example` documents the matching operating-profile settings.
+
 ## How it works
 
 ### Analysts
