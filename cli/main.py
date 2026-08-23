@@ -116,6 +116,7 @@ from tradingagents.brokers.paper_tournament import (
     ALPHAINSIDER_PAPER_WATCH_ID,
     STRATEGY_IDS,
     adapt_candidate_signals_for_live_strategy,
+    authenticated_market_date_window,
     build_alphainsider_paper_watch_plan,
     build_tournament_actions,
     build_tournament_order_payloads,
@@ -10358,6 +10359,12 @@ def alpaca_paper_tournament_init(
     paper_account = paper_client.get_account()
     paper_positions = paper_client.list_positions()
     now = _alpaca_policy_now()
+    first_market_date, last_market_date = authenticated_market_date_window(
+        now,
+        duration_days=duration_days,
+        market_day_limit=max_submission_market_days,
+    )
+    market_calendar = paper_client.list_calendar(start=first_market_date, end=last_market_date)
     ledger = initialize_tournament(
         paper_account=paper_account,
         paper_positions=paper_positions,
@@ -10365,6 +10372,7 @@ def alpaca_paper_tournament_init(
         now=now,
         duration_days=duration_days,
         max_submission_market_days=max_submission_market_days,
+        market_calendar=market_calendar,
     )
     market_data = {}
     record_equity_snapshot(ledger, market_data=market_data, now=now)

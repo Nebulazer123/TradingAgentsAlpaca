@@ -25,6 +25,7 @@ from tradingagents.brokers.alpaca_supervisor import CandidateSignal
 
 UTC = datetime.timezone.utc
 CENTRAL = ZoneInfo("America/Chicago")
+EXCHANGE_TZ = ZoneInfo("America/New_York")
 MAX_BROKER_CLOCK_SKEW_SECONDS = 15 * 60
 LEDGER_FILE = "paper-tournament-ledger.json"
 COMPACT_LEDGER_FILE = "paper-tournament-ledger.compact.json"
@@ -289,9 +290,112 @@ def _submission_lease_evidence(ledger: Mapping) -> str:
         "started_at": ledger.get("started_at"),
         "ends_at": ledger.get("ends_at"),
         "authorized_market_day_limit": ledger.get("authorized_market_day_limit"),
+        "authorized_market_dates": ledger.get("authorized_market_dates"),
+        "lease_window_days": ledger.get("lease_window_days"),
     }
     canonical = json.dumps(evidence, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _parse_exchange_calendar_time(value: object) -> datetime.time | None:
+    """Accept only a strict 24-hour HH:MM exchange session wall time."""
+
+    if type(value) is not str or len(value) != 5 or value[2] != ":":
+        return None
+    hour_text, minute_text = value[:2], value[3:]
+    if not hour_text.isdigit() or not minute_text.isdigit():
+        return None
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if hour > 23 or minute > 59:
+        return None
+    return datetime.time(hour=hour, minute=minute)
+
+
+def _normalize_exchange_calendar_entry(entry: object) -> dict | None:
+    """Return a strict authenticated calendar entry with date plus open/close."""
+
+    if not isinstance(entry, Mapping):
+        return None
+    date_value = entry.get("date")
+    if type(date_value) is not str or _submitted_market_date_is_malformed(date_value):
+        return None
+    open_time = _parse_exchange_calendar_time(entry.get("open"))
+    close_time = _parse_exchange_calendar_time(entry.get("close"))
+    if open_time is None or close_time is None or open_time >= close_time:
+        return None
+    return {"date": date_value, "open": entry["open"], "close": entry["close"]}
+
+
+def _exchange_session_bounds_utc(entry: Mapping) -> tuple[datetime.datetime, datetime.datetime]:
+    """Convert an authenticated entry's open/close into UTC instants."""
+
+    day = datetime.date.fromisoformat(str(entry["date"]))
+    open_time = _parse_exchange_calendar_time(entry["open"])
+    close_time = _parse_exchange_calendar_time(entry["close"])
+    if open_time is None or close_time is None:
+        raise ValueError("paper tournament lease calendar evidence is malformed")
+    open_at = datetime.datetime.combine(day, open_time, tzinfo=EXCHANGE_TZ).astimezone(UTC)
+    close_at = datetime.datetime.combine(day, close_time, tzinfo=EXCHANGE_TZ).astimezone(UTC)
+    return open_at, close_at
+
+
+def authenticated_market_date_window(
+    now: datetime.datetime,
+    *,
+    duration_days: int,
+    market_day_limit: int,
+) -> tuple[str, str]:
+    """Return the inclusive Central market-date window a lease admits from."""
+
+    start_market_date = _central_market_date(now)
+    if start_market_date is None:
+        raise ValueError("paper tournament lease has no Central market date")
+    capacity_days = max(0, int(market_day_limit)) * 2
+    last_market_date = (
+        datetime.date.fromisoformat(start_market_date)
+        + datetime.timedelta(days=max(int(duration_days) - 1, capacity_days))
+    ).isoformat()
+    return start_market_date, last_market_date
+
+
+def _authenticated_market_calendar_entries(market_calendar: object) -> list[dict]:
+    """Normalize every raw exchange calendar entry or fail closed."""
+
+    if isinstance(market_calendar, (str, bytes)) or not isinstance(market_calendar, Sequence):
+        raise ValueError("paper tournament lease calendar evidence is unavailable")
+    normalized_entries = []
+    seen_dates = set()
+    for entry in market_calendar:
+        normalized_entry = _normalize_exchange_calendar_entry(entry)
+        if normalized_entry is None:
+            raise ValueError("paper tournament lease calendar evidence is malformed")
+        if normalized_entry["date"] in seen_dates:
+            raise ValueError("paper tournament lease calendar evidence duplicates a market date")
+        seen_dates.add(normalized_entry["date"])
+        normalized_entries.append(normalized_entry)
+    if not normalized_entries:
+        raise ValueError("paper tournament lease calendar evidence is unavailable")
+    return sorted(normalized_entries, key=lambda item: item["date"])
+
+
+def _authorized_market_dates_for_lease(
+    entries: Sequence[Mapping],
+    *,
+    start_market_date: str,
+    last_window_date: str,
+    count: int,
+) -> list[dict]:
+    """Admit exactly ``count`` authenticated sessions inside the lease window."""
+
+    selected = [
+        dict(entry)
+        for entry in entries
+        if start_market_date <= entry["date"] <= last_window_date
+    ][:count]
+    if len(selected) != count:
+        raise ValueError("paper tournament lease calendar evidence is missing admitted market days")
+    return selected
 
 
 def _central_market_date(now: datetime.datetime) -> str | None:
@@ -492,6 +596,52 @@ def _validate_submission_lease(
     calendar_market_date = _central_market_date(now_timestamp)
     if calendar_market_date is None:
         raise ValueError("paper submission lease has no Central market date")
+    authorized_market_dates = ledger.get("authorized_market_dates")
+    if (
+        not isinstance(authorized_market_dates, list)
+        or not authorized_market_dates
+        or any(not isinstance(item, Mapping) for item in authorized_market_dates)
+    ):
+        raise ValueError("paper submission lease has no admitted market-day calendar evidence")
+    admitted_entries = []
+    for item in authorized_market_dates:
+        admitted_entry = _normalize_exchange_calendar_entry(item)
+        if admitted_entry is None:
+            raise ValueError("paper submission lease admitted market-day calendar is malformed")
+        admitted_entries.append(admitted_entry)
+    admitted_by_date = {entry["date"]: entry for entry in admitted_entries}
+    if len(admitted_by_date) != len(admitted_entries):
+        raise ValueError(
+            "paper submission lease admitted market-day calendar duplicates a market date"
+        )
+    if sorted(admitted_by_date) != list(admitted_by_date):
+        raise ValueError("paper submission lease admitted market-day calendar is malformed")
+    if len(admitted_entries) != limit:
+        raise ValueError(
+            "paper submission lease admitted market-day calendar disagrees with the day limit"
+        )
+    admitted_entry = admitted_by_date.get(calendar_market_date)
+    if admitted_entry is None:
+        raise ValueError(
+            "paper submission lease Central market date is outside the admitted market-day calendar"
+        )
+    lease_window_days = ledger.get("lease_window_days")
+    if type(lease_window_days) is not int or not 1 <= lease_window_days <= 31:
+        raise ValueError("paper submission lease wall-clock ceiling is malformed")
+    expected_ends_at = _iso(
+        min(
+            _exchange_session_bounds_utc(admitted_entries[-1])[1],
+            started_at + datetime.timedelta(days=lease_window_days),
+        )
+    )
+    if ledger.get("ends_at") != expected_ends_at:
+        raise ValueError(
+            "paper submission lease ends_at is inconsistent with the admitted market-day evidence"
+        )
+    if _exchange_session_bounds_utc(admitted_entry)[1] > ends_at:
+        raise ValueError(
+            "paper submission lease Central market date close is beyond the lease wall-clock ceiling"
+        )
     list_calendar = getattr(paper_client, "list_calendar", None)
     if not callable(list_calendar):
         raise ValueError("paper submission lease cannot verify the broker market calendar")
@@ -499,11 +649,27 @@ def _validate_submission_lease(
         calendar = list_calendar(start=calendar_market_date, end=calendar_market_date)
     except Exception as exc:
         raise ValueError("paper submission lease broker calendar check failed") from exc
-    if not isinstance(calendar, Sequence) or not any(
-        isinstance(item, Mapping) and str(item.get("date", "")) == calendar_market_date
-        for item in calendar
-    ):
-        raise ValueError("paper submission lease requires a regular Central market date")
+    if isinstance(calendar, (str, bytes)) or not isinstance(calendar, Sequence):
+        raise ValueError("paper submission lease broker calendar evidence is unavailable")
+    observed_entries = []
+    observed_dates = set()
+    for item in calendar:
+        observed_entry = _normalize_exchange_calendar_entry(item)
+        if observed_entry is None:
+            raise ValueError("paper submission lease broker calendar evidence is malformed")
+        if observed_entry["date"] in observed_dates:
+            raise ValueError(
+                "paper submission lease broker calendar evidence duplicates a market date"
+            )
+        observed_dates.add(observed_entry["date"])
+        observed_entries.append(observed_entry)
+    matching = [entry for entry in observed_entries if entry["date"] == calendar_market_date]
+    if not matching:
+        raise ValueError("paper submission lease broker calendar evidence is missing")
+    if matching[0] != admitted_entry:
+        raise ValueError(
+            "paper submission lease broker calendar evidence changed after admission"
+        )
     authoritative_policy_now, clock_timestamp = _validate_regular_paper_broker_clock(
         paper_client,
         now=now_timestamp,
@@ -521,19 +687,14 @@ def _validate_submission_lease(
         or clock_central.date().isoformat() != calendar_market_date
     ):
         raise ValueError("paper submission lease broker clock has the wrong Central market date")
-    regular_open = datetime.time(hour=8, minute=30)
-    regular_close = datetime.time(hour=15)
+    session_open_utc, session_close_utc = _exchange_session_bounds_utc(admitted_entry)
     if not (
-        regular_open <= policy_central.timetz().replace(tzinfo=None) < regular_close
-        and regular_open <= clock_central.timetz().replace(tzinfo=None) < regular_close
+        session_open_utc <= authoritative_policy_now < session_close_utc
+        and session_open_utc <= clock_timestamp < session_close_utc
     ):
         raise ValueError("paper submission lease broker clock is outside the regular session")
-    if policy_central.weekday() >= 5:
-        raise ValueError("paper submission lease requires a regular Central market date")
     if authoritative_policy_now < started_at:
         raise ValueError("paper submission lease has not started")
-    if authoritative_policy_now >= ends_at:
-        raise ValueError("paper submission lease has expired")
     consuming_active_submission_date = active_submission_market_date == market_date
     if market_date in submitted_dates and not consuming_active_submission_date:
         raise ValueError("paper submission lease already used this Central market date")
@@ -932,6 +1093,7 @@ def initialize_tournament(
     now: datetime.datetime | None = None,
     duration_days: int = 31,
     max_submission_market_days: int = 31,
+    market_calendar: Sequence[Mapping] | None = None,
 ) -> dict:
     if type(duration_days) is not int or not 1 <= duration_days <= 31:
         raise ValueError("duration_days must be an integer from 1 through 31")
@@ -939,7 +1101,26 @@ def initialize_tournament(
         raise ValueError("max_submission_market_days must be an integer from 1 through 31")
     now = now or _now()
     started_at = _iso(now)
-    ends_at = _iso(now + datetime.timedelta(days=duration_days))
+    authorized_market_dates: list[dict] = []
+    if market_calendar is not None:
+        first_market_date, last_window_date = authenticated_market_date_window(
+            now,
+            duration_days=duration_days,
+            market_day_limit=max_submission_market_days,
+        )
+        authorized_market_dates = _authorized_market_dates_for_lease(
+            _authenticated_market_calendar_entries(market_calendar),
+            start_market_date=first_market_date,
+            last_window_date=last_window_date,
+            count=max_submission_market_days,
+        )
+        final_session_close = _exchange_session_bounds_utc(authorized_market_dates[-1])[1]
+        wall_clock_ceiling = _normalize_timestamp(now + datetime.timedelta(days=duration_days))
+        if wall_clock_ceiling is None:
+            raise ValueError("paper tournament lease wall-clock ceiling is malformed")
+        ends_at = _iso(min(final_session_close, wall_clock_ceiling))
+    else:
+        ends_at = _iso(now + datetime.timedelta(days=duration_days))
     capital = _as_decimal(capital_per_strategy)
     strategies = {}
     for strategy_id in STRATEGY_IDS:
@@ -992,6 +1173,8 @@ def initialize_tournament(
         "started_at": started_at,
         "ends_at": ends_at,
         "authorized_market_day_limit": max_submission_market_days,
+        "authorized_market_dates": authorized_market_dates,
+        "lease_window_days": duration_days,
         "submitted_market_dates": [],
         "submission_window_status": SUBMISSION_WINDOW_OPEN,
         "capital_per_strategy": _money(capital),
