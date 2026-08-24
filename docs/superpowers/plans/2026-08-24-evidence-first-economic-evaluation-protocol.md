@@ -96,7 +96,7 @@ mutable mappings.
 - Consumes: canonical UTC timestamps and explicit point-in-time source identities.
 - Produces: `DecisionEvent`, `build_decision_event`, and `validate_decision_event` for Tasks 2 and 3.
 
-- [ ] **Step 1: Write the focused RED tests**
+- [x] **Step 1: Write the focused RED tests**
 
 Start `tests/test_economic_evaluation_protocol.py` with helpers and exact
 acceptance cases:
@@ -184,7 +184,7 @@ caller-owned nested container, and proves the stored event bytes, `to_dict()`
 value, and cluster ID are unchanged. Mutating a dict/list returned by
 `to_dict()` must likewise leave the event unchanged.
 
-- [ ] **Step 2: Run RED and capture the expected failure**
+- [x] **Step 2: Run RED and capture the expected failure**
 
 Run:
 
@@ -196,7 +196,7 @@ TA_LIVE_SUBMIT=0 .venv/bin/python -m pytest -q \
 Expected: collection fails with
 `ModuleNotFoundError: No module named 'tradingagents.evals.economic_evaluation_protocol'`.
 
-- [ ] **Step 3: Implement canonical primitives and the event contract**
+- [x] **Step 3: Implement canonical primitives and the event contract**
 
 In `tradingagents/evals/economic_evaluation_protocol.py`:
 
@@ -280,7 +280,7 @@ identity with `decision-event-`. Make `validate_decision_event` enforce an
 exact field set, rebuild through `build_decision_event`, and compare every
 serialized byte.
 
-- [ ] **Step 4: Run GREEN for Task 1**
+- [x] **Step 4: Run GREEN for Task 1**
 
 Run the focused file. Expected: all Task 1 tests pass.
 
@@ -296,7 +296,7 @@ Run the focused file. Expected: all Task 1 tests pass.
 - Consumes: exact `DecisionEvent` values from Task 1.
 - Produces: `BitemporalInputManifest`, builder, and validator for Task 3.
 
-- [ ] **Step 1: Add manifest RED tests**
+- [x] **Step 1: Add manifest RED tests**
 
 Add imports for the manifest API and tests equivalent to:
 
@@ -326,11 +326,11 @@ inconsistent reuse of a source-artifact ID, missing/extra fields, a changed
 event body with retained IDs, and a changed ordered payload digest or manifest
 digest. Prove that mapping insertion order does not change canonical bytes.
 
-- [ ] **Step 2: Run the new manifest selectors and observe RED**
+- [x] **Step 2: Run the new manifest selectors and observe RED**
 
 Expected: import failure or missing-symbol failures for the manifest API.
 
-- [ ] **Step 3: Implement the frozen manifest**
+- [x] **Step 3: Implement the frozen manifest**
 
 Use schema `bitemporal_input_manifest/v1`. Sort events by
 `decision_event_id`, reject duplicates before constructing the tuple, and hash
@@ -354,7 +354,7 @@ validate_bitemporal_input_manifest(value: object)
 `validate_decision_event`, rebuild the manifest, and require an exact canonical
 byte match. Do not retain a caller list, dict, or nested event mapping.
 
-- [ ] **Step 4: Run Task 1 and Task 2 GREEN**
+- [x] **Step 4: Run Task 1 and Task 2 GREEN**
 
 Run the full new test file. Expected: all event and manifest tests pass.
 
@@ -371,7 +371,7 @@ Run the full new test file. Expected: all event and manifest tests pass.
   `tradingagents.strategy.evaluator.StrategyEvaluationPolicy`.
 - Produces: `EvaluationSearchBudget`, `FrozenEvaluationProtocol`, builder, and validator.
 
-- [ ] **Step 1: Add protocol RED tests**
+- [x] **Step 1: Add protocol RED tests**
 
 Use deterministic synthetic universes:
 
@@ -443,12 +443,12 @@ Add rejection tests for:
 - a changed manifest/policy/universe digest;
 - missing/extra fields or obsolete schema.
 
-- [ ] **Step 2: Run protocol selectors and observe RED**
+- [x] **Step 2: Run protocol selectors and observe RED**
 
 Expected: the new protocol imports or assertions fail because the API is not
 implemented yet.
 
-- [ ] **Step 3: Implement the strict protocol**
+- [x] **Step 3: Implement the strict protocol**
 
 Use schema `frozen_economic_evaluation_protocol/v1`. Require the protocol
 builder to receive the exact signature below:
@@ -484,7 +484,7 @@ validate the embedded budget types, rebuild from parsed immutable inputs, and
 require exact canonical equality. It must not accept aliases for schema, arms,
 metrics, route, cadence, authority, or dependence method.
 
-- [ ] **Step 4: Run the complete new test file GREEN**
+- [x] **Step 4: Run the complete new test file GREEN**
 
 Expected: all event, manifest, protocol, tamper, and partition tests pass.
 
@@ -500,7 +500,7 @@ Expected: all event, manifest, protocol, tamper, and partition tests pass.
 - Consumes: the completed pure module from Tasks 1–3.
 - Produces: accepted verification/review evidence and one scoped commit.
 
-- [ ] **Step 1: Add the import and side-effect isolation test**
+- [x] **Step 1: Add the import and side-effect isolation test**
 
 Parse the new module with `ast` and fail if an import path begins with any of:
 
@@ -523,7 +523,7 @@ Monkeypatch `socket.socket`, `subprocess.run`, `subprocess.Popen`, `Path.write_b
 network, subprocess, or filesystem effect fails immediately. Construct and
 validate all three public objects successfully under those sentinels.
 
-- [ ] **Step 2: Run the focused and adjacent GREEN gate**
+- [x] **Step 2: Run the focused and adjacent GREEN gate**
 
 Run:
 
@@ -553,7 +553,7 @@ git diff --check
 Expected: all tests and static checks pass; Git lists only the new module, new
 test, spec, and plan.
 
-- [ ] **Step 3: Stop the sole writer and run three fresh no-edit gates**
+- [x] **Step 3: Stop the sole writer and run three fresh no-edit gates**
 
 Run sequentially:
 
@@ -567,14 +567,14 @@ session. P2 findings are fixed or recorded with a concrete justification in
 this plan before acceptance. Confirm each no-edit session leaves Git hashes
 unchanged.
 
-- [ ] **Step 4: Update the implementation record**
+- [x] **Step 4: Update the implementation record**
 
 Append exact RED output, GREEN counts, Ruff/compile/lock/diff results, reviewer
 verdicts, changed-path hashes, safety posture, and the final commit hash to this
 plan. Do not claim an economic experiment, independent sample size, route
 skill, or alpha result.
 
-- [ ] **Step 5: Commit the accepted increment**
+- [x] **Step 5: Commit the accepted increment**
 
 ```zsh
 git add \
@@ -585,7 +585,7 @@ git add \
 git commit -m "feat(evals): freeze economic evaluation protocol"
 ```
 
-- [ ] **Step 6: Verify committed HEAD and stop**
+- [x] **Step 6: Verify committed HEAD and stop**
 
 Rerun the new test file, Ruff, compileall, `uv lock --check`, and
 `git diff --check` against committed HEAD. Require a clean feature worktree.
@@ -596,6 +596,17 @@ directly because `docs/` is intentionally excluded from the graph.
 Stop after the clean accepted feature commit. Do not run the protocol against
 real data, implement the evaluator adapter, admit the protocol to the immutable
 store, alter promotion/influence, start an automation/trial, or touch a broker.
+
+## Implementation record — 2026-08-24
+
+- RED evidence: the preserved Task 1 test file initially reported `27 failed, 15 passed` because the validator forwarded derived IDs into the source-material builder. The accepted repair yielded `42 passed`. Task 2/3 RED then failed at collection with `ImportError: cannot import name 'BitemporalInputManifest'`. The post-review regression RED reported three failures: decoded canonical JSON rejected the value-equal `execution_authority="none"`, and `dataclasses.replace()` could bypass frozen-object invariants.
+- GREEN evidence: the complete protocol contract and isolation suite passed `88 passed in 0.54s` after the final repair.
+- Independent affected gate: `TA_LIVE_SUBMIT=0 /Users/corbinfloyd/Documents/TradingAgents/.venv/bin/python -m pytest -q` over the protocol, strategy/genome/evaluator/store/promotion/mutation, replay, and reconciliation files passed `656 passed in 20.02s` on the accepted uncommitted revision.
+- Static gates: targeted Ruff passed; compileall with a temporary `PYTHONPYCACHEPREFIX` exited 0; `uv lock --check` passed (124 packages resolved); `git diff --check` passed.
+- Review: initial independent specification and quality/security reviews found the decoded-string identity P1 and public-constructor/aliasing P1. Both were regression-tested and fixed. Follow-up specification and quality/security reviews reported no P0, P1, or P2 findings.
+- Candidate source SHA-256: `tradingagents/evals/economic_evaluation_protocol.py` `78f057b0839ca5d440a59749a28e920c7a0d846b1aa7338907f2102e2fe4b127`; `tests/test_economic_evaluation_protocol.py` `3c67ff852d697369d27c83bbf26587af9a2e5f12f2b1a64590974afdca6b7182`.
+- Safety posture: `results/policy/live_control.json` remains frozen at SHA-256 `a3fc5ddb2b300596833c48c1554fad088ecb43d46bd70aeeac074531d6e9fb07`; all ten TradingAgents native automations remained `PAUSED`; no broker, model, vendor, scheduler, paper-trial, or other runtime action was performed.
+- Commit: `feat(evals): freeze economic evaluation protocol`; its final object ID is recorded in the receiving checkpoint and final handoff, because a commit cannot contain its own final object ID.
 
 ## Later increments, explicitly not authorized by this plan
 
