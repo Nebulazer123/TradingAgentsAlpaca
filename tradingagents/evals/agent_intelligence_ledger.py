@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from tradingagents.agents.utils.rating import parse_rating
+from tradingagents.evals.agent_intelligence_reconciliation import dependence_block
 from tradingagents.evals.resolution_quality import (
     DEFER_INVALID_WINDOW,
     LABEL_QUALITY_DEGRADED,
@@ -1314,6 +1315,7 @@ def summarize_agent_scores(forecasts: Sequence[AgentForecast]) -> dict[str, Any]
         "resolved_forecast_count": sum(1 for forecast in forecasts if forecast.resolved),
         "outcome_counts": outcome_counts,
         "label_quality_counts": label_quality_counts,
+        "dependence": dependence_block(forecasts),
     }
     for agent, bucket in by_agent.items():
         resolved_count = bucket["resolved_count"]

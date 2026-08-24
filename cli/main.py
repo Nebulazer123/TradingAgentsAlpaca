@@ -151,6 +151,7 @@ from tradingagents.evals.agent_intelligence_brain import (
 from tradingagents.evals.agent_intelligence_ledger import (
     DEFAULT_LEDGER_PATH,
     DEFAULT_RATING_CALIBRATION_PATH,
+    DEFAULT_SUMMARY_PATH,
     agent_influence_weights,
     append_forecasts,
     audit_resolved_forecasts,
@@ -163,6 +164,13 @@ from tradingagents.evals.agent_intelligence_ledger import (
     summarize_agent_scores,
     write_ledger,
     write_summary,
+)
+from tradingagents.evals.agent_intelligence_reconciliation import (
+    ReconciliationPathError,
+    SummaryReadError,
+    canonical_json_text,
+    reconcile_ledger_file,
+    write_reconciliation_receipt,
 )
 from tradingagents.evals.automation_health_audit import (
     build_automation_health_audit,
@@ -1547,7 +1555,7 @@ def research_agent_ledger_resolve(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path.",
     ),
@@ -1658,7 +1666,7 @@ def research_ledger_quality_audit(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path (refreshed with quality counts).",
     ),
@@ -1774,7 +1782,7 @@ def research_agent_ledger_update(
         help="Append-only Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path.",
     ),
@@ -1923,7 +1931,7 @@ def research_agent_ledger_summary(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
     ),
     context_ticker: str = typer.Option("", "--context-ticker"),
@@ -1963,6 +1971,54 @@ def research_agent_ledger_summary(
             f"resolved={stats['resolved_count']} accuracy={accuracy}"
         )
     console.print("Influence weights are advisory only and cannot bypass risk gates.")
+
+
+@research_app.command("agent-ledger-reconcile")
+def research_agent_ledger_reconcile(
+    ledger_path: Path = typer.Option(
+        DEFAULT_LEDGER_PATH,
+        "--ledger-path",
+        help="Agent Intelligence Ledger JSONL path (read-only).",
+    ),
+    summary_path: Path = typer.Option(
+        DEFAULT_SUMMARY_PATH,
+        "--summary-path",
+        help=(
+            "Agent score summary evaluated for freshness; "
+            "it is never replaced by this command."
+        ),
+    ),
+    receipt_path: Path | None = typer.Option(
+        None,
+        "--receipt-path",
+        help="Optional path for an atomic write of the reconciliation receipt only.",
+    ),
+):
+    """Emit a read-only reconciliation receipt for one ledger byte snapshot.
+
+    Prints canonical JSON to stdout. Counts valid, corrupt, duplicate,
+    conflicting, resolved, and clustered rows without rewriting anything.
+    The conservative market-event cluster count is labeled provisional until
+    a preregistered estimator exists.
+    """
+    try:
+        receipt = reconcile_ledger_file(ledger_path, summary_path=summary_path)
+    except SummaryReadError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except OSError as exc:
+        raise typer.BadParameter(f"could not read ledger: {exc}") from exc
+    if receipt_path is not None:
+        try:
+            write_reconciliation_receipt(
+                receipt,
+                receipt_path,
+                protected_paths=(ledger_path, summary_path),
+            )
+        except ReconciliationPathError as exc:
+            raise typer.BadParameter(f"rejected receipt path: {exc}") from exc
+        except OSError as exc:
+            raise typer.BadParameter(f"could not write receipt: {exc}") from exc
+    typer.echo(canonical_json_text(receipt))
 
 
 @research_app.command("hypothesis-factory")
@@ -2066,7 +2122,7 @@ def research_agent_intelligence_brief(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary (source of earned influence weights).",
     ),
@@ -3622,7 +3678,7 @@ def research_outcome_labeling(
         help="Agent Intelligence Ledger JSONL path with resolved forecasts.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path.",
     ),
