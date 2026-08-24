@@ -403,3 +403,64 @@ Expected: `NO_GO` keeps the system operating autonomously in observer/paper/shad
 **Failure containment:** Every phase keeps runtime live control frozen until the final evidence ladder. A merge, passing test, scheduled job, or paper result cannot substitute for clean broker reconciliation or the missing NFLX execution history.
 
 **No-placeholder check:** Each task has an exact scope, owner boundary, command or decision procedure, expected result, and verification outcome. New defects use RED-GREEN tests and a source-only reviewer before integration.
+
+---
+
+## Implementation Record: Owner-Approval Authority Boundary (2026-08-23 increment)
+
+The existing hourly supervisor path is intentionally fail-closed for live
+actions in this increment: every live order at the unified go-live guard and
+every normal-live admission now requires a current, signed account_owner
+approval artifact (live_promotion per order plus risk_envelope_expansion when
+the envelope changed). Until a future, explicitly owner-artifact-bearing
+command surface is separately designed and reviewed, scheduled supervisor runs
+will therefore refuse live submission rather than act autonomously. This is a
+deliberate authority boundary — it is not an automation authority bypass, and
+no schedule, live-control state, runtime trial, or automation was modified by
+this increment.
+
+Research, paper simulation, freeze, repair, verification, genuine risk
+reduction, and paper-only promotion records remain autonomous exactly as
+before; only entering live eligibility, normal-live activation, capital/
+envelope expansion, and each individual live order require the owner artifact.
+No live runtime or schedule change was made by this work.
+
+### Implementation and acceptance record
+
+The accepted implementation adds one canonical owner-approval policy with
+signed, source-bound, account-bound, action-bound, expiry-bound artifacts and a
+write-once prepare/consume/finalize transaction protocol. Normal-live
+activation, live promotion, risk-envelope expansion, and order admission all
+fail closed unless their exact approval transaction is complete. Crash recovery
+may finish an already consumed transaction, but a prepared record alone cannot
+authorize broker transport or mint live eligibility.
+
+The final RED-GREEN repair rounds closed four concurrency and composition
+defects found during fresh review: mixed paper/gated promotion writers now share
+the canonical state lock; the public risk helpers cannot be composed to revive
+an expired expansion; generic approval preparation serializes the full
+absent/read/compare/write lifecycle; and the public record-writer regression
+executes the production writer before asserting refusal and no mutation.
+
+Acceptance used the complete uncommitted source snapshot represented by review
+package SHA-256
+`c8d07af37501681e5b029ae9af104aed9d6c365dc898ead4cc3e674f43322b13`.
+A fresh specification reviewer, a separate quality/security reviewer, and a
+fresh read-only OpenCode `build` session using
+`opencode/x-preview-f-free` with `variant=max` all returned GO with no open
+P0/P1/P2 findings. The final no-edit verifier confirmed the package and Git
+state were unchanged, then reported:
+
+- full test suite: 4,307 passed, 1 skipped because `DEEPSEEK_API_KEY` was not
+  available, and 75 subtests passed;
+- full Ruff check: passed;
+- external-cache `compileall -q`: passed;
+- `uv lock --check`: passed;
+- `git diff --check`: passed.
+
+Four non-blocking P3 observations remain recorded for later cleanup: an unused
+private promotion helper, manual cleanup for a matching but unconsumed promotion
+prepare, a misleading empty-batch comment, and deliberate manual repair after a
+torn durable-ledger append. None grants authority, weakens fail-closed behavior,
+or blocks this increment. The scoped implementation commit is named
+`feat(policy): require owner approval for live authority`.

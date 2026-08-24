@@ -21,9 +21,14 @@ from tradingagents.policy.decision_authority import (
 )
 from tradingagents.policy.live_control import (
     load_live_control_state,
-    verify_pending_normal_live_submission_commitment,
+    verify_normal_live_submission_commitment_for_recovery,
 )
 from tradingagents.policy.order_rate_limit import evaluate_order_rate_limit
+from tradingagents.policy.owner_approval import (
+    OwnerApprovalError,
+    require_prior_consumption_for_commitment_recovery,
+    verify_owner_approval_structure,
+)
 from tradingagents.policy.promotion_sync import PAPER_TOURNAMENT_RECORD_SOURCE_KEYS
 from tradingagents.policy.risk_envelope import RiskEnvelope, load_risk_envelope
 from tradingagents.policy.strategy_promotion_sync import (
@@ -681,6 +686,134 @@ def _canonical_gate_moment(now: datetime.datetime | None) -> datetime.datetime:
     return moment.astimezone(datetime.timezone.utc)
 
 
+def _owner_approval_authority_utc_now() -> datetime.datetime:
+    """Return the private policy clock for fresh guard authority only.
+
+    ``evaluate_go_live_guard(..., now=...)`` deliberately retains a public
+    evidence/gate-time input.  It must never make an expired, unconsumed owner
+    artifact current, however, so fresh verification and its durable
+    prepare/consume/finalize boundary receive this no-argument UTC value.
+    """
+
+    return datetime.datetime.now(tz=datetime.timezone.utc).replace(microsecond=0)
+
+
+def _live_order_owner_subject(
+    action: Any,
+    *,
+    client_order_id: str | None = None,
+    intent_full_sha256: str | None = None,
+    order_payload_sha256: str | None = None,
+) -> dict[str, str]:
+    if client_order_id is None:
+        client_order_id = str(
+            _action_value(action, "client_order_id", "")
+            or _action_value(action, "idempotency_key", "")
+            or ""
+        )
+    client_order_id = str(client_order_id)
+    subject = {
+        "kind": "live_order_submit",
+        "symbol": _action_symbol(action),
+        "side": str(_action_value(action, "side", "")).lower(),
+        "order_type": str(_action_value(action, "order_type", "")).lower(),
+        "notional_usd": str(_decimal_action_value(action, "notional")),
+        "limit_price": str(_decimal_action_value(action, "limit_price")),
+        "client_order_id": client_order_id,
+        "decision_id": str(_action_value(action, "decision_id", "") or ""),
+    }
+    if intent_full_sha256 is not None:
+        subject["intent_full_sha256"] = str(intent_full_sha256)
+    if order_payload_sha256 is not None:
+        subject["order_payload_sha256"] = str(order_payload_sha256)
+    return subject
+
+
+def _require_live_order_owner_approvals(
+    live_actions: Sequence[Any],
+    *,
+    approval: object,
+    normal_live_intent_full_sha256: str | None = None,
+    normal_live_order_payload_sha256: str | None = None,
+    normal_live_client_order_id: str | None = None,
+    authority_now: datetime.datetime,
+) -> list[tuple[dict, dict, str]]:
+    """Structurally verify one owner approval per live order before any I/O.
+
+    Performs no repository state or configuration reads: only the trust
+    anchor and the consumption ledger supplied by the caller are touched.
+    Returns the parsed artifacts so the guard can compare their
+    ``risk_envelope_binding`` against the freshly loaded risk envelope.
+    """
+
+    if approval is None:
+        raise OwnerApprovalError(
+            "owner approval required: live order submission is a privileged "
+            "transition and no account_owner approval artifact was supplied"
+        )
+    if isinstance(approval, Mapping):
+        approvals: list[Mapping[str, object]] = [approval]
+    elif isinstance(approval, Sequence) and not isinstance(approval, (str, bytes)):
+        approvals = list(approval)
+    else:
+        raise OwnerApprovalError("owner approval artifact is malformed")
+    if len(approvals) != len(live_actions):
+        raise OwnerApprovalError(
+            "owner approval required: exactly one current account_owner "
+            f"approval per live order (got {len(approvals)} for "
+            f"{len(live_actions)} live orders)"
+        )
+    # Trust root, ledger, and policy fingerprint resolve through canonical
+    # protected resolvers inside the verifier; callers cannot select them.
+    moment = _canonical_gate_moment(authority_now)
+    verified: list[tuple[dict, dict, str]] = []
+    for action, item in zip(live_actions, approvals, strict=True):
+        subject = _live_order_owner_subject(
+            action,
+            client_order_id=normal_live_client_order_id,
+            intent_full_sha256=normal_live_intent_full_sha256,
+            order_payload_sha256=normal_live_order_payload_sha256,
+        )
+        purpose = (
+            f"live_order:{subject['decision_id']}:{subject['client_order_id']}"
+        )
+        artifact = verify_owner_approval_structure(
+            approval=item,
+            expected_action="live_promotion",
+            subject=subject,
+            source_binding={"guard": "unified_go_live_guard"},
+            now=moment,
+            purpose=purpose,
+        )
+        verified.append((artifact, subject, purpose))
+    return verified
+
+
+def _approved_envelope_binding_issue(
+    approvals: Sequence[tuple[dict, dict, str]] | None,
+    *,
+    risk_envelope_ref: str,
+    envelope_sha256: str | None,
+) -> str | None:
+    """Compare approved envelope bindings with loaded configuration."""
+
+    if not approvals:
+        return None
+    if envelope_sha256 is None:
+        return (
+            "owner approval refused: risk envelope binding could not be "
+            "verified because the risk envelope is unavailable"
+        )
+    for artifact, _subject, _purpose in approvals:
+        binding = artifact["risk_envelope_binding"]
+        if binding["ref"] != risk_envelope_ref or binding["sha256"] != envelope_sha256:
+            return (
+                "owner approval refused: risk envelope binding does not match "
+                "this request"
+            )
+    return None
+
+
 def _evidence_time(value: object, *, label: str) -> datetime.datetime:
     if type(value) is not str:
         raise LiveGateError(f"{label} must be canonical UTC")
@@ -886,10 +1019,64 @@ def evaluate_go_live_guard(
     activation_receipt: object = _UNSET,
     proposal_ledger_root: object = _UNSET,
     repo_root: object = _UNSET,
+    owner_approval: Mapping[str, object] | Sequence[Mapping[str, object]] | None = None,
+    risk_envelope_expansion_approval: Mapping[str, object] | None = None,
 ) -> LiveGateResult:
     live_actions = [action for action in actions if _is_live_order_action(action)]
     if not live_actions:
         return LiveGateResult(allowed=True, checks={"no_live_actions": True})
+    # Capture one private authority moment for every fresh approval operation
+    # in this evaluation.  The public ``now`` remains available below for
+    # evidence age, control/dead-man, rate, and ordinary gate calculations.
+    authority_moment = _canonical_gate_moment(_owner_approval_authority_utc_now())
+
+    try:
+        approved_artifacts = _require_live_order_owner_approvals(
+            live_actions,
+            approval=owner_approval,
+            normal_live_intent_full_sha256=normal_live_intent_full_sha256,
+            normal_live_order_payload_sha256=normal_live_order_payload_sha256,
+            normal_live_client_order_id=normal_live_client_order_id,
+            authority_now=authority_moment,
+        )
+    except OwnerApprovalError as exc:
+        return LiveGateResult(
+            allowed=False,
+            issues=[
+                OrderIssue(
+                    "LIVE_GATE",
+                    f"owner approval refused before any state or broker I/O: {exc}",
+                )
+            ],
+            checks={
+                # Refusal happened before any of these checks were performed;
+                # report them as not-performed (False) rather than claiming
+                # they passed.
+                "risk_envelope_loaded": False,
+                "promotion_state_loaded": False,
+                "control_state_loaded": False,
+                "live_not_frozen": False,
+                "dead_man_fresh": False,
+                "tiny_live_only": False,
+                "risk_caps": False,
+                "account_hard_ceiling": False,
+                "order_rate_limit": False,
+                "portfolio_circuit_breakers": False,
+                "autonomous_live_budget": False,
+                "promotion": False,
+                "loss_exit_review": False,
+                "broker_buying_power": False,
+                "current_live_exposure_considered": current_live_exposure > Decimal("0"),
+                "daily_loss_considered": current_daily_loss_usd is not None,
+                "drawdown_considered": current_drawdown_pct is not None,
+                "broker_buying_power_considered": live_buying_power is not None,
+                "autonomous_authority_proofs": False,
+                "owner_approval": False,
+                # Not performed either: the expansion transition is only
+                # evaluated after owner approval passes.
+                "risk_envelope_expansion": False,
+            },
+        )
 
     authority_proofs = _require_autonomous_authority_proofs(
         live_actions,
@@ -903,6 +1090,8 @@ def evaluate_go_live_guard(
     )
 
     issues: list[OrderIssue] = []
+    envelope_sha256: str | None = None
+    expansion_entry: dict[str, object] | None = None
     checks: dict[str, bool] = {
         "risk_envelope_loaded": False,
         "promotion_state_loaded": False,
@@ -923,17 +1112,73 @@ def evaluate_go_live_guard(
         "drawdown_considered": current_drawdown_pct is not None,
         "broker_buying_power_considered": live_buying_power is not None,
         "autonomous_authority_proofs": authority_proofs is not None,
+        "owner_approval": True,
+        # Provisionally True; set False by the expansion gate on refusal.
+        "risk_envelope_expansion": True,
     }
 
     envelope, envelope_issues = load_risk_envelope(risk_envelope_path)
-    if envelope_issues:
+    if envelope_issues or envelope is None:
         checks["risk_envelope_loaded"] = False
+        checks["owner_approval"] = False
+        # Expansion was not evaluated either: the envelope is unavailable.
+        checks["risk_envelope_expansion"] = False
         issues.extend(OrderIssue(_action_symbol(action), issue) for action in live_actions for issue in envelope_issues)
+        issues.append(
+            OrderIssue(
+                "LIVE_GATE",
+                (
+                    "owner approval refused: risk envelope binding could not "
+                    "be verified because the risk envelope is unavailable"
+                ),
+            )
+        )
     else:
         checks["risk_envelope_loaded"] = True
         checks["autonomous_live_budget"] = (
             envelope.live_budget_mode == "autonomous_with_caps"
         )
+        # Compare approved envelope bindings against freshly loaded config.
+        # Consumption is deferred to the single final allowed path below so a
+        # later denial never burns an owner artifact.
+        envelope_sha256 = hashlib.sha256(
+            Path(risk_envelope_path).read_bytes()
+        ).hexdigest()
+        binding_issue = _approved_envelope_binding_issue(
+            approved_artifacts,
+            risk_envelope_ref=str(risk_envelope_path),
+            envelope_sha256=envelope_sha256,
+        )
+        if binding_issue is not None:
+            checks["owner_approval"] = False
+            issues.append(OrderIssue("LIVE_GATE", binding_issue))
+
+        # P1-A: a changed/enlarged envelope becomes usable for tiny-live only
+        # through an independently signed, single-use risk_envelope_expansion
+        # approval.  Structural preflight happens here (no consumption);
+        # durable consumption joins the final atomic batch below so later
+        # ordinary-gate denials never burn the expansion artifact.
+        checks["risk_envelope_expansion"] = True
+        try:
+            from tradingagents.policy.owner_approval import (
+                require_risk_envelope_expansion,
+            )
+
+            expansion_entry = require_risk_envelope_expansion(
+                resolved_envelope_path=str(risk_envelope_path),
+                current_envelope_sha256=envelope_sha256,
+                expansion_approval=risk_envelope_expansion_approval,
+                now=authority_moment,
+                consume=False,
+            )
+        except OwnerApprovalError as exc:
+            checks["risk_envelope_expansion"] = False
+            issues.append(
+                OrderIssue(
+                    "LIVE_GATE",
+                    f"risk envelope expansion refused: {exc}",
+                )
+            )
 
     promotion_state, state_issues = _read_promotion_state(Path(promotion_state_path))
     if state_issues:
@@ -957,7 +1202,7 @@ def evaluate_go_live_guard(
     control_state, control_issues = load_live_control_state(control_state_path, now=now)
     if normal_live_commitment is not None:
         try:
-            verify_pending_normal_live_submission_commitment(
+            verify_normal_live_submission_commitment_for_recovery(
                 control_state_path,
                 commitment=normal_live_commitment,
                 intent_full_sha256=str(normal_live_intent_full_sha256 or ""),
@@ -1096,6 +1341,73 @@ def evaluate_go_live_guard(
         if rate_issues:
             checks["order_rate_limit"] = False
             issues.extend(OrderIssue("LIVE_GATE", issue) for issue in rate_issues)
+
+    if not issues and approved_artifacts and normal_live_commitment is not None:
+        # A public call without a durable normal-live commitment is strictly a
+        # structural evaluation: it must not prepare, consume, or finalize an
+        # order OR a risk-envelope transition.  This final block is therefore
+        # reachable only by the exact committed recovery path.
+        try:
+            from tradingagents.policy.owner_approval import (
+                transaction_binding_sha256 as compute_binding,
+            )
+
+            batch: list[dict[str, str]] = []
+            for artifact, subject, purpose in approved_artifacts:
+                binding = compute_binding(
+                    approval_id=artifact["approval_id"],
+                    action=artifact["action"],
+                    purpose=purpose,
+                    subject=subject,
+                    risk_envelope_ref=str(risk_envelope_path),
+                    risk_envelope_sha256=envelope_sha256,
+                )
+                # Recovery continuation: the durable pending commitment must
+                # be bound to THIS approval and its exact recorded consumption
+                # (id + action + purpose + binding).
+                require_prior_consumption_for_commitment_recovery(
+                    approval_id=artifact["approval_id"],
+                    action=artifact["action"],
+                    purpose=purpose,
+                    transaction_binding_sha256=binding,
+                )
+                if str(
+                    normal_live_commitment.get("owner_approval_id") or ""
+                ) != artifact["approval_id"]:
+                    raise OwnerApprovalError(
+                        "normal-live commitment is not bound to this owner approval"
+                    )
+                if str(
+                    normal_live_commitment.get(
+                        "owner_approval_transaction_binding_sha256"
+                    )
+                    or ""
+                ) != binding:
+                    raise OwnerApprovalError(
+                        "normal-live commitment transaction binding does not match "
+                        "this owner approval"
+                    )
+            from tradingagents.policy.owner_approval import (
+                _commit_owner_approval_transaction,
+            )
+
+            # One authorization-owned transaction performs the predecessor
+            # compare, custom prepare, nested ledger append, state write, and
+            # prepare retirement.  A stale risk tip is therefore rejected
+            # before any approval in this batch can be burned.
+            _commit_owner_approval_transaction(
+                batch,
+                expansion_entry=expansion_entry or None,
+                now=authority_moment,
+            )
+        except OwnerApprovalError as exc:
+            checks["owner_approval"] = False
+            issues.append(
+                OrderIssue(
+                    "LIVE_GATE",
+                    f"owner approval refused at final consumption: {exc}",
+                )
+            )
 
     return LiveGateResult(
         allowed=not issues,

@@ -34,8 +34,10 @@ from tradingagents.execution.reconcile import (
 from tradingagents.policy import strategy_promotion_sync as promotion_sync_module
 from tradingagents.policy.live_control import (
     _write_live_control_state_locked,
+    commit_normal_live_submission_candidate_locked,
     commit_normal_live_submission_locked,
     live_control_lock,
+    prepare_normal_live_submission_candidate_locked,
     resolve_normal_live_submission_commitment,
     write_live_control_state,
 )
@@ -608,33 +610,142 @@ def test_live_client_collects_owned_normal_live_reconciliation_reads():
     ]
 
 
-def _real_normal_live_activation(tmp_path, monkeypatch):
+def _real_normal_live_activation(tmp_path, monkeypatch, *, isolated_repo=None):
+    """Full real activation chain, isolated from process-global state.
+
+    The disposable checkout chain rebinds process-global loaded-calculation
+    provenance to its own source paths. Snapshot and restore that state so
+    the running checkout's binding survives this helper.
+    """
+
+    import sys
+
     import tradingagents.strategy.promotion_evidence as promotion_evidence_module
+    from tests._owner_approval_testing import (
+        build_owner_approval,
+        install_isolated_owner_trust,
+    )
+    from tradingagents.policy import strategy_promotion_sync as sync_promotion_module
+    from tradingagents.policy.strategy_promotion_sync import activate_normal_live_intent
+
+    saved_sources = promotion_evidence_module._LOADED_CALCULATION_SOURCES
+    calculation_names = tuple(
+        name for name, _rel in promotion_evidence_module._CALCULATION_MODULE_PATHS
+    )
+    saved_modules = {name: sys.modules.get(name) for name in calculation_names}
+    try:
+        return _run_real_normal_live_activation_body(
+            tmp_path,
+            monkeypatch,
+            promotion_evidence_module,
+            build_owner_approval,
+            sync_promotion_module,
+            activate_normal_live_intent,
+            install_isolated_owner_trust,
+            isolated_repo=isolated_repo,
+        )
+    finally:
+        promotion_evidence_module._LOADED_CALCULATION_SOURCES = saved_sources
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def _run_real_normal_live_activation_body(
+    tmp_path,
+    monkeypatch,
+    promotion_evidence_module,
+    build_owner_approval,
+    sync_promotion_module,
+    activate_normal_live_intent,
+    install_isolated_owner_trust,
+    *,
+    isolated_repo=None,
+):
+
     from tests.test_strategy_promotion_sync import (
         _capped_activation_journal,
         _sync_capped_activation_state,
     )
-    from tradingagents.policy.strategy_promotion_sync import activate_normal_live_intent
+    from tradingagents.policy import owner_approval as owner_approval_module
 
-    # The production runtime deliberately binds calculation modules to the
-    # checkout that imported them. This fixture uses Task 3's disposable
-    # committed checkout, so preserve that fixture's existing source bytes
-    # while letting its runtime registration be constructed in-process.
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "owner", seed=b"alpaca-anchor"
+    )
+    private_hex = handle.private_hex
+
+    # Scoped test-only allowance for the WHOLE test duration: this chain and
+    # its later submit-time revalidation deliberately run against a
+    # disposable repo, so production provenance (which pins loaded modules
+    # to the canonical checkout) cannot hold. Applied through the caller's
+    # monkeypatch so it is undone at test end; process-global calculation
+    # source state is still snapshotted/restored by the wrapper above.
     monkeypatch.setattr(
         promotion_evidence_module,
         "_require_loaded_source_binding",
         lambda *_args, **_kwargs: None,
     )
     root, repo_root, proposal, activated_at, _commit = _capped_activation_journal(
-        tmp_path, monkeypatch
+        tmp_path, monkeypatch, isolated_repo=isolated_repo
+    )
+    # Public ``clock`` values remain evidence/output clocks.  This fixture
+    # deliberately signs deterministic approvals at its isolated timestamp,
+    # so bind the private policy-owned authority seam to that same test clock
+    # rather than letting the production wall clock revive historical fixtures.
+    monkeypatch.setattr(
+        sync_promotion_module,
+        "_owner_approval_authority_utc_now",
+        lambda: activated_at,
+    )
+    monkeypatch.setattr(
+        owner_approval_module,
+        "_owner_approval_authority_utc_now",
+        lambda: activated_at,
     )
     state = tmp_path / "real-promotion-state.json"
+
+    def owner_kwargs(kind, target_proposal, intent=None):
+        envelope = target_proposal.risk_attestation
+        subject = {
+            "kind": kind,
+            "proposal_id": target_proposal.proposal_id,
+            "sleeve": target_proposal.sleeve,
+        }
+        if kind == "strategy_promotion_sync":
+            subject["proposed_stage"] = target_proposal.proposed_stage
+            source = {
+                "proposal_sha256": sync_promotion_module._digest(
+                    target_proposal.canonical_json_bytes()
+                )
+            }
+        else:
+            subject["intent_full_sha256"] = sync_promotion_module._digest(
+                intent.canonical_json_bytes()
+            )
+            source = {"promotion_state_sha256": str(intent.promotion_state_sha256)}
+        return build_owner_approval(
+            private_key_hex=private_hex,
+            action="live_promotion",
+            # Sign at the chain's own aware fixture clock so the artifacts
+            # are current when sync/activation verify them.
+            issued_at=activated_at,
+            ttl_minutes=30,
+            subject=subject,
+            source_binding=source,
+            risk_envelope_ref=str(envelope.risk_envelope_ref),
+            risk_envelope_sha256=str(envelope.risk_envelope_sha256),
+        )
+
+    sync_approval = owner_kwargs("strategy_promotion_sync", proposal)
     intent = _sync_capped_activation_state(
         root=root,
         repo_root=repo_root,
         proposal=proposal,
         state=state,
         synced_at=activated_at,
+        owner_approval=sync_approval,
     )
     receipt = activate_normal_live_intent(
         proposal,
@@ -643,6 +754,7 @@ def _real_normal_live_activation(tmp_path, monkeypatch):
         repo_root=repo_root,
         state_path=state,
         clock=lambda: activated_at,
+        owner_approval=owner_kwargs("normal_live_activation", proposal, intent),
     )
     return root, repo_root, intent, receipt, activated_at
 
@@ -670,6 +782,8 @@ def _normal_live_admission(
     per_name_cap_usd: str = "100.00",
     rate_records: int = 0,
     max_live_orders_per_window: int = 1,
+    with_owner_approval: bool = True,
+    owner_approval_ttl_minutes: int = 30,
 ):
     """Issue an exact, short-lived final-gate artifact for boundary tests."""
     from tradingagents.brokers import alpaca_supervisor as supervisor_module
@@ -699,18 +813,21 @@ def _normal_live_admission(
         encoding="utf-8",
     )
     control_path = tmp_path / "normal-live-control.json"
-    control_path.write_text(
-        json.dumps(
-            {
-                "frozen": frozen,
-                "reason": "test normal-live admission",
-                "dead_man_expires_at": (
-                    activated_at + datetime.timedelta(minutes=2)
-                ).isoformat(timespec="seconds"),
-            }
-        ),
-        encoding="utf-8",
-    )
+    if not control_path.exists():
+        # Durable control state survives across retries; never wipe an
+        # existing commitment ledger when issuing a later admission.
+        control_path.write_text(
+            json.dumps(
+                {
+                    "frozen": frozen,
+                    "reason": "test normal-live admission",
+                    "dead_man_expires_at": (
+                        activated_at + datetime.timedelta(minutes=2)
+                    ).isoformat(timespec="seconds"),
+                }
+            ),
+            encoding="utf-8",
+        )
     rate_path = (tmp_path / "normal-live-rate.json").resolve()
     # A valid normal-live admission always has an observer-owned ledger before
     # policy work starts. The final reservation must only use this existing
@@ -756,6 +873,53 @@ def _normal_live_admission(
         control_state_path=control_path.resolve(),
         broker_read_adapter=metric_client._normal_live_broker_read_adapter,
     )
+    owner_values: dict[str, object] = {"owner_approval": None}
+    if with_owner_approval:
+        # A genuine order-specific account_owner approval signed against this
+        # admission's exact envelope bytes and final-gate action identity.
+        from tests._owner_approval_testing import (
+            build_owner_approval,
+            build_risk_envelope_expansion_approval,
+            install_isolated_owner_trust,
+        )
+        from tradingagents.policy.live_gate import _live_order_owner_subject
+
+        handle = install_isolated_owner_trust(monkeypatch, tmp_path / "owner-admission", seed=b'alpaca-admission-seed')
+        private_hex = handle.private_hex
+        payload = _bound_normal_live_order(intent)
+        action = supervisor_module._normal_live_action_from_payload(
+            payload, sleeve="pullback-support"
+        )
+        subject = _live_order_owner_subject(
+            action,
+            client_order_id=str(payload.get("client_order_id", "")),
+            intent_full_sha256=supervisor_module._normal_live_intent_sha256(intent),
+            order_payload_sha256=(
+                supervisor_module._normal_live_metrics_payload_sha256(payload)
+            ),
+        )
+        owner_values = {
+            "owner_approval": build_owner_approval(
+                private_key_hex=private_hex,
+                action="live_promotion",
+                issued_at=activated_at,
+                ttl_minutes=owner_approval_ttl_minutes,
+                subject=subject,
+                source_binding={"guard": "unified_go_live_guard"},
+                risk_envelope_ref=str(risk_path.resolve()),
+                risk_envelope_sha256=hashlib.sha256(
+                    risk_path.read_bytes()
+                ).hexdigest(),
+            ),
+            "risk_envelope_expansion_approval": (
+                build_risk_envelope_expansion_approval(
+                    private_hex,
+                    ref=str(risk_path.resolve()),
+                    sha256=hashlib.sha256(risk_path.read_bytes()).hexdigest(),
+                    issued_at=activated_at,
+                )
+            ),
+        }
     return supervisor_module._issue_normal_live_submit_admission(
         intent,
         order_payload=_bound_normal_live_order(intent),
@@ -765,6 +929,7 @@ def _normal_live_admission(
         order_rate_state_path=rate_path,
         risk_metrics=risk_metrics,
         decision_evidence={},
+        **owner_values,
     )
 
 
@@ -1849,6 +2014,10 @@ def test_malformed_normal_live_commitment_blocks_before_owned_broker_io(
             order_payload_sha256="b" * 64,
             client_order_id="prior-normal-live-order",
             rate_reservation_sha256="c" * 64,
+            owner_approval_id="d" * 64,
+            owner_approval_transaction_binding_sha256="e" * 64,
+            risk_envelope_ref="config/risk_envelope.yaml",
+            risk_envelope_sha256="f" * 64,
             now=activated_at,
         )
         control = json.loads(control_path.read_text(encoding="utf-8"))
@@ -1865,6 +2034,54 @@ def test_malformed_normal_live_commitment_blocks_before_owned_broker_io(
         )
 
     assert client.session.requests == []
+
+
+@pytest.mark.parametrize("tamper", ("preimage", "rate", "after"))
+def test_normal_live_candidate_tampering_refuses_before_control_write(tmp_path, tamper):
+    """The pre-consumption candidate is one exact control transaction.
+
+    Altering its captured control preimage, reserved rate binding, or after
+    image cannot turn the durable owner prepare into a different commitment.
+    """
+
+    control_path = tmp_path / "normal-live-control.json"
+    moment = _NORMAL_LIVE_TEST_NOW
+    write_live_control_state(
+        control_path,
+        frozen=False,
+        reason="candidate tamper fixture",
+        now=moment,
+    )
+    with live_control_lock(control_path):
+        candidate = prepare_normal_live_submission_candidate_locked(
+            control_path,
+            intent_full_sha256="a" * 64,
+            order_payload_sha256="b" * 64,
+            client_order_id="candidate-tamper-order",
+            rate_reservation_sha256="c" * 64,
+            owner_approval_id="d" * 64,
+            owner_approval_transaction_binding_sha256="e" * 64,
+            risk_envelope_ref="config/risk_envelope.yaml",
+            risk_envelope_sha256="f" * 64,
+            now=moment,
+        )
+        before = control_path.read_bytes()
+        tampered = dict(candidate)
+        if tamper == "preimage":
+            tampered["control_preimage_sha256"] = "0" * 64
+        elif tamper == "rate":
+            tampered["commitment"] = {
+                **candidate["commitment"],
+                "rate_reservation_sha256": "0" * 64,
+            }
+        else:
+            tampered["control_after_json"] = "{}"
+
+        with pytest.raises(ValueError, match="candidate"):
+            commit_normal_live_submission_candidate_locked(
+                control_path, candidate=tampered
+            )
+        assert control_path.read_bytes() == before
 
 
 def test_corrupt_duplicate_normal_live_commitment_blocks_before_owned_broker_io(
@@ -1886,6 +2103,10 @@ def test_corrupt_duplicate_normal_live_commitment_blocks_before_owned_broker_io(
             order_payload_sha256="b" * 64,
             client_order_id="prior-normal-live-order",
             rate_reservation_sha256="c" * 64,
+            owner_approval_id="d" * 64,
+            owner_approval_transaction_binding_sha256="e" * 64,
+            risk_envelope_ref="config/risk_envelope.yaml",
+            risk_envelope_sha256="f" * 64,
             now=activated_at,
         )
         control = json.loads(control_path.read_text(encoding="utf-8"))
@@ -2051,6 +2272,55 @@ def test_live_client_consumes_each_supervisor_admission_once(tmp_path, monkeypat
         client.submit_order(_bound_normal_live_order(intent), **kwargs)
 
     assert client.session.post_calls == 1
+
+
+def test_final_risk_envelope_race_rechecks_under_shared_lock_before_raw_post(
+    tmp_path, monkeypatch
+):
+    """A post-boundary envelope swap denies before ``send`` reaches the fake broker."""
+
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    admission = _normal_live_admission(
+        tmp_path,
+        monkeypatch,
+        root=root,
+        intent=intent,
+        receipt=receipt,
+        activated_at=activated_at,
+    )
+    risk_path = tmp_path / "normal-live-risk.yaml"
+    original = risk_path.read_text(encoding="utf-8")
+    swapped = {"called": False}
+
+    def tighten_after_first_hash() -> None:
+        swapped["called"] = True
+        risk_path.write_text(
+            original.replace("per_name_cap_usd: 100.00", "per_name_cap_usd: 50.00"),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "_after_normal_live_final_envelope_hash_check",
+        tighten_after_first_hash,
+    )
+    client = _fake_live_client(root, repo_root=repo_root, clock=lambda: activated_at)
+
+    with pytest.raises(ValueError, match="risk envelope changed after commitment"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert swapped["called"] is True
+    assert client.session.post_calls == 0
+    assert [request[0] for request in client.session.requests if request[0] == "POST"] == []
 
 
 def test_live_client_get_only_retry_does_not_record_the_same_order_twice(
@@ -2721,6 +2991,80 @@ def test_fresh_live_client_after_uncertain_post_only_performs_lookup(tmp_path, m
     assert [request[0] for request in retry_session.requests].count("GET") >= 1
 
 
+def test_resolved_normal_live_commitment_allows_lookup_only_recovery(
+    tmp_path, monkeypatch
+):
+    """An exact resolved commitment may recover an existing broker order,
+    but the restarted process must never receive a second POST capability."""
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    initial_session = _FakeLiveSession(fail_post=True)
+    initial = _fake_live_client(
+        root,
+        repo_root=repo_root,
+        session=initial_session,
+        clock=lambda: activated_at,
+    )
+    order = _bound_normal_live_order(intent)
+
+    with pytest.raises(AlpacaExecutionError):
+        initial.submit_order(
+            order,
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path,
+                monkeypatch,
+                root=root,
+                intent=intent,
+                receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    control_path = tmp_path / "normal-live-control.json"
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    commitment = control["normal_live_submission_commitments"][0]
+    resolve_normal_live_submission_commitment(
+        control_path,
+        commitment_id=commitment["commitment_id"],
+        outcome="submitted",
+        now=activated_at,
+    )
+
+    retry_session = _FakeLiveSession()
+    retry_session.add_existing_order(order)
+    retry = _fake_live_client(
+        root,
+        repo_root=repo_root,
+        session=retry_session,
+        clock=lambda: activated_at,
+    )
+    recovered = retry.submit_order(
+        order,
+        authorized_normal_trade_intent=intent,
+        activation_receipt=_reconstructed_activation_receipt(receipt),
+        supervisor_admission=_normal_live_admission(
+            tmp_path,
+            monkeypatch,
+            root=root,
+            intent=intent,
+            receipt=receipt,
+            activated_at=activated_at,
+        ),
+    )
+
+    assert recovered["client_order_id"] == intent.client_order_id
+    assert initial_session.post_calls == 1
+    assert retry_session.post_calls == 0
+    assert [request[0] for request in retry_session.requests].count("GET") >= 1
+    assert not (
+        tmp_path / f"{intent.client_order_id}.owner-approval-prepare.json"
+    ).exists()
+
+
 def test_unresolved_accepted_post_reservation_blocks_new_cap_until_reconciliation(
     tmp_path, monkeypatch
 ):
@@ -3297,3 +3641,502 @@ def test_red_list_orders_status_only_callers_keep_single_read_compatibility():
 
     assert orders == [{"id": "open-1"}]
     assert session.orders_calls == [{"status": "open"}]
+
+
+def test_real_normal_live_activation_restores_loaded_calculation_sources(
+    tmp_path, monkeypatch
+):
+    """Regression: the disposable activation chain must not leak its own
+    loaded-calculation provenance into the running checkout's globals."""
+
+    import sys
+
+    import tradingagents.strategy.promotion_evidence as promotion_evidence_module
+
+    before_sources = promotion_evidence_module._LOADED_CALCULATION_SOURCES
+    names = tuple(
+        name for name, _rel in promotion_evidence_module._CALCULATION_MODULE_PATHS
+    )
+    before_modules = {name: sys.modules.get(name) for name in names}
+
+    _real_normal_live_activation(tmp_path, monkeypatch)
+
+    assert before_sources == promotion_evidence_module._LOADED_CALCULATION_SOURCES
+    for name in names:
+        assert sys.modules.get(name) is before_modules[name]
+
+
+def test_envelope_swapped_after_admission_blocks_raw_post_with_zero_post(
+    tmp_path, monkeypatch
+):
+    """TOCTOU defense: a risk envelope swapped after admission (but before
+    the raw POST) blocks transport with zero broker POST."""
+
+    import tradingagents.execution.reconcile as reconcile_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    envelope_path = tmp_path / "normal-live-risk.yaml"
+
+    original_lookup = reconcile_module._owned_normal_live_broker_lookup
+
+    def lookup_and_swap(broker_read_adapter, *, client_order_id):
+        # Mutate the canonical envelope after reconciliation/capability
+        # issuance but before the sole raw-POST consumer runs.
+        current = envelope_path.read_text(encoding="utf-8")
+        envelope_path.write_text(
+            current.replace("per_name_cap_usd: 100.00", "per_name_cap_usd: 90.00"),
+            encoding="utf-8",
+        )
+        return original_lookup(broker_read_adapter, client_order_id=client_order_id)
+
+    monkeypatch.setattr(reconcile_module, "_owned_normal_live_broker_lookup", lookup_and_swap)
+
+    session = _FakeLiveSession()
+    client = _fake_live_client(root, repo_root=repo_root, session=session,
+                               clock=lambda: activated_at)
+    with pytest.raises(ValueError, match="risk envelope changed after commitment"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    assert session.post_calls == 0
+    assert [m for m, _u, _k in session.requests if m == "POST"] == []
+
+
+def test_envelope_missing_before_raw_post_blocks_with_zero_post(tmp_path, monkeypatch):
+    import tradingagents.execution.reconcile as reconcile_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    envelope_path = tmp_path / "normal-live-risk.yaml"
+
+    original_lookup = reconcile_module._owned_normal_live_broker_lookup
+
+    def lookup_and_delete(broker_read_adapter, *, client_order_id):
+        envelope_path.unlink()
+        return original_lookup(broker_read_adapter, client_order_id=client_order_id)
+
+    monkeypatch.setattr(reconcile_module, "_owned_normal_live_broker_lookup", lookup_and_delete)
+
+    session = _FakeLiveSession()
+    client = _fake_live_client(root, repo_root=repo_root, session=session,
+                               clock=lambda: activated_at)
+    with pytest.raises(ValueError, match="risk envelope is unavailable"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=_normal_live_admission(
+                tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+                activated_at=activated_at,
+            ),
+        )
+
+    assert session.post_calls == 0
+
+
+def test_owner_approval_failure_releases_rate_reservation(tmp_path, monkeypatch):
+    """Owner-approval failure before the durable commitment must release the
+    reserved rate capacity (no stranded slot), and the burned approval stays
+    recorded in the canonical ledger."""
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+
+    # Tamper with the canonical trust anchor after admission so pre-commit
+    # verification fails (anchor digest no longer matches artifact).
+    from tradingagents.policy.owner_approval import (
+        canonical_owner_consumption_ledger_path,
+        canonical_owner_trust_anchor_path,
+    )
+
+    trust_anchor = canonical_owner_trust_anchor_path()
+    attacker_public = "ab" * 32
+    trust_anchor.write_text(attacker_public + "\n", encoding="utf-8")
+
+    session = _FakeLiveSession()
+    client = _fake_live_client(root, repo_root=repo_root, session=session,
+                               clock=lambda: activated_at)
+
+    with pytest.raises(ValueError, match="owner approval refused"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert session.post_calls == 0
+
+    rate_path = tmp_path / "normal-live-rate.json"
+    rate_state = json.loads(rate_path.read_text(encoding="utf-8"))
+    assert rate_state["submissions"] == []
+
+    # Burned approval: structure passed at admission-time consumption? No —
+    # consumption happens at pre-commit; a failed verify burns nothing.
+    ledger = canonical_owner_consumption_ledger_path()
+    assert not ledger.exists() or all(
+        json.loads(line)["approval_id"] != "" for line in ledger.read_text().splitlines()
+    )
+
+
+def test_commit_write_crash_consumes_once_then_retry_is_lookup_only_no_post(
+    tmp_path, monkeypatch
+):
+    """Crash-safe contract: a commitment-write failure must not strand the
+    approval.  The durable owner-approval prepare plus the canonical ledger
+    prove the exact prior consumption; an exact retry after the original
+    artifact TTL expires recovers and finalizes the same commitment without a
+    second consumption or fresh owner authority."""
+
+    from tradingagents.policy import strategy_promotion_sync as sync_module
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+        owner_approval_ttl_minutes=1,
+    )
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    admission_context = supervisor_module._NORMAL_LIVE_ADMISSION_CAPABILITIES[
+        id(admission)
+    ][1]
+    prepare_path = Path(admission_context.control_state_path).parent / (
+        f"{intent.client_order_id}.owner-approval-prepare.json"
+    )
+
+    real_commit = sync_module.commit_normal_live_submission_locked
+    fail_state = {"failed_once": False}
+
+    def failing_commit(*args, **kwargs):
+        if not fail_state["failed_once"]:
+            fail_state["failed_once"] = True
+            raise OSError("simulated durable commitment write failure")
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(sync_module, "commit_normal_live_submission_locked", failing_commit)
+
+    session = _FakeLiveSession()
+    client = _fake_live_client(root, repo_root=repo_root, session=session,
+                               clock=lambda: activated_at)
+
+    with pytest.raises(OSError, match="simulated durable commitment write failure"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert session.post_calls == 0
+    assert len(session.requests) == 0
+    rate_path = tmp_path / "normal-live-rate.json"
+    rate_state = json.loads(rate_path.read_text(encoding="utf-8"))
+    # The consumed durable prepare retains its exact reservation image.  A
+    # restarted recovery must reuse this binding, never reserve a fresh slot.
+    assert rate_state["submissions"] == [
+        {
+            "client_order_id": intent.client_order_id,
+            "state": "reserved",
+            "submitted_at": activated_at.isoformat(timespec="seconds"),
+        }
+    ]
+
+    from tradingagents.policy.owner_approval import canonical_owner_consumption_ledger_path
+
+    ledger = canonical_owner_consumption_ledger_path()
+    assert ledger.exists()
+    prepared = json.loads(prepare_path.read_text(encoding="utf-8"))
+    original_approval_id = prepared["approval_id"]
+    original_action = prepared["action"]
+    original_purpose = prepared["purpose"]
+    original_binding = prepared["transaction_binding_sha256"]
+    original_prepared_binding = prepared["prepared_transaction_binding_sha256"]
+
+    def exact_original_consumptions():
+        return [
+            json.loads(line)
+            for line in ledger.read_text(encoding="utf-8").splitlines()
+            if line
+            and json.loads(line).get("approval_id") == original_approval_id
+            and json.loads(line).get("action") == original_action
+            and json.loads(line).get("purpose") == original_purpose
+            and json.loads(line).get("transaction_binding_sha256")
+            == original_binding
+            and json.loads(line).get("prepared_transaction_binding_sha256")
+            == original_prepared_binding
+        ]
+
+    original_records = exact_original_consumptions()
+    assert len(original_records) == 1
+
+    # Retry long after the original TTL: prepare + ledger evidence finalize
+    # the exact same commitment with no second consumption.
+    # Retry after the approval TTL expired: a restart lacking the in-process
+    # first-POST capability may do exact lookup-only recovery for an already
+    # committed client ID, but cannot issue a new POST when no broker order
+    # exists (fail-closed).  The single consumption is preserved exactly.
+    def retry_clock():
+        return activated_at + datetime.timedelta(minutes=2)
+    session2 = _FakeLiveSession()
+    client2 = _fake_live_client(root, repo_root=repo_root, session=session2,
+                                clock=retry_clock)
+    admission2 = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+    with pytest.raises(ValueError, match="refusing second POST"):
+        client2.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission2,
+        )
+
+    assert session.post_calls == 0
+    assert session2.post_calls == 0
+    assert [request[0] for request in session2.requests].count("GET") >= 1
+    assert exact_original_consumptions() == original_records
+    control = json.loads(
+        Path(admission_context.control_state_path).read_text(encoding="utf-8")
+    )
+    recovered_commitments = [
+        commitment
+        for commitment in control["normal_live_submission_commitments"]
+        if commitment["owner_approval_id"] == original_approval_id
+        and commitment["owner_approval_transaction_binding_sha256"]
+        == original_binding
+    ]
+    assert len(recovered_commitments) == 1
+    assert recovered_commitments[0]["state"] == "resolved"
+    assert recovered_commitments[0]["outcome"] == "missing_refused"
+    assert json.loads(rate_path.read_text(encoding="utf-8"))["submissions"] == []
+    # A terminal commitment safely retires the recovery-only sidecar.  It was
+    # retained through the crash window, but cannot become a stale capability.
+    assert not prepare_path.exists()
+    total_posts = session.post_calls + session2.post_calls
+    assert total_posts == 0
+
+
+@pytest.mark.parametrize("sidecar_fault", ("deleted", "malformed", "tampered"))
+def test_pending_normal_live_commitment_requires_exact_retained_sidecar_before_broker_io(
+    tmp_path, monkeypatch, sidecar_fault
+):
+    """A pending commit never falls back to a current caller artifact.
+
+    The real control write succeeds, then this direct fault destroys the
+    retained generic owner transaction before revalidation.  No owned broker
+    GET/POST and no terminalization may follow: the pending commitment can
+    only resume from its original sidecar plus exact ledger binding.
+    """
+
+    from tradingagents.policy import strategy_promotion_sync as sync_module
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    admission = _normal_live_admission(
+        tmp_path,
+        monkeypatch,
+        root=root,
+        intent=intent,
+        receipt=receipt,
+        activated_at=activated_at,
+    )
+    from tradingagents.brokers import alpaca_supervisor as supervisor_module
+
+    admission_context = supervisor_module._NORMAL_LIVE_ADMISSION_CAPABILITIES[
+        id(admission)
+    ][1]
+    # The broker uses an explicitly named normal-live sidecar, sibling to its
+    # control state rather than a promotion-state sidecar.
+    sidecar = Path(admission_context.control_state_path).parent / (
+        f"{intent.client_order_id}.owner-approval-prepare.json"
+    )
+    real_commit = sync_module.commit_normal_live_submission_locked
+
+    def commit_then_break_sidecar(*args, **kwargs):
+        committed = real_commit(*args, **kwargs)
+        assert committed["state"] == "pending"
+        if sidecar_fault == "deleted":
+            sidecar.unlink()
+        elif sidecar_fault == "malformed":
+            sidecar.write_text("{", encoding="utf-8")
+        else:
+            raw = json.loads(sidecar.read_text(encoding="utf-8"))
+            raw["transaction"]["commitment_candidate"]["control_after_json"] = "{}"
+            sidecar.write_text(json.dumps(raw), encoding="utf-8")
+        return committed
+
+    monkeypatch.setattr(
+        sync_module, "commit_normal_live_submission_locked", commit_then_break_sidecar
+    )
+    session = _FakeLiveSession()
+    client = _fake_live_client(
+        root, repo_root=repo_root, session=session, clock=lambda: activated_at
+    )
+
+    with pytest.raises(ValueError, match="exact retained owner prepare"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert session.requests == []
+    assert session.post_calls == 0
+    control = json.loads(
+        Path(admission_context.control_state_path).read_text(encoding="utf-8")
+    )
+    matching = [
+        item
+        for item in control["normal_live_submission_commitments"]
+        if item["client_order_id"] == intent.client_order_id
+    ]
+    assert len(matching) == 1
+    assert matching[0]["state"] == "pending"
+    assert matching[0]["outcome"] is None
+    assert not ImmutableStrategyEvidenceStore(root).envelopes(
+        kind="normal-live-broker-submit-receipt"
+    )
+
+
+def test_successful_commit_preserves_reservation_on_later_failure(tmp_path, monkeypatch):
+    """After a successful durable commit, later failure must NOT release the
+    reservation (the order may exist)."""
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+
+    session = _FakeLiveSession(fail_post=True)
+    client = _fake_live_client(root, repo_root=repo_root, session=session,
+                               clock=lambda: activated_at)
+    order = _bound_normal_live_order(intent)
+
+    # First attempt: post fails (uncertain outcome) — commit already durable.
+    with pytest.raises(AlpacaExecutionError):
+        client.submit_order(
+            order,
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    rate_before = json.loads(
+        (tmp_path / "normal-live-rate.json").read_text(encoding="utf-8")
+    )["submissions"]
+    assert len(rate_before) >= 1
+
+
+def test_normal_live_changed_envelope_consumes_both_at_final_gate(
+    tmp_path, monkeypatch
+):
+    """P2-B: a changed-envelope normal-live submit consumes BOTH the order
+    approval and the risk_envelope_expansion approval, only at the final
+    gate — after every ordinary gate passes."""
+
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+
+    # Before submit: neither artifact consumed.
+    from tradingagents.policy.owner_approval import canonical_owner_consumption_ledger_path
+
+    ledger = canonical_owner_consumption_ledger_path()
+    assert not ledger.exists()
+
+    session = _FakeLiveSession()
+    client = _fake_live_client(root, repo_root=repo_root, session=session,
+                               clock=lambda: activated_at)
+    client.submit_order(
+        _bound_normal_live_order(intent),
+        authorized_normal_trade_intent=intent,
+        activation_receipt=receipt,
+        supervisor_admission=admission,
+    )
+
+    lines = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    consumed_actions = {r["action"] for r in lines}
+    assert "live_promotion" in consumed_actions
+    assert "risk_envelope_expansion" in consumed_actions
+    assert session.post_calls == 1
+
+
+def test_later_denial_after_issuance_consumes_neither_and_no_post(
+    tmp_path, monkeypatch
+):
+    """P2-B: a denial after issuance (frozen control) consumes NEITHER the
+    order approval NOR the expansion artifact, and performs no POST."""
+
+
+    root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
+        tmp_path, monkeypatch
+    )
+    control_path = tmp_path / "normal-live-control.json"
+    admission = _normal_live_admission(
+        tmp_path, monkeypatch, root=root, intent=intent, receipt=receipt,
+        activated_at=activated_at,
+    )
+    # Freeze after issuance: expansion structural preflight passed, but the
+    # frozen-control gate denies before any consumption.
+    control_path.write_text(
+        json.dumps(
+            {
+                "frozen": True,
+                "reason": "later denial fixture",
+                "dead_man_expires_at": (
+                    activated_at + datetime.timedelta(minutes=2)
+                ).isoformat(timespec="seconds"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    session = _FakeLiveSession()
+    client = _fake_live_client(root, repo_root=repo_root, session=session,
+                               clock=lambda: activated_at)
+    with pytest.raises(ValueError, match="final gates rejected admission"):
+        client.submit_order(
+            _bound_normal_live_order(intent),
+            authorized_normal_trade_intent=intent,
+            activation_receipt=receipt,
+            supervisor_admission=admission,
+        )
+
+    assert session.post_calls == 0
+    from tradingagents.policy.owner_approval import canonical_owner_consumption_ledger_path
+
+    ledger = canonical_owner_consumption_ledger_path()
+    assert not ledger.exists()

@@ -33,6 +33,21 @@ from tradingagents.policy.live_control import (
     live_control_lock,
     resolve_normal_live_submission_commitment,
 )
+from tradingagents.policy.owner_approval import (
+    OwnerApprovalError,
+    consume_owner_approval,
+    finalize_owner_approval_prepare,
+    owner_approval_prepare_matches,
+    owner_approval_prepare_path,
+    owner_prepare_has_exact_consumption,
+    prepared_transaction_binding_sha256,
+    prepared_transaction_sha256,
+    read_owner_approval_prepare,
+    transaction_binding_sha256,
+    verify_owner_approval,
+    verify_owner_approval_structure,
+    write_owner_approval_prepare,
+)
 from tradingagents.policy.promotion import SleevePromotionEvidence, evaluate_sleeve_promotion
 from tradingagents.policy.promotion_sync import promotion_state_lock
 from tradingagents.policy.risk_envelope import load_risk_envelope
@@ -78,6 +93,16 @@ from tradingagents.strategy.shadow_attestation import (
 from tradingagents.strategy.staged_intent import StrategyStagedIntentLedger
 
 PROMOTION_STATE_SCHEMA_VERSION = "1.2.0"
+
+
+def _owner_approval_authority_utc_now() -> datetime.datetime:
+    """Return current UTC for fresh owner-artifact authority only.
+
+    Public ``clock`` remains evidence/output timing for the immutable strategy
+    workflow.  It cannot control a signature TTL or first ledger consumption.
+    """
+
+    return datetime.datetime.now(tz=datetime.timezone.utc)
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,7 +244,10 @@ def _sync_keys(prefix: str) -> set[str]:
 
 def _strict_sync(payload: Mapping[str, object], prefix: str) -> dict[str, object]:
     expected = _sync_keys(prefix)
-    if not isinstance(payload, Mapping) or set(payload) != expected:
+    allowed = {frozenset(expected)}
+    if prefix == "sync_prepare":
+        allowed.add(frozenset({*expected, "serialized_output"}))
+    if not isinstance(payload, Mapping) or frozenset(payload) not in allowed:
         raise ValueError(f"{prefix} fields do not match schema")
     values = dict(payload)
     if values["schema_version"] != 1 or values["analysis_only"] is not True or values["execution_authority"] != "none" or values["can_submit_orders"] is not False:
@@ -281,6 +309,14 @@ def _strict_sync(payload: Mapping[str, object], prefix: str) -> dict[str, object
     _time(values["recorded_at"], "recorded_at")
     if _time(values["recorded_at"], "recorded_at") < _time(values["effective_at"], "effective_at"):
         raise ValueError(f"{prefix} recorded_at precedes effective_at")
+    if prefix == "sync_prepare" and "serialized_output" in values:
+        serialized_output = values["serialized_output"]
+        if (
+            type(serialized_output) is not str
+            or _digest(serialized_output.encode("utf-8"))
+            != values["canonical_after_sha256"]
+        ):
+            raise ValueError("sync prepare serialized output is invalid")
     return values
 
 
@@ -298,6 +334,7 @@ class StrategyPromotionSyncPrepare:
     state_path: str
     effective_at: str
     recorded_at: str
+    serialized_output: str = ""
     promoted: tuple[str, ...] = ()
     demoted: tuple[str, ...] = ()
     unchanged: tuple[str, ...] = ()
@@ -316,13 +353,14 @@ class StrategyPromotionSyncPrepare:
         }
         return cls(
             **values,  # type: ignore[arg-type]
+            serialized_output=str(v.get("serialized_output") or ""),
             promoted=tuple(v["promoted"]),
             demoted=tuple(v["demoted"]),
             unchanged=tuple(v["unchanged"]),
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result = {
             "sync_prepare_id": self.sync_prepare_id,
             "proposal_id": self.proposal_id,
             "proposal_sha256": self.proposal_sha256,
@@ -343,6 +381,9 @@ class StrategyPromotionSyncPrepare:
             "execution_authority": "none",
             "can_submit_orders": False,
         }
+        if self.serialized_output:
+            result["serialized_output"] = self.serialized_output
+        return result
 
     def canonical_json_bytes(self) -> bytes:
         return _canonical(self.to_dict())
@@ -1377,7 +1418,296 @@ def _require_matching_receipt(
         raise ValueError("sync receipt does not match prepared replacement")
 
 
-def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo_root: str | Path, proposal: StrategyPromotionProposal, state_path: str | Path, expected_current_state_sha256: str, actor_role: str, clock: Callable[[], datetime.datetime] | None = None) -> StrategyPromotionSyncResult:
+def _require_live_eligibility_owner_approval(
+    *,
+    proposal: StrategyPromotionProposal,
+    owner_approval: Mapping[str, object] | None,
+    now: datetime.datetime,
+    purpose: str,
+    intent_full_sha256: str | None = None,
+    kind: str = "strategy_promotion_sync",
+    source_binding: Mapping[str, str] | None = None,
+    consume: bool = False,
+) -> None:
+    """Refuse privileged live-eligibility work without a current owner approval."""
+
+    if proposal.proposed_stage != "tiny_live_eligible" and kind == "strategy_promotion_sync":
+        return
+    if owner_approval is None:
+        raise OwnerApprovalError(
+            "owner approval required: entering live eligibility or activating "
+            "a normal-live sleeve is a privileged transition; supply a current "
+            "account_owner approval artifact with its trust anchor and "
+            "consumption ledger"
+        )
+    risk_attestation = proposal.risk_attestation
+    envelope_ref = getattr(risk_attestation, "risk_envelope_ref", None)
+    envelope_sha256 = getattr(risk_attestation, "risk_envelope_sha256", None)
+    if not envelope_ref or not envelope_sha256:
+        raise OwnerApprovalError(
+            "owner approval risk envelope binding is unavailable for this proposal"
+        )
+    subject: dict[str, str] = {
+        "kind": kind,
+        "proposal_id": proposal.proposal_id,
+        "sleeve": proposal.sleeve,
+    }
+    if kind == "strategy_promotion_sync":
+        subject["proposed_stage"] = str(proposal.proposed_stage)
+        binding: Mapping[str, str] = {
+            "proposal_sha256": _digest(proposal.canonical_json_bytes())
+        }
+    else:
+        subject["intent_full_sha256"] = str(intent_full_sha256 or "")
+        binding = dict(source_binding or {})
+    verify_owner_approval(
+        approval=owner_approval,
+        expected_action="live_promotion",
+        subject=subject,
+        source_binding=binding,
+        risk_envelope_ref=str(envelope_ref),
+        risk_envelope_sha256=str(envelope_sha256),
+        now=_owner_approval_authority_utc_now(),
+        purpose=purpose,
+        consume=consume,
+    )
+
+
+def _live_eligibility_owner_request(
+    *,
+    proposal: StrategyPromotionProposal,
+    kind: str,
+    purpose: str,
+    intent_full_sha256: str | None = None,
+    source_binding: Mapping[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, str], str, str]:
+    """Return the exact owner-signed request image for an immutable write."""
+
+    envelope_ref = str(proposal.risk_attestation.risk_envelope_ref)
+    envelope_sha256 = str(proposal.risk_attestation.risk_envelope_sha256)
+    if not envelope_ref or not envelope_sha256:
+        raise OwnerApprovalError(
+            "owner approval risk envelope binding is unavailable for this proposal"
+        )
+    subject: dict[str, str] = {
+        "kind": kind,
+        "proposal_id": proposal.proposal_id,
+        "sleeve": proposal.sleeve,
+    }
+    if kind == "strategy_promotion_sync":
+        subject["proposed_stage"] = str(proposal.proposed_stage)
+        binding = {"proposal_sha256": _digest(proposal.canonical_json_bytes())}
+    else:
+        subject["intent_full_sha256"] = str(intent_full_sha256 or "")
+        binding = dict(source_binding or {})
+    return subject, binding, envelope_ref, envelope_sha256
+
+
+def _prepare_or_recover_live_eligibility_owner_approval(
+    *,
+    prepare_path: Path,
+    proposal: StrategyPromotionProposal,
+    owner_approval: Mapping[str, object] | None,
+    now: datetime.datetime,
+    kind: str,
+    purpose: str,
+    transaction: Mapping[str, object],
+    intent_full_sha256: str | None = None,
+    source_binding: Mapping[str, str] | None = None,
+) -> bool:
+    """Durably prepare, consume once, or prove exact crash recovery.
+
+    ``True`` is the only route that allows an expired approval: an immutable
+    transaction image and canonical ledger entry already prove this same use.
+    A durable prepare by itself remains inert.
+    """
+
+    subject, source, envelope_ref, envelope_sha256 = _live_eligibility_owner_request(
+        proposal=proposal,
+        kind=kind,
+        purpose=purpose,
+        intent_full_sha256=intent_full_sha256,
+        source_binding=source_binding,
+    )
+    prepared = read_owner_approval_prepare(prepare_path)
+    matching = owner_approval_prepare_matches(prepare_path, transaction=transaction)
+    if prepared is not None and matching is None:
+        raise OwnerApprovalError(
+            "owner approval prepare does not match this immutable transaction"
+        )
+    if matching is not None and owner_prepare_has_exact_consumption(prepare_path):
+        return True
+    if owner_approval is None:
+        raise OwnerApprovalError(
+            "owner approval required: a prepared-only immutable transaction is inert"
+        )
+    # ``now`` is the immutable/evidence timestamp supplied by the public
+    # strategy clock.  Only the private policy clock may admit a fresh owner
+    # artifact or append its first canonical ledger record.
+    authority_moment = _owner_approval_authority_utc_now()
+    parsed = verify_owner_approval_structure(
+        approval=owner_approval,
+        expected_action="live_promotion",
+        subject=subject,
+        source_binding=source,
+        now=authority_moment,
+        purpose=purpose,
+    )
+    envelope = parsed["risk_envelope_binding"]
+    if (
+        envelope["ref"] != envelope_ref
+        or envelope["sha256"] != envelope_sha256
+    ):
+        raise OwnerApprovalError(
+            "owner approval risk envelope binding does not match this request"
+        )
+    binding = transaction_binding_sha256(
+        approval_id=parsed["approval_id"],
+        action=parsed["action"],
+        purpose=purpose,
+        subject=subject,
+        risk_envelope_ref=envelope_ref,
+        risk_envelope_sha256=envelope_sha256,
+    )
+    prepared_binding = prepared_transaction_binding_sha256(
+        transaction_binding_sha256=binding,
+        transaction_sha256=prepared_transaction_sha256(transaction),
+    )
+    if matching is not None:
+        if (
+            matching["approval_id"] != parsed["approval_id"]
+            or matching["action"] != parsed["action"]
+            or matching["purpose"] != purpose
+            or matching["transaction_binding_sha256"] != binding
+            or matching["prepared_transaction_binding_sha256"]
+            != prepared_binding
+        ):
+            raise OwnerApprovalError(
+                "owner approval prepare does not match this exact approval"
+            )
+    else:
+        written_binding = write_owner_approval_prepare(
+            prepare_path,
+            approval_id=parsed["approval_id"],
+            action=parsed["action"],
+            purpose=purpose,
+            transaction_binding_sha256=binding,
+            transaction=transaction,
+            now=authority_moment,
+        )
+        if written_binding != prepared_binding:
+            raise OwnerApprovalError(
+                "owner approval prepare binding does not match this immutable transaction"
+            )
+    consume_owner_approval(
+        approval_id=parsed["approval_id"],
+        action=parsed["action"],
+        purpose=purpose,
+        transaction_binding_sha256=binding,
+        prepared_transaction_binding_sha256=prepared_binding,
+        now=authority_moment,
+    )
+    return False
+
+
+def _strategy_sync_owner_transaction(
+    *,
+    proposal: StrategyPromotionProposal,
+    proposal_sha256: str,
+    state_file: Path,
+    canonical_before_sha256: str,
+    canonical_after_sha256: str,
+    promoted: tuple[str, ...],
+    demoted: tuple[str, ...],
+    unchanged: tuple[str, ...],
+    durable_prepare: StrategyPromotionSyncPrepare | None = None,
+) -> dict[str, object]:
+    subject, source, envelope_ref, envelope_sha256 = _live_eligibility_owner_request(
+        proposal=proposal,
+        kind="strategy_promotion_sync",
+        purpose=f"strategy_sync:{proposal.proposal_id}",
+    )
+    transaction = {
+        "operation": "strategy_promotion_sync",
+        "subject": subject,
+        "source_binding": source,
+        "proposal_sha256": proposal_sha256,
+        "risk_envelope_ref": envelope_ref,
+        "risk_envelope_sha256": envelope_sha256,
+        "canonical_before_sha256": canonical_before_sha256,
+        "canonical_after_sha256": canonical_after_sha256,
+        "state_path": str(state_file),
+        "promoted": list(promoted),
+        "demoted": list(demoted),
+        "unchanged": list(unchanged),
+    }
+    if durable_prepare is not None:
+        if (
+            not durable_prepare.serialized_output
+            or _digest(durable_prepare.serialized_output.encode("utf-8"))
+            != canonical_after_sha256
+        ):
+            raise ValueError(
+                "durable strategy sync prepare does not reproduce the exact output"
+            )
+        transaction.update(
+            {
+                "sync_prepare_id": durable_prepare.sync_prepare_id,
+                "sync_prepare_sha256": _digest(
+                    durable_prepare.canonical_json_bytes()
+                ),
+                "effective_at": durable_prepare.effective_at,
+                "recorded_at": durable_prepare.recorded_at,
+                "serialized_output": durable_prepare.serialized_output,
+            }
+        )
+    return transaction
+
+
+def _activation_owner_transaction(
+    *,
+    proposal: StrategyPromotionProposal,
+    intent: AuthorizedNormalTradeIntent,
+    intent_full_sha256: str,
+    expected_prepare: Mapping[str, object],
+    state_file: Path,
+) -> dict[str, object]:
+    subject, source, envelope_ref, envelope_sha256 = _live_eligibility_owner_request(
+        proposal=proposal,
+        kind="normal_live_activation",
+        purpose=f"normal_live_activation:{intent_full_sha256}",
+        intent_full_sha256=intent_full_sha256,
+        source_binding={
+            "promotion_state_sha256": str(intent.promotion_state_sha256),
+        },
+    )
+    return {
+        "operation": "normal_live_activation",
+        "subject": subject,
+        "source_binding": source,
+        "risk_envelope_ref": envelope_ref,
+        "risk_envelope_sha256": envelope_sha256,
+        "intent_full_sha256": intent_full_sha256,
+        "logical_order_sha256": intent.logical_order_sha256,
+        "canonical_before_sha256": expected_prepare["canonical_before_sha256"],
+        "canonical_after_sha256": expected_prepare["canonical_after_sha256"],
+        "state_path": str(state_file),
+        "activation_prepare": dict(expected_prepare),
+    }
+
+
+def sync_strategy_promotion_state_file(
+    *,
+    proposal_ledger_root: str | Path,
+    repo_root: str | Path,
+    proposal: StrategyPromotionProposal,
+    state_path: str | Path,
+    expected_current_state_sha256: str,
+    actor_role: str,
+    clock: Callable[[], datetime.datetime] | None = None,
+    fault_hook: Callable[[str], None] | None = None,
+    owner_approval: Mapping[str, object] | None = None,
+) -> StrategyPromotionSyncResult:
     if actor_role != authority_for(ActionClass.PROMOTION_CHANGE).owner_role:
         raise ValueError("actor_role lacks promotion authority")
     if type(proposal) is not StrategyPromotionProposal or len(expected_current_state_sha256) != 64:
@@ -1423,6 +1753,78 @@ def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo
                 canonical_after_sha256=snapshot.sha256,
             )
             if prepared is not None:
+                # A receipt is the durable finalization record.  A later
+                # idempotent read-only retry must not require the transient
+                # owner-prepare sidecar, which is intentionally removed once
+                # that receipt has been admitted.
+                matching_receipts: list[StrategyPromotionSyncReceipt] = []
+                for envelope in store.envelopes(
+                    kind=STRATEGY_PROMOTION_SYNC_RECEIPT_KIND
+                ):
+                    candidate = _envelope_object(
+                        envelope, StrategyPromotionSyncReceipt
+                    )
+                    if not isinstance(candidate, StrategyPromotionSyncReceipt):
+                        continue
+                    try:
+                        _require_matching_receipt(
+                            receipt=candidate,
+                            prepared=prepared,
+                            proposal=proposal,
+                            proposal_sha256=proposal_sha,
+                            canonical_before_sha256=prepared.canonical_before_sha256,
+                            canonical_after_sha256=prepared.canonical_after_sha256,
+                            state_file=state_file,
+                        )
+                    except ValueError:
+                        continue
+                    matching_receipts.append(candidate)
+                if len(matching_receipts) > 1:
+                    raise ValueError("multiple immutable strategy eligibility receipts")
+                if matching_receipts:
+                    recorded = matching_receipts[0]
+                    return StrategyPromotionSyncResult(
+                        dict(snapshot.state),
+                        prepared.promoted,
+                        prepared.demoted,
+                        prepared.unchanged,
+                        proposal.proposal_id,
+                        prepared.sync_prepare_id,
+                        recorded.sync_receipt_id,
+                        prepared.canonical_before_sha256,
+                        prepared.canonical_after_sha256,
+                        False,
+                        "immutable strategy eligibility read-only retry",
+                    )
+                if (
+                    proposal.proposed_stage == "tiny_live_eligible"
+                    and isinstance(prepared, StrategyPromotionSyncPrepare)
+                ):
+                    recovery_moment = (
+                        datetime.datetime.now(datetime.timezone.utc)
+                        if clock is None
+                        else clock()
+                    )
+                    transaction = _strategy_sync_owner_transaction(
+                        proposal=proposal,
+                        proposal_sha256=proposal_sha,
+                        state_file=state_file,
+                        canonical_before_sha256=prepared.canonical_before_sha256,
+                        canonical_after_sha256=prepared.canonical_after_sha256,
+                        promoted=prepared.promoted,
+                        demoted=prepared.demoted,
+                        unchanged=prepared.unchanged,
+                        durable_prepare=prepared,
+                    )
+                    _prepare_or_recover_live_eligibility_owner_approval(
+                        prepare_path=owner_approval_prepare_path(state_file),
+                        proposal=proposal,
+                        owner_approval=owner_approval,
+                        now=recovery_moment,
+                        kind="strategy_promotion_sync",
+                        purpose=f"strategy_sync:{proposal.proposal_id}",
+                        transaction=transaction,
+                    )
                 _require_state_path_anchor_current(state_anchor)
                 _require_snapshot_current(snapshot)
                 receipt = store.admit_checked(
@@ -1454,6 +1856,8 @@ def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo
                     canonical_after_sha256=prepared.canonical_after_sha256,
                     state_file=state_file,
                 )
+                if proposal.proposed_stage == "tiny_live_eligible":
+                    finalize_owner_approval_prepare(owner_approval_prepare_path(state_file))
                 return StrategyPromotionSyncResult(
                     dict(snapshot.state),
                     prepared.promoted,
@@ -1577,7 +1981,12 @@ def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo
         after = _canonical(state)
         after_sha = _digest(after)
         if prepared_before_replace is not None:
-            if after_sha != prepared_before_replace.canonical_after_sha256:
+            stored_output = prepared_before_replace.serialized_output
+            if (
+                not stored_output
+                or after != stored_output.encode("utf-8")
+                or after_sha != prepared_before_replace.canonical_after_sha256
+            ):
                 raise ValueError("prepared sync replacement does not match recomputed state")
             prepared = prepared_before_replace
             prepare_created = False
@@ -1605,6 +2014,7 @@ def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo
                 "risk_envelope_sha256": proposal.risk_attestation.risk_envelope_sha256,
                 "canonical_before_sha256": snapshot.sha256,
                 "canonical_after_sha256": after_sha,
+                "serialized_output": after.decode("utf-8"),
                 "state_path": str(state_file),
                 "promoted": list(promoted),
                 "demoted": list(demoted),
@@ -1615,9 +2025,64 @@ def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo
             }
             prepare_candidate = EvidenceCandidate(kind=STRATEGY_PROMOTION_SYNC_PREPARE_KIND, effective_at=synced, payload=prepare_payload)
             _require_state_path_anchor_current(state_anchor)
+            # The immutable prepare is the durable transition image.  It must
+            # exist before the owner ledger can consume an approval, so a
+            # prepare-only retry remains inert while an exact prepared/ledger
+            # pair can reproduce the same bytes and effective timestamp.
             admission = store.admit_checked(prepare_candidate, validate=lambda s, e: _envelope_object(e, StrategyPromotionSyncPrepare))
             prepared = _envelope_object(admission.envelope, StrategyPromotionSyncPrepare)
+            if not isinstance(prepared, StrategyPromotionSyncPrepare):
+                raise ValueError("strategy sync prepare type is invalid")
             prepare_created = admission.created
+            if proposal.proposed_stage == "tiny_live_eligible":
+                if fault_hook is not None:
+                    fault_hook("after_immutable_prepare")
+                transaction = _strategy_sync_owner_transaction(
+                    proposal=proposal,
+                    proposal_sha256=proposal_sha,
+                    state_file=state_file,
+                    canonical_before_sha256=snapshot.sha256,
+                    canonical_after_sha256=after_sha,
+                    promoted=promoted,
+                    demoted=demoted,
+                    unchanged=unchanged,
+                    durable_prepare=prepared,
+                )
+                _prepare_or_recover_live_eligibility_owner_approval(
+                    prepare_path=owner_approval_prepare_path(state_file),
+                    proposal=proposal,
+                    owner_approval=owner_approval,
+                    now=moment,
+                    kind="strategy_promotion_sync",
+                    purpose=f"strategy_sync:{proposal.proposal_id}",
+                    transaction=transaction,
+                )
+                if fault_hook is not None:
+                    fault_hook("after_owner_consumption")
+        if (
+            proposal.proposed_stage == "tiny_live_eligible"
+            and isinstance(prepared, StrategyPromotionSyncPrepare)
+        ):
+            transaction = _strategy_sync_owner_transaction(
+                proposal=proposal,
+                proposal_sha256=proposal_sha,
+                state_file=state_file,
+                canonical_before_sha256=prepared.canonical_before_sha256,
+                canonical_after_sha256=prepared.canonical_after_sha256,
+                promoted=prepared.promoted,
+                demoted=prepared.demoted,
+                unchanged=prepared.unchanged,
+                durable_prepare=prepared,
+            )
+            _prepare_or_recover_live_eligibility_owner_approval(
+                prepare_path=owner_approval_prepare_path(state_file),
+                proposal=proposal,
+                owner_approval=owner_approval,
+                now=moment,
+                kind="strategy_promotion_sync",
+                purpose=f"strategy_sync:{proposal.proposal_id}",
+                transaction=transaction,
+            )
         # A content-identical retry never changes state; a missing receipt is repaired below.
         if snapshot.sha256 != after_sha:
             staged = _stage_state_replacement(state_file, after)
@@ -1660,6 +2125,8 @@ def sync_strategy_promotion_state_file(*, proposal_ledger_root: str | Path, repo
             canonical_after_sha256=after_sha,
             state_file=state_file,
         )
+        if proposal.proposed_stage == "tiny_live_eligible":
+            finalize_owner_approval_prepare(owner_approval_prepare_path(state_file))
         return StrategyPromotionSyncResult(state, promoted, demoted, unchanged, proposal.proposal_id, prepared.sync_prepare_id, recorded.sync_receipt_id, snapshot.sha256, after_sha, prepare_created or receipt.created, "immutable strategy eligibility synchronized")
 
 
@@ -1678,6 +2145,7 @@ _NORMAL_LIVE_PREPARE_FIELDS = frozenset(
         "promotion_runtime_commit",
         "canonical_before_sha256",
         "canonical_after_sha256",
+        "serialized_output",
         "activation_state_marker",
         "state_path",
         "promoted",
@@ -1705,6 +2173,7 @@ def _activation_payload(
     intent_full_sha256: str,
     canonical_before_sha256: str,
     canonical_after_sha256: str,
+    serialized_output: str,
     activation_state_marker: str,
     state_file: Path,
 ) -> dict[str, object]:
@@ -1722,6 +2191,7 @@ def _activation_payload(
         "promotion_runtime_commit": proposal.promotion_runtime_commit,
         "canonical_before_sha256": canonical_before_sha256,
         "canonical_after_sha256": canonical_after_sha256,
+        "serialized_output": serialized_output,
         "activation_state_marker": activation_state_marker,
         "state_path": str(state_file),
         "promoted": [proposal.sleeve],
@@ -1768,6 +2238,13 @@ def _require_activation_payload(
         "canonical_after_sha256",
     ):
         _activation_digest(material.get(key), key)
+    serialized_output = material.get("serialized_output")
+    if (
+        type(serialized_output) is not str
+        or _digest(serialized_output.encode("utf-8"))
+        != material["canonical_after_sha256"]
+    ):
+        raise ValueError("normal live activation output is invalid")
     if (
         material["schema_version"] != 1
         or material["live_enabled"] is not True
@@ -2112,6 +2589,7 @@ def _verify_normal_live_activation_receipt(
             intent_full_sha256=_digest(intent.canonical_json_bytes()),
             canonical_before_sha256=intent.promotion_state_sha256,
             canonical_after_sha256=snapshot.sha256,
+            serialized_output=_canonical(snapshot.state).decode("utf-8"),
             activation_state_marker=activation_state_marker,
             state_file=state_file,
         )
@@ -2405,6 +2883,7 @@ def execute_normal_live_broker_submit(
         from tradingagents.brokers.alpaca_supervisor import (
             _bind_normal_live_submit_claim_reconciliation,
             _claim_normal_live_submit_admission,
+            _consume_or_confirm_owner_approval_before_commit,
             _discard_normal_live_submit_claim,
             _issue_normal_live_submit_post_capability,
             _normal_live_submit_admission_control_path,
@@ -2414,6 +2893,7 @@ def execute_normal_live_broker_submit(
             _release_normal_live_submit_claim_reservation,
             _require_normal_live_submit_admission_available,
             _require_normal_live_submit_claim_leases_current,
+            _require_pending_normal_live_commitment_owner_prepare,
             _reserve_normal_live_submit_claim,
             _revalidate_normal_live_submit_claim,
             _revalidate_normal_live_submit_reconciliation_after_lookup,
@@ -2475,6 +2955,39 @@ def execute_normal_live_broker_submit(
                 commitment: Mapping[str, str],
                 outcome: str,
             ) -> object:
+                def finalize_owner_prepare_after_terminal_outcome() -> None:
+                    """Remove recovery-only owner state once the commitment is terminal.
+
+                    The sibling prepare is intentionally retained while a
+                    commitment is pending: it is the evidence that permits an
+                    exact, lookup-only recovery after a crash.  A durable
+                    terminal commitment, by contrast, cannot mint another
+                    POST capability, so leaving the prepare around only widens
+                    the stale state surface.
+                    """
+
+                    finalize_owner_approval_prepare(
+                        Path(control_state_path).parent
+                        / f"{intent.client_order_id}.owner-approval-prepare.json"
+                    )
+
+                def resolve_if_pending(*, resolved_outcome: str) -> None:
+                    state = commitment.get("state")
+                    if state == "resolved":
+                        # Lookup-only recovery preserves the already-durable
+                        # terminal outcome instead of trying to rewrite it.
+                        return
+                    if state != "pending":
+                        raise ValueError(
+                            "normal live submission commitment state is invalid"
+                        )
+                    resolve_normal_live_submission_commitment(
+                        control_state_path,
+                        commitment_id=commitment["commitment_id"],
+                        outcome=resolved_outcome,
+                        now=_normal_live_policy_moment(),
+                    )
+
                 _require_matching_normal_live_broker_order(result, frozen_order)
                 try:
                     _normal_live_broker_status(result)
@@ -2490,12 +3003,8 @@ def execute_normal_live_broker_submit(
                     _release_normal_live_submit_claim_reservation(
                         supervisor_claim, client_order_id=intent.client_order_id
                     )
-                    resolve_normal_live_submission_commitment(
-                        control_state_path,
-                        commitment_id=commitment["commitment_id"],
-                        outcome="broker_terminal",
-                        now=_normal_live_policy_moment(),
-                    )
+                    resolve_if_pending(resolved_outcome="broker_terminal")
+                    finalize_owner_prepare_after_terminal_outcome()
                     raise
                 # An actual matching order is the only point at which the rolling
                 # limit is recorded.  The durable receipt is then written from the
@@ -2505,16 +3014,22 @@ def execute_normal_live_broker_submit(
                     client_order_id=intent.client_order_id,
                     accepted_at=accepted_at,
                 )
-                resolve_normal_live_submission_commitment(
-                    control_state_path,
-                    commitment_id=commitment["commitment_id"],
-                    outcome=outcome,
-                    now=(
-                        accepted_at
-                        if outcome == "submitted"
-                        else _normal_live_policy_moment()
-                    ),
-                )
+                if commitment.get("state") == "pending":
+                    resolve_normal_live_submission_commitment(
+                        control_state_path,
+                        commitment_id=commitment["commitment_id"],
+                        outcome=outcome,
+                        now=(
+                            accepted_at
+                            if outcome == "submitted"
+                            else _normal_live_policy_moment()
+                        ),
+                    )
+                elif commitment.get("state") != "resolved":
+                    raise ValueError(
+                        "normal live submission commitment state is invalid"
+                    )
+                finalize_owner_prepare_after_terminal_outcome()
                 prepare = next(
                     envelope
                     for envelope in store.envelopes(
@@ -2559,14 +3074,75 @@ def execute_normal_live_broker_submit(
                 rate_reservation = _reserve_normal_live_submit_claim(
                     supervisor_claim, client_order_id=intent.client_order_id
                 )
-                commitment = commit_normal_live_submission_locked(
-                    control_state_path,
-                    intent_full_sha256=_digest(intent.canonical_json_bytes()),
-                    order_payload_sha256=order_payload_sha256,
-                    client_order_id=intent.client_order_id,
-                    rate_reservation_sha256=rate_reservation.binding_sha256,
-                    now=_normal_live_policy_moment(),
-                )
+                owner_commit_binding = None
+                try:
+                    commitment_now = _normal_live_policy_moment()
+                    owner_commit_binding = (
+                        _consume_or_confirm_owner_approval_before_commit(
+                            supervisor_claim,
+                            payload=frozen_order,
+                            sleeve=sleeve,
+                            intent=intent,
+                            rate_reservation_sha256=rate_reservation.binding_sha256,
+                            commitment_now=commitment_now,
+                        )
+                    )
+                    terminal = owner_commit_binding.get("resolved_commitment")
+                    if isinstance(terminal, Mapping):
+                        commitment = dict(terminal)
+                    else:
+                        commitment = commit_normal_live_submission_locked(
+                            control_state_path,
+                            intent_full_sha256=_digest(intent.canonical_json_bytes()),
+                            order_payload_sha256=order_payload_sha256,
+                            client_order_id=intent.client_order_id,
+                            rate_reservation_sha256=rate_reservation.binding_sha256,
+                            owner_approval_id=owner_commit_binding["owner_approval_id"],
+                            owner_approval_transaction_binding_sha256=(
+                                owner_commit_binding[
+                                    "owner_approval_transaction_binding_sha256"
+                                ]
+                            ),
+                            risk_envelope_ref=owner_commit_binding["risk_envelope_ref"],
+                            risk_envelope_sha256=owner_commit_binding[
+                                "risk_envelope_sha256"
+                            ],
+                            now=commitment_now,
+                            candidate=owner_commit_binding["commitment_candidate"],
+                        )
+                    # A pending commitment may only reach even a lookup GET
+                    # when its retained owner sidecar still proves the exact
+                    # original approval, candidate, and consumed binding.
+                    # This deliberately runs while the control lock remains
+                    # held, before the first owned broker read below.
+                    if commitment.get("state") == "pending":
+                        _require_pending_normal_live_commitment_owner_prepare(
+                            supervisor_claim,
+                            payload=frozen_order,
+                            sleeve=sleeve,
+                            normal_live_commitment=commitment,
+                        )
+                except BaseException:
+                    # No durable commitment exists yet: release the reserved
+                    # rate capacity unless the exact owner prepare has already
+                    # consumed it.  That crash window must retain the captured
+                    # rate ledger image: its immutable candidate is the only
+                    # transaction that may later be committed and a restarted
+                    # process remains lookup-only.  Releasing it would create
+                    # a different reservation binding and make exact recovery
+                    # impossible after the owner artifact expires.
+                    prepare_path = (
+                        Path(control_state_path).parent
+                        / f"{intent.client_order_id}.owner-approval-prepare.json"
+                    )
+                    if (
+                        commitment is None
+                        and not owner_prepare_has_exact_consumption(prepare_path)
+                    ):
+                        _release_normal_live_submit_claim_reservation(
+                            supervisor_claim, client_order_id=intent.client_order_id
+                        )
+                    raise
 
             # Only a prior durable commitment can reach owned broker reads.
             # Its exact control decision survives a later freeze; all remaining
@@ -2616,11 +3192,16 @@ def execute_normal_live_broker_submit(
                 _release_normal_live_submit_claim_reservation(
                     supervisor_claim, client_order_id=intent.client_order_id
                 )
-                resolve_normal_live_submission_commitment(
-                    control_state_path,
-                    commitment_id=commitment["commitment_id"],
-                    outcome="missing_refused",
-                    now=_normal_live_policy_moment(),
+                if commitment.get("state") == "pending":
+                    resolve_normal_live_submission_commitment(
+                        control_state_path,
+                        commitment_id=commitment["commitment_id"],
+                        outcome="missing_refused",
+                        now=_normal_live_policy_moment(),
+                    )
+                finalize_owner_approval_prepare(
+                    Path(control_state_path).parent
+                    / f"{intent.client_order_id}.owner-approval-prepare.json"
                 )
                 raise ValueError("live retry lookup found no order; refusing second POST")
             recheck_before_broker_io()
@@ -2682,20 +3263,24 @@ def activate_normal_live_intent(
     state_path: str | Path,
     clock: Callable[[], datetime.datetime] | None = None,
     fault_hook: Callable[[str], None] | None = None,
+    owner_approval: Mapping[str, object] | None = None,
 ) -> NormalLiveActivationReceipt:
     """Atomically enable exactly one already-bound normal-live sleeve locally.
 
     The operation has no broker dependency and writes only the supplied local
     promotion state plus immutable analysis-only evidence.  It intentionally
-    creates no order and exposes no live-capable command surface.
+    creates no order and exposes no live-capable command surface.  Activation
+    uses a durable owner transaction prepare before its single consumption;
+    only an exact ledger-backed prepare can resume after artifact expiry.
     """
 
     if type(proposal) is not StrategyPromotionProposal or type(intent) is not AuthorizedNormalTradeIntent:
         raise ValueError("activation requires exact current intent and proposal")
+    intent_full_sha256_entry = _digest(intent.canonical_json_bytes())
     state_anchor = _capture_state_path_anchor(state_path)
     state_file = state_anchor.path
     repo = Path(repo_root).resolve()
-    intent_full_sha256 = _digest(intent.canonical_json_bytes())
+    intent_full_sha256 = intent_full_sha256_entry
     with promotion_state_lock(state_file):
         _require_state_path_anchor_current(state_anchor)
         # The caller can have waited on this lock for most or all of Task 2's
@@ -2748,6 +3333,7 @@ def activate_normal_live_intent(
                 intent_full_sha256=intent_full_sha256,
                 canonical_before_sha256=intent.promotion_state_sha256,
                 canonical_after_sha256=after_sha256,
+                serialized_output=_canonical(snapshot.state).decode("utf-8"),
                 activation_state_marker=repaired_activation_state_marker,
                 state_file=state_file,
             )
@@ -2757,6 +3343,24 @@ def activate_normal_live_intent(
             raise ValueError("multiple normal live activation prepares")
         if repaired_prepares:
             prepare, expected_prepare = repaired_prepares[0]
+            transaction = _activation_owner_transaction(
+                proposal=proposal,
+                intent=intent,
+                intent_full_sha256=intent_full_sha256,
+                expected_prepare=expected_prepare,
+                state_file=state_file,
+            )
+            if (
+                owner_approval_prepare_matches(
+                    owner_approval_prepare_path(state_file), transaction=transaction
+                ) is None
+                or not owner_prepare_has_exact_consumption(
+                    owner_approval_prepare_path(state_file)
+                )
+            ):
+                raise ValueError(
+                    "prepared normal-live activation has no exact owner consumption"
+                )
             expected_receipt = {
                 **expected_prepare,
                 "activation_prepare_id": prepare.object_id,
@@ -2772,7 +3376,7 @@ def activate_normal_live_intent(
                     _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
                 ),
             )
-            return _issue_normal_live_broker_post_capability(
+            finalized = _issue_normal_live_broker_post_capability(
                 NormalLiveActivationReceipt(
                     prepare.object_id,
                     repaired.envelope.object_id,
@@ -2784,6 +3388,8 @@ def activate_normal_live_intent(
                     "receipt_repaired",
                 )
             )
+            finalize_owner_approval_prepare(owner_approval_prepare_path(state_file))
+            return finalized
         if snapshot.sha256 != intent.promotion_state_sha256:
             raise ValueError("promotion state preimage does not match exact intent")
         if not intent.is_active(at=checked_at):
@@ -2875,6 +3481,7 @@ def activate_normal_live_intent(
             intent_full_sha256=intent_full_sha256,
             canonical_before_sha256=snapshot.sha256,
             canonical_after_sha256=after_sha256,
+            serialized_output=after.decode("utf-8"),
             activation_state_marker=activation_state_marker,
             state_file=state_file,
         )
@@ -2912,7 +3519,33 @@ def activate_normal_live_intent(
                 prepare = prepare_admission.envelope
                 prepare_created = prepare_admission.created
             if fault_hook is not None:
-                fault_hook("after_prepare")
+                fault_hook("after_immutable_prepare")
+            # The immutable evidence prepare is the only authority image that
+            # may be consumed.  A pre-consumption crash leaves it inert; a
+            # retry must still present a current exact approval.  A consumed
+            # prepare can later recover after the artifact expires.
+            transaction = _activation_owner_transaction(
+                proposal=proposal,
+                intent=intent,
+                intent_full_sha256=intent_full_sha256,
+                expected_prepare=expected_prepare,
+                state_file=state_file,
+            )
+            _prepare_or_recover_live_eligibility_owner_approval(
+                prepare_path=owner_approval_prepare_path(state_file),
+                proposal=proposal,
+                owner_approval=owner_approval,
+                now=moment,
+                kind="normal_live_activation",
+                purpose=f"normal_live_activation:{intent_full_sha256}",
+                transaction=transaction,
+                intent_full_sha256=intent_full_sha256,
+                source_binding={
+                    "promotion_state_sha256": str(intent.promotion_state_sha256),
+                },
+            )
+            if fault_hook is not None:
+                fault_hook("after_owner_consumption")
             _require_state_path_anchor_current(state_anchor)
             _require_snapshot_current(snapshot)
             # A recovered prepare still cannot enable a sleeve after the bound
@@ -2946,7 +3579,7 @@ def activate_normal_live_intent(
                     _thaw_json(envelope.payload), expected=expected_prepare, receipt=True
                 ),
             )
-            return _issue_normal_live_broker_post_capability(
+            finalized = _issue_normal_live_broker_post_capability(
                 NormalLiveActivationReceipt(
                     prepare.object_id,
                     receipt_admission.envelope.object_id,
@@ -2958,5 +3591,7 @@ def activate_normal_live_intent(
                     "activated",
                 )
             )
+            finalize_owner_approval_prepare(owner_approval_prepare_path(state_file))
+            return finalized
         finally:
             staged.unlink(missing_ok=True)

@@ -44,6 +44,18 @@ from tradingagents.policy.strategy_promotion import INTERNAL_EVIDENCE_MAX_AGE_SE
 
 UTC = datetime.timezone.utc
 
+
+def _owner_approval_authority_utc_now() -> datetime.datetime:
+    """Return the policy-owned clock for owner-approval authority.
+
+    Tournament ``generated_at`` / ``now`` values are reproducibility evidence,
+    not authority.  Keep this private zero-argument seam so isolated tests can
+    choose a deterministic policy clock without exposing a caller-controlled
+    runtime or CLI override.
+    """
+
+    return datetime.datetime.now(tz=UTC)
+
 #: Sleeves that are preregistered by construction: they exist as named,
 #: deterministic strategies in the paper tournament code and methodology docs.
 PREREGISTERED_TOURNAMENT_SLEEVES = (
@@ -712,6 +724,10 @@ def sync_promotion_state_file(
     arm_live: bool = False,
     ci_green: bool = False,
     now: datetime.datetime | None = None,
+    owner_approval: Mapping[str, object] | None = None,
+    owner_approval_envelope_ref: str | None = None,
+    owner_approval_envelope_sha256: str | None = None,
+    risk_envelope_ref: str = DEFAULT_RISK_ENVELOPE_REF,
 ) -> PromotionSyncResult:
     state_file = Path(state_path)
     output_file = (
@@ -730,7 +746,8 @@ def sync_promotion_state_file(
                     "existing promotion state must be valid UTF-8 JSON"
                 ) from exc
             current_state = _validate_existing_promotion_state(current_state)
-        report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        report_bytes = Path(report_path).read_bytes()
+        report = json.loads(report_bytes.decode("utf-8"))
         # The tournament dir stores the full report under "latest_report" inside
         # compact packets; accept either a bare report or a wrapper.
         if "rankings" not in report and isinstance(
@@ -743,13 +760,245 @@ def sync_promotion_state_file(
             tiny_live_tranche_usd=tiny_live_tranche_usd,
             arm_live=arm_live,
             ci_green=ci_green,
+            validation_report_ref=DEFAULT_VALIDATION_REPORT_REF,
+            risk_envelope_ref=risk_envelope_ref,
             now=now,
         )
         result.state["source"]["canonical_input_sha256"] = hashlib.sha256(
             input_bytes
         ).hexdigest()
-        atomic_write_text(output_file, json.dumps(result.state, indent=2))
+        serialized = json.dumps(result.state, indent=2)
+        output_digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+        # Final envelope source validation MUST precede approval consumption:
+        # a changed/missing envelope leaves no promotion write and no approval
+        # consumption.
+        prewrite_ok = False
+        if result.promoted and owner_approval_envelope_sha256:
+            try:
+                prewrite_bytes = Path(owner_approval_envelope_ref).read_bytes()
+            except OSError as exc:
+                raise ValueError(
+                    "bound risk envelope is unavailable before promotion write"
+                ) from exc
+            if (
+                hashlib.sha256(prewrite_bytes).hexdigest()
+                != owner_approval_envelope_sha256
+            ):
+                raise ValueError(
+                    "bound risk envelope changed after approval validation; "
+                    "promotion refused"
+                )
+            prewrite_ok = True
+        if result.promoted:
+            from tradingagents.policy.owner_approval import (
+                OwnerApprovalError,
+                consume_owner_approval,
+                finalize_owner_approval_prepare,
+                owner_approval_prepare_exists,
+                owner_approval_prepare_matches,
+                owner_approval_prepare_path,
+                owner_prepare_has_exact_consumption,
+                prepared_transaction_binding_sha256,
+                prepared_transaction_sha256,
+                read_owner_approval_prepare,
+                transaction_binding_sha256,
+                verify_owner_approval_structure,
+                write_owner_approval_prepare,
+            )
+
+            # ``now`` belongs exclusively to deterministic tournament
+            # evaluation/output evidence.  Signature freshness and durable
+            # single-use consumption always use the policy-owned UTC clock.
+            moment = _owner_approval_authority_utc_now()
+            subject, source_binding, purpose = _tournament_promotion_request(
+                tournament_id=str(report.get("tournament_id") or ""),
+                report_generated_at=str(report.get("generated_at") or ""),
+                report_sha256=hashlib.sha256(report_bytes).hexdigest(),
+                canonical_input_sha256=hashlib.sha256(input_bytes).hexdigest(),
+                promoted=list(result.promoted),
+                demoted=list(result.demoted),
+                unchanged=list(result.unchanged),
+                output_path=output_file.resolve(),
+                output_state_sha256=output_digest,
+            )
+            recovery_identity = {
+                "operation": "tournament_promotion_sync",
+                "tournament_id": str(report.get("tournament_id") or ""),
+                "report_generated_at": str(report.get("generated_at") or ""),
+                "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
+                "promoted": sorted(result.promoted),
+                "demoted": sorted(result.demoted),
+                "unchanged": sorted(result.unchanged),
+                "risk_envelope_ref": owner_approval_envelope_ref,
+                "risk_envelope_sha256": owner_approval_envelope_sha256,
+                "canonical_before_sha256": hashlib.sha256(input_bytes).hexdigest(),
+                "input_state_path": str(state_file.resolve()),
+                "output_state_path": str(output_file.resolve()),
+                "report_path": str(Path(report_path).resolve()),
+            }
+            transaction = {
+                **recovery_identity,
+                "canonical_after_sha256": output_digest,
+                "serialized_output": serialized,
+                "recovery_identity": recovery_identity,
+            }
+            prepare_path = owner_approval_prepare_path(output_file)
+            prepared = read_owner_approval_prepare(prepare_path)
+            matching_prepare = owner_approval_prepare_matches(
+                prepare_path, transaction=transaction
+            )
+            recovered = (
+                prepared is not None
+                and prepared["transaction"].get("recovery_identity")
+                == recovery_identity
+                and owner_prepare_has_exact_consumption(prepare_path)
+            )
+            if prepared is None and owner_approval_prepare_exists(prepare_path):
+                # A durable-but-unreadable sidecar is never equivalent to an
+                # absent prepare.  Continuing to a fresh verification here
+                # could conceal tampering after an interrupted consumption.
+                raise OwnerApprovalError("owner approval prepare is malformed")
+            if prepared is not None and matching_prepare is None and not recovered:
+                raise ValueError(
+                    "owner approval prepare does not match this promotion transaction"
+                )
+            if recovered:
+                stored_output = prepared["transaction"].get("serialized_output")
+                if type(stored_output) is not str:
+                    raise ValueError("prepared promotion transaction output is invalid")
+                if output_file.exists():
+                    if output_file.read_bytes() != stored_output.encode("utf-8"):
+                        raise ValueError(
+                            "prepared promotion transaction output does not match"
+                        )
+                else:
+                    atomic_write_text(output_file, stored_output)
+                finalize_owner_approval_prepare(prepare_path)
+                return result
+            else:
+                try:
+                    if (
+                        owner_approval is None
+                        or not owner_approval_envelope_ref
+                        or not owner_approval_envelope_sha256
+                    ):
+                        raise OwnerApprovalError("owner approval required")
+                    parsed = verify_owner_approval_structure(
+                        approval=owner_approval,
+                        expected_action="live_promotion",
+                        subject=subject,
+                        source_binding=source_binding,
+                        now=moment,
+                        purpose=purpose,
+                    )
+                    envelope = parsed["risk_envelope_binding"]
+                    if (
+                        envelope["ref"] != owner_approval_envelope_ref
+                        or envelope["sha256"] != owner_approval_envelope_sha256
+                    ):
+                        raise OwnerApprovalError(
+                            "owner approval risk envelope binding does not match this request"
+                        )
+                    binding = transaction_binding_sha256(
+                        approval_id=parsed["approval_id"],
+                        action=parsed["action"],
+                        purpose=purpose,
+                        subject=subject,
+                        risk_envelope_ref=owner_approval_envelope_ref,
+                        risk_envelope_sha256=owner_approval_envelope_sha256,
+                    )
+                    prepared_binding = prepared_transaction_binding_sha256(
+                        transaction_binding_sha256=binding,
+                        transaction_sha256=prepared_transaction_sha256(transaction),
+                    )
+                    if matching_prepare is not None:
+                        if (
+                            matching_prepare["approval_id"] != parsed["approval_id"]
+                            or matching_prepare["action"] != parsed["action"]
+                            or matching_prepare["purpose"] != purpose
+                            or matching_prepare["transaction_binding_sha256"] != binding
+                            or matching_prepare[
+                                "prepared_transaction_binding_sha256"
+                            ]
+                            != prepared_binding
+                        ):
+                            raise OwnerApprovalError(
+                                "owner approval prepare does not match this exact approval"
+                            )
+                    else:
+                        written_binding = write_owner_approval_prepare(
+                            prepare_path,
+                            approval_id=parsed["approval_id"],
+                            action=parsed["action"],
+                            purpose=purpose,
+                            transaction_binding_sha256=binding,
+                            transaction=transaction,
+                            now=moment,
+                        )
+                        if written_binding != prepared_binding:
+                            raise OwnerApprovalError(
+                                "owner approval prepare binding does not match this promotion transaction"
+                            )
+                    consume_owner_approval(
+                        approval_id=parsed["approval_id"],
+                        action=parsed["action"],
+                        purpose=purpose,
+                        transaction_binding_sha256=binding,
+                        prepared_transaction_binding_sha256=prepared_binding,
+                        now=moment,
+                    )
+                except OwnerApprovalError:
+                    raise
+            if owner_approval_envelope_sha256 and not prewrite_ok:
+                raise ValueError(
+                    "bound risk envelope is unavailable before promotion write"
+                )
+            atomic_write_text(output_file, serialized)
+            finalize_owner_approval_prepare(prepare_path)
+            return result
+        atomic_write_text(output_file, serialized)
         return result
 
     with promotion_state_lock(state_file):
-        return evaluate_and_write()
+        if output_file.resolve() == state_file.resolve():
+            return evaluate_and_write()
+        with promotion_state_lock(output_file):
+            return evaluate_and_write()
+
+
+def _tournament_promotion_request(
+    *,
+    tournament_id: str,
+    report_generated_at: str,
+    report_sha256: str,
+    canonical_input_sha256: str,
+    promoted: list[str],
+    demoted: list[str],
+    unchanged: list[str],
+    output_path: Path,
+    output_state_sha256: str,
+) -> tuple[dict[str, object], dict[str, object], str]:
+    """Return the exact signed request image for a tournament promotion."""
+    subject = {
+        "kind": "tournament_promotion_sync",
+        "tournament_id": tournament_id,
+        "report_generated_at": report_generated_at,
+        "report_sha256": report_sha256,
+        "input_state_sha256": canonical_input_sha256,
+        "promoted": sorted(promoted),
+        "demoted": sorted(demoted),
+        "unchanged": sorted(unchanged),
+        "output_path": str(output_path),
+        "output_state_sha256": output_state_sha256,
+    }
+    source_binding = {
+        "kind": "paper_tournament_sync",
+        "tournament_id": tournament_id,
+        "report_sha256": report_sha256,
+        "canonical_input_sha256": canonical_input_sha256,
+    }
+    purpose = (
+        f"tournament_promotion:{tournament_id}:"
+        f"{canonical_input_sha256}:{output_state_sha256}"
+    )
+    return subject, source_binding, purpose

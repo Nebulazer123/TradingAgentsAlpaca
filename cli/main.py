@@ -3414,6 +3414,14 @@ def research_self_heal_plan(
         max=1440,
         help="Minutes before a persistent safe-plane signal is verified again.",
     ),
+    promotion_owner_approval_path: Path | None = typer.Option(
+        None,
+        "--promotion-owner-approval-path",
+        help=(
+            "Signed account_owner JSON artifact for an already prepared, "
+            "exact verified-recovery promotion. Used only with --execute-safe."
+        ),
+    ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Write an audited safe-plane self-heal plan without executing fixes."""
@@ -3436,8 +3444,42 @@ def research_self_heal_plan(
     # ``owned_recovery_ready`` classification is evidence for a later
     # independently controlled recovery operation; it is not authority to
     # coordinate recovery, rearm live control, or run an executor here.
+    promotion_owner_approval = None
+    if promotion_owner_approval_path is not None:
+        if not execute_safe:
+            raise typer.BadParameter(
+                "--promotion-owner-approval-path requires --execute-safe"
+            )
+        if (
+            not promotion_owner_approval_path.is_file()
+            or promotion_owner_approval_path.is_symlink()
+        ):
+            raise typer.BadParameter(
+                "promotion owner approval must be a regular non-symlink JSON file"
+            )
+        try:
+            promotion_owner_approval = json.loads(
+                promotion_owner_approval_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise typer.BadParameter(
+                "promotion owner approval artifact is unreadable JSON"
+            ) from exc
+        if not isinstance(promotion_owner_approval, dict):
+            raise typer.BadParameter(
+                "promotion owner approval artifact must be a JSON object"
+            )
     if execute_safe:
-        packet = execute_self_heal_plan(packet, repo_root=Path.cwd())
+        execute_kwargs = (
+            {"promotion_owner_approval": promotion_owner_approval}
+            if promotion_owner_approval is not None
+            else {}
+        )
+        packet = execute_self_heal_plan(
+            packet,
+            repo_root=Path.cwd(),
+            **execute_kwargs,
+        )
     json_path, markdown_path = write_self_heal_plan(packet, output_dir)
     payload = dict(packet)
     payload["json_path"] = str(json_path)
@@ -4181,9 +4223,21 @@ def policy_sync_promotion(
     generated_at: str | None = typer.Option(
         None,
         "--generated-at",
-        help="Optional timezone-aware deterministic generation time.",
+        help=(
+            "Optional timezone-aware deterministic tournament-evaluation "
+            "time; never controls owner-approval authority time."
+        ),
     ),
     json_output: bool = typer.Option(False, "--json-output"),
+    owner_approval_path: Path | None = typer.Option(
+        None,
+        "--owner-approval-path",
+        help=(
+            "Signed account_owner approval artifact (JSON) bound to this "
+            "exact promotion. Required when --arm-live would promote; "
+            "verified against the canonical trust root."
+        ),
+    ),
 ):
     """Sync live promotion state from paper-tournament evidence.
 
@@ -4194,11 +4248,50 @@ def policy_sync_promotion(
     """
     from tradingagents.policy.promotion_sync import sync_promotion_state_file
 
+    owner_approval_artifact = None
+    if owner_approval_path is not None:
+        try:
+            parsed = json.loads(owner_approval_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise typer.BadParameter(
+                f"owner approval artifact unreadable at {owner_approval_path}: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise typer.BadParameter(
+                "owner approval artifact must be a JSON object"
+            )
+        owner_approval_artifact = parsed
+
+    # Bind exactly the validated regular file: read bytes once, validate,
+    # then confirm the bytes did not change during validation so the signed
+    # envelope binding cannot differ from what was checked.
+    if not envelope_path.is_file():
+        raise typer.BadParameter(
+            f"risk envelope must be an existing regular file: {envelope_path}"
+        )
+    try:
+        envelope_bytes = envelope_path.read_bytes()
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"risk envelope unreadable at {envelope_path}: {exc}"
+        ) from exc
     envelope, envelope_issues = load_risk_envelope(envelope_path)
     if envelope is None:
         raise typer.BadParameter(
             f"risk envelope unusable at {envelope_path}: {'; '.join(envelope_issues)}"
         )
+    try:
+        confirmed_bytes = envelope_path.read_bytes()
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"risk envelope unreadable at {envelope_path}: {exc}"
+        ) from exc
+    if confirmed_bytes != envelope_bytes:
+        raise typer.BadParameter(
+            f"risk envelope changed while being validated: {envelope_path}"
+        )
+    owner_approval_envelope_ref = str(envelope_path.resolve())
+    owner_approval_envelope_sha256 = hashlib.sha256(confirmed_bytes).hexdigest()
     promotion_now = None
     if generated_at is not None:
         try:
@@ -4223,6 +4316,10 @@ def policy_sync_promotion(
         arm_live=arm_live,
         ci_green=ci_green,
         now=promotion_now,
+        owner_approval=owner_approval_artifact,
+        owner_approval_envelope_ref=owner_approval_envelope_ref,
+        owner_approval_envelope_sha256=owner_approval_envelope_sha256,
+        risk_envelope_ref=owner_approval_envelope_ref,
     )
     written_state_path = output_state_path or state_path
     payload = {
