@@ -1665,3 +1665,27 @@ quality-security re-review both returned `ACCEPT` with no P0/P1/P2 findings.
 Canonical ledger and summary hashes, the frozen live-control hash, and all ten
 paused TradingAgents automation states remained unchanged. Scoped commit:
 `feat(evals): reconcile agent ledger dependence`.
+
+**Post-integration correction (2026-08-24, focused fix, uncommitted):**
+
+After the scoped commit `49f4490 feat(evals): reconcile agent ledger
+dependence`, the full suite ran RED `1 failed, 4389 passed, 1 skipped,
+75 subtests`:
+`tests/test_authority_role_alignment.py::test_production_raw_http_mutation_inventory_has_no_unclassified_transport`
+reported the new 56-line `research agent-ledger-reconcile` command shifted
+the `_overnight_ticker_process_main` raw-http-put occurrences in
+`cli/main.py` from lines 5342/5354 to 5398/5410. Correction: updated only
+the two exact classification tuples in
+`tests/test_authority_role_alignment.py`
+(`("cli/main.py", 5342, "_overnight_ticker_process_main", "raw-http-put") ->
+5398`, `(..., 5354, ...) -> 5410`), preserving both classification names
+(`non-trading-local-process-result-queue`,
+`non-trading-local-process-error-queue`) and all production source behavior.
+Focused GREEN: the previously failing test passes and
+`tests/test_authority_role_alignment.py` is 53 passed; the 217-test ledger
+five-suite gate stays green; Ruff clean on the changed test path;
+external-cache compileall OK; `uv lock --check` OK; `git diff --check`
+clean. Final full-suite rerun GREEN: 4,390 passed, 1 skipped, 11 warnings,
+and 75 subtests passed in 520.90 seconds. The skip is the existing
+credential-gated DeepSeek live-API case; no runtime, broker, schedule,
+automation, or production command was invoked.
