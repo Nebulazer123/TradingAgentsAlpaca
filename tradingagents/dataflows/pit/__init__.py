@@ -13,6 +13,12 @@ from .partitions import (
     build_market_date_partitions,
     validate_market_date_partitions,
 )
+from .raw_artifacts import (
+    RawPointInTimeArtifact,
+    RawPointInTimeArtifactArchive,
+    build_raw_point_in_time_artifact,
+    validate_raw_point_in_time_artifact,
+)
 from .records import (
     CorporateAction,
     PointInTimeDataError,
@@ -40,4 +46,8 @@ __all__ = [
     "MarketDatePartitions",
     "build_market_date_partitions",
     "validate_market_date_partitions",
+    "RawPointInTimeArtifact",
+    "RawPointInTimeArtifactArchive",
+    "build_raw_point_in_time_artifact",
+    "validate_raw_point_in_time_artifact",
 ]
