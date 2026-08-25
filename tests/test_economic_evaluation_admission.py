@@ -712,6 +712,49 @@ def test_holdout_release_rejects_a_report_without_an_immutable_validation_run(
         )
 
 
+def test_readiness_status_and_validation_report_are_read_only_and_protocol_bound(tmp_path):
+    adapter = _adapter(tmp_path)
+    protocol, partitions = _partitioned_protocol(tmp_path)
+
+    absent = adapter.readiness_status(protocol.protocol_id)
+    assert absent.state == "protocol_not_admitted"
+    assert absent.protocol_admission_object_id is None
+    assert absent.validation_run_object_id is None
+    assert absent.holdout_release_object_id is None
+
+    protocol_admission = adapter.admit_protocol(
+        protocol,
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    admitted = adapter.readiness_status(protocol.protocol_id)
+    assert admitted.state == "validation_not_admitted"
+    assert admitted.protocol_admission_object_id == protocol_admission.envelope.object_id
+
+    report = _validation_report(protocol, partitions)
+    run = adapter.admit_evaluation_run(
+        protocol.protocol_id,
+        phase="validation",
+        effective_at=NOW,
+        frozen_validation_report=report,
+    )
+    sealed = adapter.readiness_status(protocol.protocol_id)
+    assert sealed.state == "holdout_sealed"
+    assert sealed.validation_run_object_id == run.envelope.object_id
+    assert adapter.frozen_validation_report(protocol.protocol_id) == report
+
+    release = adapter.release_holdout(
+        protocol.protocol_id,
+        released_by="owner-corbin",
+        released_at=NOW,
+        frozen_validation_report=adapter.frozen_validation_report(protocol.protocol_id),
+    )
+    released = adapter.readiness_status(protocol.protocol_id)
+    assert released.state == "holdout_released_analysis_only"
+    assert released.holdout_release_object_id == release.envelope.object_id
+
+
 @pytest.mark.parametrize(
     "source_revision,source_paths",
     [

@@ -394,6 +394,58 @@ def test_economic_tournament_run_binds_only_purged_validation_results(tmp_path: 
     assert second_payload["created"] is False
     assert second_payload["evaluation_run_object_id"] == first_payload["evaluation_run_object_id"]
 
+    status_args = [
+        "research",
+        "economic-readiness-status",
+        "--protocol-id",
+        protocol.protocol_id,
+        "--evidence-root",
+        str(tmp_path / "evidence"),
+        "--repo-root",
+        str(tmp_path / "repo"),
+        "--json-output",
+    ]
+    sealed = runner.invoke(app, status_args)
+    assert sealed.exit_code == 0, sealed.output
+    assert json.loads(sealed.output)["state"] == "holdout_sealed"
+
+    release_args = [
+        "research",
+        "economic-holdout-release",
+        "--protocol-id",
+        protocol.protocol_id,
+        "--released-by",
+        "owner-corbin",
+        "--released-at",
+        NOW.isoformat(timespec="seconds"),
+        "--evidence-root",
+        str(tmp_path / "evidence"),
+        "--repo-root",
+        str(tmp_path / "repo"),
+        "--json-output",
+    ]
+    released = runner.invoke(app, release_args)
+    repeated = runner.invoke(app, release_args)
+    assert released.exit_code == 0, released.output
+    assert repeated.exit_code == 0, repeated.output
+    release_payload = json.loads(released.output)
+    repeated_payload = json.loads(repeated.output)
+    assert release_payload["analysis_only"] is True
+    assert release_payload["execution_authority"] == "none"
+    assert release_payload["can_submit_orders"] is False
+    assert release_payload["created"] is True
+    assert repeated_payload["created"] is False
+    assert (
+        repeated_payload["holdout_release_object_id"]
+        == release_payload["holdout_release_object_id"]
+    )
+
+    final_status = runner.invoke(app, status_args)
+    assert final_status.exit_code == 0, final_status.output
+    final_payload = json.loads(final_status.output)
+    assert final_payload["state"] == "holdout_released_analysis_only"
+    assert final_payload["holdout_release_object_id"] == release_payload["holdout_release_object_id"]
+
 
 def test_economic_tournament_run_rejects_malformed_local_input_before_evidence_write(
     tmp_path: Path,

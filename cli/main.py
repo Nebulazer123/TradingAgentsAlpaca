@@ -3207,6 +3207,119 @@ def research_economic_tournament_run(
     console.print("Analysis-only; this receipt grants no execution or promotion authority.")
 
 
+@research_app.command("economic-holdout-release")
+def research_economic_holdout_release(
+    protocol_id: str = typer.Option(
+        ...,
+        "--protocol-id",
+        help="Exact protocol ID whose immutable validation report is eligible for release.",
+    ),
+    released_by: str = typer.Option(
+        ...,
+        "--released-by",
+        help="Explicit owner identifier recorded in the immutable release evidence.",
+    ),
+    released_at: str = typer.Option(
+        ...,
+        "--released-at",
+        help="Canonical UTC timestamp for the immutable holdout-release receipt.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root retained for the immutable admission adapter identity.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Release a sealed holdout only from its existing immutable validation report."""
+
+    released = _economic_effective_at(released_at)
+    try:
+        adapter = EconomicEvaluationAdmissionAdapter(evidence_root, repo_root=repo_root)
+        release = adapter.release_holdout(
+            protocol_id,
+            released_by=released_by,
+            released_at=released,
+            frozen_validation_report=adapter.frozen_validation_report(protocol_id),
+        )
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic holdout release rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": release.protocol_id,
+        "holdout_release_object_id": release.envelope.object_id,
+        "validation_run_object_id": release.validation_run_object_id,
+        "created": release.created,
+        "evidence_root": str(evidence_root),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic holdout release: {release.envelope.object_id}")
+    console.print("Analysis-only; this release grants no execution or promotion authority.")
+
+
+@research_app.command("economic-readiness-status")
+def research_economic_readiness_status(
+    protocol_id: str = typer.Option(
+        ...,
+        "--protocol-id",
+        help="Exact economic protocol ID to inspect without opening holdout rows.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root retained for the immutable admission adapter identity.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Read non-authorizing economic evidence state without accessing holdout rows."""
+
+    try:
+        readiness = EconomicEvaluationAdmissionAdapter(
+            evidence_root,
+            repo_root=repo_root,
+        ).readiness_status(protocol_id)
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic readiness status rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": readiness.protocol_id,
+        "state": readiness.state,
+        "protocol_admission_object_id": readiness.protocol_admission_object_id,
+        "validation_run_object_id": readiness.validation_run_object_id,
+        "holdout_release_object_id": readiness.holdout_release_object_id,
+        "evidence_sequence": readiness.evidence_sequence,
+        "evidence_head_event_sha256": readiness.evidence_head_event_sha256,
+        "evidence_root": str(evidence_root),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic evidence state: {readiness.state}")
+    console.print("Read-only and analysis-only; this status grants no execution or promotion authority.")
+
+
 @research_app.command("economic-protocol-admit")
 def research_economic_protocol_admit(
     protocol_path: Path = typer.Option(

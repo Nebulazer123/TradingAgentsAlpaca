@@ -44,6 +44,7 @@ __all__ = [
     "EconomicEvaluationProtocolAdmission",
     "EconomicEvaluationRun",
     "EconomicHoldoutRelease",
+    "EconomicEvaluationReadiness",
     "EconomicEvaluationAdmissionAdapter",
 ]
 
@@ -201,6 +202,46 @@ class EconomicEvaluationRun:
             raise EconomicEvaluationAdmissionError("evaluation-run predecessor sequence is invalid")
         if _SHA256.fullmatch(self.predecessor_event_sha256) is None:
             raise EconomicEvaluationAdmissionError("evaluation-run predecessor digest is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class EconomicEvaluationReadiness:
+    """Read-only evidence state for one protocol; never execution authority."""
+
+    protocol_id: str
+    protocol_admission_object_id: str | None
+    validation_run_object_id: str | None
+    holdout_release_object_id: str | None
+    evidence_sequence: int
+    evidence_head_event_sha256: str
+
+    def __post_init__(self) -> None:
+        _require_protocol_id(self.protocol_id)
+        for value in (
+            self.protocol_admission_object_id,
+            self.validation_run_object_id,
+            self.holdout_release_object_id,
+        ):
+            if value is not None and type(value) is not str:
+                raise EconomicEvaluationAdmissionError("readiness object identity is invalid")
+        if type(self.evidence_sequence) is not int or self.evidence_sequence < 0:
+            raise EconomicEvaluationAdmissionError("readiness evidence sequence is invalid")
+        if _SHA256.fullmatch(self.evidence_head_event_sha256) is None:
+            raise EconomicEvaluationAdmissionError("readiness evidence digest is invalid")
+        if self.validation_run_object_id is not None and self.protocol_admission_object_id is None:
+            raise EconomicEvaluationAdmissionError("validation run lacks an admitted protocol")
+        if self.holdout_release_object_id is not None and self.validation_run_object_id is None:
+            raise EconomicEvaluationAdmissionError("holdout release lacks a validation run")
+
+    @property
+    def state(self) -> str:
+        if self.protocol_admission_object_id is None:
+            return "protocol_not_admitted"
+        if self.validation_run_object_id is None:
+            return "validation_not_admitted"
+        if self.holdout_release_object_id is None:
+            return "holdout_sealed"
+        return "holdout_released_analysis_only"
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -1202,6 +1243,142 @@ class EconomicEvaluationAdmissionAdapter:
             protocol_admission_object_id=validated.protocol_admission_object_id,
             predecessor_sequence=validated.predecessor_sequence,
             predecessor_event_sha256=validated.predecessor_event_sha256,
+        )
+
+    def readiness_status(self, protocol_id: str) -> EconomicEvaluationReadiness:
+        """Read one protocol's immutable admission state without opening holdout rows."""
+
+        identity = _require_protocol_id(protocol_id)
+        snapshot, events = self._store.verify_with_events()
+        predecessor = _current_predecessor(events)
+        admitted_pairs = [
+            (
+                envelope,
+                _admitted_protocol_from_envelope(envelope, events=events),
+            )
+            for envelope in snapshot
+            if envelope.kind == ECONOMIC_EVALUATION_PROTOCOL_KIND
+        ]
+        matches = [
+            (envelope, protocol)
+            for envelope, protocol in admitted_pairs
+            if protocol.protocol_id == identity
+        ]
+        if len(matches) > 1:
+            raise EconomicEvaluationAdmissionError(
+                "protocol identity has more than one immutable admission"
+            )
+        if not matches:
+            return EconomicEvaluationReadiness(
+                protocol_id=identity,
+                protocol_admission_object_id=None,
+                validation_run_object_id=None,
+                holdout_release_object_id=None,
+                evidence_sequence=predecessor["sequence"],  # type: ignore[arg-type]
+                evidence_head_event_sha256=predecessor["event_sha256"],  # type: ignore[arg-type]
+            )
+        protocol_envelope, protocol = matches[0]
+        validation_runs = [
+            _evaluation_run_from_envelope(
+                envelope,
+                protocol=protocol,
+                protocol_admission_object_id=protocol_envelope.object_id,
+                events=events,
+            )
+            for envelope in snapshot
+            if envelope.kind == ECONOMIC_EVALUATION_RUN_KIND
+            and _payload_mapping(
+                envelope.payload,
+                label="evaluation-run payload",
+            ).get("protocol_id")
+            == identity
+        ]
+        if len(validation_runs) > 1:
+            raise EconomicEvaluationAdmissionError(
+                "protocol identity has more than one immutable validation run"
+            )
+        validation_run = validation_runs[0] if validation_runs else None
+        releases = [
+            envelope
+            for envelope in snapshot
+            if envelope.kind == ECONOMIC_HOLDOUT_RELEASE_KIND
+            and _payload_mapping(
+                envelope.payload,
+                label="holdout release payload",
+            ).get("protocol_id")
+            == identity
+        ]
+        if len(releases) > 1:
+            raise EconomicEvaluationAdmissionError(
+                "protocol identity has more than one immutable holdout release"
+            )
+        if releases and validation_run is None:
+            raise EconomicEvaluationAdmissionError(
+                "holdout release exists without an immutable validation run"
+            )
+        if releases and not self.is_holdout_released(identity):
+            raise EconomicEvaluationAdmissionError("holdout release is not fully validated")
+        return EconomicEvaluationReadiness(
+            protocol_id=identity,
+            protocol_admission_object_id=protocol_envelope.object_id,
+            validation_run_object_id=(
+                validation_run.envelope.object_id if validation_run is not None else None
+            ),
+            holdout_release_object_id=releases[0].object_id if releases else None,
+            evidence_sequence=predecessor["sequence"],  # type: ignore[arg-type]
+            evidence_head_event_sha256=predecessor["event_sha256"],  # type: ignore[arg-type]
+        )
+
+    def frozen_validation_report(self, protocol_id: str) -> dict[str, object]:
+        """Return the one validated immutable validation report for release binding."""
+
+        identity = _require_protocol_id(protocol_id)
+        readiness = self.readiness_status(identity)
+        if readiness.protocol_admission_object_id is None:
+            raise EconomicEvaluationAdmissionError(
+                "validation report requires exactly one admitted protocol"
+            )
+        if readiness.validation_run_object_id is None:
+            raise EconomicEvaluationAdmissionError(
+                "validation report requires exactly one immutable validation run"
+            )
+        snapshot, events = self._store.verify_with_events()
+        protocol_envelope = next(
+            (
+                envelope
+                for envelope in snapshot
+                if envelope.object_id == readiness.protocol_admission_object_id
+            ),
+            None,
+        )
+        validation_envelope = next(
+            (
+                envelope
+                for envelope in snapshot
+                if envelope.object_id == readiness.validation_run_object_id
+            ),
+            None,
+        )
+        if protocol_envelope is None or validation_envelope is None:
+            raise EconomicEvaluationAdmissionError(
+                "immutable validation evidence changed during read"
+            )
+        protocol = _admitted_protocol_from_envelope(protocol_envelope, events=events)
+        run = _evaluation_run_from_envelope(
+            validation_envelope,
+            protocol=protocol,
+            protocol_admission_object_id=protocol_envelope.object_id,
+            events=events,
+        )
+        if run.protocol_id != identity:
+            raise EconomicEvaluationAdmissionError("validation report binds a different protocol")
+        payload = _payload_mapping(
+            _thaw_json(validation_envelope.payload),
+            label="evaluation-run payload",
+        )
+        return _frozen_validation_report(
+            payload["frozen_validation_report"],
+            protocol=protocol,
         )
 
     def release_holdout(
