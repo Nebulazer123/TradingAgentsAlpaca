@@ -8,6 +8,11 @@ from .cohort import (
     build_point_in_time_cohort,
     validate_point_in_time_cohort,
 )
+from .partitions import (
+    MarketDatePartitions,
+    build_market_date_partitions,
+    validate_market_date_partitions,
+)
 from .records import (
     CorporateAction,
     PointInTimeDataError,
@@ -32,4 +37,7 @@ __all__ = [
     "PointInTimeCohortRejection",
     "build_point_in_time_cohort",
     "validate_point_in_time_cohort",
+    "MarketDatePartitions",
+    "build_market_date_partitions",
+    "validate_market_date_partitions",
 ]
