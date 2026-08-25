@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from tradingagents.dataflows.pit import (
@@ -29,6 +30,58 @@ __all__ = [
     "load_source_bound_window_lookup",
     "source_bound_price_window",
 ]
+
+_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v2"
+_RESOLUTION_EVIDENCE_FIELDS = frozenset(
+    {"schema_version", "ticker", "benchmark", "alpha_threshold_pct"}
+)
+
+
+def _decimal_field(value: object) -> Decimal | None:
+    if type(value) is not str:
+        return None
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def _alpha_threshold(value: object) -> Decimal | None:
+    threshold = _decimal_field(value)
+    if threshold is None or threshold < 0:
+        return None
+    return threshold
+
+
+def _canonical_alpha_threshold(value: Decimal) -> str:
+    canonical = format(value.normalize(), "f")
+    return "0" if canonical == "-0" else canonical
+
+
+def _return_pct(entry_close: str, exit_close: str) -> Decimal | None:
+    entry = _decimal_field(entry_close)
+    exit_ = _decimal_field(exit_close)
+    if entry is None or exit_ is None or entry <= 0:
+        return None
+    return ((exit_ - entry) / entry * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _outcome_for_direction(
+    direction: object,
+    relative_return: Decimal,
+    *,
+    alpha_threshold: Decimal,
+) -> bool | None:
+    if type(direction) is not str:
+        return None
+    if direction == "bullish":
+        return relative_return > alpha_threshold
+    if direction == "bearish":
+        return relative_return < -alpha_threshold
+    if direction == "neutral":
+        return abs(relative_return) <= alpha_threshold
+    return None
 
 
 def _receipt_evidence(receipt: SourceBoundAdjustedPriceWindow) -> dict[str, str]:
@@ -108,7 +161,7 @@ class SourceBoundWindowLookup:
         )
 
     def verify_forecast(self, forecast: object) -> bool:
-        """Rebuild the two retained receipt legs named by a resolved forecast."""
+        """Rebuild and verify the retained resolution evidence and outcome fields."""
 
         ticker = getattr(forecast, "ticker", None)
         benchmark = getattr(forecast, "benchmark", None)
@@ -136,11 +189,61 @@ class SourceBoundWindowLookup:
             return False
         ticker_evidence = ticker_window.source_evidence
         benchmark_evidence = benchmark_window.source_evidence
-        return evidence == {
-            "schema_version": "source_bound_resolution_evidence/v1",
-            "ticker": ticker_evidence,
-            "benchmark": benchmark_evidence,
-        }
+        if not isinstance(evidence, Mapping) or set(evidence) != _RESOLUTION_EVIDENCE_FIELDS:
+            return False
+        alpha_threshold = _alpha_threshold(evidence["alpha_threshold_pct"])
+        if (
+            alpha_threshold is None
+            or evidence["alpha_threshold_pct"] != _canonical_alpha_threshold(alpha_threshold)
+            or evidence
+            != {
+                "schema_version": _RESOLUTION_EVIDENCE_SCHEMA,
+                "ticker": ticker_evidence,
+                "benchmark": benchmark_evidence,
+                "alpha_threshold_pct": evidence["alpha_threshold_pct"],
+            }
+        ):
+            return False
+
+        actual_return = _return_pct(ticker_window.entry_close, ticker_window.exit_close)
+        benchmark_return = _return_pct(
+            benchmark_window.entry_close,
+            benchmark_window.exit_close,
+        )
+        if actual_return is None or benchmark_return is None:
+            return False
+        relative_return = (actual_return - benchmark_return).quantize(Decimal("0.01"))
+        outcome = _outcome_for_direction(
+            getattr(forecast, "direction", None),
+            relative_return,
+            alpha_threshold=alpha_threshold,
+        )
+        probability = _decimal_field(getattr(forecast, "probability", None))
+        if (
+            outcome is None
+            or probability is None
+            or probability < 0
+            or probability > 1
+            or getattr(forecast, "resolved", None) is not True
+        ):
+            return False
+        expected_brier = (
+            (probability - (Decimal("1") if outcome else Decimal("0"))) ** 2
+        ).quantize(Decimal("0.0001"))
+        expected_score_delta = (
+            probability - Decimal("0.50")
+            if outcome
+            else -(probability - Decimal("0.50"))
+        ).quantize(Decimal("0.01"))
+        return (
+            getattr(forecast, "outcome", None) is outcome
+            and _decimal_field(getattr(forecast, "actual_return", None)) == actual_return
+            and _decimal_field(getattr(forecast, "benchmark_return", None)) == benchmark_return
+            and _decimal_field(getattr(forecast, "relative_return", None)) == relative_return
+            and _decimal_field(getattr(forecast, "brier_score", None)) == expected_brier
+            and _decimal_field(getattr(forecast, "agent_score_delta", None))
+            == expected_score_delta
+        )
 
 
 def build_source_bound_window_lookup(

@@ -62,9 +62,10 @@ def _source_bound_resolution_evidence() -> dict[str, object]:
         }
 
     return {
-        "schema_version": "source_bound_resolution_evidence/v1",
+        "schema_version": "source_bound_resolution_evidence/v2",
         "ticker": leg("a"),
         "benchmark": leg("b"),
+        "alpha_threshold_pct": "1.5",
     }
 
 

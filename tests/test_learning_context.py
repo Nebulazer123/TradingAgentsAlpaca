@@ -74,9 +74,10 @@ def _resolution_evidence() -> dict[str, object]:
         }
 
     return {
-        "schema_version": "source_bound_resolution_evidence/v1",
+        "schema_version": "source_bound_resolution_evidence/v2",
         "ticker": leg(marker="a"),
         "benchmark": leg(marker="b"),
+        "alpha_threshold_pct": "1.5",
     }
 
 
@@ -387,6 +388,28 @@ def test_latest_snapshot_is_selected_before_quality_and_never_falls_back():
         min_resolved=1,
     )
 
+    assert context.source_forecast_ids == ()
+
+
+def test_legacy_source_bound_evidence_stays_readable_but_never_enters_context(tmp_path):
+    current_evidence = _resolution_evidence()
+    legacy_observation = _forecast_observation(
+        resolution_evidence={
+            "schema_version": "source_bound_resolution_evidence/v1",
+            "ticker": current_evidence["ticker"],
+            "benchmark": current_evidence["benchmark"],
+        }
+    )
+    root = tmp_path / "availability"
+    LearningAvailabilityLedger(root).record(legacy_observation)
+
+    assert LearningAvailabilityLedger(root).verify() == (legacy_observation,)
+    context = learning_context_from_store(
+        availability_root=root,
+        as_of=AS_OF,
+        ticker="NFLX",
+        min_resolved=1,
+    )
     assert context.source_forecast_ids == ()
 
 

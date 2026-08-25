@@ -41,7 +41,7 @@ DEFAULT_AGENT_WEIGHT_FLOOR = Decimal("0.50")
 DEFAULT_AGENT_WEIGHT_CEILING = Decimal("1.50")
 DEFER_INVALID_FORECAST_TIMESTAMPS = "invalid_forecast_timestamps"
 NONQUALIFYING_LEGACY_PRICE_WINDOW = "legacy_yfinance_nonqualifying"
-_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v1"
+_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v2"
 _SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_SCHEMA = "source_bound_price_window_evidence/v1"
 _SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_FIELDS = frozenset(
     {
@@ -178,6 +178,8 @@ def _source_bound_window_evidence(window: Any) -> dict[str, str] | None:
 def _source_bound_resolution_evidence(
     ticker_window: Any,
     benchmark_window: Any,
+    *,
+    alpha_threshold_pct: Decimal,
 ) -> dict[str, Any] | None:
     """Bind both return legs to the receipts that supplied their closes."""
 
@@ -185,10 +187,14 @@ def _source_bound_resolution_evidence(
     benchmark = _source_bound_window_evidence(benchmark_window)
     if ticker is None or benchmark is None:
         return None
+    threshold = _canonical_alpha_threshold(alpha_threshold_pct)
+    if threshold is None:
+        return None
     return {
         "schema_version": _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
         "ticker": ticker,
         "benchmark": benchmark,
+        "alpha_threshold_pct": threshold,
     }
 
 
@@ -198,15 +204,27 @@ def has_source_bound_resolution_evidence(forecast: AgentForecast) -> bool:
     evidence = forecast.resolution_evidence
     if (
         not isinstance(evidence, Mapping)
-        or set(evidence) != {"schema_version", "ticker", "benchmark"}
+        or set(evidence)
+        != {"schema_version", "ticker", "benchmark", "alpha_threshold_pct"}
         or evidence["schema_version"] != _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA
     ):
+        return False
+    threshold = _canonical_alpha_threshold(evidence["alpha_threshold_pct"])
+    if threshold is None or threshold != evidence["alpha_threshold_pct"]:
         return False
 
     return (
         _source_bound_window_evidence_from_mapping(evidence["ticker"]) is not None
         and _source_bound_window_evidence_from_mapping(evidence["benchmark"]) is not None
     )
+
+
+def _canonical_alpha_threshold(value: Any) -> str | None:
+    threshold = _decimal(value, "NaN")
+    if not threshold.is_finite() or threshold < 0:
+        return None
+    canonical = format(threshold.normalize(), "f")
+    return "0" if canonical == "-0" else canonical
 
 
 def _is_qualifying_learning_forecast(forecast: AgentForecast) -> bool:
@@ -1032,6 +1050,8 @@ def resolve_forecasts_with_quality(
 
     current = _as_utc(now)
     threshold = _decimal(alpha_threshold_pct, "1.5")
+    if _canonical_alpha_threshold(threshold) is None:
+        raise ValueError("alpha_threshold_pct must be a finite nonnegative decimal")
     updated: list[AgentForecast] = []
     reports: list[ResolutionQualityReport] = []
     for forecast in forecasts:
@@ -1151,6 +1171,7 @@ def resolve_forecasts_with_quality(
                 resolution_evidence=_source_bound_resolution_evidence(
                     ticker_window,
                     benchmark_window,
+                    alpha_threshold_pct=threshold,
                 ),
             )
         )
@@ -1174,6 +1195,8 @@ def audit_resolved_forecasts(
 
     current = _as_utc(now)
     threshold = _decimal(alpha_threshold_pct, "1.5")
+    if _canonical_alpha_threshold(threshold) is None:
+        raise ValueError("alpha_threshold_pct must be a finite nonnegative decimal")
     updated: list[AgentForecast] = []
     reports: list[ResolutionQualityReport] = []
     for forecast in forecasts:
@@ -1272,7 +1295,11 @@ def audit_resolved_forecasts(
                 quality_flags=list(flags),
                 resolution_window=window_payload,
                 resolution_evidence=(
-                    _source_bound_resolution_evidence(ticker_window, benchmark_window)
+                    _source_bound_resolution_evidence(
+                        ticker_window,
+                        benchmark_window,
+                        alpha_threshold_pct=threshold,
+                    )
                     if window_payload is not None
                     else None
                 ),

@@ -149,9 +149,10 @@ def _source_bound_window_lookup_for(
                 and benchmark is not None
                 and forecast.resolution_evidence
                 == {
-                    "schema_version": "source_bound_resolution_evidence/v1",
+                    "schema_version": "source_bound_resolution_evidence/v2",
                     "ticker": ticker.source_evidence,
                     "benchmark": benchmark.source_evidence,
+                    "alpha_threshold_pct": "1.5",
                 }
             )
 
@@ -182,10 +183,41 @@ def _with_source_bound_learning_evidence(
             "intended_end": end_date,
         },
         resolution_evidence={
-            "schema_version": "source_bound_resolution_evidence/v1",
+            "schema_version": "source_bound_resolution_evidence/v2",
             "ticker": ticker.source_evidence,
             "benchmark": benchmark.source_evidence,
+            "alpha_threshold_pct": "1.5",
         },
+    )
+
+
+def _with_verified_source_bound_result(
+    forecast: AgentForecast,
+    *,
+    direction: str,
+) -> AgentForecast:
+    probability = Decimal(forecast.probability)
+    outcome = direction == "bullish"
+    return replace(
+        forecast,
+        direction=direction,
+        resolved=True,
+        outcome=outcome,
+        actual_return="10.00",
+        benchmark_return="2.00",
+        relative_return="8.00",
+        brier_score=str(
+            ((probability - (Decimal("1") if outcome else Decimal("0"))) ** 2).quantize(
+                Decimal("0.0001")
+            )
+        ),
+        agent_score_delta=str(
+            (
+                probability - Decimal("0.50")
+                if outcome
+                else -(probability - Decimal("0.50"))
+            ).quantize(Decimal("0.01"))
+        ),
     )
 
 
@@ -569,28 +601,14 @@ def test_agent_influence_weights_reward_useful_agents_and_downrank_noisy_agents(
         if forecast.agent == "market_analyst":
             resolved.append(
                 _with_source_bound_learning_evidence(
-                    replace(
-                        forecast,
-                        resolved=True,
-                        outcome=True,
-                        brier_score="0.1156",
-                        agent_score_delta="0.16",
-                        relative_return="8.00",
-                    ),
+                    _with_verified_source_bound_result(forecast, direction="bullish"),
                     lookup=verifier,
                 )
             )
         elif forecast.agent == "news_analyst":
             resolved.append(
                 _with_source_bound_learning_evidence(
-                    replace(
-                        forecast,
-                        resolved=True,
-                        outcome=False,
-                        brier_score="0.4356",
-                        agent_score_delta="-0.16",
-                        relative_return="-2.00",
-                    ),
+                    _with_verified_source_bound_result(forecast, direction="bearish"),
                     lookup=verifier,
                 )
             )
@@ -687,54 +705,48 @@ def test_agent_influence_weights_use_setup_sector_regime_and_evidence_context(tm
     for index in range(3):
         forecasts.append(
             _with_source_bound_learning_evidence(
-                replace(
-                    market_forecast,
-                    forecast_id=f"af-market-good-{index}",
-                    setup="pullback_support",
-                    sector="semiconductors",
-                    regime="risk_on",
-                    evidence_sources=["market_report", "news_report"],
-                    resolved=True,
-                    outcome=True,
-                    brier_score="0.1000",
-                    agent_score_delta="0.18",
-                    relative_return="3.00",
+                _with_verified_source_bound_result(
+                    replace(
+                        market_forecast,
+                        forecast_id=f"af-market-good-{index}",
+                        setup="pullback_support",
+                        sector="semiconductors",
+                        regime="risk_on",
+                        evidence_sources=["market_report", "news_report"],
+                    ),
+                    direction="bullish",
                 ),
                 lookup=verifier,
             )
         )
         forecasts.append(
             _with_source_bound_learning_evidence(
-                replace(
-                    market_forecast,
-                    forecast_id=f"af-market-bad-{index}",
-                    setup="breakout_chase",
-                    sector="banks",
-                    regime="risk_off",
-                    evidence_sources=["market_report", "news_report"],
-                    resolved=True,
-                    outcome=False,
-                    brier_score="0.4900",
-                    agent_score_delta="-0.18",
-                    relative_return="-2.00",
+                _with_verified_source_bound_result(
+                    replace(
+                        market_forecast,
+                        forecast_id=f"af-market-bad-{index}",
+                        setup="breakout_chase",
+                        sector="banks",
+                        regime="risk_off",
+                        evidence_sources=["market_report", "news_report"],
+                    ),
+                    direction="bearish",
                 ),
                 lookup=verifier,
             )
         )
         forecasts.append(
             _with_source_bound_learning_evidence(
-                replace(
-                    news_forecast,
-                    forecast_id=f"af-news-bad-{index}",
-                    setup="pullback_support",
-                    sector="semiconductors",
-                    regime="risk_on",
-                    evidence_sources=["news_report"],
-                    resolved=True,
-                    outcome=False,
-                    brier_score="0.4900",
-                    agent_score_delta="-0.16",
-                    relative_return="-1.00",
+                _with_verified_source_bound_result(
+                    replace(
+                        news_forecast,
+                        forecast_id=f"af-news-bad-{index}",
+                        setup="pullback_support",
+                        sector="semiconductors",
+                        regime="risk_on",
+                        evidence_sources=["news_report"],
+                    ),
+                    direction="bearish",
                 ),
                 lookup=verifier,
             )
@@ -1024,6 +1036,33 @@ def test_agent_ledger_resolve_cli_loads_and_reverifies_real_source_receipts(tmp_
     assert evidence["ticker"]["security_id"] == "security-nvda"
     assert evidence["benchmark"]["security_id"] == "security-qqq"
     assert evidence["ticker"]["raw_artifact_sha256"] != evidence["benchmark"]["raw_artifact_sha256"]
+
+
+def test_source_bound_resolution_retains_the_exact_alpha_threshold(tmp_path: Path):
+    forecast = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0]
+    verifier = _source_bound_verifier(tmp_path, forecast)
+
+    resolved, _reports = resolve_forecasts_with_quality(
+        [forecast],
+        window_lookup=verifier,
+        now=datetime.datetime(2026, 6, 12, tzinfo=datetime.timezone.utc),
+        alpha_threshold_pct="9.0",
+    )
+
+    result = resolved[0]
+    assert result.outcome is False
+    assert result.resolution_evidence is not None
+    assert result.resolution_evidence["alpha_threshold_pct"] == "9"
+    assert verifier.verify_forecast(result) is True
+    assert verifier.verify_forecast(
+        replace(
+            result,
+            resolution_evidence={
+                **result.resolution_evidence,
+                "alpha_threshold_pct": "1.5",
+            },
+        )
+    ) is False
 
 
 def test_legacy_downgrade_preserves_existing_source_bound_resolution_evidence():

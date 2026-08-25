@@ -12,6 +12,7 @@ import stat
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -134,7 +135,10 @@ _RESOLUTION_WINDOW_FIELDS = frozenset(
         "horizon_kind",
     }
 )
-_RESOLUTION_EVIDENCE_FIELDS = frozenset({"schema_version", "ticker", "benchmark"})
+_LEGACY_RESOLUTION_EVIDENCE_FIELDS = frozenset({"schema_version", "ticker", "benchmark"})
+_RESOLUTION_EVIDENCE_FIELDS = frozenset(
+    {"schema_version", "ticker", "benchmark", "alpha_threshold_pct"}
+)
 _SOURCE_BOUND_LEG_FIELDS = frozenset(
     {
         "schema_version",
@@ -150,7 +154,8 @@ _SOURCE_BOUND_LEG_FIELDS = frozenset(
         "adjustment_status",
     }
 )
-_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v1"
+_LEGACY_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v1"
+_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v2"
 _SOURCE_BOUND_LEG_EVIDENCE_SCHEMA = "source_bound_price_window_evidence/v1"
 _LIFECYCLE_CONTEXT_FIELDS = frozenset(
     {"agent", "direction", "setup", "regime", "sector"}
@@ -349,13 +354,34 @@ def _validate_forecast_payload(payload: Mapping[str, Any]) -> None:
 def _validate_source_bound_resolution_evidence(value: Any) -> None:
     if not isinstance(value, Mapping):
         raise LearningAvailabilityError("resolution_evidence must be an object")
+    schema_version = value.get("schema_version")
+    if schema_version == _LEGACY_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        expected_fields = _LEGACY_RESOLUTION_EVIDENCE_FIELDS
+    elif schema_version == _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        expected_fields = _RESOLUTION_EVIDENCE_FIELDS
+    else:
+        raise LearningAvailabilityError("resolution_evidence schema_version is invalid")
     _require_exact_fields(
         value,
-        _RESOLUTION_EVIDENCE_FIELDS,
+        expected_fields,
         label="resolution_evidence",
     )
-    if value["schema_version"] != _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
-        raise LearningAvailabilityError("resolution_evidence schema_version is invalid")
+    if schema_version == _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        alpha_threshold = value["alpha_threshold_pct"]
+        if type(alpha_threshold) is not str:
+            raise LearningAvailabilityError("resolution_evidence alpha_threshold_pct is invalid")
+        try:
+            parsed_threshold = Decimal(alpha_threshold)
+        except (InvalidOperation, ValueError) as exc:
+            raise LearningAvailabilityError(
+                "resolution_evidence alpha_threshold_pct is invalid"
+            ) from exc
+        if (
+            not parsed_threshold.is_finite()
+            or parsed_threshold < 0
+            or alpha_threshold != format(parsed_threshold.normalize(), "f")
+        ):
+            raise LearningAvailabilityError("resolution_evidence alpha_threshold_pct is invalid")
     for leg_name in ("ticker", "benchmark"):
         leg = value[leg_name]
         if not isinstance(leg, Mapping):

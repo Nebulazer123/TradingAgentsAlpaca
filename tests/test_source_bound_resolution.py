@@ -19,7 +19,7 @@ from tradingagents.evals.source_bound_resolution import (
 )
 
 
-def _window(tmp_path, *, symbol: str = "T000"):
+def _window(tmp_path, *, symbol: str = "T000", last_close: str = "12"):
     archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
     artifact = archive.admit(
         raw_bytes=json.dumps(
@@ -28,7 +28,7 @@ def _window(tmp_path, *, symbol: str = "T000"):
                     symbol: [
                         {"t": "2026-01-05T05:00:00Z", "c": "10"},
                         {"t": "2026-01-06T05:00:00Z", "c": "11"},
-                        {"t": "2026-01-07T05:00:00Z", "c": "12"},
+                        {"t": "2026-01-07T05:00:00Z", "c": last_close},
                     ]
                 }
             }
@@ -128,18 +128,85 @@ def test_source_bound_lookup_reverifies_both_retained_forecast_legs(tmp_path):
     forecast = SimpleNamespace(
         ticker="T000",
         benchmark="SPY",
+        direction="bullish",
+        probability="0.60",
+        resolved=True,
+        outcome=False,
+        actual_return="20.00",
+        benchmark_return="20.00",
+        relative_return="0.00",
+        brier_score="0.36",
+        agent_score_delta="-0.10",
         resolution_window={
             "intended_start": "2026-01-05",
             "intended_end": "2026-01-07",
         },
         resolution_evidence={
-            "schema_version": "source_bound_resolution_evidence/v1",
+            "schema_version": "source_bound_resolution_evidence/v2",
             "ticker": ticker.source_evidence,
             "benchmark": benchmark.source_evidence,
+            "alpha_threshold_pct": "1.5",
         },
     )
 
     assert lookup.verify_forecast(forecast) is True
+    forecast.probability = "1.01"
+    forecast.brier_score = "1.0201"
+    forecast.agent_score_delta = "-0.51"
+    assert lookup.verify_forecast(forecast) is False
+    forecast.probability = "0.60"
+    forecast.brier_score = "0.36"
+    forecast.agent_score_delta = "-0.10"
+    forecast.outcome = True
+    assert lookup.verify_forecast(forecast) is False
+
+
+def test_source_bound_lookup_uses_the_retained_alpha_threshold(tmp_path):
+    archive, ticker_artifact, ticker_receipt = _window(tmp_path, symbol="T000")
+    _archive, benchmark_artifact, benchmark_receipt = _window(
+        tmp_path,
+        symbol="SPY",
+        last_close="10.1",
+    )
+    lookup = build_source_bound_window_lookup(
+        archive=archive,
+        raw_artifacts={
+            ticker_artifact.raw_artifact_id: ticker_artifact,
+            benchmark_artifact.raw_artifact_id: benchmark_artifact,
+        },
+        receipts=(ticker_receipt, benchmark_receipt),
+    )
+    ticker = lookup("T000", "2026-01-05", "2026-01-07")
+    benchmark = lookup("SPY", "2026-01-05", "2026-01-07")
+    assert ticker is not None and benchmark is not None
+    forecast = SimpleNamespace(
+        ticker="T000",
+        benchmark="SPY",
+        direction="bullish",
+        probability="0.60",
+        resolved=True,
+        outcome=False,
+        actual_return="20.00",
+        benchmark_return="1.00",
+        relative_return="19.00",
+        brier_score="0.36",
+        agent_score_delta="-0.10",
+        resolution_window={
+            "intended_start": "2026-01-05",
+            "intended_end": "2026-01-07",
+        },
+        resolution_evidence={
+            "schema_version": "source_bound_resolution_evidence/v2",
+            "ticker": ticker.source_evidence,
+            "benchmark": benchmark.source_evidence,
+            "alpha_threshold_pct": "20",
+        },
+    )
+
+    assert lookup.verify_forecast(forecast) is True
+    forecast.resolution_evidence["alpha_threshold_pct"] = "1.5"
+    assert lookup.verify_forecast(forecast) is False
+    forecast.outcome = False
     forecast.resolution_evidence["ticker"]["security_id"] = "security-tampered"
     assert lookup.verify_forecast(forecast) is False
 
