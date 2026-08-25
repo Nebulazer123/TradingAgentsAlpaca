@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from tradingagents.dataflows.pit import (
 )
 from tradingagents.evals.source_bound_resolution import (
     build_source_bound_window_lookup,
+    load_source_bound_window_lookup,
     source_bound_price_window,
 )
 
@@ -63,6 +65,19 @@ def test_source_bound_price_window_reverifies_archived_bytes(tmp_path):
     assert window.entry_close == "10"
     assert window.exit_close == "12"
     assert window.session_count == 3
+    assert window.source_evidence == {
+        "schema_version": "source_bound_price_window_evidence/v1",
+        "window_id": receipt.window_id,
+        "window_sha256": receipt.window_sha256,
+        "security_id": "security-t000",
+        "raw_artifact_id": artifact.raw_artifact_id,
+        "raw_artifact_sha256": artifact.raw_artifact_sha256,
+        "decision_cutoff": "2026-01-09T21:00:00+00:00",
+        "retrieved_at": "2026-01-09T21:00:00+00:00",
+        "feed": "iex",
+        "adjustment_mode": "all",
+        "adjustment_status": "total_return_adjusted",
+    }
 
 
 def test_source_bound_window_lookup_has_no_fallback_and_rejects_wrong_artifact(tmp_path):
@@ -96,6 +111,39 @@ def test_source_bound_window_lookup_has_no_fallback_and_rejects_wrong_artifact(t
         lookup("T000", "2026-01-05", "2026-01-07")
 
 
+def test_source_bound_lookup_reverifies_both_retained_forecast_legs(tmp_path):
+    archive, ticker_artifact, ticker_receipt = _window(tmp_path, symbol="T000")
+    _archive, benchmark_artifact, benchmark_receipt = _window(tmp_path, symbol="SPY")
+    lookup = build_source_bound_window_lookup(
+        archive=archive,
+        raw_artifacts={
+            ticker_artifact.raw_artifact_id: ticker_artifact,
+            benchmark_artifact.raw_artifact_id: benchmark_artifact,
+        },
+        receipts=(ticker_receipt, benchmark_receipt),
+    )
+    ticker = lookup("T000", "2026-01-05", "2026-01-07")
+    benchmark = lookup("SPY", "2026-01-05", "2026-01-07")
+    assert ticker is not None and benchmark is not None
+    forecast = SimpleNamespace(
+        ticker="T000",
+        benchmark="SPY",
+        resolution_window={
+            "intended_start": "2026-01-05",
+            "intended_end": "2026-01-07",
+        },
+        resolution_evidence={
+            "schema_version": "source_bound_resolution_evidence/v1",
+            "ticker": ticker.source_evidence,
+            "benchmark": benchmark.source_evidence,
+        },
+    )
+
+    assert lookup.verify_forecast(forecast) is True
+    forecast.resolution_evidence["ticker"]["security_id"] = "security-tampered"
+    assert lookup.verify_forecast(forecast) is False
+
+
 def test_source_bound_window_lookup_rejects_malformed_outer_containers(tmp_path):
     archive, artifact, receipt = _window(tmp_path)
 
@@ -111,3 +159,21 @@ def test_source_bound_window_lookup_rejects_malformed_outer_containers(tmp_path)
             raw_artifacts={artifact.raw_artifact_id: artifact},
             receipts=None,
         )
+
+
+def test_source_bound_window_lookup_loads_only_canonical_receipts(tmp_path):
+    archive, artifact, receipt = _window(tmp_path)
+    raw_receipt_path = tmp_path / "raw-artifact.json"
+    price_receipt_path = tmp_path / "price-window.json"
+    raw_receipt_path.write_bytes(artifact.canonical_json_bytes())
+    price_receipt_path.write_bytes(receipt.canonical_json_bytes())
+
+    lookup = load_source_bound_window_lookup(
+        raw_artifact_archive=archive.root,
+        raw_artifact_receipts=(raw_receipt_path,),
+        price_window_receipts=(price_receipt_path,),
+    )
+
+    window = lookup("T000", "2026-01-05", "2026-01-07")
+    assert window is not None
+    assert window.entry_close == "10"

@@ -45,6 +45,29 @@ WINDOW_A = {"entry_date": "2026-06-02", "exit_date": "2026-06-09"}
 WINDOW_B = {"entry_date": "2026-06-02", "exit_date": "2026-06-10"}
 
 
+def _source_bound_resolution_evidence() -> dict[str, object]:
+    def leg(marker: str) -> dict[str, str]:
+        return {
+            "schema_version": "source_bound_price_window_evidence/v1",
+            "window_id": f"spw-{marker}",
+            "window_sha256": marker * 64,
+            "security_id": f"security-{marker}",
+            "raw_artifact_id": f"pit-{marker}",
+            "raw_artifact_sha256": marker * 64,
+            "decision_cutoff": "2026-06-12T00:00:00+00:00",
+            "retrieved_at": "2026-06-11T00:00:00+00:00",
+            "feed": "iex",
+            "adjustment_mode": "all",
+            "adjustment_status": "total_return_adjusted",
+        }
+
+    return {
+        "schema_version": "source_bound_resolution_evidence/v1",
+        "ticker": leg("a"),
+        "benchmark": leg("b"),
+    }
+
+
 def _forecast(
     forecast_id="af-x",
     *,
@@ -437,7 +460,7 @@ def test_summarize_agent_scores_exposes_deterministic_dependence_block():
     assert summary["dependence"]["raw_resolved_rows_are_independent_observations"] is False
 
 
-def test_earned_influence_behavior_is_unchanged_by_dependence_fields():
+def test_unverified_source_metadata_cannot_earn_influence_despite_dependence_fields():
     def row(fid, agent, outcome):
         return _forecast(
             fid,
@@ -447,6 +470,8 @@ def test_earned_influence_behavior_is_unchanged_by_dependence_fields():
             brier_score="0.1156" if outcome else "0.4356",
             agent_score_delta="0.16" if outcome else "-0.16",
             relative_return="8.00" if outcome else "-2.00",
+            label_quality="high",
+            resolution_evidence=_source_bound_resolution_evidence(),
         )
 
     forecasts = []
@@ -459,10 +484,10 @@ def test_earned_influence_behavior_is_unchanged_by_dependence_fields():
     assert weights["kind"] == "agent_influence_weights"
     assert weights["execution_authority"] == "none"
     assert weights["forecast_count"] == 6
-    assert weights["agents"]["market_analyst"]["weight"] == "1.50"
-    assert weights["agents"]["market_analyst"]["state"] == "earned_weight"
-    assert weights["agents"]["news_analyst"]["weight"] == "0.50"
-    assert weights["agents"]["news_analyst"]["accuracy"] == "0.00"
+    assert weights["qualifying_resolved_count"] == 0
+    assert weights["agents"]["market_analyst"]["weight"] == "1.00"
+    assert weights["agents"]["market_analyst"]["state"] == "insufficient_history"
+    assert weights["agents"]["news_analyst"]["weight"] == "1.00"
 
 
 def test_cli_prints_canonical_json_and_hermetic_summary_state(tmp_path):

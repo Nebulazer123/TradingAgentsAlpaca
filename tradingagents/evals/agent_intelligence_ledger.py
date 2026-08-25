@@ -30,6 +30,7 @@ from tradingagents.evals.resolution_quality import (
     WindowLookup,
     audit_resolution_window,
 )
+from tradingagents.evals.source_bound_resolution import SourceBoundWindowLookup
 
 UTC = datetime.timezone.utc
 DEFAULT_LEDGER_PATH = Path("results/agent_intelligence/ledger.jsonl")
@@ -39,6 +40,24 @@ DEFAULT_BENCHMARK = "SPY"
 DEFAULT_AGENT_WEIGHT_FLOOR = Decimal("0.50")
 DEFAULT_AGENT_WEIGHT_CEILING = Decimal("1.50")
 DEFER_INVALID_FORECAST_TIMESTAMPS = "invalid_forecast_timestamps"
+NONQUALIFYING_LEGACY_PRICE_WINDOW = "legacy_yfinance_nonqualifying"
+_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v1"
+_SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_SCHEMA = "source_bound_price_window_evidence/v1"
+_SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "window_id",
+        "window_sha256",
+        "security_id",
+        "raw_artifact_id",
+        "raw_artifact_sha256",
+        "decision_cutoff",
+        "retrieved_at",
+        "feed",
+        "adjustment_mode",
+        "adjustment_status",
+    }
+)
 LEDGER_FORBIDDEN_EFFECTS = (
     "submit_order",
     "waive_live_gate",
@@ -126,9 +145,124 @@ class AgentForecast:
     label_quality: str | None = None
     quality_flags: list[str] = field(default_factory=list)
     resolution_window: dict[str, Any] | None = None
+    # Present only when both resolution legs were rebuilt from immutable
+    # source-bound adjusted-price receipts.
+    resolution_evidence: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _source_bound_window_evidence_from_mapping(evidence: Any) -> dict[str, str] | None:
+    """Copy one source-bound receipt identity after validating its shape."""
+
+    if not isinstance(evidence, Mapping) or set(evidence) != _SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_FIELDS:
+        return None
+    values = {key: evidence[key] for key in sorted(_SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_FIELDS)}
+    if (
+        values["schema_version"] != _SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_SCHEMA
+        or not all(isinstance(value, str) and value for value in values.values())
+    ):
+        return None
+    return values
+
+
+def _source_bound_window_evidence(window: Any) -> dict[str, str] | None:
+    """Copy the minimal immutable identity carried by a PIT price window."""
+
+    return _source_bound_window_evidence_from_mapping(
+        getattr(window, "source_evidence", None)
+    )
+
+
+def _source_bound_resolution_evidence(
+    ticker_window: Any,
+    benchmark_window: Any,
+) -> dict[str, Any] | None:
+    """Bind both return legs to the receipts that supplied their closes."""
+
+    ticker = _source_bound_window_evidence(ticker_window)
+    benchmark = _source_bound_window_evidence(benchmark_window)
+    if ticker is None or benchmark is None:
+        return None
+    return {
+        "schema_version": _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+        "ticker": ticker,
+        "benchmark": benchmark,
+    }
+
+
+def has_source_bound_resolution_evidence(forecast: AgentForecast) -> bool:
+    """Return whether a stored forecast retains both receipt-bound return legs."""
+
+    evidence = forecast.resolution_evidence
+    if (
+        not isinstance(evidence, Mapping)
+        or set(evidence) != {"schema_version", "ticker", "benchmark"}
+        or evidence["schema_version"] != _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA
+    ):
+        return False
+
+    return (
+        _source_bound_window_evidence_from_mapping(evidence["ticker"]) is not None
+        and _source_bound_window_evidence_from_mapping(evidence["benchmark"]) is not None
+    )
+
+
+def _is_qualifying_learning_forecast(forecast: AgentForecast) -> bool:
+    """Return whether a row may affect learned advisory influence weights."""
+
+    return (
+        forecast.resolved is True
+        and forecast.label_quality in {LABEL_QUALITY_HIGH, LABEL_QUALITY_DEGRADED}
+        and has_source_bound_resolution_evidence(forecast)
+    )
+
+
+def downgrade_nonqualifying_resolution_labels(
+    forecasts: Sequence[AgentForecast],
+    reports: Sequence[ResolutionQualityReport],
+) -> tuple[list[AgentForecast], list[ResolutionQualityReport]]:
+    """Retain legacy measurements as analysis, never as qualifying learning.
+
+    The yfinance route is deliberately a comparison/fallback route.  It can
+    record an exploratory outcome, but it cannot leave a high/degraded label
+    or an evidence record that later enters the immutable learning ledger.
+    """
+
+    downgraded_forecasts: list[AgentForecast] = []
+    for forecast in forecasts:
+        if not forecast.resolved or has_source_bound_resolution_evidence(forecast):
+            downgraded_forecasts.append(forecast)
+            continue
+        flags = list(dict.fromkeys([*forecast.quality_flags, NONQUALIFYING_LEGACY_PRICE_WINDOW]))
+        note = forecast.resolution_note or "resolved against legacy price window"
+        downgraded_forecasts.append(
+            replace(
+                forecast,
+                label_quality=LABEL_QUALITY_SUSPECT,
+                quality_flags=flags,
+                resolution_note=f"{note}; legacy price route is nonqualifying",
+                resolution_evidence=None,
+            )
+        )
+    downgraded_reports: list[ResolutionQualityReport] = []
+    for report in reports:
+        if report.status != STATUS_RESOLVABLE or report.label_quality is None:
+            downgraded_reports.append(report)
+            continue
+        flags = tuple(
+            dict.fromkeys([*report.quality_flags, NONQUALIFYING_LEGACY_PRICE_WINDOW])
+        )
+        downgraded_reports.append(
+            replace(
+                report,
+                label_quality=LABEL_QUALITY_SUSPECT,
+                quality_flags=flags,
+                note=f"{report.note}; legacy price route is nonqualifying",
+            )
+        )
+    return downgraded_forecasts, downgraded_reports
 
 
 def _as_utc(value: str | datetime.datetime | None = None) -> datetime.datetime:
@@ -1014,6 +1148,10 @@ def resolve_forecasts_with_quality(
                 label_quality=report.label_quality,
                 quality_flags=list(report.quality_flags),
                 resolution_window=report.window.as_dict() if report.window else None,
+                resolution_evidence=_source_bound_resolution_evidence(
+                    ticker_window,
+                    benchmark_window,
+                ),
             )
         )
     return updated, reports
@@ -1063,6 +1201,7 @@ def audit_resolved_forecasts(
                     label_quality=LABEL_QUALITY_SUSPECT,
                     quality_flags=["window_unverifiable"],
                     resolution_window=None,
+                    resolution_evidence=None,
                 )
             )
             continue
@@ -1097,6 +1236,7 @@ def audit_resolved_forecasts(
                     label_quality=LABEL_QUALITY_SUSPECT,
                     quality_flags=list(flags),
                     resolution_window=None,
+                    resolution_evidence=None,
                 )
             )
             continue
@@ -1131,6 +1271,11 @@ def audit_resolved_forecasts(
                 label_quality=label_quality,
                 quality_flags=list(flags),
                 resolution_window=window_payload,
+                resolution_evidence=(
+                    _source_bound_resolution_evidence(ticker_window, benchmark_window)
+                    if window_payload is not None
+                    else None
+                ),
             )
         )
     return updated, reports
@@ -1444,6 +1589,7 @@ def _forecast_matches_context(
 def agent_influence_weights(
     forecasts: Sequence[AgentForecast],
     *,
+    source_bound_verifier: SourceBoundWindowLookup | None = None,
     min_resolved: int = 3,
     floor: Decimal | str = DEFAULT_AGENT_WEIGHT_FLOOR,
     ceiling: Decimal | str = DEFAULT_AGENT_WEIGHT_CEILING,
@@ -1456,10 +1602,53 @@ def agent_influence_weights(
     """Compute bounded earned influence weights for TradingAgents roles.
 
     The result is advisory. It is meant for prompt/context weighting and policy
-    replays, not for bypassing execution safety.
+    replays, not for bypassing execution safety.  A source-looking mapping in
+    a mutable ledger is not sufficient to change a weight: callers must supply
+    the exact receipt lookup that re-verifies both return legs against their
+    immutable raw artifacts.  Without that proof path, all weights stay
+    neutral.
     """
 
-    summary = summarize_agent_scores(forecasts)
+    qualifying_forecasts = (
+        [
+            forecast
+            for forecast in forecasts
+            if _is_qualifying_learning_forecast(forecast)
+            and source_bound_verifier.verify_forecast(forecast)
+        ]
+        if type(source_bound_verifier) is SourceBoundWindowLookup
+        else []
+    )
+    return _agent_influence_weights_for_qualifying_forecasts(
+        forecasts,
+        qualifying_forecasts,
+        min_resolved=min_resolved,
+        floor=floor,
+        ceiling=ceiling,
+        ticker=ticker,
+        setup=setup,
+        sector=sector,
+        regime=regime,
+        evidence_type=evidence_type,
+    )
+
+
+def _agent_influence_weights_for_qualifying_forecasts(
+    forecasts: Sequence[AgentForecast],
+    qualifying_forecasts: Sequence[AgentForecast],
+    *,
+    min_resolved: int,
+    floor: Decimal | str,
+    ceiling: Decimal | str,
+    ticker: str | None,
+    setup: str | None,
+    sector: str | None,
+    regime: str | None,
+    evidence_type: str | None,
+) -> dict[str, Any]:
+    """Compute bounded advisory weights from an already proven row set."""
+
+    summary = summarize_agent_scores(qualifying_forecasts)
     floor_value = _decimal(floor, str(DEFAULT_AGENT_WEIGHT_FLOOR))
     ceiling_value = _decimal(ceiling, str(DEFAULT_AGENT_WEIGHT_CEILING))
     context_filters = {
@@ -1473,7 +1662,7 @@ def agent_influence_weights(
     context_forecasts = (
         [
             forecast
-            for forecast in forecasts
+            for forecast in qualifying_forecasts
             if _forecast_matches_context(forecast, **context_filters)
         ]
         if has_context
@@ -1482,7 +1671,16 @@ def agent_influence_weights(
     context_summary = summarize_agent_scores(context_forecasts) if has_context else {"agents": {}}
     context_resolved_count = sum(1 for forecast in context_forecasts if forecast.resolved)
     agents: dict[str, Any] = {}
-    for agent, stats in summary["agents"].items():
+    for agent in sorted({forecast.agent for forecast in forecasts}):
+        stats = summary["agents"].get(agent)
+        if stats is None:
+            agents[agent] = {
+                "weight": "1.00",
+                "state": "insufficient_history",
+                "resolved_count": 0,
+                "reason": "no source-bound qualifying resolved forecasts",
+            }
+            continue
         resolved_count = int(stats["resolved_count"] or 0)
         if resolved_count < max(1, int(min_resolved)):
             agents[agent] = {
@@ -1552,7 +1750,11 @@ def agent_influence_weights(
         agents[agent] = item
     return {
         "kind": "agent_influence_weights",
-        "forecast_count": summary["forecast_count"],
+        "forecast_count": len(forecasts),
+        "qualifying_forecast_count": len(qualifying_forecasts),
+        "qualifying_resolved_count": sum(
+            1 for forecast in qualifying_forecasts if forecast.resolved
+        ),
         "min_resolved": max(1, int(min_resolved)),
         "floor": str(floor_value),
         "ceiling": str(ceiling_value),
@@ -1565,6 +1767,35 @@ def agent_influence_weights(
         "execution_authority": "none",
         "forbidden_effects": list(LEDGER_FORBIDDEN_EFFECTS),
     }
+
+
+def _admitted_source_bound_influence_weights(
+    forecasts: Sequence[AgentForecast],
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Weight only rows already admitted through source-bound availability.
+
+    This is intentionally private to the learning-context adapter. That
+    adapter accepts only ``forecast_resolution_quality_source_bound`` records,
+    which ``LearningObservation.from_source_bound_forecast`` can create only
+    after the exact receipt lookup re-verifies both raw price legs.
+    """
+
+    qualifying_forecasts = [
+        forecast
+        for forecast in forecasts
+        if _is_qualifying_learning_forecast(forecast)
+    ]
+    options = {
+        "floor": DEFAULT_AGENT_WEIGHT_FLOOR,
+        "ceiling": DEFAULT_AGENT_WEIGHT_CEILING,
+        **kwargs,
+    }
+    return _agent_influence_weights_for_qualifying_forecasts(
+        forecasts,
+        qualifying_forecasts,
+        **options,
+    )
 
 
 def render_agent_influence_context(weights: Mapping[str, Any]) -> str:
@@ -1607,11 +1838,15 @@ def write_summary(
     forecasts: Sequence[AgentForecast],
     *,
     path: str | Path = DEFAULT_SUMMARY_PATH,
+    source_bound_verifier: SourceBoundWindowLookup | None = None,
 ) -> Path:
     summary_path = Path(path)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary = summarize_agent_scores(forecasts)
-    summary["influence_weights"] = agent_influence_weights(forecasts)
+    summary["influence_weights"] = agent_influence_weights(
+        forecasts,
+        source_bound_verifier=source_bound_verifier,
+    )
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True),
         encoding="utf-8",

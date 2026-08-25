@@ -57,6 +57,29 @@ def _window(**changes: object) -> dict[str, object]:
     return values
 
 
+def _resolution_evidence() -> dict[str, object]:
+    def leg(*, marker: str) -> dict[str, str]:
+        return {
+            "schema_version": "source_bound_price_window_evidence/v1",
+            "window_id": f"spw-{marker}",
+            "window_sha256": marker * 64,
+            "security_id": f"security-{marker}",
+            "raw_artifact_id": f"pit-{marker}",
+            "raw_artifact_sha256": marker * 64,
+            "decision_cutoff": "2026-07-18T15:00:00+00:00",
+            "retrieved_at": "2026-07-18T14:00:00+00:00",
+            "feed": "iex",
+            "adjustment_mode": "all",
+            "adjustment_status": "total_return_adjusted",
+        }
+
+    return {
+        "schema_version": "source_bound_resolution_evidence/v1",
+        "ticker": leg(marker="a"),
+        "benchmark": leg(marker="b"),
+    }
+
+
 def _forecast(index: int = 1, **changes: object) -> AgentForecast:
     values: dict[str, object] = {
         "forecast_id": f"af-safe-{index:03d}",
@@ -88,6 +111,7 @@ def _forecast(index: int = 1, **changes: object) -> AgentForecast:
         "label_quality": "high",
         "quality_flags": [],
         "resolution_window": _window(),
+        "resolution_evidence": _resolution_evidence(),
     }
     values.update(changes)
     return AgentForecast(**values)
@@ -99,9 +123,43 @@ def _forecast_observation(
     recorded_at: dt.datetime = dt.datetime(2026, 7, 18, 15, 5, tzinfo=UTC),
     **changes: object,
 ) -> LearningObservation:
-    return LearningObservation.from_forecast(
-        _forecast(index, **changes),
+    forecast = _forecast(index, **changes)
+    payload_fields = (
+        "forecast_id",
+        "agent",
+        "ticker",
+        "forecast_type",
+        "horizon",
+        "probability",
+        "direction",
+        "benchmark",
+        "sector",
+        "evidence_sources",
+        "evidence_refs",
+        "setup",
+        "regime",
+        "created_at",
+        "resolve_after",
+        "source_packet_id",
+        "resolved",
+        "outcome",
+        "actual_return",
+        "benchmark_return",
+        "relative_return",
+        "brier_score",
+        "agent_score_delta",
+        "resolved_at",
+        "label_quality",
+        "quality_flags",
+        "resolution_window",
+        "resolution_evidence",
+    )
+    return LearningObservation._create(
+        source_kind="forecast_resolution_quality_source_bound",
+        source_id=forecast.forecast_id,
+        effective_at=forecast.resolved_at,
         recorded_at=recorded_at,
+        payload={field: getattr(forecast, field) for field in payload_fields},
     )
 
 

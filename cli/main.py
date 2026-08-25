@@ -155,8 +155,10 @@ from tradingagents.evals.agent_intelligence_ledger import (
     agent_influence_weights,
     append_forecasts,
     audit_resolved_forecasts,
+    downgrade_nonqualifying_resolution_labels,
     forecasts_from_mirofish_handoff_packet,
     forecasts_from_overnight_packet,
+    has_source_bound_resolution_evidence,
     load_ledger,
     load_ledger_with_stats,
     render_agent_influence_context,
@@ -210,6 +212,9 @@ from tradingagents.evals.resolution_quality import (
     DEFAULT_RESOLUTION_QUALITY_PATH,
     price_window_from_bars,
     summarize_resolution_quality,
+)
+from tradingagents.evals.source_bound_resolution import (
+    load_source_bound_window_lookup,
 )
 from tradingagents.evals.source_quality import (
     build_compact_source_quality_review,
@@ -1569,6 +1574,25 @@ def research_agent_ledger_resolve(
         "--learning-availability-root",
         help="Immutable point-in-time learning availability ledger root.",
     ),
+    pit_raw_artifact_archive: Path | None = typer.Option(
+        None,
+        "--pit-raw-artifact-archive",
+        help="Immutable PIT raw-artifact archive root for source-bound resolution.",
+    ),
+    pit_raw_artifact_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-raw-artifact-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical raw-artifact receipt JSON. Repeat for every ticker/benchmark source.",
+    ),
+    pit_price_window_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-price-window-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical source-bound adjusted-price receipt JSON. Repeat for every window.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     context_ticker: str = typer.Option("", "--context-ticker"),
     context_setup: str = typer.Option("", "--context-setup"),
@@ -1581,23 +1605,59 @@ def research_agent_ledger_resolve(
 
     Forecasts whose windows fail the mechanical audit (missing final bar,
     mismatched ticker/benchmark sessions, stale data) are deferred with a
-    machine-readable reason instead of being scored against bad windows.
+    machine-readable reason instead of being scored against bad windows.  The
+    default legacy yfinance route is explicitly nonqualifying; immutable PIT
+    receipts are required before a result can enter learning availability.
     """
     producer_recorded_at = _learning_producer_now()
     availability_root = _forecast_learning_availability_root(
         ledger_path,
         learning_availability_root,
     )
+    pit_inputs_supplied = (
+        pit_raw_artifact_archive is not None
+        or bool(pit_raw_artifact_receipts)
+        or bool(pit_price_window_receipts)
+    )
+    if pit_inputs_supplied and (
+        pit_raw_artifact_archive is None
+        or not pit_raw_artifact_receipts
+        or not pit_price_window_receipts
+    ):
+        raise typer.BadParameter(
+            "source-bound resolution requires --pit-raw-artifact-archive plus at least "
+            "one --pit-raw-artifact-receipt and --pit-price-window-receipt"
+        )
+    if pit_inputs_supplied:
+        try:
+            window_lookup = load_source_bound_window_lookup(
+                raw_artifact_archive=pit_raw_artifact_archive,
+                raw_artifact_receipts=tuple(pit_raw_artifact_receipts),
+                price_window_receipts=tuple(pit_price_window_receipts),
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"source-bound PIT resolution inputs are invalid: {exc}"
+            ) from exc
+        price_window_route = "source_bound_adjusted_pit_receipts"
+    else:
+        window_lookup = _ledger_window_lookup
+        price_window_route = "legacy_yfinance_nonqualifying"
     forecasts = load_ledger(ledger_path)
     unaudited_before = sum(
         1 for forecast in forecasts if forecast.resolved and not forecast.label_quality
     )
     resolved, quality_reports = resolve_forecasts_with_quality(
         forecasts,
-        window_lookup=_ledger_window_lookup,
+        window_lookup=window_lookup,
         now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
+    if not pit_inputs_supplied:
+        resolved, quality_reports = downgrade_nonqualifying_resolution_labels(
+            resolved,
+            quality_reports,
+        )
     quality_summary = summarize_resolution_quality(
         quality_reports,
         unaudited_resolved_count=unaudited_before,
@@ -1607,8 +1667,13 @@ def research_agent_ledger_resolve(
         resolved,
         availability_root=availability_root,
         recorded_at=producer_recorded_at,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
     )
-    write_summary(resolved, path=summary_path)
+    write_summary(
+        resolved,
+        path=summary_path,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
+    )
     resolution_quality_path.parent.mkdir(parents=True, exist_ok=True)
     resolution_quality_path.write_text(
         json.dumps(quality_summary, indent=2, sort_keys=True),
@@ -1618,6 +1683,7 @@ def research_agent_ledger_resolve(
     after = sum(1 for forecast in resolved if forecast.resolved)
     influence = agent_influence_weights(
         resolved,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
         ticker=context_ticker or None,
         setup=context_setup or None,
         sector=context_sector or None,
@@ -1631,6 +1697,12 @@ def research_agent_ledger_resolve(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "resolution_quality_path": str(resolution_quality_path),
+        "price_window_route": price_window_route,
+        "economic_qualification": (
+            "source_bound_ledger_resolution_only"
+            if pit_inputs_supplied
+            else "legacy_nonqualifying"
+        ),
         "learning_availability_root": str(availability_root),
         "learning_observed_count": len(availability_admissions),
         "learning_newly_recorded_count": sum(
@@ -1680,6 +1752,25 @@ def research_ledger_quality_audit(
         "--learning-availability-root",
         help="Immutable point-in-time learning availability ledger root.",
     ),
+    pit_raw_artifact_archive: Path | None = typer.Option(
+        None,
+        "--pit-raw-artifact-archive",
+        help="Immutable PIT raw-artifact archive root for source-bound audit.",
+    ),
+    pit_raw_artifact_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-raw-artifact-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical raw-artifact receipt JSON. Repeat for every ticker/benchmark source.",
+    ),
+    pit_price_window_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-price-window-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical source-bound adjusted-price receipt JSON. Repeat for every window.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     backup: bool = typer.Option(
         True,
@@ -1701,6 +1792,35 @@ def research_ledger_quality_audit(
         ledger_path,
         learning_availability_root,
     )
+    pit_inputs_supplied = (
+        pit_raw_artifact_archive is not None
+        or bool(pit_raw_artifact_receipts)
+        or bool(pit_price_window_receipts)
+    )
+    if pit_inputs_supplied and (
+        pit_raw_artifact_archive is None
+        or not pit_raw_artifact_receipts
+        or not pit_price_window_receipts
+    ):
+        raise typer.BadParameter(
+            "source-bound audit requires --pit-raw-artifact-archive plus at least "
+            "one --pit-raw-artifact-receipt and --pit-price-window-receipt"
+        )
+    if pit_inputs_supplied:
+        try:
+            window_lookup = load_source_bound_window_lookup(
+                raw_artifact_archive=pit_raw_artifact_archive,
+                raw_artifact_receipts=tuple(pit_raw_artifact_receipts),
+                price_window_receipts=tuple(pit_price_window_receipts),
+            )
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"source-bound PIT audit inputs are invalid: {exc}"
+            ) from exc
+        price_window_route = "source_bound_adjusted_pit_receipts"
+    else:
+        window_lookup = _ledger_window_lookup
+        price_window_route = "legacy_yfinance_nonqualifying"
     forecasts, corrupt_line_count = load_ledger_with_stats(ledger_path)
     resolved_count = sum(1 for forecast in forecasts if forecast.resolved)
     backup_path: Path | None = None
@@ -1710,19 +1830,43 @@ def research_ledger_quality_audit(
             f"{ledger_path.stem}.backup-quality-audit-{stamp}.jsonl"
         )
         backup_path.write_text(ledger_path.read_text(encoding="utf-8"), encoding="utf-8")
-    audited, quality_reports = audit_resolved_forecasts(
-        forecasts,
-        window_lookup=_ledger_window_lookup,
+    audit_targets = (
+        forecasts
+        if pit_inputs_supplied
+        else [
+            forecast
+            for forecast in forecasts
+            if not has_source_bound_resolution_evidence(forecast)
+        ]
+    )
+    audited_targets, quality_reports = audit_resolved_forecasts(
+        audit_targets,
+        window_lookup=window_lookup,
         now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
+    if pit_inputs_supplied:
+        audited = audited_targets
+    else:
+        audited_by_id = {forecast.forecast_id: forecast for forecast in audited_targets}
+        audited = [audited_by_id.get(forecast.forecast_id, forecast) for forecast in forecasts]
+    if not pit_inputs_supplied:
+        audited, quality_reports = downgrade_nonqualifying_resolution_labels(
+            audited,
+            quality_reports,
+        )
     write_ledger(audited, path=ledger_path)
     availability_admissions = observe_forecasts(
         audited,
         availability_root=availability_root,
         recorded_at=producer_recorded_at,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
     )
-    write_summary(audited, path=summary_path)
+    write_summary(
+        audited,
+        path=summary_path,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
+    )
     quality_summary = summarize_resolution_quality(quality_reports)
     quality_path.parent.mkdir(parents=True, exist_ok=True)
     quality_path.write_text(
@@ -1741,6 +1885,12 @@ def research_ledger_quality_audit(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "quality_path": str(quality_path),
+        "price_window_route": price_window_route,
+        "economic_qualification": (
+            "source_bound_ledger_resolution_only"
+            if pit_inputs_supplied
+            else "legacy_nonqualifying"
+        ),
         "learning_availability_root": str(availability_root),
         "learning_observed_count": len(availability_admissions),
         "learning_newly_recorded_count": sum(
@@ -1808,10 +1958,11 @@ def research_agent_ledger_update(
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Append latest advisory forecasts, resolve due forecasts, and write summary.
+    """Append latest advisory forecasts and write a nonqualifying summary.
 
-    This is the automation-safe one-shot path for the Agent Intelligence Ledger.
-    It mutates only ledger/summary files and has no execution authority.
+    Source-bound price receipts are required by ``agent-ledger-resolve`` before
+    any due forecast is resolved.  This automation-safe ingestion path never
+    uses a legacy downloader to manufacture learning-quality labels.
     """
 
     producer_recorded_at = _learning_producer_now()
@@ -1850,20 +2001,8 @@ def research_agent_ledger_update(
     appended = append_forecasts(discovered_forecasts, path=ledger_path)
 
     forecasts = load_ledger(ledger_path)
-    unaudited_before = sum(
-        1 for forecast in forecasts if forecast.resolved and not forecast.label_quality
-    )
-    resolved, quality_reports = resolve_forecasts_with_quality(
-        forecasts,
-        window_lookup=_ledger_window_lookup,
-        now=producer_recorded_at,
-        alpha_threshold_pct=threshold,
-    )
-    quality_summary = summarize_resolution_quality(
-        quality_reports,
-        unaudited_resolved_count=unaudited_before,
-    )
-    write_ledger(resolved, path=ledger_path)
+    resolved = forecasts
+    quality_summary = summarize_resolution_quality((), unaudited_resolved_count=0)
     availability_admissions = observe_forecasts(
         resolved,
         availability_root=availability_root,
@@ -1897,6 +2036,8 @@ def research_agent_ledger_update(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "learning_availability_root": str(availability_root),
+        "price_window_route": "not_resolved_by_agent_ledger_update",
+        "economic_qualification": "requires_source_bound_ledger_resolution",
         "learning_observed_count": len(availability_admissions),
         "learning_newly_recorded_count": sum(
             admission.created for admission in availability_admissions

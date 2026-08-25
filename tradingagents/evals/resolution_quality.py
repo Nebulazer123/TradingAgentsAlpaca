@@ -22,7 +22,7 @@ paths, live gates, or sizing.
 from __future__ import annotations
 
 import datetime
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -72,6 +72,11 @@ class PriceWindow:
     exit_date: str
     exit_close: str
     session_count: int
+    # Optional immutable provenance carried by point-in-time adapters.  The
+    # quality audit intentionally remains able to inspect legacy windows, but
+    # only callers that receive this provenance may create source-bound
+    # learning evidence.
+    source_evidence: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
