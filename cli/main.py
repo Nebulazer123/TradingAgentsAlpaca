@@ -13,7 +13,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
@@ -144,6 +144,7 @@ from tradingagents.dataflows.integration_registry import build_integration_regis
 from tradingagents.dataflows.pit import (
     PointInTimeCohortCandidate,
     build_point_in_time_cohort,
+    validate_market_date_partitions,
     validate_security_identity,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -195,8 +196,16 @@ from tradingagents.evals.economic_evaluation_admission import (
     EconomicEvaluationAdmissionAdapter,
     EconomicEvaluationAdmissionError,
 )
+from tradingagents.evals.economic_evaluation_partition_binding import (
+    bind_validation_phase_eligibility,
+)
 from tradingagents.evals.economic_evaluation_protocol import (
     validate_frozen_evaluation_protocol,
+)
+from tradingagents.evals.economic_tournament import (
+    EconomicTournamentCandidate,
+    EconomicTournamentOutcome,
+    evaluate_validation_ta_control,
 )
 from tradingagents.evals.email_clarity import evaluate_email_clarity, write_email_clarity_eval
 from tradingagents.evals.execution_board import (
@@ -2797,6 +2806,245 @@ def _write_economic_receipt(path: Path, payload: dict[str, object], *, label: st
     return path
 
 
+def _economic_decimal(value: object, *, label: str) -> Decimal:
+    """Parse one finite decimal required by the frozen pullback rule."""
+
+    if type(value) is not str:
+        raise typer.BadParameter(f"{label} must be a decimal string")
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise typer.BadParameter(f"{label} must be a decimal string") from exc
+    if not parsed.is_finite():
+        raise typer.BadParameter(f"{label} must be finite")
+    return parsed
+
+
+def _economic_pullback_features(value: object, *, label: str) -> PullbackFeatures | None:
+    """Parse complete pullback inputs without allowing an implicit live route."""
+
+    if value is None:
+        return None
+    fields = frozenset(
+        {
+            "symbol",
+            "current_price",
+            "support_level",
+            "atr",
+            "pullback_atr",
+            "above_rising_50d",
+            "above_rising_200d",
+            "sell_volume_state",
+            "gap_state",
+            "sector_relative_strength",
+            "regime_state",
+            "earnings_blackout",
+            "fresh_negative_event",
+            "green_spike_atr",
+            "evidence_trend",
+            "reward_risk_ratio",
+            "notional_usd",
+        }
+    )
+    payload = _economic_exact_object(value, label=label, fields=fields)
+    string_fields = (
+        "symbol",
+        "sell_volume_state",
+        "gap_state",
+        "regime_state",
+        "evidence_trend",
+    )
+    if any(type(payload[field]) is not str or not payload[field] for field in string_fields):
+        raise typer.BadParameter(f"{label} string fields are invalid")
+    bool_fields = (
+        "above_rising_50d",
+        "above_rising_200d",
+        "earnings_blackout",
+        "fresh_negative_event",
+    )
+    if any(type(payload[field]) is not bool for field in bool_fields):
+        raise typer.BadParameter(f"{label} boolean fields are invalid")
+    return PullbackFeatures(
+        symbol=payload["symbol"],
+        current_price=_economic_decimal(payload["current_price"], label=f"{label}.current_price"),
+        support_level=_economic_decimal(payload["support_level"], label=f"{label}.support_level"),
+        atr=_economic_decimal(payload["atr"], label=f"{label}.atr"),
+        pullback_atr=_economic_decimal(payload["pullback_atr"], label=f"{label}.pullback_atr"),
+        above_rising_50d=payload["above_rising_50d"],
+        above_rising_200d=payload["above_rising_200d"],
+        sell_volume_state=payload["sell_volume_state"],
+        gap_state=payload["gap_state"],
+        sector_relative_strength=_economic_decimal(
+            payload["sector_relative_strength"],
+            label=f"{label}.sector_relative_strength",
+        ),
+        regime_state=payload["regime_state"],
+        earnings_blackout=payload["earnings_blackout"],
+        fresh_negative_event=payload["fresh_negative_event"],
+        green_spike_atr=_economic_decimal(
+            payload["green_spike_atr"], label=f"{label}.green_spike_atr"
+        ),
+        evidence_trend=payload["evidence_trend"],
+        reward_risk_ratio=_economic_decimal(
+            payload["reward_risk_ratio"], label=f"{label}.reward_risk_ratio"
+        ),
+        notional_usd=_economic_decimal(payload["notional_usd"], label=f"{label}.notional_usd"),
+    )
+
+
+def _economic_tournament_candidate(value: object, *, label: str) -> EconomicTournamentCandidate:
+    """Rebuild one explicit, cutoff-limited candidate for a frozen arm."""
+
+    payload = _economic_exact_object(
+        value,
+        label=label,
+        fields=frozenset(
+            {
+                "symbol",
+                "available_at",
+                "close_t_21",
+                "close_t_252",
+                "trailing_operating_income",
+                "average_total_assets",
+                "pullback_features",
+            }
+        ),
+    )
+    for field in (
+        "close_t_21",
+        "close_t_252",
+        "trailing_operating_income",
+        "average_total_assets",
+    ):
+        if payload[field] is not None and type(payload[field]) is not str:
+            raise typer.BadParameter(f"{label}.{field} must be a decimal string or null")
+    if type(payload["available_at"]) is not str:
+        raise typer.BadParameter(f"{label}.available_at must be canonical UTC")
+    _economic_effective_at(payload["available_at"])
+    try:
+        return EconomicTournamentCandidate(
+            symbol=payload["symbol"],
+            available_at=payload["available_at"],
+            close_t_21=payload["close_t_21"],
+            close_t_252=payload["close_t_252"],
+            trailing_operating_income=payload["trailing_operating_income"],
+            average_total_assets=payload["average_total_assets"],
+            pullback_features=_economic_pullback_features(
+                payload["pullback_features"],
+                label=f"{label}.pullback_features",
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"{label} is invalid: {exc}") from exc
+
+
+def _economic_tournament_inputs(
+    payload: dict[str, object],
+    *,
+    expected_event_ids: tuple[str, ...],
+) -> tuple[dict[str, tuple[EconomicTournamentCandidate, ...]], tuple[EconomicTournamentOutcome, ...]]:
+    """Require one complete, canonically ordered validation tournament input."""
+
+    values = _economic_exact_object(
+        payload,
+        label="economic tournament input",
+        fields=frozenset({"candidates_by_event", "outcomes"}),
+    )
+    raw_candidates = values["candidates_by_event"]
+    raw_outcomes = values["outcomes"]
+    if type(raw_candidates) is not list or type(raw_outcomes) is not list:
+        raise typer.BadParameter("economic tournament inputs must contain JSON lists")
+    candidate_rows: list[tuple[str, tuple[EconomicTournamentCandidate, ...]]] = []
+    for index, raw_row in enumerate(raw_candidates):
+        row = _economic_exact_object(
+            raw_row,
+            label=f"economic tournament candidates_by_event[{index}]",
+            fields=frozenset({"decision_event_id", "candidates"}),
+        )
+        if type(row["decision_event_id"]) is not str or type(row["candidates"]) is not list:
+            raise typer.BadParameter(
+                f"economic tournament candidates_by_event[{index}] is invalid"
+            )
+        candidate_rows.append(
+            (
+                row["decision_event_id"],
+                tuple(
+                    _economic_tournament_candidate(
+                        candidate,
+                        label=f"economic tournament candidates_by_event[{index}].candidates[{offset}]",
+                    )
+                    for offset, candidate in enumerate(row["candidates"])
+                ),
+            )
+        )
+    if tuple(item[0] for item in candidate_rows) != expected_event_ids:
+        raise typer.BadParameter(
+            "economic tournament candidate rows must exactly match canonical validation IDs"
+        )
+    outcome_rows: list[EconomicTournamentOutcome] = []
+    for index, raw_row in enumerate(raw_outcomes):
+        row = _economic_exact_object(
+            raw_row,
+            label=f"economic tournament outcomes[{index}]",
+            fields=frozenset({"decision_event_id", "realized_returns"}),
+        )
+        returns = row["realized_returns"]
+        if type(row["decision_event_id"]) is not str or type(returns) is not list:
+            raise typer.BadParameter(f"economic tournament outcomes[{index}] is invalid")
+        return_rows: list[tuple[str, str]] = []
+        for offset, raw_return in enumerate(returns):
+            realized = _economic_exact_object(
+                raw_return,
+                label=f"economic tournament outcomes[{index}].realized_returns[{offset}]",
+                fields=frozenset({"symbol", "return"}),
+            )
+            if type(realized["symbol"]) is not str or type(realized["return"]) is not str:
+                raise typer.BadParameter(
+                    f"economic tournament outcomes[{index}].realized_returns[{offset}] is invalid"
+                )
+            return_rows.append((realized["symbol"], realized["return"]))
+        try:
+            outcome_rows.append(
+                EconomicTournamentOutcome(
+                    decision_event_id=row["decision_event_id"],
+                    realized_returns=tuple(return_rows),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise typer.BadParameter(
+                f"economic tournament outcomes[{index}] are invalid: {exc}"
+            ) from exc
+    if tuple(item.decision_event_id for item in outcome_rows) != expected_event_ids:
+        raise typer.BadParameter(
+            "economic tournament outcome rows must exactly match canonical validation IDs"
+        )
+    return dict(candidate_rows), tuple(outcome_rows)
+
+
+def _economic_validation_report(
+    *,
+    protocol_id: str,
+    partitions: object,
+    validation_event_ids: tuple[str, ...],
+    result: object,
+) -> dict[str, object]:
+    """Wrap one canonical validation result in the immutable admission schema."""
+
+    result_payload = result.to_dict()
+    return {
+        "schema_version": "economic_validation_report/v2",
+        "protocol_id": protocol_id,
+        "market_date_partitions": partitions.to_dict(),
+        "validation_event_ids": list(validation_event_ids),
+        "result": result_payload,
+        "result_id": result_payload["result_id"],
+        "result_sha256": result_payload["result_sha256"],
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+
+
 def _economic_effective_at(value: str) -> datetime.datetime:
     """Parse a canonical, second-aligned UTC receipt timestamp."""
 
@@ -2853,6 +3101,109 @@ def research_economic_cohort_build(
         return
     console.print(f"Economic cohort: {cohort.cohort_id}")
     console.print(f"Canonical local receipt: {written}")
+    console.print("Analysis-only; this receipt grants no execution or promotion authority.")
+
+
+@research_app.command("economic-tournament-run")
+def research_economic_tournament_run(
+    protocol_path: Path = typer.Option(
+        ...,
+        "--protocol-path",
+        exists=True,
+        readable=True,
+        help="Canonical frozen protocol JSON receipt already admitted to the evidence store.",
+    ),
+    partitions_path: Path = typer.Option(
+        ...,
+        "--partitions-path",
+        exists=True,
+        readable=True,
+        help="Canonical PIT market-date partition receipt for this protocol.",
+    ),
+    tournament_input_path: Path = typer.Option(
+        ...,
+        "--tournament-input-path",
+        exists=True,
+        readable=True,
+        help="Canonical candidates and realized-outcomes JSON for validation only.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root retained for the immutable admission adapter identity.",
+    ),
+    effective_at: str = typer.Option(
+        ...,
+        "--effective-at",
+        help="Canonical UTC timestamp for the immutable validation-only receipt.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Admit one sealed validation TA-Control result as analysis-only evidence."""
+
+    protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
+    partitions_payload = _economic_json_object(partitions_path, label="partitions-path")
+    tournament_payload = _economic_json_object(
+        tournament_input_path,
+        label="tournament-input-path",
+    )
+    effective = _economic_effective_at(effective_at)
+    try:
+        protocol = validate_frozen_evaluation_protocol(protocol_payload)
+        eligibility = bind_validation_phase_eligibility(
+            protocol=protocol,
+            partitions=validate_market_date_partitions(partitions_payload),
+        )
+        candidates_by_event, outcomes = _economic_tournament_inputs(
+            tournament_payload,
+            expected_event_ids=eligibility.event_ids,
+        )
+        result = evaluate_validation_ta_control(
+            protocol=protocol,
+            eligibility=eligibility,
+            candidates_by_event=candidates_by_event,
+            outcomes=outcomes,
+        )
+        admission = EconomicEvaluationAdmissionAdapter(
+            evidence_root,
+            repo_root=repo_root,
+        ).admit_evaluation_run(
+            protocol.protocol_id,
+            phase="validation",
+            effective_at=effective,
+            frozen_validation_report=_economic_validation_report(
+                protocol_id=protocol.protocol_id,
+                partitions=eligibility.partitions,
+                validation_event_ids=eligibility.event_ids,
+                result=result,
+            ),
+        )
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic tournament admission rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": result.protocol_id,
+        "validation_result_id": result.result_id,
+        "validation_partition_id": result.validation_partition_id,
+        "evaluation_run_object_id": admission.envelope.object_id,
+        "created": admission.created,
+        "evidence_root": str(evidence_root),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic validation result: {result.result_id}")
+    console.print(f"Immutable validation admission: {admission.envelope.object_id}")
     console.print("Analysis-only; this receipt grants no execution or promotion authority.")
 
 

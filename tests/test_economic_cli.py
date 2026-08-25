@@ -11,6 +11,11 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from cli.main import app
+from tradingagents.dataflows.pit import (
+    RawPointInTimeArtifactArchive,
+    build_market_date_partitions,
+    build_market_session_calendar,
+)
 from tradingagents.evals.economic_evaluation_protocol import (
     EvaluationSearchBudget,
     build_bitemporal_input_manifest,
@@ -71,6 +76,118 @@ def _protocol():
         validation_event_ids=(events[1].decision_event_id,),
         holdout_event_ids=(events[2].decision_event_id,),
     )
+
+
+def _market_dates() -> tuple[str, ...]:
+    day = dt.date(2026, 1, 5)
+    dates: list[str] = []
+    while len(dates) < 60:
+        if day.weekday() < 5:
+            dates.append(day.isoformat())
+        day += dt.timedelta(days=1)
+    return tuple(dates)
+
+
+def _partitioned_protocol(tmp_path: Path):
+    primary = tuple(f"T{index:03d}" for index in range(75))
+    market_dates = _market_dates()
+    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
+    artifact = archive.admit(
+        raw_bytes=json.dumps([{"date": value} for value in market_dates]).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2026-12-31T21:00:00+00:00",
+    )
+    calendar = build_market_session_calendar(archive=archive, raw_artifact=artifact)
+    events = tuple(
+        build_decision_event(
+            universe_id=canonical_universe_id(primary),
+            symbol=primary[index % len(primary)],
+            decision_at=f"{market_date}T20:55:00+00:00",
+            market_date=market_date,
+            horizon_sessions=5,
+            horizon="5_sessions",
+            benchmark="SPY",
+            created_at=f"{market_date}T20:45:00+00:00",
+            resolution_window={"start_at": f"{market_date}T20:55:00+00:00"},
+            observation_start=f"{market_date}T19:00:00+00:00",
+            observation_end=f"{market_date}T20:50:00+00:00",
+            available_at=f"{market_date}T20:50:00+00:00",
+            recorded_at=f"{market_date}T20:52:00+00:00",
+            source_packet_id=f"packet-{market_date}-{index:03d}",
+            source_artifact_id=f"artifact-{market_date}-{index:03d}",
+            source_artifact_sha256=hashlib.sha256(
+                f"{market_date}-{index:03d}".encode()
+            ).hexdigest(),
+        )
+        for index, market_date in enumerate(market_dates)
+    )
+    partitions = build_market_date_partitions(
+        market_calendar=calendar,
+        events=events,
+    )
+    manifest = build_bitemporal_input_manifest(
+        dataset_id="economic-cli-partitioned-fixture",
+        as_of_cutoff="2026-12-31T21:00:00+00:00",
+        captured_at="2026-12-31T21:00:00+00:00",
+        events=events,
+    )
+    protocol = build_frozen_evaluation_protocol(
+        input_manifest=manifest,
+        primary_universe=primary,
+        sensitivity_universe_50=primary[:50],
+        sensitivity_universe_100=tuple(f"T{index:03d}" for index in range(100)),
+        evaluation_policy=StrategyEvaluationPolicy(
+            benchmark_symbol="SPY",
+            holding_sessions=5,
+            commission_bps_per_side="0",
+            half_spread_bps_per_side="5",
+            slippage_bps_per_side="5",
+            round_trip_sides=2,
+        ),
+        search_budget=EvaluationSearchBudget(5, 3, 25),
+        development_event_ids=partitions.development_event_ids,
+        validation_event_ids=partitions.validation_event_ids,
+        holdout_event_ids=partitions.holdout_event_ids,
+    )
+    return protocol, partitions
+
+
+def _tournament_input(protocol, partitions) -> dict[str, object]:
+    events_by_id = {
+        event.decision_event_id: event for event in protocol.input_manifest.events
+    }
+    event_ids = partitions.validation_eligible_event_ids
+    return {
+        "candidates_by_event": [
+            {
+                "decision_event_id": event_id,
+                "candidates": [
+                    {
+                        "symbol": symbol,
+                        "available_at": events_by_id[event_id].available_at,
+                        "close_t_21": "110" if symbol == "T000" else None,
+                        "close_t_252": "100" if symbol == "T000" else None,
+                        "trailing_operating_income": "10" if symbol == "T000" else None,
+                        "average_total_assets": "100" if symbol == "T000" else None,
+                        "pullback_features": None,
+                    }
+                    for symbol in protocol.primary_universe
+                ],
+            }
+            for event_id in event_ids
+        ],
+        "outcomes": [
+            {
+                "decision_event_id": event_id,
+                "realized_returns": [
+                    {"symbol": symbol, "return": "0.02" if symbol == "SPY" else "0.01"}
+                    for symbol in sorted((*protocol.primary_universe, "SPY"))
+                ],
+            }
+            for event_id in event_ids
+        ],
+    }
 
 
 def _admit_args(tmp_path: Path, protocol_path: Path):
@@ -228,6 +345,130 @@ def test_economic_cohort_build_rejects_different_existing_receipt_without_overwr
 
     assert result.exit_code == 2
     assert output_path.read_bytes() == original
+
+
+def test_economic_tournament_run_binds_only_purged_validation_results(tmp_path: Path):
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    protocol_path = tmp_path / "protocol.json"
+    partitions_path = tmp_path / "partitions.json"
+    tournament_path = tmp_path / "tournament-input.json"
+    protocol_path.write_text(json.dumps(protocol.to_dict()), encoding="utf-8")
+    partitions_path.write_text(json.dumps(partitions.to_dict()), encoding="utf-8")
+    tournament_path.write_text(
+        json.dumps(_tournament_input(protocol, partitions)),
+        encoding="utf-8",
+    )
+    admission_args = _admit_args(tmp_path, protocol_path)
+    admitted = runner.invoke(app, admission_args)
+    assert admitted.exit_code == 0, admitted.output
+    args = [
+        "research",
+        "economic-tournament-run",
+        "--protocol-path",
+        str(protocol_path),
+        "--partitions-path",
+        str(partitions_path),
+        "--tournament-input-path",
+        str(tournament_path),
+        "--evidence-root",
+        str(tmp_path / "evidence"),
+        "--repo-root",
+        str(tmp_path / "repo"),
+        "--effective-at",
+        NOW.isoformat(timespec="seconds"),
+        "--json-output",
+    ]
+
+    first = runner.invoke(app, args)
+    second = runner.invoke(app, args)
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    first_payload = json.loads(first.output)
+    second_payload = json.loads(second.output)
+    assert first_payload["analysis_only"] is True
+    assert first_payload["execution_authority"] == "none"
+    assert first_payload["can_submit_orders"] is False
+    assert first_payload["protocol_id"] == protocol.protocol_id
+    assert first_payload["created"] is True
+    assert second_payload["created"] is False
+    assert second_payload["evaluation_run_object_id"] == first_payload["evaluation_run_object_id"]
+
+
+def test_economic_tournament_run_rejects_malformed_local_input_before_evidence_write(
+    tmp_path: Path,
+):
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    protocol_path = tmp_path / "protocol.json"
+    partitions_path = tmp_path / "partitions.json"
+    tournament_path = tmp_path / "invalid-tournament-input.json"
+    protocol_path.write_text(json.dumps(protocol.to_dict()), encoding="utf-8")
+    partitions_path.write_text(json.dumps(partitions.to_dict()), encoding="utf-8")
+    tournament_path.write_text(json.dumps({"unexpected": True}), encoding="utf-8")
+    evidence_root = tmp_path / "evidence"
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "economic-tournament-run",
+            "--protocol-path",
+            str(protocol_path),
+            "--partitions-path",
+            str(partitions_path),
+            "--tournament-input-path",
+            str(tournament_path),
+            "--evidence-root",
+            str(evidence_root),
+            "--repo-root",
+            str(tmp_path),
+            "--effective-at",
+            NOW.isoformat(timespec="seconds"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not evidence_root.exists()
+
+
+def test_economic_tournament_run_rejects_malformed_candidate_availability_before_write(
+    tmp_path: Path,
+):
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    protocol_path = tmp_path / "protocol.json"
+    partitions_path = tmp_path / "partitions.json"
+    tournament_path = tmp_path / "invalid-availability-tournament-input.json"
+    protocol_path.write_text(json.dumps(protocol.to_dict()), encoding="utf-8")
+    partitions_path.write_text(json.dumps(partitions.to_dict()), encoding="utf-8")
+    tournament_input = _tournament_input(protocol, partitions)
+    candidate_rows = tournament_input["candidates_by_event"]
+    assert isinstance(candidate_rows, list)
+    candidate_rows[0]["candidates"][0]["available_at"] = "0000+00:00"
+    tournament_path.write_text(json.dumps(tournament_input), encoding="utf-8")
+    evidence_root = tmp_path / "evidence"
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "economic-tournament-run",
+            "--protocol-path",
+            str(protocol_path),
+            "--partitions-path",
+            str(partitions_path),
+            "--tournament-input-path",
+            str(tournament_path),
+            "--evidence-root",
+            str(evidence_root),
+            "--repo-root",
+            str(tmp_path),
+            "--effective-at",
+            NOW.isoformat(timespec="seconds"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not evidence_root.exists()
 
 
 def test_economic_protocol_admit_is_idempotent_and_analysis_only(tmp_path: Path):
