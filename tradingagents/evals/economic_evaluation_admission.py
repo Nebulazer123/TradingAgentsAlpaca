@@ -18,11 +18,17 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from tradingagents.dataflows.pit.partitions import validate_market_date_partitions
+from tradingagents.evals.economic_evaluation_partition_binding import (
+    bind_validation_phase_eligibility,
+)
 from tradingagents.evals.economic_evaluation_protocol import (
     FrozenEvaluationProtocol,
     validate_frozen_evaluation_protocol,
 )
 from tradingagents.evals.economic_evaluation_result import (
+    EconomicValidationResult,
+    LegacyEconomicValidationResult,
     validate_economic_validation_result,
 )
 from tradingagents.strategy._immutable_evidence_store import (
@@ -49,7 +55,8 @@ ECONOMIC_EVALUATION_PROTOCOL_ADMISSION_SCHEMA = (
 )
 ECONOMIC_HOLDOUT_RELEASE_SCHEMA = "economic_holdout_release/v1"
 ECONOMIC_EVALUATION_RUN_SCHEMA = "economic_evaluation_run/v1"
-ECONOMIC_VALIDATION_REPORT_SCHEMA = "economic_validation_report/v1"
+ECONOMIC_VALIDATION_REPORT_SCHEMA = "economic_validation_report/v2"
+_LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA = "economic_validation_report/v1"
 _AUTHORITY_FIELDS: dict[str, object] = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -61,6 +68,18 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,255}")
 _CANONICAL_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00")
 _VALIDATION_REPORT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "protocol_id",
+        "market_date_partitions",
+        "validation_event_ids",
+        "result",
+        "result_id",
+        "result_sha256",
+        *_AUTHORITY_FIELDS,
+    }
+)
+_LEGACY_VALIDATION_REPORT_FIELDS = frozenset(
     {
         "schema_version",
         "protocol_id",
@@ -348,25 +367,48 @@ def _frozen_validation_report(
     value: object,
     *,
     protocol: FrozenEvaluationProtocol,
+    allow_legacy: bool = False,
 ) -> dict[str, object]:
     report = _payload_mapping(_thaw_json(value), label="frozen_validation_report")
+    if report.get("schema_version") == _LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA:
+        return _legacy_frozen_validation_report(
+            report,
+            protocol=protocol,
+            allow_legacy=allow_legacy,
+        )
     if set(report) != _VALIDATION_REPORT_FIELDS:
         raise EconomicEvaluationAdmissionError("frozen_validation_report fields are invalid")
     if report["schema_version"] != ECONOMIC_VALIDATION_REPORT_SCHEMA:
         raise EconomicEvaluationAdmissionError("validation report schema is invalid")
     if _require_protocol_id(report["protocol_id"]) != protocol.protocol_id:
         raise EconomicEvaluationAdmissionError("validation report protocol does not match")
-    if report["validation_event_ids"] != list(protocol.validation_event_ids):
+    try:
+        partitions = validate_market_date_partitions(report["market_date_partitions"])
+        eligibility = bind_validation_phase_eligibility(
+            protocol=protocol,
+            partitions=partitions,
+        )
+    except (TypeError, ValueError) as exc:
         raise EconomicEvaluationAdmissionError(
-            "validation report event partition does not match protocol"
+            "validation report PIT partition binding is invalid"
+        ) from exc
+    if report["validation_event_ids"] != list(eligibility.event_ids):
+        raise EconomicEvaluationAdmissionError(
+            "validation report event partition does not match PIT eligibility"
         )
     try:
         result = validate_economic_validation_result(report["result"])
     except (TypeError, ValueError) as exc:
         raise EconomicEvaluationAdmissionError("validation report result is invalid") from exc
+    if type(result) is not EconomicValidationResult:
+        raise EconomicEvaluationAdmissionError(
+            "legacy validation results are readable but nonqualifying"
+        )
     if (
         result.protocol_id != protocol.protocol_id
-        or result.validation_event_ids != protocol.validation_event_ids
+        or result.validation_partition_id != eligibility.partition_id
+        or result.validation_partition_sha256 != eligibility.partition_sha256
+        or result.validation_event_ids != eligibility.event_ids
         or report["result_id"] != result.result_id
         or report["result_sha256"] != result.result_sha256
         or _canonical_json_bytes(report["result"])
@@ -383,6 +425,49 @@ def _frozen_validation_report(
             "frozen_validation_report is not canonical JSON"
         ) from exc
     return report
+
+
+def _legacy_frozen_validation_report(
+    report: Mapping[str, object],
+    *,
+    protocol: FrozenEvaluationProtocol,
+    allow_legacy: bool,
+) -> dict[str, object]:
+    """Validate historical v1 report bytes without granting qualifying status."""
+
+    values = _payload_mapping(report, label="legacy_validation_report")
+    if set(values) != _LEGACY_VALIDATION_REPORT_FIELDS:
+        raise EconomicEvaluationAdmissionError("legacy validation report fields are invalid")
+    if values["schema_version"] != _LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA:
+        raise EconomicEvaluationAdmissionError("legacy validation report schema is invalid")
+    if _require_protocol_id(values["protocol_id"]) != protocol.protocol_id:
+        raise EconomicEvaluationAdmissionError("legacy validation report protocol does not match")
+    if values["validation_event_ids"] != list(protocol.validation_event_ids):
+        raise EconomicEvaluationAdmissionError(
+            "legacy validation report event partition does not match protocol"
+        )
+    try:
+        result = validate_economic_validation_result(values["result"])
+    except (TypeError, ValueError) as exc:
+        raise EconomicEvaluationAdmissionError("legacy validation report result is invalid") from exc
+    if type(result) is not LegacyEconomicValidationResult:
+        raise EconomicEvaluationAdmissionError("legacy validation report result schema is invalid")
+    if (
+        result.protocol_id != protocol.protocol_id
+        or result.validation_event_ids != protocol.validation_event_ids
+        or values["result_id"] != result.result_id
+        or values["result_sha256"] != result.result_sha256
+        or _canonical_json_bytes(values["result"]) != result.canonical_json_bytes()
+    ):
+        raise EconomicEvaluationAdmissionError(
+            "legacy validation report result does not bind protocol output"
+        )
+    _require_authority(values, label="legacy_validation_report")
+    if not allow_legacy:
+        raise EconomicEvaluationAdmissionError(
+            "legacy validation reports are readable but nonqualifying"
+        )
+    return values
 
 
 def _admission_from_envelope(
@@ -610,6 +695,7 @@ def _evaluation_run_from_envelope(
     report = _frozen_validation_report(
         payload["frozen_validation_report"],
         protocol=protocol,
+        allow_legacy=True,
     )
     if payload["validation_report_sha256"] != _sha256(report):
         raise EconomicEvaluationAdmissionError("evaluation-run report digest is invalid")
@@ -640,6 +726,7 @@ def _validate_holdout_release_payload(
     protocol: FrozenEvaluationProtocol,
     protocol_admission_object_id: str,
     validation_run_object_id: str,
+    allow_legacy: bool = False,
 ) -> None:
     expected_fields = {
         "schema_version",
@@ -672,6 +759,7 @@ def _validate_holdout_release_payload(
     report = _frozen_validation_report(
         payload["frozen_validation_report"],
         protocol=protocol,
+        allow_legacy=allow_legacy,
     )
     if payload["validation_report_sha256"] != _sha256(report):
         raise EconomicEvaluationAdmissionError("holdout validation report digest is invalid")
@@ -1172,6 +1260,7 @@ class EconomicEvaluationAdmissionAdapter:
                 protocol=protocol,
                 protocol_admission_object_id=protocol_envelope.object_id,
                 validation_run_object_id=validation_run.envelope.object_id,
+                allow_legacy=True,
             )
             _validate_historical_predecessor(
                 _payload_mapping(
@@ -1334,6 +1423,7 @@ class EconomicEvaluationAdmissionAdapter:
                 protocol=protocols[admitted_object_id],
                 protocol_admission_object_id=admitted_object_id,
                 validation_run_object_id=validation_run_object_id,
+                allow_legacy=True,
             )
             run_report = _payload_mapping(
                 _thaw_json(validation_run.envelope.payload),
@@ -1350,6 +1440,11 @@ class EconomicEvaluationAdmissionAdapter:
                 envelope=envelope,
                 events=events,
             )
+            if _payload_mapping(
+                _thaw_json(run_report),
+                label="validation-run report",
+            ).get("schema_version") != ECONOMIC_VALIDATION_REPORT_SCHEMA:
+                continue
             if payload["protocol_id"] == identity:
                 return True
         return False

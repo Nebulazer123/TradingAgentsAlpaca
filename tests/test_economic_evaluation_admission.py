@@ -8,10 +8,19 @@ import json
 
 import pytest
 
+from tradingagents.dataflows.pit import (
+    RawPointInTimeArtifactArchive,
+    build_market_date_partitions,
+    build_market_session_calendar,
+)
 from tradingagents.evals import economic_evaluation_admission as admission_module
+from tradingagents.evals import economic_evaluation_result as result_module
 from tradingagents.evals.economic_evaluation_admission import (
     EconomicEvaluationAdmissionAdapter,
     EconomicEvaluationAdmissionError,
+)
+from tradingagents.evals.economic_evaluation_partition_binding import (
+    bind_validation_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     EvaluationSearchBudget,
@@ -22,6 +31,7 @@ from tradingagents.evals.economic_evaluation_protocol import (
 )
 from tradingagents.evals.economic_evaluation_result import (
     EconomicEvaluationResultError,
+    LegacyEconomicValidationResult,
     build_validation_evaluation_result,
     validate_economic_validation_result,
 )
@@ -82,6 +92,75 @@ def _protocol():
         validation_event_ids=(manifest.events[1].decision_event_id,),
         holdout_event_ids=(manifest.events[2].decision_event_id,),
     )
+
+
+def _partitioned_protocol(tmp_path):
+    primary = tuple(f"T{i:03d}" for i in range(75))
+    day = dt.date(2025, 10, 1)
+    market_dates: list[str] = []
+    while len(market_dates) < 60:
+        if day.weekday() < 5:
+            market_dates.append(day.isoformat())
+        day += dt.timedelta(days=1)
+    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
+    artifact = archive.admit(
+        raw_bytes=json.dumps([{"date": date} for date in market_dates]).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at=NOW.isoformat(timespec="seconds"),
+    )
+    calendar = build_market_session_calendar(archive=archive, raw_artifact=artifact)
+    events = tuple(
+        build_decision_event(
+            universe_id=canonical_universe_id(primary),
+            symbol=primary[index],
+            decision_at=f"{market_date}T20:55:00+00:00",
+            market_date=market_date,
+            horizon_sessions=5,
+            horizon="5_sessions",
+            benchmark="SPY",
+            created_at=f"{market_date}T20:45:00+00:00",
+            resolution_window={"start_at": f"{market_date}T20:55:00+00:00"},
+            observation_start=f"{market_date}T19:00:00+00:00",
+            observation_end=f"{market_date}T20:50:00+00:00",
+            available_at=f"{market_date}T20:50:00+00:00",
+            recorded_at=f"{market_date}T20:52:00+00:00",
+            source_packet_id=f"packet-{market_date}",
+            source_artifact_id=f"artifact-{market_date}",
+            source_artifact_sha256=hashlib.sha256(market_date.encode()).hexdigest(),
+        )
+        for index, market_date in enumerate(market_dates)
+    )
+    partitions = build_market_date_partitions(
+        market_calendar=calendar,
+        events=events,
+    )
+    manifest = build_bitemporal_input_manifest(
+        dataset_id="pit-admission-partitioned-fixture",
+        as_of_cutoff=NOW.isoformat(timespec="seconds"),
+        captured_at=NOW.isoformat(timespec="seconds"),
+        events=events,
+    )
+    policy = StrategyEvaluationPolicy(
+        benchmark_symbol="SPY",
+        holding_sessions=5,
+        commission_bps_per_side="0",
+        half_spread_bps_per_side="5",
+        slippage_bps_per_side="5",
+        round_trip_sides=2,
+    )
+    protocol = build_frozen_evaluation_protocol(
+        input_manifest=manifest,
+        primary_universe=primary,
+        sensitivity_universe_50=primary[:50],
+        sensitivity_universe_100=tuple(f"T{i:03d}" for i in range(100)),
+        evaluation_policy=policy,
+        search_budget=EvaluationSearchBudget(5, 3, 25),
+        development_event_ids=partitions.development_event_ids,
+        validation_event_ids=partitions.validation_event_ids,
+        holdout_event_ids=partitions.holdout_event_ids,
+    )
+    return protocol, partitions
 
 
 def _adapter(tmp_path):
@@ -253,9 +332,15 @@ def test_admission_rejects_an_orphaned_economic_protocol_object(tmp_path):
         )
 
 
-def _validation_report(protocol):
+def _validation_report(protocol, partitions):
+    eligibility = bind_validation_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+    )
+    event_count = str(len(eligibility.event_ids))
     result = build_validation_evaluation_result(
         protocol,
+        eligibility=eligibility,
         arm_metrics={
             arm_id: {
                 "net_return_after_costs": "0",
@@ -263,9 +348,9 @@ def _validation_report(protocol):
                 "max_drawdown": "0",
                 "turnover": "0",
                 "false_positive_rate": "0",
-                "decision_event_count": "1",
-                "packet_event_cluster_count": "1",
-                "market_event_cluster_count": "1",
+                "decision_event_count": event_count,
+                "packet_event_cluster_count": event_count,
+                "market_event_cluster_count": event_count,
                 "cost_per_useful_decision": "0",
             }
             for arm_id in (
@@ -276,6 +361,50 @@ def _validation_report(protocol):
                 "pullback_support",
             )
         },
+    )
+    return {
+        "schema_version": "economic_validation_report/v2",
+        "protocol_id": protocol.protocol_id,
+        "market_date_partitions": partitions.to_dict(),
+        "validation_event_ids": list(eligibility.event_ids),
+        "result": result.to_dict(),
+        "result_id": result.result_id,
+        "result_sha256": result.result_sha256,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+
+
+def _legacy_validation_report(protocol):
+    event_count = str(len(protocol.validation_event_ids))
+    arm_metrics = result_module._legacy_canonical_arm_metrics(
+        {
+            arm_id: {
+                "net_return_after_costs": "0",
+                "benchmark_excess_after_costs": "0",
+                "max_drawdown": "0",
+                "turnover": "0.0",
+                "false_positive_rate": "0",
+                "decision_event_count": event_count,
+                "packet_event_cluster_count": event_count,
+                "market_event_cluster_count": event_count,
+                "cost_per_useful_decision": "0",
+            }
+            for arm_id in (
+                "cash",
+                "spy",
+                "equal_weight",
+                "momentum_quality",
+                "pullback_support",
+            )
+        },
+        validation_event_count=len(protocol.validation_event_ids),
+    )
+    result = result_module._build_legacy_result_from_components(
+        protocol_id=protocol.protocol_id,
+        validation_event_ids=protocol.validation_event_ids,
+        arm_metrics=arm_metrics,
     )
     return {
         "schema_version": "economic_validation_report/v1",
@@ -290,13 +419,69 @@ def _validation_report(protocol):
     }
 
 
-def test_validation_result_is_complete_canonical_and_alias_resistant():
-    protocol = _protocol()
-    result = _validation_report(protocol)["result"]
+def _append_legacy_validation_run_and_holdout_release(adapter, protocol, report):
+    snapshot, events = adapter._store.verify_with_events()
+    protocol_envelope = next(
+        item
+        for item in snapshot
+        if item.kind == "economic-evaluation-protocol"
+        and item.payload["protocol_id"] == protocol.protocol_id
+    )
+    run_payload = {
+        "schema_version": "economic_evaluation_run/v1",
+        "protocol_id": protocol.protocol_id,
+        "protocol_admission_object_id": protocol_envelope.object_id,
+        "phase": "validation",
+        "frozen_validation_report": report,
+        "validation_report_sha256": admission_module._sha256(report),
+        "store_predecessor": admission_module._current_predecessor(events),
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    run = adapter._store.admit_checked(
+        EvidenceCandidate(
+            kind="economic-evaluation-run",
+            effective_at=NOW.isoformat(timespec="seconds"),
+            payload=run_payload,
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    ).envelope
+    _snapshot, events = adapter._store.verify_with_events()
+    release_payload = {
+        "schema_version": "economic_holdout_release/v1",
+        "protocol_id": protocol.protocol_id,
+        "protocol_admission_object_id": protocol_envelope.object_id,
+        "validation_run_object_id": run.object_id,
+        "released_by": "owner-corbin",
+        "released_at": NOW.isoformat(timespec="seconds"),
+        "frozen_validation_report": report,
+        "validation_report_sha256": admission_module._sha256(report),
+        "store_predecessor": admission_module._current_predecessor(events),
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    release = adapter._store.admit_checked(
+        EvidenceCandidate(
+            kind="economic-holdout-release",
+            effective_at=NOW.isoformat(timespec="seconds"),
+            payload=release_payload,
+        ),
+        validate=lambda _snapshot, _envelope: None,
+    ).envelope
+    return protocol_envelope, run, release
+
+
+def test_validation_result_is_complete_canonical_and_alias_resistant(tmp_path):
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    result = _validation_report(protocol, partitions)["result"]
     parsed = validate_economic_validation_result(json.loads(json.dumps(result)))
 
     assert parsed.protocol_id == protocol.protocol_id
-    assert parsed.validation_event_ids == protocol.validation_event_ids
+    assert parsed.validation_event_ids == partitions.validation_eligible_event_ids
+    assert parsed.validation_partition_id == partitions.partition_id
+    assert parsed.validation_partition_sha256 == partitions.partition_sha256
     assert [row["arm_id"] for row in parsed.arm_metrics] == [
         "cash",
         "spy",
@@ -310,16 +495,80 @@ def test_validation_result_is_complete_canonical_and_alias_resistant():
         parsed.arm_metrics[0]["arm_id"] = "forged-arm"
 
     tampered = json.loads(parsed.canonical_json_bytes())
-    tampered["arm_metrics"][0]["metrics"]["decision_event_count"] = "2"
+    tampered["arm_metrics"][0]["metrics"]["decision_event_count"] = "1"
     with pytest.raises(EconomicEvaluationResultError):
         validate_economic_validation_result(tampered)
+    tampered = json.loads(parsed.canonical_json_bytes())
+    tampered["arm_metrics"][0]["metrics"]["turnover"] = "0.0"
+    with pytest.raises(EconomicEvaluationResultError):
+        validate_economic_validation_result(tampered)
+
+
+def test_legacy_result_and_report_remain_readable_but_are_nonqualifying(tmp_path):
+    protocol = _protocol()
+    report = _legacy_validation_report(protocol)
+    parsed = validate_economic_validation_result(report["result"])
+
+    assert type(parsed) is LegacyEconomicValidationResult
+    assert parsed.canonical_json_bytes() == json.dumps(
+        report["result"],
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    assert admission_module._frozen_validation_report(
+        report,
+        protocol=protocol,
+        allow_legacy=True,
+    ) == report
+
+    adapter = _adapter(tmp_path)
+    adapter.admit_protocol(
+        protocol,
+        source_revision="a" * 40,
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        adapter.admit_evaluation_run(
+            protocol.protocol_id,
+            phase="validation",
+            effective_at=NOW,
+            frozen_validation_report=report,
+        )
+
+
+def test_persisted_legacy_release_remains_readable_but_cannot_unlock_holdout(tmp_path):
+    adapter = _adapter(tmp_path)
+    protocol = _protocol()
+    report = _legacy_validation_report(protocol)
+    adapter.admit_protocol(
+        protocol,
+        source_revision="a" * 40,
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    protocol_envelope, run, _release = _append_legacy_validation_run_and_holdout_release(
+        adapter,
+        protocol,
+        report,
+    )
+    _snapshot, events = adapter._store.verify_with_events()
+    parsed_run = admission_module._evaluation_run_from_envelope(
+        run,
+        protocol=protocol,
+        protocol_admission_object_id=protocol_envelope.object_id,
+        events=events,
+    )
+
+    assert parsed_run.protocol_id == protocol.protocol_id
+    assert adapter.is_holdout_released(protocol.protocol_id) is False
 
 
 def test_holdout_release_requires_admitted_protocol_and_freezes_validation_report(
     tmp_path,
 ):
     adapter = _adapter(tmp_path)
-    protocol = _protocol()
+    protocol, partitions = _partitioned_protocol(tmp_path)
     admitted = adapter.admit_protocol(
         protocol,
         source_revision="a" * 40,
@@ -330,14 +579,14 @@ def test_holdout_release_requires_admitted_protocol_and_freezes_validation_repor
         protocol.protocol_id,
         phase="validation",
         effective_at=NOW,
-        frozen_validation_report=_validation_report(protocol),
+        frozen_validation_report=_validation_report(protocol, partitions),
     )
 
     release = adapter.release_holdout(
         protocol.protocol_id,
         released_by="owner-corbin",
         released_at=NOW,
-        frozen_validation_report=_validation_report(protocol),
+        frozen_validation_report=_validation_report(protocol, partitions),
     )
 
     assert release.created is True
@@ -353,14 +602,14 @@ def test_holdout_release_requires_admitted_protocol_and_freezes_validation_repor
 
 def test_holdout_release_is_idempotent_only_for_the_same_frozen_report(tmp_path):
     adapter = _adapter(tmp_path)
-    protocol = _protocol()
+    protocol, partitions = _partitioned_protocol(tmp_path)
     adapter.admit_protocol(
         protocol,
         source_revision="a" * 40,
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
-    report = _validation_report(protocol)
+    report = _validation_report(protocol, partitions)
     adapter.admit_evaluation_run(
         protocol.protocol_id,
         phase="validation",
@@ -397,13 +646,13 @@ def test_holdout_release_rejects_missing_protocol_and_report_not_bound_to_valida
     tmp_path,
 ):
     adapter = _adapter(tmp_path)
-    protocol = _protocol()
+    protocol, partitions = _partitioned_protocol(tmp_path)
     with pytest.raises(EconomicEvaluationAdmissionError):
         adapter.release_holdout(
             protocol.protocol_id,
             released_by="owner-corbin",
             released_at=NOW,
-            frozen_validation_report=_validation_report(protocol),
+            frozen_validation_report=_validation_report(protocol, partitions),
         )
 
     adapter.admit_protocol(
@@ -412,7 +661,7 @@ def test_holdout_release_rejects_missing_protocol_and_report_not_bound_to_valida
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
-    report = _validation_report(protocol)
+    report = _validation_report(protocol, partitions)
     report["validation_event_ids"] = []
     with pytest.raises(EconomicEvaluationAdmissionError):
         adapter.release_holdout(
@@ -427,7 +676,7 @@ def test_holdout_release_rejects_a_report_without_an_immutable_validation_run(
     tmp_path,
 ):
     adapter = _adapter(tmp_path)
-    protocol = _protocol()
+    protocol, partitions = _partitioned_protocol(tmp_path)
     adapter.admit_protocol(
         protocol,
         source_revision="a" * 40,
@@ -440,7 +689,7 @@ def test_holdout_release_rejects_a_report_without_an_immutable_validation_run(
             protocol.protocol_id,
             released_by="owner-corbin",
             released_at=NOW,
-            frozen_validation_report=_validation_report(protocol),
+            frozen_validation_report=_validation_report(protocol, partitions),
         )
 
 

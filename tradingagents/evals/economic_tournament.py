@@ -9,6 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from tradingagents.evals.economic_evaluation_partition_binding import (
+    ValidationPhaseEligibility,
+    validate_validation_phase_eligibility,
+)
 from tradingagents.evals.economic_evaluation_protocol import (
     CONTROL_ARM_IDS,
     DecisionEvent,
@@ -203,6 +207,7 @@ def _arm_return(allocation: ControlArmAllocation, outcome: EconomicTournamentOut
 def evaluate_validation_ta_control(
     *,
     protocol: FrozenEvaluationProtocol,
+    eligibility: ValidationPhaseEligibility,
     candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
     outcomes: tuple[EconomicTournamentOutcome, ...],
 ) -> EconomicValidationResult:
@@ -211,7 +216,14 @@ def evaluate_validation_ta_control(
     if type(protocol) is not FrozenEvaluationProtocol:
         raise EconomicTournamentError("protocol must be an exact frozen value")
     frozen = validate_frozen_evaluation_protocol(protocol.to_dict())
-    expected_ids = frozen.validation_event_ids
+    try:
+        bound = validate_validation_phase_eligibility(
+            protocol=frozen,
+            eligibility=eligibility,
+        )
+    except ValueError as exc:
+        raise EconomicTournamentError(str(exc)) from exc
+    expected_ids = bound.event_ids
     if type(candidates_by_event) is not dict or set(candidates_by_event) != set(expected_ids):
         raise EconomicTournamentError("candidate inputs must exactly cover validation events")
     if type(outcomes) is not tuple or tuple(item.decision_event_id for item in outcomes) != expected_ids:
@@ -269,4 +281,8 @@ def evaluate_validation_ta_control(
             "market_event_cluster_count": str(market_clusters),
             "cost_per_useful_decision": _text(total_cost / Decimal(useful) if useful else total_cost),
         }
-    return build_validation_evaluation_result(frozen, arm_metrics=metrics)
+    return build_validation_evaluation_result(
+        frozen,
+        arm_metrics=metrics,
+        eligibility=bound,
+    )
