@@ -141,6 +141,11 @@ from tradingagents.dataflows.alpaca_reference import (
     load_alpaca_reference_catalog,
 )
 from tradingagents.dataflows.integration_registry import build_integration_registry_report
+from tradingagents.dataflows.pit import (
+    PointInTimeCohortCandidate,
+    build_point_in_time_cohort,
+    validate_security_identity,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evals.agent_intelligence_brain import (
     DEFAULT_BRAIN_PATH,
@@ -2680,6 +2685,118 @@ def _economic_json_object(path: Path, *, label: str) -> dict[str, object]:
     return payload
 
 
+def _economic_exact_object(
+    value: object,
+    *,
+    label: str,
+    fields: frozenset[str],
+) -> dict[str, object]:
+    """Require one explicitly versioned JSON object shape at the CLI boundary."""
+
+    if not isinstance(value, dict) or set(value) != fields:
+        raise typer.BadParameter(f"{label} fields are invalid")
+    return value
+
+
+def _economic_cohort_from_input(payload: dict[str, object]):
+    """Rebuild one PIT cohort from explicit, source-bound candidate JSON."""
+
+    values = _economic_exact_object(
+        payload,
+        label="cohort candidate input",
+        fields=frozenset({"market_date", "as_of_cutoff", "candidates"}),
+    )
+    raw_candidates = values["candidates"]
+    if type(raw_candidates) is not list:
+        raise typer.BadParameter("cohort candidate input candidates must be a JSON list")
+    candidates: list[PointInTimeCohortCandidate] = []
+    candidate_fields = frozenset(
+        {
+            "security",
+            "prior_complete_close",
+            "session_dollar_volumes",
+            "selection_artifact_id",
+            "selection_artifact_sha256",
+        }
+    )
+    for index, raw_candidate in enumerate(raw_candidates):
+        candidate = _economic_exact_object(
+            raw_candidate,
+            label=f"cohort candidate input candidates[{index}]",
+            fields=candidate_fields,
+        )
+        volumes = candidate["session_dollar_volumes"]
+        if type(volumes) is not list:
+            raise typer.BadParameter(
+                f"cohort candidate input candidates[{index}] volumes must be a JSON list"
+            )
+        try:
+            candidates.append(
+                PointInTimeCohortCandidate(
+                    security=validate_security_identity(candidate["security"]),
+                    prior_complete_close=candidate["prior_complete_close"],
+                    session_dollar_volumes=tuple(volumes),
+                    selection_artifact_id=candidate["selection_artifact_id"],
+                    selection_artifact_sha256=candidate["selection_artifact_sha256"],
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise typer.BadParameter(
+                f"cohort candidate input candidates[{index}] are invalid: {exc}"
+            ) from exc
+    try:
+        return build_point_in_time_cohort(
+            market_date=values["market_date"],
+            as_of_cutoff=values["as_of_cutoff"],
+            candidates=tuple(candidates),
+        )
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"cohort candidate input is invalid: {exc}") from exc
+
+
+def _write_economic_receipt(path: Path, payload: dict[str, object], *, label: str) -> Path:
+    """Write a local canonical receipt once, or prove the existing bytes match."""
+
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    expected = text.encode("utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            existing = path.read_bytes()
+        except OSError as exc:
+            raise typer.BadParameter(f"{label} cannot be read") from exc
+        if existing != expected:
+            raise typer.BadParameter(f"{label} already exists with different bytes") from None
+        return path
+    except OSError as exc:
+        raise typer.BadParameter(f"{label} cannot be created") from exc
+    try:
+        offset = 0
+        while offset < len(expected):
+            written = os.write(descriptor, expected[offset:])
+            if written <= 0:
+                raise OSError("incomplete receipt write")
+            offset += written
+        os.fsync(descriptor)
+    except OSError as exc:
+        with suppress(OSError):
+            path.unlink()
+        raise typer.BadParameter(f"{label} cannot be written") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        raise typer.BadParameter(f"{label} directory cannot be synchronized") from exc
+    return path
+
+
 def _economic_effective_at(value: str) -> datetime.datetime:
     """Parse a canonical, second-aligned UTC receipt timestamp."""
 
@@ -2695,6 +2812,48 @@ def _economic_effective_at(value: str) -> datetime.datetime:
     ):
         raise typer.BadParameter("effective-at must be canonical UTC ISO-8601 seconds")
     return parsed
+
+
+@research_app.command("economic-cohort-build")
+def research_economic_cohort_build(
+    candidate_input_path: Path = typer.Option(
+        ...,
+        "--candidate-input-path",
+        exists=True,
+        readable=True,
+        help="Explicit source-bound PIT cohort candidate JSON input.",
+    ),
+    output_path: Path = typer.Option(
+        ...,
+        "--output-path",
+        help="New local canonical cohort receipt path; a differing existing receipt is rejected.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Build an analysis-only PIT cohort receipt without reading a provider or broker."""
+
+    cohort = _economic_cohort_from_input(
+        _economic_json_object(candidate_input_path, label="candidate-input-path")
+    )
+    written = _write_economic_receipt(
+        output_path,
+        cohort.to_dict(),
+        label="economic cohort receipt",
+    )
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "cohort_id": cohort.cohort_id,
+        "cohort_sha256": cohort.cohort_sha256,
+        "receipt_path": str(written),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic cohort: {cohort.cohort_id}")
+    console.print(f"Canonical local receipt: {written}")
+    console.print("Analysis-only; this receipt grants no execution or promotion authority.")
 
 
 @research_app.command("economic-protocol-admit")

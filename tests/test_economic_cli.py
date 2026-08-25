@@ -110,6 +110,126 @@ def _admit_args(tmp_path: Path, protocol_path: Path):
     ]
 
 
+def _cohort_input() -> dict[str, object]:
+    return {
+        "market_date": "2026-01-09",
+        "as_of_cutoff": "2026-01-09T21:00:00+00:00",
+        "candidates": [
+            {
+                "security": {
+                    "schema_version": "security_identity/v1",
+                    "security_id": f"security-{index:03d}",
+                    "symbol": f"C{index:03d}",
+                    "cik": None,
+                    "figi": None,
+                    "exchange": "NYSE",
+                    "security_type": "common_stock",
+                    "effective_from": "2020-01-01",
+                    "effective_to": None,
+                    "status": "active",
+                    "successor_security_id": None,
+                    "terminal_proceeds_artifact_id": None,
+                    "source_hashes": {
+                        "security-master": hashlib.sha256(
+                            f"security-{index:03d}".encode()
+                        ).hexdigest(),
+                    },
+                    "analysis_only": True,
+                    "execution_authority": "none",
+                    "can_submit_orders": False,
+                },
+                "prior_complete_close": "5",
+                "session_dollar_volumes": [str(index + 1)] * 60,
+                "selection_artifact_id": f"selection-{index:03d}",
+                "selection_artifact_sha256": hashlib.sha256(
+                    f"selection-{index:03d}".encode()
+                ).hexdigest(),
+            }
+            for index in range(100)
+        ],
+    }
+
+
+def test_economic_cohort_build_writes_only_one_canonical_analysis_receipt(tmp_path: Path):
+    input_path = tmp_path / "cohort-input.json"
+    output_path = tmp_path / "cohort.json"
+    input_path.write_text(json.dumps(_cohort_input()), encoding="utf-8")
+    args = [
+        "research",
+        "economic-cohort-build",
+        "--candidate-input-path",
+        str(input_path),
+        "--output-path",
+        str(output_path),
+        "--json-output",
+    ]
+
+    first = runner.invoke(app, args)
+    second = runner.invoke(app, args)
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    payload = json.loads(first.output)
+    receipt = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["analysis_only"] is True
+    assert payload["execution_authority"] == "none"
+    assert payload["can_submit_orders"] is False
+    assert receipt["cohort_id"] == payload["cohort_id"]
+    assert receipt["analysis_only"] is True
+
+
+def test_economic_cohort_build_rejects_invalid_input_without_writing_receipt(tmp_path: Path):
+    input_path = tmp_path / "invalid-cohort-input.json"
+    output_path = tmp_path / "cohort.json"
+    input_path.write_text(json.dumps({"unexpected": True}), encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "economic-cohort-build",
+            "--candidate-input-path",
+            str(input_path),
+            "--output-path",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert not output_path.exists()
+
+
+def test_economic_cohort_build_rejects_different_existing_receipt_without_overwrite(
+    tmp_path: Path,
+):
+    input_path = tmp_path / "cohort-input.json"
+    output_path = tmp_path / "cohort.json"
+    input_path.write_text(json.dumps(_cohort_input()), encoding="utf-8")
+    args = [
+        "research",
+        "economic-cohort-build",
+        "--candidate-input-path",
+        str(input_path),
+        "--output-path",
+        str(output_path),
+        "--json-output",
+    ]
+    first = runner.invoke(app, args)
+    assert first.exit_code == 0, first.output
+    original = output_path.read_bytes()
+
+    changed = _cohort_input()
+    candidates = changed["candidates"]
+    assert isinstance(candidates, list)
+    candidates[0]["prior_complete_close"] = "6"
+    input_path.write_text(json.dumps(changed), encoding="utf-8")
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 2
+    assert output_path.read_bytes() == original
+
+
 def test_economic_protocol_admit_is_idempotent_and_analysis_only(tmp_path: Path):
     protocol_path = tmp_path / "protocol.json"
     protocol = _protocol()
