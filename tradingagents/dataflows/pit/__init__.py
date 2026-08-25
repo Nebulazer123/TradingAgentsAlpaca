@@ -8,6 +8,10 @@ from .cohort import (
     build_point_in_time_cohort,
     validate_point_in_time_cohort,
 )
+from .official_observations import (
+    build_alpaca_market_observation,
+    build_sec_fundamental_observation,
+)
 from .partitions import (
     MarketDatePartitions,
     build_market_date_partitions,
@@ -46,6 +50,8 @@ __all__ = [
     "MarketDatePartitions",
     "build_market_date_partitions",
     "validate_market_date_partitions",
+    "build_alpaca_market_observation",
+    "build_sec_fundamental_observation",
     "RawPointInTimeArtifact",
     "RawPointInTimeArtifactArchive",
     "build_raw_point_in_time_artifact",
