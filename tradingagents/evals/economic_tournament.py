@@ -16,13 +16,19 @@ from tradingagents.evals.economic_evaluation_protocol import (
     validate_decision_event,
     validate_frozen_evaluation_protocol,
 )
+from tradingagents.evals.economic_evaluation_result import (
+    EconomicValidationResult,
+    build_validation_evaluation_result,
+)
 from tradingagents.sleeves.pullback_support import PullbackFeatures, evaluate_pullback_support
 
 __all__ = [
     "EconomicTournamentError",
     "EconomicTournamentCandidate",
     "ControlArmAllocation",
+    "EconomicTournamentOutcome",
     "build_ta_control_allocations",
+    "evaluate_validation_ta_control",
 ]
 
 
@@ -85,6 +91,38 @@ class ControlArmAllocation:
         _decimal(self.cash_weight, label="cash_weight", positive=False)
 
 
+@dataclass(frozen=True, slots=True)
+class EconomicTournamentOutcome:
+    """One realized, source-bound outcome vector for a frozen decision event."""
+
+    decision_event_id: str
+    realized_returns: tuple[tuple[str, str], ...]
+
+    def __post_init__(self) -> None:
+        if not self.decision_event_id.startswith("decision-event-"):
+            raise EconomicTournamentError("outcome decision event identity is invalid")
+        if type(self.realized_returns) is not tuple or not self.realized_returns:
+            raise EconomicTournamentError("realized_returns must be a nonempty exact tuple")
+        symbols = []
+        for symbol, value in self.realized_returns:
+            if type(symbol) is not str or not symbol.isupper():
+                raise EconomicTournamentError("outcome return symbol is invalid")
+            parsed = _decimal(value, label="realized_return", positive=False)
+            if parsed is None or parsed < Decimal("-1"):
+                raise EconomicTournamentError("realized_return is invalid")
+            symbols.append(symbol)
+        if tuple(symbols) != tuple(sorted(symbols)) or len(set(symbols)) != len(symbols):
+            raise EconomicTournamentError("outcome return symbols must be canonical")
+
+    def return_for(self, symbol: str) -> Decimal:
+        for known_symbol, value in self.realized_returns:
+            if known_symbol == symbol:
+                parsed = _decimal(value, label="realized_return", positive=False)
+                assert parsed is not None
+                return parsed
+        raise EconomicTournamentError(f"outcome is missing realized return for {symbol}")
+
+
 def _cash_weight(selected_count: int, *, capacity: int) -> str:
     return format(Decimal(capacity - selected_count) / Decimal(capacity), "f")
 
@@ -145,3 +183,90 @@ def build_ta_control_allocations(
         ControlArmAllocation("momentum_quality", momentum, _cash_weight(len(momentum), capacity=15)),
         ControlArmAllocation("pullback_support", pullback, _cash_weight(len(pullback), capacity=15)),
     )
+
+
+def _text(value: Decimal) -> str:
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _arm_return(allocation: ControlArmAllocation, outcome: EconomicTournamentOutcome) -> tuple[Decimal, Decimal, Decimal]:
+    selected = allocation.selected_symbols
+    invested = Decimal("1") - Decimal(allocation.cash_weight)
+    if not selected:
+        return Decimal("0"), Decimal("0"), Decimal("0")
+    gross = sum((outcome.return_for(symbol) for symbol in selected), Decimal("0")) / Decimal(len(selected))
+    turnover = invested * Decimal("2")
+    return gross, turnover, invested
+
+
+def evaluate_validation_ta_control(
+    *,
+    protocol: FrozenEvaluationProtocol,
+    candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
+    outcomes: tuple[EconomicTournamentOutcome, ...],
+) -> EconomicValidationResult:
+    """Evaluate the sealed validation events and build canonical arm metrics."""
+
+    if type(protocol) is not FrozenEvaluationProtocol:
+        raise EconomicTournamentError("protocol must be an exact frozen value")
+    frozen = validate_frozen_evaluation_protocol(protocol.to_dict())
+    expected_ids = frozen.validation_event_ids
+    if type(candidates_by_event) is not dict or set(candidates_by_event) != set(expected_ids):
+        raise EconomicTournamentError("candidate inputs must exactly cover validation events")
+    if type(outcomes) is not tuple or tuple(item.decision_event_id for item in outcomes) != expected_ids:
+        raise EconomicTournamentError("outcomes must be canonically ordered validation events")
+    events = {event.decision_event_id: event for event in frozen.input_manifest.events}
+    metrics: dict[str, dict[str, str]] = {}
+    per_arm: dict[str, list[tuple[Decimal, Decimal, Decimal]]] = {arm: [] for arm in CONTROL_ARM_IDS}
+    for outcome in outcomes:
+        event = events[outcome.decision_event_id]
+        required_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
+        if tuple(symbol for symbol, _value in outcome.realized_returns) != required_symbols:
+            raise EconomicTournamentError("outcome must cover primary universe and SPY exactly")
+        for allocation in build_ta_control_allocations(
+            protocol=frozen,
+            decision_event=event,
+            candidates=candidates_by_event[event.decision_event_id],
+        ):
+            per_arm[allocation.arm_id].append(_arm_return(allocation, outcome))
+    policy_cost = Decimal(frozen.evaluation_policy["commission_bps_per_side"]) + Decimal(frozen.evaluation_policy["half_spread_bps_per_side"]) + Decimal(frozen.evaluation_policy["slippage_bps_per_side"])
+    per_side_cost = policy_cost / Decimal("10000")
+    benchmark_returns = per_arm["spy"]
+    packet_clusters = len({events[event_id].packet_event_cluster_id for event_id in expected_ids})
+    market_clusters = len({events[event_id].market_event_cluster_id for event_id in expected_ids})
+    for arm in CONTROL_ARM_IDS:
+        capital = Decimal("1")
+        peak = capital
+        drawdown = Decimal("0")
+        total_turnover = Decimal("0")
+        total_cost = Decimal("0")
+        false_positives = 0
+        useful = 0
+        net_returns: list[Decimal] = []
+        for gross, turnover, invested in per_arm[arm]:
+            cost = turnover * per_side_cost
+            net = gross - cost
+            net_returns.append(net)
+            total_turnover += turnover
+            total_cost += cost
+            capital *= Decimal("1") + net
+            peak = max(peak, capital)
+            drawdown = min(drawdown, capital / peak - Decimal("1"))
+            if net > 0:
+                useful += 1
+            elif invested > 0:
+                false_positives += 1
+        benchmark_net = [gross - turnover * per_side_cost for gross, turnover, _ in benchmark_returns]
+        metrics[arm] = {
+            "net_return_after_costs": _text(capital - Decimal("1")),
+            "benchmark_excess_after_costs": _text(sum(net_returns, Decimal("0")) - sum(benchmark_net, Decimal("0"))),
+            "max_drawdown": _text(drawdown),
+            "turnover": _text(total_turnover),
+            "false_positive_rate": _text(Decimal(false_positives) / Decimal(len(expected_ids))),
+            "decision_event_count": str(len(expected_ids)),
+            "packet_event_cluster_count": str(packet_clusters),
+            "market_event_cluster_count": str(market_clusters),
+            "cost_per_useful_decision": _text(total_cost / Decimal(useful) if useful else total_cost),
+        }
+    return build_validation_evaluation_result(frozen, arm_metrics=metrics)

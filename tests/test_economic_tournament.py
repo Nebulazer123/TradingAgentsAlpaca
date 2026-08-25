@@ -16,7 +16,9 @@ from tradingagents.evals.economic_evaluation_protocol import (
 from tradingagents.evals.economic_tournament import (
     EconomicTournamentCandidate,
     EconomicTournamentError,
+    EconomicTournamentOutcome,
     build_ta_control_allocations,
+    evaluate_validation_ta_control,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
 
@@ -57,11 +59,12 @@ def _protocol():
         development_event_ids=(events[0].decision_event_id,),
         validation_event_ids=(events[1].decision_event_id,),
         holdout_event_ids=(events[2].decision_event_id,),
-    ), events[0]
+    ), events
 
 
 def test_ta_control_uses_frozen_universe_and_leaves_missing_inputs_in_cash():
-    protocol, event = _protocol()
+    protocol, events = _protocol()
+    event = events[0]
     candidates = tuple(
         EconomicTournamentCandidate(
             symbol=symbol, available_at="2026-01-09T20:50:00+00:00",
@@ -84,7 +87,38 @@ def test_ta_control_uses_frozen_universe_and_leaves_missing_inputs_in_cash():
 
 
 def test_ta_control_rejects_candidate_universe_or_event_outside_protocol():
-    protocol, event = _protocol()
+    protocol, events = _protocol()
+    event = events[0]
     candidates = tuple(EconomicTournamentCandidate(symbol=symbol, available_at="2026-01-09T20:50:00+00:00") for symbol in UNIVERSE)
     with pytest.raises(EconomicTournamentError):
         build_ta_control_allocations(protocol=protocol, decision_event=event, candidates=candidates[:-1])
+
+
+def test_validation_tournament_builds_canonical_complete_result():
+    protocol, events = _protocol()
+    event = events[1]
+    candidates = tuple(
+        EconomicTournamentCandidate(
+            symbol=symbol, available_at="2026-01-09T20:50:00+00:00",
+            close_t_21="110" if symbol == "T000" else None,
+            close_t_252="100" if symbol == "T000" else None,
+            trailing_operating_income="10" if symbol == "T000" else None,
+            average_total_assets="100" if symbol == "T000" else None,
+        ) for symbol in UNIVERSE
+    )
+    outcome = EconomicTournamentOutcome(
+        decision_event_id=event.decision_event_id,
+        realized_returns=tuple(sorted(
+            [(symbol, "0.01") for symbol in UNIVERSE] + [("SPY", "0.02")]
+        )),
+    )
+    result = evaluate_validation_ta_control(
+        protocol=protocol,
+        candidates_by_event={event.decision_event_id: candidates},
+        outcomes=(outcome,),
+    )
+
+    metrics = {row["arm_id"]: row["metrics"] for row in result.arm_metrics}
+    assert result.protocol_id == protocol.protocol_id
+    assert metrics["equal_weight"]["net_return_after_costs"] == "0.008"
+    assert metrics["spy"]["benchmark_excess_after_costs"] == "0"
