@@ -186,6 +186,13 @@ from tradingagents.evals.automation_memory_rollup import (
     write_automation_memory_rollup_apply_result,
     write_automation_memory_rollup_plan,
 )
+from tradingagents.evals.economic_evaluation_admission import (
+    EconomicEvaluationAdmissionAdapter,
+    EconomicEvaluationAdmissionError,
+)
+from tradingagents.evals.economic_evaluation_protocol import (
+    validate_frozen_evaluation_protocol,
+)
 from tradingagents.evals.email_clarity import evaluate_email_clarity, write_email_clarity_eval
 from tradingagents.evals.execution_board import (
     build_execution_board_review,
@@ -2659,6 +2666,117 @@ def research_decision_quality_report(
     console.print(f"Point-in-time gaps: {packet.quality_gates['point_in_time_gap_count']}")
     console.print(f"Packet: {packet_path}")
     console.print(f"Rating calibration: {rating_calibration_path}")
+
+
+def _economic_json_object(path: Path, *, label: str) -> dict[str, object]:
+    """Load one explicit JSON receipt without accepting an implicit default."""
+
+    try:
+        payload = json.loads(path.read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter(f"{label} must be readable JSON") from exc
+    if not isinstance(payload, dict):
+        raise typer.BadParameter(f"{label} must contain a JSON object")
+    return payload
+
+
+def _economic_effective_at(value: str) -> datetime.datetime:
+    """Parse a canonical, second-aligned UTC receipt timestamp."""
+
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter("effective-at must be canonical UTC ISO-8601 seconds") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != datetime.timedelta(0)
+        or parsed.microsecond
+        or parsed.isoformat(timespec="seconds") != value
+    ):
+        raise typer.BadParameter("effective-at must be canonical UTC ISO-8601 seconds")
+    return parsed
+
+
+@research_app.command("economic-protocol-admit")
+def research_economic_protocol_admit(
+    protocol_path: Path = typer.Option(
+        ...,
+        "--protocol-path",
+        exists=True,
+        readable=True,
+        help="Canonical frozen economic protocol JSON receipt.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root that owns the declared source paths.",
+    ),
+    source_revision: str = typer.Option(
+        ...,
+        "--source-revision",
+        help="Exact 40-character Git revision that produced the protocol source.",
+    ),
+    source_paths: list[str] = typer.Option(
+        [],
+        "--source-path",
+        help="Repository-relative source path to bind; repeat for every source file.",
+    ),
+    effective_at: str = typer.Option(
+        ...,
+        "--effective-at",
+        help="Canonical UTC timestamp for this immutable analysis-only receipt.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Admit one complete frozen protocol as analysis-only local evidence.
+
+    This command has no provider, broker, scheduling, promotion, or submit
+    option. It binds only supplied protocol bytes, repository source bytes,
+    and the immutable evidence-store predecessor.
+    """
+
+    if not source_paths:
+        raise typer.BadParameter("at least one --source-path is required")
+    protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
+    effective = _economic_effective_at(effective_at)
+    try:
+        protocol = validate_frozen_evaluation_protocol(protocol_payload)
+        admission = EconomicEvaluationAdmissionAdapter(
+            evidence_root,
+            repo_root=repo_root,
+        ).admit_protocol(
+            protocol,
+            source_revision=source_revision,
+            effective_at=effective,
+            source_paths=tuple(source_paths),
+        )
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic protocol admission rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": admission.protocol_id,
+        "input_manifest_sha256": admission.input_manifest_sha256,
+        "admission_object_id": admission.envelope.object_id,
+        "created": admission.created,
+        "evidence_root": str(evidence_root),
+        "source_revision": source_revision,
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic protocol: {payload['protocol_id']}")
+    console.print(f"Immutable admission: {payload['admission_object_id']}")
+    console.print("Analysis-only; this receipt grants no execution or promotion authority.")
 
 
 @research_app.command("walk-forward-replay")

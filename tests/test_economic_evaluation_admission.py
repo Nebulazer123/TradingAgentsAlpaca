@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import subprocess
 
 import pytest
 
@@ -167,6 +168,14 @@ def _adapter(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "evaluation.py").write_text("VALUE = 'frozen'\n", encoding="utf-8")
+    for command in (
+        ("git", "init", "-q", str(repo_root)),
+        ("git", "-C", str(repo_root), "config", "user.name", "Economic Test"),
+        ("git", "-C", str(repo_root), "config", "user.email", "economic-test@example.invalid"),
+        ("git", "-C", str(repo_root), "add", "evaluation.py"),
+        ("git", "-C", str(repo_root), "commit", "-qm", "freeze evaluation source"),
+    ):
+        subprocess.run(command, check=True, capture_output=True)
     return EconomicEvaluationAdmissionAdapter(
         tmp_path / "evidence",
         repo_root=repo_root,
@@ -174,11 +183,21 @@ def _adapter(tmp_path):
     )
 
 
+def _source_revision(tmp_path) -> str:
+    result = subprocess.run(
+        ("git", "-C", str(tmp_path / "repo"), "rev-parse", "HEAD"),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip()
+
+
 def test_admission_binds_complete_protocol_source_bytes_and_store_predecessor(tmp_path):
     protocol = _protocol()
     admission = _adapter(tmp_path).admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -189,7 +208,7 @@ def test_admission_binds_complete_protocol_source_bytes_and_store_predecessor(tm
     assert admission.predecessor_sequence == 0
     assert admission.predecessor_event_sha256 == "0" * 64
     assert admission.envelope.kind == "economic-evaluation-protocol"
-    assert admission.envelope.payload["source_revision"] == "a" * 40
+    assert admission.envelope.payload["source_revision"] == _source_revision(tmp_path)
     assert admission.envelope.payload["analysis_only"] is True
     assert admission.envelope.payload["can_submit_orders"] is False
 
@@ -199,13 +218,13 @@ def test_same_admitted_protocol_is_idempotent_but_not_reissued(tmp_path):
     protocol = _protocol()
     first = adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
     second = adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -220,7 +239,7 @@ def test_admission_rejects_changed_provenance_for_an_existing_protocol(tmp_path)
     protocol = _protocol()
     adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -232,7 +251,7 @@ def test_admission_rejects_changed_provenance_for_an_existing_protocol(tmp_path)
     with pytest.raises(EconomicEvaluationAdmissionError):
         adapter.admit_protocol(
             protocol,
-            source_revision="a" * 40,
+            source_revision=_source_revision(tmp_path),
             effective_at=NOW,
             source_paths=("evaluation.py",),
         )
@@ -266,7 +285,7 @@ def test_admission_rejects_source_bytes_changed_during_preflight(
     with pytest.raises(EconomicEvaluationAdmissionError):
         adapter.admit_protocol(
             _protocol(),
-            source_revision="a" * 40,
+            source_revision=_source_revision(tmp_path),
             effective_at=NOW,
             source_paths=("evaluation.py",),
         )
@@ -300,7 +319,7 @@ def test_admission_rejects_changed_evidence_store_head_after_preflight(
     with pytest.raises(EconomicEvaluationAdmissionError):
         adapter.admit_protocol(
             _protocol(),
-            source_revision="a" * 40,
+            source_revision=_source_revision(tmp_path),
             effective_at=NOW,
             source_paths=("evaluation.py",),
         )
@@ -326,7 +345,7 @@ def test_admission_rejects_an_orphaned_economic_protocol_object(tmp_path):
     with pytest.raises(EconomicEvaluationAdmissionError):
         _adapter(tmp_path).admit_protocol(
             _protocol(),
-            source_revision="a" * 40,
+            source_revision=_source_revision(tmp_path),
             effective_at=NOW,
             source_paths=("evaluation.py",),
         )
@@ -524,7 +543,7 @@ def test_legacy_result_and_report_remain_readable_but_are_nonqualifying(tmp_path
     adapter = _adapter(tmp_path)
     adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -543,7 +562,7 @@ def test_persisted_legacy_release_remains_readable_but_cannot_unlock_holdout(tmp
     report = _legacy_validation_report(protocol)
     adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -571,7 +590,7 @@ def test_holdout_release_requires_admitted_protocol_and_freezes_validation_repor
     protocol, partitions = _partitioned_protocol(tmp_path)
     admitted = adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -605,7 +624,7 @@ def test_holdout_release_is_idempotent_only_for_the_same_frozen_report(tmp_path)
     protocol, partitions = _partitioned_protocol(tmp_path)
     adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -657,7 +676,7 @@ def test_holdout_release_rejects_missing_protocol_and_report_not_bound_to_valida
 
     adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
@@ -679,7 +698,7 @@ def test_holdout_release_rejects_a_report_without_an_immutable_validation_run(
     protocol, partitions = _partitioned_protocol(tmp_path)
     adapter.admit_protocol(
         protocol,
-        source_revision="a" * 40,
+        source_revision=_source_revision(tmp_path),
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )

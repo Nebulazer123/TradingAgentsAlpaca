@@ -14,6 +14,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -309,6 +310,49 @@ def _require_source_revision(value: object) -> str:
             "source_revision must be a lowercase 40-hex Git revision"
         )
     return value
+
+
+def _bind_source_revision_to_manifest(
+    root: Path,
+    *,
+    revision: str,
+    source_rows: list[dict[str, str]],
+) -> None:
+    """Require every admitted working-tree byte to match one local Git commit."""
+
+    try:
+        resolved = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", f"{revision}^{{commit}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise EconomicEvaluationAdmissionError(
+            "repo_root must support local Git revision verification"
+        ) from exc
+    if resolved.returncode != 0 or resolved.stdout.strip() != revision:
+        raise EconomicEvaluationAdmissionError(
+            "source_revision is not an exact commit in repo_root"
+        )
+    for row in source_rows:
+        path = row["path"]
+        try:
+            blob = subprocess.run(
+                ["git", "-C", str(root), "show", f"{revision}:{path}"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise EconomicEvaluationAdmissionError(
+                "source_revision blob verification failed"
+            ) from exc
+        if blob.returncode != 0 or hashlib.sha256(blob.stdout).hexdigest() != row["sha256"]:
+            raise EconomicEvaluationAdmissionError(
+                "source bytes do not match source_revision"
+            )
 
 
 def _require_protocol_id(value: object) -> str:
@@ -821,6 +865,11 @@ class EconomicEvaluationAdmissionAdapter:
         source_rows, source_manifest_sha256 = _source_manifest(
             self._repo_root,
             source_paths,
+        )
+        _bind_source_revision_to_manifest(
+            self._repo_root,
+            revision=revision,
+            source_rows=source_rows,
         )
 
         snapshot, events = self._store.verify_with_events()
