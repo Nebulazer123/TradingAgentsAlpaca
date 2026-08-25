@@ -33,24 +33,13 @@ def _market_dates() -> tuple[str, ...]:
 
 
 def _calendar(tmp_path, market_dates: tuple[str, ...]):
-    raw_bytes = json.dumps({"days": list(market_dates)}).encode("utf-8")
+    raw_bytes = json.dumps([{"date": day} for day in market_dates]).encode("utf-8")
     archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
     artifact = archive.admit(
         raw_bytes=raw_bytes,
         source_uri="https://paper-api.alpaca.markets/v2/calendar",
         content_type="application/json",
         retrieved_at="2026-01-05T21:00:00+00:00",
-        source_metadata={
-            "source_kind": "market_session_calendar",
-            "venue": "XNYS",
-            "market_dates": list(market_dates),
-            "source_span": {
-                "span_type": "byte_range",
-                "start_byte": 0,
-                "end_byte": len(raw_bytes),
-                "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
-            },
-        },
     )
     return build_market_session_calendar(archive=archive, raw_artifact=artifact)
 

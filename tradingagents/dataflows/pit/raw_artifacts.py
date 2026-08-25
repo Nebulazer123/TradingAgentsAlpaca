@@ -18,7 +18,6 @@ import stat
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
-from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from tradingagents.dataflows.pit.records import PointInTimeDataError
@@ -131,41 +130,6 @@ def _authority(payload: Mapping[str, object]) -> None:
         raise PointInTimeDataError("raw artifact authority fields are fixed")
 
 
-def _freeze_json(value: object, *, label: str) -> object:
-    if value is None or type(value) in (bool, int, str):
-        return value
-    if type(value) is float:
-        raise PointInTimeDataError(f"{label} must not contain floating-point values")
-    if isinstance(value, Mapping):
-        frozen: dict[str, object] = {}
-        for key, item in value.items():
-            if type(key) is not str:
-                raise PointInTimeDataError(f"{label} keys must be strings")
-            frozen[key] = _freeze_json(item, label=f"{label}.{key}")
-        return MappingProxyType(frozen)
-    if type(value) in (list, tuple):
-        return tuple(
-            _freeze_json(item, label=f"{label}[{index}]")
-            for index, item in enumerate(value)
-        )
-    raise PointInTimeDataError(f"{label} must contain JSON values")
-
-
-def _thaw_json(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
-    if type(value) is tuple:
-        return [_thaw_json(item) for item in value]
-    return value
-
-
-def _source_metadata(value: object) -> Mapping[str, object]:
-    frozen = _freeze_json(value, label="source_metadata")
-    if not isinstance(frozen, MappingProxyType) or not frozen:
-        raise PointInTimeDataError("source_metadata must be a nonempty JSON mapping")
-    return frozen
-
-
 @dataclasses.dataclass(frozen=True, slots=True, init=False)
 class RawPointInTimeArtifact:
     """Canonical receipt for exact, local immutable source bytes."""
@@ -177,7 +141,6 @@ class RawPointInTimeArtifact:
     content_type: str
     retrieved_at: str
     byte_count: int
-    source_metadata: Mapping[str, object]
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError(
@@ -194,7 +157,6 @@ class RawPointInTimeArtifact:
             "content_type": self.content_type,
             "retrieved_at": self.retrieved_at,
             "byte_count": self.byte_count,
-            "source_metadata": _thaw_json(self.source_metadata),
             **_AUTHORITY,
         }
 
@@ -220,7 +182,6 @@ def _from_material(
     content_type: object,
     retrieved_at: object,
     byte_count: object,
-    source_metadata: object,
 ) -> RawPointInTimeArtifact:
     raw_digest = _digest(raw_artifact_sha256, label="raw_artifact_sha256")
     uri = _source_uri(source_uri)
@@ -228,7 +189,6 @@ def _from_material(
     timestamp = _canonical_timestamp(retrieved_at, label="retrieved_at")
     if type(byte_count) is not int or byte_count <= 0:
         raise PointInTimeDataError("byte_count must be a positive exact integer")
-    metadata = _source_metadata(source_metadata)
     identity = {
         "schema_version": _SCHEMA,
         "raw_artifact_sha256": raw_digest,
@@ -236,7 +196,6 @@ def _from_material(
         "content_type": mime,
         "retrieved_at": timestamp,
         "byte_count": byte_count,
-        "source_metadata": _thaw_json(metadata),
         **_AUTHORITY,
     }
     artifact_id = "pit-raw-artifact-" + _sha256(identity)
@@ -249,7 +208,6 @@ def _from_material(
         content_type=mime,
         retrieved_at=timestamp,
         byte_count=byte_count,
-        source_metadata=metadata,
     )
 
 
@@ -259,7 +217,6 @@ def build_raw_point_in_time_artifact(
     source_uri: str,
     content_type: str,
     retrieved_at: str,
-    source_metadata: Mapping[str, object] | None = None,
 ) -> RawPointInTimeArtifact:
     """Create a receipt while preserving the supplied bytes exactly."""
 
@@ -271,11 +228,6 @@ def build_raw_point_in_time_artifact(
         content_type=content_type,
         retrieved_at=retrieved_at,
         byte_count=len(raw_bytes),
-        source_metadata=(
-            {"observed_at": retrieved_at}
-            if source_metadata is None
-            else source_metadata
-        ),
     )
 
 
@@ -294,7 +246,6 @@ def validate_raw_point_in_time_artifact(value: object) -> RawPointInTimeArtifact
         content_type=payload["content_type"],
         retrieved_at=payload["retrieved_at"],
         byte_count=payload["byte_count"],
-        source_metadata=payload["source_metadata"],
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(payload):
         raise PointInTimeDataError("raw artifact bytes do not match canonical rebuild")
@@ -318,7 +269,6 @@ class RawPointInTimeArtifactArchive:
         source_uri: str,
         content_type: str,
         retrieved_at: str,
-        source_metadata: Mapping[str, object] | None = None,
     ) -> RawPointInTimeArtifact:
         """Persist exact bytes once, or verify the identical prior object."""
 
@@ -327,7 +277,6 @@ class RawPointInTimeArtifactArchive:
             source_uri=source_uri,
             content_type=content_type,
             retrieved_at=retrieved_at,
-            source_metadata=source_metadata,
         )
         self._ensure_directories()
         raw_path, receipt_path = self._paths(artifact)

@@ -30,9 +30,6 @@ _AUTHORITY = {
     "execution_authority": "none",
     "can_submit_orders": False,
 }
-_METADATA_FIELDS = frozenset(
-    {"source_kind", "venue", "market_dates", "source_span"}
-)
 _SOURCE_SPAN_FIELDS = frozenset(
     {"span_type", "start_byte", "end_byte", "source_sha256"}
 )
@@ -216,18 +213,30 @@ def build_market_session_calendar(
         or raw_artifact.content_type != "application/json"
     ):
         raise PointInTimeDataError("market calendar must be an Alpaca calendar receipt")
-    metadata = raw_artifact.source_metadata
-    if (
-        set(metadata) != _METADATA_FIELDS
-        or metadata["source_kind"] != "market_session_calendar"
-    ):
-        raise PointInTimeDataError("market calendar metadata is invalid")
+    try:
+        raw_calendar = json.loads(raw_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PointInTimeDataError("market calendar source bytes are not JSON") from exc
+    if type(raw_calendar) is not list:
+        raise PointInTimeDataError("market calendar source must be a JSON list")
+    market_dates = []
+    for index, row in enumerate(raw_calendar):
+        if not isinstance(row, Mapping) or type(row.get("date")) is not str:
+            raise PointInTimeDataError(f"market calendar row {index} has no date")
+        market_dates.append(row["date"])
     span = _source_span(
-        metadata["source_span"], raw_artifact=raw_artifact, raw_bytes=raw_bytes
+        {
+            "span_type": "byte_range",
+            "start_byte": 0,
+            "end_byte": len(raw_bytes),
+            "source_sha256": raw_artifact.raw_artifact_sha256,
+        },
+        raw_artifact=raw_artifact,
+        raw_bytes=raw_bytes,
     )
     return _from_material(
-        venue=metadata["venue"],
-        market_dates=metadata["market_dates"],
+        venue="XNYS",
+        market_dates=market_dates,
         raw_artifact_id=raw_artifact.raw_artifact_id,
         raw_artifact_sha256=raw_artifact.raw_artifact_sha256,
         source_span=span,

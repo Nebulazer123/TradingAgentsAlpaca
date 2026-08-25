@@ -63,7 +63,7 @@ def test_raw_artifact_archive_rejects_unsafe_source_or_tampered_bytes(tmp_path):
         archive.read_bytes(artifact)
 
 
-def test_raw_artifact_admission_snapshots_source_metadata_and_syncs_directories(
+def test_raw_artifact_admission_syncs_files_and_containing_directories(
     monkeypatch,
     tmp_path,
 ):
@@ -74,17 +74,12 @@ def test_raw_artifact_admission_snapshots_source_metadata_and_syncs_directories(
         "fsync",
         lambda descriptor: (sync_calls.append(descriptor), original_fsync(descriptor))[1],
     )
-    source_metadata = {"observed_at": "2026-01-05T21:00:00+00:00"}
     artifact = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts").admit(
         raw_bytes=b"{}",
         source_uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
         content_type="application/json",
         retrieved_at="2026-01-05T21:00:00+00:00",
-        source_metadata=source_metadata,
     )
-    source_metadata["observed_at"] = "tampered"
 
-    assert artifact.to_dict()["source_metadata"] == {
-        "observed_at": "2026-01-05T21:00:00+00:00"
-    }
+    assert artifact.raw_artifact_id.startswith("pit-raw-artifact-")
     assert len(sync_calls) >= 4

@@ -1,14 +1,11 @@
-"""Source-bound builders for SEC fundamentals and Alpaca market observations.
-
-These adapters perform no fetching.  Callers first archive the exact HTTPS
-response bytes, then bind a bounded source span and observed availability to a
-pure :class:`PointInTimeObservation` value.
-"""
+"""Source-derived point-in-time SEC and Alpaca observations."""
 
 from __future__ import annotations
 
+import datetime as dt
+import json
 from collections.abc import Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from tradingagents.dataflows.pit.raw_artifacts import (
     RawPointInTimeArtifact,
@@ -19,109 +16,65 @@ from tradingagents.dataflows.pit.records import (
     PointInTimeObservation,
 )
 
-__all__ = [
-    "build_alpaca_market_observation",
-    "build_sec_fundamental_observation",
-]
-
+__all__ = ["build_alpaca_market_observation", "build_sec_fundamental_observation"]
 
 _SEC_HOSTS = frozenset({"data.sec.gov", "www.sec.gov"})
 _ALPACA_HOSTS = frozenset({"data.alpaca.markets"})
-_SEC_CONTENT_TYPES = frozenset(
-    {
-        "application/json",
-        "application/xhtml+xml",
-        "application/xml",
-        "text/html",
-        "text/xml",
-    }
-)
-_ALPACA_CONTENT_TYPES = frozenset({"application/json", "application/x-ndjson"})
 _ALPACA_ADJUSTMENT_STATUS = {
     "raw": "unadjusted",
     "split": "split_adjusted",
     "all": "total_return_adjusted",
 }
-_SOURCE_SPAN_FIELDS = frozenset(
-    {"span_type", "start_byte", "end_byte", "source_sha256"}
-)
-_SEC_METADATA_FIELDS = frozenset(
-    {
-        "source_kind",
-        "event_time",
-        "publication_time",
-        "availability_time",
-        "source_span",
-    }
-)
-_ALPACA_METADATA_FIELDS = _SEC_METADATA_FIELDS | {"feed", "adjustment_mode"}
 
 
-def _raw_bytes(
-    *,
-    archive: RawPointInTimeArtifactArchive,
-    raw_artifact: RawPointInTimeArtifact,
-) -> bytes:
+def _bytes(archive: RawPointInTimeArtifactArchive, artifact: RawPointInTimeArtifact) -> bytes:
     if type(archive) is not RawPointInTimeArtifactArchive:
         raise PointInTimeDataError("archive must be an exact raw PIT artifact archive")
-    if type(raw_artifact) is not RawPointInTimeArtifact:
+    if type(artifact) is not RawPointInTimeArtifact:
         raise PointInTimeDataError("raw_artifact must be an exact raw PIT artifact")
-    return archive.read_bytes(raw_artifact)
+    return archive.read_bytes(artifact)
 
 
-def _host(raw_artifact: RawPointInTimeArtifact, *, allowed: frozenset[str], label: str) -> None:
-    hostname = urlsplit(raw_artifact.source_uri).hostname
-    if hostname is None or hostname.lower() not in allowed:
-        raise PointInTimeDataError(f"raw artifact is not a {label} source")
+def _json_mapping(raw_bytes: bytes, *, label: str) -> Mapping[str, object]:
+    try:
+        parsed = json.loads(raw_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PointInTimeDataError(f"{label} source bytes are not JSON") from exc
+    if not isinstance(parsed, Mapping):
+        raise PointInTimeDataError(f"{label} source JSON must be an object")
+    return parsed
 
 
-def _source_span(
-    value: object,
-    *,
-    sealed_value: object,
-    raw_artifact: RawPointInTimeArtifact,
+def _timestamp(value: object, *, label: str) -> str:
+    if type(value) is not str:
+        raise PointInTimeDataError(f"{label} is absent from the raw source")
+    normalized = value.removesuffix("Z") + ("+00:00" if value.endswith("Z") else "")
+    try:
+        parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise PointInTimeDataError(f"{label} is not a source UTC timestamp") from exc
+    if parsed.tzinfo != dt.UTC or parsed.microsecond:
+        raise PointInTimeDataError(f"{label} is not a source UTC timestamp")
+    return parsed.isoformat(timespec="seconds")
+
+
+def _whole_source_span(
+    artifact: RawPointInTimeArtifact,
     raw_bytes: bytes,
-    source_kind: str,
+    *,
+    kind: str,
     extra: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    if not isinstance(value, Mapping) or set(value) != _SOURCE_SPAN_FIELDS:
-        raise PointInTimeDataError("source_span must be an exact byte-range mapping")
-    if not isinstance(sealed_value, Mapping) or dict(value) != dict(sealed_value):
-        raise PointInTimeDataError("source_span is not the immutable source claim")
-    span_type = value["span_type"]
-    start = value["start_byte"]
-    end = value["end_byte"]
-    digest = value["source_sha256"]
-    if span_type != "byte_range":
-        raise PointInTimeDataError("source_span.span_type must be byte_range")
-    if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(raw_bytes):
-        raise PointInTimeDataError("source_span byte range is outside raw source bytes")
-    if digest != raw_artifact.raw_artifact_sha256:
-        raise PointInTimeDataError("source_span digest does not match raw source bytes")
     result: dict[str, object] = {
-        "source_kind": source_kind,
-        "span_type": span_type,
-        "start_byte": start,
-        "end_byte": end,
-        "source_sha256": digest,
+        "source_kind": kind,
+        "span_type": "byte_range",
+        "start_byte": 0,
+        "end_byte": len(raw_bytes),
+        "source_sha256": artifact.raw_artifact_sha256,
     }
-    if extra is not None:
+    if extra:
         result.update(extra)
     return result
-
-
-def _metadata(
-    raw_artifact: RawPointInTimeArtifact,
-    *,
-    expected_fields: frozenset[str],
-    source_kind: str,
-) -> Mapping[str, object]:
-    metadata = raw_artifact.source_metadata
-    if set(metadata) != expected_fields or metadata.get("source_kind") != source_kind:
-        raise PointInTimeDataError("raw artifact source metadata is not the expected receipt")
-    if not isinstance(metadata["source_span"], Mapping):
-        raise PointInTimeDataError("raw artifact source span is invalid")
-    return metadata
 
 
 def build_sec_fundamental_observation(
@@ -129,35 +82,30 @@ def build_sec_fundamental_observation(
     security_id: str,
     archive: RawPointInTimeArtifactArchive,
     raw_artifact: RawPointInTimeArtifact,
-    source_span: Mapping[str, object],
 ) -> PointInTimeObservation:
-    """Bind one SEC HTML/XBRL fact to exact archived source bytes."""
+    """Derive SEC fact times from exact archived response bytes."""
 
-    raw_bytes = _raw_bytes(archive=archive, raw_artifact=raw_artifact)
-    _host(raw_artifact, allowed=_SEC_HOSTS, label="SEC")
-    if raw_artifact.content_type not in _SEC_CONTENT_TYPES:
-        raise PointInTimeDataError("SEC raw artifact content type is not supported")
-    metadata = _metadata(
-        raw_artifact,
-        expected_fields=_SEC_METADATA_FIELDS,
-        source_kind="sec_html_xbrl",
+    raw_bytes = _bytes(archive, raw_artifact)
+    if (
+        urlsplit(raw_artifact.source_uri).hostname not in _SEC_HOSTS
+        or raw_artifact.content_type != "application/json"
+    ):
+        raise PointInTimeDataError("raw artifact is not an SEC JSON source")
+    payload = _json_mapping(raw_bytes, label="SEC")
+    event_time = _timestamp(payload.get("event_time"), label="SEC event_time")
+    publication_time = _timestamp(
+        payload.get("publication_time"), label="SEC publication_time"
     )
     return PointInTimeObservation(
         security_id=security_id,
-        event_time=metadata["event_time"],  # type: ignore[arg-type]
-        publication_time=metadata["publication_time"],  # type: ignore[arg-type]
-        availability_time=metadata["availability_time"],  # type: ignore[arg-type]
+        event_time=event_time,
+        publication_time=publication_time,
+        availability_time=raw_artifact.retrieved_at,
         retrieval_time=raw_artifact.retrieved_at,
         raw_artifact_id=raw_artifact.raw_artifact_id,
         raw_artifact_sha256=raw_artifact.raw_artifact_sha256,
         adjustment_status="unadjusted",
-        source_span=_source_span(
-            source_span,
-            sealed_value=metadata["source_span"],
-            raw_artifact=raw_artifact,
-            raw_bytes=raw_bytes,
-            source_kind="sec_html_xbrl",
-        ),
+        source_span=_whole_source_span(raw_artifact, raw_bytes, kind="sec_html_xbrl"),
     )
 
 
@@ -166,40 +114,41 @@ def build_alpaca_market_observation(
     security_id: str,
     archive: RawPointInTimeArtifactArchive,
     raw_artifact: RawPointInTimeArtifact,
-    source_span: Mapping[str, object],
 ) -> PointInTimeObservation:
-    """Bind market bars to the exact recorded Alpaca feed and adjustment mode."""
+    """Derive bar time and feed/adjustment facts from archived response evidence."""
 
-    raw_bytes = _raw_bytes(archive=archive, raw_artifact=raw_artifact)
-    _host(raw_artifact, allowed=_ALPACA_HOSTS, label="Alpaca market-data")
-    if raw_artifact.content_type not in _ALPACA_CONTENT_TYPES:
-        raise PointInTimeDataError("Alpaca raw artifact content type is not supported")
-    metadata = _metadata(
-        raw_artifact,
-        expected_fields=_ALPACA_METADATA_FIELDS,
-        source_kind="alpaca_market_data",
-    )
-    feed = metadata["feed"]
-    adjustment_mode = metadata["adjustment_mode"]
-    if feed not in {"iex", "sip"}:
-        raise PointInTimeDataError("Alpaca market-data feed must be iex or sip")
-    if adjustment_mode not in _ALPACA_ADJUSTMENT_STATUS:
-        raise PointInTimeDataError("Alpaca adjustment mode is not supported")
+    raw_bytes = _bytes(archive, raw_artifact)
+    parsed_url = urlsplit(raw_artifact.source_uri)
+    if (
+        parsed_url.hostname not in _ALPACA_HOSTS
+        or raw_artifact.content_type != "application/json"
+    ):
+        raise PointInTimeDataError("raw artifact is not Alpaca market-data JSON")
+    query = parse_qs(parsed_url.query, keep_blank_values=True)
+    feed = query.get("feed")
+    adjustment = query.get("adjustment")
+    if feed is None or adjustment is None or len(feed) != 1 or len(adjustment) != 1:
+        raise PointInTimeDataError("Alpaca URL must bind one feed and adjustment")
+    if feed[0] not in {"iex", "sip"} or adjustment[0] not in _ALPACA_ADJUSTMENT_STATUS:
+        raise PointInTimeDataError("Alpaca URL has unsupported feed or adjustment")
+    payload = _json_mapping(raw_bytes, label="Alpaca")
+    bars = payload.get("bars")
+    if type(bars) is not list or not bars or not isinstance(bars[0], Mapping):
+        raise PointInTimeDataError("Alpaca source has no first bar")
+    event_time = _timestamp(bars[0].get("t"), label="Alpaca bar timestamp")
     return PointInTimeObservation(
         security_id=security_id,
-        event_time=metadata["event_time"],  # type: ignore[arg-type]
-        publication_time=metadata["publication_time"],  # type: ignore[arg-type]
-        availability_time=metadata["availability_time"],  # type: ignore[arg-type]
+        event_time=event_time,
+        publication_time=event_time,
+        availability_time=raw_artifact.retrieved_at,
         retrieval_time=raw_artifact.retrieved_at,
         raw_artifact_id=raw_artifact.raw_artifact_id,
         raw_artifact_sha256=raw_artifact.raw_artifact_sha256,
-        adjustment_status=_ALPACA_ADJUSTMENT_STATUS[adjustment_mode],
-        source_span=_source_span(
-            source_span,
-            sealed_value=metadata["source_span"],
-            raw_artifact=raw_artifact,
-            raw_bytes=raw_bytes,
-            source_kind="alpaca_market_data",
-            extra={"feed": feed, "adjustment_mode": adjustment_mode},
+        adjustment_status=_ALPACA_ADJUSTMENT_STATUS[adjustment[0]],
+        source_span=_whole_source_span(
+            raw_artifact,
+            raw_bytes,
+            kind="alpaca_market_data",
+            extra={"feed": feed[0], "adjustment_mode": adjustment[0]},
         ),
     )
