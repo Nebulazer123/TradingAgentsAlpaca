@@ -18,6 +18,7 @@ import stat
 from collections.abc import Mapping
 from contextlib import suppress
 from pathlib import Path
+from types import MappingProxyType
 from urllib.parse import urlsplit
 
 from tradingagents.dataflows.pit.records import PointInTimeDataError
@@ -130,6 +131,41 @@ def _authority(payload: Mapping[str, object]) -> None:
         raise PointInTimeDataError("raw artifact authority fields are fixed")
 
 
+def _freeze_json(value: object, *, label: str) -> object:
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        raise PointInTimeDataError(f"{label} must not contain floating-point values")
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise PointInTimeDataError(f"{label} keys must be strings")
+            frozen[key] = _freeze_json(item, label=f"{label}.{key}")
+        return MappingProxyType(frozen)
+    if type(value) in (list, tuple):
+        return tuple(
+            _freeze_json(item, label=f"{label}[{index}]")
+            for index, item in enumerate(value)
+        )
+    raise PointInTimeDataError(f"{label} must contain JSON values")
+
+
+def _thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if type(value) is tuple:
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+def _source_metadata(value: object) -> Mapping[str, object]:
+    frozen = _freeze_json(value, label="source_metadata")
+    if not isinstance(frozen, MappingProxyType) or not frozen:
+        raise PointInTimeDataError("source_metadata must be a nonempty JSON mapping")
+    return frozen
+
+
 @dataclasses.dataclass(frozen=True, slots=True, init=False)
 class RawPointInTimeArtifact:
     """Canonical receipt for exact, local immutable source bytes."""
@@ -141,6 +177,7 @@ class RawPointInTimeArtifact:
     content_type: str
     retrieved_at: str
     byte_count: int
+    source_metadata: Mapping[str, object]
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError(
@@ -157,6 +194,7 @@ class RawPointInTimeArtifact:
             "content_type": self.content_type,
             "retrieved_at": self.retrieved_at,
             "byte_count": self.byte_count,
+            "source_metadata": _thaw_json(self.source_metadata),
             **_AUTHORITY,
         }
 
@@ -182,6 +220,7 @@ def _from_material(
     content_type: object,
     retrieved_at: object,
     byte_count: object,
+    source_metadata: object,
 ) -> RawPointInTimeArtifact:
     raw_digest = _digest(raw_artifact_sha256, label="raw_artifact_sha256")
     uri = _source_uri(source_uri)
@@ -189,6 +228,7 @@ def _from_material(
     timestamp = _canonical_timestamp(retrieved_at, label="retrieved_at")
     if type(byte_count) is not int or byte_count <= 0:
         raise PointInTimeDataError("byte_count must be a positive exact integer")
+    metadata = _source_metadata(source_metadata)
     identity = {
         "schema_version": _SCHEMA,
         "raw_artifact_sha256": raw_digest,
@@ -196,6 +236,7 @@ def _from_material(
         "content_type": mime,
         "retrieved_at": timestamp,
         "byte_count": byte_count,
+        "source_metadata": _thaw_json(metadata),
         **_AUTHORITY,
     }
     artifact_id = "pit-raw-artifact-" + _sha256(identity)
@@ -208,6 +249,7 @@ def _from_material(
         content_type=mime,
         retrieved_at=timestamp,
         byte_count=byte_count,
+        source_metadata=metadata,
     )
 
 
@@ -217,6 +259,7 @@ def build_raw_point_in_time_artifact(
     source_uri: str,
     content_type: str,
     retrieved_at: str,
+    source_metadata: Mapping[str, object] | None = None,
 ) -> RawPointInTimeArtifact:
     """Create a receipt while preserving the supplied bytes exactly."""
 
@@ -228,6 +271,11 @@ def build_raw_point_in_time_artifact(
         content_type=content_type,
         retrieved_at=retrieved_at,
         byte_count=len(raw_bytes),
+        source_metadata=(
+            {"observed_at": retrieved_at}
+            if source_metadata is None
+            else source_metadata
+        ),
     )
 
 
@@ -246,6 +294,7 @@ def validate_raw_point_in_time_artifact(value: object) -> RawPointInTimeArtifact
         content_type=payload["content_type"],
         retrieved_at=payload["retrieved_at"],
         byte_count=payload["byte_count"],
+        source_metadata=payload["source_metadata"],
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(payload):
         raise PointInTimeDataError("raw artifact bytes do not match canonical rebuild")
@@ -269,6 +318,7 @@ class RawPointInTimeArtifactArchive:
         source_uri: str,
         content_type: str,
         retrieved_at: str,
+        source_metadata: Mapping[str, object] | None = None,
     ) -> RawPointInTimeArtifact:
         """Persist exact bytes once, or verify the identical prior object."""
 
@@ -277,11 +327,14 @@ class RawPointInTimeArtifactArchive:
             source_uri=source_uri,
             content_type=content_type,
             retrieved_at=retrieved_at,
+            source_metadata=source_metadata,
         )
         self._ensure_directories()
         raw_path, receipt_path = self._paths(artifact)
-        self._write_or_verify(raw_path, raw_bytes)
-        self._write_or_verify(receipt_path, artifact.canonical_json_bytes())
+        if self._write_or_verify(raw_path, raw_bytes):
+            self._fsync_directory(self._objects_root)
+        if self._write_or_verify(receipt_path, artifact.canonical_json_bytes()):
+            self._fsync_directory(self._objects_root)
         return self.read_receipt(artifact)
 
     def read_receipt(self, artifact: RawPointInTimeArtifact) -> RawPointInTimeArtifact:
@@ -326,16 +379,22 @@ class RawPointInTimeArtifactArchive:
         )
 
     def _ensure_directories(self) -> None:
+        created: list[Path] = []
         for path in (self.root, self._objects_root):
             try:
+                existed = path.exists()
                 path.mkdir(mode=0o700, parents=path == self.root, exist_ok=True)
                 mode = os.lstat(path).st_mode
             except OSError as exc:
                 raise PointInTimeDataError("raw artifact archive cannot create directory") from exc
             if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
                 raise PointInTimeDataError("raw artifact archive directory is unsafe")
+            if not existed:
+                created.append(path)
+        for path in created:
+            self._fsync_directory(path.parent)
 
-    def _write_or_verify(self, path: Path, data: bytes) -> None:
+    def _write_or_verify(self, path: Path, data: bytes) -> bool:
         try:
             descriptor = os.open(
                 path,
@@ -347,7 +406,7 @@ class RawPointInTimeArtifactArchive:
                 raise PointInTimeDataError(
                     "immutable raw artifact path already differs"
                 ) from exc
-            return
+            return False
         except OSError as exc:
             raise PointInTimeDataError("raw artifact archive cannot write object") from exc
         try:
@@ -359,6 +418,18 @@ class RawPointInTimeArtifactArchive:
             with suppress(OSError):
                 path.unlink(missing_ok=True)
             raise
+        return True
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        try:
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except OSError as exc:
+            raise PointInTimeDataError("raw artifact archive cannot sync directory") from exc
 
     @staticmethod
     def _read_regular(path: Path) -> bytes:

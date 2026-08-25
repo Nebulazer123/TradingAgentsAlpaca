@@ -14,13 +14,14 @@ from tradingagents.dataflows.pit import (
 )
 
 
-def _archive(tmp_path, *, uri: str, raw_bytes: bytes):
+def _archive(tmp_path, *, uri: str, raw_bytes: bytes, source_metadata: dict):
     archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
     artifact = archive.admit(
         raw_bytes=raw_bytes,
         source_uri=uri,
         content_type="application/json",
         retrieved_at="2026-01-05T21:00:00+00:00",
+        source_metadata=source_metadata,
     )
     return archive, artifact
 
@@ -31,14 +32,23 @@ def test_sec_observation_binds_exact_archived_bytes_and_source_span(tmp_path):
         tmp_path,
         uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
         raw_bytes=raw_bytes,
+        source_metadata={
+            "source_kind": "sec_html_xbrl",
+            "event_time": "2026-01-04T21:00:00+00:00",
+            "publication_time": "2026-01-05T20:00:00+00:00",
+            "availability_time": "2026-01-05T20:30:00+00:00",
+            "source_span": {
+                "span_type": "byte_range",
+                "start_byte": 0,
+                "end_byte": len(raw_bytes),
+                "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            },
+        },
     )
     observation = build_sec_fundamental_observation(
         security_id="security-0001",
         archive=archive,
         raw_artifact=artifact,
-        event_time="2026-01-04T21:00:00+00:00",
-        publication_time="2026-01-05T20:00:00+00:00",
-        availability_time="2026-01-05T20:30:00+00:00",
         source_span={
             "span_type": "byte_range",
             "start_byte": 0,
@@ -59,15 +69,24 @@ def test_official_observations_reject_wrong_origin_or_unverifiable_source_span(t
         tmp_path,
         uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
         raw_bytes=raw_bytes,
+        source_metadata={
+            "source_kind": "sec_html_xbrl",
+            "event_time": "2026-01-04T21:00:00+00:00",
+            "publication_time": "2026-01-05T20:00:00+00:00",
+            "availability_time": "2026-01-05T20:30:00+00:00",
+            "source_span": {
+                "span_type": "byte_range",
+                "start_byte": 0,
+                "end_byte": len(raw_bytes),
+                "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            },
+        },
     )
     with pytest.raises(PointInTimeDataError):
         build_sec_fundamental_observation(
             security_id="security-0001",
             archive=sec_archive,
             raw_artifact=sec_artifact,
-            event_time="2026-01-04T21:00:00+00:00",
-            publication_time="2026-01-05T20:00:00+00:00",
-            availability_time="2026-01-05T20:30:00+00:00",
             source_span={
                 "span_type": "byte_range",
                 "start_byte": 0,
@@ -80,15 +99,26 @@ def test_official_observations_reject_wrong_origin_or_unverifiable_source_span(t
         tmp_path,
         uri="https://data.alpaca.markets/v2/stocks/bars",
         raw_bytes=raw_bytes,
+        source_metadata={
+            "source_kind": "alpaca_market_data",
+            "event_time": "2026-01-05T20:00:00+00:00",
+            "publication_time": "2026-01-05T20:00:00+00:00",
+            "availability_time": "2026-01-05T20:00:00+00:00",
+            "feed": "iex",
+            "adjustment_mode": "split",
+            "source_span": {
+                "span_type": "byte_range",
+                "start_byte": 0,
+                "end_byte": len(raw_bytes),
+                "source_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            },
+        },
     )
     with pytest.raises(PointInTimeDataError):
         build_sec_fundamental_observation(
             security_id="security-0001",
             archive=alpaca_archive,
             raw_artifact=alpaca_artifact,
-            event_time="2026-01-05T20:00:00+00:00",
-            publication_time="2026-01-05T20:00:00+00:00",
-            availability_time="2026-01-05T20:00:00+00:00",
             source_span={
                 "span_type": "byte_range",
                 "start_byte": 0,
@@ -100,11 +130,6 @@ def test_official_observations_reject_wrong_origin_or_unverifiable_source_span(t
         security_id="security-0001",
         archive=alpaca_archive,
         raw_artifact=alpaca_artifact,
-        event_time="2026-01-05T20:00:00+00:00",
-        publication_time="2026-01-05T20:00:00+00:00",
-        availability_time="2026-01-05T20:00:00+00:00",
-        feed="iex",
-        adjustment_mode="split",
         source_span={
             "span_type": "byte_range",
             "start_byte": 0,

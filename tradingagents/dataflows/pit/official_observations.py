@@ -45,6 +45,16 @@ _ALPACA_ADJUSTMENT_STATUS = {
 _SOURCE_SPAN_FIELDS = frozenset(
     {"span_type", "start_byte", "end_byte", "source_sha256"}
 )
+_SEC_METADATA_FIELDS = frozenset(
+    {
+        "source_kind",
+        "event_time",
+        "publication_time",
+        "availability_time",
+        "source_span",
+    }
+)
+_ALPACA_METADATA_FIELDS = _SEC_METADATA_FIELDS | {"feed", "adjustment_mode"}
 
 
 def _raw_bytes(
@@ -68,6 +78,7 @@ def _host(raw_artifact: RawPointInTimeArtifact, *, allowed: frozenset[str], labe
 def _source_span(
     value: object,
     *,
+    sealed_value: object,
     raw_artifact: RawPointInTimeArtifact,
     raw_bytes: bytes,
     source_kind: str,
@@ -75,6 +86,8 @@ def _source_span(
 ) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != _SOURCE_SPAN_FIELDS:
         raise PointInTimeDataError("source_span must be an exact byte-range mapping")
+    if not isinstance(sealed_value, Mapping) or dict(value) != dict(sealed_value):
+        raise PointInTimeDataError("source_span is not the immutable source claim")
     span_type = value["span_type"]
     start = value["start_byte"]
     end = value["end_byte"]
@@ -97,14 +110,25 @@ def _source_span(
     return result
 
 
+def _metadata(
+    raw_artifact: RawPointInTimeArtifact,
+    *,
+    expected_fields: frozenset[str],
+    source_kind: str,
+) -> Mapping[str, object]:
+    metadata = raw_artifact.source_metadata
+    if set(metadata) != expected_fields or metadata.get("source_kind") != source_kind:
+        raise PointInTimeDataError("raw artifact source metadata is not the expected receipt")
+    if not isinstance(metadata["source_span"], Mapping):
+        raise PointInTimeDataError("raw artifact source span is invalid")
+    return metadata
+
+
 def build_sec_fundamental_observation(
     *,
     security_id: str,
     archive: RawPointInTimeArtifactArchive,
     raw_artifact: RawPointInTimeArtifact,
-    event_time: str,
-    publication_time: str,
-    availability_time: str,
     source_span: Mapping[str, object],
 ) -> PointInTimeObservation:
     """Bind one SEC HTML/XBRL fact to exact archived source bytes."""
@@ -113,17 +137,23 @@ def build_sec_fundamental_observation(
     _host(raw_artifact, allowed=_SEC_HOSTS, label="SEC")
     if raw_artifact.content_type not in _SEC_CONTENT_TYPES:
         raise PointInTimeDataError("SEC raw artifact content type is not supported")
+    metadata = _metadata(
+        raw_artifact,
+        expected_fields=_SEC_METADATA_FIELDS,
+        source_kind="sec_html_xbrl",
+    )
     return PointInTimeObservation(
         security_id=security_id,
-        event_time=event_time,
-        publication_time=publication_time,
-        availability_time=availability_time,
+        event_time=metadata["event_time"],  # type: ignore[arg-type]
+        publication_time=metadata["publication_time"],  # type: ignore[arg-type]
+        availability_time=metadata["availability_time"],  # type: ignore[arg-type]
         retrieval_time=raw_artifact.retrieved_at,
         raw_artifact_id=raw_artifact.raw_artifact_id,
         raw_artifact_sha256=raw_artifact.raw_artifact_sha256,
         adjustment_status="unadjusted",
         source_span=_source_span(
             source_span,
+            sealed_value=metadata["source_span"],
             raw_artifact=raw_artifact,
             raw_bytes=raw_bytes,
             source_kind="sec_html_xbrl",
@@ -136,11 +166,6 @@ def build_alpaca_market_observation(
     security_id: str,
     archive: RawPointInTimeArtifactArchive,
     raw_artifact: RawPointInTimeArtifact,
-    event_time: str,
-    publication_time: str,
-    availability_time: str,
-    feed: str,
-    adjustment_mode: str,
     source_span: Mapping[str, object],
 ) -> PointInTimeObservation:
     """Bind market bars to the exact recorded Alpaca feed and adjustment mode."""
@@ -149,21 +174,29 @@ def build_alpaca_market_observation(
     _host(raw_artifact, allowed=_ALPACA_HOSTS, label="Alpaca market-data")
     if raw_artifact.content_type not in _ALPACA_CONTENT_TYPES:
         raise PointInTimeDataError("Alpaca raw artifact content type is not supported")
+    metadata = _metadata(
+        raw_artifact,
+        expected_fields=_ALPACA_METADATA_FIELDS,
+        source_kind="alpaca_market_data",
+    )
+    feed = metadata["feed"]
+    adjustment_mode = metadata["adjustment_mode"]
     if feed not in {"iex", "sip"}:
         raise PointInTimeDataError("Alpaca market-data feed must be iex or sip")
     if adjustment_mode not in _ALPACA_ADJUSTMENT_STATUS:
         raise PointInTimeDataError("Alpaca adjustment mode is not supported")
     return PointInTimeObservation(
         security_id=security_id,
-        event_time=event_time,
-        publication_time=publication_time,
-        availability_time=availability_time,
+        event_time=metadata["event_time"],  # type: ignore[arg-type]
+        publication_time=metadata["publication_time"],  # type: ignore[arg-type]
+        availability_time=metadata["availability_time"],  # type: ignore[arg-type]
         retrieval_time=raw_artifact.retrieved_at,
         raw_artifact_id=raw_artifact.raw_artifact_id,
         raw_artifact_sha256=raw_artifact.raw_artifact_sha256,
         adjustment_status=_ALPACA_ADJUSTMENT_STATUS[adjustment_mode],
         source_span=_source_span(
             source_span,
+            sealed_value=metadata["source_span"],
             raw_artifact=raw_artifact,
             raw_bytes=raw_bytes,
             source_kind="alpaca_market_data",

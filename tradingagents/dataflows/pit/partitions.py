@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
-import datetime as dt
 import hashlib
 import json
 from collections.abc import Mapping
 
+from tradingagents.dataflows.pit.market_calendar import (
+    MarketSessionCalendar,
+    validate_market_session_calendar,
+)
 from tradingagents.dataflows.pit.records import PointInTimeDataError
 from tradingagents.evals.economic_evaluation_protocol import (
     DecisionEvent,
@@ -37,18 +40,6 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
 
 
-def _date(value: object, *, label: str) -> str:
-    if type(value) is not str:
-        raise PointInTimeDataError(f"{label} must be an ISO market date")
-    try:
-        parsed = dt.date.fromisoformat(value)
-    except ValueError as exc:
-        raise PointInTimeDataError(f"{label} must be an ISO market date") from exc
-    if parsed.isoformat() != value:
-        raise PointInTimeDataError(f"{label} must be an ISO market date")
-    return value
-
-
 def _authority(payload: Mapping[str, object], *, label: str) -> None:
     if (
         payload["analysis_only"] is not True
@@ -65,6 +56,7 @@ class MarketDatePartitions:
 
     partition_id: str
     partition_sha256: str
+    market_calendar: MarketSessionCalendar
     market_dates: tuple[str, ...]
     events: tuple[DecisionEvent, ...]
     development_market_dates: tuple[str, ...]
@@ -73,10 +65,17 @@ class MarketDatePartitions:
     development_event_ids: tuple[str, ...]
     validation_event_ids: tuple[str, ...]
     holdout_event_ids: tuple[str, ...]
+    development_eligible_event_ids: tuple[str, ...]
+    validation_eligible_event_ids: tuple[str, ...]
+    holdout_eligible_event_ids: tuple[str, ...]
     development_validation_purge_dates: tuple[str, ...]
     development_validation_embargo_dates: tuple[str, ...]
     validation_holdout_purge_dates: tuple[str, ...]
     validation_holdout_embargo_dates: tuple[str, ...]
+    development_validation_purge_event_ids: tuple[str, ...]
+    development_validation_embargo_event_ids: tuple[str, ...]
+    validation_holdout_purge_event_ids: tuple[str, ...]
+    validation_holdout_embargo_event_ids: tuple[str, ...]
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("MarketDatePartitions instances must be created by its builder")
@@ -86,6 +85,7 @@ class MarketDatePartitions:
             "schema_version": _SCHEMA,
             "partition_id": self.partition_id,
             "partition_sha256": self.partition_sha256,
+            "market_calendar": self.market_calendar.to_dict(),
             "market_dates": list(self.market_dates),
             "events": [event.to_dict() for event in self.events],
             "development_market_dates": list(self.development_market_dates),
@@ -94,6 +94,11 @@ class MarketDatePartitions:
             "development_event_ids": list(self.development_event_ids),
             "validation_event_ids": list(self.validation_event_ids),
             "holdout_event_ids": list(self.holdout_event_ids),
+            "development_eligible_event_ids": list(
+                self.development_eligible_event_ids
+            ),
+            "validation_eligible_event_ids": list(self.validation_eligible_event_ids),
+            "holdout_eligible_event_ids": list(self.holdout_eligible_event_ids),
             "development_validation_purge_dates": list(
                 self.development_validation_purge_dates
             ),
@@ -103,6 +108,18 @@ class MarketDatePartitions:
             "validation_holdout_purge_dates": list(self.validation_holdout_purge_dates),
             "validation_holdout_embargo_dates": list(
                 self.validation_holdout_embargo_dates
+            ),
+            "development_validation_purge_event_ids": list(
+                self.development_validation_purge_event_ids
+            ),
+            "development_validation_embargo_event_ids": list(
+                self.development_validation_embargo_event_ids
+            ),
+            "validation_holdout_purge_event_ids": list(
+                self.validation_holdout_purge_event_ids
+            ),
+            "validation_holdout_embargo_event_ids": list(
+                self.validation_holdout_embargo_event_ids
             ),
             "purge_sessions": _PURGE_SESSIONS,
             **_AUTHORITY,
@@ -123,17 +140,6 @@ def _new_partitions(**fields: object) -> MarketDatePartitions:
     for name in _FIELD_NAMES:
         object.__setattr__(partitions, name, fields[name])
     return partitions
-
-
-def _canonical_market_dates(value: object) -> tuple[str, ...]:
-    if type(value) is not tuple or len(value) < 25:
-        raise PointInTimeDataError(
-            "market_dates must be an exact chronological tuple of at least 25 sessions"
-        )
-    dates = tuple(_date(item, label=f"market_dates[{index}]") for index, item in enumerate(value))
-    if dates != tuple(sorted(dates)) or len(set(dates)) != len(dates):
-        raise PointInTimeDataError("market_dates must be unique and chronological")
-    return dates
 
 
 def _canonical_events(value: object, *, market_dates: tuple[str, ...]) -> tuple[DecisionEvent, ...]:
@@ -167,12 +173,15 @@ def _event_ids_for_dates(
 
 def build_market_date_partitions(
     *,
-    market_dates: tuple[str, ...],
+    market_calendar: MarketSessionCalendar,
     events: tuple[DecisionEvent, ...],
 ) -> MarketDatePartitions:
-    """Split market sessions 60/20/20 and pin five-session boundary guards."""
+    """Split one source-backed market calendar and enforce boundary masks."""
 
-    dates = _canonical_market_dates(market_dates)
+    if type(market_calendar) is not MarketSessionCalendar:
+        raise PointInTimeDataError("market_calendar must be an exact MarketSessionCalendar")
+    calendar = validate_market_session_calendar(market_calendar.to_dict())
+    dates = calendar.market_dates
     validated_events = _canonical_events(events, market_dates=dates)
     total = len(dates)
     development_end = total * 60 // 100
@@ -180,8 +189,14 @@ def build_market_date_partitions(
     development_dates = dates[:development_end]
     validation_dates = dates[development_end:validation_end]
     holdout_dates = dates[validation_end:]
-    if min(len(development_dates), len(validation_dates), len(holdout_dates)) < _PURGE_SESSIONS:
-        raise PointInTimeDataError("each chronological partition must support five-session guards")
+    if (
+        len(development_dates) <= _PURGE_SESSIONS
+        or len(validation_dates) <= _PURGE_SESSIONS * 2
+        or len(holdout_dates) <= _PURGE_SESSIONS
+    ):
+        raise PointInTimeDataError(
+            "partitions must retain evaluable sessions after five-session guards"
+        )
     development_ids = _event_ids_for_dates(validated_events, development_dates)
     validation_ids = _event_ids_for_dates(validated_events, validation_dates)
     holdout_ids = _event_ids_for_dates(validated_events, holdout_dates)
@@ -192,7 +207,45 @@ def build_market_date_partitions(
         event.decision_event_id for event in validated_events
     }:
         raise PointInTimeDataError("partition event assignment is not exhaustive and disjoint")
+    development_validation_purge_dates = development_dates[-_PURGE_SESSIONS:]
+    development_validation_embargo_dates = validation_dates[:_PURGE_SESSIONS]
+    validation_holdout_purge_dates = validation_dates[-_PURGE_SESSIONS:]
+    validation_holdout_embargo_dates = holdout_dates[:_PURGE_SESSIONS]
+    development_validation_purge_ids = _event_ids_for_dates(
+        validated_events, development_validation_purge_dates
+    )
+    development_validation_embargo_ids = _event_ids_for_dates(
+        validated_events, development_validation_embargo_dates
+    )
+    validation_holdout_purge_ids = _event_ids_for_dates(
+        validated_events, validation_holdout_purge_dates
+    )
+    validation_holdout_embargo_ids = _event_ids_for_dates(
+        validated_events, validation_holdout_embargo_dates
+    )
+    development_eligible_ids = tuple(
+        event_id
+        for event_id in development_ids
+        if event_id not in set(development_validation_purge_ids)
+    )
+    validation_eligible_ids = tuple(
+        event_id
+        for event_id in validation_ids
+        if event_id
+        not in set(development_validation_embargo_ids)
+        | set(validation_holdout_purge_ids)
+    )
+    holdout_eligible_ids = tuple(
+        event_id
+        for event_id in holdout_ids
+        if event_id not in set(validation_holdout_embargo_ids)
+    )
+    if not all(
+        (development_eligible_ids, validation_eligible_ids, holdout_eligible_ids)
+    ):
+        raise PointInTimeDataError("each partition must retain an eligible decision event")
     fields: dict[str, object] = {
+        "market_calendar": calendar,
         "market_dates": dates,
         "events": validated_events,
         "development_market_dates": development_dates,
@@ -201,13 +254,21 @@ def build_market_date_partitions(
         "development_event_ids": development_ids,
         "validation_event_ids": validation_ids,
         "holdout_event_ids": holdout_ids,
-        "development_validation_purge_dates": development_dates[-_PURGE_SESSIONS:],
-        "development_validation_embargo_dates": validation_dates[:_PURGE_SESSIONS],
-        "validation_holdout_purge_dates": validation_dates[-_PURGE_SESSIONS:],
-        "validation_holdout_embargo_dates": holdout_dates[:_PURGE_SESSIONS],
+        "development_eligible_event_ids": development_eligible_ids,
+        "validation_eligible_event_ids": validation_eligible_ids,
+        "holdout_eligible_event_ids": holdout_eligible_ids,
+        "development_validation_purge_dates": development_validation_purge_dates,
+        "development_validation_embargo_dates": development_validation_embargo_dates,
+        "validation_holdout_purge_dates": validation_holdout_purge_dates,
+        "validation_holdout_embargo_dates": validation_holdout_embargo_dates,
+        "development_validation_purge_event_ids": development_validation_purge_ids,
+        "development_validation_embargo_event_ids": development_validation_embargo_ids,
+        "validation_holdout_purge_event_ids": validation_holdout_purge_ids,
+        "validation_holdout_embargo_event_ids": validation_holdout_embargo_ids,
     }
     identity = {
         "schema_version": _SCHEMA,
+        "market_calendar": calendar.to_dict(),
         "market_dates": list(dates),
         "events": [event.to_dict() for event in validated_events],
         "development_market_dates": list(development_dates),
@@ -216,6 +277,9 @@ def build_market_date_partitions(
         "development_event_ids": list(development_ids),
         "validation_event_ids": list(validation_ids),
         "holdout_event_ids": list(holdout_ids),
+        "development_eligible_event_ids": list(development_eligible_ids),
+        "validation_eligible_event_ids": list(validation_eligible_ids),
+        "holdout_eligible_event_ids": list(holdout_eligible_ids),
         "development_validation_purge_dates": list(
             fields["development_validation_purge_dates"]
         ),
@@ -225,6 +289,16 @@ def build_market_date_partitions(
         "validation_holdout_purge_dates": list(fields["validation_holdout_purge_dates"]),
         "validation_holdout_embargo_dates": list(
             fields["validation_holdout_embargo_dates"]
+        ),
+        "development_validation_purge_event_ids": list(
+            development_validation_purge_ids
+        ),
+        "development_validation_embargo_event_ids": list(
+            development_validation_embargo_ids
+        ),
+        "validation_holdout_purge_event_ids": list(validation_holdout_purge_ids),
+        "validation_holdout_embargo_event_ids": list(
+            validation_holdout_embargo_ids
         ),
         "purge_sessions": _PURGE_SESSIONS,
         **_AUTHORITY,
@@ -247,10 +321,17 @@ def validate_market_date_partitions(value: object) -> MarketDatePartitions:
     if payload["schema_version"] != _SCHEMA or payload["purge_sessions"] != _PURGE_SESSIONS:
         raise PointInTimeDataError("market-date partition schema is invalid")
     _authority(payload, label="market-date partitions")
-    if type(payload["market_dates"]) is not list or type(payload["events"]) is not list:
+    if (
+        type(payload["market_dates"]) is not list
+        or type(payload["events"]) is not list
+        or not isinstance(payload["market_calendar"], Mapping)
+    ):
         raise PointInTimeDataError("market-date partition source material is invalid")
+    calendar = validate_market_session_calendar(payload["market_calendar"])
+    if tuple(payload["market_dates"]) != calendar.market_dates:
+        raise PointInTimeDataError("partition market dates do not match market calendar")
     rebuilt = build_market_date_partitions(
-        market_dates=tuple(payload["market_dates"]),
+        market_calendar=calendar,
         events=tuple(validate_decision_event(event) for event in payload["events"]),
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(payload):
