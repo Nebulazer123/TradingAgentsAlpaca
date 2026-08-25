@@ -1,5 +1,11 @@
 """Immutable point-in-time data contracts for economic evaluation."""
 
+from .adjusted_price_windows import (
+    SourceBoundAdjustedPriceWindow,
+    build_source_bound_adjusted_price_window,
+    validate_source_bound_adjusted_price_window,
+    verify_source_bound_adjusted_price_window,
+)
 from .cohort import (
     PointInTimeCohort,
     PointInTimeCohortCandidate,
@@ -52,6 +58,10 @@ __all__ = [
     "PointInTimeCohortRejection",
     "build_point_in_time_cohort",
     "validate_point_in_time_cohort",
+    "SourceBoundAdjustedPriceWindow",
+    "build_source_bound_adjusted_price_window",
+    "validate_source_bound_adjusted_price_window",
+    "verify_source_bound_adjusted_price_window",
     "MarketSessionCalendar",
     "build_market_session_calendar",
     "validate_market_session_calendar",
