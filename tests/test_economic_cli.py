@@ -24,6 +24,7 @@ from tradingagents.evals.economic_evaluation_protocol import (
     canonical_universe_id,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
+from tests.test_point_in_time_cohort import _source_cohort_fixture
 
 runner = CliRunner()
 NOW = dt.datetime(2026, 1, 9, 21, 30, tzinfo=dt.UTC)
@@ -227,55 +228,26 @@ def _admit_args(tmp_path: Path, protocol_path: Path):
     ]
 
 
-def _cohort_input() -> dict[str, object]:
-    return {
-        "market_date": "2026-01-09",
-        "as_of_cutoff": "2026-01-09T21:00:00+00:00",
-        "candidates": [
-            {
-                "security": {
-                    "schema_version": "security_identity/v1",
-                    "security_id": f"security-{index:03d}",
-                    "symbol": f"C{index:03d}",
-                    "cik": None,
-                    "figi": None,
-                    "exchange": "NYSE",
-                    "security_type": "common_stock",
-                    "effective_from": "2020-01-01",
-                    "effective_to": None,
-                    "status": "active",
-                    "successor_security_id": None,
-                    "terminal_proceeds_artifact_id": None,
-                    "source_hashes": {
-                        "security-master": hashlib.sha256(
-                            f"security-{index:03d}".encode()
-                        ).hexdigest(),
-                    },
-                    "analysis_only": True,
-                    "execution_authority": "none",
-                    "can_submit_orders": False,
-                },
-                "prior_complete_close": "5",
-                "session_dollar_volumes": [str(index + 1)] * 60,
-                "selection_artifact_id": f"selection-{index:03d}",
-                "selection_artifact_sha256": hashlib.sha256(
-                    f"selection-{index:03d}".encode()
-                ).hexdigest(),
-            }
-            for index in range(100)
-        ],
-    }
+def _cohort_input(tmp_path: Path):
+    return _source_cohort_fixture(tmp_path / "cohort-pit")
 
 
 def test_economic_cohort_build_writes_only_one_canonical_analysis_receipt(tmp_path: Path):
+    archive, calendar, cohort_input = _cohort_input(tmp_path)
     input_path = tmp_path / "cohort-input.json"
+    calendar_path = tmp_path / "market-calendar.json"
     output_path = tmp_path / "cohort.json"
-    input_path.write_text(json.dumps(_cohort_input()), encoding="utf-8")
+    input_path.write_text(json.dumps(cohort_input), encoding="utf-8")
+    calendar_path.write_text(json.dumps(calendar.to_dict()), encoding="utf-8")
     args = [
         "research",
         "economic-cohort-build",
         "--candidate-input-path",
         str(input_path),
+        "--pit-artifact-root",
+        str(archive.root),
+        "--market-calendar-path",
+        str(calendar_path),
         "--output-path",
         str(output_path),
         "--json-output",
@@ -297,8 +269,12 @@ def test_economic_cohort_build_writes_only_one_canonical_analysis_receipt(tmp_pa
 
 def test_economic_cohort_build_rejects_invalid_input_without_writing_receipt(tmp_path: Path):
     input_path = tmp_path / "invalid-cohort-input.json"
+    calendar_path = tmp_path / "market-calendar.json"
+    artifact_root = tmp_path / "cohort-pit"
     output_path = tmp_path / "cohort.json"
     input_path.write_text(json.dumps({"unexpected": True}), encoding="utf-8")
+    calendar_path.write_text(json.dumps({"unexpected": True}), encoding="utf-8")
+    artifact_root.mkdir()
 
     result = runner.invoke(
         app,
@@ -307,6 +283,10 @@ def test_economic_cohort_build_rejects_invalid_input_without_writing_receipt(tmp
             "economic-cohort-build",
             "--candidate-input-path",
             str(input_path),
+            "--pit-artifact-root",
+            str(artifact_root),
+            "--market-calendar-path",
+            str(calendar_path),
             "--output-path",
             str(output_path),
         ],
@@ -319,14 +299,21 @@ def test_economic_cohort_build_rejects_invalid_input_without_writing_receipt(tmp
 def test_economic_cohort_build_rejects_different_existing_receipt_without_overwrite(
     tmp_path: Path,
 ):
+    archive, calendar, cohort_input = _cohort_input(tmp_path)
     input_path = tmp_path / "cohort-input.json"
+    calendar_path = tmp_path / "market-calendar.json"
     output_path = tmp_path / "cohort.json"
-    input_path.write_text(json.dumps(_cohort_input()), encoding="utf-8")
+    input_path.write_text(json.dumps(cohort_input), encoding="utf-8")
+    calendar_path.write_text(json.dumps(calendar.to_dict()), encoding="utf-8")
     args = [
         "research",
         "economic-cohort-build",
         "--candidate-input-path",
         str(input_path),
+        "--pit-artifact-root",
+        str(archive.root),
+        "--market-calendar-path",
+        str(calendar_path),
         "--output-path",
         str(output_path),
         "--json-output",
@@ -335,10 +322,8 @@ def test_economic_cohort_build_rejects_different_existing_receipt_without_overwr
     assert first.exit_code == 0, first.output
     original = output_path.read_bytes()
 
-    changed = _cohort_input()
-    candidates = changed["candidates"]
-    assert isinstance(candidates, list)
-    candidates[0]["prior_complete_close"] = "6"
+    changed = dict(cohort_input)
+    changed["selection_time"] = "2026-04-01T12:06:00+00:00"
     input_path.write_text(json.dumps(changed), encoding="utf-8")
 
     result = runner.invoke(app, args)

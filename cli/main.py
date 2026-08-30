@@ -142,10 +142,9 @@ from tradingagents.dataflows.alpaca_reference import (
 )
 from tradingagents.dataflows.integration_registry import build_integration_registry_report
 from tradingagents.dataflows.pit import (
-    PointInTimeCohortCandidate,
-    build_point_in_time_cohort,
+    build_source_verifiable_point_in_time_cohort,
     validate_market_date_partitions,
-    validate_security_identity,
+    validate_market_session_calendar,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evals.agent_intelligence_brain import (
@@ -2707,57 +2706,32 @@ def _economic_exact_object(
     return value
 
 
-def _economic_cohort_from_input(payload: dict[str, object]):
-    """Rebuild one PIT cohort from explicit, source-bound candidate JSON."""
+def _economic_cohort_from_input(
+    payload: dict[str, object],
+    *,
+    archive: object,
+    market_calendar: object,
+):
+    """Open exact source references and derive one source-verifiable cohort."""
 
     values = _economic_exact_object(
         payload,
         label="cohort candidate input",
-        fields=frozenset({"market_date", "as_of_cutoff", "candidates"}),
+        fields=frozenset(
+            {"market_date", "as_of_cutoff", "selection_time", "candidates"}
+        ),
     )
     raw_candidates = values["candidates"]
     if type(raw_candidates) is not list:
         raise typer.BadParameter("cohort candidate input candidates must be a JSON list")
-    candidates: list[PointInTimeCohortCandidate] = []
-    candidate_fields = frozenset(
-        {
-            "security",
-            "prior_complete_close",
-            "session_dollar_volumes",
-            "selection_artifact_id",
-            "selection_artifact_sha256",
-        }
-    )
-    for index, raw_candidate in enumerate(raw_candidates):
-        candidate = _economic_exact_object(
-            raw_candidate,
-            label=f"cohort candidate input candidates[{index}]",
-            fields=candidate_fields,
-        )
-        volumes = candidate["session_dollar_volumes"]
-        if type(volumes) is not list:
-            raise typer.BadParameter(
-                f"cohort candidate input candidates[{index}] volumes must be a JSON list"
-            )
-        try:
-            candidates.append(
-                PointInTimeCohortCandidate(
-                    security=validate_security_identity(candidate["security"]),
-                    prior_complete_close=candidate["prior_complete_close"],
-                    session_dollar_volumes=tuple(volumes),
-                    selection_artifact_id=candidate["selection_artifact_id"],
-                    selection_artifact_sha256=candidate["selection_artifact_sha256"],
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            raise typer.BadParameter(
-                f"cohort candidate input candidates[{index}] are invalid: {exc}"
-            ) from exc
     try:
-        return build_point_in_time_cohort(
+        return build_source_verifiable_point_in_time_cohort(
+            archive=archive,
+            market_calendar=validate_market_session_calendar(market_calendar),
             market_date=values["market_date"],
             as_of_cutoff=values["as_of_cutoff"],
-            candidates=tuple(candidates),
+            selection_time=values["selection_time"],
+            candidates=tuple(raw_candidates),
         )
     except (TypeError, ValueError) as exc:
         raise typer.BadParameter(f"cohort candidate input is invalid: {exc}") from exc
@@ -3069,7 +3043,22 @@ def research_economic_cohort_build(
         "--candidate-input-path",
         exists=True,
         readable=True,
-        help="Explicit source-bound PIT cohort candidate JSON input.",
+        help="Security identities plus exact retained-source selectors; derived qualification facts are rejected.",
+    ),
+    pit_artifact_root: Path = typer.Option(
+        ...,
+        "--pit-artifact-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Immutable PIT raw-artifact archive reopened for every cohort candidate.",
+    ),
+    market_calendar_path: Path = typer.Option(
+        ...,
+        "--market-calendar-path",
+        exists=True,
+        readable=True,
+        help="Canonical source-bound market-session calendar receipt.",
     ),
     output_path: Path = typer.Option(
         ...,
@@ -3078,10 +3067,19 @@ def research_economic_cohort_build(
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Build an analysis-only PIT cohort receipt without reading a provider or broker."""
+    """Build one analysis-only cohort by reopening retained local source bytes."""
+
+    from tradingagents.dataflows.pit.raw_artifacts import (
+        RawPointInTimeArtifactArchive as CohortArtifactArchive,
+    )
 
     cohort = _economic_cohort_from_input(
-        _economic_json_object(candidate_input_path, label="candidate-input-path")
+        _economic_json_object(candidate_input_path, label="candidate-input-path"),
+        archive=CohortArtifactArchive(pit_artifact_root),
+        market_calendar=_economic_json_object(
+            market_calendar_path,
+            label="market-calendar-path",
+        ),
     )
     written = _write_economic_receipt(
         output_path,
@@ -3094,6 +3092,12 @@ def research_economic_cohort_build(
         "can_submit_orders": False,
         "cohort_id": cohort.cohort_id,
         "cohort_sha256": cohort.cohort_sha256,
+        "sensitivity_universe_100_id": cohort.sensitivity_universe_100_id,
+        "sensitivity_universe_100_sha256": cohort.sensitivity_universe_100_sha256,
+        "primary_universe_75_id": cohort.primary_universe_75_id,
+        "primary_universe_75_sha256": cohort.primary_universe_75_sha256,
+        "sensitivity_universe_50_id": cohort.sensitivity_universe_50_id,
+        "sensitivity_universe_50_sha256": cohort.sensitivity_universe_50_sha256,
         "receipt_path": str(written),
     }
     if json_output:

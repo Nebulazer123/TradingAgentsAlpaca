@@ -9,10 +9,16 @@ from .adjusted_price_windows import (
 from .cohort import (
     PointInTimeCohort,
     PointInTimeCohortCandidate,
+    PointInTimeCohortIdentitySourceReference,
+    PointInTimeCohortMarketDataSourceReference,
     PointInTimeCohortRanking,
     PointInTimeCohortRejection,
     build_point_in_time_cohort,
     validate_point_in_time_cohort,
+)
+from .cohort_admission import (
+    build_source_verifiable_point_in_time_cohort,
+    verify_source_verifiable_point_in_time_cohort,
 )
 from .market_calendar import (
     MarketSessionCalendar,
@@ -54,10 +60,14 @@ __all__ = [
     "validate_security_identity",
     "PointInTimeCohort",
     "PointInTimeCohortCandidate",
+    "PointInTimeCohortIdentitySourceReference",
+    "PointInTimeCohortMarketDataSourceReference",
     "PointInTimeCohortRanking",
     "PointInTimeCohortRejection",
     "build_point_in_time_cohort",
     "validate_point_in_time_cohort",
+    "build_source_verifiable_point_in_time_cohort",
+    "verify_source_verifiable_point_in_time_cohort",
     "SourceBoundAdjustedPriceWindow",
     "build_source_bound_adjusted_price_window",
     "validate_source_bound_adjusted_price_window",
