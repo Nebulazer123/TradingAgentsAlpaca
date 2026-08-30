@@ -1,8 +1,8 @@
-"""Pure canonical values for source-verifiable point-in-time cohorts.
+"""Pure, nonqualifying canonical records for point-in-time cohorts.
 
-Filesystem custody and raw-source parsing intentionally live in
-``cohort_admission``.  This module only freezes already-derived facts and source
-references into one deterministic, content-addressed receipt.
+This module performs no filesystem or network work. It proves only internal
+receipt canonicality. Qualifying consumers must call the archive-backed
+verifier in ``cohort_admission``.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from decimal import Decimal, DecimalException, InvalidOperation
 from types import MappingProxyType
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from tradingagents.dataflows.pit.market_calendar import (
     MarketSessionCalendar,
@@ -35,7 +36,7 @@ __all__ = [
     "PointInTimeCohortRanking",
     "PointInTimeCohortRejection",
     "build_point_in_time_cohort",
-    "validate_point_in_time_cohort",
+    "validate_nonqualifying_point_in_time_cohort_record",
 ]
 
 
@@ -44,12 +45,12 @@ _AUTHORITY = {
     "execution_authority": "none",
     "can_submit_orders": False,
 }
-_COHORT_SCHEMA = "point_in_time_cohort/v2"
-_CANDIDATE_SCHEMA = "point_in_time_cohort_candidate/v2"
-_IDENTITY_SOURCE_SCHEMA = "point_in_time_cohort_identity_source_reference/v1"
-_MARKET_SOURCE_SCHEMA = "point_in_time_cohort_market_data_source_reference/v1"
-_RANKING_SCHEMA = "point_in_time_cohort_ranking/v2"
-_REJECTION_SCHEMA = "point_in_time_cohort_rejection/v2"
+_COHORT_SCHEMA = "point_in_time_cohort/v3"
+_CANDIDATE_SCHEMA = "point_in_time_cohort_candidate/v3"
+_IDENTITY_SOURCE_SCHEMA = "point_in_time_cohort_identity_source_reference/v2"
+_MARKET_SOURCE_SCHEMA = "point_in_time_cohort_market_data_source_reference/v2"
+_RANKING_SCHEMA = "point_in_time_cohort_ranking/v3"
+_REJECTION_SCHEMA = "point_in_time_cohort_rejection/v3"
 _UNIVERSE_SCHEMA = "canonical_ranked_universe/v1"
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -62,7 +63,49 @@ _REASON = re.compile(r"[a-z0-9][a-z0-9_:.-]{2,255}")
 _US_LISTED_EXCHANGES = frozenset(
     {"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE", "NYSEARCA"}
 )
-_DECIMAL_LIMITS = (128, 128, 256)
+_SOURCE_DECIMAL_LIMITS = (128, 128, 256)
+_DERIVED_DECIMAL_LIMITS = (513, 640, 768)
+_MAX_JSON_PATH_DEPTH = 4
+_MAX_JSON_PATH_COMPONENT_CHARS = 64
+_MAX_CANDIDATES = 512
+_MARKET_TZ = ZoneInfo("America/New_York")
+_IDENTITY_PROFILE_ORDER = ("alpaca_asset/v1", "security_master/v1")
+_IDENTITY_PROFILE_SPECS: dict[str, tuple[str, Mapping[str, tuple[str, ...]]]] = {
+    "alpaca_asset/v1": (
+        "alpaca_asset",
+        MappingProxyType(
+            {
+                "security_id": ("id",),
+                "symbol": ("symbol",),
+                "exchange": ("exchange",),
+                "asset_class": ("class",),
+                "status": ("status",),
+                "tradable": ("tradable",),
+            }
+        ),
+    ),
+    "security_master/v1": (
+        "security_master",
+        MappingProxyType(
+            {
+                "security_id": ("security_id",),
+                "symbol": ("symbol",),
+                "security_type": ("security_type",),
+                "effective_from": ("effective_from",),
+                "effective_to": ("effective_to",),
+            }
+        ),
+    ),
+}
+_MARKET_SOURCE_PROFILE = "alpaca_stock_daily_bars/v1"
+_MARKET_BAR_SELECTORS = MappingProxyType(
+    {
+        "rows_path": ("bars",),
+        "timestamp_field": "t",
+        "close_field": "c",
+        "volume_field": "v",
+    }
+)
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -103,6 +146,10 @@ def _timestamp(value: object, *, label: str) -> str:
     return value
 
 
+def _timestamp_value(value: object, *, label: str) -> dt.datetime:
+    return dt.datetime.fromisoformat(_timestamp(value, label=label))
+
+
 def _identifier(value: object, *, label: str) -> str:
     if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
         raise PointInTimeDataError(f"{label} must be a canonical identifier")
@@ -125,19 +172,31 @@ def _source_uri(value: object, *, label: str) -> str:
     if type(value) is not str:
         raise PointInTimeDataError(f"{label} must be a canonical HTTPS URI")
     parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise PointInTimeDataError(f"{label} must be a canonical HTTPS URI") from exc
     if (
         parsed.scheme != "https"
-        or not parsed.hostname
-        or not parsed.path
+        or parsed.hostname is None
+        or parsed.netloc != parsed.hostname
+        or port is not None
         or parsed.username is not None
         or parsed.password is not None
+        or not parsed.path
         or parsed.fragment
     ):
         raise PointInTimeDataError(f"{label} must be a canonical HTTPS URI")
     return value
 
 
-def _decimal(value: object, *, label: str, positive: bool) -> Decimal:
+def _decimal(
+    value: object,
+    *,
+    label: str,
+    positive: bool,
+    limits: tuple[int, int, int],
+) -> Decimal:
     if type(value) is not str or _DECIMAL.fullmatch(value) is None:
         raise PointInTimeDataError(f"{label} must be a canonical decimal")
     try:
@@ -146,7 +205,7 @@ def _decimal(value: object, *, label: str, positive: bool) -> Decimal:
         adjusted = len(digits) + exponent - 1
     except (InvalidOperation, DecimalException, ValueError) as exc:
         raise PointInTimeDataError(f"{label} must be a canonical decimal") from exc
-    max_digits, max_exponent, max_chars = _DECIMAL_LIMITS
+    max_digits, max_exponent, max_chars = limits
     if (
         not parsed.is_finite()
         or len(digits) > max_digits
@@ -161,17 +220,6 @@ def _decimal(value: object, *, label: str, positive: bool) -> Decimal:
     return parsed
 
 
-def _decimal_text(value: Decimal) -> str:
-    if not value.is_finite():
-        raise PointInTimeDataError("derived decimal must be finite")
-    text = format(value, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    if text == "-0":
-        return "0"
-    return text
-
-
 def _authority(payload: Mapping[str, object], *, label: str) -> None:
     if any(payload[key] != expected for key, expected in _AUTHORITY.items()):
         raise PointInTimeDataError(f"{label} authority fields are fixed")
@@ -184,13 +232,21 @@ def _exact(value: object, fields: frozenset[str], *, label: str) -> dict[str, ob
 
 
 def _json_path(value: object, *, label: str) -> tuple[str | int, ...]:
-    if type(value) not in (list, tuple) or not value:
-        raise PointInTimeDataError(f"{label} must be a nonempty JSON path")
+    if (
+        type(value) not in (list, tuple)
+        or not value
+        or len(value) > _MAX_JSON_PATH_DEPTH
+    ):
+        raise PointInTimeDataError(f"{label} must be a bounded nonempty JSON path")
     path: list[str | int] = []
     for component in value:
-        if type(component) is str and component:
+        if (
+            type(component) is str
+            and component
+            and len(component) <= _MAX_JSON_PATH_COMPONENT_CHARS
+        ):
             path.append(component)
-        elif type(component) is int and component >= 0:
+        elif type(component) is int and 0 <= component <= _MAX_CANDIDATES:
             path.append(component)
         else:
             raise PointInTimeDataError(f"{label} contains an invalid component")
@@ -198,8 +254,8 @@ def _json_path(value: object, *, label: str) -> tuple[str | int, ...]:
 
 
 def _selectors(value: object, *, label: str) -> MappingProxyType:
-    if not isinstance(value, Mapping) or not value:
-        raise PointInTimeDataError(f"{label} must be a nonempty selector mapping")
+    if not isinstance(value, Mapping) or not value or len(value) > 16:
+        raise PointInTimeDataError(f"{label} must be a bounded selector mapping")
     frozen: dict[str, tuple[str | int, ...]] = {}
     for name, path in value.items():
         _identifier(name, label=f"{label} name")
@@ -212,8 +268,8 @@ def _thaw_selectors(value: Mapping[str, Sequence[str | int]]) -> dict[str, objec
 
 
 def _reasons(value: object) -> tuple[str, ...]:
-    if type(value) not in (list, tuple):
-        raise PointInTimeDataError("candidate rejection_reasons must be a sequence")
+    if type(value) not in (list, tuple) or len(value) > 32:
+        raise PointInTimeDataError("candidate rejection_reasons must be bounded")
     reasons: list[str] = []
     for reason in value:
         if type(reason) is not str or _REASON.fullmatch(reason) is None:
@@ -225,9 +281,11 @@ def _reasons(value: object) -> tuple[str, ...]:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PointInTimeCohortIdentitySourceReference:
-    """One verified raw identity source and its exact qualification selectors."""
+    """One registered, code-profiled identity source reference."""
 
+    source_profile: str
     source_hash_name: str
+    record_identity: str
     raw_artifact_id: str
     raw_artifact_sha256: str
     source_uri: str
@@ -237,7 +295,14 @@ class PointInTimeCohortIdentitySourceReference:
     qualification_field_selectors: Mapping[str, Sequence[str | int]]
 
     def __post_init__(self) -> None:
-        _identifier(self.source_hash_name, label="source_hash_name")
+        if self.source_profile not in _IDENTITY_PROFILE_SPECS:
+            raise PointInTimeDataError("identity source profile is not registered")
+        expected_hash_name, expected_selectors = _IDENTITY_PROFILE_SPECS[
+            self.source_profile
+        ]
+        if self.source_hash_name != expected_hash_name:
+            raise PointInTimeDataError("identity source hash role does not match profile")
+        _identifier(self.record_identity, label="identity source record_identity")
         artifact_id = _identifier(self.raw_artifact_id, label="raw_artifact_id")
         if not artifact_id.startswith("pit-raw-artifact-"):
             raise PointInTimeDataError("identity source raw artifact identity is invalid")
@@ -247,19 +312,22 @@ class PointInTimeCohortIdentitySourceReference:
             raise PointInTimeDataError("identity source must be JSON")
         _timestamp(self.retrieved_at, label="identity source retrieved_at")
         _timestamp(self.archive_recorded_at, label="identity source archive_recorded_at")
-        object.__setattr__(
-            self,
-            "qualification_field_selectors",
-            _selectors(
-                self.qualification_field_selectors,
-                label="qualification_field_selectors",
-            ),
+        selectors = _selectors(
+            self.qualification_field_selectors,
+            label="qualification_field_selectors",
         )
+        if dict(selectors) != dict(expected_selectors):
+            raise PointInTimeDataError(
+                "identity source selectors are fixed by the registered profile"
+            )
+        object.__setattr__(self, "qualification_field_selectors", selectors)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": _IDENTITY_SOURCE_SCHEMA,
+            "source_profile": self.source_profile,
             "source_hash_name": self.source_hash_name,
+            "record_identity": self.record_identity,
             "raw_artifact_id": self.raw_artifact_id,
             "raw_artifact_sha256": self.raw_artifact_sha256,
             "source_uri": self.source_uri,
@@ -275,8 +343,10 @@ class PointInTimeCohortIdentitySourceReference:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PointInTimeCohortMarketDataSourceReference:
-    """Compact source reference for the exact retained 60-session bar response."""
+    """Compact code-profiled reference to one retained 60-session response."""
 
+    source_profile: str
+    record_identity: str
     raw_artifact_id: str
     raw_artifact_sha256: str
     source_uri: str
@@ -292,6 +362,9 @@ class PointInTimeCohortMarketDataSourceReference:
     volume_field: str
 
     def __post_init__(self) -> None:
+        if self.source_profile != _MARKET_SOURCE_PROFILE:
+            raise PointInTimeDataError("market source profile is not registered")
+        _symbol(self.record_identity, label="market source record_identity")
         artifact_id = _identifier(self.raw_artifact_id, label="raw_artifact_id")
         if not artifact_id.startswith("pit-raw-artifact-"):
             raise PointInTimeDataError("market source raw artifact identity is invalid")
@@ -305,21 +378,23 @@ class PointInTimeCohortMarketDataSourceReference:
             raise PointInTimeDataError("market source feed is invalid")
         if self.adjustment != "raw" or self.timeframe != "1Day":
             raise PointInTimeDataError("market source must bind raw 1Day bars")
-        object.__setattr__(
-            self,
-            "rows_path",
-            _json_path(self.rows_path, label="market source rows_path"),
-        )
+        rows_path = _json_path(self.rows_path, label="market source rows_path")
         if (
-            self.timestamp_field != "t"
-            or self.close_field != "c"
-            or self.volume_field != "v"
+            rows_path != _MARKET_BAR_SELECTORS["rows_path"]
+            or self.timestamp_field != _MARKET_BAR_SELECTORS["timestamp_field"]
+            or self.close_field != _MARKET_BAR_SELECTORS["close_field"]
+            or self.volume_field != _MARKET_BAR_SELECTORS["volume_field"]
         ):
-            raise PointInTimeDataError("market source bar selectors are invalid")
+            raise PointInTimeDataError(
+                "market source selectors are fixed by the registered profile"
+            )
+        object.__setattr__(self, "rows_path", rows_path)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": _MARKET_SOURCE_SCHEMA,
+            "source_profile": self.source_profile,
+            "record_identity": self.record_identity,
             "raw_artifact_id": self.raw_artifact_id,
             "raw_artifact_sha256": self.raw_artifact_sha256,
             "source_uri": self.source_uri,
@@ -341,8 +416,6 @@ class PointInTimeCohortMarketDataSourceReference:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PointInTimeCohortCandidate:
-    """Source-derived qualification facts plus compact reopenable references."""
-
     security: SecurityIdentity
     prior_complete_close: str
     median_daily_dollar_volume: str
@@ -353,25 +426,33 @@ class PointInTimeCohortCandidate:
     def __post_init__(self) -> None:
         if type(self.security) is not SecurityIdentity:
             raise PointInTimeDataError("candidate security must be a SecurityIdentity")
-        _decimal(self.prior_complete_close, label="prior_complete_close", positive=True)
+        _decimal(
+            self.prior_complete_close,
+            label="prior_complete_close",
+            positive=True,
+            limits=_SOURCE_DECIMAL_LIMITS,
+        )
         _decimal(
             self.median_daily_dollar_volume,
             label="median_daily_dollar_volume",
             positive=False,
+            limits=_DERIVED_DECIMAL_LIMITS,
         )
-        if type(self.identity_sources) is not tuple or not self.identity_sources:
-            raise PointInTimeDataError("candidate identity_sources must be nonempty")
-        if any(
-            type(source) is not PointInTimeCohortIdentitySourceReference
-            for source in self.identity_sources
-        ):
-            raise PointInTimeDataError("candidate identity_sources are invalid")
-        if len({source.source_hash_name for source in self.identity_sources}) != len(
+        if type(self.identity_sources) is not tuple:
+            raise PointInTimeDataError("candidate identity_sources must be an exact tuple")
+        profiles = tuple(source.source_profile for source in self.identity_sources)
+        if profiles != _IDENTITY_PROFILE_ORDER:
+            raise PointInTimeDataError(
+                "candidate identity_sources must use canonical registered profile order"
+            )
+        if len({source.raw_artifact_id for source in self.identity_sources}) != len(
             self.identity_sources
         ):
-            raise PointInTimeDataError("candidate identity_sources must be unique")
+            raise PointInTimeDataError("candidate identity source artifacts must be unique")
         if type(self.market_data_source) is not PointInTimeCohortMarketDataSourceReference:
             raise PointInTimeDataError("candidate market_data_source is invalid")
+        if self.market_data_source.record_identity != self.security.symbol:
+            raise PointInTimeDataError("candidate market source identity is inconsistent")
         object.__setattr__(self, "rejection_reasons", _reasons(self.rejection_reasons))
 
     @property
@@ -409,6 +490,7 @@ class PointInTimeCohortRanking:
             self.median_daily_dollar_volume,
             label="ranking median_daily_dollar_volume",
             positive=True,
+            limits=_DERIVED_DECIMAL_LIMITS,
         )
         _identifier(
             self.market_data_raw_artifact_id,
@@ -461,8 +543,12 @@ class PointInTimeCohort:
     cohort_id: str
     cohort_sha256: str
     market_date: str
-    as_of_cutoff: str
+    selection_window_open_at: str
+    selection_window_close_at: str
+    market_session_open_at: str
+    market_session_close_at: str
     selection_time: str
+    as_of_cutoff: str
     market_calendar: MarketSessionCalendar
     calendar_retrieved_at: str
     calendar_archive_recorded_at: str
@@ -490,8 +576,12 @@ class PointInTimeCohort:
             "cohort_id": self.cohort_id,
             "cohort_sha256": self.cohort_sha256,
             "market_date": self.market_date,
-            "as_of_cutoff": self.as_of_cutoff,
+            "selection_window_open_at": self.selection_window_open_at,
+            "selection_window_close_at": self.selection_window_close_at,
+            "market_session_open_at": self.market_session_open_at,
+            "market_session_close_at": self.market_session_close_at,
             "selection_time": self.selection_time,
+            "as_of_cutoff": self.as_of_cutoff,
             "market_calendar": self.market_calendar.to_dict(),
             "calendar_retrieved_at": self.calendar_retrieved_at,
             "calendar_archive_recorded_at": self.calendar_archive_recorded_at,
@@ -549,6 +639,7 @@ def _canonical_candidate(
     *,
     session_dates: tuple[str, ...],
     market_date: str,
+    selection_time: dt.datetime,
 ) -> PointInTimeCohortCandidate:
     reasons = list(candidate.rejection_reasons)
     identity = candidate.security
@@ -568,29 +659,110 @@ def _canonical_candidate(
         _merge_reason(reasons, "prior_complete_close_below_5")
     if candidate.median_dollar_volume <= 0:
         _merge_reason(reasons, "median_daily_dollar_volume_not_positive")
+    sources = (*candidate.identity_sources, candidate.market_data_source)
+    if any(
+        _timestamp_value(source.archive_recorded_at, label="source archive_recorded_at")
+        > selection_time
+        for source in sources
+    ):
+        raise PointInTimeDataError("candidate source was archived after selection_time")
     if tuple(reasons) == candidate.rejection_reasons:
         return candidate
     return dataclasses.replace(candidate, rejection_reasons=tuple(reasons))
 
 
+def _selection_bounds(
+    *,
+    market_date: str,
+    selection_window_open_at: object,
+    selection_window_close_at: object,
+    market_session_open_at: object,
+    market_session_close_at: object,
+    selection_time: object,
+    as_of_cutoff: object,
+) -> tuple[str, str, str, str, str, str]:
+    window_open_text = _timestamp(selection_window_open_at, label="selection_window_open_at")
+    window_close_text = _timestamp(
+        selection_window_close_at,
+        label="selection_window_close_at",
+    )
+    session_open_text = _timestamp(market_session_open_at, label="market_session_open_at")
+    session_close_text = _timestamp(
+        market_session_close_at,
+        label="market_session_close_at",
+    )
+    selection_text = _timestamp(selection_time, label="selection_time")
+    cutoff_text = _timestamp(as_of_cutoff, label="as_of_cutoff")
+    window_open = dt.datetime.fromisoformat(window_open_text)
+    window_close = dt.datetime.fromisoformat(window_close_text)
+    session_open = dt.datetime.fromisoformat(session_open_text)
+    session_close = dt.datetime.fromisoformat(session_close_text)
+    selected_at = dt.datetime.fromisoformat(selection_text)
+    cutoff = dt.datetime.fromisoformat(cutoff_text)
+    local_midnight = dt.datetime.combine(
+        dt.date.fromisoformat(market_date),
+        dt.time(0, 0),
+        tzinfo=_MARKET_TZ,
+    ).astimezone(dt.UTC)
+    if window_open != local_midnight or window_close != session_open:
+        raise PointInTimeDataError(
+            "cohort selection window must be local midnight through registered open"
+        )
+    if (
+        session_open.astimezone(_MARKET_TZ).date().isoformat() != market_date
+        or session_close.astimezone(_MARKET_TZ).date().isoformat() != market_date
+        or session_open >= session_close
+    ):
+        raise PointInTimeDataError("market session bounds do not match market_date")
+    if not window_open <= selected_at <= cutoff <= window_close:
+        raise PointInTimeDataError(
+            "selection_time and as_of_cutoff must be ordered within the pre-open window"
+        )
+    return (
+        window_open_text,
+        window_close_text,
+        session_open_text,
+        session_close_text,
+        selection_text,
+        cutoff_text,
+    )
+
+
 def build_point_in_time_cohort(
     *,
     market_date: str,
-    as_of_cutoff: str,
+    selection_window_open_at: str,
+    selection_window_close_at: str,
+    market_session_open_at: str,
+    market_session_close_at: str,
     selection_time: str,
+    as_of_cutoff: str,
     market_calendar: MarketSessionCalendar,
     calendar_retrieved_at: str,
     calendar_archive_recorded_at: str,
     session_dates: tuple[str, ...],
     candidates: tuple[PointInTimeCohortCandidate, ...],
 ) -> PointInTimeCohort:
-    """Freeze a ranked cohort from source-derived values without I/O authority."""
+    """Freeze source-derived values; this record-only builder is nonqualifying."""
 
     normalized_market_date = _date(market_date, label="market_date")
-    cutoff = _timestamp(as_of_cutoff, label="as_of_cutoff")
-    selected_at = _timestamp(selection_time, label="selection_time")
-    if dt.datetime.fromisoformat(selected_at) < dt.datetime.fromisoformat(cutoff):
-        raise PointInTimeDataError("selection_time cannot precede as_of_cutoff")
+    (
+        window_open,
+        window_close,
+        session_open,
+        session_close,
+        selected_at,
+        cutoff,
+    ) = _selection_bounds(
+        market_date=normalized_market_date,
+        selection_window_open_at=selection_window_open_at,
+        selection_window_close_at=selection_window_close_at,
+        market_session_open_at=market_session_open_at,
+        market_session_close_at=market_session_close_at,
+        selection_time=selection_time,
+        as_of_cutoff=as_of_cutoff,
+    )
+    selection_value = dt.datetime.fromisoformat(selected_at)
     calendar_retrieved = _timestamp(
         calendar_retrieved_at,
         label="calendar_retrieved_at",
@@ -599,6 +771,10 @@ def build_point_in_time_cohort(
         calendar_archive_recorded_at,
         label="calendar_archive_recorded_at",
     )
+    if dt.datetime.fromisoformat(calendar_recorded) > selection_value:
+        raise PointInTimeDataError("calendar was archived after selection_time")
+    if dt.datetime.fromisoformat(calendar_retrieved) > selection_value:
+        raise PointInTimeDataError("calendar was retrieved after selection_time")
     if type(market_calendar) is not MarketSessionCalendar:
         raise PointInTimeDataError("market_calendar must be an exact calendar receipt")
     calendar = validate_market_session_calendar(market_calendar.to_dict())
@@ -612,11 +788,14 @@ def build_point_in_time_cohort(
         raise PointInTimeDataError(
             "session_dates must be the exact 60 registered sessions before market_date"
         )
-    if type(candidates) is not tuple or not candidates:
-        raise PointInTimeDataError("candidates must be a nonempty exact tuple")
+    if (
+        type(candidates) is not tuple
+        or not candidates
+        or len(candidates) > _MAX_CANDIDATES
+    ):
+        raise PointInTimeDataError("candidates must be a bounded nonempty exact tuple")
     if any(type(candidate) is not PointInTimeCohortCandidate for candidate in candidates):
         raise PointInTimeDataError("candidates must contain exact candidate records")
-
     sorted_candidates = sorted(candidates, key=lambda row: row.security.security_id)
     if len({row.security.security_id for row in sorted_candidates}) != len(sorted_candidates):
         raise PointInTimeDataError("candidates must not duplicate security identities")
@@ -627,6 +806,7 @@ def build_point_in_time_cohort(
             candidate,
             session_dates=session_dates,
             market_date=normalized_market_date,
+            selection_time=selection_value,
         )
         for candidate in sorted_candidates
     )
@@ -640,10 +820,13 @@ def build_point_in_time_cohort(
     ranked_candidates = sorted(
         eligible,
         key=lambda candidate: (
-            -candidate.median_dollar_volume,
             candidate.security.symbol,
             candidate.security.security_id,
         ),
+    )
+    ranked_candidates.sort(
+        key=lambda candidate: candidate.median_dollar_volume,
+        reverse=True,
     )
     ranking = tuple(
         PointInTimeCohortRanking(
@@ -675,8 +858,12 @@ def build_point_in_time_cohort(
     top_50_id, top_50_sha256 = _universe_identity(top_50)
     fields: dict[str, object] = {
         "market_date": normalized_market_date,
-        "as_of_cutoff": cutoff,
+        "selection_window_open_at": window_open,
+        "selection_window_close_at": window_close,
+        "market_session_open_at": session_open,
+        "market_session_close_at": session_close,
         "selection_time": selected_at,
+        "as_of_cutoff": cutoff,
         "market_calendar": calendar,
         "calendar_retrieved_at": calendar_retrieved,
         "calendar_archive_recorded_at": calendar_recorded,
@@ -697,26 +884,23 @@ def build_point_in_time_cohort(
     }
     identity = {
         "schema_version": _COHORT_SCHEMA,
-        "market_date": normalized_market_date,
-        "as_of_cutoff": cutoff,
-        "selection_time": selected_at,
-        "market_calendar": calendar.to_dict(),
-        "calendar_retrieved_at": calendar_retrieved,
-        "calendar_archive_recorded_at": calendar_recorded,
-        "session_dates": list(session_dates),
-        "market_data_feed": market_data_feed,
-        "candidates": [candidate.to_dict() for candidate in canonical_candidates],
-        "ranking": [row.to_dict() for row in ranking],
-        "rejections": [row.to_dict() for row in rejections],
-        "sensitivity_universe_100": list(top_100),
-        "primary_universe_75": list(top_75),
-        "sensitivity_universe_50": list(top_50),
-        "sensitivity_universe_100_id": top_100_id,
-        "sensitivity_universe_100_sha256": top_100_sha256,
-        "primary_universe_75_id": top_75_id,
-        "primary_universe_75_sha256": top_75_sha256,
-        "sensitivity_universe_50_id": top_50_id,
-        "sensitivity_universe_50_sha256": top_50_sha256,
+        **{
+            key: (
+                value.to_dict()
+                if key == "market_calendar"
+                else [item.to_dict() for item in value]
+                if key in {"candidates", "ranking", "rejections"}
+                else list(value)
+                if key in {
+                    "session_dates",
+                    "sensitivity_universe_100",
+                    "primary_universe_75",
+                    "sensitivity_universe_50",
+                }
+                else value
+            )
+            for key, value in fields.items()
+        },
         **_AUTHORITY,
     }
     cohort_id = "point-in-time-cohort-" + _sha256(identity)
@@ -731,7 +915,9 @@ def _identity_source_from_dict(value: object) -> PointInTimeCohortIdentitySource
     fields = frozenset(
         {
             "schema_version",
+            "source_profile",
             "source_hash_name",
+            "record_identity",
             "raw_artifact_id",
             "raw_artifact_sha256",
             "source_uri",
@@ -747,7 +933,9 @@ def _identity_source_from_dict(value: object) -> PointInTimeCohortIdentitySource
         raise PointInTimeDataError("cohort identity source schema is invalid")
     _authority(payload, label="cohort identity source")
     return PointInTimeCohortIdentitySourceReference(
+        source_profile=payload["source_profile"],  # type: ignore[arg-type]
         source_hash_name=payload["source_hash_name"],  # type: ignore[arg-type]
+        record_identity=payload["record_identity"],  # type: ignore[arg-type]
         raw_artifact_id=payload["raw_artifact_id"],  # type: ignore[arg-type]
         raw_artifact_sha256=payload["raw_artifact_sha256"],  # type: ignore[arg-type]
         source_uri=payload["source_uri"],  # type: ignore[arg-type]
@@ -762,6 +950,8 @@ def _market_source_from_dict(value: object) -> PointInTimeCohortMarketDataSource
     fields = frozenset(
         {
             "schema_version",
+            "source_profile",
+            "record_identity",
             "raw_artifact_id",
             "raw_artifact_sha256",
             "source_uri",
@@ -785,6 +975,8 @@ def _market_source_from_dict(value: object) -> PointInTimeCohortMarketDataSource
         label="cohort market source bar selectors",
     )
     return PointInTimeCohortMarketDataSourceReference(
+        source_profile=payload["source_profile"],  # type: ignore[arg-type]
+        record_identity=payload["record_identity"],  # type: ignore[arg-type]
         raw_artifact_id=payload["raw_artifact_id"],  # type: ignore[arg-type]
         raw_artifact_sha256=payload["raw_artifact_sha256"],  # type: ignore[arg-type]
         source_uri=payload["source_uri"],  # type: ignore[arg-type]
@@ -833,19 +1025,27 @@ def _candidate_from_dict(value: object) -> PointInTimeCohortCandidate:
     )
 
 
-def validate_point_in_time_cohort(value: object) -> PointInTimeCohort:
-    """Rebuild the pure canonical receipt and reject any altered material."""
+def validate_nonqualifying_point_in_time_cohort_record(value: object) -> PointInTimeCohort:
+    """Validate canonical bytes only; this does not establish source qualification."""
 
     payload = _exact(value, _COHORT_SERIALIZED_FIELDS, label="point-in-time cohort")
     if payload["schema_version"] != _COHORT_SCHEMA:
         raise PointInTimeDataError("point-in-time cohort schema is invalid")
     _authority(payload, label="point-in-time cohort")
-    if type(payload["session_dates"]) is not list or type(payload["candidates"]) is not list:
+    if (
+        type(payload["session_dates"]) is not list
+        or type(payload["candidates"]) is not list
+        or len(payload["candidates"]) > _MAX_CANDIDATES
+    ):
         raise PointInTimeDataError("point-in-time cohort sequences are invalid")
     rebuilt = build_point_in_time_cohort(
         market_date=payload["market_date"],  # type: ignore[arg-type]
-        as_of_cutoff=payload["as_of_cutoff"],  # type: ignore[arg-type]
+        selection_window_open_at=payload["selection_window_open_at"],  # type: ignore[arg-type]
+        selection_window_close_at=payload["selection_window_close_at"],  # type: ignore[arg-type]
+        market_session_open_at=payload["market_session_open_at"],  # type: ignore[arg-type]
+        market_session_close_at=payload["market_session_close_at"],  # type: ignore[arg-type]
         selection_time=payload["selection_time"],  # type: ignore[arg-type]
+        as_of_cutoff=payload["as_of_cutoff"],  # type: ignore[arg-type]
         market_calendar=validate_market_session_calendar(payload["market_calendar"]),
         calendar_retrieved_at=payload["calendar_retrieved_at"],  # type: ignore[arg-type]
         calendar_archive_recorded_at=payload["calendar_archive_recorded_at"],  # type: ignore[arg-type]

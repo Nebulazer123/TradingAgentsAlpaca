@@ -238,7 +238,7 @@ def test_economic_cohort_build_writes_only_one_canonical_analysis_receipt(tmp_pa
     calendar_path = tmp_path / "market-calendar.json"
     output_path = tmp_path / "cohort.json"
     input_path.write_text(json.dumps(cohort_input), encoding="utf-8")
-    calendar_path.write_text(json.dumps(calendar.to_dict()), encoding="utf-8")
+    calendar_path.write_bytes(calendar.canonical_json_bytes())
     args = [
         "research",
         "economic-cohort-build",
@@ -304,7 +304,7 @@ def test_economic_cohort_build_rejects_different_existing_receipt_without_overwr
     calendar_path = tmp_path / "market-calendar.json"
     output_path = tmp_path / "cohort.json"
     input_path.write_text(json.dumps(cohort_input), encoding="utf-8")
-    calendar_path.write_text(json.dumps(calendar.to_dict()), encoding="utf-8")
+    calendar_path.write_bytes(calendar.canonical_json_bytes())
     args = [
         "research",
         "economic-cohort-build",
@@ -323,13 +323,46 @@ def test_economic_cohort_build_rejects_different_existing_receipt_without_overwr
     original = output_path.read_bytes()
 
     changed = dict(cohort_input)
-    changed["selection_time"] = "2026-04-01T12:06:00+00:00"
+    changed["selection_time"] = "2026-04-01T11:56:00+00:00"
     input_path.write_text(json.dumps(changed), encoding="utf-8")
 
     result = runner.invoke(app, args)
 
     assert result.exit_code == 2
     assert output_path.read_bytes() == original
+
+
+def test_economic_cohort_build_rejects_ambiguous_nonfinite_and_oversized_input(
+    tmp_path: Path,
+):
+    archive, calendar, _cohort_input_payload = _cohort_input(tmp_path)
+    input_path = tmp_path / "cohort-input.json"
+    calendar_path = tmp_path / "market-calendar.json"
+    output_path = tmp_path / "cohort.json"
+    calendar_path.write_bytes(calendar.canonical_json_bytes())
+    args = [
+        "research",
+        "economic-cohort-build",
+        "--candidate-input-path",
+        str(input_path),
+        "--pit-artifact-root",
+        str(archive.root),
+        "--market-calendar-path",
+        str(calendar_path),
+        "--output-path",
+        str(output_path),
+    ]
+
+    for raw_bytes in (
+        b'{"market_date":"2026-04-01","market_date":"2026-04-02"}',
+        b'{"unexpected":NaN}',
+        b'{"unexpected":' + (b"9" * 129) + b'}',
+        b'{"padding":"' + (b"x" * 4_000_001) + b'"}',
+    ):
+        input_path.write_bytes(raw_bytes)
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2
+        assert not output_path.exists()
 
 
 def test_economic_tournament_run_binds_only_purged_validation_results(tmp_path: Path):

@@ -2681,15 +2681,108 @@ def research_decision_quality_report(
     console.print(f"Rating calibration: {rating_calibration_path}")
 
 
-def _economic_json_object(path: Path, *, label: str) -> dict[str, object]:
-    """Load one explicit JSON receipt without accepting an implicit default."""
+def _economic_json_object(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = 16_000_000,
+    require_canonical: bool = False,
+) -> dict[str, object]:
+    """Load one bounded strict JSON receipt without ambiguous decoder behavior."""
+
+    max_depth = 32
+    max_nodes = 100_000
+    max_objects = 20_000
+    max_lists = 20_000
+    max_strings = 100_000
+    max_container_items = 2_048
+    max_string_chars = 4_096
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise typer.BadParameter(f"{label} contains a duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(_value: str) -> object:
+        raise typer.BadParameter(f"{label} contains a nonfinite JSON number")
+
+    def bounded_integer(text: str) -> int:
+        if len(text.removeprefix("-")) > 128:
+            raise typer.BadParameter(f"{label} contains an over-limit JSON number")
+        return int(text)
+
+    def bounded_float(text: str) -> float:
+        parts = text.lower().split("e", 1)
+        coefficient = parts[0].replace("-", "").replace(".", "")
+        exponent = parts[1] if len(parts) == 2 else "0"
+        if (
+            len(coefficient.lstrip("0") or "0") > 128
+            or len(exponent.removeprefix("-").removeprefix("+")) > 4
+            or abs(int(exponent)) > 128
+        ):
+            raise typer.BadParameter(f"{label} contains an over-limit JSON number")
+        return float(text)
 
     try:
-        payload = json.loads(path.read_bytes())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise typer.BadParameter(f"{label} must be readable JSON") from exc
+        if path.stat().st_size > max_bytes:
+            raise typer.BadParameter(f"{label} exceeds the {max_bytes}-byte limit")
+        raw_bytes = path.read_bytes()
+        if len(raw_bytes) > max_bytes:
+            raise typer.BadParameter(f"{label} exceeds the {max_bytes}-byte limit")
+        payload = json.loads(
+            raw_bytes,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_int=bounded_integer,
+            parse_float=bounded_float,
+            parse_constant=reject_nonfinite,
+        )
+    except typer.BadParameter:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise typer.BadParameter(f"{label} must be bounded strict JSON") from exc
     if not isinstance(payload, dict):
         raise typer.BadParameter(f"{label} must contain a JSON object")
+    objects = 0
+    lists = 0
+    strings = 0
+    nodes = 0
+    stack: list[tuple[object, int]] = [(payload, 0)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            raise typer.BadParameter(f"{label} exceeds JSON depth/node limits")
+        if isinstance(value, dict):
+            objects += 1
+            if objects > max_objects or len(value) > max_container_items:
+                raise typer.BadParameter(f"{label} exceeds JSON object limits")
+            for key, item in value.items():
+                strings += 1
+                if strings > max_strings or len(key) > max_string_chars:
+                    raise typer.BadParameter(f"{label} exceeds JSON string limits")
+                stack.append((item, depth + 1))
+        elif isinstance(value, list):
+            lists += 1
+            if lists > max_lists or len(value) > max_container_items:
+                raise typer.BadParameter(f"{label} exceeds JSON list limits")
+            stack.extend((item, depth + 1) for item in value)
+        elif isinstance(value, str):
+            strings += 1
+            if strings > max_strings or len(value) > max_string_chars:
+                raise typer.BadParameter(f"{label} exceeds JSON string limits")
+    if require_canonical:
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if raw_bytes != canonical:
+            raise typer.BadParameter(f"{label} must use canonical JSON bytes")
     return payload
 
 
@@ -3043,7 +3136,7 @@ def research_economic_cohort_build(
         "--candidate-input-path",
         exists=True,
         readable=True,
-        help="Security identities plus exact retained-source selectors; derived qualification facts are rejected.",
+        help="Security identities plus registered retained-source profiles; caller-authored qualification facts and paths are rejected.",
     ),
     pit_artifact_root: Path = typer.Option(
         ...,
@@ -3074,11 +3167,17 @@ def research_economic_cohort_build(
     )
 
     cohort = _economic_cohort_from_input(
-        _economic_json_object(candidate_input_path, label="candidate-input-path"),
+        _economic_json_object(
+            candidate_input_path,
+            label="candidate-input-path",
+            max_bytes=4_000_000,
+        ),
         archive=CohortArtifactArchive(pit_artifact_root),
         market_calendar=_economic_json_object(
             market_calendar_path,
             label="market-calendar-path",
+            max_bytes=2_000_000,
+            require_canonical=True,
         ),
     )
     written = _write_economic_receipt(

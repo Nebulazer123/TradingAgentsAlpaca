@@ -1,13 +1,15 @@
-"""Archive-backed admission for source-verifiable economic cohorts."""
+"""Archive-backed qualification for source-verifiable economic cohorts."""
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
+import stat
 from collections.abc import Mapping, Sequence
 from decimal import Decimal, DecimalException
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from tradingagents.dataflows.pit.cohort import (
@@ -16,7 +18,7 @@ from tradingagents.dataflows.pit.cohort import (
     PointInTimeCohortIdentitySourceReference,
     PointInTimeCohortMarketDataSourceReference,
     build_point_in_time_cohort,
-    validate_point_in_time_cohort,
+    validate_nonqualifying_point_in_time_cohort_record,
 )
 from tradingagents.dataflows.pit.market_calendar import (
     MarketSessionCalendar,
@@ -43,27 +45,70 @@ _UTC_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00"
 )
 _SESSION_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
-_QUALIFICATION_FIELDS = frozenset(
-    {
-        "security_id",
-        "symbol",
-        "exchange",
-        "security_type",
-        "effective_from",
-        "effective_to",
-        "status",
-        "asset_class",
-        "tradable",
-    }
-)
 _US_LISTED_EXCHANGES = frozenset(
     {"AMEX", "ARCA", "BATS", "NASDAQ", "NYSE", "NYSEARCA"}
 )
 _ALPACA_ASSET_HOSTS = frozenset(
     {"api.alpaca.markets", "paper-api.alpaca.markets"}
 )
+_SECURITY_MASTER_HOST = "security-master.tradingagents.local"
 _MARKET_TZ = ZoneInfo("America/New_York")
-_DECIMAL_LIMITS = (128, 128, 256)
+_SOURCE_DECIMAL_LIMITS = (128, 128, 256)
+_DERIVED_DECIMAL_LIMITS = (513, 640, 768)
+_MAX_CANDIDATES = 512
+_MAX_CALENDAR_ARTIFACT_BYTES = 2_000_000
+_MAX_IDENTITY_ARTIFACT_BYTES = 64_000
+_MAX_BAR_ARTIFACT_BYTES = 1_000_000
+_MAX_JSON_DEPTH = 12
+_MAX_JSON_OBJECTS = 512
+_MAX_JSON_LISTS = 64
+_MAX_JSON_STRINGS = 4_096
+_MAX_JSON_NODES = 8_192
+_MAX_CONTAINER_ITEMS = 1_024
+_MAX_STRING_CHARS = 512
+_MAX_NUMERIC_DIGITS = 128
+_MAX_ARTIFACT_RECEIPT_BYTES = 16_384
+_RAW_ARTIFACT_ID = re.compile(r"pit-raw-artifact-[0-9a-f]{64}")
+_IDENTITY_PROFILE_ORDER = ("alpaca_asset/v1", "security_master/v1")
+_IDENTITY_PROFILES: dict[str, dict[str, object]] = {
+    "alpaca_asset/v1": {
+        "source_hash_name": "alpaca_asset",
+        "selectors": {
+            "security_id": ("id",),
+            "symbol": ("symbol",),
+            "exchange": ("exchange",),
+            "asset_class": ("class",),
+            "status": ("status",),
+            "tradable": ("tradable",),
+        },
+    },
+    "security_master/v1": {
+        "source_hash_name": "security_master",
+        "selectors": {
+            "security_id": ("security_id",),
+            "symbol": ("symbol",),
+            "security_type": ("security_type",),
+            "effective_from": ("effective_from",),
+            "effective_to": ("effective_to",),
+        },
+    },
+}
+_MARKET_SOURCE_PROFILE = "alpaca_stock_daily_bars/v1"
+_MARKET_SELECTORS = {
+    "rows_path": ("bars",),
+    "timestamp_field": "t",
+    "close_field": "c",
+    "volume_field": "v",
+}
+_CANDIDATE_FIELDS = frozenset(
+    {"security", "identity_sources", "market_data_source"}
+)
+_IDENTITY_INPUT_FIELDS = frozenset(
+    {"source_profile", "record_identity", "raw_artifact_id", "raw_artifact_sha256"}
+)
+_MARKET_INPUT_FIELDS = frozenset(
+    {"source_profile", "record_identity", "raw_artifact_id", "raw_artifact_sha256"}
+)
 
 
 def _exact(value: object, fields: frozenset[str], *, label: str) -> dict[str, object]:
@@ -84,6 +129,10 @@ def _timestamp(value: object, *, label: str) -> dt.datetime:
     return parsed
 
 
+def _timestamp_text(value: dt.datetime) -> str:
+    return value.astimezone(dt.UTC).isoformat(timespec="seconds")
+
+
 def _date(value: object, *, label: str) -> str:
     if type(value) is not str:
         raise PointInTimeDataError(f"{label} must be an ISO date")
@@ -94,20 +143,6 @@ def _date(value: object, *, label: str) -> str:
     if parsed.isoformat() != value:
         raise PointInTimeDataError(f"{label} must be an ISO date")
     return value
-
-
-def _json_path(value: object, *, label: str) -> tuple[str | int, ...]:
-    if type(value) not in (list, tuple) or not value:
-        raise PointInTimeDataError(f"{label} must be a nonempty exact JSON path")
-    result: list[str | int] = []
-    for component in value:
-        if type(component) is str and component:
-            result.append(component)
-        elif type(component) is int and component >= 0:
-            result.append(component)
-        else:
-            raise PointInTimeDataError(f"{label} contains an invalid component")
-    return tuple(result)
 
 
 def _select_json(payload: object, path: Sequence[str | int], *, label: str) -> object:
@@ -126,6 +161,41 @@ def _select_json(payload: object, path: Sequence[str | int], *, label: str) -> o
     return selected
 
 
+def _bounded_json_shape(payload: object, *, label: str) -> None:
+    objects = 0
+    lists = 0
+    strings = 0
+    nodes = 0
+    stack: list[tuple[object, int]] = [(payload, 0)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
+            raise PointInTimeDataError(f"{label} exceeds JSON depth/node limits")
+        if isinstance(value, Mapping):
+            objects += 1
+            if objects > _MAX_JSON_OBJECTS or len(value) > _MAX_CONTAINER_ITEMS:
+                raise PointInTimeDataError(f"{label} exceeds JSON object limits")
+            for key, item in value.items():
+                strings += 1
+                if (
+                    strings > _MAX_JSON_STRINGS
+                    or type(key) is not str
+                    or len(key) > _MAX_STRING_CHARS
+                ):
+                    raise PointInTimeDataError(f"{label} exceeds JSON string limits")
+                stack.append((item, depth + 1))
+        elif type(value) is list:
+            lists += 1
+            if lists > _MAX_JSON_LISTS or len(value) > _MAX_CONTAINER_ITEMS:
+                raise PointInTimeDataError(f"{label} exceeds JSON list limits")
+            stack.extend((item, depth + 1) for item in value)
+        elif type(value) is str:
+            strings += 1
+            if strings > _MAX_JSON_STRINGS or len(value) > _MAX_STRING_CHARS:
+                raise PointInTimeDataError(f"{label} exceeds JSON string limits")
+
+
 def _strict_json(raw_bytes: bytes, *, label: str) -> object:
     def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
@@ -135,23 +205,50 @@ def _strict_json(raw_bytes: bytes, *, label: str) -> object:
             result[key] = value
         return result
 
+    def bounded_integer(text: str) -> int:
+        digits = text.removeprefix("-")
+        if len(digits) > _MAX_NUMERIC_DIGITS:
+            raise PointInTimeDataError(f"{label} numeric coefficient is too large")
+        return int(text)
+
+    def bounded_decimal(text: str) -> Decimal:
+        coefficient = text.lower().split("e", 1)[0].replace("-", "").replace(".", "")
+        exponent = text.lower().split("e", 1)[1] if "e" in text.lower() else "0"
+        exponent_digits = exponent.removeprefix("-").removeprefix("+")
+        if (
+            len(coefficient.lstrip("0") or "0") > _MAX_NUMERIC_DIGITS
+            or len(exponent_digits) > 4
+            or abs(int(exponent)) > _MAX_NUMERIC_DIGITS
+        ):
+            raise PointInTimeDataError(f"{label} numeric coefficient is too large")
+        return Decimal(text)
+
     def reject_nonfinite(_value: str) -> object:
         raise PointInTimeDataError(f"{label} contains a nonfinite JSON number")
 
     try:
-        return json.loads(
+        payload = json.loads(
             raw_bytes,
             object_pairs_hook=reject_duplicate_keys,
-            parse_float=Decimal,
+            parse_int=bounded_integer,
+            parse_float=bounded_decimal,
             parse_constant=reject_nonfinite,
         )
     except PointInTimeDataError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PointInTimeDataError(f"{label} is not strict JSON") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError, DecimalException, RecursionError) as exc:
+        raise PointInTimeDataError(f"{label} is not bounded strict JSON") from exc
+    _bounded_json_shape(payload, label=label)
+    return payload
 
 
-def _canonical_decimal(value: object, *, label: str, positive: bool) -> str:
+def _canonical_decimal(
+    value: object,
+    *,
+    label: str,
+    positive: bool,
+    limits: tuple[int, int, int],
+) -> str:
     if type(value) not in (int, Decimal):
         raise PointInTimeDataError(f"{label} must be an exact JSON number")
     try:
@@ -160,7 +257,7 @@ def _canonical_decimal(value: object, *, label: str, positive: bool) -> str:
         adjusted = len(digits) + exponent - 1
     except (DecimalException, TypeError, ValueError, OverflowError) as exc:
         raise PointInTimeDataError(f"{label} is not a bounded decimal") from exc
-    max_digits, max_exponent, max_chars = _DECIMAL_LIMITS
+    max_digits, max_exponent, max_chars = limits
     if (
         not parsed.is_finite()
         or len(digits) > max_digits
@@ -179,29 +276,127 @@ def _canonical_decimal(value: object, *, label: str, positive: bool) -> str:
     return "0" if text == "-0" else text
 
 
+def _coefficient(value: Decimal) -> tuple[int, int]:
+    sign, digits, exponent = value.as_tuple()
+    coefficient = int("".join(str(digit) for digit in digits))
+    return (-coefficient if sign else coefficient), exponent
+
+
+def _decimal_from_coefficient(coefficient: int, exponent: int) -> Decimal:
+    sign = 1 if coefficient < 0 else 0
+    digits = tuple(int(char) for char in str(abs(coefficient))) if coefficient else (0,)
+    return Decimal((sign, digits, exponent))
+
+
+def _exact_product(close: Decimal, volume: int) -> Decimal:
+    coefficient, exponent = _coefficient(close)
+    return _decimal_from_coefficient(coefficient * volume, exponent)
+
+
+def _exact_even_median(lower: Decimal, upper: Decimal) -> Decimal:
+    lower_coefficient, lower_exponent = _coefficient(lower)
+    upper_coefficient, upper_exponent = _coefficient(upper)
+    common_exponent = min(lower_exponent, upper_exponent)
+    numerator = (
+        lower_coefficient * (10 ** (lower_exponent - common_exponent))
+        + upper_coefficient * (10 ** (upper_exponent - common_exponent))
+    )
+    if numerator % 2 == 0:
+        return _decimal_from_coefficient(numerator // 2, common_exponent)
+    return _decimal_from_coefficient(numerator * 5, common_exponent - 1)
+
+
+def _exact_https_uri(value: str, *, host: str, path: str, query: str = "") -> bool:
+    expected = f"https://{host}{path}" + (f"?{query}" if query else "")
+    if value != expected:
+        return False
+    parsed = urlsplit(value)
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == host
+        and parsed.hostname == host
+        and parsed.port is None
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path == path
+        and parsed.query == query
+        and not parsed.fragment
+    )
+
+
 def _verified_artifact(
     *,
     archive: RawPointInTimeArtifactArchive,
     raw_artifact_id: object,
     raw_artifact_sha256: object,
-    cutoff: dt.datetime,
+    selection_time: dt.datetime,
+    max_byte_count: int,
     label: str,
 ) -> RawPointInTimeArtifact:
     if type(raw_artifact_id) is not str or type(raw_artifact_sha256) is not str:
         raise PointInTimeDataError(f"{label} raw artifact reference is invalid")
+    if _RAW_ARTIFACT_ID.fullmatch(raw_artifact_id) is None:
+        raise PointInTimeDataError(f"{label} raw artifact identity is invalid")
+    object_root = archive.root / "objects"
+    for path, byte_limit in (
+        (object_root / f"{raw_artifact_id}.json", _MAX_ARTIFACT_RECEIPT_BYTES),
+        (object_root / f"{raw_artifact_id}.raw", max_byte_count),
+    ):
+        try:
+            metadata = os.lstat(path)
+        except OSError as exc:
+            raise PointInTimeDataError(f"{label} raw artifact path is unavailable") from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_size > byte_limit
+        ):
+            raise PointInTimeDataError(f"{label} raw artifact exceeds safe path/byte limits")
     artifact = archive.read_artifact(raw_artifact_id)
     if artifact.raw_artifact_sha256 != raw_artifact_sha256:
         raise PointInTimeDataError(f"{label} raw artifact digest does not match archive")
-    if (
-        _timestamp(artifact.retrieved_at, label=f"{label} retrieved_at") > cutoff
-        or _timestamp(
-            artifact.archive_recorded_at,
-            label=f"{label} archive_recorded_at",
-        )
-        > cutoff
-    ):
-        raise PointInTimeDataError(f"{label} was retained after the selection cutoff")
+    if artifact.byte_count > max_byte_count:
+        raise PointInTimeDataError(f"{label} raw artifact exceeds byte limit")
+    if _timestamp(
+        artifact.archive_recorded_at,
+        label=f"{label} archive_recorded_at",
+    ) > selection_time:
+        raise PointInTimeDataError(f"{label} was archived after selection_time")
+    if _timestamp(artifact.retrieved_at, label=f"{label} retrieved_at") > selection_time:
+        raise PointInTimeDataError(f"{label} was retrieved after selection_time")
     return artifact
+
+
+def _preflight_candidates(
+    candidates: object,
+) -> tuple[dict[str, object], ...]:
+    if (
+        type(candidates) is not tuple
+        or not candidates
+        or len(candidates) > _MAX_CANDIDATES
+    ):
+        raise PointInTimeDataError("candidate input exceeds the bounded candidate count")
+    preflight: list[dict[str, object]] = []
+    for index, candidate in enumerate(candidates):
+        values = _exact(candidate, _CANDIDATE_FIELDS, label=f"candidate input {index}")
+        sources = values["identity_sources"]
+        if type(sources) is not list or len(sources) != len(_IDENTITY_PROFILE_ORDER):
+            raise PointInTimeDataError(
+                "candidate identity_sources must contain exactly two registered profiles"
+            )
+        for source_index, source in enumerate(sources):
+            _exact(
+                source,
+                _IDENTITY_INPUT_FIELDS,
+                label=f"candidate identity source {index}:{source_index}",
+            )
+        _exact(
+            values["market_data_source"],
+            _MARKET_INPUT_FIELDS,
+            label=f"candidate market source {index}",
+        )
+        preflight.append(values)
+    return tuple(preflight)
 
 
 def _calendar_context(
@@ -209,12 +404,16 @@ def _calendar_context(
     archive: RawPointInTimeArtifactArchive,
     market_calendar: MarketSessionCalendar,
     market_date: str,
-    cutoff: dt.datetime,
+    selection_time: dt.datetime,
+    as_of_cutoff: dt.datetime,
 ) -> tuple[
     MarketSessionCalendar,
     RawPointInTimeArtifact,
     tuple[str, ...],
     dict[str, dt.datetime],
+    dt.datetime,
+    dt.datetime,
+    dt.datetime,
 ]:
     if type(market_calendar) is not MarketSessionCalendar:
         raise PointInTimeDataError("market_calendar must be an exact canonical receipt")
@@ -223,9 +422,19 @@ def _calendar_context(
         archive=archive,
         raw_artifact_id=calendar.raw_artifact_id,
         raw_artifact_sha256=calendar.raw_artifact_sha256,
-        cutoff=cutoff,
+        selection_time=selection_time,
+        max_byte_count=_MAX_CALENDAR_ARTIFACT_BYTES,
         label="market calendar",
     )
+    if not any(
+        _exact_https_uri(
+            artifact.source_uri,
+            host=host,
+            path="/v2/calendar",
+        )
+        for host in _ALPACA_ASSET_HOSTS
+    ):
+        raise PointInTimeDataError("market calendar URI is not canonical Alpaca provenance")
     rebuilt = build_market_session_calendar(archive=archive, raw_artifact=artifact)
     if rebuilt.canonical_json_bytes() != calendar.canonical_json_bytes():
         raise PointInTimeDataError("market calendar receipt does not match retained bytes")
@@ -238,15 +447,15 @@ def _calendar_context(
     source = _strict_json(archive.read_bytes(artifact), label="market calendar source")
     if type(source) is not list:
         raise PointInTimeDataError("market calendar source must be a JSON list")
-    close_times: dict[str, dt.datetime] = {}
-    selected = set(session_dates)
+    selected = {*session_dates, market_date}
+    hours: dict[str, tuple[dt.datetime, dt.datetime]] = {}
     for index, row in enumerate(source):
         if not isinstance(row, Mapping):
             raise PointInTimeDataError(f"market calendar row {index} is invalid")
         date_value = row.get("date")
         if date_value not in selected:
             continue
-        if date_value in close_times:
+        if date_value in hours:
             raise PointInTimeDataError("market calendar contains a duplicate selected session")
         raw_open = row.get("open")
         raw_close = row.get("close")
@@ -261,17 +470,34 @@ def _calendar_context(
         close_time = dt.time.fromisoformat(raw_close)
         if open_time >= close_time:
             raise PointInTimeDataError("market calendar selected session hours are invalid")
-        local_close = dt.datetime.combine(
-            dt.date.fromisoformat(date_value),
-            close_time,
-            tzinfo=_MARKET_TZ,
-        )
-        close_times[date_value] = local_close.astimezone(dt.UTC)
-    if tuple(date for date in session_dates if date in close_times) != session_dates:
+        session_date = dt.date.fromisoformat(date_value)
+        local_open = dt.datetime.combine(session_date, open_time, tzinfo=_MARKET_TZ)
+        local_close = dt.datetime.combine(session_date, close_time, tzinfo=_MARKET_TZ)
+        hours[date_value] = (local_open.astimezone(dt.UTC), local_close.astimezone(dt.UTC))
+    if set(hours) != selected:
         raise PointInTimeDataError("market calendar selected sessions are incomplete")
-    if any(completion > cutoff for completion in close_times.values()):
-        raise PointInTimeDataError("selected market session completes after cutoff")
-    return calendar, artifact, session_dates, close_times
+    close_times = {date: hours[date][1] for date in session_dates}
+    if any(completion > as_of_cutoff for completion in close_times.values()):
+        raise PointInTimeDataError("preceding session completes after as_of_cutoff")
+    market_open, market_close = hours[market_date]
+    selection_window_open = dt.datetime.combine(
+        dt.date.fromisoformat(market_date),
+        dt.time(0, 0),
+        tzinfo=_MARKET_TZ,
+    ).astimezone(dt.UTC)
+    if not selection_window_open <= selection_time <= as_of_cutoff <= market_open:
+        raise PointInTimeDataError(
+            "selection_time and as_of_cutoff must be ordered within the pre-open window"
+        )
+    return (
+        calendar,
+        artifact,
+        session_dates,
+        close_times,
+        selection_window_open,
+        market_open,
+        market_close,
+    )
 
 
 def _identity_type_reason(value: object) -> str | None:
@@ -288,80 +514,117 @@ def _identity_type_reason(value: object) -> str | None:
     return "security_type_not_common_stock"
 
 
+def _identity_profile_uri(
+    *,
+    profile: str,
+    record_identity: str,
+    security: SecurityIdentity,
+    source_uri: str,
+) -> bool:
+    if profile == "alpaca_asset/v1":
+        if record_identity not in {security.symbol, security.security_id}:
+            return False
+        return any(
+            _exact_https_uri(
+                source_uri,
+                host=host,
+                path=f"/v2/assets/{record_identity}",
+            )
+            for host in _ALPACA_ASSET_HOSTS
+        )
+    return (
+        record_identity == security.security_id
+        and _exact_https_uri(
+            source_uri,
+            host=_SECURITY_MASTER_HOST,
+            path=f"/v1/securities/{security.security_id}",
+        )
+    )
+
+
 def _identity_sources(
     *,
     archive: RawPointInTimeArtifactArchive,
     security: SecurityIdentity,
     raw_sources: object,
-    cutoff: dt.datetime,
+    selection_time: dt.datetime,
     first_session: str,
     market_date: str,
 ) -> tuple[tuple[PointInTimeCohortIdentitySourceReference, ...], tuple[str, ...]]:
-    if type(raw_sources) is not list or not raw_sources:
-        raise PointInTimeDataError("candidate identity_sources must be a nonempty list")
-    expected_fields = frozenset(
-        {
-            "source_hash_name",
-            "raw_artifact_id",
-            "raw_artifact_sha256",
-            "qualification_field_selectors",
-        }
-    )
-    parsed_sources: list[PointInTimeCohortIdentitySourceReference] = []
-    selected_values: dict[str, object] = {}
-    seen_hash_names: set[str] = set()
+    if set(security.source_hashes) != {"alpaca_asset", "security_master"}:
+        raise PointInTimeDataError(
+            "SecurityIdentity must bind exact alpaca_asset and security_master hashes"
+        )
+    if type(raw_sources) is not list or len(raw_sources) != 2:
+        raise PointInTimeDataError("candidate identity_sources must contain two profiles")
+    by_profile: dict[str, dict[str, object]] = {}
     for index, raw_source in enumerate(raw_sources):
-        values = _exact(raw_source, expected_fields, label=f"identity source {index}")
-        source_hash_name = values["source_hash_name"]
-        if type(source_hash_name) is not str or source_hash_name in seen_hash_names:
-            raise PointInTimeDataError("candidate identity source hash names are invalid")
-        seen_hash_names.add(source_hash_name)
-        if source_hash_name not in security.source_hashes:
-            raise PointInTimeDataError("identity source hash name is absent from SecurityIdentity")
+        values = _exact(raw_source, _IDENTITY_INPUT_FIELDS, label=f"identity source {index}")
+        profile = values["source_profile"]
+        if type(profile) is not str or profile not in _IDENTITY_PROFILES or profile in by_profile:
+            raise PointInTimeDataError("candidate identity source profiles are invalid")
+        by_profile[profile] = values
+    if set(by_profile) != set(_IDENTITY_PROFILE_ORDER):
+        raise PointInTimeDataError("candidate identity source profiles are incomplete")
+    selected_by_profile: dict[str, dict[str, object]] = {}
+    references: list[PointInTimeCohortIdentitySourceReference] = []
+    artifact_ids: set[str] = set()
+    for profile in _IDENTITY_PROFILE_ORDER:
+        values = by_profile[profile]
+        specification = _IDENTITY_PROFILES[profile]
+        source_hash_name = specification["source_hash_name"]
+        selectors = specification["selectors"]
+        if type(source_hash_name) is not str or not isinstance(selectors, Mapping):
+            raise AssertionError("registered identity profile is malformed")
+        record_identity = values["record_identity"]
+        if type(record_identity) is not str:
+            raise PointInTimeDataError("identity source record_identity is invalid")
         artifact = _verified_artifact(
             archive=archive,
             raw_artifact_id=values["raw_artifact_id"],
             raw_artifact_sha256=values["raw_artifact_sha256"],
-            cutoff=cutoff,
-            label=f"identity source {index}",
+            selection_time=selection_time,
+            max_byte_count=_MAX_IDENTITY_ARTIFACT_BYTES,
+            label=f"identity source {profile}",
         )
+        if artifact.raw_artifact_id in artifact_ids:
+            raise PointInTimeDataError("identity source artifacts must be unique")
+        artifact_ids.add(artifact.raw_artifact_id)
         if artifact.raw_artifact_sha256 != security.source_hashes[source_hash_name]:
             raise PointInTimeDataError(
                 "SecurityIdentity source hash has no matching retained raw artifact"
             )
-        parsed_uri = urlsplit(artifact.source_uri)
         if (
-            parsed_uri.hostname not in _ALPACA_ASSET_HOSTS
-            or not parsed_uri.path.startswith("/v2/assets/")
-            or parsed_uri.query
-            or artifact.content_type != "application/json"
+            artifact.content_type != "application/json"
+            or not _identity_profile_uri(
+                profile=profile,
+                record_identity=record_identity,
+                security=security,
+                source_uri=artifact.source_uri,
+            )
         ):
             raise PointInTimeDataError(
-                "identity qualification source must be retained Alpaca asset JSON"
+                f"identity source {profile} URI/content profile is invalid"
             )
-        selectors_raw = values["qualification_field_selectors"]
-        if not isinstance(selectors_raw, Mapping) or not selectors_raw:
-            raise PointInTimeDataError("qualification_field_selectors must be nonempty")
-        selectors: dict[str, tuple[str | int, ...]] = {}
         source_payload = _strict_json(
             archive.read_bytes(artifact),
-            label=f"identity source {index}",
+            label=f"identity source {profile}",
         )
         if not isinstance(source_payload, Mapping):
             raise PointInTimeDataError("identity source JSON must be an object")
-        for field_name, raw_path in selectors_raw.items():
-            if field_name not in _QUALIFICATION_FIELDS or field_name in selected_values:
-                raise PointInTimeDataError("qualification field binding is mixed or ambiguous")
-            path = _json_path(raw_path, label=f"qualification selector {field_name}")
-            selectors[field_name] = path
-            selected_values[field_name] = _select_json(
+        selected_values: dict[str, object] = {}
+        for role, path in selectors.items():
+            selected_values[role] = _select_json(
                 source_payload,
                 path,
-                label=f"qualification field {field_name}",
+                label=f"qualification field {role}",
             )
-        parsed_sources.append(
+        selected_by_profile[profile] = selected_values
+        references.append(
             PointInTimeCohortIdentitySourceReference(
+                source_profile=profile,
                 source_hash_name=source_hash_name,
+                record_identity=record_identity,
                 raw_artifact_id=artifact.raw_artifact_id,
                 raw_artifact_sha256=artifact.raw_artifact_sha256,
                 source_uri=artifact.source_uri,
@@ -371,22 +634,20 @@ def _identity_sources(
                 qualification_field_selectors=selectors,
             )
         )
-    if seen_hash_names != set(security.source_hashes):
-        raise PointInTimeDataError(
-            "every SecurityIdentity source hash must name a retained raw artifact"
-        )
-    missing_fields = _QUALIFICATION_FIELDS - set(selected_values)
-    if missing_fields:
-        raise PointInTimeDataError(
-            f"unbound qualification fields: {sorted(missing_fields)}"
-        )
-
+    asset_values = selected_by_profile["alpaca_asset/v1"]
+    master_values = selected_by_profile["security_master/v1"]
     reasons: list[str] = []
-    if selected_values["security_id"] != security.security_id:
+    if (
+        asset_values["security_id"] != security.security_id
+        or master_values["security_id"] != security.security_id
+    ):
         reasons.append("security_identity_id_mismatch")
-    if selected_values["symbol"] != security.symbol:
+    if (
+        asset_values["symbol"] != security.symbol
+        or master_values["symbol"] != security.symbol
+    ):
         reasons.append("security_identity_symbol_mismatch")
-    exchange = selected_values["exchange"]
+    exchange = asset_values["exchange"]
     if type(exchange) is not str:
         raise PointInTimeDataError("source-derived exchange must be a string")
     if exchange == "OTC":
@@ -395,34 +656,42 @@ def _identity_sources(
         reasons.append("exchange_not_us_listed")
     elif exchange != security.exchange:
         reasons.append("security_identity_exchange_mismatch")
-    type_reason = _identity_type_reason(selected_values["security_type"])
+    type_reason = _identity_type_reason(master_values["security_type"])
     if type_reason is not None:
         reasons.append(type_reason)
-    source_status = selected_values["status"]
+    if master_values["security_type"] != security.security_type:
+        reasons.append("security_identity_type_mismatch")
+    source_status = asset_values["status"]
     if source_status != "active":
         reasons.append("asset_status_not_active")
-    if selected_values["asset_class"] != "us_equity":
+    if source_status != security.status:
+        reasons.append("security_identity_status_mismatch")
+    if asset_values["asset_class"] != "us_equity":
         reasons.append("asset_class_not_us_equity")
-    tradable = selected_values["tradable"]
+    tradable = asset_values["tradable"]
     if type(tradable) is not bool:
         raise PointInTimeDataError("source-derived tradable must be an exact boolean")
     if not tradable:
         reasons.append("asset_not_tradable")
     effective_from = _date(
-        selected_values["effective_from"],
+        master_values["effective_from"],
         label="source-derived effective_from",
     )
-    raw_effective_to = selected_values["effective_to"]
+    raw_effective_to = master_values["effective_to"]
     effective_to = (
         None
         if raw_effective_to is None
         else _date(raw_effective_to, label="source-derived effective_to")
     )
+    if effective_from != security.effective_from:
+        reasons.append("security_identity_effective_from_mismatch")
+    if effective_to != security.effective_to:
+        reasons.append("security_identity_effective_to_mismatch")
     if effective_from > first_session or (
         effective_to is not None and effective_to < market_date
     ):
         reasons.append("identity_not_effective_for_full_window")
-    return tuple(parsed_sources), tuple(reasons)
+    return tuple(references), tuple(dict.fromkeys(reasons))
 
 
 def _market_source(
@@ -430,71 +699,60 @@ def _market_source(
     archive: RawPointInTimeArtifactArchive,
     security: SecurityIdentity,
     raw_source: object,
-    cutoff: dt.datetime,
+    selection_time: dt.datetime,
+    as_of_cutoff: dt.datetime,
     market_date: str,
     session_dates: tuple[str, ...],
     close_times: Mapping[str, dt.datetime],
 ) -> tuple[PointInTimeCohortMarketDataSourceReference, str, str]:
-    values = _exact(
-        raw_source,
-        frozenset({"raw_artifact_id", "raw_artifact_sha256", "bar_selectors"}),
-        label="candidate market_data_source",
-    )
+    values = _exact(raw_source, _MARKET_INPUT_FIELDS, label="candidate market_data_source")
+    if values["source_profile"] != _MARKET_SOURCE_PROFILE:
+        raise PointInTimeDataError("market source profile is not registered")
+    if values["record_identity"] != security.symbol:
+        raise PointInTimeDataError("market source record_identity must be the exact symbol")
     artifact = _verified_artifact(
         archive=archive,
         raw_artifact_id=values["raw_artifact_id"],
         raw_artifact_sha256=values["raw_artifact_sha256"],
-        cutoff=cutoff,
+        selection_time=selection_time,
+        max_byte_count=_MAX_BAR_ARTIFACT_BYTES,
         label="candidate market-data source",
     )
-    parsed_uri = urlsplit(artifact.source_uri)
-    if (
-        parsed_uri.hostname != "data.alpaca.markets"
-        or parsed_uri.path != f"/v2/stocks/{security.symbol}/bars"
-        or artifact.content_type != "application/json"
-    ):
-        raise PointInTimeDataError("market source is not the exact Alpaca stock-bars route")
-    query_pairs = parse_qsl(parsed_uri.query, keep_blank_values=True)
-    if len({key for key, _value in query_pairs}) != len(query_pairs):
-        raise PointInTimeDataError("Alpaca bar route contains duplicate query selectors")
-    query = dict(query_pairs)
     expected_start = f"{session_dates[0]}T00:00:00Z"
     expected_end = f"{market_date}T00:00:00Z"
-    if set(query) != {"timeframe", "feed", "adjustment", "start", "end"}:
-        raise PointInTimeDataError("Alpaca bar route selectors are mixed or ambiguous")
-    if (
-        query["timeframe"] != "1Day"
-        or query["feed"] not in {"iex", "sip"}
-        or query["adjustment"] != "raw"
-        or query["start"] != expected_start
-        or query["end"] != expected_end
-    ):
-        raise PointInTimeDataError(
-            "Alpaca bars must pin the exact 60-session range, feed, and raw adjustment"
+    matched_feed: str | None = None
+    for feed in ("iex", "sip"):
+        query = (
+            f"timeframe=1Day&feed={feed}&adjustment=raw"
+            f"&start={expected_start}&end={expected_end}"
         )
-    selector_values = _exact(
-        values["bar_selectors"],
-        frozenset({"rows_path", "timestamp_field", "close_field", "volume_field"}),
-        label="candidate bar_selectors",
-    )
-    rows_path = _json_path(selector_values["rows_path"], label="bar rows_path")
-    if rows_path != ("bars", security.symbol):
-        raise PointInTimeDataError("bar rows_path must bind the exact security symbol")
-    if (
-        selector_values["timestamp_field"] != "t"
-        or selector_values["close_field"] != "c"
-        or selector_values["volume_field"] != "v"
-    ):
-        raise PointInTimeDataError("bar field selectors must bind Alpaca t/c/v")
+        if _exact_https_uri(
+            artifact.source_uri,
+            host="data.alpaca.markets",
+            path=f"/v2/stocks/{security.symbol}/bars",
+            query=query,
+        ):
+            matched_feed = feed
+            break
+    if artifact.content_type != "application/json" or matched_feed is None:
+        raise PointInTimeDataError(
+            "market source URI must be the exact canonical Alpaca daily-bars route"
+        )
     source_payload = _strict_json(
         archive.read_bytes(artifact),
         label="Alpaca bar source",
     )
-    if not isinstance(source_payload, Mapping):
-        raise PointInTimeDataError("Alpaca bar source must be a JSON object")
-    if source_payload.get("next_page_token") is not None:
+    if not isinstance(source_payload, Mapping) or set(source_payload) != {
+        "bars",
+        "symbol",
+        "next_page_token",
+    }:
+        raise PointInTimeDataError("Alpaca bar source response fields are invalid")
+    if source_payload["symbol"] != security.symbol:
+        raise PointInTimeDataError("Alpaca bar source symbol is invalid")
+    if source_payload["next_page_token"] is not None:
         raise PointInTimeDataError("Alpaca bar source is incomplete or paginated")
-    raw_rows = _select_json(source_payload, rows_path, label="Alpaca bar rows")
+    raw_rows = source_payload["bars"]
     if type(raw_rows) is not list or len(raw_rows) != 60:
         raise PointInTimeDataError("Alpaca bar source must contain exactly 60 session rows")
     closes: list[Decimal] = []
@@ -505,20 +763,16 @@ def _market_source(
         if not isinstance(row, Mapping):
             raise PointInTimeDataError(f"Alpaca bar row {index} must be an object")
         raw_timestamp = row.get("t")
-        if type(raw_timestamp) is not str:
-            raise PointInTimeDataError(f"Alpaca bar row {index} has no timestamp")
-        normalized = raw_timestamp.removesuffix("Z") + (
-            "+00:00" if raw_timestamp.endswith("Z") else ""
-        )
+        if type(raw_timestamp) is not str or not raw_timestamp.endswith("Z"):
+            raise PointInTimeDataError(f"Alpaca bar row {index} has no canonical timestamp")
         try:
-            bar_time = dt.datetime.fromisoformat(normalized)
+            bar_time = dt.datetime.fromisoformat(raw_timestamp[:-1] + "+00:00")
         except ValueError as exc:
             raise PointInTimeDataError(f"Alpaca bar row {index} timestamp is invalid") from exc
-        local_time = bar_time.astimezone(_MARKET_TZ) if bar_time.tzinfo is not None else None
+        local_time = bar_time.astimezone(_MARKET_TZ)
         if (
             bar_time.tzinfo != dt.UTC
             or bar_time.microsecond
-            or local_time is None
             or local_time.timetz().replace(tzinfo=None) != dt.time(0, 0)
         ):
             raise PointInTimeDataError(f"Alpaca bar row {index} is not a daily session bar")
@@ -528,46 +782,68 @@ def _market_source(
             row.get("c"),
             label=f"Alpaca bar row {index} close",
             positive=True,
+            limits=_SOURCE_DECIMAL_LIMITS,
         )
         raw_volume = row.get("v")
-        if type(raw_volume) is not int or raw_volume < 0:
+        if (
+            type(raw_volume) is not int
+            or raw_volume < 0
+            or len(str(raw_volume)) > _MAX_NUMERIC_DIGITS
+        ):
             raise PointInTimeDataError(
-                f"Alpaca bar row {index} volume must be a nonnegative exact integer"
+                f"Alpaca bar row {index} volume must be a bounded nonnegative integer"
             )
         close = Decimal(close_text)
         closes.append(close)
-        daily_dollar_volumes.append(close * Decimal(raw_volume))
+        product = _exact_product(close, raw_volume)
+        _canonical_decimal(
+            product,
+            label=f"Alpaca bar row {index} daily dollar volume",
+            positive=False,
+            limits=_DERIVED_DECIMAL_LIMITS,
+        )
+        daily_dollar_volumes.append(product)
         completion = close_times.get(session_date)
         if completion is None:
             raise PointInTimeDataError("Alpaca bar row is not a registered calendar session")
-        if completion > cutoff or artifact_retrieved < completion:
+        if completion > as_of_cutoff or artifact_retrieved < completion:
             raise PointInTimeDataError("Alpaca bar row is incomplete or after cutoff")
     if tuple(actual_dates) != session_dates:
         raise PointInTimeDataError(
             "Alpaca bars must be unique, chronological, and exactly match 60 sessions"
         )
     ordered_volumes = sorted(daily_dollar_volumes)
-    median = (ordered_volumes[29] + ordered_volumes[30]) / Decimal("2")
+    median = _exact_even_median(ordered_volumes[29], ordered_volumes[30])
+    prior_close = _canonical_decimal(
+        closes[-1],
+        label="prior complete close",
+        positive=True,
+        limits=_SOURCE_DECIMAL_LIMITS,
+    )
+    median_text = _canonical_decimal(
+        median,
+        label="median daily dollar volume",
+        positive=False,
+        limits=_DERIVED_DECIMAL_LIMITS,
+    )
     reference = PointInTimeCohortMarketDataSourceReference(
+        source_profile=_MARKET_SOURCE_PROFILE,
+        record_identity=security.symbol,
         raw_artifact_id=artifact.raw_artifact_id,
         raw_artifact_sha256=artifact.raw_artifact_sha256,
         source_uri=artifact.source_uri,
         content_type=artifact.content_type,
         retrieved_at=artifact.retrieved_at,
         archive_recorded_at=artifact.archive_recorded_at,
-        feed=query["feed"],
-        adjustment=query["adjustment"],
-        timeframe=query["timeframe"],
-        rows_path=rows_path,
+        feed=matched_feed,
+        adjustment="raw",
+        timeframe="1Day",
+        rows_path=_MARKET_SELECTORS["rows_path"],
         timestamp_field="t",
         close_field="c",
         volume_field="v",
     )
-    return (
-        reference,
-        _canonical_decimal(closes[-1], label="prior complete close", positive=True),
-        _canonical_decimal(median, label="median daily dollar volume", positive=False),
-    )
+    return reference, prior_close, median_text
 
 
 def build_source_verifiable_point_in_time_cohort(
@@ -579,34 +855,37 @@ def build_source_verifiable_point_in_time_cohort(
     selection_time: str,
     candidates: tuple[Mapping[str, object], ...],
 ) -> PointInTimeCohort:
-    """Strictly reopen every named source and derive all qualification facts."""
+    """Reopen every registered source and derive all qualification facts."""
 
     if type(archive) is not RawPointInTimeArtifactArchive:
         raise PointInTimeDataError("archive must be an exact raw PIT artifact archive")
+    preflight = _preflight_candidates(candidates)
     normalized_market_date = _date(market_date, label="market_date")
+    selected_at = _timestamp(selection_time, label="selection_time")
     cutoff = _timestamp(as_of_cutoff, label="as_of_cutoff")
-    _timestamp(selection_time, label="selection_time")
-    calendar, calendar_artifact, session_dates, close_times = _calendar_context(
+    (
+        calendar,
+        calendar_artifact,
+        session_dates,
+        close_times,
+        selection_window_open,
+        market_open,
+        market_close,
+    ) = _calendar_context(
         archive=archive,
         market_calendar=market_calendar,
         market_date=normalized_market_date,
-        cutoff=cutoff,
+        selection_time=selected_at,
+        as_of_cutoff=cutoff,
     )
-    if type(candidates) is not tuple or not candidates:
-        raise PointInTimeDataError("candidate input must be a nonempty exact tuple")
     derived: list[PointInTimeCohortCandidate] = []
-    for index, raw_candidate in enumerate(candidates):
-        values = _exact(
-            raw_candidate,
-            frozenset({"security", "identity_sources", "market_data_source"}),
-            label=f"candidate input fields at index {index}",
-        )
+    for values in preflight:
         security = validate_security_identity(values["security"])
         identity_sources, reasons = _identity_sources(
             archive=archive,
             security=security,
             raw_sources=values["identity_sources"],
-            cutoff=cutoff,
+            selection_time=selected_at,
             first_session=session_dates[0],
             market_date=normalized_market_date,
         )
@@ -614,7 +893,8 @@ def build_source_verifiable_point_in_time_cohort(
             archive=archive,
             security=security,
             raw_source=values["market_data_source"],
-            cutoff=cutoff,
+            selection_time=selected_at,
+            as_of_cutoff=cutoff,
             market_date=normalized_market_date,
             session_dates=session_dates,
             close_times=close_times,
@@ -631,8 +911,12 @@ def build_source_verifiable_point_in_time_cohort(
         )
     return build_point_in_time_cohort(
         market_date=normalized_market_date,
-        as_of_cutoff=as_of_cutoff,
+        selection_window_open_at=_timestamp_text(selection_window_open),
+        selection_window_close_at=_timestamp_text(market_open),
+        market_session_open_at=_timestamp_text(market_open),
+        market_session_close_at=_timestamp_text(market_close),
         selection_time=selection_time,
+        as_of_cutoff=as_of_cutoff,
         market_calendar=calendar,
         calendar_retrieved_at=calendar_artifact.retrieved_at,
         calendar_archive_recorded_at=calendar_artifact.archive_recorded_at,
@@ -646,35 +930,28 @@ def verify_source_verifiable_point_in_time_cohort(
     archive: RawPointInTimeArtifactArchive,
     value: object,
 ) -> PointInTimeCohort:
-    """Reopen every source named by a serialized cohort and rederive its bytes."""
+    """Mandatory qualifying verification: reopen and rederive every source byte."""
 
-    cohort = validate_point_in_time_cohort(value)
+    cohort = validate_nonqualifying_point_in_time_cohort_record(value)
     candidate_inputs = tuple(
         {
             "security": candidate.security.to_dict(),
             "identity_sources": [
                 {
-                    "source_hash_name": source.source_hash_name,
+                    "source_profile": source.source_profile,
+                    "record_identity": source.record_identity,
                     "raw_artifact_id": source.raw_artifact_id,
                     "raw_artifact_sha256": source.raw_artifact_sha256,
-                    "qualification_field_selectors": {
-                        name: list(path)
-                        for name, path in source.qualification_field_selectors.items()
-                    },
                 }
                 for source in candidate.identity_sources
             ],
             "market_data_source": {
+                "source_profile": candidate.market_data_source.source_profile,
+                "record_identity": candidate.market_data_source.record_identity,
                 "raw_artifact_id": candidate.market_data_source.raw_artifact_id,
                 "raw_artifact_sha256": (
                     candidate.market_data_source.raw_artifact_sha256
                 ),
-                "bar_selectors": {
-                    "rows_path": list(candidate.market_data_source.rows_path),
-                    "timestamp_field": candidate.market_data_source.timestamp_field,
-                    "close_field": candidate.market_data_source.close_field,
-                    "volume_field": candidate.market_data_source.volume_field,
-                },
             },
         }
         for candidate in cohort.candidates

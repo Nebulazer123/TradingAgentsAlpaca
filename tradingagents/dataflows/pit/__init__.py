@@ -14,7 +14,7 @@ from .cohort import (
     PointInTimeCohortRanking,
     PointInTimeCohortRejection,
     build_point_in_time_cohort,
-    validate_point_in_time_cohort,
+    validate_nonqualifying_point_in_time_cohort_record,
 )
 from .cohort_admission import (
     build_source_verifiable_point_in_time_cohort,
@@ -65,7 +65,7 @@ __all__ = [
     "PointInTimeCohortRanking",
     "PointInTimeCohortRejection",
     "build_point_in_time_cohort",
-    "validate_point_in_time_cohort",
+    "validate_nonqualifying_point_in_time_cohort_record",
     "build_source_verifiable_point_in_time_cohort",
     "verify_source_verifiable_point_in_time_cohort",
     "SourceBoundAdjustedPriceWindow",
