@@ -449,16 +449,20 @@ def _calendar_context(
     source = _strict_json(archive.read_bytes(artifact), label="market calendar source")
     if type(source) is not list:
         raise PointInTimeDataError("market calendar source must be a JSON list")
-    selected = {*session_dates, market_date}
+    expected_dates = (*session_dates, market_date)
+    if len(source) != len(expected_dates):
+        raise PointInTimeDataError(
+            "market calendar source must contain exactly the requested 61 sessions"
+        )
     hours: dict[str, tuple[dt.datetime, dt.datetime]] = {}
-    for index, row in enumerate(source):
+    for index, (row, expected_date) in enumerate(zip(source, expected_dates, strict=True)):
         if not isinstance(row, Mapping):
             raise PointInTimeDataError(f"market calendar row {index} is invalid")
         date_value = row.get("date")
-        if date_value not in selected:
-            continue
-        if date_value in hours:
-            raise PointInTimeDataError("market calendar contains a duplicate selected session")
+        if date_value != expected_date:
+            raise PointInTimeDataError(
+                "market calendar source rows must exactly match the requested sessions"
+            )
         raw_open = row.get("open")
         raw_close = row.get("close")
         if (
@@ -476,8 +480,8 @@ def _calendar_context(
         local_open = dt.datetime.combine(session_date, open_time, tzinfo=_MARKET_TZ)
         local_close = dt.datetime.combine(session_date, close_time, tzinfo=_MARKET_TZ)
         hours[date_value] = (local_open.astimezone(dt.UTC), local_close.astimezone(dt.UTC))
-    if set(hours) != selected:
-        raise PointInTimeDataError("market calendar selected sessions are incomplete")
+    if tuple(hours) != expected_dates:
+        raise PointInTimeDataError("market calendar requested sessions are incomplete")
     close_times = {date: hours[date][1] for date in session_dates}
     if any(completion > as_of_cutoff for completion in close_times.values()):
         raise PointInTimeDataError("preceding session completes after as_of_cutoff")

@@ -571,6 +571,38 @@ def test_exact_uri_provenance_rejects_ports_suffixes_encodings_and_query_aliases
             _build_from_fixture(archive, calendar, changed)
 
 
+@pytest.mark.parametrize(
+    ("extra_row", "position"),
+    (
+        ({"date": "2026-01-06", "open": "09:30", "close": "16:00"}, "before"),
+        ({"date": "2026-04-02", "open": "09:30", "close": "16:00"}, "after"),
+    ),
+)
+def test_calendar_source_rejects_rows_outside_exact_requested_61_sessions(
+    tmp_path: Path,
+    extra_row: dict[str, object],
+    position: str,
+):
+    archive, calendar, payload = _source_cohort_fixture(tmp_path / position)
+    artifact = archive.read_artifact(calendar.raw_artifact_id)
+    rows = json.loads(archive.read_bytes(artifact))
+    assert isinstance(rows, list)
+    changed_rows = [extra_row, *rows] if position == "before" else [*rows, extra_row]
+    replacement = archive.admit(
+        raw_bytes=json.dumps(changed_rows, separators=(",", ":")).encode(),
+        source_uri=artifact.source_uri,
+        content_type="application/json",
+        retrieved_at=SOURCE_RETRIEVED_AT,
+    )
+    replacement_calendar = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=replacement,
+    )
+
+    with pytest.raises(PointInTimeDataError, match="exactly the requested 61"):
+        _build_from_fixture(archive, replacement_calendar, payload)
+
+
 def test_resource_limits_reject_before_unbounded_candidate_or_artifact_work(tmp_path: Path):
     archive, calendar, payload = _source_cohort_fixture(tmp_path / "pit")
     candidates = payload["candidates"]
