@@ -289,6 +289,42 @@ def validate_raw_point_in_time_artifact(value: object) -> RawPointInTimeArtifact
     return rebuilt
 
 
+def _decode_canonical_receipt(raw_bytes: bytes) -> RawPointInTimeArtifact:
+    """Decode one receipt without accepting ambiguous or reformatted JSON."""
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise PointInTimeDataError(
+                    "raw artifact receipt contains a duplicate JSON key"
+                )
+            result[key] = value
+        return result
+
+    def reject_nonfinite_constant(_value: str) -> object:
+        raise PointInTimeDataError(
+            "raw artifact receipt contains a nonfinite JSON number"
+        )
+
+    try:
+        payload = json.loads(
+            raw_bytes,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite_constant,
+        )
+    except PointInTimeDataError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PointInTimeDataError("raw artifact receipt cannot be read") from exc
+    persisted = validate_raw_point_in_time_artifact(payload)
+    if raw_bytes != persisted.canonical_json_bytes():
+        raise PointInTimeDataError(
+            "raw artifact receipt bytes are not exact canonical JSON"
+        )
+    return persisted
+
+
 class RawPointInTimeArtifactArchive:
     """Write-once local archive of raw source bytes and canonical receipts."""
 
@@ -339,11 +375,7 @@ class RawPointInTimeArtifactArchive:
             raise PointInTimeDataError("artifact must be an exact RawPointInTimeArtifact")
         rebuilt = validate_raw_point_in_time_artifact(artifact.to_dict())
         raw_path, receipt_path = self._paths(rebuilt)
-        try:
-            receipt_payload = json.loads(self._read_regular(receipt_path))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise PointInTimeDataError("raw artifact receipt cannot be read") from exc
-        persisted = validate_raw_point_in_time_artifact(receipt_payload)
+        persisted = _decode_canonical_receipt(self._read_regular(receipt_path))
         if persisted.canonical_json_bytes() != rebuilt.canonical_json_bytes():
             raise PointInTimeDataError("raw artifact receipt does not match requested record")
         raw_bytes = self._read_regular(raw_path)
@@ -373,13 +405,7 @@ class RawPointInTimeArtifactArchive:
         if type(raw_artifact_id) is not str or _RAW_ARTIFACT_ID.fullmatch(raw_artifact_id) is None:
             raise PointInTimeDataError("raw artifact identity is invalid")
         receipt_path = self._objects_root / f"{raw_artifact_id}.json"
-        try:
-            payload = json.loads(self._read_regular(receipt_path))
-            artifact = validate_raw_point_in_time_artifact(payload)
-        except PointInTimeDataError:
-            raise
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise PointInTimeDataError("raw artifact receipt cannot be read") from exc
+        artifact = _decode_canonical_receipt(self._read_regular(receipt_path))
         if artifact.raw_artifact_id != raw_artifact_id:
             raise PointInTimeDataError("raw artifact receipt identity does not match path")
         return self.read_receipt(artifact)

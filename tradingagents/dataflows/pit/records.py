@@ -16,6 +16,7 @@ import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
+from zoneinfo import ZoneInfo
 
 _UTC = dt.timezone.utc
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -30,6 +31,16 @@ _ADJUSTMENT_MODES = {
     "split": "split_adjusted",
     "all": "total_return_adjusted",
 }
+_ALPACA_TIMEFRAME_SECONDS = {
+    "1Min": 60,
+    "5Min": 300,
+    "15Min": 900,
+    "30Min": 1_800,
+    "1Hour": 3_600,
+}
+_MARKET_TZ = ZoneInfo("America/New_York")
+_REGULAR_OPEN = dt.time(9, 30)
+_REGULAR_CLOSE = dt.time(16, 0)
 _AUTHORITY = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -131,7 +142,116 @@ def _source_hashes(value: object) -> MappingProxyType:
     return frozen
 
 
-def _source_span(value: object, *, raw_artifact_sha256: str) -> MappingProxyType:
+def _validate_json_paths(
+    paths: object,
+    *,
+    expected_roles: frozenset[str] | None,
+) -> None:
+    if not isinstance(paths, MappingProxyType) or not paths:
+        raise PointInTimeDataError("source_span.paths must be a nonempty mapping")
+    if expected_roles is not None and set(paths) != expected_roles:
+        raise PointInTimeDataError("source_span.paths roles are invalid for source_kind")
+    for label, path in paths.items():
+        _identifier(label, field_name="source_span.paths key")
+        if type(path) is not tuple or not path:
+            raise PointInTimeDataError(f"source_span.paths.{label} must be a nonempty JSON path")
+        for component in path:
+            if type(component) is str and component:
+                continue
+            if type(component) is int and component >= 0:
+                continue
+            raise PointInTimeDataError(
+                f"source_span.paths.{label} contains an invalid JSON path component"
+            )
+
+
+def _validate_alpaca_derivation(
+    frozen: MappingProxyType,
+    *,
+    event_time: dt.datetime,
+    publication_time: dt.datetime,
+) -> None:
+    _identifier(
+        frozen["market_calendar_id"],
+        field_name="source_span.market_calendar_id",
+    )
+    _digest(
+        frozen["market_calendar_sha256"],
+        field_name="source_span.market_calendar_sha256",
+    )
+    timeframe = frozen["timeframe"]
+    if type(timeframe) is not str or timeframe not in {
+        *_ALPACA_TIMEFRAME_SECONDS,
+        "1Day",
+    }:
+        raise PointInTimeDataError("source_span.timeframe is not supported")
+    derivation = frozen["publication_derivation"]
+    expected_fields = frozenset(
+        {
+            "method",
+            "completion_time",
+            "market_timezone",
+            "regular_session_open",
+            "regular_session_close",
+            "bar_duration_seconds",
+        }
+    )
+    if not isinstance(derivation, MappingProxyType) or set(derivation) != expected_fields:
+        raise PointInTimeDataError("source_span publication derivation fields are invalid")
+    if (
+        derivation["market_timezone"] != "America/New_York"
+        or derivation["regular_session_open"] != "09:30:00"
+        or derivation["regular_session_close"] != "16:00:00"
+    ):
+        raise PointInTimeDataError("source_span publication derivation session is invalid")
+
+    local_event = event_time.astimezone(_MARKET_TZ)
+    local_date = local_event.date()
+    local_time = local_event.timetz().replace(tzinfo=None)
+    if timeframe == "1Day":
+        if (
+            local_time != dt.time(0, 0)
+            or derivation["method"] != "registered_regular_session_close"
+            or derivation["bar_duration_seconds"] is not None
+        ):
+            raise PointInTimeDataError("daily publication derivation is invalid")
+        expected_publication = dt.datetime.combine(
+            local_date,
+            _REGULAR_CLOSE,
+            tzinfo=_MARKET_TZ,
+        ).astimezone(_UTC)
+    else:
+        duration = _ALPACA_TIMEFRAME_SECONDS[timeframe]
+        if (
+            derivation["method"] != "bar_start_plus_timeframe"
+            or derivation["bar_duration_seconds"] != duration
+            or not (_REGULAR_OPEN <= local_time < _REGULAR_CLOSE)
+        ):
+            raise PointInTimeDataError("intraday publication derivation is invalid")
+        expected_publication = event_time + dt.timedelta(seconds=duration)
+        local_completion = expected_publication.astimezone(_MARKET_TZ)
+        if (
+            local_completion.date() != local_date
+            or local_completion.timetz().replace(tzinfo=None) > _REGULAR_CLOSE
+        ):
+            raise PointInTimeDataError("intraday bar overruns the regular session")
+
+    completion = _timestamp(
+        derivation["completion_time"],
+        field_name="source_span.publication_derivation.completion_time",
+    )
+    if completion != expected_publication or publication_time != expected_publication:
+        raise PointInTimeDataError("publication time does not match its bound derivation")
+
+
+def _source_span(
+    value: object,
+    *,
+    raw_artifact_sha256: str,
+    event_time: dt.datetime,
+    publication_time: dt.datetime,
+    is_market: bool,
+) -> MappingProxyType:
     frozen = _freeze_json(value, field_name="source_span")
     if not isinstance(frozen, MappingProxyType):
         raise PointInTimeDataError("source_span must be a nonempty mapping")
@@ -148,6 +268,10 @@ def _source_span(value: object, *, raw_artifact_sha256: str) -> MappingProxyType
 
     span_type = frozen["span_type"]
     if span_type == "byte_range":
+        if frozen["source_kind"] in {"sec_json_xbrl", "alpaca_market_data"}:
+            raise PointInTimeDataError(
+                "official observation source_kind requires exact JSON paths"
+            )
         expected = common_fields | frozenset({"start_byte", "end_byte"})
         if set(frozen) != expected:
             raise PointInTimeDataError("byte-range source_span fields are invalid")
@@ -157,23 +281,38 @@ def _source_span(value: object, *, raw_artifact_sha256: str) -> MappingProxyType
             raise PointInTimeDataError("byte-range source_span bounds are invalid")
         return frozen
 
-    if span_type != "json_paths" or set(frozen) != common_fields | {"paths"}:
+    if span_type != "json_paths":
         raise PointInTimeDataError("source_span must be an exact byte range or JSON path set")
-    paths = frozen["paths"]
-    if not isinstance(paths, MappingProxyType) or not paths:
-        raise PointInTimeDataError("source_span.paths must be a nonempty mapping")
-    for label, path in paths.items():
-        _identifier(label, field_name="source_span.paths key")
-        if type(path) is not tuple or not path:
-            raise PointInTimeDataError(f"source_span.paths.{label} must be a nonempty JSON path")
-        for component in path:
-            if type(component) is str and component:
-                continue
-            if type(component) is int and component >= 0:
-                continue
-            raise PointInTimeDataError(
-                f"source_span.paths.{label} contains an invalid JSON path component"
-            )
+    source_kind = frozen["source_kind"]
+    if source_kind == "sec_json_xbrl":
+        if is_market or set(frozen) != common_fields | {"paths"}:
+            raise PointInTimeDataError("SEC source_span fields are invalid")
+        expected_roles = frozenset(
+            {"source_identity", "observed_value", "event_time", "publication_time"}
+        )
+    elif source_kind == "alpaca_market_data":
+        expected = common_fields | frozenset(
+            {
+                "paths",
+                "market_calendar_id",
+                "market_calendar_sha256",
+                "timeframe",
+                "publication_derivation",
+            }
+        )
+        if not is_market or set(frozen) != expected:
+            raise PointInTimeDataError("Alpaca source_span fields are invalid")
+        expected_roles = frozenset({"observed_value", "event_time"})
+        _validate_alpaca_derivation(
+            frozen,
+            event_time=event_time,
+            publication_time=publication_time,
+        )
+    else:
+        if set(frozen) != common_fields | {"paths"}:
+            raise PointInTimeDataError("JSON-path source_span fields are invalid")
+        expected_roles = None
+    _validate_json_paths(frozen["paths"], expected_roles=expected_roles)
     return frozen
 
 
@@ -397,7 +536,13 @@ class PointInTimeObservation:
         object.__setattr__(
             self,
             "source_span",
-            _source_span(self.source_span, raw_artifact_sha256=raw_digest),
+            _source_span(
+                self.source_span,
+                raw_artifact_sha256=raw_digest,
+                event_time=event,
+                publication_time=publication,
+                is_market=self.market_data_feed is not None,
+            ),
         )
 
     def to_dict(self) -> dict[str, object]:

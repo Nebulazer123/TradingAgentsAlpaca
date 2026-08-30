@@ -42,12 +42,13 @@ def _security(**overrides: object) -> SecurityIdentity:
 
 def _observation(**overrides: object) -> PointInTimeObservation:
     raw_digest = hashlib.sha256(b"aapl-bar").hexdigest()
+    calendar_digest = hashlib.sha256(b"xnys-calendar").hexdigest()
     values: dict[str, object] = {
         "security_id": "security-us-aapl-common-0001",
         "identity_effective_from": "1980-12-12",
         "identity_effective_to": None,
         "event_time": "2026-01-09T20:00:00+00:00",
-        "publication_time": "2026-01-09T20:10:00+00:00",
+        "publication_time": "2026-01-09T20:05:00+00:00",
         "availability_time": "2026-01-09T20:12:00+00:00",
         "retrieval_time": "2026-01-09T20:13:00+00:00",
         "raw_artifact_id": "raw-aapl-bar-20260109",
@@ -62,6 +63,17 @@ def _observation(**overrides: object) -> PointInTimeObservation:
             "source_kind": "alpaca_market_data",
             "span_type": "json_paths",
             "source_sha256": raw_digest,
+            "market_calendar_id": "market-session-calendar-xnys-2026",
+            "market_calendar_sha256": calendar_digest,
+            "timeframe": "5Min",
+            "publication_derivation": {
+                "method": "bar_start_plus_timeframe",
+                "completion_time": "2026-01-09T20:05:00+00:00",
+                "market_timezone": "America/New_York",
+                "regular_session_open": "09:30:00",
+                "regular_session_close": "16:00:00",
+                "bar_duration_seconds": 300,
+            },
             "paths": {
                 "event_time": ["bars", "AAPL", 0, "t"],
                 "observed_value": ["bars", "AAPL", 0, "c"],
@@ -70,6 +82,28 @@ def _observation(**overrides: object) -> PointInTimeObservation:
     }
     values.update(overrides)
     return PointInTimeObservation(**values)
+
+
+def _sec_observation() -> PointInTimeObservation:
+    raw_digest = hashlib.sha256(b"sec-fact").hexdigest()
+    return _observation(
+        raw_artifact_sha256=raw_digest,
+        market_data_feed=None,
+        adjustment_mode=None,
+        market_session=None,
+        session_date=None,
+        source_span={
+            "source_kind": "sec_json_xbrl",
+            "span_type": "json_paths",
+            "source_sha256": raw_digest,
+            "paths": {
+                "source_identity": ["cik"],
+                "observed_value": ["facts", "value"],
+                "event_time": ["facts", "event_time"],
+                "publication_time": ["facts", "publication_time"],
+            },
+        },
+    )
 
 
 def _action(**overrides: object) -> CorporateAction:
@@ -143,6 +177,17 @@ def test_observation_binds_all_bitemporal_times_and_raw_provenance():
         "source_kind": "alpaca_market_data",
         "span_type": "json_paths",
         "source_sha256": hashlib.sha256(b"aapl-bar").hexdigest(),
+        "market_calendar_id": "market-session-calendar-xnys-2026",
+        "market_calendar_sha256": hashlib.sha256(b"xnys-calendar").hexdigest(),
+        "timeframe": "5Min",
+        "publication_derivation": {
+            "method": "bar_start_plus_timeframe",
+            "completion_time": "2026-01-09T20:05:00+00:00",
+            "market_timezone": "America/New_York",
+            "regular_session_open": "09:30:00",
+            "regular_session_close": "16:00:00",
+            "bar_duration_seconds": 300,
+        },
         "paths": {
             "event_time": ["bars", "AAPL", 0, "t"],
             "observed_value": ["bars", "AAPL", 0, "c"],
@@ -158,7 +203,7 @@ def test_observation_binds_all_bitemporal_times_and_raw_provenance():
     [
         {"event_time": "2026-01-09T20:00:00Z"},
         {"publication_time": "2026-01-09T19:59:59+00:00"},
-        {"availability_time": "2026-01-09T20:09:59+00:00"},
+        {"availability_time": "2026-01-09T20:04:59+00:00"},
         {"retrieval_time": "2026-01-09T20:11:59+00:00"},
         {"identity_effective_from": "2026-01-10"},
         {"identity_effective_to": "1980-12-11"},
@@ -186,10 +231,22 @@ def test_observation_rejects_future_leakage_and_invalid_provenance(overrides):
 
 
 def test_observation_deep_freezes_source_span():
+    calendar_digest = hashlib.sha256(b"xnys-calendar").hexdigest()
     span = {
         "source_kind": "alpaca_market_data",
         "span_type": "json_paths",
         "source_sha256": hashlib.sha256(b"aapl-bar").hexdigest(),
+        "market_calendar_id": "market-session-calendar-xnys-2026",
+        "market_calendar_sha256": calendar_digest,
+        "timeframe": "5Min",
+        "publication_derivation": {
+            "method": "bar_start_plus_timeframe",
+            "completion_time": "2026-01-09T20:05:00+00:00",
+            "market_timezone": "America/New_York",
+            "regular_session_open": "09:30:00",
+            "regular_session_close": "16:00:00",
+            "bar_duration_seconds": 300,
+        },
         "paths": {
             "event_time": ["bars", "AAPL", 0, "t"],
             "observed_value": ["bars", "AAPL", 0, "c"],
@@ -200,8 +257,65 @@ def test_observation_deep_freezes_source_span():
 
     span["paths"]["observed_value"][-1] = "o"
     span["paths"]["event_time"].append("tampered")
+    span["publication_derivation"]["completion_time"] = "2026-01-09T20:04:00+00:00"
 
     assert observation.canonical_json_bytes() == expected
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "paths"),
+    [
+        (
+            "sec_json_xbrl",
+            {
+                "source_identity": ["cik"],
+                "observed_value": ["facts", "value"],
+                "event_time": ["facts", "event_time"],
+            },
+        ),
+        (
+            "sec_json_xbrl",
+            {
+                "source_identity": ["cik"],
+                "observed_value": ["facts", "value"],
+                "event_time": ["facts", "event_time"],
+                "publication_time": ["facts", "publication_time"],
+                "summary": ["summary"],
+            },
+        ),
+        (
+            "alpaca_market_data",
+            {"observed_value": ["bars", "AAPL", 0, "c"]},
+        ),
+        (
+            "alpaca_market_data",
+            {
+                "observed_value": ["bars", "AAPL", 0, "c"],
+                "event_time": ["bars", "AAPL", 0, "t"],
+                "summary": ["summary"],
+            },
+        ),
+    ],
+)
+def test_observation_rejects_missing_or_extra_source_path_roles(
+    source_kind,
+    paths,
+):
+    observation = _sec_observation() if source_kind == "sec_json_xbrl" else _observation()
+    payload = observation.to_dict()
+    payload["source_span"]["paths"] = paths
+
+    with pytest.raises(PointInTimeDataError):
+        validate_point_in_time_observation(payload)
+
+
+@pytest.mark.parametrize("field", ["market_calendar_id", "timeframe", "publication_derivation"])
+def test_observation_rejects_missing_alpaca_derivation_material(field):
+    payload = _observation().to_dict()
+    del payload["source_span"][field]
+
+    with pytest.raises(PointInTimeDataError):
+        validate_point_in_time_observation(payload)
 
 
 def test_observation_deep_freezes_selected_source_value():

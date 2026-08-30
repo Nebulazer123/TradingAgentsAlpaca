@@ -140,6 +140,56 @@ def test_raw_artifact_archive_rejects_tampered_trusted_time_and_unsafe_paths(tmp
         archive.read_artifact(artifact.raw_artifact_id)
 
 
+@pytest.mark.parametrize("reader", ["by_object", "by_id"])
+@pytest.mark.parametrize("tamper", ["whitespace", "key_order", "duplicate_key"])
+def test_raw_artifact_archive_rejects_noncanonical_or_ambiguous_receipt_bytes(
+    tmp_path,
+    reader,
+    tamper,
+):
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: dt.datetime(2026, 1, 5, 21, 0, 5, tzinfo=dt.UTC),
+    )
+    artifact = archive.admit(
+        raw_bytes=b'{"value":42}',
+        source_uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
+        content_type="application/json",
+        retrieved_at="2026-01-05T21:00:00+00:00",
+    )
+    receipt_path = (
+        tmp_path
+        / "pit-artifacts"
+        / "objects"
+        / f"{artifact.raw_artifact_id}.json"
+    )
+    canonical = artifact.canonical_json_bytes()
+    if tamper == "whitespace":
+        receipt_path.write_bytes(b" " + canonical)
+    elif tamper == "key_order":
+        payload = json.loads(canonical)
+        receipt_path.write_bytes(
+            json.dumps(
+                dict(reversed(tuple(payload.items()))),
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        assert receipt_path.read_bytes() != canonical
+    else:
+        receipt_path.write_bytes(
+            canonical[:-1]
+            + b',"raw_artifact_id":"'
+            + artifact.raw_artifact_id.encode("ascii")
+            + b'"}'
+        )
+
+    with pytest.raises(PointInTimeDataError):
+        if reader == "by_object":
+            archive.read_receipt(artifact)
+        else:
+            archive.read_artifact(artifact.raw_artifact_id)
+
+
 def test_raw_artifact_admission_syncs_files_and_containing_directories(
     monkeypatch,
     tmp_path,
