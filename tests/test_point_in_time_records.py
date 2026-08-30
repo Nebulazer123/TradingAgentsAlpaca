@@ -41,16 +41,32 @@ def _security(**overrides: object) -> SecurityIdentity:
 
 
 def _observation(**overrides: object) -> PointInTimeObservation:
+    raw_digest = hashlib.sha256(b"aapl-bar").hexdigest()
     values: dict[str, object] = {
         "security_id": "security-us-aapl-common-0001",
+        "identity_effective_from": "1980-12-12",
+        "identity_effective_to": None,
         "event_time": "2026-01-09T20:00:00+00:00",
         "publication_time": "2026-01-09T20:10:00+00:00",
         "availability_time": "2026-01-09T20:12:00+00:00",
         "retrieval_time": "2026-01-09T20:13:00+00:00",
         "raw_artifact_id": "raw-aapl-bar-20260109",
-        "raw_artifact_sha256": hashlib.sha256(b"aapl-bar").hexdigest(),
+        "raw_artifact_sha256": raw_digest,
+        "observed_value": "188.42",
+        "market_data_feed": "sip",
+        "adjustment_mode": "raw",
+        "market_session": "regular",
+        "session_date": "2026-01-09",
         "adjustment_status": "unadjusted",
-        "source_span": {"source_ref": "fixture://aapl-bar", "row": 7},
+        "source_span": {
+            "source_kind": "alpaca_market_data",
+            "span_type": "json_paths",
+            "source_sha256": raw_digest,
+            "paths": {
+                "event_time": ["bars", "AAPL", 0, "t"],
+                "observed_value": ["bars", "AAPL", 0, "c"],
+            },
+        },
     }
     values.update(overrides)
     return PointInTimeObservation(**values)
@@ -119,14 +135,22 @@ def test_security_identity_deep_freezes_source_hashes():
 def test_observation_binds_all_bitemporal_times_and_raw_provenance():
     observation = _observation()
 
-    assert observation.schema_version == "point_in_time_observation/v1"
+    assert observation.schema_version == "point_in_time_observation/v2"
     assert validate_point_in_time_observation(
         json.loads(observation.canonical_json_bytes())
     ) == observation
     assert observation.to_dict()["source_span"] == {
-        "source_ref": "fixture://aapl-bar",
-        "row": 7,
+        "source_kind": "alpaca_market_data",
+        "span_type": "json_paths",
+        "source_sha256": hashlib.sha256(b"aapl-bar").hexdigest(),
+        "paths": {
+            "event_time": ["bars", "AAPL", 0, "t"],
+            "observed_value": ["bars", "AAPL", 0, "c"],
+        },
     }
+    assert observation.observed_value == "188.42"
+    assert observation.identity_effective_from == "1980-12-12"
+    assert observation.market_session == "regular"
 
 
 @pytest.mark.parametrize(
@@ -136,10 +160,24 @@ def test_observation_binds_all_bitemporal_times_and_raw_provenance():
         {"publication_time": "2026-01-09T19:59:59+00:00"},
         {"availability_time": "2026-01-09T20:09:59+00:00"},
         {"retrieval_time": "2026-01-09T20:11:59+00:00"},
+        {"identity_effective_from": "2026-01-10"},
+        {"identity_effective_to": "1980-12-11"},
         {"raw_artifact_id": ""},
         {"raw_artifact_sha256": "ABC"},
+        {"market_data_feed": "unknown"},
+        {"adjustment_mode": "split"},
+        {"market_session": "extended"},
+        {"session_date": "2026-01-10"},
         {"adjustment_status": "adjusted"},
         {"source_span": []},
+        {
+            "source_span": {
+                "source_kind": "alpaca_market_data",
+                "span_type": "json_paths",
+                "source_sha256": hashlib.sha256(b"different").hexdigest(),
+                "paths": {"observed_value": ["bars", "AAPL", 0, "c"]},
+            }
+        },
     ],
 )
 def test_observation_rejects_future_leakage_and_invalid_provenance(overrides):
@@ -148,12 +186,31 @@ def test_observation_rejects_future_leakage_and_invalid_provenance(overrides):
 
 
 def test_observation_deep_freezes_source_span():
-    span = {"source_ref": "fixture://span", "cells": [1, {"column": "close"}]}
+    span = {
+        "source_kind": "alpaca_market_data",
+        "span_type": "json_paths",
+        "source_sha256": hashlib.sha256(b"aapl-bar").hexdigest(),
+        "paths": {
+            "event_time": ["bars", "AAPL", 0, "t"],
+            "observed_value": ["bars", "AAPL", 0, "c"],
+        },
+    }
     observation = _observation(source_span=span)
     expected = observation.canonical_json_bytes()
 
-    span["cells"][1]["column"] = "open"
-    span["cells"].append(3)
+    span["paths"]["observed_value"][-1] = "o"
+    span["paths"]["event_time"].append("tampered")
+
+    assert observation.canonical_json_bytes() == expected
+
+
+def test_observation_deep_freezes_selected_source_value():
+    observed_value = {"amount": "188.42", "dimensions": ["USD", {"period": "FY"}]}
+    observation = _observation(observed_value=observed_value)
+    expected = observation.canonical_json_bytes()
+
+    observed_value["amount"] = "0"
+    observed_value["dimensions"][1]["period"] = "Q1"
 
     assert observation.canonical_json_bytes() == expected
 

@@ -24,6 +24,12 @@ _SYMBOL = re.compile(r"[A-Z][A-Z0-9.-]{0,14}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,255}")
 _FIGI = re.compile(r"[A-Z0-9]{12}")
 _EXCHANGE = re.compile(r"[A-Z0-9_-]{1,32}")
+_MARKET_FEEDS = frozenset({"iex", "sip"})
+_ADJUSTMENT_MODES = {
+    "raw": "unadjusted",
+    "split": "split_adjusted",
+    "all": "total_return_adjusted",
+}
 _AUTHORITY = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -122,6 +128,52 @@ def _source_hashes(value: object) -> MappingProxyType:
     for name, digest in frozen.items():
         _identifier(name, field_name="source_hashes key")
         _digest(digest, field_name=f"source_hashes.{name}")
+    return frozen
+
+
+def _source_span(value: object, *, raw_artifact_sha256: str) -> MappingProxyType:
+    frozen = _freeze_json(value, field_name="source_span")
+    if not isinstance(frozen, MappingProxyType):
+        raise PointInTimeDataError("source_span must be a nonempty mapping")
+    common_fields = frozenset({"source_kind", "span_type", "source_sha256"})
+    if not common_fields.issubset(frozen):
+        raise PointInTimeDataError("source_span lacks canonical source binding fields")
+    _identifier(frozen["source_kind"], field_name="source_span.source_kind")
+    span_digest = _digest(
+        frozen["source_sha256"],
+        field_name="source_span.source_sha256",
+    )
+    if span_digest != raw_artifact_sha256:
+        raise PointInTimeDataError("source_span is not bound to raw_artifact_sha256")
+
+    span_type = frozen["span_type"]
+    if span_type == "byte_range":
+        expected = common_fields | frozenset({"start_byte", "end_byte"})
+        if set(frozen) != expected:
+            raise PointInTimeDataError("byte-range source_span fields are invalid")
+        start = frozen["start_byte"]
+        end = frozen["end_byte"]
+        if type(start) is not int or type(end) is not int or start < 0 or end <= start:
+            raise PointInTimeDataError("byte-range source_span bounds are invalid")
+        return frozen
+
+    if span_type != "json_paths" or set(frozen) != common_fields | {"paths"}:
+        raise PointInTimeDataError("source_span must be an exact byte range or JSON path set")
+    paths = frozen["paths"]
+    if not isinstance(paths, MappingProxyType) or not paths:
+        raise PointInTimeDataError("source_span.paths must be a nonempty mapping")
+    for label, path in paths.items():
+        _identifier(label, field_name="source_span.paths key")
+        if type(path) is not tuple or not path:
+            raise PointInTimeDataError(f"source_span.paths.{label} must be a nonempty JSON path")
+        for component in path:
+            if type(component) is str and component:
+                continue
+            if type(component) is int and component >= 0:
+                continue
+            raise PointInTimeDataError(
+                f"source_span.paths.{label} contains an invalid JSON path component"
+            )
     return frozen
 
 
@@ -247,29 +299,56 @@ class PointInTimeObservation:
     """One raw-artifact observation with event, publication, and availability times."""
 
     security_id: str
+    identity_effective_from: str
+    identity_effective_to: str | None
     event_time: str
     publication_time: str
     availability_time: str
     retrieval_time: str
     raw_artifact_id: str
     raw_artifact_sha256: str
+    observed_value: object
+    market_data_feed: str | None
+    adjustment_mode: str | None
+    market_session: str | None
+    session_date: str | None
     adjustment_status: str
     source_span: Mapping[str, object]
-    schema_version: str = dataclasses.field(init=False, default="point_in_time_observation/v1")
+    schema_version: str = dataclasses.field(init=False, default="point_in_time_observation/v2")
     analysis_only: bool = dataclasses.field(init=False, default=True)
     execution_authority: str = dataclasses.field(init=False, default="none")
     can_submit_orders: bool = dataclasses.field(init=False, default=False)
 
     def __post_init__(self) -> None:
         _identifier(self.security_id, field_name="security_id")
+        identity_start = _date(
+            self.identity_effective_from,
+            field_name="identity_effective_from",
+        )
+        identity_end = (
+            None
+            if self.identity_effective_to is None
+            else _date(self.identity_effective_to, field_name="identity_effective_to")
+        )
+        if identity_end is not None and identity_end < identity_start:
+            raise PointInTimeDataError(
+                "identity_effective_to cannot precede identity_effective_from"
+            )
         event = _timestamp(self.event_time, field_name="event_time")
         publication = _timestamp(self.publication_time, field_name="publication_time")
         availability = _timestamp(self.availability_time, field_name="availability_time")
         retrieval = _timestamp(self.retrieval_time, field_name="retrieval_time")
         if event > publication or publication > availability or availability > retrieval:
             raise PointInTimeDataError("observation times must be event <= publication <= availability <= retrieval")
+        if event.date() < identity_start or (
+            identity_end is not None and event.date() > identity_end
+        ):
+            raise PointInTimeDataError("observation event is outside the bound security identity")
         _identifier(self.raw_artifact_id, field_name="raw_artifact_id")
-        _digest(self.raw_artifact_sha256, field_name="raw_artifact_sha256")
+        raw_digest = _digest(
+            self.raw_artifact_sha256,
+            field_name="raw_artifact_sha256",
+        )
         if self.adjustment_status not in {
             "unadjusted",
             "split_adjusted",
@@ -277,21 +356,67 @@ class PointInTimeObservation:
             "corporate_action_adjusted",
         }:
             raise PointInTimeDataError("adjustment_status is not recognized")
-        frozen = _freeze_json(self.source_span, field_name="source_span")
-        if not isinstance(frozen, MappingProxyType) or not frozen:
-            raise PointInTimeDataError("source_span must be a nonempty mapping")
-        object.__setattr__(self, "source_span", frozen)
+        if self.market_data_feed is None:
+            if any(
+                value is not None
+                for value in (
+                    self.adjustment_mode,
+                    self.market_session,
+                    self.session_date,
+                )
+            ):
+                raise PointInTimeDataError(
+                    "nonmarket observations cannot carry partial market identity"
+                )
+        else:
+            if self.market_data_feed not in _MARKET_FEEDS:
+                raise PointInTimeDataError("market_data_feed is not recognized")
+            expected_status = _ADJUSTMENT_MODES.get(self.adjustment_mode)
+            if expected_status is None or expected_status != self.adjustment_status:
+                raise PointInTimeDataError(
+                    "adjustment_mode does not match adjustment_status"
+                )
+            if self.market_session != "regular":
+                raise PointInTimeDataError("market_session must bind the regular session")
+            session = _date(self.session_date, field_name="session_date")
+            if session != event.date():
+                raise PointInTimeDataError(
+                    "session_date does not match the selected market observation"
+                )
+            if session < identity_start or (
+                identity_end is not None and session > identity_end
+            ):
+                raise PointInTimeDataError(
+                    "session_date is outside the bound security identity"
+                )
+        object.__setattr__(
+            self,
+            "observed_value",
+            _freeze_json(self.observed_value, field_name="observed_value"),
+        )
+        object.__setattr__(
+            self,
+            "source_span",
+            _source_span(self.source_span, raw_artifact_sha256=raw_digest),
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
             "security_id": self.security_id,
+            "identity_effective_from": self.identity_effective_from,
+            "identity_effective_to": self.identity_effective_to,
             "event_time": self.event_time,
             "publication_time": self.publication_time,
             "availability_time": self.availability_time,
             "retrieval_time": self.retrieval_time,
             "raw_artifact_id": self.raw_artifact_id,
             "raw_artifact_sha256": self.raw_artifact_sha256,
+            "observed_value": _thaw_json(self.observed_value),
+            "market_data_feed": self.market_data_feed,
+            "adjustment_mode": self.adjustment_mode,
+            "market_session": self.market_session,
+            "session_date": self.session_date,
             "adjustment_status": self.adjustment_status,
             "source_span": _thaw_json(self.source_span),
             **_AUTHORITY,
@@ -305,12 +430,19 @@ _OBSERVATION_FIELDS = frozenset(
     {
         "schema_version",
         "security_id",
+        "identity_effective_from",
+        "identity_effective_to",
         "event_time",
         "publication_time",
         "availability_time",
         "retrieval_time",
         "raw_artifact_id",
         "raw_artifact_sha256",
+        "observed_value",
+        "market_data_feed",
+        "adjustment_mode",
+        "market_session",
+        "session_date",
         "adjustment_status",
         "source_span",
         *_AUTHORITY,
@@ -401,17 +533,24 @@ def validate_security_identity(value: object) -> SecurityIdentity:
 
 def validate_point_in_time_observation(value: object) -> PointInTimeObservation:
     values = _exact_fields(value, _OBSERVATION_FIELDS, field_name="point-in-time observation")
-    if values["schema_version"] != "point_in_time_observation/v1":
+    if values["schema_version"] != "point_in_time_observation/v2":
         raise PointInTimeDataError("point-in-time observation schema_version is fixed")
     _validate_authority(values, field_name="point-in-time observation")
     rebuilt = PointInTimeObservation(
         security_id=values["security_id"],
+        identity_effective_from=values["identity_effective_from"],
+        identity_effective_to=values["identity_effective_to"],
         event_time=values["event_time"],
         publication_time=values["publication_time"],
         availability_time=values["availability_time"],
         retrieval_time=values["retrieval_time"],
         raw_artifact_id=values["raw_artifact_id"],
         raw_artifact_sha256=values["raw_artifact_sha256"],
+        observed_value=values["observed_value"],
+        market_data_feed=values["market_data_feed"],
+        adjustment_mode=values["adjustment_mode"],
+        market_session=values["market_session"],
+        session_date=values["session_date"],
         adjustment_status=values["adjustment_status"],
         source_span=values["source_span"],
     )

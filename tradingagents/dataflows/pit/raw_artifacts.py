@@ -14,8 +14,9 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -30,7 +31,7 @@ __all__ = [
 ]
 
 
-_SCHEMA = "raw_point_in_time_artifact/v1"
+_SCHEMA = "raw_point_in_time_artifact/v2"
 _AUTHORITY = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -48,6 +49,7 @@ _CONTENT_TYPES = frozenset(
 )
 _TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_RAW_ARTIFACT_ID = re.compile(r"pit-raw-artifact-[0-9a-f]{64}")
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -82,6 +84,22 @@ def _canonical_timestamp(value: object, *, label: str) -> str:
     if parsed.tzinfo != dt.UTC or parsed.strftime(_TIMESTAMP_FORMAT) != value:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds")
     return value
+
+
+def _clock_timestamp(value: object) -> str:
+    if (
+        type(value) is not dt.datetime
+        or value.tzinfo != dt.UTC
+        or value.microsecond != 0
+    ):
+        raise PointInTimeDataError(
+            "archive clock must return an exact UTC datetime at whole-second precision"
+        )
+    return value.isoformat(timespec="seconds")
+
+
+def _exact_utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC).replace(microsecond=0)
 
 
 def _source_uri(value: object) -> str:
@@ -140,6 +158,7 @@ class RawPointInTimeArtifact:
     source_uri: str
     content_type: str
     retrieved_at: str
+    archive_recorded_at: str
     byte_count: int
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -156,6 +175,7 @@ class RawPointInTimeArtifact:
             "source_uri": self.source_uri,
             "content_type": self.content_type,
             "retrieved_at": self.retrieved_at,
+            "archive_recorded_at": self.archive_recorded_at,
             "byte_count": self.byte_count,
             **_AUTHORITY,
         }
@@ -181,12 +201,24 @@ def _from_material(
     source_uri: object,
     content_type: object,
     retrieved_at: object,
+    archive_recorded_at: object,
     byte_count: object,
 ) -> RawPointInTimeArtifact:
     raw_digest = _digest(raw_artifact_sha256, label="raw_artifact_sha256")
     uri = _source_uri(source_uri)
     mime = _content_type(content_type)
-    timestamp = _canonical_timestamp(retrieved_at, label="retrieved_at")
+    retrieval_timestamp = _canonical_timestamp(retrieved_at, label="retrieved_at")
+    recorded_timestamp = _canonical_timestamp(
+        archive_recorded_at,
+        label="archive_recorded_at",
+    )
+    if dt.datetime.strptime(recorded_timestamp, _TIMESTAMP_FORMAT) < dt.datetime.strptime(
+        retrieval_timestamp,
+        _TIMESTAMP_FORMAT,
+    ):
+        raise PointInTimeDataError(
+            "archive_recorded_at cannot be before source retrieval"
+        )
     if type(byte_count) is not int or byte_count <= 0:
         raise PointInTimeDataError("byte_count must be a positive exact integer")
     identity = {
@@ -194,7 +226,8 @@ def _from_material(
         "raw_artifact_sha256": raw_digest,
         "source_uri": uri,
         "content_type": mime,
-        "retrieved_at": timestamp,
+        "retrieved_at": retrieval_timestamp,
+        "archive_recorded_at": recorded_timestamp,
         "byte_count": byte_count,
         **_AUTHORITY,
     }
@@ -206,7 +239,8 @@ def _from_material(
         record_sha256=record_sha256,
         source_uri=uri,
         content_type=mime,
-        retrieved_at=timestamp,
+        retrieved_at=retrieval_timestamp,
+        archive_recorded_at=recorded_timestamp,
         byte_count=byte_count,
     )
 
@@ -217,6 +251,7 @@ def build_raw_point_in_time_artifact(
     source_uri: str,
     content_type: str,
     retrieved_at: str,
+    archive_recorded_at: str,
 ) -> RawPointInTimeArtifact:
     """Create a receipt while preserving the supplied bytes exactly."""
 
@@ -227,6 +262,7 @@ def build_raw_point_in_time_artifact(
         source_uri=source_uri,
         content_type=content_type,
         retrieved_at=retrieved_at,
+        archive_recorded_at=archive_recorded_at,
         byte_count=len(raw_bytes),
     )
 
@@ -245,6 +281,7 @@ def validate_raw_point_in_time_artifact(value: object) -> RawPointInTimeArtifact
         source_uri=payload["source_uri"],
         content_type=payload["content_type"],
         retrieved_at=payload["retrieved_at"],
+        archive_recorded_at=payload["archive_recorded_at"],
         byte_count=payload["byte_count"],
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(payload):
@@ -255,8 +292,16 @@ def validate_raw_point_in_time_artifact(value: object) -> RawPointInTimeArtifact
 class RawPointInTimeArtifactArchive:
     """Write-once local archive of raw source bytes and canonical receipts."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        clock: Callable[[], dt.datetime] | None = None,
+    ) -> None:
         self.root = Path(root).expanduser().absolute()
+        if clock is not None and not callable(clock):
+            raise PointInTimeDataError("archive clock must be callable")
+        self._clock = _exact_utc_now if clock is None else clock
 
     @property
     def _objects_root(self) -> Path:
@@ -277,6 +322,7 @@ class RawPointInTimeArtifactArchive:
             source_uri=source_uri,
             content_type=content_type,
             retrieved_at=retrieved_at,
+            archive_recorded_at=_clock_timestamp(self._clock()),
         )
         self._ensure_directories()
         raw_path, receipt_path = self._paths(artifact)
@@ -320,6 +366,23 @@ class RawPointInTimeArtifactArchive:
         ):
             raise PointInTimeDataError("raw artifact bytes do not match immutable receipt")
         return raw_bytes
+
+    def read_artifact(self, raw_artifact_id: str) -> RawPointInTimeArtifact:
+        """Load one retained artifact by its exact immutable identity."""
+
+        if type(raw_artifact_id) is not str or _RAW_ARTIFACT_ID.fullmatch(raw_artifact_id) is None:
+            raise PointInTimeDataError("raw artifact identity is invalid")
+        receipt_path = self._objects_root / f"{raw_artifact_id}.json"
+        try:
+            payload = json.loads(self._read_regular(receipt_path))
+            artifact = validate_raw_point_in_time_artifact(payload)
+        except PointInTimeDataError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise PointInTimeDataError("raw artifact receipt cannot be read") from exc
+        if artifact.raw_artifact_id != raw_artifact_id:
+            raise PointInTimeDataError("raw artifact receipt identity does not match path")
+        return self.read_receipt(artifact)
 
     def _paths(self, artifact: RawPointInTimeArtifact) -> tuple[Path, Path]:
         return (

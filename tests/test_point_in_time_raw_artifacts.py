@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 
 import pytest
@@ -17,7 +18,10 @@ from tradingagents.dataflows.pit import (
 def test_raw_artifact_archive_preserves_exact_source_bytes_and_canonical_receipt(
     tmp_path,
 ):
-    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: dt.datetime(2026, 1, 5, 21, 0, 5, tzinfo=dt.UTC),
+    )
     raw_bytes = b'{"filed":"2026-01-05","value":42}\n'
     artifact = archive.admit(
         raw_bytes=raw_bytes,
@@ -38,10 +42,16 @@ def test_raw_artifact_archive_preserves_exact_source_bytes_and_canonical_receipt
     ) == artifact
     assert artifact.raw_artifact_id.startswith("pit-raw-artifact-")
     assert artifact.raw_artifact_sha256
+    assert artifact.retrieved_at == "2026-01-05T21:00:00+00:00"
+    assert artifact.archive_recorded_at == "2026-01-05T21:00:05+00:00"
+    assert artifact.to_dict()["schema_version"] == "raw_point_in_time_artifact/v2"
 
 
 def test_raw_artifact_archive_rejects_unsafe_source_or_tampered_bytes(tmp_path):
-    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: dt.datetime(2026, 1, 5, 21, 0, 5, tzinfo=dt.UTC),
+    )
     with pytest.raises(PointInTimeDataError):
         archive.admit(
             raw_bytes=b"{}",
@@ -63,6 +73,73 @@ def test_raw_artifact_archive_rejects_unsafe_source_or_tampered_bytes(tmp_path):
         archive.read_bytes(artifact)
 
 
+@pytest.mark.parametrize(
+    "clock_value",
+    [
+        dt.datetime(2026, 1, 5, 21, 0, 5),
+        dt.datetime(2026, 1, 5, 21, 0, 5, 1, tzinfo=dt.UTC),
+        "2026-01-05T21:00:05+00:00",
+    ],
+)
+def test_raw_artifact_archive_rejects_nonexact_nonutc_clock_values(
+    tmp_path,
+    clock_value,
+):
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: clock_value,
+    )
+
+    with pytest.raises(PointInTimeDataError, match="clock"):
+        archive.admit(
+            raw_bytes=b"{}",
+            source_uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
+            content_type="application/json",
+            retrieved_at="2026-01-05T21:00:00+00:00",
+        )
+
+
+def test_raw_artifact_archive_rejects_archive_time_before_source_retrieval(tmp_path):
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: dt.datetime(2026, 1, 5, 20, 59, 59, tzinfo=dt.UTC),
+    )
+
+    with pytest.raises(PointInTimeDataError, match="before source retrieval"):
+        archive.admit(
+            raw_bytes=b"{}",
+            source_uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
+            content_type="application/json",
+            retrieved_at="2026-01-05T21:00:00+00:00",
+        )
+
+
+def test_raw_artifact_archive_rejects_tampered_trusted_time_and_unsafe_paths(tmp_path):
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: dt.datetime(2026, 1, 5, 21, 0, 5, tzinfo=dt.UTC),
+    )
+    artifact = archive.admit(
+        raw_bytes=b'{"value":42}',
+        source_uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
+        content_type="application/json",
+        retrieved_at="2026-01-05T21:00:00+00:00",
+    )
+    objects = tmp_path / "pit-artifacts" / "objects"
+    receipt_path = objects / f"{artifact.raw_artifact_id}.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["archive_recorded_at"] = "2026-01-05T20:59:59+00:00"
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    with pytest.raises(PointInTimeDataError):
+        archive.read_artifact(artifact.raw_artifact_id)
+
+    receipt_path.unlink()
+    receipt_path.symlink_to(objects / "missing-receipt.json")
+    with pytest.raises(PointInTimeDataError, match="regular file"):
+        archive.read_artifact(artifact.raw_artifact_id)
+
+
 def test_raw_artifact_admission_syncs_files_and_containing_directories(
     monkeypatch,
     tmp_path,
@@ -74,7 +151,10 @@ def test_raw_artifact_admission_syncs_files_and_containing_directories(
         "fsync",
         lambda descriptor: (sync_calls.append(descriptor), original_fsync(descriptor))[1],
     )
-    artifact = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts").admit(
+    artifact = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: dt.datetime(2026, 1, 5, 21, 0, 5, tzinfo=dt.UTC),
+    ).admit(
         raw_bytes=b"{}",
         source_uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
         content_type="application/json",
