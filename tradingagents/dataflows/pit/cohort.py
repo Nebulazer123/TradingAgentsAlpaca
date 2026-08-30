@@ -302,7 +302,13 @@ class PointInTimeCohortIdentitySourceReference:
         ]
         if self.source_hash_name != expected_hash_name:
             raise PointInTimeDataError("identity source hash role does not match profile")
-        _identifier(self.record_identity, label="identity source record_identity")
+        if self.source_profile == "alpaca_asset/v1":
+            try:
+                _symbol(self.record_identity, label="identity source record_identity")
+            except PointInTimeDataError:
+                _identifier(self.record_identity, label="identity source record_identity")
+        else:
+            _identifier(self.record_identity, label="identity source record_identity")
         artifact_id = _identifier(self.raw_artifact_id, label="raw_artifact_id")
         if not artifact_id.startswith("pit-raw-artifact-"):
             raise PointInTimeDataError("identity source raw artifact identity is invalid")
@@ -449,6 +455,14 @@ class PointInTimeCohortCandidate:
             self.identity_sources
         ):
             raise PointInTimeDataError("candidate identity source artifacts must be unique")
+        asset_source, master_source = self.identity_sources
+        if asset_source.record_identity not in {
+            self.security.symbol,
+            self.security.security_id,
+        }:
+            raise PointInTimeDataError("candidate Alpaca asset identity is inconsistent")
+        if master_source.record_identity != self.security.security_id:
+            raise PointInTimeDataError("candidate security-master identity is inconsistent")
         if type(self.market_data_source) is not PointInTimeCohortMarketDataSourceReference:
             raise PointInTimeDataError("candidate market_data_source is invalid")
         if self.market_data_source.record_identity != self.security.symbol:
@@ -639,7 +653,7 @@ def _canonical_candidate(
     *,
     session_dates: tuple[str, ...],
     market_date: str,
-    selection_time: dt.datetime,
+    as_of_cutoff: dt.datetime,
 ) -> PointInTimeCohortCandidate:
     reasons = list(candidate.rejection_reasons)
     identity = candidate.security
@@ -660,12 +674,17 @@ def _canonical_candidate(
     if candidate.median_dollar_volume <= 0:
         _merge_reason(reasons, "median_daily_dollar_volume_not_positive")
     sources = (*candidate.identity_sources, candidate.market_data_source)
-    if any(
-        _timestamp_value(source.archive_recorded_at, label="source archive_recorded_at")
-        > selection_time
-        for source in sources
-    ):
-        raise PointInTimeDataError("candidate source was archived after selection_time")
+    for source in sources:
+        if _timestamp_value(
+            source.archive_recorded_at,
+            label="source archive_recorded_at",
+        ) > as_of_cutoff:
+            raise PointInTimeDataError("candidate source was archived after as_of_cutoff")
+        if _timestamp_value(
+            source.retrieved_at,
+            label="source retrieved_at",
+        ) > as_of_cutoff:
+            raise PointInTimeDataError("candidate source was retrieved after as_of_cutoff")
     if tuple(reasons) == candidate.rejection_reasons:
         return candidate
     return dataclasses.replace(candidate, rejection_reasons=tuple(reasons))
@@ -714,9 +733,9 @@ def _selection_bounds(
         or session_open >= session_close
     ):
         raise PointInTimeDataError("market session bounds do not match market_date")
-    if not window_open <= selected_at <= cutoff <= window_close:
+    if not window_open <= cutoff <= selected_at <= window_close:
         raise PointInTimeDataError(
-            "selection_time and as_of_cutoff must be ordered within the pre-open window"
+            "as_of_cutoff and selection_time must be ordered within the pre-open window"
         )
     return (
         window_open_text,
@@ -762,7 +781,7 @@ def build_point_in_time_cohort(
         selection_time=selection_time,
         as_of_cutoff=as_of_cutoff,
     )
-    selection_value = dt.datetime.fromisoformat(selected_at)
+    cutoff_value = dt.datetime.fromisoformat(cutoff)
     calendar_retrieved = _timestamp(
         calendar_retrieved_at,
         label="calendar_retrieved_at",
@@ -771,10 +790,10 @@ def build_point_in_time_cohort(
         calendar_archive_recorded_at,
         label="calendar_archive_recorded_at",
     )
-    if dt.datetime.fromisoformat(calendar_recorded) > selection_value:
-        raise PointInTimeDataError("calendar was archived after selection_time")
-    if dt.datetime.fromisoformat(calendar_retrieved) > selection_value:
-        raise PointInTimeDataError("calendar was retrieved after selection_time")
+    if dt.datetime.fromisoformat(calendar_recorded) > cutoff_value:
+        raise PointInTimeDataError("calendar was archived after as_of_cutoff")
+    if dt.datetime.fromisoformat(calendar_retrieved) > cutoff_value:
+        raise PointInTimeDataError("calendar was retrieved after as_of_cutoff")
     if type(market_calendar) is not MarketSessionCalendar:
         raise PointInTimeDataError("market_calendar must be an exact calendar receipt")
     calendar = validate_market_session_calendar(market_calendar.to_dict())
@@ -806,7 +825,7 @@ def build_point_in_time_cohort(
             candidate,
             session_dates=session_dates,
             market_date=normalized_market_date,
-            selection_time=selection_value,
+            as_of_cutoff=cutoff_value,
         )
         for candidate in sorted_candidates
     )

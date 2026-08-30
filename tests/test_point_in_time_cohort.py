@@ -22,8 +22,8 @@ from tradingagents.dataflows.pit import (
 )
 
 MARKET_DATE = "2026-04-01"
-AS_OF_CUTOFF = "2026-04-01T12:00:00+00:00"
-SELECTION_TIME = "2026-04-01T11:55:00+00:00"
+AS_OF_CUTOFF = "2026-04-01T11:55:00+00:00"
+SELECTION_TIME = "2026-04-01T12:00:00+00:00"
 SOURCE_RETRIEVED_AT = "2026-03-31T20:30:00+00:00"
 ARCHIVE_RECORDED_AT = dt.datetime(2026, 3, 31, 20, 31, tzinfo=dt.UTC)
 MARKET_TIMEZONE = ZoneInfo("America/New_York")
@@ -56,6 +56,7 @@ def _source_cohort_fixture(
     candidate_count: int = 100,
     asset_overrides: dict[int, dict[str, object]] | None = None,
     master_overrides: dict[int, dict[str, object]] | None = None,
+    symbol_overrides: dict[int, str] | None = None,
     source_retrieved_at: str = SOURCE_RETRIEVED_AT,
     archive_recorded_at: dt.datetime = ARCHIVE_RECORDED_AT,
 ) -> tuple[RawPointInTimeArtifactArchive, object, dict[str, object]]:
@@ -74,7 +75,10 @@ def _source_cohort_fixture(
             ],
             separators=(",", ":"),
         ).encode(),
-        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        source_uri=(
+            "https://paper-api.alpaca.markets/v2/calendar"
+            f"?start={market_dates[0]}&end={MARKET_DATE}"
+        ),
         content_type="application/json",
         retrieved_at=source_retrieved_at,
     )
@@ -85,7 +89,7 @@ def _source_cohort_fixture(
     session_dates = market_dates[:-1]
     candidates: list[dict[str, object]] = []
     for index in range(candidate_count):
-        symbol = f"X{index:03d}"
+        symbol = (symbol_overrides or {}).get(index, f"X{index:03d}")
         security_id = f"security-us-{symbol.lower()}-common"
         asset_payload: dict[str, object] = {
             "id": security_id,
@@ -259,7 +263,7 @@ def test_source_verifiable_cohort_rebuilds_profiles_ranked_prefixes_and_rejectio
 
     cohort = _build_from_fixture(archive, calendar, payload)
 
-    assert cohort.selection_time <= cohort.as_of_cutoff <= cohort.selection_window_close_at
+    assert cohort.as_of_cutoff <= cohort.selection_time <= cohort.selection_window_close_at
     assert cohort.market_session_open_at == cohort.selection_window_close_at
     assert cohort.session_dates[-1] == "2026-03-31"
     assert cohort.ranking[0].symbol == "X099"
@@ -359,6 +363,30 @@ def test_code_owned_profiles_defeat_shadow_fields_wrong_paths_and_source_reorder
         _build_from_fixture(archive, calendar, bypass)
 
 
+def test_one_and_two_character_alpaca_symbols_build_serialize_and_reverify(
+    tmp_path: Path,
+):
+    archive, calendar, payload = _source_cohort_fixture(
+        tmp_path / "pit",
+        symbol_overrides={0: "A", 1: "BR"},
+    )
+
+    cohort = _build_from_fixture(archive, calendar, payload)
+    serialized = cohort.canonical_json_bytes()
+    rebuilt = validate_nonqualifying_point_in_time_cohort_record(json.loads(serialized))
+    reverified = verify_source_verifiable_point_in_time_cohort(
+        archive=archive,
+        value=json.loads(serialized),
+    )
+
+    candidates = {candidate.security.symbol: candidate for candidate in cohort.candidates}
+    assert {"A", "BR"} <= set(candidates)
+    assert candidates["A"].identity_sources[0].record_identity == "A"
+    assert candidates["BR"].identity_sources[0].record_identity == "BR"
+    assert rebuilt.canonical_json_bytes() == serialized
+    assert reverified.canonical_json_bytes() == serialized
+
+
 def test_exact_liquidity_and_even_median_ignore_ambient_decimal_context(tmp_path: Path):
     archive, calendar, payload = _source_cohort_fixture(tmp_path / "pit")
     huge = 10**60
@@ -437,12 +465,12 @@ def test_source_verifiable_cohort_rejects_bad_bar_sets_and_numeric_limits(tmp_pa
 def test_selection_window_and_archive_time_are_prospective(tmp_path: Path):
     archive, calendar, payload = _source_cohort_fixture(tmp_path / "pit")
     reversed_times = copy.deepcopy(payload)
-    reversed_times["selection_time"] = "2026-04-01T12:05:00+00:00"
+    reversed_times["as_of_cutoff"] = "2026-04-01T12:05:00+00:00"
     with pytest.raises(PointInTimeDataError, match="pre-open window"):
         _build_from_fixture(archive, calendar, reversed_times)
 
     after_open = copy.deepcopy(payload)
-    after_open["as_of_cutoff"] = "2026-04-01T14:00:00+00:00"
+    after_open["selection_time"] = "2026-04-01T14:00:00+00:00"
     with pytest.raises(PointInTimeDataError, match="pre-open window"):
         _build_from_fixture(archive, calendar, after_open)
 
@@ -453,10 +481,10 @@ def test_selection_window_and_archive_time_are_prospective(tmp_path: Path):
 
     late_archive, late_calendar, late_payload = _source_cohort_fixture(
         tmp_path / "late-pit",
-        source_retrieved_at="2026-04-01T12:29:00+00:00",
-        archive_recorded_at=dt.datetime(2026, 4, 1, 12, 30, tzinfo=dt.UTC),
+        source_retrieved_at="2026-04-01T11:56:00+00:00",
+        archive_recorded_at=dt.datetime(2026, 4, 1, 11, 57, tzinfo=dt.UTC),
     )
-    with pytest.raises(PointInTimeDataError, match="after selection_time"):
+    with pytest.raises(PointInTimeDataError, match="after as_of_cutoff"):
         _build_from_fixture(late_archive, late_calendar, late_payload)
 
 
@@ -464,6 +492,41 @@ def test_exact_uri_provenance_rejects_ports_suffixes_encodings_and_query_aliases
     tmp_path: Path,
 ):
     archive, calendar, payload = _source_cohort_fixture(tmp_path / "pit")
+    calendar_artifact = archive.read_artifact(calendar.raw_artifact_id)
+    calendar_bytes = archive.read_bytes(calendar_artifact)
+    calendar_start = _registered_market_dates()[0]
+    calendar_base = (
+        "https://paper-api.alpaca.markets/v2/calendar"
+        f"?start={calendar_start}&end={MARKET_DATE}"
+    )
+    assert calendar_artifact.source_uri == calendar_base
+    bad_calendar_uris = (
+        "https://paper-api.alpaca.markets/v2/calendar",
+        (
+            "https://paper-api.alpaca.markets/v2/calendar"
+            f"?end={MARKET_DATE}&start={calendar_start}"
+        ),
+        calendar_base + f"&start={calendar_start}",
+        calendar_base + "&extra=1",
+        calendar_base.replace(
+            calendar_start,
+            calendar_start.replace("-", "%2D"),
+        ),
+    )
+    for uri in bad_calendar_uris:
+        replacement = archive.admit(
+            raw_bytes=calendar_bytes,
+            source_uri=uri,
+            content_type="application/json",
+            retrieved_at=SOURCE_RETRIEVED_AT,
+        )
+        replacement_calendar = build_market_session_calendar(
+            archive=archive,
+            raw_artifact=replacement,
+        )
+        with pytest.raises(PointInTimeDataError, match="calendar URI"):
+            _build_from_fixture(archive, replacement_calendar, payload)
+
     candidates = payload["candidates"]
     assert isinstance(candidates, list)
     candidate = candidates[0]

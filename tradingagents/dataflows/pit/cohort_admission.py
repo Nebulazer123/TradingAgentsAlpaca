@@ -329,7 +329,7 @@ def _verified_artifact(
     archive: RawPointInTimeArtifactArchive,
     raw_artifact_id: object,
     raw_artifact_sha256: object,
-    selection_time: dt.datetime,
+    as_of_cutoff: dt.datetime,
     max_byte_count: int,
     label: str,
 ) -> RawPointInTimeArtifact:
@@ -360,10 +360,10 @@ def _verified_artifact(
     if _timestamp(
         artifact.archive_recorded_at,
         label=f"{label} archive_recorded_at",
-    ) > selection_time:
-        raise PointInTimeDataError(f"{label} was archived after selection_time")
-    if _timestamp(artifact.retrieved_at, label=f"{label} retrieved_at") > selection_time:
-        raise PointInTimeDataError(f"{label} was retrieved after selection_time")
+    ) > as_of_cutoff:
+        raise PointInTimeDataError(f"{label} was archived after as_of_cutoff")
+    if _timestamp(artifact.retrieved_at, label=f"{label} retrieved_at") > as_of_cutoff:
+        raise PointInTimeDataError(f"{label} was retrieved after as_of_cutoff")
     return artifact
 
 
@@ -422,19 +422,10 @@ def _calendar_context(
         archive=archive,
         raw_artifact_id=calendar.raw_artifact_id,
         raw_artifact_sha256=calendar.raw_artifact_sha256,
-        selection_time=selection_time,
+        as_of_cutoff=as_of_cutoff,
         max_byte_count=_MAX_CALENDAR_ARTIFACT_BYTES,
         label="market calendar",
     )
-    if not any(
-        _exact_https_uri(
-            artifact.source_uri,
-            host=host,
-            path="/v2/calendar",
-        )
-        for host in _ALPACA_ASSET_HOSTS
-    ):
-        raise PointInTimeDataError("market calendar URI is not canonical Alpaca provenance")
     rebuilt = build_market_session_calendar(archive=archive, raw_artifact=artifact)
     if rebuilt.canonical_json_bytes() != calendar.canonical_json_bytes():
         raise PointInTimeDataError("market calendar receipt does not match retained bytes")
@@ -444,6 +435,17 @@ def _calendar_context(
     session_dates = calendar.market_dates[max(0, market_index - 60) : market_index]
     if len(session_dates) != 60:
         raise PointInTimeDataError("calendar lacks 60 complete sessions before market_date")
+    calendar_query = f"start={session_dates[0]}&end={market_date}"
+    if not any(
+        _exact_https_uri(
+            artifact.source_uri,
+            host=host,
+            path="/v2/calendar",
+            query=calendar_query,
+        )
+        for host in _ALPACA_ASSET_HOSTS
+    ):
+        raise PointInTimeDataError("market calendar URI is not canonical Alpaca provenance")
     source = _strict_json(archive.read_bytes(artifact), label="market calendar source")
     if type(source) is not list:
         raise PointInTimeDataError("market calendar source must be a JSON list")
@@ -485,9 +487,9 @@ def _calendar_context(
         dt.time(0, 0),
         tzinfo=_MARKET_TZ,
     ).astimezone(dt.UTC)
-    if not selection_window_open <= selection_time <= as_of_cutoff <= market_open:
+    if not selection_window_open <= as_of_cutoff <= selection_time <= market_open:
         raise PointInTimeDataError(
-            "selection_time and as_of_cutoff must be ordered within the pre-open window"
+            "as_of_cutoff and selection_time must be ordered within the pre-open window"
         )
     return (
         calendar,
@@ -547,7 +549,7 @@ def _identity_sources(
     archive: RawPointInTimeArtifactArchive,
     security: SecurityIdentity,
     raw_sources: object,
-    selection_time: dt.datetime,
+    as_of_cutoff: dt.datetime,
     first_session: str,
     market_date: str,
 ) -> tuple[tuple[PointInTimeCohortIdentitySourceReference, ...], tuple[str, ...]]:
@@ -583,7 +585,7 @@ def _identity_sources(
             archive=archive,
             raw_artifact_id=values["raw_artifact_id"],
             raw_artifact_sha256=values["raw_artifact_sha256"],
-            selection_time=selection_time,
+            as_of_cutoff=as_of_cutoff,
             max_byte_count=_MAX_IDENTITY_ARTIFACT_BYTES,
             label=f"identity source {profile}",
         )
@@ -699,7 +701,6 @@ def _market_source(
     archive: RawPointInTimeArtifactArchive,
     security: SecurityIdentity,
     raw_source: object,
-    selection_time: dt.datetime,
     as_of_cutoff: dt.datetime,
     market_date: str,
     session_dates: tuple[str, ...],
@@ -714,7 +715,7 @@ def _market_source(
         archive=archive,
         raw_artifact_id=values["raw_artifact_id"],
         raw_artifact_sha256=values["raw_artifact_sha256"],
-        selection_time=selection_time,
+        as_of_cutoff=as_of_cutoff,
         max_byte_count=_MAX_BAR_ARTIFACT_BYTES,
         label="candidate market-data source",
     )
@@ -885,7 +886,7 @@ def build_source_verifiable_point_in_time_cohort(
             archive=archive,
             security=security,
             raw_sources=values["identity_sources"],
-            selection_time=selected_at,
+            as_of_cutoff=cutoff,
             first_session=session_dates[0],
             market_date=normalized_market_date,
         )
@@ -893,7 +894,6 @@ def build_source_verifiable_point_in_time_cohort(
             archive=archive,
             security=security,
             raw_source=values["market_data_source"],
-            selection_time=selected_at,
             as_of_cutoff=cutoff,
             market_date=normalized_market_date,
             session_dates=session_dates,
