@@ -25,6 +25,7 @@ _SYMBOL = re.compile(r"[A-Z][A-Z0-9.-]{0,14}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,255}")
 _FIGI = re.compile(r"[A-Z0-9]{12}")
 _EXCHANGE = re.compile(r"[A-Z0-9_-]{1,32}")
+_SESSION_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:00")
 _MARKET_FEEDS = frozenset({"iex", "sip"})
 _ADJUSTMENT_MODES = {
     "raw": "unadjusted",
@@ -39,8 +40,6 @@ _ALPACA_TIMEFRAME_SECONDS = {
     "1Hour": 3_600,
 }
 _MARKET_TZ = ZoneInfo("America/New_York")
-_REGULAR_OPEN = dt.time(9, 30)
-_REGULAR_CLOSE = dt.time(16, 0)
 _AUTHORITY = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -194,16 +193,60 @@ def _validate_alpaca_derivation(
             "regular_session_open",
             "regular_session_close",
             "bar_duration_seconds",
+            "calendar_raw_artifact_id",
+            "calendar_raw_artifact_sha256",
+            "calendar_date_path",
+            "calendar_open_path",
+            "calendar_close_path",
         }
     )
     if not isinstance(derivation, MappingProxyType) or set(derivation) != expected_fields:
         raise PointInTimeDataError("source_span publication derivation fields are invalid")
-    if (
-        derivation["market_timezone"] != "America/New_York"
-        or derivation["regular_session_open"] != "09:30:00"
-        or derivation["regular_session_close"] != "16:00:00"
-    ):
+    if derivation["market_timezone"] != "America/New_York":
         raise PointInTimeDataError("source_span publication derivation session is invalid")
+    calendar_artifact_id = _identifier(
+        derivation["calendar_raw_artifact_id"],
+        field_name="source_span.publication_derivation.calendar_raw_artifact_id",
+    )
+    if not calendar_artifact_id.startswith("pit-raw-artifact-"):
+        raise PointInTimeDataError("calendar raw artifact identity is invalid")
+    _digest(
+        derivation["calendar_raw_artifact_sha256"],
+        field_name="source_span.publication_derivation.calendar_raw_artifact_sha256",
+    )
+    row_indexes: set[int] = set()
+    for field_name, source_field in (
+        ("calendar_date_path", "date"),
+        ("calendar_open_path", "open"),
+        ("calendar_close_path", "close"),
+    ):
+        path = derivation[field_name]
+        if (
+            type(path) is not tuple
+            or len(path) != 2
+            or type(path[0]) is not int
+            or path[0] < 0
+            or path[1] != source_field
+        ):
+            raise PointInTimeDataError(
+                f"source_span.publication_derivation.{field_name} is invalid"
+            )
+        row_indexes.add(path[0])
+    if len(row_indexes) != 1:
+        raise PointInTimeDataError("calendar session paths must select one source row")
+    source_open = derivation["regular_session_open"]
+    source_close = derivation["regular_session_close"]
+    if (
+        type(source_open) is not str
+        or _SESSION_TIME.fullmatch(source_open) is None
+        or type(source_close) is not str
+        or _SESSION_TIME.fullmatch(source_close) is None
+    ):
+        raise PointInTimeDataError("source-derived regular session hours are invalid")
+    regular_open = dt.time.fromisoformat(source_open)
+    regular_close = dt.time.fromisoformat(source_close)
+    if regular_open >= regular_close:
+        raise PointInTimeDataError("source-derived session open must precede close")
 
     local_event = event_time.astimezone(_MARKET_TZ)
     local_date = local_event.date()
@@ -217,7 +260,7 @@ def _validate_alpaca_derivation(
             raise PointInTimeDataError("daily publication derivation is invalid")
         expected_publication = dt.datetime.combine(
             local_date,
-            _REGULAR_CLOSE,
+            regular_close,
             tzinfo=_MARKET_TZ,
         ).astimezone(_UTC)
     else:
@@ -225,14 +268,14 @@ def _validate_alpaca_derivation(
         if (
             derivation["method"] != "bar_start_plus_timeframe"
             or derivation["bar_duration_seconds"] != duration
-            or not (_REGULAR_OPEN <= local_time < _REGULAR_CLOSE)
+            or not (regular_open <= local_time < regular_close)
         ):
             raise PointInTimeDataError("intraday publication derivation is invalid")
         expected_publication = event_time + dt.timedelta(seconds=duration)
         local_completion = expected_publication.astimezone(_MARKET_TZ)
         if (
             local_completion.date() != local_date
-            or local_completion.timetz().replace(tzinfo=None) > _REGULAR_CLOSE
+            or local_completion.timetz().replace(tzinfo=None) > regular_close
         ):
             raise PointInTimeDataError("intraday bar overruns the regular session")
 

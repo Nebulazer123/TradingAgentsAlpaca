@@ -66,10 +66,22 @@ def _archive(
     return archive, artifact
 
 
-def _calendar(archive, *market_dates: str):
+def _calendar(
+    archive,
+    *market_dates: str,
+    open_time: str = "09:30",
+    close_time: str = "16:00",
+):
     artifact = archive.admit(
         raw_bytes=json.dumps(
-            [{"date": market_date} for market_date in market_dates],
+            [
+                {
+                    "date": market_date,
+                    "open": open_time,
+                    "close": close_time,
+                }
+                for market_date in market_dates
+            ],
             separators=(",", ":"),
         ).encode(),
         source_uri="https://paper-api.alpaca.markets/v2/calendar",
@@ -330,6 +342,11 @@ def test_alpaca_intraday_observation_uses_proven_interval_completion(tmp_path):
         "regular_session_open": "09:30:00",
         "regular_session_close": "16:00:00",
         "bar_duration_seconds": 3600,
+        "calendar_raw_artifact_id": calendar.raw_artifact_id,
+        "calendar_raw_artifact_sha256": calendar.raw_artifact_sha256,
+        "calendar_date_path": (0, "date"),
+        "calendar_open_path": (0, "open"),
+        "calendar_close_path": (0, "close"),
     }
 
 
@@ -356,6 +373,141 @@ def test_alpaca_daily_completion_uses_new_york_dst_offset(tmp_path):
     )
 
     assert observation.publication_time == "2026-07-06T20:00:00+00:00"
+
+
+def test_alpaca_observation_uses_source_early_close_and_rejects_post_close_bar(
+    tmp_path,
+):
+    daily_archive, daily_artifact = _archive(
+        tmp_path / "daily",
+        uri=(
+            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "timeframe=1Day&feed=iex&adjustment=raw"
+        ),
+        payload={"bars": {"AAPL": [{"t": "2026-11-27T05:00:00Z", "c": 10}]}},
+        retrieved_at="2026-11-27T18:00:00+00:00",
+        archive_recorded_at="2026-11-27T18:00:05+00:00",
+    )
+    daily_calendar = _calendar(
+        daily_archive,
+        "2026-11-27",
+        close_time="13:00",
+    )
+
+    observation = build_alpaca_market_observation(
+        security_identity=_security(),
+        archive=daily_archive,
+        raw_artifact=daily_artifact,
+        market_calendar=daily_calendar,
+        bar_path=("bars", "AAPL", 0),
+        value_field="c",
+    )
+
+    derivation = observation.source_span["publication_derivation"]
+    assert observation.publication_time == "2026-11-27T18:00:00+00:00"
+    assert derivation["regular_session_close"] == "13:00:00"
+    assert derivation["calendar_raw_artifact_id"] == daily_calendar.raw_artifact_id
+    assert derivation["calendar_raw_artifact_sha256"] == (
+        daily_calendar.raw_artifact_sha256
+    )
+    assert derivation["calendar_close_path"] == (0, "close")
+
+    late_archive, late_artifact = _archive(
+        tmp_path / "post-close",
+        uri=(
+            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "timeframe=5Min&feed=iex&adjustment=raw"
+        ),
+        payload={"bars": {"AAPL": [{"t": "2026-11-27T18:00:00Z", "c": 10}]}},
+        retrieved_at="2026-11-27T20:00:00+00:00",
+        archive_recorded_at="2026-11-27T20:00:05+00:00",
+    )
+    late_calendar = _calendar(
+        late_archive,
+        "2026-11-27",
+        close_time="13:00",
+    )
+
+    with pytest.raises(PointInTimeDataError, match="outside"):
+        build_alpaca_market_observation(
+            security_identity=_security(),
+            archive=late_archive,
+            raw_artifact=late_artifact,
+            market_calendar=late_calendar,
+            bar_path=("bars", "AAPL", 0),
+            value_field="c",
+        )
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"date": "2026-01-05", "open": "09:30"},
+        {"date": "2026-01-05", "open": "9:30", "close": "16:00"},
+        {"date": "2026-01-05", "open": "16:00", "close": "16:00"},
+    ],
+)
+def test_alpaca_observation_rejects_absent_or_malformed_source_session_hours(
+    tmp_path,
+    row,
+):
+    archive, artifact = _archive(
+        tmp_path,
+        uri=(
+            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "timeframe=1Day&feed=iex&adjustment=raw"
+        ),
+        payload={"bars": {"AAPL": [{"t": "2026-01-05T05:00:00Z", "c": 10}]}},
+    )
+    calendar_artifact = archive.admit(
+        raw_bytes=json.dumps([row], separators=(",", ":")).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2020-01-01T00:00:00+00:00",
+    )
+    calendar = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=calendar_artifact,
+    )
+
+    with pytest.raises(PointInTimeDataError):
+        build_alpaca_market_observation(
+            security_identity=_security(),
+            archive=archive,
+            raw_artifact=artifact,
+            market_calendar=calendar,
+            bar_path=("bars", "AAPL", 0),
+            value_field="c",
+        )
+
+
+@pytest.mark.parametrize(
+    "calendar_bytes",
+    [
+        b'[{"date":"2026-01-04","date":"2026-01-05","open":"09:30","close":"16:00"}]',
+        b'[{"date":"2026-01-05","open":"09:30","close":"16:00","extra":NaN}]',
+    ],
+)
+def test_market_calendar_rejects_ambiguous_or_nonfinite_json(
+    tmp_path,
+    calendar_bytes,
+):
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "pit-artifacts",
+        clock=lambda: dt.datetime(2026, 1, 5, 21, 0, 5, tzinfo=dt.UTC),
+    )
+    calendar_artifact = archive.admit(
+        raw_bytes=calendar_bytes,
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2026-01-05T21:00:00+00:00",
+    )
+
+    with pytest.raises(PointInTimeDataError):
+        build_market_session_calendar(
+            archive=archive,
+            raw_artifact=calendar_artifact,
+        )
 
 
 @pytest.mark.parametrize(
@@ -464,6 +616,52 @@ def test_alpaca_observation_preserves_decimal_source_numbers_losslessly(
     )
 
     assert observation.observed_value == expected
+
+
+def test_official_observations_reject_compact_extreme_decimal_exponents(tmp_path):
+    archive, artifact = _archive(
+        tmp_path / "alpaca",
+        uri=(
+            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "timeframe=1Day&feed=iex&adjustment=raw"
+        ),
+        raw_bytes=(
+            b'{"bars":{"AAPL":[{"t":"2026-01-05T05:00:00Z",'
+            b'"c":1e999999999}]}}'
+        ),
+    )
+    calendar = _calendar(archive, "2026-01-05")
+
+    with pytest.raises(PointInTimeDataError, match="resource limits"):
+        build_alpaca_market_observation(
+            security_identity=_security(),
+            archive=archive,
+            raw_artifact=artifact,
+            market_calendar=calendar,
+            bar_path=("bars", "AAPL", 0),
+            value_field="c",
+        )
+
+    sec_archive, sec_artifact = _archive(
+        tmp_path / "sec",
+        uri="https://data.sec.gov/api/xbrl/companyfacts/CIK0000000001.json",
+        raw_bytes=(
+            b'{"cik":"0000000001","fact":{"nested":1e999999999},'
+            b'"event_time":"2026-01-04T21:00:00Z",'
+            b'"publication_time":"2026-01-05T20:00:00Z"}'
+        ),
+    )
+
+    with pytest.raises(PointInTimeDataError, match="resource limits"):
+        build_sec_fundamental_observation(
+            security_identity=_security(),
+            archive=sec_archive,
+            raw_artifact=sec_artifact,
+            source_identity_path=("cik",),
+            value_path=("fact",),
+            event_time_path=("event_time",),
+            publication_time_path=("publication_time",),
+        )
 
 
 @pytest.mark.parametrize(

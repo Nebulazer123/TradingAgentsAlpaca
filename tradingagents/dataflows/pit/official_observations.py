@@ -6,13 +6,13 @@ import datetime as dt
 import json
 import re
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
+from decimal import Decimal, DecimalException
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from tradingagents.dataflows.pit.market_calendar import (
     MarketSessionCalendar,
-    build_market_session_calendar,
+    _resolve_source_session,
 )
 from tradingagents.dataflows.pit.raw_artifacts import (
     RawPointInTimeArtifact,
@@ -43,8 +43,8 @@ _ALPACA_TIMEFRAME_SECONDS = {
     "30Min": 1_800,
     "1Hour": 3_600,
 }
-_REGULAR_OPEN = dt.time(9, 30)
-_REGULAR_CLOSE = dt.time(16, 0)
+_SEC_DECIMAL_LIMITS = (1_024, 1_024, 2_048)
+_ALPACA_DECIMAL_LIMITS = (128, 128, 256)
 _MARKET_TZ = ZoneInfo("America/New_York")
 
 
@@ -147,13 +147,52 @@ def _security_identity(value: object) -> SecurityIdentity:
     return value
 
 
-def _canonical_decimal(value: Decimal | int) -> str:
-    decimal_value = value if type(value) is Decimal else Decimal(value)
-    if not decimal_value.is_finite():
-        raise PointInTimeDataError("source numeric value must be finite")
-    if decimal_value.is_zero():
-        return "0"
-    text = format(decimal_value, "f")
+def _canonical_decimal(
+    value: Decimal | int,
+    *,
+    label: str,
+    limits: tuple[int, int, int],
+) -> str:
+    max_digits, max_exponent, max_output_chars = limits
+    try:
+        decimal_value = value if type(value) is Decimal else Decimal(value)
+        if not decimal_value.is_finite():
+            raise PointInTimeDataError(f"{label} must be finite")
+        if decimal_value.is_zero():
+            return "0"
+        sign, digits, exponent = decimal_value.as_tuple()
+    except PointInTimeDataError:
+        raise
+    except (DecimalException, TypeError, ValueError, OverflowError) as exc:
+        raise PointInTimeDataError(f"{label} is not a bounded decimal") from exc
+
+    digit_count = len(digits)
+    adjusted_exponent = digit_count + exponent - 1
+    if (
+        digit_count > max_digits
+        or abs(exponent) > max_exponent
+        or abs(adjusted_exponent) > max_exponent
+    ):
+        raise PointInTimeDataError(f"{label} exceeds decimal resource limits")
+    if exponent >= 0:
+        predicted_length = digit_count + exponent
+    else:
+        decimal_position = digit_count + exponent
+        predicted_length = (
+            digit_count + 1
+            if decimal_position > 0
+            else 2 - decimal_position + digit_count
+        )
+    predicted_length += sign
+    if predicted_length > max_output_chars:
+        raise PointInTimeDataError(f"{label} exceeds decimal output limits")
+
+    try:
+        text = format(decimal_value, "f")
+    except (DecimalException, ValueError, OverflowError) as exc:
+        raise PointInTimeDataError(f"{label} cannot be canonicalized") from exc
+    if len(text) > max_output_chars:
+        raise PointInTimeDataError(f"{label} exceeds decimal output limits")
     if "." in text:
         text = text.rstrip("0").rstrip(".")
     return text
@@ -161,7 +200,11 @@ def _canonical_decimal(value: Decimal | int) -> str:
 
 def _normalize_source_value(value: object) -> object:
     if type(value) is Decimal:
-        return _canonical_decimal(value)
+        return _canonical_decimal(
+            value,
+            label="SEC selected decimal",
+            limits=_SEC_DECIMAL_LIMITS,
+        )
     if isinstance(value, Mapping):
         return {
             key: _normalize_source_value(item)
@@ -183,7 +226,11 @@ def _alpaca_value(value: object, *, field: str) -> object:
             raise PointInTimeDataError(
                 f"Alpaca {field} must be a finite positive number"
             )
-        return _canonical_decimal(decimal_value)
+        return _canonical_decimal(
+            decimal_value,
+            label=f"Alpaca {field}",
+            limits=_ALPACA_DECIMAL_LIMITS,
+        )
     if field in _ALPACA_INTEGER_FIELDS:
         if type(value) is not int or value < 0:
             raise PointInTimeDataError(
@@ -227,41 +274,28 @@ def _alpaca_symbol(parsed_url, *, expected_symbol: str) -> None:
         )
 
 
-def _source_bound_calendar(
-    value: object,
-    *,
-    archive: RawPointInTimeArtifactArchive,
-) -> MarketSessionCalendar:
-    if type(value) is not MarketSessionCalendar:
-        raise PointInTimeDataError(
-            "market_calendar must be an exact MarketSessionCalendar"
-        )
-    calendar_artifact = archive.read_artifact(value.raw_artifact_id)
-    rebuilt = build_market_session_calendar(
-        archive=archive,
-        raw_artifact=calendar_artifact,
-    )
-    if rebuilt.canonical_json_bytes() != value.canonical_json_bytes():
-        raise PointInTimeDataError(
-            "market_calendar does not match its retained source bytes"
-        )
-    return rebuilt
-
-
 def _bar_completion(
     event_time: str,
     *,
     timeframe: str,
+    archive: RawPointInTimeArtifactArchive,
     market_calendar: MarketSessionCalendar,
-) -> tuple[str, str, dict[str, object]]:
+) -> tuple[str, str, dict[str, object], MarketSessionCalendar]:
     parsed = dt.datetime.fromisoformat(event_time)
     local_event = parsed.astimezone(_MARKET_TZ)
     local_date = local_event.date()
     session_date = local_date.isoformat()
-    if session_date not in market_calendar.market_dates:
-        raise PointInTimeDataError(
-            "Alpaca bar date is absent from the source-bound market calendar"
-        )
+    calendar, session_material = _resolve_source_session(
+        archive=archive,
+        market_calendar=market_calendar,
+        session_date=session_date,
+    )
+    regular_open = dt.time.fromisoformat(
+        str(session_material["regular_session_open"])
+    )
+    regular_close = dt.time.fromisoformat(
+        str(session_material["regular_session_close"])
+    )
     local_time = local_event.timetz().replace(tzinfo=None)
     if timeframe == "1Day":
         if local_time != dt.time(0, 0):
@@ -270,7 +304,7 @@ def _bar_completion(
             )
         completion = dt.datetime.combine(
             local_date,
-            _REGULAR_CLOSE,
+            regular_close,
             tzinfo=_MARKET_TZ,
         ).astimezone(dt.UTC)
         method = "registered_regular_session_close"
@@ -279,13 +313,13 @@ def _bar_completion(
         duration = _ALPACA_TIMEFRAME_SECONDS.get(timeframe)
         if duration is None:
             raise PointInTimeDataError("Alpaca timeframe is not explicitly supported")
-        if not (_REGULAR_OPEN <= local_time < _REGULAR_CLOSE):
+        if not (regular_open <= local_time < regular_close):
             raise PointInTimeDataError(
                 "Alpaca intraday bar is outside the regular market session"
             )
         session_open = dt.datetime.combine(
             local_date,
-            _REGULAR_OPEN,
+            regular_open,
             tzinfo=_MARKET_TZ,
         )
         elapsed = int((local_event - session_open).total_seconds())
@@ -297,7 +331,7 @@ def _bar_completion(
         local_completion = completion.astimezone(_MARKET_TZ)
         if (
             local_completion.date() != local_date
-            or local_completion.timetz().replace(tzinfo=None) > _REGULAR_CLOSE
+            or local_completion.timetz().replace(tzinfo=None) > regular_close
         ):
             raise PointInTimeDataError(
                 "Alpaca intraday bar overruns the regular market session"
@@ -308,13 +342,13 @@ def _bar_completion(
         session_date,
         completion_time,
         {
+            **session_material,
             "method": method,
             "completion_time": completion_time,
             "market_timezone": "America/New_York",
-            "regular_session_open": "09:30:00",
-            "regular_session_close": "16:00:00",
             "bar_duration_seconds": duration,
         },
+        calendar,
     )
 
 
@@ -412,7 +446,6 @@ def build_alpaca_market_observation(
     """Derive bar time and feed/adjustment facts from archived response evidence."""
 
     identity = _security_identity(security_identity)
-    calendar = _source_bound_calendar(market_calendar, archive=archive)
     raw_bytes = _bytes(archive, raw_artifact)
     parsed_url = urlsplit(raw_artifact.source_uri)
     if (
@@ -461,10 +494,11 @@ def build_alpaca_market_observation(
         _select_json(payload, event_path, label="Alpaca bar timestamp"),
         label="Alpaca bar timestamp",
     )
-    session_date, publication_time, publication_derivation = _bar_completion(
+    session_date, publication_time, publication_derivation, calendar = _bar_completion(
         event_time,
         timeframe=timeframe,
-        market_calendar=calendar,
+        archive=archive,
+        market_calendar=market_calendar,
     )
     if dt.datetime.fromisoformat(raw_artifact.retrieved_at) < dt.datetime.fromisoformat(
         publication_time

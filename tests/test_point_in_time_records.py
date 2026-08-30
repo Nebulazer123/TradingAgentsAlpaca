@@ -43,6 +43,7 @@ def _security(**overrides: object) -> SecurityIdentity:
 def _observation(**overrides: object) -> PointInTimeObservation:
     raw_digest = hashlib.sha256(b"aapl-bar").hexdigest()
     calendar_digest = hashlib.sha256(b"xnys-calendar").hexdigest()
+    calendar_raw_digest = hashlib.sha256(b"xnys-calendar-raw").hexdigest()
     values: dict[str, object] = {
         "security_id": "security-us-aapl-common-0001",
         "identity_effective_from": "1980-12-12",
@@ -73,6 +74,11 @@ def _observation(**overrides: object) -> PointInTimeObservation:
                 "regular_session_open": "09:30:00",
                 "regular_session_close": "16:00:00",
                 "bar_duration_seconds": 300,
+                "calendar_raw_artifact_id": "pit-raw-artifact-" + "a" * 64,
+                "calendar_raw_artifact_sha256": calendar_raw_digest,
+                "calendar_date_path": [0, "date"],
+                "calendar_open_path": [0, "open"],
+                "calendar_close_path": [0, "close"],
             },
             "paths": {
                 "event_time": ["bars", "AAPL", 0, "t"],
@@ -187,6 +193,13 @@ def test_observation_binds_all_bitemporal_times_and_raw_provenance():
             "regular_session_open": "09:30:00",
             "regular_session_close": "16:00:00",
             "bar_duration_seconds": 300,
+            "calendar_raw_artifact_id": "pit-raw-artifact-" + "a" * 64,
+            "calendar_raw_artifact_sha256": hashlib.sha256(
+                b"xnys-calendar-raw"
+            ).hexdigest(),
+            "calendar_date_path": [0, "date"],
+            "calendar_open_path": [0, "open"],
+            "calendar_close_path": [0, "close"],
         },
         "paths": {
             "event_time": ["bars", "AAPL", 0, "t"],
@@ -232,6 +245,7 @@ def test_observation_rejects_future_leakage_and_invalid_provenance(overrides):
 
 def test_observation_deep_freezes_source_span():
     calendar_digest = hashlib.sha256(b"xnys-calendar").hexdigest()
+    calendar_raw_digest = hashlib.sha256(b"xnys-calendar-raw").hexdigest()
     span = {
         "source_kind": "alpaca_market_data",
         "span_type": "json_paths",
@@ -246,6 +260,11 @@ def test_observation_deep_freezes_source_span():
             "regular_session_open": "09:30:00",
             "regular_session_close": "16:00:00",
             "bar_duration_seconds": 300,
+            "calendar_raw_artifact_id": "pit-raw-artifact-" + "a" * 64,
+            "calendar_raw_artifact_sha256": calendar_raw_digest,
+            "calendar_date_path": [0, "date"],
+            "calendar_open_path": [0, "open"],
+            "calendar_close_path": [0, "close"],
         },
         "paths": {
             "event_time": ["bars", "AAPL", 0, "t"],
@@ -258,6 +277,7 @@ def test_observation_deep_freezes_source_span():
     span["paths"]["observed_value"][-1] = "o"
     span["paths"]["event_time"].append("tampered")
     span["publication_derivation"]["completion_time"] = "2026-01-09T20:04:00+00:00"
+    span["publication_derivation"]["calendar_close_path"][1] = "open"
 
     assert observation.canonical_json_bytes() == expected
 
