@@ -3303,7 +3303,9 @@ def research_economic_tournament_run(
             protocol=protocol,
             eligibility=eligibility,
             candidates_by_event=dict(tournament_input.candidates_by_event),
-            outcomes=tournament_input.outcomes,
+            execution_outcomes=tournament_input.outcomes,
+            tournament_input_id=tournament_input.input_id,
+            tournament_input_sha256=tournament_input.input_sha256,
         )
         admission = EconomicEvaluationAdmissionAdapter(
             evidence_root,

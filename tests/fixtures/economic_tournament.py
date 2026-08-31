@@ -9,10 +9,15 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from tradingagents.dataflows.pit import (
+    ExecutionPriceTwin,
     PointInTimeObservation,
     RawPointInTimeArtifactArchive,
     SecurityIdentity,
+    SourceBoundAdjustedPriceWindow,
+    build_market_session_calendar,
     build_source_bound_adjusted_price_window,
+    build_source_bound_execution_outcome,
+    resolve_market_session_open,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
     ValidationPhaseEligibility,
@@ -200,14 +205,14 @@ def _candidate_row(
     )
 
 
-def _next_weekdays(market_date: str) -> tuple[str, str]:
+def _next_weekdays(market_date: str, count: int = 5) -> tuple[str, ...]:
     day = dt.date.fromisoformat(market_date)
     dates: list[str] = []
-    while len(dates) < 2:
+    while len(dates) < count:
         day += dt.timedelta(days=1)
         if day.weekday() < 5:
             dates.append(day.isoformat())
-    return dates[0], dates[1]
+    return tuple(dates)
 
 
 def _outcome_window(
@@ -216,16 +221,20 @@ def _outcome_window(
     *,
     security: SecurityIdentity,
     market_date: str,
-) -> dict[str, object]:
-    start, end = _next_weekdays(market_date)
+) -> SourceBoundAdjustedPriceWindow:
+    session_dates = _next_weekdays(market_date)
+    start, end = session_dates[0], session_dates[-1]
     retrieved_at = f"{end}T20:00:00+00:00"
     clock_value[0] = dt.datetime.fromisoformat(retrieved_at)
     raw_bytes = _canonical_bytes(
         {
             "bars": {
                 security.symbol: [
-                    {"t": f"{start}T05:00:00Z", "c": "10"},
-                    {"t": f"{end}T05:00:00Z", "c": "11"},
+                    {
+                        "t": f"{session_date}T05:00:00Z",
+                        "c": str(11 + index),
+                    }
+                    for index, session_date in enumerate(session_dates)
                 ]
             }
         }
@@ -248,7 +257,7 @@ def _outcome_window(
         requested_start=start,
         requested_end=end,
         decision_cutoff=f"{end}T21:00:00+00:00",
-    ).to_dict()
+    )
 
 
 def build_tournament_receipt(
@@ -339,25 +348,126 @@ def build_tournament_receipt(
         eligibility=eligibility,
         market_date_inputs=tuple(feature_inputs),
     )
+    calendar_dates = tuple(
+        sorted(
+            {
+                date
+                for market_date in grouped
+                for date in (market_date, *_next_weekdays(market_date))
+            }
+        )
+    )
+    clock_value[0] = dt.datetime.fromisoformat(
+        f"{calendar_dates[-1]}T22:00:00+00:00"
+    )
+    calendar_artifact = archive.admit(
+        raw_bytes=_canonical_bytes(
+            [
+                {"date": date, "open": "09:30", "close": "16:00"}
+                for date in calendar_dates
+            ]
+        ),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at=clock_value[0].isoformat(timespec="seconds"),
+    )
+    market_calendar = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=calendar_artifact,
+    )
     outcome_inputs = []
-    for market_date in grouped:
+    for market_date, date_events in grouped.items():
         identities = identities_by_date[market_date]
+        events_for_date = {event.symbol: event for event in date_events}
+        first_event = events_for_date[protocol.primary_universe[0]]
+        date_outcomes = []
+        for symbol in sorted((*protocol.primary_universe, "SPY")):
+            security = identities[symbol]
+            window = _outcome_window(
+                archive,
+                clock_value,
+                security=security,
+                market_date=market_date,
+            )
+            official_open = resolve_market_session_open(
+                archive=archive,
+                market_calendar=market_calendar,
+                session_date=window.entry_date,
+            )
+            twins = (
+                ExecutionPriceTwin(
+                    price_basis="mid_price",
+                    status="unavailable",
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=None,
+                    price=None,
+                    adjustment_status=None,
+                    source_artifact_id=None,
+                    source_artifact_sha256=None,
+                    unavailable_reason="source_not_retained",
+                ),
+                ExecutionPriceTwin(
+                    price_basis="next_open",
+                    status="available",
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=official_open,
+                    price="10",
+                    adjustment_status="total_return_adjusted",
+                    source_artifact_id=window.raw_artifact_id,
+                    source_artifact_sha256=window.raw_artifact_sha256,
+                    unavailable_reason=None,
+                ),
+                ExecutionPriceTwin(
+                    price_basis="executable_quote",
+                    status="unavailable",
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=None,
+                    price=None,
+                    adjustment_status=None,
+                    source_artifact_id=None,
+                    source_artifact_sha256=None,
+                    unavailable_reason="source_not_retained",
+                ),
+                ExecutionPriceTwin(
+                    price_basis="observed_paper_fill",
+                    status="unavailable",
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=None,
+                    price=None,
+                    adjustment_status=None,
+                    source_artifact_id=None,
+                    source_artifact_sha256=None,
+                    unavailable_reason="source_not_retained",
+                ),
+            )
+            event = first_event if symbol == "SPY" else events_for_date[symbol]
+            execution = build_source_bound_execution_outcome(
+                decision_event_id=event.decision_event_id,
+                decision_market_date=market_date,
+                decision_cutoff=event.decision_at,
+                security=security,
+                market_calendar=market_calendar,
+                adjusted_price_window=window,
+                entry_session_open_at=official_open,
+                corporate_actions=(),
+                terminal_proceeds=None,
+                price_twins=twins,
+            )
+            date_outcomes.append(
+                {
+                    "execution_outcome": execution.to_dict(),
+                    "price_window": window.to_dict(),
+                }
+            )
         outcome_inputs.append(
             {
                 "market_date": market_date,
-                "outcomes": [
-                    {
-                        "symbol": symbol,
-                        "return": "0.1",
-                        "price_window": _outcome_window(
-                            archive,
-                            clock_value,
-                            security=identities[symbol],
-                            market_date=market_date,
-                        ),
-                    }
-                    for symbol in sorted((*protocol.primary_universe, "SPY"))
-                ],
+                "market_calendar": market_calendar.to_dict(),
+                "outcomes": date_outcomes,
             }
         )
     outcomes = build_source_bound_tournament_outcomes(

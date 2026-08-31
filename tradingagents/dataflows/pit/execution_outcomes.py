@@ -256,6 +256,7 @@ class SourceBoundExecutionOutcome:
     decision_market_date: str
     decision_cutoff: str
     entry_session_date: str
+    entry_session_open_at: str
     exit_session_date: str
     holding_session_dates: tuple[str, ...]
     market_calendar_id: str
@@ -264,6 +265,11 @@ class SourceBoundExecutionOutcome:
     market_calendar_raw_artifact_sha256: str
     adjusted_price_window_id: str
     adjusted_price_window_sha256: str
+    security_identity_sha256: str
+    successor_security_id: str | None
+    successor_security_sha256: str | None
+    corporate_action_set_id: str
+    corporate_action_set_sha256: str
     corporate_actions: tuple[CorporateAction, ...]
     terminal_proceeds: TerminalProceeds | None
     price_twins: tuple[ExecutionPriceTwin, ...]
@@ -286,6 +292,7 @@ class SourceBoundExecutionOutcome:
             "decision_market_date": self.decision_market_date,
             "decision_cutoff": self.decision_cutoff,
             "entry_session_date": self.entry_session_date,
+            "entry_session_open_at": self.entry_session_open_at,
             "exit_session_date": self.exit_session_date,
             "holding_session_dates": list(self.holding_session_dates),
             "market_calendar_id": self.market_calendar_id,
@@ -294,6 +301,11 @@ class SourceBoundExecutionOutcome:
             "market_calendar_raw_artifact_sha256": self.market_calendar_raw_artifact_sha256,
             "adjusted_price_window_id": self.adjusted_price_window_id,
             "adjusted_price_window_sha256": self.adjusted_price_window_sha256,
+            "security_identity_sha256": self.security_identity_sha256,
+            "successor_security_id": self.successor_security_id,
+            "successor_security_sha256": self.successor_security_sha256,
+            "corporate_action_set_id": self.corporate_action_set_id,
+            "corporate_action_set_sha256": self.corporate_action_set_sha256,
             "corporate_actions": [item.to_dict() for item in self.corporate_actions],
             "terminal_proceeds": (
                 None if self.terminal_proceeds is None else self.terminal_proceeds.to_dict()
@@ -338,9 +350,11 @@ def build_source_bound_execution_outcome(
     security: SecurityIdentity,
     market_calendar: MarketSessionCalendar,
     adjusted_price_window: SourceBoundAdjustedPriceWindow,
+    entry_session_open_at: str,
     corporate_actions: tuple[CorporateAction, ...],
     terminal_proceeds: TerminalProceeds | None,
     price_twins: tuple[ExecutionPriceTwin, ...],
+    successor_security: SecurityIdentity | None = None,
 ) -> SourceBoundExecutionOutcome:
     """Build a deterministic outcome without filesystem or provider authority."""
 
@@ -372,6 +386,14 @@ def build_source_bound_execution_outcome(
         raise PointInTimeDataError(
             "execution outcome must retain the feature security identity"
         )
+    official_open = _timestamp(
+        entry_session_open_at,
+        label="entry_session_open_at",
+    )
+    if official_open[:10] != window.entry_date:
+        raise PointInTimeDataError(
+            "official entry-session open must occur on the entry session"
+        )
 
     if type(corporate_actions) is not tuple:
         raise PointInTimeDataError("corporate_actions must be an exact tuple")
@@ -394,6 +416,74 @@ def build_source_bound_execution_outcome(
             "corporate actions must fall inside the five-session holding window"
         )
 
+    terminal_actions = tuple(
+        item
+        for item in actions
+        if item.action_type in {"merger", "acquisition", "delisting"}
+    )
+    transition_actions = tuple(
+        item
+        for item in actions
+        if item.action_type
+        in {"merger", "acquisition", "symbol_change", "delisting"}
+    )
+    if identity.effective_from > market_date:
+        raise PointInTimeDataError(
+            "security identity is not effective on the decision market date"
+        )
+    if identity.effective_to is None:
+        if transition_actions or identity.successor_security_id is not None:
+            raise PointInTimeDataError(
+                "terminal or successor actions require a terminating identity"
+            )
+    else:
+        transition_dates = {item.effective_date for item in transition_actions}
+        if identity.effective_to not in transition_dates:
+            raise PointInTimeDataError(
+                "terminating security identity is not linked to a retained action"
+            )
+        if not window.entry_date <= identity.effective_to <= window.exit_date:
+            raise PointInTimeDataError(
+                "terminating security identity must cover entry through its action"
+            )
+
+    successor = None
+    successor_digest = None
+    if identity.successor_security_id is not None:
+        if type(successor_security) is not SecurityIdentity:
+            raise PointInTimeDataError(
+                "successor identity evidence is required for a successor security"
+            )
+        successor = validate_security_identity(successor_security.to_dict())
+        if (
+            successor.security_id != identity.successor_security_id
+            or successor.effective_from > window.exit_date
+            or (
+                successor.effective_to is not None
+                and successor.effective_to < window.exit_date
+            )
+        ):
+            raise PointInTimeDataError(
+                "successor security identity does not cover the remaining window"
+            )
+        successor_digest = _sha256(successor.to_dict())
+    elif successor_security is not None:
+        raise PointInTimeDataError(
+            "successor identity cannot be supplied without a bound successor"
+        )
+
+    action_set_material = {
+        "security_id": identity.security_id,
+        "entry_session_date": window.entry_date,
+        "exit_session_date": window.exit_date,
+        "actions": [item.to_dict() for item in actions],
+        "completeness_status": "complete",
+    }
+    action_set_id = "corporate-action-set-" + _sha256(action_set_material)
+    action_set_sha256 = _sha256(
+        {**action_set_material, "corporate_action_set_id": action_set_id}
+    )
+
     if type(price_twins) is not tuple or len(price_twins) != len(_TWIN_BASES):
         raise PointInTimeDataError("execution outcome requires the exact four price twins")
     twins = tuple(validate_execution_price_twin(item.to_dict()) for item in price_twins)
@@ -408,12 +498,10 @@ def build_source_bound_execution_outcome(
             "execution price twins must bind the entry security and session"
         )
     next_open = twins[_TWIN_BASES.index("next_open")]
-    if next_open.status != "available" or next_open.price is None:
-        raise PointInTimeDataError("the exact next-open execution price is required")
-
-    terminal_actions = tuple(
-        item for item in actions if item.action_type in {"acquisition", "delisting"}
-    )
+    if next_open.status == "available" and next_open.observed_at != official_open:
+        raise PointInTimeDataError(
+            "next-open observation must equal the official session open"
+        )
     proceeds = None
     status = "completed"
     unavailable_reason = None
@@ -434,14 +522,27 @@ def build_source_bound_execution_outcome(
             raise PointInTimeDataError(
                 "terminal proceeds do not match the retained terminal action"
             )
+        if identity.terminal_proceeds_artifact_id != proceeds.source_artifact_id:
+            raise PointInTimeDataError(
+                "terminal proceeds artifact is not linked by the security identity"
+            )
         exit_value = proceeds.amount_per_share
     elif terminal_actions:
         status = "unavailable"
         unavailable_reason = "required_terminal_proceeds_unproven"
         exit_value = None
 
+    if next_open.status != "available" or next_open.price is None:
+        status = "unavailable"
+        unavailable_reason = (
+            "required_next_open_and_terminal_proceeds_unproven"
+            if terminal_actions and proceeds is None
+            else "required_next_open_unproven"
+        )
+        exit_value = None
+
     gross_return = None
-    if exit_value is not None:
+    if exit_value is not None and next_open.price is not None:
         gross_return = _decimal_text(
             (Decimal(exit_value) - Decimal(next_open.price))
             / Decimal(next_open.price)
@@ -454,6 +555,7 @@ def build_source_bound_execution_outcome(
         "decision_market_date": market_date,
         "decision_cutoff": cutoff,
         "entry_session_date": window.entry_date,
+        "entry_session_open_at": official_open,
         "exit_session_date": window.exit_date,
         "holding_session_dates": [item[0] for item in window.daily_closes],
         "market_calendar_id": calendar.calendar_id,
@@ -462,6 +564,11 @@ def build_source_bound_execution_outcome(
         "market_calendar_raw_artifact_sha256": calendar.raw_artifact_sha256,
         "adjusted_price_window_id": window.window_id,
         "adjusted_price_window_sha256": window.window_sha256,
+        "security_identity_sha256": _sha256(identity.to_dict()),
+        "successor_security_id": None if successor is None else successor.security_id,
+        "successor_security_sha256": successor_digest,
+        "corporate_action_set_id": action_set_id,
+        "corporate_action_set_sha256": action_set_sha256,
         "corporate_actions": [item.to_dict() for item in actions],
         "terminal_proceeds": None if proceeds is None else proceeds.to_dict(),
         "price_twins": [item.to_dict() for item in twins],
@@ -482,6 +589,7 @@ def build_source_bound_execution_outcome(
         decision_market_date=market_date,
         decision_cutoff=cutoff,
         entry_session_date=window.entry_date,
+        entry_session_open_at=official_open,
         exit_session_date=window.exit_date,
         holding_session_dates=tuple(item[0] for item in window.daily_closes),
         market_calendar_id=calendar.calendar_id,
@@ -490,6 +598,11 @@ def build_source_bound_execution_outcome(
         market_calendar_raw_artifact_sha256=calendar.raw_artifact_sha256,
         adjusted_price_window_id=window.window_id,
         adjusted_price_window_sha256=window.window_sha256,
+        security_identity_sha256=_sha256(identity.to_dict()),
+        successor_security_id=None if successor is None else successor.security_id,
+        successor_security_sha256=successor_digest,
+        corporate_action_set_id=action_set_id,
+        corporate_action_set_sha256=action_set_sha256,
         corporate_actions=actions,
         terminal_proceeds=proceeds,
         price_twins=twins,
@@ -506,6 +619,7 @@ def validate_source_bound_execution_outcome(
     security: SecurityIdentity,
     market_calendar: MarketSessionCalendar,
     adjusted_price_window: SourceBoundAdjustedPriceWindow,
+    successor_security: SecurityIdentity | None = None,
 ) -> SourceBoundExecutionOutcome:
     """Canonical-rebuild an outcome against its separately retained receipts."""
 
@@ -535,9 +649,11 @@ def validate_source_bound_execution_outcome(
         security=security,
         market_calendar=market_calendar,
         adjusted_price_window=adjusted_price_window,
+        entry_session_open_at=value["entry_session_open_at"],
         corporate_actions=actions,
         terminal_proceeds=proceeds,
         price_twins=twins,
+        successor_security=successor_security,
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(value):
         raise PointInTimeDataError(

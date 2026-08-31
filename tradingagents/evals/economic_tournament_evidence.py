@@ -1,11 +1,9 @@
 """Pure, source-bound inputs for qualifying TA-Control evaluation.
 
-The evaluator deliberately receives simple candidate and return values.  This
-module is the immutable boundary that makes those values auditable: every
-candidate is bound to a PIT security and observation, every non-null signal is
-bound to a cutoff-safe observation, and every realized return is rebuilt from a
-complete total-return-adjusted price-window receipt.  It has no archive, store,
-filesystem, network, broker, or execution dependency.
+The evaluator receives canonical execution outcomes, never free-form realized
+return tuples. This immutable boundary binds every candidate and execution
+outcome to its PIT identities and supporting receipts. It has no archive,
+store, filesystem, network, broker, or execution dependency.
 """
 
 from __future__ import annotations
@@ -26,6 +24,16 @@ from tradingagents.dataflows.pit.records import (
     validate_point_in_time_observation,
     validate_security_identity,
 )
+from tradingagents.dataflows.pit.adjusted_price_windows import (
+    validate_five_session_adjusted_price_window,
+)
+from tradingagents.dataflows.pit.execution_outcomes import (
+    SourceBoundExecutionOutcome,
+    validate_source_bound_execution_outcome,
+)
+from tradingagents.dataflows.pit.market_calendar import (
+    validate_market_session_calendar,
+)
 from tradingagents.evals.economic_evaluation_partition_binding import (
     ValidationPhaseEligibility,
     validate_validation_phase_eligibility,
@@ -34,10 +42,7 @@ from tradingagents.evals.economic_evaluation_protocol import (
     FrozenEvaluationProtocol,
     validate_frozen_evaluation_protocol,
 )
-from tradingagents.evals.economic_tournament import (
-    EconomicTournamentCandidate,
-    EconomicTournamentOutcome,
-)
+from tradingagents.evals.economic_tournament import EconomicTournamentCandidate
 from tradingagents.sleeves.pullback_support import PullbackFeatures
 
 __all__ = [
@@ -55,8 +60,8 @@ __all__ = [
 
 
 _FEATURE_SCHEMA = "source_bound_economic_tournament_features/v1"
-_OUTCOME_SCHEMA = "source_bound_economic_tournament_outcomes/v1"
-_SCHEMA = "source_bound_economic_tournament_input/v2"
+_OUTCOME_SCHEMA = "source_bound_economic_tournament_outcomes/v2"
+_SCHEMA = "source_bound_economic_tournament_input/v3"
 _AUTHORITY = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -120,8 +125,10 @@ _BENCHMARK_FIELDS = frozenset(
 )
 _FIELD_SOURCE_FIELDS = frozenset({"field", "value", "observation"})
 _PULLBACK_SOURCE_FIELDS = frozenset({"field", "value_sha256", "observation"})
-_OUTCOME_FIELDS = frozenset({"symbol", "return", "price_window"})
-_OUTCOME_DATE_FIELDS = frozenset({"market_date", "outcomes"})
+_OUTCOME_FIELDS = frozenset({"execution_outcome", "price_window"})
+_OUTCOME_DATE_FIELDS = frozenset(
+    {"market_date", "market_calendar", "outcomes"}
+)
 _PRICE_WINDOW_FIELDS = frozenset(
     {
         "schema_version",
@@ -465,53 +472,47 @@ def _outcome(
     value: object,
     *,
     security: SecurityIdentity,
+    market_calendar: object,
     event_market_date: str,
-    event_decision_at: str,
+    expected_decision_event_id: str,
     label: str,
-) -> tuple[tuple[str, str], dict[str, object]]:
+) -> tuple[SourceBoundExecutionOutcome, dict[str, object]]:
     payload = _exact_mapping(value, _OUTCOME_FIELDS, label=label)
-    if payload["symbol"] != security.symbol:
-        raise EconomicTournamentInputEvidenceError(f"{label}.symbol is invalid")
-    returned = _canonical_decimal(payload["return"], label=f"{label}.return")
     window = _exact_mapping(
         payload["price_window"],
         _PRICE_WINDOW_FIELDS,
         label=f"{label}.price_window",
     )
+    try:
+        calendar = validate_market_session_calendar(market_calendar)
+        rebuilt_window = validate_five_session_adjusted_price_window(
+            value=window,
+            market_calendar=calendar,
+            decision_market_date=event_market_date,
+        )
+        outcome = validate_source_bound_execution_outcome(
+            payload["execution_outcome"],
+            security=security,
+            market_calendar=calendar,
+            adjusted_price_window=rebuilt_window,
+        )
+    except (TypeError, ValueError) as exc:
+        raise EconomicTournamentInputEvidenceError(
+            f"{label} execution outcome is invalid"
+        ) from exc
     if (
-        window["schema_version"] != "source_bound_adjusted_price_window/v1"
-        or any(window[key] != expected for key, expected in _AUTHORITY.items())
-        or window["symbol"] != security.symbol
-        or window["security_id"] != security.security_id
-        or type(window["entry_date"]) is not str
-        or type(window["decision_cutoff"]) is not str
+        outcome.symbol != security.symbol
+        or outcome.security_id != security.security_id
+        or outcome.decision_event_id != expected_decision_event_id
+        or outcome.decision_market_date != event_market_date
     ):
         raise EconomicTournamentInputEvidenceError(
-            f"{label} price window security identity does not match"
+            f"{label} execution outcome event or security identity does not match"
         )
-    if window["entry_date"] <= event_market_date or window["decision_cutoff"] <= event_decision_at:
-        raise EconomicTournamentInputEvidenceError(f"{label} price window is not a post-decision outcome")
-    if (
-        type(window["window_id"]) is not str
-        or not window["window_id"].startswith("source-bound-adjusted-price-window-")
-        or type(window["window_sha256"]) is not str
-        or _SHA256.fullmatch(window["window_sha256"]) is None
-        or type(window["raw_artifact_sha256"]) is not str
-        or _SHA256.fullmatch(window["raw_artifact_sha256"]) is None
-    ):
-        raise EconomicTournamentInputEvidenceError(
-            f"{label} price window identity is invalid"
-        )
-    expected = (Decimal(window["exit_close"]) - Decimal(window["entry_close"])) / Decimal(
-        window["entry_close"]
-    )
-    expected_text = _decimal_text(expected)
-    if returned != expected_text:
-        raise EconomicTournamentInputEvidenceError(
-            f"{label} outcome return does not match source-bound price window"
-        )
-    payload["price_window"] = window
-    return (payload["symbol"], returned), payload  # type: ignore[return-value]
+    return outcome, {
+        "execution_outcome": outcome.to_dict(),
+        "price_window": rebuilt_window.to_dict(),
+    }
 
 
 def _feature_date(
@@ -736,7 +737,7 @@ class SourceBoundTournamentOutcomes:
     validation_event_ids: tuple[str, ...]
     market_dates: tuple[str, ...]
     date_evidence: tuple[Mapping[str, object], ...]
-    outcomes: tuple[EconomicTournamentOutcome, ...]
+    outcomes: tuple[SourceBoundExecutionOutcome, ...]
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("SourceBoundTournamentOutcomes instances require its builder")
@@ -769,7 +770,7 @@ class SourceBoundTournamentInput:
     features: SourceBoundTournamentFeatures
     outcome_receipt: SourceBoundTournamentOutcomes
     candidates_by_event: Mapping[str, tuple[EconomicTournamentCandidate, ...]]
-    outcomes: tuple[EconomicTournamentOutcome, ...]
+    outcomes: tuple[SourceBoundExecutionOutcome, ...]
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("SourceBoundTournamentInput instances require its builder")
@@ -928,9 +929,9 @@ def _build_outcomes(
     if len(raw_dates) != len(grouped):
         raise EconomicTournamentInputEvidenceError(
             "outcomes must be grouped once per validation market date"
-        )
+    )
     canonical_dates: list[Mapping[str, object]] = []
-    evaluator_outcomes: dict[str, EconomicTournamentOutcome] = {}
+    evaluator_outcomes: list[SourceBoundExecutionOutcome] = []
     for index, ((market_date, events), raw_date, feature_date) in enumerate(
         zip(grouped, raw_dates, features.date_evidence, strict=True)
     ):
@@ -943,6 +944,12 @@ def _build_outcomes(
             raise EconomicTournamentInputEvidenceError(
                 f"market_dates[{index}] is not the matching outcome date"
             )
+        try:
+            calendar = validate_market_session_calendar(payload["market_calendar"])
+        except (TypeError, ValueError) as exc:
+            raise EconomicTournamentInputEvidenceError(
+                f"market_dates[{index}] market calendar is invalid"
+            ) from exc
         identities: dict[str, SecurityIdentity] = {}
         feature_candidates = feature_date.get("candidates")
         feature_benchmark = feature_date.get("benchmark")
@@ -961,43 +968,55 @@ def _build_outcomes(
             _thaw_json(feature_benchmark["security"])
         )
         identities[benchmark_security.symbol] = benchmark_security
-        returns: list[tuple[str, str]] = []
+        date_outcomes: list[SourceBoundExecutionOutcome] = []
         normalized: list[dict[str, object]] = []
-        decision_at = max(event.decision_at for event in events)
+        events_by_symbol = {event.symbol: event for event in events}
+        first_event_id = events[0].decision_event_id
         for outcome_index, raw_outcome in enumerate(payload["outcomes"]):
-            if not isinstance(raw_outcome, Mapping) or type(raw_outcome.get("symbol")) is not str:
+            execution_payload = (
+                raw_outcome.get("execution_outcome")
+                if isinstance(raw_outcome, Mapping)
+                else None
+            )
+            if not isinstance(execution_payload, Mapping) or type(
+                execution_payload.get("symbol")
+            ) is not str:
                 raise EconomicTournamentInputEvidenceError(
                     f"market_dates[{index}].outcomes[{outcome_index}] is invalid"
                 )
-            symbol = raw_outcome["symbol"]
+            symbol = execution_payload["symbol"]
             if symbol not in identities:
                 raise EconomicTournamentInputEvidenceError(
                     f"market_dates[{index}].outcomes[{outcome_index}] lacks feature identity"
                 )
-            returned, evidence = _outcome(
+            expected_event_id = (
+                first_event_id
+                if symbol == "SPY"
+                else events_by_symbol[symbol].decision_event_id
+            )
+            outcome, evidence = _outcome(
                 raw_outcome,
                 security=identities[symbol],
+                market_calendar=calendar.to_dict(),
                 event_market_date=market_date,
-                event_decision_at=decision_at,
+                expected_decision_event_id=expected_event_id,
                 label=f"market_dates[{index}].outcomes[{outcome_index}]",
             )
-            returns.append(returned)
+            date_outcomes.append(outcome)
             normalized.append(evidence)
         expected_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
-        if tuple(symbol for symbol, _value in returns) != expected_symbols:
+        if tuple(item.symbol for item in date_outcomes) != expected_symbols:
             raise EconomicTournamentInputEvidenceError(
                 "outcomes must cover the primary universe and SPY exactly"
             )
-        shared_returns = tuple(returns)
-        for event in events:
-            event_id = event.decision_event_id
-            evaluator_outcomes[event_id] = EconomicTournamentOutcome(
-                decision_event_id=event_id,
-                realized_returns=shared_returns,
-            )
+        evaluator_outcomes.extend(date_outcomes)
         canonical_dates.append(
             _freeze_json(
-                {"market_date": market_date, "outcomes": normalized},
+                {
+                    "market_date": market_date,
+                    "market_calendar": calendar.to_dict(),
+                    "outcomes": normalized,
+                },
                 label=f"market_dates[{index}]",
             )
         )
@@ -1026,7 +1045,7 @@ def _build_outcomes(
         validation_event_ids=bound.event_ids,
         market_dates=tuple(item[0] for item in grouped),
         date_evidence=tuple(canonical_dates),
-        outcomes=tuple(evaluator_outcomes[event_id] for event_id in bound.event_ids),
+        outcomes=tuple(evaluator_outcomes),
     )  # type: ignore[return-value]
 
 

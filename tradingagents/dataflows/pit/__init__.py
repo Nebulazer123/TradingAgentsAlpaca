@@ -31,6 +31,7 @@ from .cohort_admission import (
 from .market_calendar import (
     MarketSessionCalendar,
     build_market_session_calendar,
+    resolve_market_session_open,
     validate_market_session_calendar,
 )
 from .official_observations import (
@@ -92,6 +93,7 @@ __all__ = [
     "validate_source_bound_execution_outcome",
     "MarketSessionCalendar",
     "build_market_session_calendar",
+    "resolve_market_session_open",
     "validate_market_session_calendar",
     "MarketDatePartitions",
     "build_market_date_partitions",

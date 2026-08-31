@@ -42,6 +42,8 @@ def _observations():
                     net_return=returned,
                     benchmark_net_return="0.005",
                     turnover="0" if arm == "cash" else "0.25",
+                    buy_notional="0" if arm == "cash" else "0.15",
+                    sell_notional="0" if arm == "cash" else "0.1",
                     cost_drag="0" if arm == "cash" else "0.00025",
                     false_positive=returned.startswith("-"),
                     positions=(
@@ -86,6 +88,18 @@ def test_registered_statistics_are_deterministic_and_weekly_date_primary():
     assert payload["walk_forward"]["purge_sessions"] == 5
     assert payload["walk_forward"]["embargo_sessions"] == 5
     assert payload["multiple_testing"]["method"] == "holm_bonferroni_registered_contrasts"
+    assert payload["multiple_testing"]["registered_hypothesis_count"] == 8
+    assert all(
+        "raw_p_value" in row and "holm_adjusted_p_value" in row
+        for row in payload["multiple_testing"]["diagnostics"]
+    )
+    equal_weight = next(
+        row for row in payload["arm_diagnostics"] if row["arm_id"] == "equal_weight"
+    )
+    assert equal_weight["turnover_convention"] == "gross_security_traded_notional"
+    assert equal_weight["factor_exposure_status"] == "available"
+    assert equal_weight["position_concentration"]["cross_date_aggregation"] == "arithmetic_mean"
+    assert len(equal_weight["position_concentration"]["per_date"]) == 8
     assert payload["status"] == "completed"
     assert payload["analysis_only"] is True
     assert "effective_sample_size" not in json.dumps(payload)
@@ -113,3 +127,50 @@ def test_statistics_reject_arm_or_date_pseudoreplication():
             market_event_cluster_count=8,
             observations_by_arm=rows,
         )
+
+
+def test_statistics_reject_noncanonical_nested_identity_and_partial_exposures():
+    statistics = build_economic_tournament_statistics(
+        raw_source_row_count=1208,
+        decision_event_count=600,
+        packet_event_cluster_count=32,
+        market_event_cluster_count=8,
+        observations_by_arm=_observations(),
+    )
+    tampered = statistics.to_dict()
+    tampered["multiple_testing"]["diagnostics"][0]["raw_p_value"] = "0.9"
+    with pytest.raises(EconomicTournamentStatisticsError):
+        validate_economic_tournament_statistics(tampered)
+
+    rows = _observations()
+    first = rows["equal_weight"][0]
+    rows["equal_weight"] = (
+        first,
+        WeeklyArmObservation(
+            market_date=rows["equal_weight"][1].market_date,
+            gross_return=rows["equal_weight"][1].gross_return,
+            net_return=rows["equal_weight"][1].net_return,
+            benchmark_net_return=rows["equal_weight"][1].benchmark_net_return,
+            turnover=rows["equal_weight"][1].turnover,
+            buy_notional=rows["equal_weight"][1].buy_notional,
+            sell_notional=rows["equal_weight"][1].sell_notional,
+            cost_drag=rows["equal_weight"][1].cost_drag,
+            false_positive=rows["equal_weight"][1].false_positive,
+            positions=rows["equal_weight"][1].positions,
+            factor_exposures=(),
+            sector_exposures=(),
+        ),
+        *rows["equal_weight"][2:],
+    )
+    partial = build_economic_tournament_statistics(
+        raw_source_row_count=1208,
+        decision_event_count=600,
+        packet_event_cluster_count=32,
+        market_event_cluster_count=8,
+        observations_by_arm=rows,
+    ).to_dict()
+    diagnostic = next(
+        row for row in partial["arm_diagnostics"] if row["arm_id"] == "equal_weight"
+    )
+    assert diagnostic["factor_exposure_status"] == "unavailable"
+    assert diagnostic["factor_exposures"] == []

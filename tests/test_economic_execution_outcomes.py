@@ -17,6 +17,7 @@ from tradingagents.dataflows.pit import (
     build_market_session_calendar,
     build_source_bound_adjusted_price_window,
     build_source_bound_execution_outcome,
+    resolve_market_session_open,
     validate_source_bound_execution_outcome,
 )
 
@@ -35,7 +36,12 @@ MARKET_DATES = (
 def _receipts(tmp_path):
     archive = RawPointInTimeArtifactArchive(tmp_path / "pit")
     calendar_artifact = archive.admit(
-        raw_bytes=json.dumps([{"date": item} for item in MARKET_DATES]).encode(),
+        raw_bytes=json.dumps(
+            [
+                {"date": item, "open": "09:30", "close": "16:00"}
+                for item in MARKET_DATES
+            ]
+        ).encode(),
         source_uri="https://paper-api.alpaca.markets/v2/calendar",
         content_type="application/json",
         retrieved_at="2026-01-20T21:00:00+00:00",
@@ -75,7 +81,9 @@ def _receipts(tmp_path):
     return calendar, window
 
 
-def _security() -> SecurityIdentity:
+def _security(
+    *, effective_to: str | None = None, terminal_artifact_id: str | None = None
+) -> SecurityIdentity:
     return SecurityIdentity(
         security_id="security-t000",
         symbol="T000",
@@ -84,15 +92,15 @@ def _security() -> SecurityIdentity:
         exchange="XNYS",
         security_type="common_stock",
         effective_from="2020-01-01",
-        effective_to=None,
-        status="active",
+        effective_to=effective_to,
+        status="active" if effective_to is None else "delisted",
         successor_security_id=None,
-        terminal_proceeds_artifact_id=None,
+        terminal_proceeds_artifact_id=terminal_artifact_id,
         source_hashes={"security_master": hashlib.sha256(b"security").hexdigest()},
     )
 
 
-def _twins(*, security_id: str = "security-t000"):
+def _twins(*, security_id: str = "security-t000", next_open: bool = True):
     digest = hashlib.sha256(b"next-open").hexdigest()
     return (
         ExecutionPriceTwin(
@@ -109,15 +117,15 @@ def _twins(*, security_id: str = "security-t000"):
         ),
         ExecutionPriceTwin(
             price_basis="next_open",
-            status="available",
+            status="available" if next_open else "unavailable",
             security_id=security_id,
             session_date="2026-01-12",
-            observed_at="2026-01-12T14:30:00+00:00",
-            price="10",
-            adjustment_status="total_return_adjusted",
-            source_artifact_id="raw-next-open",
-            source_artifact_sha256=digest,
-            unavailable_reason=None,
+            observed_at="2026-01-12T14:30:00+00:00" if next_open else None,
+            price="10" if next_open else None,
+            adjustment_status="total_return_adjusted" if next_open else None,
+            source_artifact_id="raw-next-open" if next_open else None,
+            source_artifact_sha256=digest if next_open else None,
+            unavailable_reason=None if next_open else "source_not_retained",
         ),
         ExecutionPriceTwin(
             price_basis="executable_quote",
@@ -146,9 +154,27 @@ def _twins(*, security_id: str = "security-t000"):
     )
 
 
-def _build(tmp_path, *, actions=(), proceeds=None):
+def _build(tmp_path, *, actions=(), proceeds=None, next_open=True):
     calendar, window = _receipts(tmp_path)
-    security = _security()
+    terminal = next(
+        (
+            action
+            for action in actions
+            if action.action_type in {"merger", "acquisition", "delisting"}
+        ),
+        None,
+    )
+    security = _security(
+        effective_to=None if terminal is None else terminal.effective_date,
+        terminal_artifact_id=(
+            None if terminal is None else "raw-terminal-proceeds"
+        ),
+    )
+    official_open = resolve_market_session_open(
+        archive=RawPointInTimeArtifactArchive(tmp_path / "pit"),
+        market_calendar=calendar,
+        session_date=window.entry_date,
+    )
     outcome = build_source_bound_execution_outcome(
         decision_event_id="decision-event-" + "a" * 64,
         decision_market_date="2026-01-09",
@@ -156,9 +182,10 @@ def _build(tmp_path, *, actions=(), proceeds=None):
         security=security,
         market_calendar=calendar,
         adjusted_price_window=window,
+        entry_session_open_at=official_open,
         corporate_actions=actions,
         terminal_proceeds=proceeds,
-        price_twins=_twins(),
+        price_twins=_twins(next_open=next_open),
     )
     return outcome, security, calendar, window
 
@@ -232,3 +259,26 @@ def test_terminal_action_without_verified_proceeds_is_unavailable_not_guessed(tm
             actions=(acquisition,),
             proceeds=proceeds,
         )[0].price_for("unknown")
+
+
+def test_missing_next_open_completes_as_unavailable_and_open_must_match(tmp_path):
+    outcome, *_ = _build(tmp_path / "missing-open", next_open=False)
+    assert outcome.status == "unavailable"
+    assert outcome.unavailable_reason == "required_next_open_unproven"
+    assert outcome.exit_value is None
+    assert outcome.gross_return is None
+
+    calendar, window = _receipts(tmp_path / "wrong-open")
+    with pytest.raises(PointInTimeDataError, match="official session open"):
+        build_source_bound_execution_outcome(
+            decision_event_id="decision-event-" + "a" * 64,
+            decision_market_date="2026-01-09",
+            decision_cutoff="2026-01-09T20:55:00+00:00",
+            security=_security(),
+            market_calendar=calendar,
+            adjusted_price_window=window,
+            entry_session_open_at="2026-01-12T14:31:00+00:00",
+            corporate_actions=(),
+            terminal_proceeds=None,
+            price_twins=_twins(),
+        )

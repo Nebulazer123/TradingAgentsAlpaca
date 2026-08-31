@@ -5,9 +5,11 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+from decimal import Decimal
 
 import pytest
 
+from tests.fixtures.economic_tournament import build_tournament_receipt
 from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
 from tradingagents.dataflows.pit import (
     RawPointInTimeArtifactArchive,
@@ -29,7 +31,8 @@ from tradingagents.evals.economic_evaluation_protocol import (
 from tradingagents.evals.economic_tournament import (
     EconomicTournamentCandidate,
     EconomicTournamentError,
-    EconomicTournamentOutcome,
+    _post_return_holdings,
+    _traded_notional,
     build_ta_control_allocations,
     evaluate_validation_ta_control,
 )
@@ -94,15 +97,6 @@ def _candidates(event, universe=UNIVERSE):
     )
 
 
-def _outcome(event_id: str, universe=UNIVERSE):
-    return EconomicTournamentOutcome(
-        decision_event_id=event_id,
-        realized_returns=tuple(
-            sorted([(symbol, "0.01") for symbol in universe] + [("SPY", "0.02")])
-        ),
-    )
-
-
 def test_ta_control_uses_frozen_universe_and_leaves_missing_inputs_in_cash(protocol_source):
     protocol, _partitions, events_by_id = _protocol(protocol_source)
     event = next(iter(events_by_id.values()))
@@ -135,26 +129,32 @@ def test_ta_control_rejects_candidate_universe_or_event_outside_protocol(protoco
         build_ta_control_allocations(protocol=protocol, decision_event=event, candidates=candidates[:-1])
 
 
-def test_validation_tournament_uses_only_purged_pit_validation_events(protocol_source):
+def test_validation_tournament_uses_only_purged_pit_validation_events(
+    tmp_path, protocol_source
+):
     protocol, partitions, events_by_id = _protocol(protocol_source)
     eligibility = bind_validation_phase_eligibility(
         protocol=protocol,
         partitions=partitions,
     )
+    receipt, _archive = build_tournament_receipt(
+        tmp_path / "pit",
+        protocol=protocol,
+        eligibility=eligibility,
+    )
     result = evaluate_validation_ta_control(
         protocol=protocol,
         eligibility=eligibility,
-        candidates_by_event={
-            event_id: _candidates(events_by_id[event_id], protocol.primary_universe)
-            for event_id in eligibility.event_ids
-        },
-        outcomes=tuple(_outcome(event_id, protocol.primary_universe) for event_id in eligibility.event_ids),
+        candidates_by_event=dict(receipt.candidates_by_event),
+        execution_outcomes=receipt.outcomes,
+        tournament_input_id=receipt.input_id,
+        tournament_input_sha256=receipt.input_sha256,
     )
 
     metrics = {row["arm_id"]: row["metrics"] for row in result.arm_metrics}
     assert result.protocol_id == protocol.protocol_id
     assert len(result.validation_event_ids) == len(eligibility.event_ids) == 75
-    assert metrics["equal_weight"]["net_return_after_costs"] == "0.008"
+    assert metrics["equal_weight"]["net_return_after_costs"] == "0.498"
     assert metrics["spy"]["benchmark_excess_after_costs"] == "0"
     assert metrics["equal_weight"]["turnover"] == "2"
     assert [row["cost_bps_per_side"] for row in result.cost_variants] == [
@@ -165,7 +165,47 @@ def test_validation_tournament_uses_only_purged_pit_validation_events(protocol_s
     ]
     assert result.registered_statistics["primary_unit"] == "weekly_market_date"
     assert result.registered_statistics["decision_event_count"] == 75
+    assert result.to_dict()["tournament_input"]["input_id"] == receipt.input_id
+    assert len(result.to_dict()["execution_outcomes"]) == 76
     assert "effective_sample_size" not in json.dumps(result.to_dict())
+
+
+def test_two_date_drift_rotation_uses_full_buy_and_sell_notional():
+    first_target = {
+        "CASH": Decimal("0"),
+        "T000": Decimal("0.5"),
+        "T001": Decimal("0.5"),
+    }
+    initial_buys, initial_sells = _traded_notional(
+        {"CASH": Decimal("1")}, first_target
+    )
+    drifted = _post_return_holdings(
+        first_target,
+        {"T000": Decimal("0.1"), "T001": Decimal("-0.1")},
+    )
+    second_target = {"CASH": Decimal("0"), "T001": Decimal("1")}
+    rotation_buys, rotation_sells = _traded_notional(drifted, second_target)
+    final_buys, final_sells = _traded_notional(
+        _post_return_holdings(second_target, {"T001": Decimal("0.2")}),
+        {"CASH": Decimal("1")},
+    )
+
+    assert (initial_buys, initial_sells) == (Decimal("1"), Decimal("0"))
+    assert drifted["T000"] == Decimal("0.55")
+    assert drifted["T001"] == Decimal("0.45")
+    assert (rotation_buys, rotation_sells) == (Decimal("0.55"), Decimal("0.55"))
+    assert (final_buys, final_sells) == (Decimal("0"), Decimal("1"))
+    assert sum(
+        (
+            initial_buys,
+            initial_sells,
+            rotation_buys,
+            rotation_sells,
+            final_buys,
+            final_sells,
+        ),
+        Decimal("0"),
+    ) == Decimal("3.1")
 
 
 def test_validation_eligibility_rebuilds_the_complete_pit_partition_receipt(protocol_source):

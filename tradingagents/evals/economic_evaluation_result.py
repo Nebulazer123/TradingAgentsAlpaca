@@ -8,6 +8,7 @@ may later preserve and bind to a sealed holdout release explicit and auditable.
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hashlib
 import json
 import re
@@ -15,6 +16,7 @@ from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 
+from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
 from tradingagents.evals.economic_evaluation_partition_binding import (
     ValidationPhaseEligibility,
     validate_validation_phase_eligibility,
@@ -210,6 +212,84 @@ def _canonical_decimal_half(value: str) -> str:
     return "0" if parsed.is_zero() else format(parsed.normalize(), "f")
 
 
+def _canonical_execution_outcome_refs(
+    value: object,
+) -> tuple[Mapping[str, str], ...]:
+    if type(value) is tuple and all(
+        type(item) is SourceBoundExecutionOutcome for item in value
+    ):
+        rows = [
+            {
+                "market_date": item.decision_market_date,
+                "symbol": item.symbol,
+                "outcome_id": item.outcome_id,
+                "outcome_sha256": item.outcome_sha256,
+            }
+            for item in value
+        ]
+    elif type(value) is list:
+        rows = []
+        for item in value:
+            rows.append(
+                _exact_fields(
+                    item,
+                    frozenset(
+                        {
+                            "market_date",
+                            "symbol",
+                            "outcome_id",
+                            "outcome_sha256",
+                        }
+                    ),
+                    label="execution outcome reference",
+                )
+            )
+    else:
+        raise EconomicEvaluationResultError(
+            "v3 result requires canonical execution outcome references"
+        )
+    order: list[tuple[str, str]] = []
+    canonical: list[Mapping[str, str]] = []
+    for row in rows:
+        market_date = row["market_date"]
+        symbol = row["symbol"]
+        outcome_id = row["outcome_id"]
+        outcome_sha256 = row["outcome_sha256"]
+        try:
+            parsed_market_date = (
+                dt.date.fromisoformat(market_date)
+                if type(market_date) is str
+                else None
+            )
+        except ValueError:
+            parsed_market_date = None
+        if (
+            type(market_date) is not str
+            or parsed_market_date is None
+            or parsed_market_date.isoformat() != market_date
+            or type(symbol) is not str
+            or not symbol.isupper()
+            or type(outcome_id) is not str
+            or not outcome_id.startswith("source-bound-execution-outcome-")
+            or _SHA256.fullmatch(
+                outcome_id.removeprefix("source-bound-execution-outcome-")
+            )
+            is None
+            or type(outcome_sha256) is not str
+            or _SHA256.fullmatch(outcome_sha256) is None
+        ):
+            raise EconomicEvaluationResultError(
+                "execution outcome reference is invalid"
+            )
+        order.append((market_date, symbol))
+        canonical.append(MappingProxyType(dict(row)))
+    if tuple(order) != tuple(sorted(order)) or len(set(order)) != len(order):
+        raise EconomicEvaluationResultError(
+            "execution outcome references are not canonical"
+        )
+    return tuple(canonical)
+
+
 def _legacy_metric_value(value: object, *, metric: str) -> str:
     """Apply the historical v1 decimal rules without rewriting stored bytes."""
 
@@ -276,6 +356,9 @@ class EconomicValidationResult:
     arm_metrics: tuple[Mapping[str, object], ...]
     cost_variants: tuple[Mapping[str, object], ...] | None
     registered_statistics: Mapping[str, object] | None
+    tournament_input_id: str | None
+    tournament_input_sha256: str | None
+    execution_outcome_refs: tuple[Mapping[str, str], ...] | None
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError(
@@ -307,6 +390,16 @@ class EconomicValidationResult:
         }
         if extended:
             assert self.registered_statistics is not None
+            assert self.tournament_input_id is not None
+            assert self.tournament_input_sha256 is not None
+            assert self.execution_outcome_refs is not None
+            payload["tournament_input"] = {
+                "input_id": self.tournament_input_id,
+                "input_sha256": self.tournament_input_sha256,
+            }
+            payload["execution_outcomes"] = [
+                dict(item) for item in self.execution_outcome_refs
+            ]
             payload["cost_variants"] = [
                 {
                     "cost_bps_per_side": row["cost_bps_per_side"],
@@ -374,7 +467,14 @@ _RESULT_SERIALIZED_FIELDS = frozenset(
     tuple(
         name
         for name in _RESULT_FIELD_NAMES
-        if name not in {"cost_variants", "registered_statistics"}
+        if name
+        not in {
+            "cost_variants",
+            "registered_statistics",
+            "tournament_input_id",
+            "tournament_input_sha256",
+            "execution_outcome_refs",
+        }
     )
     + (
         "schema_version",
@@ -384,7 +484,13 @@ _RESULT_SERIALIZED_FIELDS = frozenset(
     + tuple(_AUTHORITY_FIELDS)
 )
 _TOURNAMENT_RESULT_SERIALIZED_FIELDS = frozenset(
-    _RESULT_SERIALIZED_FIELDS | {"cost_variants", "registered_statistics"}
+    _RESULT_SERIALIZED_FIELDS
+    | {
+        "cost_variants",
+        "registered_statistics",
+        "tournament_input",
+        "execution_outcomes",
+    }
 )
 _LEGACY_RESULT_SERIALIZED_FIELDS = frozenset(
     {
@@ -424,6 +530,9 @@ def _result_material(
     arm_metrics: tuple[Mapping[str, object], ...],
     cost_variants: tuple[Mapping[str, object], ...] | None = None,
     registered_statistics: Mapping[str, object] | None = None,
+    tournament_input_id: str | None = None,
+    tournament_input_sha256: str | None = None,
+    execution_outcome_refs: tuple[Mapping[str, str], ...] | None = None,
     result_id: str | None = None,
     result_sha256: str | None = None,
 ) -> dict[str, object]:
@@ -449,10 +558,22 @@ def _result_material(
         **_AUTHORITY_FIELDS,
     }
     if cost_variants is not None:
-        if registered_statistics is None:
+        if (
+            registered_statistics is None
+            or tournament_input_id is None
+            or tournament_input_sha256 is None
+            or execution_outcome_refs is None
+        ):
             raise EconomicEvaluationResultError(
-                "cost variants require registered statistics"
+                "v3 results require statistics and source-bound outcome bindings"
             )
+        payload["tournament_input"] = {
+            "input_id": tournament_input_id,
+            "input_sha256": tournament_input_sha256,
+        }
+        payload["execution_outcomes"] = [
+            dict(item) for item in execution_outcome_refs
+        ]
         payload["cost_variants"] = [
             {
                 "cost_bps_per_side": row["cost_bps_per_side"],
@@ -508,6 +629,9 @@ def build_validation_evaluation_result(
     eligibility: ValidationPhaseEligibility,
     cost_variant_metrics: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
     registered_statistics: EconomicTournamentStatistics | None = None,
+    tournament_input_id: str | None = None,
+    tournament_input_sha256: str | None = None,
+    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...] | None = None,
 ) -> EconomicValidationResult:
     """Build a complete result for the canonical, purged validation phase."""
 
@@ -536,6 +660,7 @@ def build_validation_evaluation_result(
     )
     variants = None
     statistics = None
+    outcome_refs = None
     if cost_variant_metrics is not None or registered_statistics is not None:
         if cost_variant_metrics is None or type(registered_statistics) is not EconomicTournamentStatistics:
             raise EconomicEvaluationResultError(
@@ -548,6 +673,20 @@ def build_validation_evaluation_result(
         statistics = validate_economic_tournament_statistics(
             registered_statistics.to_dict()
         ).to_dict()
+        if (
+            type(tournament_input_id) is not str
+            or not tournament_input_id.startswith("economic-tournament-input-")
+            or _SHA256.fullmatch(
+                tournament_input_id.removeprefix("economic-tournament-input-")
+            )
+            is None
+            or type(tournament_input_sha256) is not str
+            or _SHA256.fullmatch(tournament_input_sha256) is None
+        ):
+            raise EconomicEvaluationResultError(
+                "v3 tournament input binding is invalid"
+            )
+        outcome_refs = _canonical_execution_outcome_refs(execution_outcomes)
     return _build_result_from_components(
         protocol_id=validated.protocol_id,
         validation_partition_id=bound.partition_id,
@@ -556,6 +695,9 @@ def build_validation_evaluation_result(
         arm_metrics=metrics,
         cost_variants=variants,
         registered_statistics=statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcome_refs=outcome_refs,
     )
 
 
@@ -568,6 +710,9 @@ def _build_result_from_components(
     arm_metrics: tuple[Mapping[str, object], ...],
     cost_variants: tuple[Mapping[str, object], ...] | None = None,
     registered_statistics: Mapping[str, object] | None = None,
+    tournament_input_id: str | None = None,
+    tournament_input_sha256: str | None = None,
+    execution_outcome_refs: tuple[Mapping[str, str], ...] | None = None,
 ) -> EconomicValidationResult:
     material = _result_material(
         protocol_id=protocol_id,
@@ -577,6 +722,9 @@ def _build_result_from_components(
         arm_metrics=arm_metrics,
         cost_variants=cost_variants,
         registered_statistics=registered_statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcome_refs=execution_outcome_refs,
     )
     result_id = "economic-evaluation-result-" + _sha256(material)
     digest_material = _result_material(
@@ -587,6 +735,9 @@ def _build_result_from_components(
         arm_metrics=arm_metrics,
         cost_variants=cost_variants,
         registered_statistics=registered_statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcome_refs=execution_outcome_refs,
         result_id=result_id,
     )
     return _new_result(
@@ -599,6 +750,9 @@ def _build_result_from_components(
         arm_metrics=arm_metrics,
         cost_variants=cost_variants,
         registered_statistics=registered_statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcome_refs=execution_outcome_refs,
     )
 
 
@@ -790,6 +944,9 @@ def validate_economic_validation_result(
     rebuilt_metrics = _validated_result_metrics(values, event_count=len(event_ids))
     variants = None
     statistics = None
+    tournament_input_id = None
+    tournament_input_sha256 = None
+    outcome_refs = None
     if extended:
         variants = _validated_cost_variants(
             values["cost_variants"],
@@ -798,6 +955,29 @@ def validate_economic_validation_result(
         statistics = validate_economic_tournament_statistics(
             values["registered_statistics"]
         ).to_dict()
+        tournament = _exact_fields(
+            values["tournament_input"],
+            frozenset({"input_id", "input_sha256"}),
+            label="tournament input binding",
+        )
+        tournament_input_id = tournament["input_id"]
+        tournament_input_sha256 = tournament["input_sha256"]
+        if (
+            type(tournament_input_id) is not str
+            or not tournament_input_id.startswith("economic-tournament-input-")
+            or _SHA256.fullmatch(
+                tournament_input_id.removeprefix("economic-tournament-input-")
+            )
+            is None
+            or type(tournament_input_sha256) is not str
+            or _SHA256.fullmatch(tournament_input_sha256) is None
+        ):
+            raise EconomicEvaluationResultError(
+                "tournament input binding is invalid"
+            )
+        outcome_refs = _canonical_execution_outcome_refs(
+            values["execution_outcomes"]
+        )
     rebuilt = _build_result_from_components(
         protocol_id=protocol_id,
         validation_partition_id=values["validation_partition_id"],  # type: ignore[arg-type]
@@ -806,6 +986,9 @@ def validate_economic_validation_result(
         arm_metrics=rebuilt_metrics,
         cost_variants=variants,
         registered_statistics=statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcome_refs=outcome_refs,
     )
     submitted = _canonical_json_bytes(values)
     if rebuilt.canonical_json_bytes() != submitted:

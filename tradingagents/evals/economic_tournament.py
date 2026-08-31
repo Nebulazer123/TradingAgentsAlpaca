@@ -10,6 +10,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
+from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
 from tradingagents.evals.economic_evaluation_partition_binding import (
     ValidationPhaseEligibility,
     validate_validation_phase_eligibility,
@@ -102,7 +103,7 @@ class ControlArmAllocation:
 
 @dataclass(frozen=True, slots=True)
 class EconomicTournamentOutcome:
-    """One realized, source-bound outcome vector for a frozen decision event."""
+    """Legacy v1/v2 tuple outcome retained for read compatibility only."""
 
     decision_event_id: str
     realized_returns: tuple[tuple[str, str], ...]
@@ -195,6 +196,7 @@ def build_ta_control_allocations(
 
 
 def _text(value: Decimal) -> str:
+    value = value.quantize(Decimal("1e-24"))
     integral = value.to_integral_value()
     if abs(value - integral) < Decimal("1e-24"):
         value = integral
@@ -206,19 +208,46 @@ def _target_weights(allocation: ControlArmAllocation) -> dict[str, Decimal]:
     result = {"CASH": Decimal(allocation.cash_weight)}
     if allocation.selected_symbols:
         weight = invested / Decimal(len(allocation.selected_symbols))
-        result.update({symbol: weight for symbol in allocation.selected_symbols})
+        for symbol in allocation.selected_symbols[:-1]:
+            result[symbol] = weight
+        result[allocation.selected_symbols[-1]] = invested - weight * Decimal(
+            len(allocation.selected_symbols) - 1
+        )
     return result
 
 
-def _turnover(
-    previous: dict[str, Decimal],
+def _traded_notional(
+    current: dict[str, Decimal],
     target: dict[str, Decimal],
-) -> Decimal:
-    names = set(previous) | set(target)
-    return sum(
-        (abs(target.get(name, Decimal("0")) - previous.get(name, Decimal("0"))) for name in names),
-        Decimal("0"),
-    ) / Decimal("2")
+) -> tuple[Decimal, Decimal]:
+    names = (set(current) | set(target)) - {"CASH"}
+    changes = {
+        name: target.get(name, Decimal("0")) - current.get(name, Decimal("0"))
+        for name in names
+    }
+    buys = sum((value for value in changes.values() if value > 0), Decimal("0"))
+    sells = sum((-value for value in changes.values() if value < 0), Decimal("0"))
+    return buys, sells
+
+
+def _post_return_holdings(
+    target: dict[str, Decimal],
+    returns: dict[str, Decimal],
+) -> dict[str, Decimal]:
+    values = {
+        symbol: (
+            weight
+            if symbol == "CASH"
+            else weight * (Decimal("1") + returns[symbol])
+        )
+        for symbol, weight in target.items()
+    }
+    total = sum(values.values(), Decimal("0"))
+    if total <= 0:
+        raise EconomicTournamentError(
+            "post-return portfolio value must remain positive"
+        )
+    return {symbol: value / total for symbol, value in values.items()}
 
 
 def _compound(values: list[Decimal]) -> Decimal:
@@ -230,7 +259,10 @@ def _compound(values: list[Decimal]) -> Decimal:
 
 def _variant_metrics(
     *,
-    weekly: dict[str, list[tuple[str, Decimal, Decimal, dict[str, Decimal]]]],
+    weekly: dict[
+        str,
+        list[tuple[str, Decimal, Decimal, Decimal, dict[str, Decimal]]],
+    ],
     cost_bps_per_side: Decimal,
     decision_event_count: int,
     packet_clusters: int,
@@ -243,8 +275,8 @@ def _variant_metrics(
     metrics: dict[str, dict[str, str]] = {}
     observations: dict[str, tuple[WeeklyArmObservation, ...]] = {}
     spy_net = [
-        gross - turnover * per_side_cost
-        for _date, gross, turnover, _positions in weekly["spy"]
+        gross - (buy_notional + sell_notional) * per_side_cost
+        for _date, gross, buy_notional, sell_notional, _positions in weekly["spy"]
     ]
     benchmark_compound = _compound(spy_net)
     for arm in CONTROL_ARM_IDS:
@@ -252,16 +284,27 @@ def _variant_metrics(
         peak = capital
         drawdown = Decimal("0")
         total_turnover = Decimal("0")
+        total_buy_notional = Decimal("0")
+        total_sell_notional = Decimal("0")
         total_cost = Decimal("0")
         false_positives = 0
         useful = 0
         net_returns: list[Decimal] = []
         rows: list[WeeklyArmObservation] = []
-        for index, (market_date, gross, turnover, positions) in enumerate(weekly[arm]):
+        for index, (
+            market_date,
+            gross,
+            buy_notional,
+            sell_notional,
+            positions,
+        ) in enumerate(weekly[arm]):
+            turnover = buy_notional + sell_notional
             cost = turnover * per_side_cost
             net = gross - cost
             net_returns.append(net)
             total_turnover += turnover
+            total_buy_notional += buy_notional
+            total_sell_notional += sell_notional
             total_cost += cost
             capital *= Decimal("1") + net
             peak = max(peak, capital)
@@ -278,6 +321,8 @@ def _variant_metrics(
                     net_return=_text(net),
                     benchmark_net_return=_text(spy_net[index]),
                     turnover=_text(turnover),
+                    buy_notional=_text(buy_notional),
+                    sell_notional=_text(sell_notional),
                     cost_drag=_text(cost),
                     false_positive=net <= 0 and invested > 0,
                     positions=tuple(
@@ -311,7 +356,9 @@ def evaluate_validation_ta_control(
     protocol: FrozenEvaluationProtocol,
     eligibility: ValidationPhaseEligibility,
     candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
-    outcomes: tuple[EconomicTournamentOutcome, ...],
+    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...],
+    tournament_input_id: str,
+    tournament_input_sha256: str,
 ) -> EconomicValidationResult:
     """Evaluate every symbol event once into registered weekly portfolios."""
 
@@ -328,10 +375,13 @@ def evaluate_validation_ta_control(
     expected_ids = bound.event_ids
     if type(candidates_by_event) is not dict or set(candidates_by_event) != set(expected_ids):
         raise EconomicTournamentError("candidate inputs must exactly cover validation events")
-    if type(outcomes) is not tuple or tuple(item.decision_event_id for item in outcomes) != expected_ids:
-        raise EconomicTournamentError("outcomes must be canonically ordered validation events")
+    if type(execution_outcomes) is not tuple or any(
+        type(item) is not SourceBoundExecutionOutcome for item in execution_outcomes
+    ):
+        raise EconomicTournamentError(
+            "v3 evaluation requires exact source-bound execution outcomes"
+        )
     events = {event.decision_event_id: event for event in frozen.input_manifest.events}
-    outcomes_by_id = {item.decision_event_id: item for item in outcomes}
     grouped_by_date: dict[str, list[object]] = {}
     for event_id in expected_ids:
         event = events[event_id]
@@ -341,7 +391,17 @@ def evaluate_validation_ta_control(
         for market_date in sorted(grouped_by_date)
     )
     required_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
-    weekly: dict[str, list[tuple[str, Decimal, Decimal, dict[str, Decimal]]]] = {
+    outcomes_by_date: dict[str, list[SourceBoundExecutionOutcome]] = {}
+    for outcome in execution_outcomes:
+        outcomes_by_date.setdefault(outcome.decision_market_date, []).append(outcome)
+    if set(outcomes_by_date) != set(grouped):
+        raise EconomicTournamentError(
+            "execution outcomes must cover the exact validation market dates"
+        )
+    weekly: dict[
+        str,
+        list[tuple[str, Decimal, Decimal, Decimal, dict[str, Decimal]]],
+    ] = {
         arm: [] for arm in CONTROL_ARM_IDS
     }
     previous = {arm: {"CASH": Decimal("1")} for arm in CONTROL_ARM_IDS}
@@ -363,19 +423,38 @@ def evaluate_validation_ta_control(
             raise EconomicTournamentError(
                 "weekly symbol events must share one immutable candidate cross-section"
             )
-        first_outcome = outcomes_by_id[first_event.decision_event_id]
-        if tuple(symbol for symbol, _value in first_outcome.realized_returns) != required_symbols:
+        date_outcomes = tuple(outcomes_by_date[market_date])
+        if tuple(item.symbol for item in date_outcomes) != required_symbols:
             raise EconomicTournamentError(
-                "outcome must cover primary universe and SPY exactly"
+                "execution outcomes must cover primary universe and SPY exactly"
             )
+        events_by_symbol = {item.symbol: item for item in date_events}
+        benchmark_event_id = events_by_symbol[
+            frozen.primary_universe[0]
+        ].decision_event_id
         if any(
-            outcomes_by_id[item.decision_event_id].realized_returns
-            != first_outcome.realized_returns
-            for item in date_events
+            outcome.decision_event_id
+            != (
+                benchmark_event_id
+                if outcome.symbol == "SPY"
+                else events_by_symbol[outcome.symbol].decision_event_id
+            )
+            for outcome in date_outcomes
         ):
             raise EconomicTournamentError(
-                "weekly symbol events must share one immutable outcome cross-section"
+                "execution outcomes do not bind the matching symbol events"
             )
+        unavailable = tuple(item.symbol for item in date_outcomes if item.gross_return is None)
+        if unavailable:
+            raise EconomicTournamentError(
+                "v3 portfolio metrics are unavailable because required execution "
+                f"outcomes are null: {','.join(unavailable)}"
+            )
+        returns = {
+            item.symbol: Decimal(item.gross_return)
+            for item in date_outcomes
+            if item.gross_return is not None
+        }
         allocations = build_ta_control_allocations(
             protocol=frozen,
             decision_event=first_event,
@@ -383,28 +462,31 @@ def evaluate_validation_ta_control(
         )
         for allocation in allocations:
             target = _target_weights(allocation)
-            turnover = _turnover(previous[allocation.arm_id], target)
+            buys, sells = _traded_notional(previous[allocation.arm_id], target)
             gross = sum(
                 (
-                    weight * first_outcome.return_for(symbol)
+                    weight * returns[symbol]
                     for symbol, weight in target.items()
                     if symbol != "CASH"
                 ),
                 Decimal("0"),
             )
             weekly[allocation.arm_id].append(
-                (market_date, gross, turnover, target)
+                (market_date, gross, buys, sells, target)
             )
-            previous[allocation.arm_id] = target
-        raw_source_rows += len(first_candidates) + len(first_outcome.realized_returns)
+            previous[allocation.arm_id] = _post_return_holdings(target, returns)
+        raw_source_rows += len(first_candidates) + len(date_outcomes)
 
     for arm in CONTROL_ARM_IDS:
-        final_turnover = _turnover(previous[arm], {"CASH": Decimal("1")})
-        market_date, gross, turnover, positions = weekly[arm][-1]
+        final_buys, final_sells = _traded_notional(
+            previous[arm], {"CASH": Decimal("1")}
+        )
+        market_date, gross, buys, sells, positions = weekly[arm][-1]
         weekly[arm][-1] = (
             market_date,
             gross,
-            turnover + final_turnover,
+            buys + final_buys,
+            sells + final_sells,
             positions,
         )
 
@@ -437,4 +519,7 @@ def evaluate_validation_ta_control(
         eligibility=bound,
         cost_variant_metrics=variants,
         registered_statistics=statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcomes=execution_outcomes,
     )
