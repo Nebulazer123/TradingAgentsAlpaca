@@ -17,6 +17,10 @@ from pathlib import Path
 import pytest
 
 import tradingagents.evals.economic_evaluation_protocol as economic_protocol
+from tests.test_point_in_time_cohort import (
+    _build_from_fixture,
+    _source_cohort_fixture,
+)
 from tradingagents.dataflows.pit import (
     RawPointInTimeArtifactArchive,
     build_market_date_partitions,
@@ -41,10 +45,6 @@ from tradingagents.evals.economic_evaluation_protocol import (
     validate_frozen_evaluation_protocol,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
-from tests.test_point_in_time_cohort import (
-    _build_from_fixture,
-    _source_cohort_fixture,
-)
 
 PRIMARY_UNIVERSE = tuple(f"T{i:03d}" for i in range(75))
 UNIVERSE_ID = canonical_universe_id(PRIMARY_UNIVERSE)

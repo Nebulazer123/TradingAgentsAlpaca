@@ -41,7 +41,6 @@ from tradingagents.dataflows.pit.cohort import (
     PointInTimeCohort,
     validate_nonqualifying_point_in_time_cohort_record,
 )
-
 from tradingagents.evals.agent_intelligence_reconciliation import (
     market_event_key,
     packet_event_key,
@@ -873,7 +872,7 @@ class FrozenEvaluationProtocol:
     cohort: PointInTimeCohort
     cohort_id: str
     cohort_sha256: str
-    market_date_partitions: "MarketDatePartitions"
+    market_date_partitions: MarketDatePartitions
     partition_id: str
     partition_sha256: str
     input_manifest: BitemporalInputManifest
@@ -979,7 +978,7 @@ def _protocol_payload_without_id(protocol: FrozenEvaluationProtocol) -> dict[str
 def build_frozen_evaluation_protocol(
     *,
     cohort: PointInTimeCohort,
-    market_date_partitions: "MarketDatePartitions",
+    market_date_partitions: MarketDatePartitions,
     input_manifest: BitemporalInputManifest,
     primary_universe: tuple[str, ...],
     sensitivity_universe_50: tuple[str, ...],

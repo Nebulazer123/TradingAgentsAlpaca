@@ -8,6 +8,10 @@ import json
 
 import pytest
 
+from tests.test_point_in_time_cohort import (
+    _build_from_fixture,
+    _source_cohort_fixture,
+)
 from tradingagents.dataflows.pit import (
     PointInTimeDataError,
     RawPointInTimeArtifactArchive,
@@ -18,10 +22,6 @@ from tradingagents.dataflows.pit import (
 from tradingagents.evals.economic_evaluation_protocol import (
     build_decision_event,
     canonical_universe_id,
-)
-from tests.test_point_in_time_cohort import (
-    _build_from_fixture,
-    _source_cohort_fixture,
 )
 
 REGISTERED_AT = "2026-04-01T12:01:00+00:00"
