@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import builtins
 import dataclasses
+import datetime as dt
 import hashlib
 import importlib
 import json
@@ -16,6 +17,11 @@ from pathlib import Path
 import pytest
 
 import tradingagents.evals.economic_evaluation_protocol as economic_protocol
+from tradingagents.dataflows.pit import (
+    RawPointInTimeArtifactArchive,
+    build_market_date_partitions,
+    build_market_session_calendar,
+)
 from tradingagents.evals.agent_intelligence_reconciliation import (
     market_event_key,
     packet_event_key,
@@ -35,6 +41,10 @@ from tradingagents.evals.economic_evaluation_protocol import (
     validate_frozen_evaluation_protocol,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
+from tests.test_point_in_time_cohort import (
+    _build_from_fixture,
+    _source_cohort_fixture,
+)
 
 PRIMARY_UNIVERSE = tuple(f"T{i:03d}" for i in range(75))
 UNIVERSE_ID = canonical_universe_id(PRIMARY_UNIVERSE)
@@ -190,13 +200,13 @@ def test_universe_id_is_hand_derived_and_strict():
         _canonical_text(list(symbols)).encode("utf-8")
     ).hexdigest()
     assert canonical_universe_id(symbols) == expected
+    assert canonical_universe_id(tuple(reversed(symbols))) != expected
     assert "universe-" + hashlib.sha256(
         _canonical_text([f"T{i:03d}" for i in range(75)]).encode("utf-8")
     ).hexdigest() == UNIVERSE_ID
     for bad in (
         ["AAPL", "MSFT"],
         {"AAPL", "MSFT"},
-        ("MSFT", "AAPL"),
         ("AAPL", "AAPL"),
         ("aapl",),
         (),
@@ -501,6 +511,92 @@ REQUIRED_METRICS = (
 )
 
 
+@pytest.fixture(scope="module")
+def protocol_source(tmp_path_factory):
+    root = tmp_path_factory.mktemp("economic-protocol")
+    ranked_primary = tuple(
+        f"T{index:03d}"
+        for index in (*range(74, -1, -2), *range(73, -1, -2))
+    )
+    ranked_symbols = (*ranked_primary, *(f"T{index:03d}" for index in range(75, 100)))
+    symbol_overrides = {
+        99 - position: symbol for position, symbol in enumerate(ranked_symbols)
+    }
+    archive, cohort_calendar, payload = _source_cohort_fixture(
+        root / "cohort",
+        symbol_overrides=symbol_overrides,
+    )
+    cohort = _build_from_fixture(archive, cohort_calendar, payload)
+    primary = cohort.primary_universe_75
+
+    monday = dt.date(2026, 4, 6)
+    market_dates = tuple(
+        (monday + dt.timedelta(weeks=week, days=weekday)).isoformat()
+        for week in range(55)
+        for weekday in range(5)
+        if not (week in {7, 23, 41} and weekday == 4)
+    )
+    by_week: dict[tuple[int, int], list[str]] = {}
+    for market_date in market_dates:
+        parsed = dt.date.fromisoformat(market_date)
+        iso = parsed.isocalendar()
+        by_week.setdefault((iso.year, iso.week), []).append(market_date)
+    decision_dates = tuple(rows[-1] for rows in by_week.values())
+    calendar_archive = RawPointInTimeArtifactArchive(
+        root / "calendar",
+        clock=lambda: dt.datetime(2026, 4, 1, 12, 0, tzinfo=dt.UTC),
+    )
+    calendar_artifact = calendar_archive.admit(
+        raw_bytes=json.dumps(
+            [{"date": day, "open": "09:30", "close": "16:00"} for day in market_dates],
+            separators=(",", ":"),
+        ).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2026-04-01T12:00:00+00:00",
+    )
+    calendar = build_market_session_calendar(
+        archive=calendar_archive,
+        raw_artifact=calendar_artifact,
+    )
+    events = tuple(
+        _event(
+            universe_id=canonical_universe_id(primary),
+            symbol=symbol,
+            decision_at=f"{market_date}T20:55:00+00:00",
+            market_date=market_date,
+            created_at=f"{market_date}T20:45:00+00:00",
+            observation_start=f"{market_date}T19:00:00+00:00",
+            observation_end=f"{market_date}T20:50:00+00:00",
+            available_at=f"{market_date}T20:50:00+00:00",
+            recorded_at=f"{market_date}T20:52:00+00:00",
+            resolution_window={"start_at": f"{market_date}T20:55:00+00:00"},
+            source_packet_id=f"packet-{market_date}-{symbol}",
+            source_artifact_id=f"artifact-{market_date}-{symbol}",
+            source_artifact_sha256=hashlib.sha256(
+                f"{market_date}-{symbol}".encode()
+            ).hexdigest(),
+        )
+        for market_date in decision_dates
+        for symbol in primary
+    )
+    partitions = build_market_date_partitions(
+        market_calendar=calendar,
+        cadence="weekly",
+        registered_at="2026-04-01T12:01:00+00:00",
+        primary_universe=primary,
+        decision_market_dates=decision_dates,
+        events=events,
+    )
+    manifest = build_bitemporal_input_manifest(
+        dataset_id="pit-ranked-weekly-fixture",
+        as_of_cutoff="2027-05-01T21:00:00+00:00",
+        captured_at="2027-05-01T21:00:00+00:00",
+        events=events,
+    )
+    return cohort, partitions, manifest
+
+
 def _policy(**overrides: object) -> StrategyEvaluationPolicy:
     values: dict[str, object] = {
         "benchmark_symbol": "SPY",
@@ -524,25 +620,27 @@ def _budget(**overrides: object) -> EvaluationSearchBudget:
     return EvaluationSearchBudget(**values)
 
 
-def _protocol(**overrides: object) -> FrozenEvaluationProtocol:
-    manifest = _manifest()
+def _protocol(protocol_source, **overrides: object) -> FrozenEvaluationProtocol:
+    cohort, partitions, manifest = protocol_source
     values: dict[str, object] = {
+        "cohort": cohort,
+        "market_date_partitions": partitions,
         "input_manifest": manifest,
-        "primary_universe": PRIMARY_UNIVERSE_75,
-        "sensitivity_universe_50": SENSITIVITY_UNIVERSE_50,
-        "sensitivity_universe_100": SENSITIVITY_UNIVERSE_100,
+        "primary_universe": cohort.primary_universe_75,
+        "sensitivity_universe_50": cohort.sensitivity_universe_50,
+        "sensitivity_universe_100": cohort.sensitivity_universe_100,
         "evaluation_policy": _policy(),
         "search_budget": _budget(),
-        "development_event_ids": (manifest.events[0].decision_event_id,),
-        "validation_event_ids": (manifest.events[1].decision_event_id,),
-        "holdout_event_ids": (manifest.events[2].decision_event_id,),
+        "development_event_ids": partitions.development_event_ids,
+        "validation_event_ids": partitions.validation_event_ids,
+        "holdout_event_ids": partitions.holdout_event_ids,
     }
     values.update(overrides)
     return build_frozen_evaluation_protocol(**values)
 
 
-def test_protocol_freezes_ta_control_constants_and_sealed_partitions():
-    protocol = _protocol()
+def test_protocol_freezes_ta_control_constants_and_sealed_partitions(protocol_source):
+    protocol = _protocol(protocol_source)
     serialized = protocol.to_dict()
 
     assert protocol.protocol_id.startswith("economic-evaluation-protocol-")
@@ -550,6 +648,11 @@ def test_protocol_freezes_ta_control_constants_and_sealed_partitions():
     assert serialized["required_metrics"] == list(REQUIRED_METRICS)
     assert serialized["route_id"] == "ta-control/v1"
     assert serialized["cadence"] == "weekly"
+    assert protocol.primary_universe == protocol.sensitivity_universe_100[:75]
+    assert protocol.sensitivity_universe_50 == protocol.sensitivity_universe_100[:50]
+    assert protocol.primary_universe != tuple(sorted(protocol.primary_universe))
+    assert protocol.cohort_id == protocol.cohort.cohort_id
+    assert protocol.partition_id == protocol.market_date_partitions.partition_id
     assert serialized["long_only"] is True
     assert serialized["cash_allowed"] is True
     assert serialized["max_leverage"] == "1"
@@ -576,10 +679,12 @@ def test_protocol_freezes_ta_control_constants_and_sealed_partitions():
         protocol.evaluation_policy["benchmark_symbol"] = "QQQ"  # type: ignore[index]
 
 
-def test_public_frozen_dataclasses_cannot_bypass_their_builders_or_alias_state():
+def test_public_frozen_dataclasses_cannot_bypass_their_builders_or_alias_state(
+    protocol_source,
+):
     event = _event()
     manifest = _manifest()
-    protocol = _protocol()
+    protocol = _protocol(protocol_source)
     mutable_window = {"tampered": ["value"]}
 
     for value in (DecisionEvent, BitemporalInputManifest, FrozenEvaluationProtocol):
@@ -640,9 +745,13 @@ def test_public_frozen_dataclasses_cannot_bypass_their_builders_or_alias_state()
         ),
     ],
 )
-def test_protocol_builder_rejects_invalid_cohorts_policies_budgets_and_partitions(name, overrides):
+def test_protocol_builder_rejects_invalid_cohorts_policies_budgets_and_partitions(
+    protocol_source,
+    name,
+    overrides,
+):
     with pytest.raises(EconomicEvaluationProtocolError):
-        _protocol(**overrides)
+        _protocol(protocol_source, **overrides)
 
 
 @pytest.mark.parametrize("invalid", [0, -1, True])
@@ -651,24 +760,37 @@ def test_search_budget_rejects_nonpositive_and_boolean_values(invalid):
         _budget(max_candidates_per_arm=invalid)
 
 
-def test_protocol_rejects_event_from_another_primary_universe():
+def test_protocol_rejects_event_from_another_primary_universe(protocol_source):
+    _cohort, _partitions, manifest = protocol_source
+    base = manifest.events[0]
     foreign_event = _event(
         universe_id=canonical_universe_id(tuple(f"X{i:03d}" for i in range(75))),
-        symbol="T000",
-        source_packet_id="packet-20260109-foreign",
-        source_artifact_id="artifact-20260109-foreign",
+        symbol=base.symbol,
+        decision_at=base.decision_at,
+        market_date=base.market_date,
+        created_at=base.created_at,
+        resolution_window=base.to_dict()["resolution_window"],
+        observation_start=base.observation_start,
+        observation_end=base.observation_end,
+        available_at=base.available_at,
+        recorded_at=base.recorded_at,
+        source_packet_id="packet-ranked-foreign",
+        source_artifact_id="artifact-ranked-foreign",
         source_artifact_sha256=hashlib.sha256(b"foreign-fixture").hexdigest(),
     )
-    foreign_manifest = _manifest(
-        events=(foreign_event, _manifest_events()[1], _manifest_events()[2])
+    foreign_manifest = build_bitemporal_input_manifest(
+        dataset_id=manifest.dataset_id,
+        as_of_cutoff=manifest.as_of_cutoff,
+        captured_at=manifest.captured_at,
+        events=(foreign_event, *manifest.events[1:]),
     )
     with pytest.raises(EconomicEvaluationProtocolError):
-        _protocol(input_manifest=foreign_manifest)
+        _protocol(protocol_source, input_manifest=foreign_manifest)
 
 
 def _protocol_mutation(name, mutate):
-    def case():
-        serialized = _protocol().to_dict()
+    def case(protocol_source):
+        serialized = _protocol(protocol_source).to_dict()
         mutate(serialized)
         return serialized
 
@@ -684,6 +806,14 @@ _PROTOCOL_MUTATIONS = [
     _protocol_mutation("control_arm_reordered", lambda d: d.update({"control_arm_ids": list(reversed(d["control_arm_ids"]))})),
     _protocol_mutation("holdout_unsealed", lambda d: d.update({"holdout_status": "released"})),
     _protocol_mutation("manifest_digest_changed", lambda d: d.update({"input_manifest_sha256": "0" * 64})),
+    _protocol_mutation("cohort_digest_changed", lambda d: d.update({"cohort_sha256": "4" * 64})),
+    _protocol_mutation("partition_digest_changed", lambda d: d.update({"partition_sha256": "5" * 64})),
+    _protocol_mutation(
+        "nested_partition_changed",
+        lambda d: d["market_date_partitions"].update(
+            {"registered_at": "2026-04-01T12:02:00+00:00"}
+        ),
+    ),
     _protocol_mutation("policy_digest_changed", lambda d: d.update({"evaluation_policy_sha256": "1" * 64})),
     _protocol_mutation("universe_digest_changed", lambda d: d.update({"primary_universe_sha256": "2" * 64})),
     _protocol_mutation("protocol_id_changed", lambda d: d.update({"protocol_id": "economic-evaluation-protocol-" + "3" * 64})),
@@ -693,9 +823,9 @@ _PROTOCOL_MUTATIONS = [
 @pytest.mark.parametrize(
     "name,mutate", _PROTOCOL_MUTATIONS, ids=[mutation[0] for mutation in _PROTOCOL_MUTATIONS]
 )
-def test_protocol_validator_rejects_tampering(name, mutate):
+def test_protocol_validator_rejects_tampering(protocol_source, name, mutate):
     with pytest.raises(EconomicEvaluationProtocolError):
-        validate_frozen_evaluation_protocol(mutate())
+        validate_frozen_evaluation_protocol(mutate(protocol_source))
 
 
 FORBIDDEN_IMPORT_PREFIXES = (
@@ -711,7 +841,10 @@ FORBIDDEN_IMPORT_PREFIXES = (
 )
 
 
-def test_protocol_imports_and_construction_have_no_authority_side_effects(monkeypatch):
+def test_protocol_imports_and_construction_have_no_authority_side_effects(
+    protocol_source,
+    monkeypatch,
+):
     module_path = Path(economic_protocol.__file__)
     syntax = ast.parse(module_path.read_text(encoding="utf-8"), filename=str(module_path))
     imported_paths = []
@@ -740,7 +873,7 @@ def test_protocol_imports_and_construction_have_no_authority_side_effects(monkey
 
     event = _event()
     manifest = _manifest()
-    protocol = _protocol()
+    protocol = _protocol(protocol_source)
     assert validate_decision_event(event.to_dict()) == event
     assert validate_bitemporal_input_manifest(manifest.to_dict()) == manifest
     assert validate_frozen_evaluation_protocol(protocol.to_dict()) == protocol

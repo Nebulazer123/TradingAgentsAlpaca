@@ -8,9 +8,12 @@ not execution authority and cannot submit orders.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import datetime as dt
 import hashlib
 import json
+import lzma
 import os
 import re
 import stat
@@ -53,7 +56,7 @@ ECONOMIC_EVALUATION_PROTOCOL_KIND = "economic-evaluation-protocol"
 ECONOMIC_EVALUATION_RUN_KIND = "economic-evaluation-run"
 ECONOMIC_HOLDOUT_RELEASE_KIND = "economic-holdout-release"
 ECONOMIC_EVALUATION_PROTOCOL_ADMISSION_SCHEMA = (
-    "economic_evaluation_protocol_admission/v1"
+    "economic_evaluation_protocol_admission/v2"
 )
 ECONOMIC_HOLDOUT_RELEASE_SCHEMA = "economic_holdout_release/v1"
 ECONOMIC_EVALUATION_RUN_SCHEMA = "economic_evaluation_run/v1"
@@ -69,6 +72,8 @@ _GIT_REVISION = re.compile(r"[0-9a-f]{40}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,255}")
 _CANONICAL_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00")
+_PROTOCOL_RECEIPT_CHUNK_CHARS = 60_000
+_MAX_PROTOCOL_RECEIPT_BYTES = 16_000_000
 _VALIDATION_REPORT_FIELDS = frozenset(
     {
         "schema_version",
@@ -98,15 +103,16 @@ _PROTOCOL_ADMISSION_FIELDS = frozenset(
         "schema_version",
         "protocol",
         "protocol_id",
+        "cohort_id",
+        "cohort_sha256",
+        "partition_id",
+        "partition_sha256",
         "input_manifest_id",
         "input_manifest_sha256",
         "evaluation_policy_sha256",
         "primary_universe_sha256",
         "sensitivity_universe_50_sha256",
         "sensitivity_universe_100_sha256",
-        "development_event_ids",
-        "validation_event_ids",
-        "holdout_event_ids",
         "source_revision",
         "source_manifest",
         "source_manifest_sha256",
@@ -262,6 +268,19 @@ def _thaw_json(value: object) -> object:
     if isinstance(value, list):
         return [_thaw_json(item) for item in value]
     return value
+
+
+def _receipt_chunks(value: object) -> list[str]:
+    compressed = lzma.compress(_canonical_json_bytes(value), preset=9)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    return [
+        encoded[offset : offset + _PROTOCOL_RECEIPT_CHUNK_CHARS]
+        for offset in range(0, len(encoded), _PROTOCOL_RECEIPT_CHUNK_CHARS)
+    ]
+
+
+def _protocol_receipt_chunks(protocol: FrozenEvaluationProtocol) -> list[str]:
+    return _receipt_chunks(protocol.to_dict())
 
 
 def _sha256(value: object) -> str:
@@ -469,6 +488,15 @@ def _frozen_validation_report(
         raise EconomicEvaluationAdmissionError("validation report protocol does not match")
     try:
         partitions = validate_market_date_partitions(report["market_date_partitions"])
+        if (
+            partitions.partition_id != protocol.partition_id
+            or partitions.partition_sha256 != protocol.partition_sha256
+            or partitions.canonical_json_bytes()
+            != protocol.market_date_partitions.canonical_json_bytes()
+        ):
+            raise EconomicEvaluationAdmissionError(
+                "validation report does not contain the protocol's complete partition receipt"
+            )
         eligibility = bind_validation_phase_eligibility(
             protocol=protocol,
             partitions=partitions,
@@ -669,6 +697,65 @@ def _validate_historical_predecessor(
         raise EconomicEvaluationAdmissionError("store_predecessor does not bind journal history")
 
 
+def _receipt_value(receipt: object, *, label: str) -> object:
+    if (
+        type(receipt) not in (list, tuple)
+        or not receipt
+        or any(
+            type(chunk) is not str
+            or not chunk
+            or len(chunk) > _PROTOCOL_RECEIPT_CHUNK_CHARS
+            for chunk in receipt
+        )
+    ):
+        raise EconomicEvaluationAdmissionError(
+            f"{label} receipt chunks are invalid"
+        )
+    try:
+        compressed = base64.b64decode("".join(receipt), validate=True)
+        decompressor = lzma.LZMADecompressor()
+        receipt_bytes = decompressor.decompress(
+            compressed,
+            max_length=_MAX_PROTOCOL_RECEIPT_BYTES + 1,
+        )
+        if (
+            len(receipt_bytes) > _MAX_PROTOCOL_RECEIPT_BYTES
+            or not decompressor.eof
+            or decompressor.unused_data
+        ):
+            raise EconomicEvaluationAdmissionError(
+                f"{label} receipt compression is invalid"
+            )
+        value = json.loads(receipt_bytes.decode("utf-8"))
+    except (
+        binascii.Error,
+        lzma.LZMAError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise EconomicEvaluationAdmissionError(f"{label} receipt is invalid") from exc
+    if receipt_bytes != _canonical_json_bytes(value):
+        raise EconomicEvaluationAdmissionError(
+            f"{label} receipt is not canonical JSON"
+        )
+    return value
+
+
+def _validation_report_receipt_value(value: object, *, label: str) -> object:
+    if isinstance(value, Mapping):
+        return _thaw_json(value)
+    return _receipt_value(value, label=label)
+
+
+def _protocol_from_receipt(protocol_receipt: object) -> FrozenEvaluationProtocol:
+    protocol = validate_frozen_evaluation_protocol(
+        _receipt_value(protocol_receipt, label="admitted protocol")
+    )
+    return protocol
+
+
 def _admitted_protocol_from_envelope(
     envelope: EvidenceEnvelope,
     *,
@@ -682,13 +769,14 @@ def _admitted_protocol_from_envelope(
     if payload.get("schema_version") != ECONOMIC_EVALUATION_PROTOCOL_ADMISSION_SCHEMA:
         raise EconomicEvaluationAdmissionError("admitted protocol schema is invalid")
     _require_authority(payload, label="admitted protocol")
-    try:
-        protocol = validate_frozen_evaluation_protocol(_thaw_json(payload["protocol"]))
-    except (KeyError, TypeError, ValueError) as exc:
-        raise EconomicEvaluationAdmissionError("admitted protocol is invalid") from exc
+    protocol = _protocol_from_receipt(payload.get("protocol"))
     if payload.get("protocol_id") != protocol.protocol_id:
         raise EconomicEvaluationAdmissionError("admitted protocol identity is inconsistent")
     for field_name in (
+        "cohort_id",
+        "cohort_sha256",
+        "partition_id",
+        "partition_sha256",
         "input_manifest_id",
         "input_manifest_sha256",
         "evaluation_policy_sha256",
@@ -700,17 +788,6 @@ def _admitted_protocol_from_envelope(
             raise EconomicEvaluationAdmissionError(
                 "admitted protocol redundant binding is inconsistent"
             )
-    if (
-        _thaw_json(payload.get("development_event_ids"))
-        != list(protocol.development_event_ids)
-        or _thaw_json(payload.get("validation_event_ids"))
-        != list(protocol.validation_event_ids)
-        or _thaw_json(payload.get("holdout_event_ids"))
-        != list(protocol.holdout_event_ids)
-    ):
-        raise EconomicEvaluationAdmissionError(
-            "admitted protocol partition binding is inconsistent"
-        )
     source_manifest = _thaw_json(payload.get("source_manifest"))
     if not isinstance(source_manifest, list) or not source_manifest:
         raise EconomicEvaluationAdmissionError("admitted source manifest is invalid")
@@ -778,7 +855,10 @@ def _evaluation_run_from_envelope(
     if payload["phase"] != "validation":
         raise EconomicEvaluationAdmissionError("evaluation-run phase is invalid")
     report = _frozen_validation_report(
-        payload["frozen_validation_report"],
+        _validation_report_receipt_value(
+            payload["frozen_validation_report"],
+            label="evaluation-run validation report",
+        ),
         protocol=protocol,
         allow_legacy=True,
     )
@@ -842,7 +922,10 @@ def _validate_holdout_release_payload(
     _require_owner(payload["released_by"])
     _canonical_timestamp_text(payload["released_at"], label="released_at")
     report = _frozen_validation_report(
-        payload["frozen_validation_report"],
+        _validation_report_receipt_value(
+            payload["frozen_validation_report"],
+            label="holdout validation report",
+        ),
         protocol=protocol,
         allow_legacy=allow_legacy,
     )
@@ -922,12 +1005,32 @@ class EconomicEvaluationAdmissionAdapter:
                 existing.payload,
                 label="existing admission payload",
             )
-            if existing_payload.get("protocol_id") != protocol.protocol_id:
-                continue
             existing_protocol = _admitted_protocol_from_envelope(
                 existing,
                 events=events,
             )
+            if existing_payload.get("protocol_id") != protocol.protocol_id:
+                receipt_identity = (
+                    existing_protocol.cohort_id,
+                    existing_protocol.cohort_sha256,
+                    existing_protocol.partition_id,
+                    existing_protocol.partition_sha256,
+                )
+                submitted_identity = (
+                    protocol.cohort_id,
+                    protocol.cohort_sha256,
+                    protocol.partition_id,
+                    protocol.partition_sha256,
+                )
+                if (
+                    existing_protocol.input_manifest_id == protocol.input_manifest_id
+                    and receipt_identity != submitted_identity
+                ):
+                    raise EconomicEvaluationAdmissionError(
+                        "input manifest is already bound to a different cohort "
+                        "or partition receipt"
+                    )
+                continue
             if (
                 existing_protocol.canonical_json_bytes()
                 != protocol.canonical_json_bytes()
@@ -936,8 +1039,13 @@ class EconomicEvaluationAdmissionAdapter:
                     "protocol identity is already bound to different bytes"
                 )
             expected_existing = {
-                "protocol": protocol.to_dict(),
+                "protocol": _protocol_receipt_chunks(protocol),
                 "protocol_id": protocol.protocol_id,
+                "cohort_id": protocol.cohort_id,
+                "cohort_sha256": protocol.cohort_sha256,
+                "partition_id": protocol.partition_id,
+                "partition_sha256": protocol.partition_sha256,
+                "input_manifest_id": protocol.input_manifest_id,
                 "input_manifest_sha256": protocol.input_manifest_sha256,
                 "source_revision": revision,
                 "source_manifest": source_rows,
@@ -956,17 +1064,18 @@ class EconomicEvaluationAdmissionAdapter:
 
         material: dict[str, object] = {
             "schema_version": ECONOMIC_EVALUATION_PROTOCOL_ADMISSION_SCHEMA,
-            "protocol": protocol.to_dict(),
+            "protocol": _protocol_receipt_chunks(protocol),
             "protocol_id": protocol.protocol_id,
+            "cohort_id": protocol.cohort_id,
+            "cohort_sha256": protocol.cohort_sha256,
+            "partition_id": protocol.partition_id,
+            "partition_sha256": protocol.partition_sha256,
             "input_manifest_id": protocol.input_manifest_id,
             "input_manifest_sha256": protocol.input_manifest_sha256,
             "evaluation_policy_sha256": protocol.evaluation_policy_sha256,
             "primary_universe_sha256": protocol.primary_universe_sha256,
             "sensitivity_universe_50_sha256": protocol.sensitivity_universe_50_sha256,
             "sensitivity_universe_100_sha256": protocol.sensitivity_universe_100_sha256,
-            "development_event_ids": list(protocol.development_event_ids),
-            "validation_event_ids": list(protocol.validation_event_ids),
-            "holdout_event_ids": list(protocol.holdout_event_ids),
             "source_revision": revision,
             "source_manifest": source_rows,
             "source_manifest_sha256": source_manifest_sha256,
@@ -1016,9 +1125,7 @@ class EconomicEvaluationAdmissionAdapter:
             if _canonical_json_bytes(submitted) != _canonical_json_bytes(material):
                 raise EconomicEvaluationAdmissionError("admission payload is not exact")
             try:
-                persisted = validate_frozen_evaluation_protocol(
-                    _thaw_json(submitted["protocol"])
-                )
+                persisted = _protocol_from_receipt(submitted["protocol"])
             except (KeyError, TypeError, ValueError) as exc:
                 raise EconomicEvaluationAdmissionError(
                     "persisted protocol validation failed"
@@ -1112,7 +1219,7 @@ class EconomicEvaluationAdmissionAdapter:
                 "protocol_id": identity,
                 "protocol_admission_object_id": protocol_envelope.object_id,
                 "phase": phase,
-                "frozen_validation_report": report,
+                "frozen_validation_report": _receipt_chunks(report),
                 "validation_report_sha256": report_sha256,
             }
             actual_existing = {
@@ -1139,7 +1246,7 @@ class EconomicEvaluationAdmissionAdapter:
             "protocol_id": identity,
             "protocol_admission_object_id": protocol_envelope.object_id,
             "phase": phase,
-            "frozen_validation_report": report,
+            "frozen_validation_report": _receipt_chunks(report),
             "validation_report_sha256": report_sha256,
             "store_predecessor": {**predecessor},
             **_AUTHORITY_FIELDS,
@@ -1377,7 +1484,10 @@ class EconomicEvaluationAdmissionAdapter:
             label="evaluation-run payload",
         )
         return _frozen_validation_report(
-            payload["frozen_validation_report"],
+            _validation_report_receipt_value(
+                payload["frozen_validation_report"],
+                label="evaluation-run validation report",
+            ),
             protocol=protocol,
         )
 
@@ -1443,10 +1553,14 @@ class EconomicEvaluationAdmissionAdapter:
                 "holdout release requires exactly one immutable validation run"
             )
         validation_run = validation_runs[0]
-        run_report = _payload_mapping(
+        run_report_receipt = _payload_mapping(
             _thaw_json(validation_run.envelope.payload),
             label="validation-run payload",
         )["frozen_validation_report"]
+        run_report = _validation_report_receipt_value(
+            run_report_receipt,
+            label="evaluation-run validation report",
+        )
         if _canonical_json_bytes(run_report) != _canonical_json_bytes(report):
             raise EconomicEvaluationAdmissionError(
                 "holdout release report does not match immutable validation run"
@@ -1466,7 +1580,7 @@ class EconomicEvaluationAdmissionAdapter:
                 "validation_run_object_id": validation_run.envelope.object_id,
                 "released_by": owner,
                 "released_at": released_text,
-                "frozen_validation_report": report,
+                "frozen_validation_report": _receipt_chunks(report),
                 "validation_report_sha256": report_sha256,
             }
             actual_existing = {
@@ -1505,7 +1619,7 @@ class EconomicEvaluationAdmissionAdapter:
             "validation_run_object_id": validation_run.envelope.object_id,
             "released_by": owner,
             "released_at": released_text,
-            "frozen_validation_report": report,
+            "frozen_validation_report": _receipt_chunks(report),
             "validation_report_sha256": report_sha256,
             "store_predecessor": {
                 **predecessor,
@@ -1655,8 +1769,16 @@ class EconomicEvaluationAdmissionAdapter:
                 _thaw_json(validation_run.envelope.payload),
                 label="evaluation-run payload",
             )["frozen_validation_report"]
-            if _canonical_json_bytes(payload["frozen_validation_report"]) != _canonical_json_bytes(
-                run_report
+            release_report_value = _validation_report_receipt_value(
+                payload["frozen_validation_report"],
+                label="holdout validation report",
+            )
+            run_report_value = _validation_report_receipt_value(
+                run_report,
+                label="evaluation-run validation report",
+            )
+            if _canonical_json_bytes(release_report_value) != _canonical_json_bytes(
+                run_report_value
             ):
                 raise EconomicEvaluationAdmissionError(
                     "holdout release report does not match validation run"
@@ -1667,7 +1789,7 @@ class EconomicEvaluationAdmissionAdapter:
                 events=events,
             )
             if _payload_mapping(
-                _thaw_json(run_report),
+                run_report_value,
                 label="validation-run report",
             ).get("schema_version") != ECONOMIC_VALIDATION_REPORT_SCHEMA:
                 continue

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hashlib
 import json
+import lzma
 import subprocess
 
 import pytest
@@ -25,10 +27,7 @@ from tradingagents.evals.economic_evaluation_partition_binding import (
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     EvaluationSearchBudget,
-    build_bitemporal_input_manifest,
-    build_decision_event,
     build_frozen_evaluation_protocol,
-    canonical_universe_id,
 )
 from tradingagents.evals.economic_evaluation_result import (
     EconomicEvaluationResultError,
@@ -41,39 +40,34 @@ from tradingagents.strategy._immutable_evidence_store import (
     ImmutableStrategyEvidenceStore,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
+from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
+from tests.test_point_in_time_cohort import (
+    _build_from_fixture,
+    _source_cohort_fixture,
+)
 
 NOW = dt.datetime(2026, 1, 9, 21, 30, tzinfo=dt.UTC)
+_PROTOCOL_SOURCE = None
+_PROTOCOL_CACHE = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _bind_protocol_source(protocol_source):
+    global _PROTOCOL_CACHE, _PROTOCOL_SOURCE
+    _PROTOCOL_SOURCE = protocol_source
+    _PROTOCOL_CACHE = None
 
 
 def _protocol():
-    primary = tuple(f"T{i:03d}" for i in range(75))
-    events = tuple(
-        build_decision_event(
-            universe_id=canonical_universe_id(primary),
-            symbol=symbol,
-            decision_at="2026-01-09T20:55:00+00:00",
-            market_date="2026-01-09",
-            horizon_sessions=5,
-            horizon="5_sessions",
-            benchmark="SPY",
-            created_at="2026-01-09T20:45:00+00:00",
-            resolution_window={"start_at": "2026-01-09T20:55:00+00:00"},
-            observation_start="2026-01-09T19:00:00+00:00",
-            observation_end="2026-01-09T20:50:00+00:00",
-            available_at="2026-01-09T20:50:00+00:00",
-            recorded_at="2026-01-09T20:52:00+00:00",
-            source_packet_id=f"packet-{symbol.lower()}",
-            source_artifact_id=f"artifact-{symbol.lower()}",
-            source_artifact_sha256=hashlib.sha256(symbol.encode()).hexdigest(),
-        )
-        for symbol in ("T000", "T001", "T002")
-    )
-    manifest = build_bitemporal_input_manifest(
-        dataset_id="pit-admission-fixture",
-        as_of_cutoff="2026-01-09T21:00:00+00:00",
-        captured_at="2026-01-09T21:00:00+00:00",
-        events=events,
-    )
+    global _PROTOCOL_CACHE
+    assert _PROTOCOL_SOURCE is not None
+    if _PROTOCOL_CACHE is None:
+        cohort, partitions, manifest = _PROTOCOL_SOURCE
+        _PROTOCOL_CACHE = _protocol_from_receipts(cohort, partitions, manifest)
+    return _PROTOCOL_CACHE
+
+
+def _protocol_from_receipts(cohort, partitions, manifest):
     policy = StrategyEvaluationPolicy(
         benchmark_symbol="SPY",
         holding_sessions=5,
@@ -83,85 +77,23 @@ def _protocol():
         round_trip_sides=2,
     )
     return build_frozen_evaluation_protocol(
+        cohort=cohort,
+        market_date_partitions=partitions,
         input_manifest=manifest,
-        primary_universe=primary,
-        sensitivity_universe_50=primary[:50],
-        sensitivity_universe_100=tuple(f"T{i:03d}" for i in range(100)),
-        evaluation_policy=policy,
-        search_budget=EvaluationSearchBudget(5, 3, 25),
-        development_event_ids=(manifest.events[0].decision_event_id,),
-        validation_event_ids=(manifest.events[1].decision_event_id,),
-        holdout_event_ids=(manifest.events[2].decision_event_id,),
-    )
-
-
-def _partitioned_protocol(tmp_path):
-    primary = tuple(f"T{i:03d}" for i in range(75))
-    day = dt.date(2025, 10, 1)
-    market_dates: list[str] = []
-    while len(market_dates) < 60:
-        if day.weekday() < 5:
-            market_dates.append(day.isoformat())
-        day += dt.timedelta(days=1)
-    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
-    artifact = archive.admit(
-        raw_bytes=json.dumps([{"date": date} for date in market_dates]).encode(),
-        source_uri="https://paper-api.alpaca.markets/v2/calendar",
-        content_type="application/json",
-        retrieved_at=NOW.isoformat(timespec="seconds"),
-    )
-    calendar = build_market_session_calendar(archive=archive, raw_artifact=artifact)
-    events = tuple(
-        build_decision_event(
-            universe_id=canonical_universe_id(primary),
-            symbol=primary[index],
-            decision_at=f"{market_date}T20:55:00+00:00",
-            market_date=market_date,
-            horizon_sessions=5,
-            horizon="5_sessions",
-            benchmark="SPY",
-            created_at=f"{market_date}T20:45:00+00:00",
-            resolution_window={"start_at": f"{market_date}T20:55:00+00:00"},
-            observation_start=f"{market_date}T19:00:00+00:00",
-            observation_end=f"{market_date}T20:50:00+00:00",
-            available_at=f"{market_date}T20:50:00+00:00",
-            recorded_at=f"{market_date}T20:52:00+00:00",
-            source_packet_id=f"packet-{market_date}",
-            source_artifact_id=f"artifact-{market_date}",
-            source_artifact_sha256=hashlib.sha256(market_date.encode()).hexdigest(),
-        )
-        for index, market_date in enumerate(market_dates)
-    )
-    partitions = build_market_date_partitions(
-        market_calendar=calendar,
-        events=events,
-    )
-    manifest = build_bitemporal_input_manifest(
-        dataset_id="pit-admission-partitioned-fixture",
-        as_of_cutoff=NOW.isoformat(timespec="seconds"),
-        captured_at=NOW.isoformat(timespec="seconds"),
-        events=events,
-    )
-    policy = StrategyEvaluationPolicy(
-        benchmark_symbol="SPY",
-        holding_sessions=5,
-        commission_bps_per_side="0",
-        half_spread_bps_per_side="5",
-        slippage_bps_per_side="5",
-        round_trip_sides=2,
-    )
-    protocol = build_frozen_evaluation_protocol(
-        input_manifest=manifest,
-        primary_universe=primary,
-        sensitivity_universe_50=primary[:50],
-        sensitivity_universe_100=tuple(f"T{i:03d}" for i in range(100)),
+        primary_universe=cohort.primary_universe_75,
+        sensitivity_universe_50=cohort.sensitivity_universe_50,
+        sensitivity_universe_100=cohort.sensitivity_universe_100,
         evaluation_policy=policy,
         search_budget=EvaluationSearchBudget(5, 3, 25),
         development_event_ids=partitions.development_event_ids,
         validation_event_ids=partitions.validation_event_ids,
         holdout_event_ids=partitions.holdout_event_ids,
     )
-    return protocol, partitions
+
+
+def _partitioned_protocol(tmp_path):
+    assert _PROTOCOL_SOURCE is not None
+    return _protocol(), _PROTOCOL_SOURCE[1]
 
 
 def _adapter(tmp_path):
@@ -209,6 +141,15 @@ def test_admission_binds_complete_protocol_source_bytes_and_store_predecessor(tm
     assert admission.predecessor_event_sha256 == "0" * 64
     assert admission.envelope.kind == "economic-evaluation-protocol"
     assert admission.envelope.payload["source_revision"] == _source_revision(tmp_path)
+    assert admission.envelope.payload["cohort_id"] == protocol.cohort_id
+    assert admission.envelope.payload["cohort_sha256"] == protocol.cohort_sha256
+    assert admission.envelope.payload["partition_id"] == protocol.partition_id
+    assert admission.envelope.payload["partition_sha256"] == protocol.partition_sha256
+    assert lzma.decompress(
+        base64.b64decode(
+            "".join(admission.envelope.payload["protocol"]), validate=True
+        )
+    ) == protocol.canonical_json_bytes()
     assert admission.envelope.payload["analysis_only"] is True
     assert admission.envelope.payload["can_submit_orders"] is False
 
@@ -232,6 +173,92 @@ def test_same_admitted_protocol_is_idempotent_but_not_reissued(tmp_path):
     assert first.created is True
     assert second.created is False
     assert second.envelope.object_id == first.envelope.object_id
+
+
+def test_admission_rejects_same_manifest_rebound_to_a_different_cohort(tmp_path):
+    assert _PROTOCOL_SOURCE is not None
+    cohort, partitions, manifest = _PROTOCOL_SOURCE
+    adapter = _adapter(tmp_path)
+    adapter.admit_protocol(
+        _protocol(),
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+
+    symbol_overrides = {
+        99 - position: symbol
+        for position, symbol in enumerate(cohort.sensitivity_universe_100)
+    }
+    archive, calendar, payload = _source_cohort_fixture(
+        tmp_path / "different-cohort",
+        symbol_overrides=symbol_overrides,
+        archive_recorded_at=dt.datetime(2026, 3, 31, 20, 32, tzinfo=dt.UTC),
+    )
+    different_cohort = _build_from_fixture(archive, calendar, payload)
+    rebound = _protocol_from_receipts(different_cohort, partitions, manifest)
+    assert rebound.protocol_id != _protocol().protocol_id
+    assert rebound.primary_universe == _protocol().primary_universe
+
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        adapter.admit_protocol(
+            rebound,
+            source_revision=_source_revision(tmp_path),
+            effective_at=NOW,
+            source_paths=("evaluation.py",),
+        )
+
+
+def test_admission_rejects_same_manifest_rebound_to_a_different_partition(tmp_path):
+    assert _PROTOCOL_SOURCE is not None
+    cohort, partitions, manifest = _PROTOCOL_SOURCE
+    adapter = _adapter(tmp_path)
+    adapter.admit_protocol(
+        _protocol(),
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "different-partition-calendar",
+        clock=lambda: dt.datetime(2026, 4, 1, 12, 0, tzinfo=dt.UTC),
+    )
+    artifact = archive.admit(
+        raw_bytes=json.dumps(
+            [
+                {"close": "16:00", "date": day, "open": "09:30"}
+                for day in partitions.market_calendar.market_dates
+            ],
+            indent=1,
+        ).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2026-04-01T12:00:00+00:00",
+    )
+    different_calendar = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=artifact,
+    )
+    different_partitions = build_market_date_partitions(
+        market_calendar=different_calendar,
+        cadence=partitions.cadence,
+        registered_at=partitions.registered_at,
+        primary_universe=partitions.primary_universe,
+        decision_market_dates=partitions.decision_market_dates,
+        events=partitions.events,
+    )
+    rebound = _protocol_from_receipts(cohort, different_partitions, manifest)
+    assert rebound.protocol_id != _protocol().protocol_id
+    assert rebound.input_manifest_id == _protocol().input_manifest_id
+
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        adapter.admit_protocol(
+            rebound,
+            source_revision=_source_revision(tmp_path),
+            effective_at=NOW,
+            source_paths=("evaluation.py",),
+        )
 
 
 def test_admission_rejects_changed_provenance_for_an_existing_protocol(tmp_path):

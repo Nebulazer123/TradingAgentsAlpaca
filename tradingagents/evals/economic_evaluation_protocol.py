@@ -35,13 +35,21 @@ import math
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from tradingagents.dataflows.pit.cohort import (
+    PointInTimeCohort,
+    validate_nonqualifying_point_in_time_cohort_record,
+)
 
 from tradingagents.evals.agent_intelligence_reconciliation import (
     market_event_key,
     packet_event_key,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
+
+if TYPE_CHECKING:
+    from tradingagents.dataflows.pit.partitions import MarketDatePartitions
 
 __all__: list[str] = [
     "EconomicEvaluationProtocolError",
@@ -61,7 +69,7 @@ __all__: list[str] = [
 DECISION_EVENT_SCHEMA = "decision_event/v1"
 BITEMPORAL_INPUT_MANIFEST_SCHEMA = "bitemporal_input_manifest/v1"
 EVALUATION_SEARCH_BUDGET_SCHEMA = "evaluation_search_budget/v1"
-FROZEN_EVALUATION_PROTOCOL_SCHEMA = "frozen_economic_evaluation_protocol/v1"
+FROZEN_EVALUATION_PROTOCOL_SCHEMA = "frozen_economic_evaluation_protocol/v2"
 AUTHORITY_FIELDS: dict[str, object] = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -268,10 +276,6 @@ def canonical_universe_id(symbols: tuple[str, ...]) -> str:
         _normalized_symbol(symbol, field_name=f"universe symbol [{index}]")
         for index, symbol in enumerate(symbols)
     ]
-    if validated != sorted(validated):
-        raise EconomicEvaluationProtocolError(
-            "universe symbols must be lexicographically ordered"
-        )
     if len(set(validated)) != len(validated):
         raise EconomicEvaluationProtocolError("universe symbols must be unique")
     return "universe-" + _sha256(validated)
@@ -866,6 +870,12 @@ class FrozenEvaluationProtocol:
     """Complete immutable TA-Control preregistration and sealed cohort binding."""
 
     protocol_id: str
+    cohort: PointInTimeCohort
+    cohort_id: str
+    cohort_sha256: str
+    market_date_partitions: "MarketDatePartitions"
+    partition_id: str
+    partition_sha256: str
     input_manifest: BitemporalInputManifest
     input_manifest_id: str
     input_manifest_sha256: str
@@ -896,6 +906,12 @@ class FrozenEvaluationProtocol:
         payload.update(
             {
                 "protocol_id": self.protocol_id,
+                "cohort": self.cohort.to_dict(),
+                "cohort_id": self.cohort_id,
+                "cohort_sha256": self.cohort_sha256,
+                "market_date_partitions": self.market_date_partitions.to_dict(),
+                "partition_id": self.partition_id,
+                "partition_sha256": self.partition_sha256,
                 "input_manifest": self.input_manifest.to_dict(),
                 "input_manifest_id": self.input_manifest_id,
                 "input_manifest_sha256": self.input_manifest_sha256,
@@ -962,6 +978,8 @@ def _protocol_payload_without_id(protocol: FrozenEvaluationProtocol) -> dict[str
 
 def build_frozen_evaluation_protocol(
     *,
+    cohort: PointInTimeCohort,
+    market_date_partitions: "MarketDatePartitions",
     input_manifest: BitemporalInputManifest,
     primary_universe: tuple[str, ...],
     sensitivity_universe_50: tuple[str, ...],
@@ -974,6 +992,33 @@ def build_frozen_evaluation_protocol(
 ) -> FrozenEvaluationProtocol:
     """Build the closed TA-Control protocol without executing any evaluation."""
 
+    from tradingagents.dataflows.pit.partitions import (
+        MarketDatePartitions,
+        validate_market_date_partitions,
+    )
+
+    if type(cohort) is not PointInTimeCohort:
+        raise EconomicEvaluationProtocolError(
+            "cohort must be an exact PointInTimeCohort receipt"
+        )
+    try:
+        frozen_cohort = validate_nonqualifying_point_in_time_cohort_record(
+            cohort.to_dict()
+        )
+    except (TypeError, ValueError) as exc:
+        raise EconomicEvaluationProtocolError("cohort canonical validation failed") from exc
+    if type(market_date_partitions) is not MarketDatePartitions:
+        raise EconomicEvaluationProtocolError(
+            "market_date_partitions must be an exact MarketDatePartitions receipt"
+        )
+    try:
+        partitioned = validate_market_date_partitions(
+            market_date_partitions.to_dict()
+        )
+    except (TypeError, ValueError) as exc:
+        raise EconomicEvaluationProtocolError(
+            "market-date partition canonical validation failed"
+        ) from exc
     if type(input_manifest) is not BitemporalInputManifest:
         raise EconomicEvaluationProtocolError(
             "input_manifest must be an exact BitemporalInputManifest"
@@ -994,6 +1039,22 @@ def build_frozen_evaluation_protocol(
         field_name="sensitivity_universe_100",
         expected_size=100,
     )
+    if primary != frozen_cohort.primary_universe_75:
+        raise EconomicEvaluationProtocolError(
+            "primary_universe must be the literal ranked cohort prefix of 75"
+        )
+    if sensitivity_50 != frozen_cohort.sensitivity_universe_50:
+        raise EconomicEvaluationProtocolError(
+            "sensitivity_universe_50 must be the literal ranked cohort prefix of 50"
+        )
+    if sensitivity_100 != frozen_cohort.sensitivity_universe_100:
+        raise EconomicEvaluationProtocolError(
+            "sensitivity_universe_100 must be the complete ranked cohort of 100"
+        )
+    if sensitivity_50 != sensitivity_100[:50] or primary != sensitivity_100[:75]:
+        raise EconomicEvaluationProtocolError(
+            "protocol universes must preserve literal ranked cohort prefixes"
+        )
     if not set(sensitivity_50) < set(primary):
         raise EconomicEvaluationProtocolError(
             "sensitivity_universe_50 must be a strict subset of primary_universe"
@@ -1018,6 +1079,26 @@ def build_frozen_evaluation_protocol(
         )
 
     primary_universe_id = canonical_universe_id(primary)
+    if (
+        partitioned.primary_universe != primary
+        or partitioned.primary_universe_id != primary_universe_id
+    ):
+        raise EconomicEvaluationProtocolError(
+            "market-date partitions do not bind the ranked primary cohort"
+        )
+    if datetime.datetime.fromisoformat(
+        frozen_cohort.selection_time
+    ) > datetime.datetime.fromisoformat(partitioned.registered_at):
+        raise EconomicEvaluationProtocolError(
+            "cohort must be frozen before weekly decision-date registration"
+        )
+    partition_events = tuple(
+        sorted(partitioned.events, key=lambda event: event.decision_event_id)
+    )
+    if manifest.events != partition_events:
+        raise EconomicEvaluationProtocolError(
+            "input manifest must contain the complete partition decision events"
+        )
     for event in manifest.events:
         if event.universe_id != primary_universe_id:
             raise EconomicEvaluationProtocolError(
@@ -1056,9 +1137,23 @@ def build_frozen_evaluation_protocol(
         raise EconomicEvaluationProtocolError(
             "protocol partitions must be exhaustive for exactly the manifest events"
         )
+    if (
+        development_ids != partitioned.development_event_ids
+        or validation_ids != partitioned.validation_event_ids
+        or holdout_ids != partitioned.holdout_event_ids
+    ):
+        raise EconomicEvaluationProtocolError(
+            "protocol partitions must match the complete market-date partition receipt"
+        )
 
     provisional = _new_frozen_evaluation_protocol(
         protocol_id="",
+        cohort=frozen_cohort,
+        cohort_id=frozen_cohort.cohort_id,
+        cohort_sha256=frozen_cohort.cohort_sha256,
+        market_date_partitions=partitioned,
+        partition_id=partitioned.partition_id,
+        partition_sha256=partitioned.partition_sha256,
         input_manifest=manifest,
         input_manifest_id=manifest.manifest_id,
         input_manifest_sha256=manifest.manifest_sha256,
@@ -1078,6 +1173,12 @@ def build_frozen_evaluation_protocol(
     return _new_frozen_evaluation_protocol(
         protocol_id="economic-evaluation-protocol-"
         + _sha256(_protocol_payload_without_id(provisional)),
+        cohort=provisional.cohort,
+        cohort_id=provisional.cohort_id,
+        cohort_sha256=provisional.cohort_sha256,
+        market_date_partitions=provisional.market_date_partitions,
+        partition_id=provisional.partition_id,
+        partition_sha256=provisional.partition_sha256,
         input_manifest=provisional.input_manifest,
         input_manifest_id=provisional.input_manifest_id,
         input_manifest_sha256=provisional.input_manifest_sha256,
@@ -1161,6 +1262,18 @@ def validate_frozen_evaluation_protocol(value: object) -> FrozenEvaluationProtoc
         field_name="input_manifest_id",
     )
     _lower_sha256(values["input_manifest_sha256"], field_name="input_manifest_sha256")
+    _prefixed_digest(
+        values["cohort_id"],
+        prefix="point-in-time-cohort-",
+        field_name="cohort_id",
+    )
+    _lower_sha256(values["cohort_sha256"], field_name="cohort_sha256")
+    _prefixed_digest(
+        values["partition_id"],
+        prefix="market-date-partitions-",
+        field_name="partition_id",
+    )
+    _lower_sha256(values["partition_sha256"], field_name="partition_sha256")
     for field_name in (
         "primary_universe_sha256",
         "sensitivity_universe_50_sha256",
@@ -1169,10 +1282,21 @@ def validate_frozen_evaluation_protocol(value: object) -> FrozenEvaluationProtoc
     ):
         _lower_sha256(values[field_name], field_name=field_name)
 
+    from tradingagents.dataflows.pit.partitions import validate_market_date_partitions
+
+    try:
+        cohort = validate_nonqualifying_point_in_time_cohort_record(values["cohort"])
+        partitions = validate_market_date_partitions(values["market_date_partitions"])
+    except (TypeError, ValueError) as exc:
+        raise EconomicEvaluationProtocolError(
+            "nested cohort or partition receipt is invalid"
+        ) from exc
     manifest = validate_bitemporal_input_manifest(values["input_manifest"])
     policy = _validated_policy(values["evaluation_policy"])
     budget = _validated_search_budget(values["search_budget"])
     rebuilt = build_frozen_evaluation_protocol(
+        cohort=cohort,
+        market_date_partitions=partitions,
         input_manifest=manifest,
         primary_universe=_tuple_from_serialized_symbols(
             values["primary_universe"],

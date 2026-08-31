@@ -1,4 +1,4 @@
-"""Contracts for exhaustive, purged market-date economic partitions."""
+"""Contracts for exhaustive, purged weekly economic partitions."""
 
 from __future__ import annotations
 
@@ -19,34 +19,55 @@ from tradingagents.evals.economic_evaluation_protocol import (
     build_decision_event,
     canonical_universe_id,
 )
+from tests.test_point_in_time_cohort import (
+    _build_from_fixture,
+    _source_cohort_fixture,
+)
+
+REGISTERED_AT = "2026-04-01T12:01:00+00:00"
 
 
-def _market_dates() -> tuple[str, ...]:
-    start = dt.date(2026, 1, 5)
+def _weekly_calendar_dates() -> tuple[str, ...]:
     dates: list[str] = []
-    day = start
-    while len(dates) < 60:
-        if day.weekday() < 5:
-            dates.append(day.isoformat())
-        day += dt.timedelta(days=1)
+    monday = dt.date(2026, 4, 6)
+    for week in range(55):
+        for weekday in range(5):
+            if week in {7, 23, 41} and weekday == 4:
+                continue
+            dates.append((monday + dt.timedelta(weeks=week, days=weekday)).isoformat())
     return tuple(dates)
 
 
+def _decision_dates(market_dates: tuple[str, ...]) -> tuple[str, ...]:
+    by_week: dict[tuple[int, int], list[str]] = {}
+    for market_date in market_dates:
+        parsed = dt.date.fromisoformat(market_date)
+        iso = parsed.isocalendar()
+        by_week.setdefault((iso.year, iso.week), []).append(market_date)
+    return tuple(rows[-1] for rows in by_week.values())
+
+
 def _calendar(tmp_path, market_dates: tuple[str, ...]):
-    raw_bytes = json.dumps([{"date": day} for day in market_dates]).encode("utf-8")
-    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
+    raw_bytes = json.dumps(
+        [{"date": day, "open": "09:30", "close": "16:00"} for day in market_dates],
+        separators=(",", ":"),
+    ).encode()
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "partition-calendar",
+        clock=lambda: dt.datetime(2026, 4, 1, 12, 0, tzinfo=dt.UTC),
+    )
     artifact = archive.admit(
         raw_bytes=raw_bytes,
         source_uri="https://paper-api.alpaca.markets/v2/calendar",
         content_type="application/json",
-        retrieved_at="2026-01-05T21:00:00+00:00",
+        retrieved_at="2026-04-01T12:00:00+00:00",
     )
     return build_market_session_calendar(archive=archive, raw_artifact=artifact)
 
 
-def _event(market_date: str, symbol: str):
+def _event(market_date: str, symbol: str, primary: tuple[str, ...]):
     return build_decision_event(
-        universe_id=canonical_universe_id(tuple(f"T{index:03d}" for index in range(75))),
+        universe_id=canonical_universe_id(primary),
         symbol=symbol,
         decision_at=f"{market_date}T20:55:00+00:00",
         market_date=market_date,
@@ -67,60 +88,109 @@ def _event(market_date: str, symbol: str):
     )
 
 
-def test_partitions_are_chronological_exhaustive_and_mask_both_purge_boundaries(tmp_path):
-    market_dates = _market_dates()
-    calendar = _calendar(tmp_path, market_dates)
+@pytest.fixture(scope="module")
+def weekly_source(tmp_path_factory):
+    root = tmp_path_factory.mktemp("weekly-partitions")
+    cohort_archive, cohort_calendar, payload = _source_cohort_fixture(root / "cohort")
+    cohort = _build_from_fixture(cohort_archive, cohort_calendar, payload)
+    primary = cohort.primary_universe_75
+    market_dates = _weekly_calendar_dates()
+    decision_dates = _decision_dates(market_dates)
+    calendar = _calendar(root, market_dates)
     events = tuple(
-        _event(market_date, f"T{index:03d}")
-        for index, market_date in enumerate(market_dates)
+        _event(market_date, symbol, primary)
+        for market_date in decision_dates
+        for symbol in primary
     )
-    partitions = build_market_date_partitions(
-        market_calendar=calendar,
-        events=events,
-    )
+    return cohort, calendar, decision_dates, events
 
-    assert len(partitions.development_market_dates) == 36
-    assert len(partitions.validation_market_dates) == 12
-    assert len(partitions.holdout_market_dates) == 12
-    assert partitions.development_validation_purge_dates == market_dates[31:36]
-    assert partitions.development_validation_embargo_dates == market_dates[36:41]
-    assert partitions.validation_holdout_purge_dates == market_dates[43:48]
-    assert partitions.validation_holdout_embargo_dates == market_dates[48:53]
-    assigned = (
-        partitions.development_event_ids
-        + partitions.validation_event_ids
-        + partitions.holdout_event_ids
-    )
-    assert set(assigned) == {event.decision_event_id for event in events}
-    assert len(assigned) == len(set(assigned))
-    assert len(partitions.development_eligible_event_ids) == 31
-    assert len(partitions.validation_eligible_event_ids) == 2
-    assert len(partitions.holdout_eligible_event_ids) == 7
-    assert not set(partitions.development_eligible_event_ids).intersection(
-        partitions.development_validation_purge_event_ids
-    )
-    assert not set(partitions.validation_eligible_event_ids).intersection(
-        partitions.development_validation_embargo_event_ids
-        + partitions.validation_holdout_purge_event_ids
-    )
-    assert not set(partitions.holdout_eligible_event_ids).intersection(
-        partitions.validation_holdout_embargo_event_ids
-    )
+
+def _build(weekly_source, **overrides):
+    cohort, calendar, decision_dates, events = weekly_source
+    values = {
+        "market_calendar": calendar,
+        "cadence": "weekly",
+        "registered_at": REGISTERED_AT,
+        "primary_universe": cohort.primary_universe_75,
+        "decision_market_dates": decision_dates,
+        "events": events,
+    }
+    values.update(overrides)
+    return build_market_date_partitions(**values)
+
+
+def test_weekly_partitions_are_source_derived_complete_and_guarded(weekly_source):
+    _cohort, _calendar_receipt, decision_dates, events = weekly_source
+    partitions = _build(weekly_source)
+
+    assert partitions.cadence == "weekly"
+    assert partitions.decision_market_dates == decision_dates
+    assert len(partitions.development_market_dates) == 33
+    assert len(partitions.validation_market_dates) == 11
+    assert len(partitions.holdout_market_dates) == 11
+    assert partitions.development_validation_purge_dates == decision_dates[28:33]
+    assert partitions.development_validation_embargo_dates == decision_dates[33:38]
+    assert partitions.validation_holdout_purge_dates == decision_dates[39:44]
+    assert partitions.validation_holdout_embargo_dates == decision_dates[44:49]
+    assert len(partitions.development_event_ids) == 33 * 75
+    assert len(partitions.validation_event_ids) == 11 * 75
+    assert len(partitions.holdout_event_ids) == 11 * 75
+    assert len(partitions.development_eligible_event_ids) == 28 * 75
+    assert len(partitions.validation_eligible_event_ids) == 75
+    assert len(partitions.holdout_eligible_event_ids) == 6 * 75
+    assert any(dt.date.fromisoformat(day).weekday() == 3 for day in decision_dates)
+
+    event_partition: dict[str, str] = {}
+    for name, event_ids in (
+        ("development", partitions.development_event_ids),
+        ("validation", partitions.validation_event_ids),
+        ("holdout", partitions.holdout_event_ids),
+    ):
+        for event_id in event_ids:
+            event_partition[event_id] = name
+    for market_date in decision_dates:
+        date_partitions = {
+            event_partition[event.decision_event_id]
+            for event in events
+            if event.market_date == market_date
+        }
+        assert len(date_partitions) == 1
+
     assert validate_market_date_partitions(
         json.loads(partitions.canonical_json_bytes())
     ) == partitions
 
 
-def test_partitions_reject_too_short_calendar_or_events_outside_calendar(tmp_path):
-    market_dates = _market_dates()
-    calendar = _calendar(tmp_path, market_dates)
+@pytest.mark.parametrize(
+    "change",
+    (
+        lambda source: {"cadence": "daily"},
+        lambda source: {
+            "decision_market_dates": (
+                source[2][0],
+                source[2][0],
+                *source[2][2:],
+            )
+        },
+        lambda source: {"decision_market_dates": source[2][:10] + source[2][11:]},
+        lambda source: {"decision_market_dates": ("2026-04-06", *source[2][1:])},
+        lambda source: {"events": source[3][:-1]},
+        lambda source: {"events": (*source[3][:-1], source[3][0])},
+        lambda source: {"registered_at": source[3][0].decision_at},
+    ),
+)
+def test_partitions_reject_nonweekly_unregistered_or_incomplete_inputs(
+    weekly_source,
+    change,
+):
     with pytest.raises(PointInTimeDataError):
-        build_market_date_partitions(
-            market_calendar=_calendar(tmp_path / "short", market_dates[:24]),
-            events=tuple(_event(day, "T000") for day in market_dates[:24]),
-        )
+        _build(weekly_source, **change(weekly_source))
+
+
+def test_partition_validator_rejects_nonexhaustive_or_overlapping_receipts(weekly_source):
+    payload = _build(weekly_source).to_dict()
+    payload["development_event_ids"].pop()
+    payload["validation_event_ids"].append(payload["holdout_event_ids"][0])
+
     with pytest.raises(PointInTimeDataError):
-        build_market_date_partitions(
-            market_calendar=calendar,
-            events=(_event("2026-02-01", "T000"),),
-        )
+        validate_market_date_partitions(payload)
