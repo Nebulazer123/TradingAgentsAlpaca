@@ -13,13 +13,12 @@ from cli.main import app
 from tests.fixtures.economic_tournament import build_tournament_receipt
 from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
 from tests.test_point_in_time_cohort import _source_cohort_fixture
-from tradingagents.dataflows.pit import RawPointInTimeArtifactArchive
+from tradingagents.evals.economic_evaluation_partition_binding import (
+    bind_validation_phase_eligibility,
+)
 from tradingagents.evals.economic_evaluation_protocol import (
     EvaluationSearchBudget,
     build_frozen_evaluation_protocol,
-)
-from tradingagents.evals.economic_evaluation_partition_binding import (
-    bind_validation_phase_eligibility,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
 

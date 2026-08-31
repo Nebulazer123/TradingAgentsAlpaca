@@ -520,6 +520,7 @@ def _feature_date(
     market_date: str,
     events: tuple[object, ...],
     primary_universe: tuple[str, ...],
+    primary_security_ids: Mapping[str, str],
     label: str,
 ) -> tuple[
     dict[str, object],
@@ -563,6 +564,10 @@ def _feature_date(
         if security.symbol != candidate.symbol or candidate.symbol != event_symbol:
             raise EconomicTournamentInputEvidenceError(
                 f"{label}.candidates[{index}] security symbol does not match candidate"
+            )
+        if security.security_id != primary_security_ids[event_symbol]:
+            raise EconomicTournamentInputEvidenceError(
+                f"{label}.candidates[{index}] security does not match the sealed cohort"
             )
         if not (
             security.effective_from <= market_date
@@ -629,7 +634,7 @@ def _feature_date(
         raise EconomicTournamentInputEvidenceError(
             f"{label} benchmark security is invalid"
         ) from exc
-    first_decision_at = min(getattr(event, "decision_at") for event in events)
+    first_decision_at = min(event.decision_at for event in events)
     if benchmark_security.symbol != "SPY" or not (
         benchmark_security.effective_from <= market_date
         and (
@@ -639,6 +644,10 @@ def _feature_date(
     ):
         raise EconomicTournamentInputEvidenceError(
             f"{label} benchmark security identity is invalid"
+        )
+    if benchmark_security.security_id in set(primary_security_ids.values()):
+        raise EconomicTournamentInputEvidenceError(
+            f"{label} benchmark security collides with the sealed primary cohort"
         )
     security_observation = _observation(
         benchmark["security_observation"],
@@ -792,6 +801,7 @@ def _context(
     FrozenEvaluationProtocol,
     ValidationPhaseEligibility,
     tuple[tuple[str, tuple[object, ...]], ...],
+    Mapping[str, str],
 ]:
     if type(protocol) is not FrozenEvaluationProtocol:
         raise EconomicTournamentInputEvidenceError("protocol must be an exact frozen value")
@@ -800,6 +810,18 @@ def _context(
         bound = validate_validation_phase_eligibility(protocol=frozen, eligibility=eligibility)
     except (TypeError, ValueError) as exc:
         raise EconomicTournamentInputEvidenceError("validation eligibility is invalid") from exc
+    primary_ranking = frozen.cohort.ranking[: len(frozen.primary_universe)]
+    primary_symbols = tuple(row.symbol for row in primary_ranking)
+    primary_ids = tuple(row.security_id for row in primary_ranking)
+    if primary_symbols != frozen.primary_universe:
+        raise EconomicTournamentInputEvidenceError(
+            "sealed cohort ranking does not match the frozen primary universe"
+        )
+    if len(set(primary_ids)) != len(primary_ids):
+        raise EconomicTournamentInputEvidenceError(
+            "sealed primary cohort security identities collide"
+        )
+    primary_security_ids = MappingProxyType(dict(zip(primary_symbols, primary_ids, strict=True)))
     events_by_id = {event.decision_event_id: event for event in frozen.input_manifest.events}
     grouped: OrderedDict[str, list[object]] = OrderedDict()
     for event_id in bound.event_ids:
@@ -807,14 +829,14 @@ def _context(
         grouped.setdefault(event.market_date, []).append(event)
     result: list[tuple[str, tuple[object, ...]]] = []
     for market_date, date_events in grouped.items():
-        events_by_symbol = {getattr(item, "symbol"): item for item in date_events}
+        events_by_symbol = {item.symbol: item for item in date_events}
         if len(date_events) != 75 or set(events_by_symbol) != set(frozen.primary_universe):
             raise EconomicTournamentInputEvidenceError(
                 "every validation market date must bind the ranked 75-symbol universe"
             )
         events = tuple(events_by_symbol[symbol] for symbol in frozen.primary_universe)
         result.append((market_date, events))
-    return frozen, bound, tuple(result)
+    return frozen, bound, tuple(result), primary_security_ids
 
 
 def _build_features(
@@ -823,7 +845,10 @@ def _build_features(
     eligibility: ValidationPhaseEligibility,
     market_date_inputs: object,
 ) -> SourceBoundTournamentFeatures:
-    frozen, bound, grouped = _context(protocol=protocol, eligibility=eligibility)
+    frozen, bound, grouped, primary_security_ids = _context(
+        protocol=protocol,
+        eligibility=eligibility,
+    )
     if type(market_date_inputs) not in (list, tuple):
         raise EconomicTournamentInputEvidenceError(
             "feature market dates must be an exact ordered sequence"
@@ -843,13 +868,14 @@ def _build_features(
             market_date=market_date,
             events=events,
             primary_universe=frozen.primary_universe,
+            primary_security_ids=primary_security_ids,
             label=f"market_dates[{index}]",
         )
         canonical_dates.append(
             _freeze_json(canonical, label=f"market_dates[{index}]")
         )
         for event in events:
-            candidates_by_event[getattr(event, "decision_event_id")] = candidates
+            candidates_by_event[event.decision_event_id] = candidates
     material = {
         "schema_version": _FEATURE_SCHEMA,
         "protocol_id": frozen.protocol_id,
@@ -882,7 +908,10 @@ def _build_outcomes(
     features: SourceBoundTournamentFeatures,
     market_date_inputs: object,
 ) -> SourceBoundTournamentOutcomes:
-    frozen, bound, grouped = _context(protocol=protocol, eligibility=eligibility)
+    frozen, bound, grouped, _primary_security_ids = _context(
+        protocol=protocol,
+        eligibility=eligibility,
+    )
     if type(features) is not SourceBoundTournamentFeatures:
         raise EconomicTournamentInputEvidenceError(
             "features must be an exact pre-outcome receipt"
@@ -934,7 +963,7 @@ def _build_outcomes(
         identities[benchmark_security.symbol] = benchmark_security
         returns: list[tuple[str, str]] = []
         normalized: list[dict[str, object]] = []
-        decision_at = max(getattr(event, "decision_at") for event in events)
+        decision_at = max(event.decision_at for event in events)
         for outcome_index, raw_outcome in enumerate(payload["outcomes"]):
             if not isinstance(raw_outcome, Mapping) or type(raw_outcome.get("symbol")) is not str:
                 raise EconomicTournamentInputEvidenceError(
@@ -961,7 +990,7 @@ def _build_outcomes(
             )
         shared_returns = tuple(returns)
         for event in events:
-            event_id = getattr(event, "decision_event_id")
+            event_id = event.decision_event_id
             evaluator_outcomes[event_id] = EconomicTournamentOutcome(
                 decision_event_id=event_id,
                 realized_returns=shared_returns,

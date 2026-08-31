@@ -483,6 +483,7 @@ class EconomicTournamentReceiptArchive:
 
     def _ensure_directories(self) -> None:
         parent = self.root.parent
+        root_existed = self.root.exists()
         if parent.exists():
             state = os.lstat(parent)
             if not stat.S_ISDIR(state.st_mode) or stat.S_ISLNK(state.st_mode):
@@ -505,6 +506,8 @@ class EconomicTournamentReceiptArchive:
                 raise EconomicTournamentInputEvidenceError(
                     "tournament receipt archive directory is unsafe"
                 )
+        if not root_existed:
+            self._fsync_directory(parent)
         self._fsync_directory(self.root)
 
     def _verify_directories(self) -> None:
@@ -553,11 +556,11 @@ class EconomicTournamentReceiptArchive:
                 os.fsync(handle.fileno())
             try:
                 os.link(staged, path, follow_symlinks=False)
-            except FileExistsError:
+            except FileExistsError as exc:
                 if self._read_regular(path) != data:
                     raise EconomicTournamentInputEvidenceError(
                         "tournament receipt content-address collision"
-                    )
+                    ) from exc
             self._fsync_directory(path.parent)
         except EconomicTournamentInputEvidenceError:
             raise

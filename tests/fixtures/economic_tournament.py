@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
 
 from tradingagents.dataflows.pit import (
@@ -35,10 +36,10 @@ def _canonical_bytes(value: object) -> bytes:
     ).encode()
 
 
-def _security_fields(symbol: str) -> dict[str, object]:
+def _security_fields(symbol: str, security_id: str) -> dict[str, object]:
     return {
         "schema_version": "security_identity/v1",
-        "security_id": f"security-{symbol.lower()}",
+        "security_id": security_id,
         "symbol": symbol,
         "cik": None,
         "figi": None,
@@ -60,9 +61,10 @@ def _security(
     clock_value: list[dt.datetime],
     *,
     symbol: str,
+    security_id: str,
     available_at: str,
 ) -> tuple[SecurityIdentity, PointInTimeObservation]:
-    source_value = _security_fields(symbol)
+    source_value = _security_fields(symbol, security_id)
     clock_value[0] = dt.datetime.fromisoformat(available_at)
     artifact = archive.admit(
         raw_bytes=_canonical_bytes({"value": source_value}),
@@ -71,7 +73,7 @@ def _security(
         retrieved_at=available_at,
     )
     security = SecurityIdentity(
-        security_id=f"security-{symbol.lower()}",
+        security_id=security_id,
         symbol=symbol,
         cik=None,
         figi=None,
@@ -136,11 +138,13 @@ def _candidate_row(
     clock_value: list[dt.datetime],
     *,
     event,
+    security_id: str,
 ) -> tuple[dict[str, object], SecurityIdentity]:
     security, security_observation = _security(
         archive,
         clock_value,
         symbol=event.symbol,
+        security_id=security_id,
         available_at=event.available_at,
     )
     candidate = {
@@ -252,11 +256,17 @@ def build_tournament_receipt(
     *,
     protocol: FrozenEvaluationProtocol,
     eligibility: ValidationPhaseEligibility,
+    security_id_overrides: Mapping[str, str] | None = None,
 ) -> tuple[SourceBoundTournamentInput, RawPointInTimeArtifactArchive]:
     """Build a complete receipt while preserving the pre/post outcome boundary."""
 
     clock_value = [dt.datetime(2026, 1, 1, tzinfo=dt.UTC)]
     archive = RawPointInTimeArtifactArchive(root, clock=lambda: clock_value[0])
+    primary_security_ids = {
+        row.symbol: row.security_id
+        for row in protocol.cohort.ranking[: len(protocol.primary_universe)]
+    }
+    overrides = dict(security_id_overrides or {})
     events_by_id = {
         event.decision_event_id: event for event in protocol.input_manifest.events
     }
@@ -276,6 +286,10 @@ def build_tournament_receipt(
                 archive,
                 clock_value,
                 event=event,
+                security_id=overrides.get(
+                    event.symbol,
+                    primary_security_ids[event.symbol],
+                ),
             )
             candidates.append(candidate)
             identities[security.symbol] = security
@@ -284,6 +298,7 @@ def build_tournament_receipt(
             archive,
             clock_value,
             symbol="SPY",
+            security_id="security-spy",
             available_at=first_event.available_at,
         )
         benchmark_value = {

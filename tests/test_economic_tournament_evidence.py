@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import subprocess
 from pathlib import Path
 
@@ -83,11 +84,53 @@ def test_features_freeze_once_per_market_date_and_outcomes_only_reference_them(
     assert rebuilt.candidates_by_event[event_ids[0]] is rebuilt.candidates_by_event[event_ids[1]]
 
 
-def test_raw_replay_and_complete_receipt_archive_are_idempotent_and_owner_only(
+def test_alternate_primary_identity_colliding_with_cohort_cannot_qualify(
     tmp_path: Path, protocol_source
+):
+    protocol, eligibility = _protocol(protocol_source)
+    first_symbol, second_symbol = protocol.primary_universe[:2]
+    cohort_ids = {
+        row.symbol: row.security_id
+        for row in protocol.cohort.ranking[: len(protocol.primary_universe)]
+    }
+    alternate_root = tmp_path / "alternate-id-pit"
+
+    with pytest.raises(EconomicTournamentInputEvidenceError, match="sealed cohort"):
+        build_tournament_receipt(
+            alternate_root,
+            protocol=protocol,
+            eligibility=eligibility,
+            security_id_overrides={first_symbol: cohort_ids[second_symbol]},
+        )
+    alternate_receipt = next(
+        receipt
+        for path in (alternate_root / "objects").glob("*.json")
+        if (receipt := json.loads(path.read_text(encoding="utf-8")))["source_uri"]
+        == f"https://example.invalid/security-master/{first_symbol}.json"
+    )
+    alternate_raw = json.loads(
+        (
+            alternate_root
+            / "objects"
+            / f"{alternate_receipt['raw_artifact_id']}.raw"
+        ).read_bytes()
+    )
+    assert alternate_raw["value"]["security_id"] == cohort_ids[second_symbol]
+
+
+def test_raw_replay_and_complete_receipt_archive_are_idempotent_and_owner_only(
+    tmp_path: Path, protocol_source, monkeypatch
 ):
     protocol, eligibility, receipt, pit_archive = _receipt(tmp_path, protocol_source)
     archive = EconomicTournamentReceiptArchive(tmp_path / "evidence" / "_tournament_receipts")
+    synced_directories: list[Path] = []
+    fsync_directory = archive._fsync_directory
+
+    def record_fsync(path: Path) -> None:
+        synced_directories.append(path)
+        fsync_directory(path)
+
+    monkeypatch.setattr(archive, "_fsync_directory", record_fsync)
 
     archive.admit(receipt, pit_artifact_root=pit_archive.root)
     archive.admit(receipt, pit_artifact_root=pit_archive.root)
@@ -99,6 +142,7 @@ def test_raw_replay_and_complete_receipt_archive_are_idempotent_and_owner_only(
     )
 
     assert reopened.canonical_json_bytes() == receipt.canonical_json_bytes()
+    assert archive.root.parent in synced_directories
     for directory in (
         archive.root,
         archive.root / "features",
