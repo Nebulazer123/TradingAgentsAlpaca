@@ -6,6 +6,7 @@ broker, runtime, filesystem, scheduler, or network dependency.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 
@@ -23,6 +24,10 @@ from tradingagents.evals.economic_evaluation_protocol import (
 from tradingagents.evals.economic_evaluation_result import (
     EconomicValidationResult,
     build_validation_evaluation_result,
+)
+from tradingagents.evals.economic_tournament_statistics import (
+    WeeklyArmObservation,
+    build_economic_tournament_statistics,
 )
 from tradingagents.sleeves.pullback_support import PullbackFeatures, evaluate_pullback_support
 
@@ -190,18 +195,115 @@ def build_ta_control_allocations(
 
 
 def _text(value: Decimal) -> str:
-    text = format(value, "f")
-    return text.rstrip("0").rstrip(".") if "." in text else text
+    integral = value.to_integral_value()
+    if abs(value - integral) < Decimal("1e-24"):
+        value = integral
+    return "0" if value.is_zero() else format(value.normalize(), "f")
 
 
-def _arm_return(allocation: ControlArmAllocation, outcome: EconomicTournamentOutcome) -> tuple[Decimal, Decimal, Decimal]:
-    selected = allocation.selected_symbols
+def _target_weights(allocation: ControlArmAllocation) -> dict[str, Decimal]:
     invested = Decimal("1") - Decimal(allocation.cash_weight)
-    if not selected:
-        return Decimal("0"), Decimal("0"), Decimal("0")
-    gross = sum((outcome.return_for(symbol) for symbol in selected), Decimal("0")) / Decimal(len(selected))
-    turnover = invested * Decimal("2")
-    return gross, turnover, invested
+    result = {"CASH": Decimal(allocation.cash_weight)}
+    if allocation.selected_symbols:
+        weight = invested / Decimal(len(allocation.selected_symbols))
+        result.update({symbol: weight for symbol in allocation.selected_symbols})
+    return result
+
+
+def _turnover(
+    previous: dict[str, Decimal],
+    target: dict[str, Decimal],
+) -> Decimal:
+    names = set(previous) | set(target)
+    return sum(
+        (abs(target.get(name, Decimal("0")) - previous.get(name, Decimal("0"))) for name in names),
+        Decimal("0"),
+    ) / Decimal("2")
+
+
+def _compound(values: list[Decimal]) -> Decimal:
+    capital = Decimal("1")
+    for value in values:
+        capital *= Decimal("1") + value
+    return capital - Decimal("1")
+
+
+def _variant_metrics(
+    *,
+    weekly: dict[str, list[tuple[str, Decimal, Decimal, dict[str, Decimal]]]],
+    cost_bps_per_side: Decimal,
+    decision_event_count: int,
+    packet_clusters: int,
+    market_clusters: int,
+) -> tuple[
+    dict[str, dict[str, str]],
+    dict[str, tuple[WeeklyArmObservation, ...]],
+]:
+    per_side_cost = cost_bps_per_side / Decimal("10000")
+    metrics: dict[str, dict[str, str]] = {}
+    observations: dict[str, tuple[WeeklyArmObservation, ...]] = {}
+    spy_net = [
+        gross - turnover * per_side_cost
+        for _date, gross, turnover, _positions in weekly["spy"]
+    ]
+    benchmark_compound = _compound(spy_net)
+    for arm in CONTROL_ARM_IDS:
+        capital = Decimal("1")
+        peak = capital
+        drawdown = Decimal("0")
+        total_turnover = Decimal("0")
+        total_cost = Decimal("0")
+        false_positives = 0
+        useful = 0
+        net_returns: list[Decimal] = []
+        rows: list[WeeklyArmObservation] = []
+        for index, (market_date, gross, turnover, positions) in enumerate(weekly[arm]):
+            cost = turnover * per_side_cost
+            net = gross - cost
+            net_returns.append(net)
+            total_turnover += turnover
+            total_cost += cost
+            capital *= Decimal("1") + net
+            peak = max(peak, capital)
+            drawdown = min(drawdown, capital / peak - Decimal("1"))
+            invested = Decimal("1") - positions.get("CASH", Decimal("0"))
+            if net > 0:
+                useful += 1
+            elif invested > 0:
+                false_positives += 1
+            rows.append(
+                WeeklyArmObservation(
+                    market_date=market_date,
+                    gross_return=_text(gross),
+                    net_return=_text(net),
+                    benchmark_net_return=_text(spy_net[index]),
+                    turnover=_text(turnover),
+                    cost_drag=_text(cost),
+                    false_positive=net <= 0 and invested > 0,
+                    positions=tuple(
+                        sorted((symbol, _text(weight)) for symbol, weight in positions.items())
+                    ),
+                )
+            )
+        metrics[arm] = {
+            "net_return_after_costs": _text(capital - Decimal("1")),
+            "benchmark_excess_after_costs": _text(
+                capital - Decimal("1") - benchmark_compound
+            ),
+            "max_drawdown": _text(drawdown),
+            "turnover": _text(total_turnover),
+            "false_positive_rate": _text(
+                Decimal(false_positives) / Decimal(len(rows))
+            ),
+            "decision_event_count": str(decision_event_count),
+            "packet_event_cluster_count": str(packet_clusters),
+            "market_event_cluster_count": str(market_clusters),
+            "cost_per_useful_decision": _text(
+                total_cost / Decimal(useful) if useful else total_cost
+            ),
+        }
+        observations[arm] = tuple(rows)
+    return metrics, observations
 
 
 def evaluate_validation_ta_control(
@@ -211,7 +313,7 @@ def evaluate_validation_ta_control(
     candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
     outcomes: tuple[EconomicTournamentOutcome, ...],
 ) -> EconomicValidationResult:
-    """Evaluate the sealed validation events and build canonical arm metrics."""
+    """Evaluate every symbol event once into registered weekly portfolios."""
 
     if type(protocol) is not FrozenEvaluationProtocol:
         raise EconomicTournamentError("protocol must be an exact frozen value")
@@ -229,60 +331,110 @@ def evaluate_validation_ta_control(
     if type(outcomes) is not tuple or tuple(item.decision_event_id for item in outcomes) != expected_ids:
         raise EconomicTournamentError("outcomes must be canonically ordered validation events")
     events = {event.decision_event_id: event for event in frozen.input_manifest.events}
-    metrics: dict[str, dict[str, str]] = {}
-    per_arm: dict[str, list[tuple[Decimal, Decimal, Decimal]]] = {arm: [] for arm in CONTROL_ARM_IDS}
-    for outcome in outcomes:
-        event = events[outcome.decision_event_id]
-        required_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
-        if tuple(symbol for symbol, _value in outcome.realized_returns) != required_symbols:
-            raise EconomicTournamentError("outcome must cover primary universe and SPY exactly")
-        for allocation in build_ta_control_allocations(
-            protocol=frozen,
-            decision_event=event,
-            candidates=candidates_by_event[event.decision_event_id],
+    outcomes_by_id = {item.decision_event_id: item for item in outcomes}
+    grouped_by_date: dict[str, list[object]] = {}
+    for event_id in expected_ids:
+        event = events[event_id]
+        grouped_by_date.setdefault(event.market_date, []).append(event)
+    grouped = OrderedDict(
+        (market_date, grouped_by_date[market_date])
+        for market_date in sorted(grouped_by_date)
+    )
+    required_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
+    weekly: dict[str, list[tuple[str, Decimal, Decimal, dict[str, Decimal]]]] = {
+        arm: [] for arm in CONTROL_ARM_IDS
+    }
+    previous = {arm: {"CASH": Decimal("1")} for arm in CONTROL_ARM_IDS}
+    raw_source_rows = 0
+    for market_date, date_events in grouped.items():
+        event_symbols = tuple(item.symbol for item in date_events)
+        if tuple(sorted(event_symbols)) != tuple(sorted(frozen.primary_universe)):
+            raise EconomicTournamentError(
+                "each weekly market date must use every primary symbol event exactly once"
+            )
+        if len({item.decision_event_id for item in date_events}) != len(date_events):
+            raise EconomicTournamentError("weekly decision events must be unique")
+        first_event = date_events[0]
+        first_candidates = candidates_by_event[first_event.decision_event_id]
+        if any(
+            candidates_by_event[item.decision_event_id] != first_candidates
+            for item in date_events
         ):
-            per_arm[allocation.arm_id].append(_arm_return(allocation, outcome))
-    policy_cost = Decimal(frozen.evaluation_policy["commission_bps_per_side"]) + Decimal(frozen.evaluation_policy["half_spread_bps_per_side"]) + Decimal(frozen.evaluation_policy["slippage_bps_per_side"])
-    per_side_cost = policy_cost / Decimal("10000")
-    benchmark_returns = per_arm["spy"]
+            raise EconomicTournamentError(
+                "weekly symbol events must share one immutable candidate cross-section"
+            )
+        first_outcome = outcomes_by_id[first_event.decision_event_id]
+        if tuple(symbol for symbol, _value in first_outcome.realized_returns) != required_symbols:
+            raise EconomicTournamentError(
+                "outcome must cover primary universe and SPY exactly"
+            )
+        if any(
+            outcomes_by_id[item.decision_event_id].realized_returns
+            != first_outcome.realized_returns
+            for item in date_events
+        ):
+            raise EconomicTournamentError(
+                "weekly symbol events must share one immutable outcome cross-section"
+            )
+        allocations = build_ta_control_allocations(
+            protocol=frozen,
+            decision_event=first_event,
+            candidates=first_candidates,
+        )
+        for allocation in allocations:
+            target = _target_weights(allocation)
+            turnover = _turnover(previous[allocation.arm_id], target)
+            gross = sum(
+                (
+                    weight * first_outcome.return_for(symbol)
+                    for symbol, weight in target.items()
+                    if symbol != "CASH"
+                ),
+                Decimal("0"),
+            )
+            weekly[allocation.arm_id].append(
+                (market_date, gross, turnover, target)
+            )
+            previous[allocation.arm_id] = target
+        raw_source_rows += len(first_candidates) + len(first_outcome.realized_returns)
+
+    for arm in CONTROL_ARM_IDS:
+        final_turnover = _turnover(previous[arm], {"CASH": Decimal("1")})
+        market_date, gross, turnover, positions = weekly[arm][-1]
+        weekly[arm][-1] = (
+            market_date,
+            gross,
+            turnover + final_turnover,
+            positions,
+        )
+
     packet_clusters = len({events[event_id].packet_event_cluster_id for event_id in expected_ids})
     market_clusters = len({events[event_id].market_event_cluster_id for event_id in expected_ids})
-    for arm in CONTROL_ARM_IDS:
-        capital = Decimal("1")
-        peak = capital
-        drawdown = Decimal("0")
-        total_turnover = Decimal("0")
-        total_cost = Decimal("0")
-        false_positives = 0
-        useful = 0
-        net_returns: list[Decimal] = []
-        for gross, turnover, invested in per_arm[arm]:
-            cost = turnover * per_side_cost
-            net = gross - cost
-            net_returns.append(net)
-            total_turnover += turnover
-            total_cost += cost
-            capital *= Decimal("1") + net
-            peak = max(peak, capital)
-            drawdown = min(drawdown, capital / peak - Decimal("1"))
-            if net > 0:
-                useful += 1
-            elif invested > 0:
-                false_positives += 1
-        benchmark_net = [gross - turnover * per_side_cost for gross, turnover, _ in benchmark_returns]
-        metrics[arm] = {
-            "net_return_after_costs": _text(capital - Decimal("1")),
-            "benchmark_excess_after_costs": _text(sum(net_returns, Decimal("0")) - sum(benchmark_net, Decimal("0"))),
-            "max_drawdown": _text(drawdown),
-            "turnover": _text(total_turnover),
-            "false_positive_rate": _text(Decimal(false_positives) / Decimal(len(expected_ids))),
-            "decision_event_count": str(len(expected_ids)),
-            "packet_event_cluster_count": str(packet_clusters),
-            "market_event_cluster_count": str(market_clusters),
-            "cost_per_useful_decision": _text(total_cost / Decimal(useful) if useful else total_cost),
-        }
+    variants: dict[str, dict[str, dict[str, str]]] = {}
+    headline_observations: dict[str, tuple[WeeklyArmObservation, ...]] | None = None
+    for cost in ("5", "10", "25", "50"):
+        variant, observations = _variant_metrics(
+            weekly=weekly,
+            cost_bps_per_side=Decimal(cost),
+            decision_event_count=len(expected_ids),
+            packet_clusters=packet_clusters,
+            market_clusters=market_clusters,
+        )
+        variants[cost] = variant
+        if cost == "10":
+            headline_observations = observations
+    assert headline_observations is not None
+    statistics = build_economic_tournament_statistics(
+        raw_source_row_count=raw_source_rows,
+        decision_event_count=len(expected_ids),
+        packet_event_cluster_count=packet_clusters,
+        market_event_cluster_count=market_clusters,
+        observations_by_arm=headline_observations,
+    )
     return build_validation_evaluation_result(
         frozen,
-        arm_metrics=metrics,
+        arm_metrics=variants["10"],
         eligibility=bound,
+        cost_variant_metrics=variants,
+        registered_statistics=statistics,
     )

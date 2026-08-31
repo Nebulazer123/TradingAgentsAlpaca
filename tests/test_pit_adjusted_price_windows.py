@@ -10,7 +10,9 @@ from tradingagents.dataflows.pit import (
     PointInTimeDataError,
     RawPointInTimeArtifactArchive,
     build_source_bound_adjusted_price_window,
+    build_market_session_calendar,
     validate_source_bound_adjusted_price_window,
+    validate_five_session_adjusted_price_window,
     verify_source_bound_adjusted_price_window,
 )
 
@@ -123,6 +125,75 @@ def test_adjusted_window_binds_request_range_and_pit_identity_contract(tmp_path)
             requested_start="2026-01-05",
             requested_end="2026-01-07",
             decision_cutoff="2026-01-09T21:00:00+00:00",
+        )
+
+
+def test_five_session_window_uses_exact_next_calendar_sessions(tmp_path):
+    dates = [
+        "2026-01-09",
+        "2026-01-12",
+        "2026-01-13",
+        "2026-01-14",
+        "2026-01-15",
+        "2026-01-16",
+    ]
+    archive = RawPointInTimeArtifactArchive(tmp_path / "five" / "pit-artifacts")
+    calendar_artifact = archive.admit(
+        raw_bytes=json.dumps([{"date": date} for date in dates]).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2026-01-20T21:00:00+00:00",
+    )
+    calendar = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=calendar_artifact,
+    )
+    price_artifact = archive.admit(
+        raw_bytes=json.dumps(
+            {
+                "bars": {
+                    "T000": [
+                        {"t": f"{date}T05:00:00Z", "c": str(10 + index)}
+                        for index, date in enumerate(dates[1:])
+                    ]
+                }
+            }
+        ).encode(),
+        source_uri=(
+            "https://data.alpaca.markets/v2/stocks/T000/bars?"
+            "timeframe=1Day&feed=iex&adjustment=all&"
+            "start=2026-01-12T00:00:00Z&end=2026-01-17T00:00:00Z"
+        ),
+        content_type="application/json",
+        retrieved_at="2026-01-20T21:00:00+00:00",
+    )
+    window = build_source_bound_adjusted_price_window(
+        archive=archive,
+        raw_artifact=price_artifact,
+        security_id="security-t000",
+        symbol="T000",
+        requested_start="2026-01-12",
+        requested_end="2026-01-16",
+        decision_cutoff="2026-01-20T21:00:00+00:00",
+    )
+
+    validated = validate_five_session_adjusted_price_window(
+        value=window.to_dict(),
+        market_calendar=calendar,
+        decision_market_date="2026-01-09",
+    )
+    assert tuple(date for date, _close in validated.daily_closes) == tuple(dates[1:])
+
+    tampered = window.to_dict()
+    tampered["daily_closes"] = tampered["daily_closes"][1:]
+    tampered["session_count"] = 4
+    tampered["entry_date"] = "2026-01-13"
+    tampered["entry_close"] = "11"
+    with pytest.raises(PointInTimeDataError):
+        validate_five_session_adjusted_price_window(
+            value=tampered,
+            market_calendar=calendar,
+            decision_market_date="2026-01-09",
         )
 
     archive, wrong_end = _artifact(

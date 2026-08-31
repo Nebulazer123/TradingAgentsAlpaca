@@ -13,9 +13,11 @@ from tradingagents.dataflows.pit import (
     PointInTimeDataError,
     PointInTimeObservation,
     SecurityIdentity,
+    TerminalProceeds,
     validate_corporate_action,
     validate_point_in_time_observation,
     validate_security_identity,
+    validate_terminal_proceeds,
 )
 
 
@@ -374,3 +376,26 @@ def test_corporate_action_binds_source_and_terms_without_aliasing():
 def test_corporate_action_rejects_invalid_terms_and_provenance(overrides):
     with pytest.raises(PointInTimeDataError):
         _action(**overrides)
+
+
+def test_terminal_proceeds_are_positive_source_bound_and_canonical():
+    proceeds = TerminalProceeds(
+        security_id="security-us-aapl-common-0001",
+        effective_date="2026-01-15",
+        amount_per_share="42.5",
+        currency="USD",
+        source_artifact_id="raw-terminal-proceeds",
+        source_artifact_sha256=hashlib.sha256(b"terminal-proceeds").hexdigest(),
+    )
+
+    assert proceeds.analysis_only is True
+    assert proceeds.execution_authority == "none"
+    assert proceeds.can_submit_orders is False
+    assert validate_terminal_proceeds(
+        json.loads(proceeds.canonical_json_bytes())
+    ) == proceeds
+
+    with pytest.raises(PointInTimeDataError):
+        dataclasses.replace(proceeds, amount_per_share="0")
+    with pytest.raises(PointInTimeDataError):
+        dataclasses.replace(proceeds, currency="EUR")

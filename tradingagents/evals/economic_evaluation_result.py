@@ -25,10 +25,15 @@ from tradingagents.evals.economic_evaluation_protocol import (
     FrozenEvaluationProtocol,
     validate_frozen_evaluation_protocol,
 )
+from tradingagents.evals.economic_tournament_statistics import (
+    EconomicTournamentStatistics,
+    validate_economic_tournament_statistics,
+)
 
 __all__ = [
     "EconomicEvaluationResultError",
     "EconomicValidationResult",
+    "ECONOMIC_TOURNAMENT_RESULT_SCHEMA",
     "LegacyEconomicValidationResult",
     "build_validation_evaluation_result",
     "validate_economic_validation_result",
@@ -36,6 +41,7 @@ __all__ = [
 
 
 ECONOMIC_VALIDATION_RESULT_SCHEMA = "economic_validation_result/v2"
+ECONOMIC_TOURNAMENT_RESULT_SCHEMA = "economic_validation_result/v3"
 _LEGACY_ECONOMIC_VALIDATION_RESULT_SCHEMA = "economic_validation_result/v1"
 _RESULT_STATUS = "completed"
 _AUTHORITY_FIELDS: dict[str, object] = {
@@ -53,6 +59,7 @@ _COUNT_METRICS = frozenset(
         "market_event_cluster_count",
     }
 )
+_COST_VARIANT_BPS = ("5", "10", "25", "50")
 
 
 class EconomicEvaluationResultError(ValueError):
@@ -166,6 +173,43 @@ def _canonical_arm_metrics(
     return tuple(arms)
 
 
+def _canonical_cost_variants(
+    value: object,
+    *,
+    validation_event_count: int,
+) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, Mapping) or set(value) != set(_COST_VARIANT_BPS):
+        raise EconomicEvaluationResultError(
+            "cost variants must contain the exact 5/10/25/50 bps cases"
+        )
+    variants: list[Mapping[str, object]] = []
+    for cost in _COST_VARIANT_BPS:
+        arms = _canonical_arm_metrics(
+            value[cost],
+            validation_event_count=validation_event_count,
+        )
+        half = _metric_value(
+            _canonical_decimal_half(cost),
+            metric="half_spread_bps_per_side",
+        )
+        variants.append(
+            MappingProxyType(
+                {
+                    "cost_bps_per_side": cost,
+                    "half_spread_bps_per_side": half,
+                    "slippage_bps_per_side": half,
+                    "arm_metrics": arms,
+                }
+            )
+        )
+    return tuple(variants)
+
+
+def _canonical_decimal_half(value: str) -> str:
+    parsed = Decimal(value) / Decimal("2")
+    return "0" if parsed.is_zero() else format(parsed.normalize(), "f")
+
+
 def _legacy_metric_value(value: object, *, metric: str) -> str:
     """Apply the historical v1 decimal rules without rewriting stored bytes."""
 
@@ -230,6 +274,8 @@ class EconomicValidationResult:
     validation_partition_sha256: str
     validation_event_ids: tuple[str, ...]
     arm_metrics: tuple[Mapping[str, object], ...]
+    cost_variants: tuple[Mapping[str, object], ...] | None
+    registered_statistics: Mapping[str, object] | None
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError(
@@ -238,8 +284,13 @@ class EconomicValidationResult:
         )
 
     def to_dict(self) -> dict[str, object]:
+        extended = self.cost_variants is not None
         payload: dict[str, object] = {
-            "schema_version": ECONOMIC_VALIDATION_RESULT_SCHEMA,
+            "schema_version": (
+                ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+                if extended
+                else ECONOMIC_VALIDATION_RESULT_SCHEMA
+            ),
             "result_id": self.result_id,
             "result_sha256": self.result_sha256,
             "protocol_id": self.protocol_id,
@@ -254,6 +305,29 @@ class EconomicValidationResult:
             ],
             **_AUTHORITY_FIELDS,
         }
+        if extended:
+            assert self.registered_statistics is not None
+            payload["cost_variants"] = [
+                {
+                    "cost_bps_per_side": row["cost_bps_per_side"],
+                    "commission_bps_per_side": "0",
+                    "half_spread_bps_per_side": row[
+                        "half_spread_bps_per_side"
+                    ],
+                    "slippage_bps_per_side": row[
+                        "slippage_bps_per_side"
+                    ],
+                    "arm_metrics": [
+                        {
+                            "arm_id": arm["arm_id"],
+                            "metrics": dict(arm["metrics"]),
+                        }
+                        for arm in row["arm_metrics"]
+                    ],
+                }
+                for row in self.cost_variants
+            ]
+            payload["registered_statistics"] = dict(self.registered_statistics)
         return payload
 
     def canonical_json_bytes(self) -> bytes:
@@ -297,13 +371,20 @@ _RESULT_FIELD_NAMES = tuple(
     field.name for field in dataclasses.fields(EconomicValidationResult)
 )
 _RESULT_SERIALIZED_FIELDS = frozenset(
-    _RESULT_FIELD_NAMES
+    tuple(
+        name
+        for name in _RESULT_FIELD_NAMES
+        if name not in {"cost_variants", "registered_statistics"}
+    )
     + (
         "schema_version",
         "phase",
         "status",
     )
     + tuple(_AUTHORITY_FIELDS)
+)
+_TOURNAMENT_RESULT_SERIALIZED_FIELDS = frozenset(
+    _RESULT_SERIALIZED_FIELDS | {"cost_variants", "registered_statistics"}
 )
 _LEGACY_RESULT_SERIALIZED_FIELDS = frozenset(
     {
@@ -341,11 +422,17 @@ def _result_material(
     validation_partition_sha256: str,
     validation_event_ids: tuple[str, ...],
     arm_metrics: tuple[Mapping[str, object], ...],
+    cost_variants: tuple[Mapping[str, object], ...] | None = None,
+    registered_statistics: Mapping[str, object] | None = None,
     result_id: str | None = None,
     result_sha256: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
-        "schema_version": ECONOMIC_VALIDATION_RESULT_SCHEMA,
+        "schema_version": (
+            ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+            if cost_variants is not None
+            else ECONOMIC_VALIDATION_RESULT_SCHEMA
+        ),
         "protocol_id": protocol_id,
         "validation_partition_id": validation_partition_id,
         "validation_partition_sha256": validation_partition_sha256,
@@ -361,6 +448,25 @@ def _result_material(
         ],
         **_AUTHORITY_FIELDS,
     }
+    if cost_variants is not None:
+        if registered_statistics is None:
+            raise EconomicEvaluationResultError(
+                "cost variants require registered statistics"
+            )
+        payload["cost_variants"] = [
+            {
+                "cost_bps_per_side": row["cost_bps_per_side"],
+                "commission_bps_per_side": "0",
+                "half_spread_bps_per_side": row["half_spread_bps_per_side"],
+                "slippage_bps_per_side": row["slippage_bps_per_side"],
+                "arm_metrics": [
+                    {"arm_id": arm["arm_id"], "metrics": dict(arm["metrics"])}
+                    for arm in row["arm_metrics"]
+                ],
+            }
+            for row in cost_variants
+        ]
+        payload["registered_statistics"] = dict(registered_statistics)
     if result_id is not None:
         payload["result_id"] = result_id
     if result_sha256 is not None:
@@ -400,6 +506,8 @@ def build_validation_evaluation_result(
     *,
     arm_metrics: Mapping[str, Mapping[str, str]],
     eligibility: ValidationPhaseEligibility,
+    cost_variant_metrics: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
+    registered_statistics: EconomicTournamentStatistics | None = None,
 ) -> EconomicValidationResult:
     """Build a complete result for the canonical, purged validation phase."""
 
@@ -426,12 +534,28 @@ def build_validation_evaluation_result(
         arm_metrics,
         validation_event_count=len(bound.event_ids),
     )
+    variants = None
+    statistics = None
+    if cost_variant_metrics is not None or registered_statistics is not None:
+        if cost_variant_metrics is None or type(registered_statistics) is not EconomicTournamentStatistics:
+            raise EconomicEvaluationResultError(
+                "extended tournament results require cost variants and exact statistics"
+            )
+        variants = _canonical_cost_variants(
+            cost_variant_metrics,
+            validation_event_count=len(bound.event_ids),
+        )
+        statistics = validate_economic_tournament_statistics(
+            registered_statistics.to_dict()
+        ).to_dict()
     return _build_result_from_components(
         protocol_id=validated.protocol_id,
         validation_partition_id=bound.partition_id,
         validation_partition_sha256=bound.partition_sha256,
         validation_event_ids=bound.event_ids,
         arm_metrics=metrics,
+        cost_variants=variants,
+        registered_statistics=statistics,
     )
 
 
@@ -442,6 +566,8 @@ def _build_result_from_components(
     validation_partition_sha256: str,
     validation_event_ids: tuple[str, ...],
     arm_metrics: tuple[Mapping[str, object], ...],
+    cost_variants: tuple[Mapping[str, object], ...] | None = None,
+    registered_statistics: Mapping[str, object] | None = None,
 ) -> EconomicValidationResult:
     material = _result_material(
         protocol_id=protocol_id,
@@ -449,6 +575,8 @@ def _build_result_from_components(
         validation_partition_sha256=validation_partition_sha256,
         validation_event_ids=validation_event_ids,
         arm_metrics=arm_metrics,
+        cost_variants=cost_variants,
+        registered_statistics=registered_statistics,
     )
     result_id = "economic-evaluation-result-" + _sha256(material)
     digest_material = _result_material(
@@ -457,6 +585,8 @@ def _build_result_from_components(
         validation_partition_sha256=validation_partition_sha256,
         validation_event_ids=validation_event_ids,
         arm_metrics=arm_metrics,
+        cost_variants=cost_variants,
+        registered_statistics=registered_statistics,
         result_id=result_id,
     )
     return _new_result(
@@ -467,6 +597,8 @@ def _build_result_from_components(
         validation_partition_sha256=validation_partition_sha256,
         validation_event_ids=validation_event_ids,
         arm_metrics=arm_metrics,
+        cost_variants=cost_variants,
+        registered_statistics=registered_statistics,
     )
 
 
@@ -544,6 +676,54 @@ def _validated_result_metrics(
     return builder(arm_input, validation_event_count=event_count)
 
 
+def _validated_cost_variants(
+    value: object,
+    *,
+    event_count: int,
+) -> tuple[Mapping[str, object], ...]:
+    if type(value) is not list or len(value) != len(_COST_VARIANT_BPS):
+        raise EconomicEvaluationResultError("validation cost variants are invalid")
+    variants: dict[str, Mapping[str, Mapping[str, str]]] = {}
+    expected = frozenset(
+        {
+            "cost_bps_per_side",
+            "commission_bps_per_side",
+            "half_spread_bps_per_side",
+            "slippage_bps_per_side",
+            "arm_metrics",
+        }
+    )
+    for raw_variant in value:
+        variant = _exact_fields(raw_variant, expected, label="cost variant")
+        cost = variant["cost_bps_per_side"]
+        if type(cost) is not str or cost in variants:
+            raise EconomicEvaluationResultError("cost variant identity is invalid")
+        if (
+            variant["commission_bps_per_side"] != "0"
+            or variant["half_spread_bps_per_side"] != _canonical_decimal_half(cost)
+            or variant["slippage_bps_per_side"] != _canonical_decimal_half(cost)
+        ):
+            raise EconomicEvaluationResultError("cost variant components are invalid")
+        raw_arms = variant["arm_metrics"]
+        if type(raw_arms) is not list:
+            raise EconomicEvaluationResultError("cost variant arm metrics are invalid")
+        arm_map: dict[str, Mapping[str, str]] = {}
+        for raw_arm in raw_arms:
+            arm = _exact_fields(
+                raw_arm,
+                frozenset({"arm_id", "metrics"}),
+                label="cost variant arm",
+            )
+            if type(arm["arm_id"]) is not str or not isinstance(arm["metrics"], Mapping):
+                raise EconomicEvaluationResultError("cost variant arm is invalid")
+            arm_map[arm["arm_id"]] = arm["metrics"]  # type: ignore[assignment]
+        variants[cost] = arm_map
+    return _canonical_cost_variants(
+        variants,
+        validation_event_count=event_count,
+    )
+
+
 def _validate_legacy_economic_validation_result(
     value: object,
 ) -> LegacyEconomicValidationResult:
@@ -580,8 +760,17 @@ def validate_economic_validation_result(
         raise EconomicEvaluationResultError("validation result must be a JSON object")
     if value.get("schema_version") == _LEGACY_ECONOMIC_VALIDATION_RESULT_SCHEMA:
         return _validate_legacy_economic_validation_result(value)
-    values = _exact_fields(value, _RESULT_SERIALIZED_FIELDS, label="validation result")
-    if values["schema_version"] != ECONOMIC_VALIDATION_RESULT_SCHEMA:
+    extended = value.get("schema_version") == ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+    expected_fields = (
+        _TOURNAMENT_RESULT_SERIALIZED_FIELDS
+        if extended
+        else _RESULT_SERIALIZED_FIELDS
+    )
+    values = _exact_fields(value, expected_fields, label="validation result")
+    if values["schema_version"] not in {
+        ECONOMIC_VALIDATION_RESULT_SCHEMA,
+        ECONOMIC_TOURNAMENT_RESULT_SCHEMA,
+    }:
         raise EconomicEvaluationResultError("validation result schema is invalid")
     if values["phase"] != "validation" or values["status"] != _RESULT_STATUS:
         raise EconomicEvaluationResultError("validation result must be completed validation")
@@ -599,12 +788,24 @@ def validate_economic_validation_result(
     if _SHA256.fullmatch(values["validation_partition_sha256"]) is None:
         raise EconomicEvaluationResultError("validation partition digest is invalid")
     rebuilt_metrics = _validated_result_metrics(values, event_count=len(event_ids))
+    variants = None
+    statistics = None
+    if extended:
+        variants = _validated_cost_variants(
+            values["cost_variants"],
+            event_count=len(event_ids),
+        )
+        statistics = validate_economic_tournament_statistics(
+            values["registered_statistics"]
+        ).to_dict()
     rebuilt = _build_result_from_components(
         protocol_id=protocol_id,
         validation_partition_id=values["validation_partition_id"],  # type: ignore[arg-type]
         validation_partition_sha256=values["validation_partition_sha256"],  # type: ignore[arg-type]
         validation_event_ids=event_ids,
         arm_metrics=rebuilt_metrics,
+        cost_variants=variants,
+        registered_statistics=statistics,
     )
     submitted = _canonical_json_bytes(values)
     if rebuilt.canonical_json_bytes() != submitted:

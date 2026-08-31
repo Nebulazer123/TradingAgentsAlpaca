@@ -3,8 +3,16 @@
 from .adjusted_price_windows import (
     SourceBoundAdjustedPriceWindow,
     build_source_bound_adjusted_price_window,
+    validate_five_session_adjusted_price_window,
     validate_source_bound_adjusted_price_window,
     verify_source_bound_adjusted_price_window,
+)
+from .execution_outcomes import (
+    ExecutionPriceTwin,
+    SourceBoundExecutionOutcome,
+    build_source_bound_execution_outcome,
+    validate_execution_price_twin,
+    validate_source_bound_execution_outcome,
 )
 from .cohort import (
     PointInTimeCohort,
@@ -45,9 +53,11 @@ from .records import (
     PointInTimeDataError,
     PointInTimeObservation,
     SecurityIdentity,
+    TerminalProceeds,
     validate_corporate_action,
     validate_point_in_time_observation,
     validate_security_identity,
+    validate_terminal_proceeds,
 )
 
 __all__ = [
@@ -55,9 +65,11 @@ __all__ = [
     "PointInTimeDataError",
     "PointInTimeObservation",
     "SecurityIdentity",
+    "TerminalProceeds",
     "validate_corporate_action",
     "validate_point_in_time_observation",
     "validate_security_identity",
+    "validate_terminal_proceeds",
     "PointInTimeCohort",
     "PointInTimeCohortCandidate",
     "PointInTimeCohortIdentitySourceReference",
@@ -70,8 +82,14 @@ __all__ = [
     "verify_source_verifiable_point_in_time_cohort",
     "SourceBoundAdjustedPriceWindow",
     "build_source_bound_adjusted_price_window",
+    "validate_five_session_adjusted_price_window",
     "validate_source_bound_adjusted_price_window",
     "verify_source_bound_adjusted_price_window",
+    "ExecutionPriceTwin",
+    "SourceBoundExecutionOutcome",
+    "build_source_bound_execution_outcome",
+    "validate_execution_price_twin",
+    "validate_source_bound_execution_outcome",
     "MarketSessionCalendar",
     "build_market_session_calendar",
     "validate_market_session_calendar",
