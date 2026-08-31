@@ -142,6 +142,7 @@ from tradingagents.dataflows.alpaca_reference import (
 )
 from tradingagents.dataflows.integration_registry import build_integration_registry_report
 from tradingagents.dataflows.pit import (
+    RawPointInTimeArtifactArchive,
     build_source_verifiable_point_in_time_cohort,
     validate_market_date_partitions,
     validate_market_session_calendar,
@@ -205,6 +206,13 @@ from tradingagents.evals.economic_tournament import (
     EconomicTournamentCandidate,
     EconomicTournamentOutcome,
     evaluate_validation_ta_control,
+)
+from tradingagents.evals.economic_tournament_evidence import (
+    SourceBoundTournamentInput,
+    validate_source_bound_tournament_input,
+)
+from tradingagents.evals.economic_tournament_evidence_admission import (
+    verify_source_bound_tournament_input,
 )
 from tradingagents.evals.email_clarity import evaluate_email_clarity, write_email_clarity_eval
 from tradingagents.evals.execution_board import (
@@ -2691,11 +2699,11 @@ def _economic_json_object(
     """Load one bounded strict JSON receipt without ambiguous decoder behavior."""
 
     max_depth = 32
-    max_nodes = 100_000
-    max_objects = 20_000
-    max_lists = 20_000
-    max_strings = 100_000
-    max_container_items = 2_048
+    max_nodes = 1_000_000
+    max_objects = 200_000
+    max_lists = 200_000
+    max_strings = 1_000_000
+    max_container_items = 10_000
     max_string_chars = 4_096
 
     def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -3094,18 +3102,23 @@ def _economic_validation_report(
     partitions: object,
     validation_event_ids: tuple[str, ...],
     result: object,
+    tournament_input: SourceBoundTournamentInput,
 ) -> dict[str, object]:
     """Wrap one canonical validation result in the immutable admission schema."""
 
     result_payload = result.to_dict()
     return {
-        "schema_version": "economic_validation_report/v2",
+        "schema_version": "economic_validation_report/v3",
         "protocol_id": protocol_id,
         "market_date_partitions": partitions.to_dict(),
         "validation_event_ids": list(validation_event_ids),
         "result": result_payload,
         "result_id": result_payload["result_id"],
         "result_sha256": result_payload["result_sha256"],
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
         "analysis_only": True,
         "execution_authority": "none",
         "can_submit_orders": False,
@@ -3228,7 +3241,15 @@ def research_economic_tournament_run(
         "--tournament-input-path",
         exists=True,
         readable=True,
-        help="Canonical candidates and realized-outcomes JSON for validation only.",
+        help="Complete source-bound candidate and realized-outcome evidence JSON for validation only.",
+    ),
+    pit_artifact_root: Path = typer.Option(
+        ...,
+        "--pit-artifact-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Immutable PIT raw-artifact archive that must verify every tournament input.",
     ),
     evidence_root: Path = typer.Option(
         Path("results/economic_evaluation/evidence"),
@@ -3257,6 +3278,8 @@ def research_economic_tournament_run(
     tournament_payload = _economic_json_object(
         tournament_input_path,
         label="tournament-input-path",
+        max_bytes=32_000_000,
+        require_canonical=True,
     )
     effective = _economic_effective_at(effective_at)
     try:
@@ -3265,15 +3288,22 @@ def research_economic_tournament_run(
             protocol=protocol,
             partitions=validate_market_date_partitions(partitions_payload),
         )
-        candidates_by_event, outcomes = _economic_tournament_inputs(
+        tournament_input = validate_source_bound_tournament_input(
             tournament_payload,
-            expected_event_ids=eligibility.event_ids,
+            protocol=protocol,
+            eligibility=eligibility,
+        )
+        tournament_input = verify_source_bound_tournament_input(
+            archive=RawPointInTimeArtifactArchive(pit_artifact_root),
+            value=tournament_input.to_dict(),
+            protocol=protocol,
+            eligibility=eligibility,
         )
         result = evaluate_validation_ta_control(
             protocol=protocol,
             eligibility=eligibility,
-            candidates_by_event=candidates_by_event,
-            outcomes=outcomes,
+            candidates_by_event=dict(tournament_input.candidates_by_event),
+            outcomes=tournament_input.outcomes,
         )
         admission = EconomicEvaluationAdmissionAdapter(
             evidence_root,
@@ -3282,11 +3312,14 @@ def research_economic_tournament_run(
             protocol.protocol_id,
             phase="validation",
             effective_at=effective,
+            pit_artifact_root=pit_artifact_root,
+            tournament_input=tournament_input,
             frozen_validation_report=_economic_validation_report(
                 protocol_id=protocol.protocol_id,
                 partitions=eligibility.partitions,
                 validation_event_ids=eligibility.event_ids,
                 result=result,
+                tournament_input=tournament_input,
             ),
         )
     except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
@@ -3298,6 +3331,8 @@ def research_economic_tournament_run(
         "protocol_id": result.protocol_id,
         "validation_result_id": result.result_id,
         "validation_partition_id": result.validation_partition_id,
+        "tournament_input_id": tournament_input.input_id,
+        "tournament_input_sha256": tournament_input.input_sha256,
         "evaluation_run_object_id": admission.envelope.object_id,
         "created": admission.created,
         "evidence_root": str(evidence_root),

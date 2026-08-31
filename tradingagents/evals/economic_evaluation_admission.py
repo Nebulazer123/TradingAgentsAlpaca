@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from tradingagents.dataflows.pit import RawPointInTimeArtifactArchive
 from tradingagents.dataflows.pit.partitions import validate_market_date_partitions
 from tradingagents.evals.economic_evaluation_partition_binding import (
     bind_validation_phase_eligibility,
@@ -34,6 +35,13 @@ from tradingagents.evals.economic_evaluation_result import (
     EconomicValidationResult,
     LegacyEconomicValidationResult,
     validate_economic_validation_result,
+)
+from tradingagents.evals.economic_tournament_evidence import (
+    SourceBoundTournamentInput,
+)
+from tradingagents.evals.economic_tournament_evidence_admission import (
+    EconomicTournamentReceiptArchive,
+    verify_source_bound_tournament_input,
 )
 from tradingagents.strategy._immutable_evidence_store import (
     EvidenceCandidate,
@@ -60,8 +68,9 @@ ECONOMIC_EVALUATION_PROTOCOL_ADMISSION_SCHEMA = (
 )
 ECONOMIC_HOLDOUT_RELEASE_SCHEMA = "economic_holdout_release/v1"
 ECONOMIC_EVALUATION_RUN_SCHEMA = "economic_evaluation_run/v1"
-ECONOMIC_VALIDATION_REPORT_SCHEMA = "economic_validation_report/v2"
+ECONOMIC_VALIDATION_REPORT_SCHEMA = "economic_validation_report/v3"
 _LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA = "economic_validation_report/v1"
+_PRE_SOURCE_BOUND_VALIDATION_REPORT_SCHEMA = "economic_validation_report/v2"
 _AUTHORITY_FIELDS: dict[str, object] = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -100,9 +109,11 @@ _VALIDATION_REPORT_FIELDS = frozenset(
         "result",
         "result_id",
         "result_sha256",
+        "tournament_input",
         *_AUTHORITY_FIELDS,
     }
 )
+_TOURNAMENT_INPUT_REFERENCE_FIELDS = frozenset({"input_id", "input_sha256"})
 _LEGACY_VALIDATION_REPORT_FIELDS = frozenset(
     {
         "schema_version",
@@ -505,6 +516,23 @@ def _payload_mapping(value: object, *, label: str) -> dict[str, object]:
     return dict(value)
 
 
+def _tournament_input_reference(value: object) -> dict[str, str]:
+    reference = _payload_mapping(value, label="tournament_input")
+    if set(reference) != _TOURNAMENT_INPUT_REFERENCE_FIELDS:
+        raise EconomicEvaluationAdmissionError("tournament input reference fields are invalid")
+    input_id = reference["input_id"]
+    input_sha256 = reference["input_sha256"]
+    if (
+        type(input_id) is not str
+        or not input_id.startswith("economic-tournament-input-")
+        or _SHA256.fullmatch(input_id.removeprefix("economic-tournament-input-")) is None
+        or type(input_sha256) is not str
+        or _SHA256.fullmatch(input_sha256) is None
+    ):
+        raise EconomicEvaluationAdmissionError("tournament input reference is invalid")
+    return {"input_id": input_id, "input_sha256": input_sha256}
+
+
 def _frozen_validation_report(
     value: object,
     *,
@@ -512,7 +540,10 @@ def _frozen_validation_report(
     allow_legacy: bool = False,
 ) -> dict[str, object]:
     report = _payload_mapping(_thaw_json(value), label="frozen_validation_report")
-    if report.get("schema_version") == _LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA:
+    if report.get("schema_version") in {
+        _LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA,
+        _PRE_SOURCE_BOUND_VALIDATION_REPORT_SCHEMA,
+    }:
         return _legacy_frozen_validation_report(
             report,
             protocol=protocol,
@@ -547,6 +578,7 @@ def _frozen_validation_report(
         raise EconomicEvaluationAdmissionError(
             "validation report event partition does not match PIT eligibility"
         )
+    _tournament_input_reference(report["tournament_input"])
     try:
         result = validate_economic_validation_result(report["result"])
     except (TypeError, ValueError) as exc:
@@ -584,13 +616,19 @@ def _legacy_frozen_validation_report(
     protocol: FrozenEvaluationProtocol,
     allow_legacy: bool,
 ) -> dict[str, object]:
-    """Validate historical v1 report bytes without granting qualifying status."""
+    """Validate historical report bytes without granting qualifying status."""
 
     values = _payload_mapping(report, label="legacy_validation_report")
-    if set(values) != _LEGACY_VALIDATION_REPORT_FIELDS:
-        raise EconomicEvaluationAdmissionError("legacy validation report fields are invalid")
-    if values["schema_version"] != _LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA:
+    if values["schema_version"] == _LEGACY_ECONOMIC_VALIDATION_REPORT_SCHEMA:
+        expected_fields = _LEGACY_VALIDATION_REPORT_FIELDS
+        require_legacy_result = True
+    elif values["schema_version"] == _PRE_SOURCE_BOUND_VALIDATION_REPORT_SCHEMA:
+        expected_fields = _VALIDATION_REPORT_FIELDS - {"tournament_input"}
+        require_legacy_result = False
+    else:
         raise EconomicEvaluationAdmissionError("legacy validation report schema is invalid")
+    if set(values) != expected_fields:
+        raise EconomicEvaluationAdmissionError("legacy validation report fields are invalid")
     if _require_protocol_id(values["protocol_id"]) != protocol.protocol_id:
         raise EconomicEvaluationAdmissionError("legacy validation report protocol does not match")
     if values["validation_event_ids"] != list(protocol.validation_event_ids):
@@ -601,7 +639,9 @@ def _legacy_frozen_validation_report(
         result = validate_economic_validation_result(values["result"])
     except (TypeError, ValueError) as exc:
         raise EconomicEvaluationAdmissionError("legacy validation report result is invalid") from exc
-    if type(result) is not LegacyEconomicValidationResult:
+    if require_legacy_result and type(result) is not LegacyEconomicValidationResult:
+        raise EconomicEvaluationAdmissionError("legacy validation report result schema is invalid")
+    if not require_legacy_result and type(result) is not EconomicValidationResult:
         raise EconomicEvaluationAdmissionError("legacy validation report result schema is invalid")
     if (
         result.protocol_id != protocol.protocol_id
@@ -1030,6 +1070,36 @@ class EconomicEvaluationAdmissionAdapter:
     ) -> None:
         self._repo_root = _canonical_repo_root(repo_root)
         self._store = ImmutableStrategyEvidenceStore(evidence_root, clock=clock)
+        self._tournament_archive = EconomicTournamentReceiptArchive(
+            Path(evidence_root).expanduser().absolute() / "_tournament_receipts"
+        )
+
+    def _reopen_tournament_input(
+        self,
+        *,
+        protocol: FrozenEvaluationProtocol,
+        report: Mapping[str, object],
+    ) -> SourceBoundTournamentInput | None:
+        """Reopen complete current receipts; legacy reports remain nonqualifying."""
+
+        if report.get("schema_version") != ECONOMIC_VALIDATION_REPORT_SCHEMA:
+            return None
+        eligibility = bind_validation_phase_eligibility(
+            protocol=protocol,
+            partitions=validate_market_date_partitions(report["market_date_partitions"]),
+        )
+        reference = _tournament_input_reference(report["tournament_input"])
+        try:
+            return self._tournament_archive.reopen(
+                input_id=reference["input_id"],
+                input_sha256=reference["input_sha256"],
+                protocol=protocol,
+                eligibility=eligibility,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise EconomicEvaluationAdmissionError(
+                "complete tournament receipt custody is not qualifying"
+            ) from exc
 
     def admit_protocol(
         self,
@@ -1238,6 +1308,8 @@ class EconomicEvaluationAdmissionAdapter:
         phase: str,
         effective_at: dt.datetime,
         frozen_validation_report: Mapping[str, object],
+        pit_artifact_root: str | Path,
+        tournament_input: SourceBoundTournamentInput | None = None,
     ) -> EconomicEvaluationRun:
         """Admit a completed validation result before any holdout release."""
 
@@ -1271,6 +1343,45 @@ class EconomicEvaluationAdmissionAdapter:
             frozen_validation_report,
             protocol=protocol,
         )
+        if type(tournament_input) is not SourceBoundTournamentInput:
+            raise EconomicEvaluationAdmissionError(
+                "evaluation-run requires one verified source-bound tournament input"
+            )
+        try:
+            eligibility = bind_validation_phase_eligibility(
+                protocol=protocol,
+                partitions=validate_market_date_partitions(report["market_date_partitions"]),
+            )
+            verified_input = verify_source_bound_tournament_input(
+                archive=RawPointInTimeArtifactArchive(pit_artifact_root),
+                value=tournament_input.to_dict(),
+                protocol=protocol,
+                eligibility=eligibility,
+            )
+            self._tournament_archive.admit(
+                verified_input,
+                pit_artifact_root=pit_artifact_root,
+            )
+            verified_input = self._tournament_archive.reopen(
+                input_id=verified_input.input_id,
+                input_sha256=verified_input.input_sha256,
+                protocol=protocol,
+                eligibility=eligibility,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise EconomicEvaluationAdmissionError(
+                "evaluation-run tournament input archive verification failed"
+            ) from exc
+        if (
+            report["tournament_input"]
+            != {
+                "input_id": verified_input.input_id,
+                "input_sha256": verified_input.input_sha256,
+            }
+        ):
+            raise EconomicEvaluationAdmissionError(
+                "evaluation-run tournament input does not match report identity"
+            )
         report_sha256 = _sha256(report)
         for existing in snapshot:
             if existing.kind != ECONOMIC_EVALUATION_RUN_KIND:
@@ -1372,6 +1483,21 @@ class EconomicEvaluationAdmissionAdapter:
             )
             if _canonical_json_bytes(submitted) != _canonical_json_bytes(material):
                 raise EconomicEvaluationAdmissionError("evaluation-run payload is not exact")
+            submitted_report = _frozen_validation_report(
+                _validation_report_receipt_value(
+                    submitted["frozen_validation_report"],
+                    label="evaluation-run validation report",
+                ),
+                protocol=protocol,
+            )
+            reopened = self._reopen_tournament_input(
+                protocol=protocol,
+                report=submitted_report,
+            )
+            if reopened is None:
+                raise EconomicEvaluationAdmissionError(
+                    "current evaluation-run receipt is not qualifying"
+                )
             if any(
                 item.kind == ECONOMIC_EVALUATION_RUN_KIND
                 and _payload_mapping(item.payload, label="prior evaluation-run payload").get(
@@ -1417,6 +1543,24 @@ class EconomicEvaluationAdmissionAdapter:
             protocol_admission_object_id=protocol_envelope.object_id,
             events=verified_events,
         )
+        persisted_payload = _payload_mapping(
+            _thaw_json(persisted.payload),
+            label="persisted evaluation-run payload",
+        )
+        persisted_report = _frozen_validation_report(
+            _validation_report_receipt_value(
+                persisted_payload["frozen_validation_report"],
+                label="persisted evaluation-run validation report",
+            ),
+            protocol=protocol,
+        )
+        if self._reopen_tournament_input(
+            protocol=protocol,
+            report=persisted_report,
+        ) is None:
+            raise EconomicEvaluationAdmissionError(
+                "persisted evaluation-run receipt is not qualifying"
+            )
         return EconomicEvaluationRun(
             envelope=validated.envelope,
             created=admission.created,
@@ -1480,6 +1624,24 @@ class EconomicEvaluationAdmissionAdapter:
                 "protocol identity has more than one immutable validation run"
             )
         validation_run = validation_runs[0] if validation_runs else None
+        if validation_run is not None:
+            run_payload = _payload_mapping(
+                _thaw_json(validation_run.envelope.payload),
+                label="readiness evaluation-run payload",
+            )
+            run_report = _frozen_validation_report(
+                _validation_report_receipt_value(
+                    run_payload["frozen_validation_report"],
+                    label="readiness validation report",
+                ),
+                protocol=protocol,
+                allow_legacy=True,
+            )
+            if self._reopen_tournament_input(
+                protocol=protocol,
+                report=run_report,
+            ) is None:
+                validation_run = None
         releases = [
             envelope
             for envelope in snapshot
@@ -1494,10 +1656,12 @@ class EconomicEvaluationAdmissionAdapter:
             raise EconomicEvaluationAdmissionError(
                 "protocol identity has more than one immutable holdout release"
             )
-        if releases and validation_run is None:
+        if releases and not validation_runs:
             raise EconomicEvaluationAdmissionError(
                 "holdout release exists without an immutable validation run"
             )
+        if releases and validation_run is None:
+            releases = []
         if releases and not self.is_holdout_released(identity):
             raise EconomicEvaluationAdmissionError("holdout release is not fully validated")
         return EconomicEvaluationReadiness(
@@ -1558,13 +1722,18 @@ class EconomicEvaluationAdmissionAdapter:
             _thaw_json(validation_envelope.payload),
             label="evaluation-run payload",
         )
-        return _frozen_validation_report(
+        report = _frozen_validation_report(
             _validation_report_receipt_value(
                 payload["frozen_validation_report"],
                 label="evaluation-run validation report",
             ),
             protocol=protocol,
         )
+        if self._reopen_tournament_input(protocol=protocol, report=report) is None:
+            raise EconomicEvaluationAdmissionError(
+                "validation report does not reference qualifying tournament custody"
+            )
+        return report
 
     def release_holdout(
         self,
@@ -1607,6 +1776,10 @@ class EconomicEvaluationAdmissionAdapter:
             frozen_validation_report,
             protocol=protocol,
         )
+        if self._reopen_tournament_input(protocol=protocol, report=report) is None:
+            raise EconomicEvaluationAdmissionError(
+                "holdout release requires qualifying tournament custody"
+            )
         report_sha256 = _sha256(report)
         validation_runs = [
             _evaluation_run_from_envelope(
@@ -1751,6 +1924,13 @@ class EconomicEvaluationAdmissionAdapter:
             submitted = _payload_mapping(_thaw_json(envelope.payload), label="holdout payload")
             if _canonical_json_bytes(submitted) != _canonical_json_bytes(material):
                 raise EconomicEvaluationAdmissionError("holdout release payload is not exact")
+            if self._reopen_tournament_input(
+                protocol=protocol,
+                report=report,
+            ) is None:
+                raise EconomicEvaluationAdmissionError(
+                    "holdout release tournament custody is not qualifying"
+                )
             _validate_holdout_release_payload(
                 submitted,
                 protocol=protocol,
@@ -1863,10 +2043,16 @@ class EconomicEvaluationAdmissionAdapter:
                 envelope=envelope,
                 events=events,
             )
-            if _payload_mapping(
+            current_report = _payload_mapping(
                 run_report_value,
                 label="validation-run report",
-            ).get("schema_version") != ECONOMIC_VALIDATION_REPORT_SCHEMA:
+            )
+            if current_report.get("schema_version") != ECONOMIC_VALIDATION_REPORT_SCHEMA:
+                continue
+            if self._reopen_tournament_input(
+                protocol=protocols[admitted_object_id],
+                report=current_report,
+            ) is None:
                 continue
             if payload["protocol_id"] == identity:
                 return True

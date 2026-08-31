@@ -183,7 +183,7 @@ def build_ta_control_allocations(
     return (
         ControlArmAllocation("cash", (), "1"),
         ControlArmAllocation("spy", ("SPY",), "0"),
-        ControlArmAllocation("equal_weight", frozen.primary_universe, "0"),
+        ControlArmAllocation("equal_weight", tuple(sorted(frozen.primary_universe)), "0"),
         ControlArmAllocation("momentum_quality", momentum, _cash_weight(len(momentum), capacity=15)),
         ControlArmAllocation("pullback_support", pullback, _cash_weight(len(pullback), capacity=15)),
     )

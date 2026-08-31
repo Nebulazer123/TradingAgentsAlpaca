@@ -11,6 +11,12 @@ import subprocess
 
 import pytest
 
+from tests.fixtures.economic_tournament import build_tournament_receipt
+from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
+from tests.test_point_in_time_cohort import (
+    _build_from_fixture,
+    _source_cohort_fixture,
+)
 from tradingagents.dataflows.pit import (
     RawPointInTimeArtifactArchive,
     build_market_date_partitions,
@@ -40,22 +46,21 @@ from tradingagents.strategy._immutable_evidence_store import (
     ImmutableStrategyEvidenceStore,
 )
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
-from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
-from tests.test_point_in_time_cohort import (
-    _build_from_fixture,
-    _source_cohort_fixture,
-)
 
 NOW = dt.datetime(2026, 1, 9, 21, 30, tzinfo=dt.UTC)
 _PROTOCOL_SOURCE = None
 _PROTOCOL_CACHE = None
+_TOURNAMENT_INPUT_CACHE = None
+_TOURNAMENT_ROOT = None
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _bind_protocol_source(protocol_source):
-    global _PROTOCOL_CACHE, _PROTOCOL_SOURCE
+def _bind_protocol_source(protocol_source, tmp_path_factory):
+    global _PROTOCOL_CACHE, _PROTOCOL_SOURCE, _TOURNAMENT_INPUT_CACHE, _TOURNAMENT_ROOT
     _PROTOCOL_SOURCE = protocol_source
     _PROTOCOL_CACHE = None
+    _TOURNAMENT_INPUT_CACHE = None
+    _TOURNAMENT_ROOT = tmp_path_factory.mktemp("economic-admission") / "tournament-pit"
 
 
 def _protocol():
@@ -94,6 +99,11 @@ def _protocol_from_receipts(cohort, partitions, manifest):
 def _partitioned_protocol(tmp_path):
     assert _PROTOCOL_SOURCE is not None
     return _protocol(), _PROTOCOL_SOURCE[1]
+
+
+def _tournament_artifact_root():
+    assert _TOURNAMENT_ROOT is not None
+    return _TOURNAMENT_ROOT
 
 
 def _adapter(tmp_path):
@@ -604,7 +614,24 @@ def test_admission_rejects_an_orphaned_economic_protocol_object(tmp_path):
         )
 
 
-def _validation_report(protocol, partitions):
+def _source_bound_tournament_input(protocol, partitions, tmp_path):
+    global _TOURNAMENT_INPUT_CACHE
+    assert _TOURNAMENT_ROOT is not None
+    if _TOURNAMENT_INPUT_CACHE is not None:
+        return _TOURNAMENT_INPUT_CACHE
+    eligibility = bind_validation_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+    )
+    _TOURNAMENT_INPUT_CACHE, _archive = build_tournament_receipt(
+        _TOURNAMENT_ROOT,
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+    return _TOURNAMENT_INPUT_CACHE
+
+
+def _validation_report(protocol, partitions, tmp_path):
     eligibility = bind_validation_phase_eligibility(
         protocol=protocol,
         partitions=partitions,
@@ -634,14 +661,19 @@ def _validation_report(protocol, partitions):
             )
         },
     )
+    tournament_input = _source_bound_tournament_input(protocol, partitions, tmp_path)
     return {
-        "schema_version": "economic_validation_report/v2",
+        "schema_version": "economic_validation_report/v3",
         "protocol_id": protocol.protocol_id,
         "market_date_partitions": partitions.to_dict(),
         "validation_event_ids": list(eligibility.event_ids),
         "result": result.to_dict(),
         "result_id": result.result_id,
         "result_sha256": result.result_sha256,
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
         "analysis_only": True,
         "execution_authority": "none",
         "can_submit_orders": False,
@@ -747,7 +779,7 @@ def _append_legacy_validation_run_and_holdout_release(adapter, protocol, report)
 
 def test_validation_result_is_complete_canonical_and_alias_resistant(tmp_path):
     protocol, partitions = _partitioned_protocol(tmp_path)
-    result = _validation_report(protocol, partitions)["result"]
+    result = _validation_report(protocol, partitions, tmp_path)["result"]
     parsed = validate_economic_validation_result(json.loads(json.dumps(result)))
 
     assert parsed.protocol_id == protocol.protocol_id
@@ -806,6 +838,7 @@ def test_legacy_result_and_report_remain_readable_but_are_nonqualifying(tmp_path
             phase="validation",
             effective_at=NOW,
             frozen_validation_report=report,
+            pit_artifact_root=_tournament_artifact_root(),
         )
 
 
@@ -851,14 +884,16 @@ def test_holdout_release_requires_admitted_protocol_and_freezes_validation_repor
         protocol.protocol_id,
         phase="validation",
         effective_at=NOW,
-        frozen_validation_report=_validation_report(protocol, partitions),
+        frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=_source_bound_tournament_input(protocol, partitions, tmp_path),
     )
 
     release = adapter.release_holdout(
         protocol.protocol_id,
         released_by="owner-corbin",
         released_at=NOW,
-        frozen_validation_report=_validation_report(protocol, partitions),
+        frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
     )
 
     assert release.created is True
@@ -881,12 +916,14 @@ def test_holdout_release_is_idempotent_only_for_the_same_frozen_report(tmp_path)
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
-    report = _validation_report(protocol, partitions)
+    report = _validation_report(protocol, partitions, tmp_path)
     adapter.admit_evaluation_run(
         protocol.protocol_id,
         phase="validation",
         effective_at=NOW,
         frozen_validation_report=report,
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=_source_bound_tournament_input(protocol, partitions, tmp_path),
     )
     first = adapter.release_holdout(
         protocol.protocol_id,
@@ -924,7 +961,7 @@ def test_holdout_release_rejects_missing_protocol_and_report_not_bound_to_valida
             protocol.protocol_id,
             released_by="owner-corbin",
             released_at=NOW,
-            frozen_validation_report=_validation_report(protocol, partitions),
+            frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
         )
 
     adapter.admit_protocol(
@@ -933,7 +970,7 @@ def test_holdout_release_rejects_missing_protocol_and_report_not_bound_to_valida
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
-    report = _validation_report(protocol, partitions)
+    report = _validation_report(protocol, partitions, tmp_path)
     report["validation_event_ids"] = []
     with pytest.raises(EconomicEvaluationAdmissionError):
         adapter.release_holdout(
@@ -961,7 +998,7 @@ def test_holdout_release_rejects_a_report_without_an_immutable_validation_run(
             protocol.protocol_id,
             released_by="owner-corbin",
             released_at=NOW,
-            frozen_validation_report=_validation_report(protocol, partitions),
+            frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
         )
 
 
@@ -985,12 +1022,14 @@ def test_readiness_status_and_validation_report_are_read_only_and_protocol_bound
     assert admitted.state == "validation_not_admitted"
     assert admitted.protocol_admission_object_id == protocol_admission.envelope.object_id
 
-    report = _validation_report(protocol, partitions)
+    report = _validation_report(protocol, partitions, tmp_path)
     run = adapter.admit_evaluation_run(
         protocol.protocol_id,
         phase="validation",
         effective_at=NOW,
         frozen_validation_report=report,
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=_source_bound_tournament_input(protocol, partitions, tmp_path),
     )
     sealed = adapter.readiness_status(protocol.protocol_id)
     assert sealed.state == "holdout_sealed"
