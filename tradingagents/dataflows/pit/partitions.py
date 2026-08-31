@@ -173,6 +173,7 @@ def _weekly_decision_dates(
 ) -> tuple[str, ...]:
     if type(value) is not tuple or not value:
         raise PointInTimeDataError("decision_market_dates must be a nonempty exact tuple")
+    known_market_dates = frozenset(market_dates)
     parsed_dates: list[dt.date] = []
     for index, raw_date in enumerate(value):
         if type(raw_date) is not str:
@@ -185,7 +186,7 @@ def _weekly_decision_dates(
             raise PointInTimeDataError(
                 f"decision_market_dates[{index}] must be an ISO market date"
             ) from exc
-        if parsed.isoformat() != raw_date or raw_date not in set(market_dates):
+        if parsed.isoformat() != raw_date or raw_date not in known_market_dates:
             raise PointInTimeDataError(
                 "every decision market date must be registered in the source calendar"
             )

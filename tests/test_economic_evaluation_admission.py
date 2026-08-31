@@ -125,6 +125,232 @@ def _source_revision(tmp_path) -> str:
     return result.stdout.strip()
 
 
+def _chunks_for_compressed_receipt(compressed: bytes) -> list[str]:
+    encoded = base64.b64encode(compressed).decode("ascii")
+    return [
+        encoded[offset : offset + admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS]
+        for offset in range(
+            0,
+            len(encoded),
+            admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS,
+        )
+    ]
+
+
+def _receipt_for_raw_bytes(
+    raw: bytes,
+    *,
+    check: int = lzma.CHECK_CRC64,
+    filters=None,
+) -> list[str]:
+    return _chunks_for_compressed_receipt(
+        lzma.compress(
+            raw,
+            format=lzma.FORMAT_XZ,
+            check=check,
+            filters=(
+                admission_module._RECEIPT_LZMA_FILTERS
+                if filters is None
+                else filters
+            ),
+        )
+    )
+
+
+def _forged_envelope_payload(envelope, payload):
+    forged = object.__new__(type(envelope))
+    for field_name in type(envelope).__dataclass_fields__:
+        object.__setattr__(forged, field_name, getattr(envelope, field_name))
+    object.__setattr__(forged, "payload", payload)
+    return forged
+
+
+def test_receipt_writer_rejects_raw_oversize_before_compression(monkeypatch):
+    monkeypatch.setattr(
+        admission_module,
+        "_canonical_json_bytes",
+        lambda _value: b"x" * (admission_module._MAX_PROTOCOL_RECEIPT_BYTES + 1),
+    )
+
+    def unexpected_compression(*_args, **_kwargs):
+        pytest.fail("oversized raw receipt reached compression")
+
+    monkeypatch.setattr(admission_module.lzma, "compress", unexpected_compression)
+
+    with pytest.raises(EconomicEvaluationAdmissionError, match="too large"):
+        admission_module._receipt_chunks({"oversized": True})
+
+
+def test_receipt_writer_rejects_compressed_output_outside_store_envelope(monkeypatch):
+    monkeypatch.setattr(
+        admission_module.lzma,
+        "compress",
+        lambda *_args, **_kwargs: b"x"
+        * (admission_module._MAX_RECEIPT_COMPRESSED_BYTES + 1),
+    )
+
+    with pytest.raises(EconomicEvaluationAdmissionError, match="too large"):
+        admission_module._receipt_chunks({"small": True})
+
+
+def test_receipt_decoder_rejects_nonlist_count_size_and_rechunking():
+    valid = admission_module._receipt_chunks({"canonical": True})
+    encoded = "".join(valid)
+    invalid_receipts = (
+        tuple(valid),
+        ["A" * admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS]
+        * (admission_module._MAX_RECEIPT_CHUNKS + 1),
+        ["A" * admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS]
+        * admission_module._MAX_RECEIPT_CHUNKS,
+        [encoded[:4], encoded[4:]],
+    )
+
+    for receipt in invalid_receipts:
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(receipt, label="test")
+
+
+def test_receipt_decoder_rejects_noncanonical_base64_and_lzma_profile():
+    noncanonical_base64 = "AB=="
+    assert base64.b64decode(noncanonical_base64) == base64.b64decode("AA==")
+
+    alternate_lzma = _receipt_for_raw_bytes(
+        admission_module._canonical_json_bytes({"canonical": True}),
+        check=lzma.CHECK_CRC32,
+    )
+
+    for receipt in ([noncanonical_base64], alternate_lzma):
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(receipt, label="test")
+
+
+def test_receipt_decoder_rejects_high_dictionary_before_output_allocation():
+    high_dictionary_filters = (
+        {
+            "id": lzma.FILTER_LZMA2,
+            "dict_size": 64 * 1024 * 1024,
+            "lc": 3,
+            "lp": 0,
+            "pb": 2,
+            "mode": lzma.MODE_FAST,
+            "nice_len": 32,
+            "mf": lzma.MF_HC3,
+            "depth": 4,
+        },
+    )
+    receipt = _receipt_for_raw_bytes(b'{"canonical":true}', filters=high_dictionary_filters)
+
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._receipt_value(receipt, label="test")
+
+
+def test_receipt_decoder_rejects_constants_and_excessive_json_depth():
+    malformed_values = (
+        b"NaN",
+        b"[" * 1_100 + b"0" + b"]" * 1_100,
+    )
+
+    for raw in malformed_values:
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(
+                _receipt_for_raw_bytes(raw),
+                label="test",
+            )
+
+
+def test_receipt_decoder_rejects_truncation_trailing_concatenation_and_output_limit(
+    monkeypatch,
+):
+    canonical = admission_module._receipt_chunks({"canonical": True})
+    compressed = base64.b64decode("".join(canonical), validate=True)
+    invalid_streams = (
+        compressed[:-1],
+        compressed + b"trailing",
+        compressed + compressed,
+    )
+    for stream in invalid_streams:
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(
+                _chunks_for_compressed_receipt(stream),
+                label="test",
+            )
+
+    raw = admission_module._canonical_json_bytes("x" * 100)
+    receipt = _receipt_for_raw_bytes(raw)
+    monkeypatch.setattr(admission_module, "_MAX_PROTOCOL_RECEIPT_BYTES", len(raw) - 1)
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._receipt_value(receipt, label="test")
+
+
+def test_persisted_protocol_and_validation_report_reads_reject_alternate_codec(tmp_path):
+    adapter = _adapter(tmp_path)
+    protocol, _partitions = _partitioned_protocol(tmp_path)
+    admitted = adapter.admit_protocol(
+        protocol,
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    forged_protocol_payload = admission_module._thaw_json(admitted.envelope.payload)
+    forged_protocol_payload["protocol"] = _receipt_for_raw_bytes(
+        protocol.canonical_json_bytes(),
+        check=lzma.CHECK_CRC32,
+    )
+    forged_protocol = _forged_envelope_payload(
+        admitted.envelope,
+        forged_protocol_payload,
+    )
+    _snapshot, events = adapter._store.verify_with_events()
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._admitted_protocol_from_envelope(
+            forged_protocol,
+            events=events,
+        )
+
+    forged_run_payload = {
+        "schema_version": admission_module.ECONOMIC_EVALUATION_RUN_SCHEMA,
+        "protocol_id": protocol.protocol_id,
+        "protocol_admission_object_id": admitted.envelope.object_id,
+        "phase": "validation",
+        "frozen_validation_report": _receipt_for_raw_bytes(
+            b'{"malformed":"alternate-codec"}',
+            check=lzma.CHECK_CRC32,
+        ),
+        "validation_report_sha256": "0" * 64,
+        "store_predecessor": {
+            "sequence": 1,
+            "object_id": admitted.envelope.object_id,
+            "event_sha256": "0" * 64,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    forged_run = _forged_envelope_payload(admitted.envelope, forged_run_payload)
+    object.__setattr__(
+        forged_run,
+        "kind",
+        admission_module.ECONOMIC_EVALUATION_RUN_KIND,
+    )
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._evaluation_run_from_envelope(
+            forged_run,
+            protocol=protocol,
+            protocol_admission_object_id=admitted.envelope.object_id,
+            events=events,
+        )
+
+
+def test_current_validation_report_mapping_cannot_bypass_receipt_codec():
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._validation_report_receipt_value(
+            {
+                "schema_version": admission_module.ECONOMIC_VALIDATION_REPORT_SCHEMA,
+            },
+            label="test validation report",
+        )
+
+
 def test_admission_binds_complete_protocol_source_bytes_and_store_predecessor(tmp_path):
     protocol = _protocol()
     admission = _adapter(tmp_path).admit_protocol(

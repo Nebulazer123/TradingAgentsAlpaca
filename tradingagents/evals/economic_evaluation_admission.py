@@ -74,6 +74,23 @@ _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,255}")
 _CANONICAL_UTC = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\+00:00")
 _PROTOCOL_RECEIPT_CHUNK_CHARS = 60_000
 _MAX_PROTOCOL_RECEIPT_BYTES = 16_000_000
+_MAX_RECEIPT_COMPRESSED_BYTES = 750_000
+_MAX_RECEIPT_ENCODED_CHARS = 1_000_000
+_MAX_RECEIPT_CHUNKS = 17
+_RECEIPT_LZMA_MEMLIMIT_BYTES = 32 * 1024 * 1024
+_RECEIPT_LZMA_FILTERS = (
+    {
+        "id": lzma.FILTER_LZMA2,
+        "dict_size": 8 * 1024 * 1024,
+        "lc": 3,
+        "lp": 0,
+        "pb": 2,
+        "mode": lzma.MODE_NORMAL,
+        "nice_len": 64,
+        "mf": lzma.MF_BT4,
+        "depth": 0,
+    },
+)
 _VALIDATION_REPORT_FIELDS = frozenset(
     {
         "schema_version",
@@ -270,9 +287,30 @@ def _thaw_json(value: object) -> object:
     return value
 
 
+def _reject_json_constant(constant: str) -> object:
+    raise ValueError(f"invalid JSON constant: {constant}")
+
+
 def _receipt_chunks(value: object) -> list[str]:
-    compressed = lzma.compress(_canonical_json_bytes(value), preset=9)
+    try:
+        receipt_bytes = _canonical_json_bytes(value)
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        raise EconomicEvaluationAdmissionError(
+            "receipt value is not canonical JSON"
+        ) from exc
+    if len(receipt_bytes) > _MAX_PROTOCOL_RECEIPT_BYTES:
+        raise EconomicEvaluationAdmissionError("receipt value is too large")
+    compressed = lzma.compress(
+        receipt_bytes,
+        format=lzma.FORMAT_XZ,
+        check=lzma.CHECK_CRC64,
+        filters=_RECEIPT_LZMA_FILTERS,
+    )
+    if len(compressed) > _MAX_RECEIPT_COMPRESSED_BYTES:
+        raise EconomicEvaluationAdmissionError("compressed receipt is too large")
     encoded = base64.b64encode(compressed).decode("ascii")
+    if len(encoded) > _MAX_RECEIPT_ENCODED_CHARS:
+        raise EconomicEvaluationAdmissionError("encoded receipt is too large")
     return [
         encoded[offset : offset + _PROTOCOL_RECEIPT_CHUNK_CHARS]
         for offset in range(0, len(encoded), _PROTOCOL_RECEIPT_CHUNK_CHARS)
@@ -698,22 +736,33 @@ def _validate_historical_predecessor(
 
 
 def _receipt_value(receipt: object, *, label: str) -> object:
-    if (
-        type(receipt) not in (list, tuple)
-        or not receipt
-        or any(
-            type(chunk) is not str
-            or not chunk
-            or len(chunk) > _PROTOCOL_RECEIPT_CHUNK_CHARS
-            for chunk in receipt
-        )
-    ):
+    if type(receipt) is not list or not receipt or len(receipt) > _MAX_RECEIPT_CHUNKS:
         raise EconomicEvaluationAdmissionError(
             f"{label} receipt chunks are invalid"
         )
+    if any(type(chunk) is not str for chunk in receipt):
+        raise EconomicEvaluationAdmissionError(f"{label} receipt chunks are invalid")
+    if any(
+        len(chunk) != _PROTOCOL_RECEIPT_CHUNK_CHARS
+        for chunk in receipt[:-1]
+    ) or not 1 <= len(receipt[-1]) <= _PROTOCOL_RECEIPT_CHUNK_CHARS:
+        raise EconomicEvaluationAdmissionError(f"{label} receipt chunks are invalid")
+    encoded_chars = sum(len(chunk) for chunk in receipt)
+    if encoded_chars > _MAX_RECEIPT_ENCODED_CHARS:
+        raise EconomicEvaluationAdmissionError(f"{label} receipt is too large")
+    encoded = "".join(receipt)
     try:
-        compressed = base64.b64decode("".join(receipt), validate=True)
-        decompressor = lzma.LZMADecompressor()
+        compressed = base64.b64decode(encoded, validate=True)
+        if len(compressed) > _MAX_RECEIPT_COMPRESSED_BYTES:
+            raise EconomicEvaluationAdmissionError(f"{label} receipt is too large")
+        if base64.b64encode(compressed).decode("ascii") != encoded:
+            raise EconomicEvaluationAdmissionError(
+                f"{label} receipt base64 is not canonical"
+            )
+        decompressor = lzma.LZMADecompressor(
+            format=lzma.FORMAT_XZ,
+            memlimit=_RECEIPT_LZMA_MEMLIMIT_BYTES,
+        )
         receipt_bytes = decompressor.decompress(
             compressed,
             max_length=_MAX_PROTOCOL_RECEIPT_BYTES + 1,
@@ -726,26 +775,46 @@ def _receipt_value(receipt: object, *, label: str) -> object:
             raise EconomicEvaluationAdmissionError(
                 f"{label} receipt compression is invalid"
             )
-        value = json.loads(receipt_bytes.decode("utf-8"))
+        value = json.loads(
+            receipt_bytes.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
     except (
         binascii.Error,
         lzma.LZMAError,
-        UnicodeDecodeError,
+        UnicodeError,
         json.JSONDecodeError,
+        RecursionError,
         TypeError,
         ValueError,
     ) as exc:
         raise EconomicEvaluationAdmissionError(f"{label} receipt is invalid") from exc
-    if receipt_bytes != _canonical_json_bytes(value):
+    try:
+        canonical_bytes = _canonical_json_bytes(value)
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        raise EconomicEvaluationAdmissionError(f"{label} receipt is invalid") from exc
+    if receipt_bytes != canonical_bytes:
         raise EconomicEvaluationAdmissionError(
             f"{label} receipt is not canonical JSON"
+        )
+    if receipt != _receipt_chunks(value):
+        raise EconomicEvaluationAdmissionError(
+            f"{label} receipt encoding is not canonical"
         )
     return value
 
 
 def _validation_report_receipt_value(value: object, *, label: str) -> object:
     if isinstance(value, Mapping):
-        return _thaw_json(value)
+        legacy = _thaw_json(value)
+        if (
+            isinstance(legacy, Mapping)
+            and legacy.get("schema_version") == ECONOMIC_VALIDATION_REPORT_SCHEMA
+        ):
+            raise EconomicEvaluationAdmissionError(
+                f"{label} current report must use a receipt"
+            )
+        return legacy
     return _receipt_value(value, label=label)
 
 
@@ -763,7 +832,10 @@ def _admitted_protocol_from_envelope(
 ) -> FrozenEvaluationProtocol:
     if envelope.kind != ECONOMIC_EVALUATION_PROTOCOL_KIND:
         raise EconomicEvaluationAdmissionError("admitted protocol envelope kind is invalid")
-    payload = _payload_mapping(envelope.payload, label="admitted protocol payload")
+    payload = _payload_mapping(
+        _thaw_json(envelope.payload),
+        label="admitted protocol payload",
+    )
     if set(payload) != _PROTOCOL_ADMISSION_FIELDS:
         raise EconomicEvaluationAdmissionError("admitted protocol fields are invalid")
     if payload.get("schema_version") != ECONOMIC_EVALUATION_PROTOCOL_ADMISSION_SCHEMA:
@@ -1121,7 +1193,10 @@ class EconomicEvaluationAdmissionAdapter:
                 raise EconomicEvaluationAdmissionError(
                     "immutable evidence-store predecessor does not match"
                 )
-            submitted = _payload_mapping(envelope.payload, label="admission payload")
+            submitted = _payload_mapping(
+                _thaw_json(envelope.payload),
+                label="admission payload",
+            )
             if _canonical_json_bytes(submitted) != _canonical_json_bytes(material):
                 raise EconomicEvaluationAdmissionError("admission payload is not exact")
             try:
