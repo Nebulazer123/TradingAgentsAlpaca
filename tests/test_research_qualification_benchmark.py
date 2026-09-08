@@ -225,10 +225,11 @@ def test_cost_budget_distinct_reviewer_and_injection_media_policies(tmp_path):
     receipt = run_registered_research_benchmark(registration=registration, lane_results=[deterministic, model, twin], artifact_root=root, lane_adapters=adapters)
     assert receipt["selected_lane"] == "openrouter_source_bound"
     reviewer = _lane("different_model_reviewer", cases, root, model="registered-model")
-    reviewer_twin = _lane("different_model_reviewer_no_text", cases, root, model="reviewer-model")
+    reviewer_twin = _lane("different_model_reviewer_no_text", cases, root, model="registered-model")
     adapters.update({reviewer["lane_id"]: _adapter(reviewer["case_outputs"]), reviewer_twin["lane_id"]: _adapter(reviewer_twin["case_outputs"])})
     same_specs = _specs()
     same_specs["different_model_reviewer"]["model"] = "registered-model"
+    same_specs["different_model_reviewer_no_text"]["model"] = "registered-model"
     same_registration = build_research_qualification_registration(cases, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=same_specs)
     with pytest.raises(ResearchQualificationBenchmarkError, match="distinct model"):
         run_registered_research_benchmark(registration=same_registration, lane_results=[deterministic, model, twin, reviewer, reviewer_twin], artifact_root=root, lane_adapters=adapters)
@@ -272,6 +273,18 @@ def test_bm25_miss_records_losing_lane_and_retains_baseline(tmp_path):
     metadata_result = next(row for row in receipt["lane_results"] if row["lane_id"] == "metadata_fts5_bm25")
     assert metadata_result["qualified"] is False
     assert metadata_result["case_outputs"][0]["answer_sha256"] is None
+
+
+def test_no_text_twin_cannot_change_the_registered_model(tmp_path):
+    _root, cases, _registration = _fixture(tmp_path)
+    specs = _specs()
+    specs["openrouter_source_bound_no_text"]["model"] = "different-model"
+    with pytest.raises(ResearchQualificationBenchmarkError, match="paired lane identity"):
+        build_research_qualification_registration(
+            cases, minimum_accuracy_gain="0.001",
+            lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER},
+            lane_specs=specs,
+        )
 
 
 def test_openrouter_execution_uses_registered_identity_telemetry_and_safe_pair(tmp_path):

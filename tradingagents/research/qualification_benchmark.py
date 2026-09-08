@@ -100,6 +100,13 @@ def _registration(value: object) -> dict[str, object]:
         if (base in MODEL_LANES) != (spec["provider"] == "openrouter"):
             raise ResearchQualificationBenchmarkError("registered provider does not match lane")
         lane_specs[lane_id] = spec
+    for lane_id in TEXT_LANES:
+        twin = lane_specs[f"{lane_id}_no_text"]
+        if any(lane_specs[lane_id][key] != twin[key]
+               for key in ("provider", "model", "revision", "route")):
+            raise ResearchQualificationBenchmarkError(
+                "paired lane identity must match before removing retained text"
+            )
     raw_cases = row["cases"]
     if type(raw_cases) is not list:
         raise ResearchQualificationBenchmarkError("registration cases must be a list")
