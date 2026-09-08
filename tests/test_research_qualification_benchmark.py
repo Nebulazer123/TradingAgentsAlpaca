@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -155,13 +156,100 @@ def test_registration_rejects_duplicate_source_pages_and_case_units(tmp_path):
     inflated = json.loads(json.dumps(cases))
     for case in inflated[:500]:
         case["byte_start"], case["byte_end"] = inflated[0]["byte_start"], inflated[0]["byte_end"]
+        case["artifact_id"] = f"retained-artifact-alias-{case['case_id']}"
         case["adapter_query"] = json.dumps({"fts_query": f"fake{case['case_id']}", "json_path": ["facts", "answer"]}, sort_keys=True, separators=(",", ":"))
     with pytest.raises(ResearchQualificationBenchmarkError, match="distinct retained source pages"):
         build_research_qualification_registration(inflated, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
     duplicate = json.loads(json.dumps(cases))
     duplicate[1]["byte_start"], duplicate[1]["byte_end"], duplicate[1]["adapter_query"] = duplicate[0]["byte_start"], duplicate[0]["byte_end"], duplicate[0]["adapter_query"]
+    duplicate[1]["artifact_id"] = "retained-artifact-alias-whitespace"
+    duplicate[1]["adapter_query"] = "   " + duplicate[1]["adapter_query"]
     with pytest.raises(ResearchQualificationBenchmarkError, match="duplicate case content/query"):
         build_research_qualification_registration(duplicate, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+
+
+def test_reviewer_gain_uses_paired_full_cohort_denominator(tmp_path):
+    root, cases, registration = _fixture(tmp_path, wrong_expected=7)
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    model = _lane("openrouter_source_bound", cases, root)
+    ambiguous_ids = {case["case_id"] for case in cases if case["ambiguous"]}
+    for output in model["case_outputs"]:
+        if output["case_id"] in ambiguous_ids:
+            output["answer"] = "definitely-wrong"
+    model_twin = _lane("openrouter_source_bound_no_text", cases, root, wrong=30)
+    reviewer = _lane("different_model_reviewer", cases, root, model="reviewer-model")
+    reviewer_twin = _lane("different_model_reviewer_no_text", cases, root, model="reviewer-model", wrong=1)
+    lanes = [deterministic, model, model_twin, reviewer, reviewer_twin]
+    receipt = run_registered_research_benchmark(
+        registration=registration,
+        lane_results=lanes,
+        artifact_root=root,
+        lane_adapters={lane["lane_id"]: _adapter(lane["case_outputs"]) for lane in lanes[1:]},
+    )
+    assert receipt["selected_lane"] == "openrouter_source_bound"
+    assert "different_model_reviewer" not in receipt["retained_improving_lanes"]
+    reviewer_result = next(row for row in receipt["lane_results"] if row["lane_id"] == "different_model_reviewer")
+    reviewer_twin_result = next(row for row in receipt["lane_results"] if row["lane_id"] == "different_model_reviewer_no_text")
+    assert reviewer_result["critical_field_accuracy"] == "1"
+    assert Decimal(reviewer_twin_result["critical_field_accuracy"]) == Decimal(1399) / Decimal(1400)
+
+
+def test_cost_budget_distinct_reviewer_and_injection_media_policies(tmp_path):
+    root, cases, registration = _fixture(tmp_path, wrong_expected=7)
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    model = _lane("openrouter_source_bound", cases, root, cost="1000000")
+    twin = _lane("openrouter_source_bound_no_text", cases, root, wrong=30)
+    adapters = {model["lane_id"]: _adapter(model["case_outputs"]), twin["lane_id"]: _adapter(twin["case_outputs"])}
+    receipt = run_registered_research_benchmark(registration=registration, lane_results=[deterministic, model, twin], artifact_root=root, lane_adapters=adapters)
+    assert receipt["selected_lane"] == "deterministic_sec_xbrl"
+    model["cost_usd"] = "1"
+    receipt = run_registered_research_benchmark(registration=registration, lane_results=[deterministic, model, twin], artifact_root=root, lane_adapters=adapters)
+    assert receipt["selected_lane"] == "openrouter_source_bound"
+    reviewer = _lane("different_model_reviewer", cases, root, model="registered-model")
+    reviewer_twin = _lane("different_model_reviewer_no_text", cases, root, model="reviewer-model")
+    adapters.update({reviewer["lane_id"]: _adapter(reviewer["case_outputs"]), reviewer_twin["lane_id"]: _adapter(reviewer_twin["case_outputs"])})
+    with pytest.raises(ResearchQualificationBenchmarkError, match="distinct model"):
+        run_registered_research_benchmark(registration=registration, lane_results=[deterministic, model, twin, reviewer, reviewer_twin], artifact_root=root, lane_adapters=adapters)
+    uncovered = json.loads(json.dumps(cases))
+    for case in uncovered:
+        if case["case_kind"] == "injection_case":
+            case["medium"] = "text"
+    with pytest.raises(ResearchQualificationBenchmarkError, match="injection cases"):
+        build_research_qualification_registration(uncovered, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+
+
+def test_retained_bytes_tamper_and_symlink_are_rejected(tmp_path):
+    root, cases, registration = _fixture(tmp_path)
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    corpus = root / "corpus.jsonl"
+    original = corpus.read_bytes()
+    corpus.write_bytes(b"tampered" + original)
+    with pytest.raises(ResearchQualificationBenchmarkError, match="digest mismatch"):
+        run_registered_research_benchmark(registration=registration, lane_results=[deterministic], artifact_root=root)
+    corpus.unlink()
+    outside = tmp_path / "outside.jsonl"
+    outside.write_bytes(original)
+    corpus.symlink_to(outside)
+    with pytest.raises(ResearchQualificationBenchmarkError, match="escapes root"):
+        run_registered_research_benchmark(registration=registration, lane_results=[deterministic], artifact_root=root)
+
+
+def test_bm25_miss_records_losing_lane_and_retains_baseline(tmp_path):
+    root, cases, _registration = _fixture(tmp_path)
+    missed = json.loads(json.dumps(cases))
+    query = json.loads(missed[0]["adapter_query"])
+    query["fts_query"] = "absenttoken"
+    missed[0]["adapter_query"] = json.dumps(query, sort_keys=True, separators=(",", ":"))
+    registration = build_research_qualification_registration(missed, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+    deterministic = _lane("deterministic_sec_xbrl", missed, root)
+    metadata = _lane("metadata_fts5_bm25", missed, root)
+    metadata["case_outputs"][0]["answer"] = None
+    twin = _lane("metadata_fts5_bm25_no_text", missed, root)
+    receipt = run_registered_research_benchmark(registration=registration, lane_results=[deterministic, metadata, twin], artifact_root=root, lane_adapters={twin["lane_id"]: _adapter(twin["case_outputs"])})
+    assert receipt["selected_lane"] == "deterministic_sec_xbrl"
+    metadata_result = next(row for row in receipt["lane_results"] if row["lane_id"] == "metadata_fts5_bm25")
+    assert metadata_result["qualified"] is False
+    assert metadata_result["case_outputs"][0]["answer_sha256"] is None
 
 
 def test_cli_writes_owner_only_verified_receipt(tmp_path):

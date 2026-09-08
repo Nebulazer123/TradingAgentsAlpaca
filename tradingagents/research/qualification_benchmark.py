@@ -117,8 +117,8 @@ def _registration(value: object) -> dict[str, object]:
         variants.append(variant_id)
         counts[kind] += 1
         cases.append(case)
-        source_unit = (case["artifact_id"], case["byte_start"], case["byte_end"])
-        unit = (kind, case["artifact_sha256"], case["byte_start"], case["byte_end"], query_text)
+        source_unit = (case["artifact_sha256"], case["byte_start"], case["byte_end"])
+        unit = (*source_unit, _digest(query))
         if unit in content_query_units:
             raise ResearchQualificationBenchmarkError("duplicate case content/query unit")
         content_query_units.add(unit)
@@ -207,22 +207,20 @@ def _extract(case: Mapping[str, object], raw: bytes) -> str:
     return str(value)
 
 
-def _bm25_answers(cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes]) -> dict[str, str]:
+def _bm25_answers(cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes]) -> dict[str, str | None]:
     db = sqlite3.connect(":memory:")
     try:
         db.execute("CREATE VIRTUAL TABLE documents USING fts5(case_id UNINDEXED, artifact_id UNINDEXED, medium UNINDEXED, body)")
         for case_id in sorted(cases):
             case = cases[case_id]
             db.execute("INSERT INTO documents VALUES (?, ?, ?, ?)", (case_id, case["artifact_id"], case["medium"], sources[case_id].decode()))
-        answers: dict[str, str] = {}
+        answers: dict[str, str | None] = {}
         for case_id in sorted(cases):
             found = db.execute(
                 "SELECT case_id, body FROM documents WHERE documents MATCH ? ORDER BY bm25(documents), case_id LIMIT 1",
                 (_query(cases[case_id])["fts_query"],),
             ).fetchone()
-            if found is None or found[0] != case_id:
-                raise ResearchQualificationBenchmarkError("FTS5/BM25 did not retrieve the registered source unit")
-            answers[case_id] = _extract(cases[case_id], str(found[1]).encode())
+            answers[case_id] = None if found is None or found[0] != case_id else _extract(cases[case_id], str(found[1]).encode())
         return answers
     except (UnicodeError, sqlite3.Error) as exc:
         raise ResearchQualificationBenchmarkError("FTS5/BM25 execution failed") from exc
@@ -249,7 +247,7 @@ def _adapter_input(case: Mapping[str, object], lane_id: str, source: bytes) -> t
     return safe, effective_source
 
 
-def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes], adapters: Mapping[str, LaneAdapter], local_answers: Mapping[str, str] | None = None) -> dict[str, object]:
+def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes], adapters: Mapping[str, LaneAdapter], local_answers: Mapping[str, str | None] | None = None) -> dict[str, object]:
     lane = _map(raw, RESULT_FIELDS, "lane result")
     lane_id = _text(lane["lane_id"], "lane_id")
     base = lane_id.removesuffix("_no_text")
@@ -311,13 +309,13 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
             answer = _text(actual_output["answer"], "adapter answer")
         if produced["answer"] != answer or produced["source_artifact_id"] != case["artifact_id"] or produced["byte_start"] != case["byte_start"] or produced["byte_end"] != case["byte_end"] or produced["input_sha256"] != safe_case["input_sha256"] or produced["pair_id"] != safe_case["pair_id"]:
             raise ResearchQualificationBenchmarkError("case output is not source-bound")
-        answer_hash = hashlib.sha256(answer.encode()).hexdigest()
-        secure = not contains_sensitive_text(answer) and "place_order" not in answer.lower()
+        answer_hash = hashlib.sha256(answer.encode()).hexdigest() if answer is not None else None
+        secure = answer is None or (not contains_sensitive_text(answer) and "place_order" not in answer.lower())
         scored.append(
             {
                 "case_id": case_id,
                 "answer_sha256": answer_hash,
-                "correct": answer_hash == case["expected_answer_sha256"],
+                "correct": answer_hash is not None and answer_hash == case["expected_answer_sha256"],
                 "security_pass": secure,
                 "input_sha256": safe_case["input_sha256"],
                 "pair_id": safe_case["pair_id"],
@@ -329,6 +327,25 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
     high_accuracy = Decimal(sum(row["correct"] for row in high)) / Decimal(len(high)) if high else Decimal(1)
     security = all(row["security_pass"] for row in scored)
     return {**lane, "case_outputs": scored, "critical_field_accuracy": format(accuracy, "f"), "high_severity_accuracy": format(high_accuracy, "f"), "security_pass": security, "qualified": accuracy >= Decimal("0.995") and high_accuracy == 1 and security, "cost_usd": format(cost, "f")}
+
+
+def _reviewed_cohort(
+    cases: Mapping[str, Mapping[str, object]],
+    reviewed: Mapping[str, object],
+    replacements: Mapping[str, object],
+) -> dict[str, object]:
+    rows = {str(row["case_id"]): row for row in reviewed["case_outputs"]}  # type: ignore[index]
+    rows.update({str(row["case_id"]): row for row in replacements["case_outputs"]})  # type: ignore[index]
+    accuracy = Decimal(sum(bool(rows[case_id]["correct"]) for case_id in cases)) / Decimal(len(cases))
+    high_ids = [case_id for case_id, case in cases.items() if case["severity"] == "high"]
+    high_accuracy = Decimal(sum(bool(rows[case_id]["correct"]) for case_id in high_ids)) / Decimal(len(high_ids)) if high_ids else Decimal(1)
+    security = all(bool(rows[case_id]["security_pass"]) for case_id in cases)
+    return {
+        "accuracy": accuracy,
+        "high_accuracy": high_accuracy,
+        "security_pass": security,
+        "qualified": accuracy >= Decimal("0.995") and high_accuracy == 1 and security,
+    }
 
 
 def run_registered_research_benchmark(*, registration: object, lane_results: object, artifact_root: str | Path, lane_adapters: Mapping[str, LaneAdapter] | None = None) -> dict[str, object]:
@@ -374,6 +391,15 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
     reviewer, reviewed = by_id.get("different_model_reviewer"), by_id.get("openrouter_source_bound")
     if reviewer and (reviewed is None or reviewer["actual_model"] == reviewed["actual_model"]):
         raise ResearchQualificationBenchmarkError("reviewer must use a distinct model")
+    if reviewer is not None:
+        for review_lane in (reviewer, by_id.get("different_model_reviewer_no_text")):
+            if review_lane is None:
+                continue
+            combined = _reviewed_cohort(cases, reviewed, review_lane)
+            review_lane["critical_field_accuracy"] = format(combined["accuracy"], "f")
+            review_lane["high_severity_accuracy"] = format(combined["high_accuracy"], "f")
+            review_lane["security_pass"] = combined["security_pass"]
+            review_lane["qualified"] = combined["qualified"]
     policy = frozen["comparison_policy"]
     gain = Decimal(policy["minimum_accuracy_gain"])
     budgets = policy["lane_cost_budgets_usd"]
@@ -383,12 +409,9 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
         if lane is None or twin is None or lane["qualified"] is not True or Decimal(lane["cost_usd"]) > Decimal(budgets[lane_id]):
             continue
         accuracy = Decimal(lane["critical_field_accuracy"])
-        if lane_id == "different_model_reviewer":
-            reviewed_rows = {row["case_id"]: row for row in reviewed["case_outputs"]}
-            reviewer_rows = {row["case_id"]: row for row in lane["case_outputs"]}
-            accuracy = Decimal(sum((reviewer_rows.get(cid) or reviewed_rows[cid])["correct"] for cid in cases)) / Decimal(len(cases))
+        twin_accuracy = Decimal(twin["critical_field_accuracy"])
         baseline = Decimal(by_id[selected]["critical_field_accuracy"])
-        if accuracy >= baseline + gain and accuracy >= Decimal(twin["critical_field_accuracy"]) + gain:
+        if accuracy >= baseline + gain and accuracy >= twin_accuracy + gain:
             selected = lane_id
             retained.append(lane_id)
     receipt = {
