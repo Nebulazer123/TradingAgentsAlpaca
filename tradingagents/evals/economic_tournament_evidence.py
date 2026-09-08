@@ -35,7 +35,9 @@ from tradingagents.dataflows.pit.records import (
     validate_security_identity,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
+    validate_phase_eligibility,
     validate_validation_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
@@ -68,6 +70,7 @@ _AUTHORITY = {
     "can_submit_orders": False,
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_Eligibility = EconomicPhaseEligibility | ValidationPhaseEligibility
 _CANDIDATE_FIELDS = frozenset(
     {
         "symbol",
@@ -797,10 +800,10 @@ def _new_value(value_type: type[object], **fields: object) -> object:
 def _context(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
 ) -> tuple[
     FrozenEvaluationProtocol,
-    ValidationPhaseEligibility,
+    _Eligibility,
     tuple[tuple[str, tuple[object, ...]], ...],
     Mapping[str, str],
 ]:
@@ -808,9 +811,14 @@ def _context(
         raise EconomicTournamentInputEvidenceError("protocol must be an exact frozen value")
     frozen = validate_frozen_evaluation_protocol(protocol.to_dict())
     try:
-        bound = validate_validation_phase_eligibility(protocol=frozen, eligibility=eligibility)
+        if type(eligibility) is EconomicPhaseEligibility:
+            bound = validate_phase_eligibility(protocol=frozen, eligibility=eligibility)
+        else:
+            bound = validate_validation_phase_eligibility(
+                protocol=frozen, eligibility=eligibility
+            )
     except (TypeError, ValueError) as exc:
-        raise EconomicTournamentInputEvidenceError("validation eligibility is invalid") from exc
+        raise EconomicTournamentInputEvidenceError("phase eligibility is invalid") from exc
     primary_ranking = frozen.cohort.ranking[: len(frozen.primary_universe)]
     primary_symbols = tuple(row.symbol for row in primary_ranking)
     primary_ids = tuple(row.security_id for row in primary_ranking)
@@ -833,7 +841,7 @@ def _context(
         events_by_symbol = {item.symbol: item for item in date_events}
         if len(date_events) != 75 or set(events_by_symbol) != set(frozen.primary_universe):
             raise EconomicTournamentInputEvidenceError(
-                "every validation market date must bind the ranked 75-symbol universe"
+                "every phase market date must bind the ranked 75-symbol universe"
             )
         events = tuple(events_by_symbol[symbol] for symbol in frozen.primary_universe)
         result.append((market_date, events))
@@ -843,7 +851,7 @@ def _context(
 def _build_features(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
     market_date_inputs: object,
 ) -> SourceBoundTournamentFeatures:
     frozen, bound, grouped, primary_security_ids = _context(
@@ -905,7 +913,7 @@ def _build_features(
 def _build_outcomes(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
     features: SourceBoundTournamentFeatures,
     market_date_inputs: object,
 ) -> SourceBoundTournamentOutcomes:
@@ -1052,7 +1060,7 @@ def _build_outcomes(
 def build_source_bound_tournament_features(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
     market_date_inputs: tuple[Mapping[str, object], ...],
 ) -> SourceBoundTournamentFeatures:
     """Freeze the pre-outcome feature receipt once per eligible market date."""
@@ -1067,7 +1075,7 @@ def build_source_bound_tournament_features(
 def build_source_bound_tournament_outcomes(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
     features: SourceBoundTournamentFeatures,
     market_date_inputs: tuple[Mapping[str, object], ...],
 ) -> SourceBoundTournamentOutcomes:
@@ -1084,7 +1092,7 @@ def build_source_bound_tournament_outcomes(
 def build_source_bound_tournament_input(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
     features: SourceBoundTournamentFeatures,
     outcomes: SourceBoundTournamentOutcomes,
 ) -> SourceBoundTournamentInput:
@@ -1149,7 +1157,7 @@ def validate_source_bound_tournament_features(
     value: object,
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
 ) -> SourceBoundTournamentFeatures:
     """Canonical-rebuild one pre-outcome feature receipt."""
 
@@ -1184,7 +1192,7 @@ def validate_source_bound_tournament_outcomes(
     value: object,
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
     features: SourceBoundTournamentFeatures,
 ) -> SourceBoundTournamentOutcomes:
     """Canonical-rebuild outcomes and their exact immutable feature reference."""
@@ -1223,7 +1231,7 @@ def validate_source_bound_tournament_input(
     value: object,
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
 ) -> SourceBoundTournamentInput:
     """Canonical-rebuild source-bound tournament inputs before evaluation."""
 

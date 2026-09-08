@@ -12,7 +12,11 @@ from decimal import Decimal, InvalidOperation
 
 from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
+    bind_phase_eligibility,
+    bind_validation_phase_eligibility,
+    validate_phase_eligibility,
     validate_validation_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
@@ -25,6 +29,7 @@ from tradingagents.evals.economic_evaluation_protocol import (
 )
 from tradingagents.evals.economic_evaluation_result import (
     EconomicValidationResult,
+    build_phase_evaluation_result,
     build_validation_evaluation_result,
 )
 from tradingagents.evals.economic_tournament_statistics import (
@@ -39,6 +44,7 @@ __all__ = [
     "ControlArmAllocation",
     "EconomicTournamentOutcome",
     "build_ta_control_allocations",
+    "evaluate_phase_ta_control",
     "evaluate_validation_ta_control",
 ]
 
@@ -352,22 +358,22 @@ def _variant_metrics(
     return metrics, observations
 
 
-def evaluate_validation_ta_control(
+def evaluate_phase_ta_control(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: EconomicPhaseEligibility,
     candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
     execution_outcomes: tuple[SourceBoundExecutionOutcome, ...],
     tournament_input_id: str,
     tournament_input_sha256: str,
 ) -> EconomicValidationResult:
-    """Evaluate every symbol event once into registered weekly portfolios."""
+    """Evaluate one named frozen phase into registered weekly portfolios."""
 
     if type(protocol) is not FrozenEvaluationProtocol:
         raise EconomicTournamentError("protocol must be an exact frozen value")
     frozen = validate_frozen_evaluation_protocol(protocol.to_dict())
     try:
-        bound = validate_validation_phase_eligibility(
+        bound = validate_phase_eligibility(
             protocol=frozen,
             eligibility=eligibility,
         )
@@ -375,7 +381,7 @@ def evaluate_validation_ta_control(
         raise EconomicTournamentError(str(exc)) from exc
     expected_ids = bound.event_ids
     if type(candidates_by_event) is not dict or set(candidates_by_event) != set(expected_ids):
-        raise EconomicTournamentError("candidate inputs must exactly cover validation events")
+        raise EconomicTournamentError("candidate inputs must exactly cover phase events")
     if type(execution_outcomes) is not tuple or any(
         type(item) is not SourceBoundExecutionOutcome for item in execution_outcomes
     ):
@@ -397,7 +403,7 @@ def evaluate_validation_ta_control(
         outcomes_by_date.setdefault(outcome.decision_market_date, []).append(outcome)
     if set(outcomes_by_date) != set(grouped):
         raise EconomicTournamentError(
-            "execution outcomes must cover the exact validation market dates"
+            "execution outcomes must cover the exact phase market dates"
         )
     weekly: dict[
         str,
@@ -453,7 +459,23 @@ def evaluate_validation_ta_control(
                 }
                 for arm in CONTROL_ARM_IDS
             }
-            return build_validation_evaluation_result(
+            if bound.phase == "validation":
+                return build_validation_evaluation_result(
+                    frozen,
+                    arm_metrics=null_metrics,  # type: ignore[arg-type]
+                    eligibility=bind_validation_phase_eligibility(
+                        protocol=frozen, partitions=bound.partitions
+                    ),
+                    cost_variant_metrics={
+                        cost: null_metrics for cost in ("5", "10", "25", "50")
+                    },  # type: ignore[arg-type]
+                    registered_statistics=None,
+                    tournament_input_id=tournament_input_id,
+                    tournament_input_sha256=tournament_input_sha256,
+                    execution_outcomes=execution_outcomes,
+                    unavailable=True,
+                )
+            return build_phase_evaluation_result(
                 frozen,
                 arm_metrics=null_metrics,  # type: ignore[arg-type]
                 eligibility=bound,
@@ -529,7 +551,20 @@ def evaluate_validation_ta_control(
         market_event_cluster_count=market_clusters,
         observations_by_arm=headline_observations,
     )
-    return build_validation_evaluation_result(
+    if bound.phase == "validation":
+        return build_validation_evaluation_result(
+            frozen,
+            arm_metrics=variants["10"],
+            eligibility=bind_validation_phase_eligibility(
+                protocol=frozen, partitions=bound.partitions
+            ),
+            cost_variant_metrics=variants,
+            registered_statistics=statistics,
+            tournament_input_id=tournament_input_id,
+            tournament_input_sha256=tournament_input_sha256,
+            execution_outcomes=execution_outcomes,
+        )
+    return build_phase_evaluation_result(
         frozen,
         arm_metrics=variants["10"],
         eligibility=bound,
@@ -538,4 +573,36 @@ def evaluate_validation_ta_control(
         tournament_input_id=tournament_input_id,
         tournament_input_sha256=tournament_input_sha256,
         execution_outcomes=execution_outcomes,
+    )
+
+
+def evaluate_validation_ta_control(
+    *,
+    protocol: FrozenEvaluationProtocol,
+    eligibility: ValidationPhaseEligibility,
+    candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
+    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...],
+    tournament_input_id: str,
+    tournament_input_sha256: str,
+) -> EconomicValidationResult:
+    """Compatibility wrapper for the historical validation-only entry point."""
+
+    if type(protocol) is not FrozenEvaluationProtocol:
+        raise EconomicTournamentError("protocol must be an exact frozen value")
+    frozen = validate_frozen_evaluation_protocol(protocol.to_dict())
+    try:
+        bound = validate_validation_phase_eligibility(protocol=frozen, eligibility=eligibility)
+    except ValueError as exc:
+        raise EconomicTournamentError(str(exc)) from exc
+    return evaluate_phase_ta_control(
+        protocol=frozen,
+        eligibility=bind_phase_eligibility(
+            protocol=frozen,
+            partitions=bound.partitions,
+            phase="validation",
+        ),
+        candidates_by_event=candidates_by_event,
+        execution_outcomes=execution_outcomes,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
     )

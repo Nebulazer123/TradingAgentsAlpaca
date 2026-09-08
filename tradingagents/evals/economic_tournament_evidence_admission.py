@@ -23,6 +23,7 @@ from tradingagents.dataflows.pit import (
     verify_source_bound_adjusted_price_window,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import FrozenEvaluationProtocol
@@ -55,6 +56,7 @@ _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 1_000_000
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CUSTODY_SCHEMA = "economic_tournament_receipt_custody/v1"
+_Eligibility = EconomicPhaseEligibility | ValidationPhaseEligibility
 
 
 def _plain_json(value: object) -> object:
@@ -236,7 +238,7 @@ def verify_source_bound_tournament_input(
     archive: RawPointInTimeArtifactArchive,
     value: object,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
 ) -> SourceBoundTournamentInput:
     """Reopen raw bytes and rebuild every declared value and price window."""
 
@@ -452,7 +454,7 @@ class EconomicTournamentReceiptArchive:
         input_id: str,
         input_sha256: str,
         protocol: FrozenEvaluationProtocol,
-        eligibility: ValidationPhaseEligibility,
+        eligibility: _Eligibility,
     ) -> SourceBoundTournamentInput:
         """Reopen both complete receipts and all retained PIT source bytes."""
 

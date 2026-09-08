@@ -6,6 +6,7 @@ import pytest
 
 from tests.test_economic_evaluation_admission import _protocol_from_receipts
 from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
+from tests.fixtures.economic_tournament import build_tournament_receipt
 from tradingagents.evals.economic_evaluation_partition_binding import (
     EconomicPartitionBindingError,
     bind_phase_eligibility,
@@ -17,6 +18,7 @@ from tradingagents.evals.economic_evaluation_result import (
     build_phase_evaluation_result,
     validate_economic_phase_result,
 )
+from tradingagents.evals.economic_tournament import evaluate_phase_ta_control
 
 
 def test_phase_eligibility_binds_each_frozen_partition_and_keeps_validation_compatibility(
@@ -82,6 +84,35 @@ def test_phase_result_uses_a_new_phase_bound_schema(protocol_source):
         eligibility=eligibility,
         arm_metrics=metrics,
     )
+    assert result.to_dict()["schema_version"] == "economic_evaluation_result/v4"
+    assert result.to_dict()["phase"] == "development"
+    assert result.validation_event_ids == eligibility.event_ids
+    assert validate_economic_phase_result(result.to_dict()).canonical_json_bytes() == result.canonical_json_bytes()
+
+
+def test_development_evaluator_uses_the_bound_development_events(tmp_path, protocol_source):
+    cohort, partitions, manifest = protocol_source
+    protocol = _protocol_from_receipts(cohort, partitions, manifest)
+    eligibility = bind_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+        phase="development",
+    )
+    receipt, _archive = build_tournament_receipt(
+        tmp_path / "development-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+
+    result = evaluate_phase_ta_control(
+        protocol=protocol,
+        eligibility=eligibility,
+        candidates_by_event=dict(receipt.candidates_by_event),
+        execution_outcomes=receipt.outcomes,
+        tournament_input_id=receipt.input_id,
+        tournament_input_sha256=receipt.input_sha256,
+    )
+
     assert result.to_dict()["schema_version"] == "economic_evaluation_result/v4"
     assert result.to_dict()["phase"] == "development"
     assert result.validation_event_ids == eligibility.event_ids
