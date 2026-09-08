@@ -1120,6 +1120,93 @@ def test_development_admission_reopens_its_exact_phase_bound_receipt(tmp_path):
     assert readiness.validation_run_object_id is None
 
 
+def test_released_holdout_admission_reopens_its_exact_phase_bound_receipt(tmp_path):
+    adapter = _adapter(tmp_path)
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    adapter.admit_protocol(
+        protocol,
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    validation_input = _source_bound_tournament_input(protocol, partitions, tmp_path)
+    validation_report = _validation_report(protocol, partitions, tmp_path)
+    adapter.admit_evaluation_run(
+        protocol.protocol_id,
+        phase="validation",
+        effective_at=NOW,
+        frozen_validation_report=validation_report,
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=validation_input,
+    )
+    adapter.release_holdout(
+        protocol.protocol_id,
+        released_by="owner-corbin",
+        released_at=NOW,
+        frozen_validation_report=validation_report,
+    )
+    eligibility = bind_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+        phase="holdout",
+    )
+    tournament_input, archive = build_tournament_receipt(
+        tmp_path / "holdout-tournament-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+    event_count = str(len(eligibility.event_ids))
+    result = build_phase_evaluation_result(
+        protocol,
+        eligibility=eligibility,
+        arm_metrics={
+            arm_id: {
+                "net_return_after_costs": "0",
+                "benchmark_excess_after_costs": "0",
+                "max_drawdown": "0",
+                "turnover": "0",
+                "false_positive_rate": "0",
+                "decision_event_count": event_count,
+                "packet_event_cluster_count": event_count,
+                "market_event_cluster_count": event_count,
+                "cost_per_useful_decision": "0",
+            }
+            for arm_id in ("cash", "spy", "equal_weight", "momentum_quality", "pullback_support")
+        },
+    )
+    report = {
+        "schema_version": admission_module.ECONOMIC_PHASE_REPORT_SCHEMA,
+        "protocol_id": protocol.protocol_id,
+        "phase": "holdout",
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(eligibility.event_ids),
+        "result": result.to_dict(),
+        "result_id": result.result_id,
+        "result_sha256": result.result_sha256,
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+
+    run = adapter.admit_evaluation_run(
+        protocol.protocol_id,
+        phase="holdout",
+        effective_at=NOW,
+        frozen_validation_report=report,
+        pit_artifact_root=archive.root,
+        tournament_input=tournament_input,
+    )
+
+    readiness = adapter.readiness_status(protocol.protocol_id)
+    assert run.phase == "holdout"
+    assert readiness.state == "holdout_completed_analysis_only"
+    assert readiness.holdout_run_object_id == run.envelope.object_id
+
+
 @pytest.mark.parametrize(
     "source_revision,source_paths",
     [
