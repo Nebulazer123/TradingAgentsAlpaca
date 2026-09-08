@@ -205,6 +205,25 @@ def test_receipt_writer_rejects_compressed_output_outside_store_envelope(monkeyp
         admission_module._receipt_chunks({"small": True})
 
 
+def test_receipt_writer_reuses_bounded_canonical_compression(monkeypatch):
+    admission_module._compressed_receipt_chunks.cache_clear()
+    compress = admission_module.lzma.compress
+    calls = []
+
+    def recording_compress(*args, **kwargs):
+        calls.append((args, kwargs))
+        return compress(*args, **kwargs)
+
+    monkeypatch.setattr(admission_module.lzma, "compress", recording_compress)
+    first = admission_module._receipt_chunks({"canonical": [1, 2, 3]})
+    second = admission_module._receipt_chunks({"canonical": [1, 2, 3]})
+
+    assert first == second
+    assert first is not second
+    assert len(calls) == 1
+    assert calls[0][1]["filters"] == admission_module._RECEIPT_LZMA_FILTERS
+
+
 def test_receipt_decoder_rejects_nonlist_count_size_and_rechunking():
     valid = admission_module._receipt_chunks({"canonical": True})
     encoded = "".join(valid)

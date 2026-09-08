@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import binascii
 import datetime as dt
+import functools
 import hashlib
 import json
 import lzma
@@ -338,15 +339,8 @@ def _reject_json_constant(constant: str) -> object:
     raise ValueError(f"invalid JSON constant: {constant}")
 
 
-def _receipt_chunks(value: object) -> list[str]:
-    try:
-        receipt_bytes = _canonical_json_bytes(value)
-    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
-        raise EconomicEvaluationAdmissionError(
-            "receipt value is not canonical JSON"
-        ) from exc
-    if len(receipt_bytes) > _MAX_PROTOCOL_RECEIPT_BYTES:
-        raise EconomicEvaluationAdmissionError("receipt value is too large")
+@functools.lru_cache(maxsize=1)
+def _compressed_receipt_chunks(receipt_bytes: bytes) -> tuple[str, ...]:
     compressed = lzma.compress(
         receipt_bytes,
         format=lzma.FORMAT_XZ,
@@ -358,10 +352,26 @@ def _receipt_chunks(value: object) -> list[str]:
     encoded = base64.b64encode(compressed).decode("ascii")
     if len(encoded) > _MAX_RECEIPT_ENCODED_CHARS:
         raise EconomicEvaluationAdmissionError("encoded receipt is too large")
-    return [
+    return tuple(
         encoded[offset : offset + _PROTOCOL_RECEIPT_CHUNK_CHARS]
         for offset in range(0, len(encoded), _PROTOCOL_RECEIPT_CHUNK_CHARS)
-    ]
+    )
+
+
+def _receipt_chunks(value: object) -> list[str]:
+    try:
+        receipt_bytes = _canonical_json_bytes(value)
+    except (RecursionError, TypeError, ValueError, UnicodeError) as exc:
+        raise EconomicEvaluationAdmissionError(
+            "receipt value is not canonical JSON"
+        ) from exc
+    if len(receipt_bytes) > _MAX_PROTOCOL_RECEIPT_BYTES:
+        raise EconomicEvaluationAdmissionError("receipt value is too large")
+    # Protocol and report bytes are immutable and rechecked repeatedly when a
+    # record is reopened. One bounded entry avoids recompressing identical
+    # retained bytes without changing their canonical encoding or admitting
+    # mutable caller state.
+    return list(_compressed_receipt_chunks(receipt_bytes))
 
 
 def _protocol_receipt_chunks(protocol: FrozenEvaluationProtocol) -> list[str]:
