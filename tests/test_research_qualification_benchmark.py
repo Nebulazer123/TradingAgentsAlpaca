@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 
 from cli.main import app
 from tradingagents.llm_clients.factory import create_llm_client
+from tradingagents.research import qualification_benchmark
 from tradingagents.research.qualification_benchmark import LANE_ORDER, OPENROUTER_PROMPT_SHA256, ResearchQualificationBenchmarkError, _adapter_input, build_research_qualification_registration, execute_registered_openrouter_benchmark, run_registered_research_benchmark
 
 
@@ -345,6 +346,13 @@ def test_openrouter_execution_uses_production_factory_telemetry_and_safe_pair(
     assert all("expected_answer" not in call["case"] and "severity" not in call["case"] for call in calls)
     assert all(call["retained_source"] for call in calls[:1400])
     assert all(call["retained_source"] == "" for call in calls[1400:])
+    assert [row["lane_id"] for row in receipt["lane_results"]] == [
+        "deterministic_sec_xbrl",
+        "metadata_fts5_bm25",
+        "metadata_fts5_bm25_no_text",
+        "openrouter_source_bound",
+        "openrouter_source_bound_no_text",
+    ]
     model = next(row for row in receipt["lane_results"] if row["lane_id"] == "openrouter_source_bound")
     assert model["input_tokens"] == 2800 and model["output_tokens"] == 1400 and model["cost_usd"] == "0.0056"
 
@@ -383,6 +391,35 @@ def test_openrouter_client_does_not_invent_missing_routing_telemetry(monkeypatch
     assert "provider" not in response.response_metadata
     assert "route" not in response.response_metadata
     assert "fallback_used" not in response.response_metadata
+
+
+def test_openrouter_executes_retained_fts_before_any_model_factory(tmp_path, monkeypatch):
+    root, cases, registration = _fixture(tmp_path, wrong_expected=7)
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    original_bm25 = qualification_benchmark._bm25_answers
+    retrieval_calls = []
+
+    def tracked_bm25(*args, **kwargs):
+        retrieval_calls.append("fts5_bm25")
+        return original_bm25(*args, **kwargs)
+
+    monkeypatch.setattr(qualification_benchmark, "_bm25_answers", tracked_bm25)
+    factory_calls = []
+
+    def factory(**kwargs):
+        assert retrieval_calls
+        factory_calls.append(kwargs)
+        raise RuntimeError("stop after ordering check")
+
+    with pytest.raises(RuntimeError, match="ordering check"):
+        execute_registered_openrouter_benchmark(
+            registration=registration,
+            deterministic_result=deterministic,
+            artifact_root=root,
+            llm_factory=factory,
+        )
+    assert retrieval_calls == ["fts5_bm25", "fts5_bm25"]
+    assert factory_calls == [{"provider": "openrouter", "model": "registered-model"}]
 
 
 def test_perfect_local_score_cannot_justify_any_model_calls(tmp_path):

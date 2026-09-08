@@ -266,6 +266,63 @@ def _bm25_answers(cases: Mapping[str, Mapping[str, object]], sources: Mapping[st
         db.close()
 
 
+def _metadata_fts5_lane_result(
+    *,
+    lane_id: str,
+    cases: Mapping[str, Mapping[str, object]],
+    sources: Mapping[str, bytes],
+    answers: Mapping[str, str | None],
+    spec: Mapping[str, object],
+    registration_sha256: str,
+    latency_ms: int,
+) -> dict[str, object]:
+    """Materialize one local retrieval lane from retained bytes only."""
+
+    no_text = lane_id.endswith("_no_text")
+    outputs = []
+    outcome_ids = []
+    for case_id in sorted(cases):
+        case = cases[case_id]
+        safe, _source_bytes = _adapter_input(case, lane_id, sources[case_id])
+        answer = None if no_text else answers[case_id]
+        outcome_digest = _digest(
+            {"case_id": case_id, "input_sha256": safe["input_sha256"]}
+        )
+        outcome_ids.append(f"registered-fts5-bm25-{lane_id}-{outcome_digest}")
+        outputs.append(
+            {
+                "case_id": case_id,
+                "answer": answer,
+                "source_artifact_id": case["artifact_id"],
+                "byte_start": case["byte_start"],
+                "byte_end": case["byte_end"],
+                "input_sha256": safe["input_sha256"],
+                "pair_id": safe["pair_id"],
+            }
+        )
+    return {
+        "lane_id": lane_id,
+        "requested_provider": spec["provider"],
+        "requested_model": spec["model"],
+        "requested_revision": spec["revision"],
+        "actual_provider": spec["provider"],
+        "actual_model": spec["model"],
+        "actual_revision": spec["revision"],
+        "route": spec["route"],
+        "prompt_sha256": spec["prompt_sha256"],
+        "fallback_used": False,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "latency_ms": 0 if no_text else latency_ms,
+        "cost_usd": "0",
+        "privacy_mode": "registered_metadata_fts5_bm25_no_text" if no_text else "registered_metadata_fts5_bm25",
+        "outcome_ids": outcome_ids,
+        "checkpoint_id": f"registered-fts5-bm25-{registration_sha256}",
+        "case_outputs": outputs,
+        **AUTHORITY,
+    }
+
+
 def _adapter_input(case: Mapping[str, object], lane_id: str, source: bytes) -> tuple[dict[str, object], bytes]:
     base = lane_id.removesuffix("_no_text")
     effective_source = b"" if lane_id.endswith("_no_text") else source
@@ -337,7 +394,10 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
     if set(indexed) != expected or len(indexed) != len(outputs):
         raise ResearchQualificationBenchmarkError("lane case coverage is invalid")
     adapter = adapters.get(lane_id)
-    if (base in MODEL_LANES or lane_id.endswith("_no_text")) and adapter is None:
+    if (
+        base in MODEL_LANES
+        or (lane_id.endswith("_no_text") and base != "metadata_fts5_bm25")
+    ) and adapter is None:
         raise ResearchQualificationBenchmarkError(f"{lane_id} source adapter is unavailable")
     scored = []
     for case_id in sorted(expected):
@@ -424,7 +484,11 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
         lane_id = str(row.get("lane_id")) if isinstance(row, Mapping) else ""
         if lane_id == LANE_ORDER[0]:
             continue
-        local_answers = metadata_answers if lane_id.removesuffix("_no_text") == "metadata_fts5_bm25" else None
+        local_answers = None
+        if lane_id == "metadata_fts5_bm25":
+            local_answers = metadata_answers
+        elif lane_id == "metadata_fts5_bm25_no_text":
+            local_answers = {case_id: None for case_id in cases}
         scored.append(_score(row, cases, sources, adapters, frozen["lane_specs"], local_answers))
     by_id = {str(row["lane_id"]): row for row in scored}
     for lane in TEXT_LANES:
@@ -510,12 +574,55 @@ def execute_registered_openrouter_benchmark(
     root = Path(artifact_root).expanduser().resolve(strict=True)
     cases = {str(case["case_id"]): case for case in frozen["cases"]}
     sources = {case_id: _source(root, case) for case_id, case in cases.items()}
+    started = time.monotonic_ns()
+    metadata_answers = _bm25_answers(cases, sources)
+    metadata_latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
+    metadata_lane_results = [
+        _metadata_fts5_lane_result(
+            lane_id="metadata_fts5_bm25",
+            cases=cases,
+            sources=sources,
+            answers=metadata_answers,
+            spec=frozen["lane_specs"]["metadata_fts5_bm25"],
+            registration_sha256=frozen["registration_sha256"],
+            latency_ms=metadata_latency_ms,
+        ),
+        _metadata_fts5_lane_result(
+            lane_id="metadata_fts5_bm25_no_text",
+            cases=cases,
+            sources=sources,
+            answers=metadata_answers,
+            spec=frozen["lane_specs"]["metadata_fts5_bm25_no_text"],
+            registration_sha256=frozen["registration_sha256"],
+            latency_ms=0,
+        ),
+    ]
+    local_receipt = run_registered_research_benchmark(
+        registration=frozen,
+        lane_results=[deterministic_result, *metadata_lane_results],
+        artifact_root=root,
+    )
+    selected_row = next(
+        row
+        for row in local_receipt["lane_results"]
+        if row["lane_id"] == local_receipt["selected_lane"]
+    )
+    if Decimal(selected_row["critical_field_accuracy"]) + required_gain > 1:
+        local_receipt["openrouter_execution"] = {
+            "status": "not_run",
+            "reason": "registered_accuracy_gain_unattainable",
+        }
+        local_receipt["receipt_id"] = local_receipt["receipt_sha256"] = None
+        digest = _digest(local_receipt)
+        local_receipt["receipt_id"] = f"research-qualification-benchmark-{digest}"
+        local_receipt["receipt_sha256"] = digest
+        return local_receipt
     if llm_factory is None:
         from tradingagents.llm_clients.factory import create_llm_client
 
         llm_factory = create_llm_client
     captured: dict[str, list[dict[str, object]]] = {}
-    lane_results = [dict(deterministic_result)]
+    lane_results = [dict(deterministic_result), *metadata_lane_results]
     for lane_id in ("openrouter_source_bound", "openrouter_source_bound_no_text"):
         spec = frozen["lane_specs"][lane_id]
         if spec["provider"] != "openrouter" or spec["prompt_sha256"] != OPENROUTER_PROMPT_SHA256:
