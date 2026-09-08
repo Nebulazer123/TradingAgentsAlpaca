@@ -5421,6 +5421,59 @@ def policy_sync_promotion(
                 console.print(f"  {sleeve}: {issue}")
 
 
+@policy_app.command("readiness-status")
+def policy_readiness_status(
+    supersession_receipt_path: Path = typer.Option(
+        ..., "--supersession-receipt-path", exists=True, readable=True
+    ),
+    promotion_state_path: Path = typer.Option(
+        ..., "--promotion-state-path", exists=True, readable=True
+    ),
+    live_control_path: Path = typer.Option(
+        ..., "--live-control-path", exists=True, readable=True
+    ),
+    schedule_contract_path: Path = typer.Option(
+        ..., "--schedule-contract-path", exists=True, readable=True
+    ),
+    automation_root: Path = typer.Option(
+        ..., "--automation-root", exists=True, file_okay=False, readable=True
+    ),
+    role_contract_path: Path = typer.Option(
+        ..., "--role-contract-path", exists=True, readable=True
+    ),
+    generated_at: str | None = typer.Option(None, "--generated-at"),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Read current non-authorizing readiness from verified local evidence."""
+
+    from tradingagents.policy.promotion_sync import build_current_readiness_packet
+
+    try:
+        moment = (
+            datetime.datetime.now(tz=datetime.timezone.utc)
+            if generated_at is None
+            else datetime.datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        )
+        packet = build_current_readiness_packet(
+            supersession_receipt_path=supersession_receipt_path,
+            promotion_state_path=promotion_state_path,
+            live_control_path=live_control_path,
+            schedule_contract_path=schedule_contract_path,
+            automation_root=automation_root,
+            role_contract_path=role_contract_path,
+            now=moment,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise typer.BadParameter(f"readiness evidence rejected: {exc}") from exc
+    if json_output:
+        typer.echo(json.dumps(packet, indent=2, sort_keys=True))
+        return
+    console.print(f"Readiness: {packet['readiness_status']}")
+    console.print(
+        "Analysis-only; this status grants no execution or promotion authority."
+    )
+
+
 @policy_app.command("preregister-sleeve")
 def policy_preregister_sleeve(
     sleeve: str = typer.Option(..., "--sleeve"),

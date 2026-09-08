@@ -13,6 +13,7 @@ from tradingagents.brokers.alpaca_supervisor import (
 )
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.promotion_sync import (
+    build_current_readiness_packet,
     supersede_legacy_readiness,
     sync_promotion_state_file,
     sync_promotion_state_from_tournament,
@@ -62,6 +63,150 @@ def _legacy_supersession_inputs(tmp_path):
         "now": SYNC_NOW,
     }
     return kwargs, go_bytes, state_bytes, tournament_bytes
+
+
+def _paused_schedule_fixture(tmp_path):
+    repo_root = Path(__file__).parents[1]
+    contract = json.loads(
+        (repo_root / "config/automation_schedule_contract.json").read_text()
+    )
+    roles = json.loads((repo_root / "config/automation_roles.json").read_text())
+    contract_path = tmp_path / "schedule-contract.json"
+    roles_path = tmp_path / "automation-roles.json"
+    automation_root = tmp_path / "automations"
+    for automation_id, record in contract["automations"].items():
+        prompt = " ".join(record["required_prompt_phrases"])
+        record["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
+        toml_path = automation_root / automation_id / "automation.toml"
+        toml_path.parent.mkdir(parents=True, exist_ok=True)
+        toml_path.write_text(
+            "\n".join(
+                [
+                    f"name = {json.dumps(record['name'])}",
+                    f"prompt = {json.dumps(prompt)}",
+                    'status = "PAUSED"',
+                    (
+                        "target = { "
+                        f"type = {json.dumps(record['target']['type'])}, "
+                        f"project_id = {json.dumps(record['target']['project_id'])} "
+                        "}"
+                    ),
+                    f"cwds = {json.dumps(record['cwds'])}",
+                    f"execution_environment = {json.dumps(record['execution_environment'])}",
+                    f"rrule = {json.dumps(record['rrule'])}",
+                    f"model = {json.dumps(record['model'])}",
+                    f"reasoning_effort = {json.dumps(record['reasoning_effort'])}",
+                    f"notification_policy = {json.dumps(record['notification_policy'])}",
+                ]
+            )
+        )
+    _write_json_bytes(contract_path, contract)
+    _write_json_bytes(roles_path, roles)
+    return contract_path, roles_path, automation_root
+
+
+def _readiness_inputs(tmp_path):
+    supersession_kwargs, _, _, _ = _legacy_supersession_inputs(tmp_path)
+    supersession = supersede_legacy_readiness(**supersession_kwargs)
+    control_path = tmp_path / "live-control.json"
+    _write_json_bytes(control_path, {"frozen": True, "reason": "source freeze"})
+    contract_path, roles_path, automation_root = _paused_schedule_fixture(tmp_path)
+    return {
+        "supersession_receipt_path": supersession.completed_receipt_path,
+        "promotion_state_path": supersession_kwargs["promotion_state_path"],
+        "live_control_path": control_path,
+        "schedule_contract_path": contract_path,
+        "automation_root": automation_root,
+        "role_contract_path": roles_path,
+        "now": SYNC_NOW,
+    }
+
+
+def test_current_readiness_packet_derives_non_authority_from_verified_files(tmp_path):
+    kwargs = _readiness_inputs(tmp_path)
+
+    packet = build_current_readiness_packet(**kwargs)
+
+    assert packet["schema_version"] == "trading_readiness_packet/v1"
+    assert packet["readiness_status"] == "NOT_ESTABLISHED"
+    assert packet["profitability"] == "NOT_ESTABLISHED"
+    assert packet["economic_qualification"] == "pending"
+    assert packet["historical_go_status"] == "superseded_historical"
+    assert packet["shadow_phase"] == "qualification_pending"
+    assert packet["all_sleeves_paper_only"] is True
+    assert packet["all_sleeves_live_disabled"] is True
+    assert packet["live_control"]["frozen"] is True
+    assert packet["paused_automation_count"] == 10
+    assert len(packet["paused_automations"]) == 10
+    assert all(len(row["sha256"]) == 64 for row in packet["paused_automations"])
+    assert packet["runtime_transition_executed"] is False
+    assert packet["compact_context_refreshed"] is False
+    assert packet["tsm_board_review_executed"] is False
+    assert packet["analysis_only"] is True
+    assert packet["execution_authority"] == "none"
+    assert packet["can_promote"] is False
+    assert packet["can_submit_orders"] is False
+
+
+def test_current_readiness_packet_rejects_unfrozen_or_active_evidence(tmp_path):
+    kwargs = _readiness_inputs(tmp_path)
+    _write_json_bytes(Path(kwargs["live_control_path"]), {"frozen": False})
+    with pytest.raises(ValueError, match="not frozen"):
+        build_current_readiness_packet(**kwargs)
+
+    kwargs = _readiness_inputs(tmp_path / "active")
+    automation = next(Path(kwargs["automation_root"]).glob("*/automation.toml"))
+    automation.write_text(automation.read_text().replace('status = "PAUSED"', 'status = "ACTIVE"'))
+    with pytest.raises(ValueError, match="ten paused automations"):
+        build_current_readiness_packet(**kwargs)
+
+
+def test_current_readiness_packet_rejects_tampered_promotion_state(tmp_path):
+    kwargs = _readiness_inputs(tmp_path)
+    state_path = Path(kwargs["promotion_state_path"])
+    state = json.loads(state_path.read_bytes())
+    state["sleeves"]["current-aggressive"].update(
+        {"stage": "tiny_live_eligible", "live_enabled": True}
+    )
+    state_path.write_text(json.dumps(state, indent=2))
+
+    with pytest.raises(ValueError, match="does not match supersession"):
+        build_current_readiness_packet(**kwargs)
+
+
+def test_policy_readiness_status_cli_is_read_only_and_json(tmp_path):
+    from typer.testing import CliRunner
+
+    from cli.main import app
+
+    kwargs = _readiness_inputs(tmp_path)
+    result = CliRunner().invoke(
+        app,
+        [
+            "policy",
+            "readiness-status",
+            "--supersession-receipt-path",
+            str(kwargs["supersession_receipt_path"]),
+            "--promotion-state-path",
+            str(kwargs["promotion_state_path"]),
+            "--live-control-path",
+            str(kwargs["live_control_path"]),
+            "--schedule-contract-path",
+            str(kwargs["schedule_contract_path"]),
+            "--automation-root",
+            str(kwargs["automation_root"]),
+            "--role-contract-path",
+            str(kwargs["role_contract_path"]),
+            "--generated-at",
+            SYNC_NOW.isoformat(),
+            "--json-output",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    packet = json.loads(result.output)
+    assert packet["readiness_status"] == "NOT_ESTABLISHED"
+    assert packet["paused_automation_count"] == 10
+    assert packet["execution_authority"] == "none"
 
 
 def test_legacy_readiness_supersession_is_immutable_paper_only_and_retryable(tmp_path):

@@ -171,6 +171,208 @@ class LegacyReadinessSupersessionResult:
     resumed: bool
 
 
+def build_current_readiness_packet(
+    *,
+    supersession_receipt_path: str | Path,
+    promotion_state_path: str | Path,
+    live_control_path: str | Path,
+    schedule_contract_path: str | Path,
+    automation_root: str | Path,
+    role_contract_path: str | Path,
+    now: datetime.datetime,
+) -> dict[str, object]:
+    """Build an authority-free readiness packet from current verified files."""
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    generated_at = now.astimezone(UTC).isoformat(timespec="seconds")
+    receipt_path = Path(supersession_receipt_path).resolve()
+    state_path = Path(promotion_state_path).resolve()
+    control_path = Path(live_control_path).resolve()
+    completed_bytes = receipt_path.read_bytes()
+    completed = _read_json_object(
+        completed_bytes, field="completed supersession receipt"
+    )
+    if (
+        completed.get("schema_version") != "1.0.0"
+        or completed.get("status") != "completed"
+        or completed.get("analysis_only") is not True
+        or completed.get("execution_authority") != "none"
+        or completed.get("can_promote") is not False
+        or completed.get("can_submit_orders") is not False
+        or completed.get("reason") != "economic qualification pending"
+    ):
+        raise ValueError("completed supersession receipt is not authority-free")
+    artifacts = completed.get("artifacts")
+    prepared_ref = completed.get("prepared_receipt")
+    if not isinstance(artifacts, Mapping) or not isinstance(prepared_ref, Mapping):
+        raise ValueError("completed supersession receipt bindings are invalid")
+    state_before = artifacts.get("promotion_state_before")
+    if (
+        not isinstance(state_before, Mapping)
+        or state_before.get("path") != str(state_path)
+    ):
+        raise ValueError("supersession receipt names a different promotion state")
+    prepared_path = Path(str(prepared_ref.get("path", ""))).resolve()
+    prepared_bytes = prepared_path.read_bytes()
+    if prepared_ref.get("sha256") != _sha256(prepared_bytes):
+        raise ValueError("prepared supersession receipt digest mismatch")
+    prepared = _read_json_object(prepared_bytes, field="prepared supersession receipt")
+    if (
+        prepared.get("schema_version") != "1.0.0"
+        or prepared.get("status") != "prepared"
+        or prepared.get("artifacts") != artifacts
+        or prepared.get("analysis_only") is not True
+        or prepared.get("execution_authority") != "none"
+        or prepared.get("can_promote") is not False
+        or prepared.get("can_submit_orders") is not False
+        or prepared.get("reason") != "economic qualification pending"
+    ):
+        raise ValueError("prepared supersession receipt is invalid")
+
+    try:
+        before_bytes = base64.b64decode(
+            str(prepared.get("promotion_state_before_base64", "")), validate=True
+        )
+    except ValueError as exc:
+        raise ValueError("prepared supersession before-image is invalid") from exc
+    before_binding = artifacts.get("promotion_state_before")
+    if (
+        not isinstance(before_binding, Mapping)
+        or before_binding.get("sha256") != _sha256(before_bytes)
+    ):
+        raise ValueError("prepared supersession before-image digest mismatch")
+    operation_iso = prepared.get("prepared_at")
+    if type(operation_iso) is not str:
+        raise ValueError("prepared supersession timestamp is invalid")
+    try:
+        operation_now = datetime.datetime.fromisoformat(operation_iso)
+    except ValueError as exc:
+        raise ValueError("prepared supersession timestamp is invalid") from exc
+    if operation_now.tzinfo is None or operation_now.utcoffset() is None:
+        raise ValueError("prepared supersession timestamp is invalid")
+    before_state = _validate_existing_promotion_state(
+        _read_json_object(before_bytes, field="prepared promotion before-image")
+    )
+    expected_decisions = _paper_only_decisions(
+        before_state,
+        now_iso=operation_iso,
+        reason="economic qualification pending",
+    )
+    expected_state = build_promotion_state(
+        expected_decisions, generated_at=operation_iso
+    )
+    expected_state_bytes = json.dumps(expected_state, indent=2).encode("utf-8")
+    if (
+        prepared.get("promotion_state_after") != expected_state
+        or prepared.get("promotion_state_after_sha256")
+        != _sha256(expected_state_bytes)
+    ):
+        raise ValueError("prepared supersession state is not derived from before-image")
+
+    state_bytes = state_path.read_bytes()
+    state_sha256 = _sha256(state_bytes)
+    if (
+        completed.get("promotion_state_after_sha256") != state_sha256
+        or prepared.get("promotion_state_after_sha256") != state_sha256
+    ):
+        raise ValueError("current promotion state does not match supersession")
+    state = _validate_existing_promotion_state(
+        _read_json_object(state_bytes, field="current promotion state")
+    )
+    if state_bytes != expected_state_bytes or expected_state != state:
+        raise ValueError("prepared supersession state does not match current state")
+    sleeves = state["sleeves"]
+    if not sleeves or any(
+        record.get("stage") != "paper_only"
+        or record.get("live_enabled") is not False
+        or record.get("demotion_reason") != "economic qualification pending"
+        for record in sleeves.values()
+    ):
+        raise ValueError("every current sleeve must remain paper-only and live-disabled")
+
+    control_bytes = control_path.read_bytes()
+    control = _read_json_object(control_bytes, field="live control")
+    if control.get("frozen") is not True:
+        raise ValueError("live control is not frozen")
+
+    from tradingagents.evals.automation_health_audit import (
+        PREDEPLOYMENT_PAUSED_PHASE,
+        capture_schedule_contract_snapshot,
+        evaluate_schedule_contract,
+        schedule_contract_snapshot_manifest,
+    )
+
+    snapshot = capture_schedule_contract_snapshot(
+        contract_path=schedule_contract_path,
+        automation_root=automation_root,
+        role_contract_path=role_contract_path,
+        captured_at=now,
+    )
+    manifest = schedule_contract_snapshot_manifest(snapshot)
+    schedule = evaluate_schedule_contract(
+        deployment_phase=PREDEPLOYMENT_PAUSED_PHASE,
+        captured_snapshot=snapshot,
+    )
+    rows = schedule.get("automations")
+    automation_sources = manifest.get("automation_tomls")
+    if (
+        manifest.get("capture_issues")
+        or schedule.get("contract_status") != "pass"
+        or schedule.get("safe_predeployment") is not True
+        or schedule.get("paused_count") != 10
+        or schedule.get("configured_count") != 10
+        or not isinstance(rows, list)
+        or len(rows) != 10
+        or any(
+            not isinstance(row, Mapping)
+            or row.get("status") != "match"
+            or row.get("config_status") != "PAUSED"
+            for row in rows
+        )
+        or not isinstance(automation_sources, list)
+        or len(automation_sources) != 10
+    ):
+        raise ValueError("ten paused automations were not verified")
+    paused = [
+        {"automation_id": source["automation_id"], "sha256": source["sha256"]}
+        for source in sorted(
+            automation_sources, key=lambda item: str(item.get("automation_id"))
+        )
+    ]
+    return {
+        "schema_version": "trading_readiness_packet/v1",
+        "generated_at": generated_at,
+        "readiness_status": "NOT_ESTABLISHED",
+        "profitability": "NOT_ESTABLISHED",
+        "economic_qualification": "pending",
+        "shadow_phase": "qualification_pending",
+        "historical_go_status": "superseded_historical",
+        "all_sleeves_paper_only": True,
+        "all_sleeves_live_disabled": True,
+        "sleeve_ids": sorted(sleeves),
+        "promotion_state": {"path": str(state_path), "sha256": state_sha256},
+        "supersession_receipt": {
+            "path": str(receipt_path),
+            "sha256": _sha256(completed_bytes),
+        },
+        "live_control": {
+            "path": str(control_path),
+            "sha256": _sha256(control_bytes),
+            "frozen": True,
+        },
+        "paused_automations": paused,
+        "paused_automation_count": 10,
+        "runtime_transition_executed": False,
+        "compact_context_refreshed": False,
+        "tsm_board_review_executed": False,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_promote": False,
+        "can_submit_orders": False,
+    }
+
+
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
