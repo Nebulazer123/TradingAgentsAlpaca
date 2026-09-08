@@ -2167,8 +2167,10 @@ def research_agent_ledger_reconcile(
 
     Prints canonical JSON to stdout. Counts valid, corrupt, duplicate,
     conflicting, resolved, and clustered rows without rewriting anything.
-    The conservative market-event cluster count is labeled provisional until
-    a preregistered estimator exists.
+    Conservative market-event clusters are labeled only as provisional
+    dependence groups, never as effective sample size. Canonical economic
+    decision identity counts remain unavailable until a verified binding is
+    present in the learning source contract.
     """
     try:
         receipt = reconcile_ledger_file(ledger_path, summary_path=summary_path)

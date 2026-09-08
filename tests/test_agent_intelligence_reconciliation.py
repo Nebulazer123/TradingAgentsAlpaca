@@ -19,7 +19,8 @@ from tradingagents.evals.agent_intelligence_ledger import (
     summarize_agent_scores,
 )
 from tradingagents.evals.agent_intelligence_reconciliation import (
-    EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+    ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
+    EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
     INFLUENCE_WEIGHTING_STATUS_LEGACY,
     SCHEMA_VERSION,
     SUMMARY_FRESHNESS_CURRENT,
@@ -166,6 +167,10 @@ def test_receipt_counts_synthetic_mixed_ledger_exactly():
     assert receipt["valid_forecast_count"] == 9
     assert receipt["corrupt_line_count"] == 2
     assert receipt["resolved_row_count"] == 6
+    assert receipt["pending_row_count"] == 3
+    assert receipt["resolved_high_quality_count"] == 0
+    assert receipt["resolved_degraded_quality_count"] == 0
+    assert receipt["resolved_suspect_quality_count"] == 0
     assert receipt["duplicate_forecast_id_row_count"] == 1
     assert receipt["conflicting_forecast_id_count"] == 1
     assert receipt["packet_event_cluster_count"] == 3
@@ -175,9 +180,39 @@ def test_receipt_counts_synthetic_mixed_ledger_exactly():
     assert receipt["packet_event_non_null_window_cluster_count"] == 2
     assert receipt["market_event_cluster_count"] == 2
     assert receipt["market_event_unclusterable_count"] == 1
-    assert receipt["provisional_effective_sample"] == 2
-    assert receipt["provisional_effective_sample_basis"] == "conservative_market_event_cluster_count"
-    assert receipt["effective_sample_status"] == EFFECTIVE_SAMPLE_STATUS_PROVISIONAL
+    assert receipt["provisional_market_event_cluster_count"] == 2
+    assert receipt["effective_sample_count"] is None
+    assert receipt["effective_sample_status"] == EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE
+    assert receipt["unique_economic_decision_event_id_count"] is None
+    assert receipt["unique_economic_decision_market_date_count"] is None
+    assert (
+        receipt["economic_decision_identity_status"]
+        == ECONOMIC_IDENTITY_STATUS_UNAVAILABLE
+    )
+    assert receipt["economic_decision_identity_reason"] == (
+        "agent_forecast_v1_has_no_verified_economic_decision_event_binding"
+    )
+    assert "provisional_effective_sample" not in receipt
+
+
+def test_receipt_reports_resolved_quality_classes_without_relabeling_rows():
+    rows = [
+        _forecast("af-high", resolved=True, label_quality="high"),
+        _forecast("af-degraded", resolved=True, label_quality="degraded"),
+        _forecast("af-suspect", resolved=True, label_quality="suspect"),
+        _forecast("af-unaudited", resolved=True, label_quality=None),
+        _forecast("af-pending", label_quality="high"),
+    ]
+
+    receipt = build_reconciliation_receipt(
+        ("\n".join(_line(row) for row in rows) + "\n").encode("utf-8")
+    )
+
+    assert receipt["resolved_row_count"] == 4
+    assert receipt["pending_row_count"] == 1
+    assert receipt["resolved_high_quality_count"] == 1
+    assert receipt["resolved_degraded_quality_count"] == 1
+    assert receipt["resolved_suspect_quality_count"] == 1
 
 
 def test_receipt_sha256_covers_whole_receipt_without_the_hash_field():
@@ -196,7 +231,12 @@ def test_receipt_sha256_covers_whole_receipt_without_the_hash_field():
         "packet_event_unclusterable_count",
         "market_event_cluster_count",
         "market_event_unclusterable_count",
-        "provisional_effective_sample",
+        "provisional_market_event_cluster_count",
+        "effective_sample_count",
+        "unique_economic_decision_event_id_count",
+        "unique_economic_decision_market_date_count",
+        "economic_decision_identity_status",
+        "economic_decision_identity_reason",
         "summary_freshness",
         "receipt_sha256",
     } <= set(receipt)
@@ -435,9 +475,9 @@ def test_dependence_block_clusters_resolved_rows_and_labels_provisional_bound():
         "packet_event_non_null_window_cluster_count": 1,
         "market_event_cluster_count": 1,
         "market_event_unclusterable_count": 0,
-        "provisional_effective_sample": 1,
-        "provisional_effective_sample_basis": "conservative_market_event_cluster_count",
-        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+        "provisional_market_event_cluster_count": 1,
+        "effective_sample_count": None,
+        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
         "raw_resolved_rows_are_independent_observations": False,
         "influence_weighting_status": INFLUENCE_WEIGHTING_STATUS_LEGACY,
     }
@@ -453,10 +493,11 @@ def test_summarize_agent_scores_exposes_deterministic_dependence_block():
     summary = summarize_agent_scores(rows)
 
     assert summary["dependence"] == dependence_block(rows)
-    assert summary["dependence"]["provisional_effective_sample"] == 1
+    assert summary["dependence"]["provisional_market_event_cluster_count"] == 1
+    assert summary["dependence"]["effective_sample_count"] is None
     assert (
         summary["dependence"]["effective_sample_status"]
-        == "provisional_pending_preregistered_estimator"
+        == "unavailable_pending_preregistered_estimator"
     )
     assert summary["dependence"]["raw_resolved_rows_are_independent_observations"] is False
 
@@ -514,7 +555,10 @@ def test_cli_prints_canonical_json_and_hermetic_summary_state(tmp_path):
     assert payload["resolved_row_count"] == 6
     assert payload["packet_event_cluster_count"] == 3
     assert payload["market_event_cluster_count"] == 2
-    assert payload["provisional_effective_sample"] == 2
+    assert payload["provisional_market_event_cluster_count"] == 2
+    assert payload["effective_sample_count"] is None
+    assert payload["unique_economic_decision_event_id_count"] is None
+    assert payload["unique_economic_decision_market_date_count"] is None
     assert payload["summary_freshness"] == SUMMARY_FRESHNESS_MISSING
     assert payload["influence_weighting_status"] == INFLUENCE_WEIGHTING_STATUS_LEGACY
     assert INFLUENCE_WEIGHTING_STATUS_LEGACY in result.output
@@ -804,6 +848,29 @@ def _raw_row(**overrides):
 def _spliced_row_line(forecast_id, **overrides):
     return json.dumps(
         _forecast(forecast_id, **overrides).as_dict(), sort_keys=True, separators=(",", ":")
+    )
+
+
+def test_arbitrary_economic_identity_keys_are_not_counted_as_verified_bindings():
+    row = _forecast(
+        "af-unverified-economic-identity",
+        resolved=True,
+        resolution_window=dict(WINDOW_A),
+    ).as_dict()
+    row["decision_event_id"] = "decision-event-" + "a" * 64
+    row["decision_market_date"] = "2026-06-01"
+
+    receipt = build_reconciliation_receipt(
+        (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+    )
+
+    assert receipt["valid_forecast_count"] == 0
+    assert receipt["corrupt_line_count"] == 1
+    assert receipt["unique_economic_decision_event_id_count"] is None
+    assert receipt["unique_economic_decision_market_date_count"] is None
+    assert (
+        receipt["economic_decision_identity_status"]
+        == ECONOMIC_IDENTITY_STATUS_UNAVAILABLE
     )
 
 

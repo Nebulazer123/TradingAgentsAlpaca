@@ -1,6 +1,6 @@
 """Read-only agent ledger reconciliation and dependence bounds.
 
-This module derives a deterministic ``agent_intelligence_reconciliation/v1``
+This module derives a deterministic ``agent_intelligence_reconciliation/v2``
 receipt from exactly one captured byte snapshot of the Agent Intelligence
 Ledger JSONL. It never mutates the ledger, never rewrites raw forecast
 history, and never replaces the derived agent score summary.
@@ -25,9 +25,14 @@ Dependence semantics (fixed for this increment):
   unclusterable and never replaced with an invented identity.
 - Both clusterings cover rows whose ``resolved`` field is exactly ``True``:
   dependence bounds describe the resolved sample, not pending rows.
-- ``provisional_effective_sample`` equals the conservative market-event
-  cluster count and is explicitly provisional until a preregistered
-  estimator exists. Raw resolved rows are never independent observations.
+- Conservative market-event clusters are reported only as provisional
+  dependence groups. They are not an effective sample size; that count stays
+  unavailable until a preregistered estimator exists. Raw resolved rows are
+  never independent observations.
+- Canonical economic decision-event and decision-market-date counts stay
+  unavailable unless a verified economic identity binding is present. The
+  current ledger schema has no such binding, so neither ``created_at`` nor a
+  provisional cluster key is promoted into economic identity.
 - ``influence_weighting_status`` labels the row-weighted influence
   estimator legacy/unregistered in every receipt and dependence block.
 
@@ -55,15 +60,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "agent_intelligence_reconciliation/v1"
+SCHEMA_VERSION = "agent_intelligence_reconciliation/v2"
 SUMMARY_FRESHNESS_MISSING = "missing"
 SUMMARY_FRESHNESS_MALFORMED = "malformed"
 SUMMARY_FRESHNESS_UNVERIFIABLE_LEGACY = "unverifiable_legacy_summary"
 SUMMARY_FRESHNESS_STALE = "stale"
 SUMMARY_FRESHNESS_CURRENT = "current"
 LEDGER_FINGERPRINT_KEY = "ledger_fingerprint"
-PROVISIONAL_EFFECTIVE_SAMPLE_BASIS = "conservative_market_event_cluster_count"
-EFFECTIVE_SAMPLE_STATUS_PROVISIONAL = "provisional_pending_preregistered_estimator"
+EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE = "unavailable_pending_preregistered_estimator"
+ECONOMIC_IDENTITY_STATUS_UNAVAILABLE = "unavailable_no_verified_economic_identity_binding"
+ECONOMIC_IDENTITY_REASON = (
+    "agent_forecast_v1_has_no_verified_economic_decision_event_binding"
+)
 INFLUENCE_WEIGHTING_STATUS_LEGACY = "legacy_unregistered_row_weighted_estimator"
 
 UTC = datetime.timezone.utc
@@ -386,9 +394,9 @@ def dependence_block(rows: Iterable[Any]) -> dict[str, Any]:
         "packet_event_non_null_window_cluster_count": non_null_window_clusters,
         "market_event_cluster_count": market_clusters,
         "market_event_unclusterable_count": market_unclusterable,
-        "provisional_effective_sample": market_clusters,
-        "provisional_effective_sample_basis": PROVISIONAL_EFFECTIVE_SAMPLE_BASIS,
-        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+        "provisional_market_event_cluster_count": market_clusters,
+        "effective_sample_count": None,
+        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
         "raw_resolved_rows_are_independent_observations": False,
         "influence_weighting_status": INFLUENCE_WEIGHTING_STATUS_LEGACY,
     }
@@ -497,6 +505,7 @@ def build_reconciliation_receipt(
             conflicting_forecast_id_count += 1
 
     resolved_raw = [row for row in valid_raw if row.get("resolved") is True]
+    pending_raw = [row for row in valid_raw if row.get("resolved") is False]
     packet_clusters, packet_unclusterable = _cluster_counts(
         resolved_raw, packet_event_key
     )
@@ -533,6 +542,16 @@ def build_reconciliation_receipt(
         "duplicate_forecast_id_row_count": duplicate_forecast_id_row_count,
         "conflicting_forecast_id_count": conflicting_forecast_id_count,
         "resolved_row_count": len(resolved_raw),
+        "pending_row_count": len(pending_raw),
+        "resolved_high_quality_count": sum(
+            row.get("label_quality") == "high" for row in resolved_raw
+        ),
+        "resolved_degraded_quality_count": sum(
+            row.get("label_quality") == "degraded" for row in resolved_raw
+        ),
+        "resolved_suspect_quality_count": sum(
+            row.get("label_quality") == "suspect" for row in resolved_raw
+        ),
         "packet_event_cluster_count": packet_clusters,
         "packet_event_unclusterable_count": packet_unclusterable,
         "packet_event_null_window_resolved_row_count": len(explicit_null_window_rows),
@@ -540,9 +559,13 @@ def build_reconciliation_receipt(
         "packet_event_non_null_window_cluster_count": non_null_window_cluster_count,
         "market_event_cluster_count": market_clusters,
         "market_event_unclusterable_count": market_unclusterable,
-        "provisional_effective_sample": market_clusters,
-        "provisional_effective_sample_basis": PROVISIONAL_EFFECTIVE_SAMPLE_BASIS,
-        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+        "provisional_market_event_cluster_count": market_clusters,
+        "effective_sample_count": None,
+        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
+        "unique_economic_decision_event_id_count": None,
+        "unique_economic_decision_market_date_count": None,
+        "economic_decision_identity_status": ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
+        "economic_decision_identity_reason": ECONOMIC_IDENTITY_REASON,
         "raw_resolved_rows_are_independent_observations": False,
         "influence_weighting_status": INFLUENCE_WEIGHTING_STATUS_LEGACY,
         "summary_freshness": evaluate_summary_freshness(
