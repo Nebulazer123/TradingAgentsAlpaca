@@ -1466,6 +1466,9 @@ def research_source_quality_review(
 def research_stack_benchmark(
     registration_path: Path = typer.Option(..., "--registration-path"),
     lane_results_path: Path = typer.Option(..., "--lane-results-path"),
+    artifact_root: Path = typer.Option(
+        ..., "--artifact-root", exists=True, file_okay=False, readable=True
+    ),
     output_path: Path = typer.Option(
         Path("results/research_qualification/benchmark-receipt.json"),
         "--output-path",
@@ -1479,6 +1482,7 @@ def research_stack_benchmark(
         receipt = run_registered_research_benchmark(
             registration=registration,
             lane_results=lane_results,
+            artifact_root=artifact_root,
         )
         written = write_research_qualification_receipt(receipt, output_path)
     except (OSError, json.JSONDecodeError, ResearchQualificationBenchmarkError) as exc:
