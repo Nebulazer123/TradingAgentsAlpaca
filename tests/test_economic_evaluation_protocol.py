@@ -694,7 +694,11 @@ def test_frozen_protocol_binding_survives_resolution_and_drives_verified_counts(
     protocol = _protocol(protocol_source)
     event = protocol.input_manifest.events[0]
     start = dt.date.fromisoformat(event.market_date)
-    end = start + dt.timedelta(days=6)
+    from tradingagents.evals.agent_intelligence_ledger import _add_trading_days
+
+    end = _add_trading_days(
+        dt.datetime.fromisoformat(event.created_at), event.horizon_sessions
+    ).date()
     recorded = dt.datetime.combine(
         end + dt.timedelta(days=1),
         dt.time(21),
@@ -799,6 +803,18 @@ def test_frozen_protocol_binding_survives_resolution_and_drives_verified_counts(
     assert receipt["economic_decision_verified_resolved_row_count"] == 1
     assert receipt["economic_decision_unbound_resolved_row_count"] == 0
     assert receipt["economic_decision_identity_status"] == "verified"
+
+    unrelated_window = dataclasses.replace(
+        resolved[0], resolve_after="2099-01-01T00:00:00+00:00"
+    )
+    assert lookup.verify_forecast(unrelated_window) is False
+    unrelated_receipt = build_reconciliation_receipt(
+        (json.dumps(unrelated_window.as_dict(), sort_keys=True) + "\n").encode(),
+        source_bound_verifier=lookup,
+    )
+    assert unrelated_receipt["unique_economic_decision_event_id_count"] == 0
+    assert unrelated_receipt["economic_decision_verified_resolved_row_count"] == 0
+    assert unrelated_receipt["economic_decision_unbound_resolved_row_count"] == 1
 
     forged = resolved[0].as_dict()
     forged["resolution_evidence"]["economic_decision"]["market_date"] = "2026-01-01"

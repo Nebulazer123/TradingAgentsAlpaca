@@ -197,6 +197,35 @@ def test_receipt_counts_synthetic_mixed_ledger_exactly():
     assert "provisional_effective_sample" not in receipt
 
 
+def test_legacy_source_bound_lookup_does_not_turn_unknown_identity_into_zero(tmp_path):
+    from tradingagents.dataflows.pit import RawPointInTimeArtifactArchive
+    from tradingagents.evals.source_bound_resolution import (
+        build_source_bound_window_lookup,
+    )
+
+    lookup = build_source_bound_window_lookup(
+        archive=RawPointInTimeArtifactArchive(tmp_path / "legacy-pit"),
+        raw_artifacts={},
+        receipts=(),
+    )
+
+    receipt = build_reconciliation_receipt(
+        _mixed_ledger_bytes(), source_bound_verifier=lookup
+    )
+
+    assert lookup.has_frozen_economic_protocol is False
+    assert receipt["unique_economic_decision_event_id_count"] is None
+    assert receipt["unique_economic_decision_market_date_count"] is None
+    assert receipt["economic_decision_verified_resolved_row_count"] == 0
+    assert receipt["economic_decision_unbound_resolved_row_count"] == 6
+    assert receipt["economic_decision_identity_status"] == (
+        ECONOMIC_IDENTITY_STATUS_UNAVAILABLE
+    )
+    assert receipt["economic_decision_identity_reason"] == (
+        "no_source_bound_verifier_with_frozen_economic_protocol"
+    )
+
+
 def test_receipt_reports_resolved_quality_classes_without_relabeling_rows():
     rows = [
         _forecast("af-high", resolved=True, label_quality="high"),

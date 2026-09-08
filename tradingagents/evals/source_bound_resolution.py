@@ -202,6 +202,12 @@ class SourceBoundWindowLookup:
         self._events_by_id = events
         self._forecast_event_bindings = bindings
 
+    @property
+    def has_frozen_economic_protocol(self) -> bool:
+        """Whether economic identity verification is actually configured."""
+
+        return self._economic_protocol is not None
+
     def economic_decision_evidence(self, forecast: object) -> dict[str, str] | None:
         """Return a binding only for an exact forecast-to-manifest mapping."""
 
@@ -221,6 +227,27 @@ class SourceBoundWindowLookup:
         if created.tzinfo is None:
             return None
         created_date = created.astimezone(dt.timezone.utc).date().isoformat()
+        resolve_after = getattr(forecast, "resolve_after", None)
+        try:
+            resolve_moment = dt.datetime.fromisoformat(
+                str(resolve_after).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        event_window = event.to_dict()["resolution_window"]
+        from tradingagents.evals.agent_intelligence_ledger import _add_trading_days
+
+        expected_resolve = _add_trading_days(
+            created.astimezone(dt.timezone.utc), event.horizon_sessions
+        )
+        if (
+            resolve_moment.tzinfo is None
+            or resolve_moment.astimezone(dt.timezone.utc) != expected_resolve
+            or not isinstance(event_window, Mapping)
+            or event_window.get("start_at") != event.decision_at
+            or event_window.get("horizon", event.horizon) != event.horizon
+        ):
+            return None
         if (
             getattr(forecast, "ticker", None) != event.symbol
             or getattr(forecast, "benchmark", None) != event.benchmark
@@ -301,6 +328,14 @@ class SourceBoundWindowLookup:
             economic_evidence = self.economic_decision_evidence(forecast)
             if (
                 economic_evidence is None
+                or window["intended_start"]
+                != dt.datetime.fromisoformat(
+                    str(getattr(forecast, "created_at", "")).replace("Z", "+00:00")
+                ).astimezone(dt.timezone.utc).date().isoformat()
+                or window["intended_end"]
+                != dt.datetime.fromisoformat(
+                    str(getattr(forecast, "resolve_after", "")).replace("Z", "+00:00")
+                ).astimezone(dt.timezone.utc).date().isoformat()
                 or not isinstance(evidence.get("economic_decision"), Mapping)
                 or set(evidence["economic_decision"]) != _ECONOMIC_DECISION_FIELDS
                 or evidence["economic_decision"] != economic_evidence

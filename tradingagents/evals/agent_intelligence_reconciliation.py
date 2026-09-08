@@ -381,6 +381,15 @@ def _verified_economic_identity_report(
 
     if type(source_bound_verifier) is not SourceBoundWindowLookup:
         raise TypeError("source_bound_verifier must be an exact SourceBoundWindowLookup")
+    if not source_bound_verifier.has_frozen_economic_protocol:
+        return {
+            "unique_economic_decision_event_id_count": None,
+            "unique_economic_decision_market_date_count": None,
+            "economic_decision_verified_resolved_row_count": 0,
+            "economic_decision_unbound_resolved_row_count": len(resolved_rows),
+            "economic_decision_identity_status": ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
+            "economic_decision_identity_reason": ECONOMIC_IDENTITY_REASON,
+        }
     event_ids: set[str] = set()
     market_dates: set[str] = set()
     verified_rows = 0
