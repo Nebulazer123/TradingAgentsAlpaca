@@ -197,7 +197,7 @@ from tradingagents.evals.economic_evaluation_admission import (
     EconomicEvaluationAdmissionError,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
-    bind_validation_phase_eligibility,
+    bind_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     validate_frozen_evaluation_protocol,
@@ -205,7 +205,7 @@ from tradingagents.evals.economic_evaluation_protocol import (
 from tradingagents.evals.economic_tournament import (
     EconomicTournamentCandidate,
     EconomicTournamentOutcome,
-    evaluate_validation_ta_control,
+    evaluate_phase_ta_control,
 )
 from tradingagents.evals.economic_tournament_evidence import (
     SourceBoundTournamentInput,
@@ -3129,6 +3129,41 @@ def _economic_validation_report(
     return report
 
 
+def _economic_phase_report(
+    *,
+    protocol_id: str,
+    phase: str,
+    partitions: object,
+    event_ids: tuple[str, ...],
+    result: object,
+    tournament_input: SourceBoundTournamentInput,
+) -> dict[str, object]:
+    """Wrap one development or holdout result in its explicit v4 report."""
+
+    result_payload = result.to_dict()
+    report = {
+        "schema_version": "economic_evaluation_report/v4",
+        "protocol_id": protocol_id,
+        "phase": phase,
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(event_ids),
+        "result": result_payload,
+        "result_id": result_payload["result_id"],
+        "result_sha256": result_payload["result_sha256"],
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
+
+
 def _economic_effective_at(value: str) -> datetime.datetime:
     """Parse a canonical, second-aligned UTC receipt timestamp."""
 
@@ -3289,18 +3324,15 @@ def research_economic_tournament_run(
         protocol = validate_frozen_evaluation_protocol(protocol_payload)
         if phase not in {"development", "validation", "holdout"}:
             raise ValueError("phase must be development, validation, or holdout")
-        eligibility = bind_validation_phase_eligibility(
+        eligibility = bind_phase_eligibility(
             protocol=protocol,
             partitions=validate_market_date_partitions(partitions_payload),
+            phase=phase,
         )
         adapter = EconomicEvaluationAdmissionAdapter(evidence_root, repo_root=repo_root)
         if phase == "holdout" and not adapter.is_holdout_released(protocol.protocol_id):
             raise EconomicEvaluationAdmissionError(
                 "holdout input is sealed until an immutable qualifying release exists"
-            )
-        if phase != "validation":
-            raise EconomicEvaluationAdmissionError(
-                "development and holdout evaluation wiring is not yet available"
             )
         tournament_payload = _economic_json_object(
             tournament_input_path,
@@ -3319,7 +3351,7 @@ def research_economic_tournament_run(
             protocol=protocol,
             eligibility=eligibility,
         )
-        result = evaluate_validation_ta_control(
+        result = evaluate_phase_ta_control(
             protocol=protocol,
             eligibility=eligibility,
             candidates_by_event=dict(tournament_input.candidates_by_event),
@@ -3329,16 +3361,27 @@ def research_economic_tournament_run(
         )
         admission = adapter.admit_evaluation_run(
             protocol.protocol_id,
-            phase="validation",
+            phase=phase,
             effective_at=effective,
             pit_artifact_root=pit_artifact_root,
             tournament_input=tournament_input,
-            frozen_validation_report=_economic_validation_report(
-                protocol_id=protocol.protocol_id,
-                partitions=eligibility.partitions,
-                validation_event_ids=eligibility.event_ids,
-                result=result,
-                tournament_input=tournament_input,
+            frozen_validation_report=(
+                _economic_validation_report(
+                    protocol_id=protocol.protocol_id,
+                    partitions=eligibility.partitions,
+                    validation_event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
+                if phase == "validation"
+                else _economic_phase_report(
+                    protocol_id=protocol.protocol_id,
+                    phase=phase,
+                    partitions=eligibility.partitions,
+                    event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
             ),
         )
     except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
