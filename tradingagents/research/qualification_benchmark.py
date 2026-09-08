@@ -492,7 +492,13 @@ def execute_registered_openrouter_benchmark(
 ) -> dict[str, object]:
     """Execute the registered source-bound OpenRouter pair after local admission."""
     frozen = _registration(registration)
-    run_registered_research_benchmark(registration=frozen, lane_results=[deterministic_result], artifact_root=artifact_root)
+    local_receipt = run_registered_research_benchmark(
+        registration=frozen, lane_results=[deterministic_result], artifact_root=artifact_root,
+    )
+    baseline = Decimal(local_receipt["lane_results"][0]["critical_field_accuracy"])
+    required_gain = Decimal(frozen["comparison_policy"]["minimum_accuracy_gain"])
+    if baseline + required_gain > 1:
+        return local_receipt
     root = Path(artifact_root).expanduser().resolve(strict=True)
     cases = {str(case["case_id"]): case for case in frozen["cases"]}
     sources = {case_id: _source(root, case) for case_id, case in cases.items()}

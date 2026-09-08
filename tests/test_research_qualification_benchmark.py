@@ -288,7 +288,7 @@ def test_no_text_twin_cannot_change_the_registered_model(tmp_path):
 
 
 def test_openrouter_execution_uses_registered_identity_telemetry_and_safe_pair(tmp_path):
-    root, cases, registration = _fixture(tmp_path)
+    root, cases, registration = _fixture(tmp_path, wrong_expected=7)
     deterministic = _lane("deterministic_sec_xbrl", cases, root)
     calls = []
 
@@ -323,6 +323,20 @@ def test_openrouter_execution_uses_registered_identity_telemetry_and_safe_pair(t
     assert all(call["retained_source"] == "" for call in calls[1400:])
     model = next(row for row in receipt["lane_results"] if row["lane_id"] == "openrouter_source_bound")
     assert model["input_tokens"] == 2800 and model["output_tokens"] == 1400 and model["cost_usd"] == "0.0056"
+
+
+def test_perfect_local_score_cannot_justify_any_model_calls(tmp_path):
+    root, cases, registration = _fixture(tmp_path)
+    calls = []
+    receipt = execute_registered_openrouter_benchmark(
+        registration=registration,
+        deterministic_result=_lane("deterministic_sec_xbrl", cases, root),
+        artifact_root=root,
+        llm_factory=lambda **kwargs: calls.append(kwargs),
+    )
+    assert calls == []
+    assert receipt["selected_lane"] == "deterministic_sec_xbrl"
+    assert len(receipt["lane_results"]) == 1
 
 
 def test_openrouter_factory_is_not_constructed_before_deterministic_admission(tmp_path):
