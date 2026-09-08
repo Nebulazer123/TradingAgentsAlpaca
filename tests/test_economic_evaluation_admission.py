@@ -224,6 +224,25 @@ def test_receipt_writer_reuses_bounded_canonical_compression(monkeypatch):
     assert calls[0][1]["filters"] == admission_module._RECEIPT_LZMA_FILTERS
 
 
+def test_protocol_receipt_reuses_exact_frozen_protocol_identity(monkeypatch):
+    protocol = _protocol()
+    monkeypatch.setattr(admission_module, "_PROTOCOL_RECEIPT_CACHE", None)
+    chunks = admission_module._receipt_chunks
+    calls = []
+
+    def recording_chunks(value):
+        calls.append(value)
+        return chunks(value)
+
+    monkeypatch.setattr(admission_module, "_receipt_chunks", recording_chunks)
+    first = admission_module._protocol_receipt_chunks(protocol)
+    second = admission_module._protocol_receipt_chunks(protocol)
+
+    assert first == second
+    assert first is not second
+    assert calls == [protocol.to_dict()]
+
+
 def test_receipt_decoder_rejects_nonlist_count_size_and_rechunking():
     valid = admission_module._receipt_chunks({"canonical": True})
     encoded = "".join(valid)

@@ -104,6 +104,7 @@ _RECEIPT_LZMA_FILTERS = (
         "depth": 0,
     },
 )
+_PROTOCOL_RECEIPT_CACHE: tuple[FrozenEvaluationProtocol, tuple[str, ...]] | None = None
 _VALIDATION_REPORT_FIELDS = frozenset(
     {
         "schema_version",
@@ -375,7 +376,15 @@ def _receipt_chunks(value: object) -> list[str]:
 
 
 def _protocol_receipt_chunks(protocol: FrozenEvaluationProtocol) -> list[str]:
-    return _receipt_chunks(protocol.to_dict())
+    global _PROTOCOL_RECEIPT_CACHE
+    cached = _PROTOCOL_RECEIPT_CACHE
+    if cached is not None and cached[0] is protocol:
+        return list(cached[1])
+    receipt = tuple(_receipt_chunks(protocol.to_dict()))
+    # FrozenEvaluationProtocol has a closed constructor and immutable public
+    # contract. Cache only this exact instance, never a caller-owned mapping.
+    _PROTOCOL_RECEIPT_CACHE = (protocol, receipt)
+    return list(receipt)
 
 
 def _sha256(value: object) -> str:
