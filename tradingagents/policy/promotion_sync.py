@@ -315,7 +315,9 @@ def supersede_legacy_readiness(
             raise ValueError("historical GO packet digest mismatch")
         if _sha256(tournament_bytes) != expected_expired_tournament_sha256:
             raise ValueError("expired tournament ledger digest mismatch")
-        _read_json_object(go_bytes, field="historical GO packet")
+        go_packet = _read_json_object(go_bytes, field="historical GO packet")
+        if go_packet.get("decision") != "GO":
+            raise ValueError("historical GO packet decision must be 'GO'")
         from tradingagents.brokers.paper_tournament import (
             fingerprint_expired_tournament_ledger,
         )
@@ -335,6 +337,12 @@ def supersede_legacy_readiness(
                 or prepared.get("status") != "prepared"
                 or prepared.get("artifacts") != expected_artifacts
                 or prepared.get("reason") != reason
+                or prepared.get("analysis_only") is not True
+                or prepared.get("execution_authority") != "none"
+                or prepared.get("can_promote") is not False
+                or prepared.get("can_submit_orders") is not False
+                or prepared.get("expired_tournament_identity")
+                != tournament_identity
             ):
                 raise ValueError("prepared supersession receipt is foreign or stale")
             operation_iso = prepared.get("prepared_at")
@@ -372,7 +380,24 @@ def supersede_legacy_readiness(
                 now_iso=operation_iso,
                 reason=reason,
             )
-            if current_bytes not in {before_bytes, after_bytes}:
+            expected_after_state = build_promotion_state(
+                decisions, generated_at=operation_iso
+            )
+            expected_after_bytes = json.dumps(expected_after_state, indent=2).encode(
+                "utf-8"
+            )
+            if (
+                after_state != expected_after_state
+                or after_bytes != expected_after_bytes
+                or prepared.get("promotion_state_after_sha256")
+                != _sha256(expected_after_bytes)
+            ):
+                raise ValueError(
+                    "prepared supersession after-state was not derived from its before-image"
+                )
+            after_state = expected_after_state
+            after_bytes = expected_after_bytes
+            if current_bytes not in {before_bytes, expected_after_bytes}:
                 raise ValueError("promotion state changed outside prepared supersession")
         else:
             operation_iso = now_iso

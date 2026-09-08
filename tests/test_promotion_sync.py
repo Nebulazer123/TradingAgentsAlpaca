@@ -1,3 +1,4 @@
+import base64
 import datetime
 import hashlib
 import json
@@ -33,7 +34,7 @@ def _legacy_supersession_inputs(tmp_path):
     state_path = tmp_path / "promotion-state.json"
     tournament_path = tmp_path / "expired-tournament.json"
     receipt_path = tmp_path / "supersession.json"
-    go_bytes = _write_json_bytes(go_path, {"status": "GO", "historical": True})
+    go_bytes = _write_json_bytes(go_path, {"decision": "GO", "historical": True})
     state = _incumbent_state()
     state["sleeves"]["paper-sleeve"] = {
         **state["sleeves"]["current-aggressive"],
@@ -125,13 +126,47 @@ def test_legacy_readiness_supersession_keeps_prepare_after_interrupted_write(
     )
 
 
+def test_legacy_readiness_recovery_rederives_after_state_from_before_image(
+    monkeypatch, tmp_path
+):
+    kwargs, _, _, _ = _legacy_supersession_inputs(tmp_path)
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(
+            "tradingagents.policy.promotion_sync._write_promotion_state_unlocked",
+            lambda *args, **call_kwargs: (_ for _ in ()).throw(
+                OSError("synthetic interruption")
+            ),
+        )
+        with pytest.raises(OSError, match="synthetic interruption"):
+            supersede_legacy_readiness(**kwargs)
+
+    receipt_path = Path(kwargs["receipt_path"])
+    prepared_path = receipt_path.with_name(receipt_path.name + ".prepared")
+    prepared = json.loads(prepared_path.read_bytes())
+    forged_after = prepared["promotion_state_after"]
+    forged_after["sleeves"]["current-aggressive"].update(
+        {"stage": "tiny_live_eligible", "live_enabled": True}
+    )
+    forged_bytes = json.dumps(forged_after, indent=2).encode("utf-8")
+    prepared["promotion_state_after_base64"] = base64.b64encode(forged_bytes).decode(
+        "ascii"
+    )
+    prepared["promotion_state_after_sha256"] = hashlib.sha256(forged_bytes).hexdigest()
+    prepared_path.write_text(json.dumps(prepared, indent=2, sort_keys=True))
+    Path(kwargs["promotion_state_path"]).write_bytes(forged_bytes)
+
+    with pytest.raises(ValueError, match="not derived from its before-image"):
+        supersede_legacy_readiness(**kwargs)
+    assert not receipt_path.exists()
+
+
 def test_legacy_readiness_supersession_rejects_stale_or_unexpired_inputs(tmp_path):
     kwargs, _, state_before, _ = _legacy_supersession_inputs(tmp_path)
     kwargs["expected_promotion_state_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="before-image digest mismatch"):
         supersede_legacy_readiness(**kwargs)
     assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
-    assert not Path(kwargs["receipt_path"]).exists()
 
     kwargs, _, state_before, _ = _legacy_supersession_inputs(tmp_path / "fresh")
     tournament_path = Path(kwargs["expired_tournament_ledger_path"])
@@ -143,6 +178,19 @@ def test_legacy_readiness_supersession_rejects_stale_or_unexpired_inputs(tmp_pat
     with pytest.raises(ValueError, match="not verifiably expired"):
         supersede_legacy_readiness(**kwargs)
     assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
+
+
+def test_legacy_readiness_supersession_rejects_non_go_historical_packet(tmp_path):
+    kwargs, _, state_before, _ = _legacy_supersession_inputs(tmp_path)
+    go_path = Path(kwargs["go_packet_path"])
+    no_go_bytes = _write_json_bytes(go_path, {"decision": "NO_GO"})
+    kwargs["expected_go_packet_sha256"] = hashlib.sha256(no_go_bytes).hexdigest()
+
+    with pytest.raises(ValueError, match="decision must be 'GO'"):
+        supersede_legacy_readiness(**kwargs)
+
+    assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
+    assert not Path(kwargs["receipt_path"]).exists()
 
 
 def _iso(moment):
