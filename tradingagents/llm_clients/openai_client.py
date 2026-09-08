@@ -32,6 +32,33 @@ class NormalizedChatOpenAI(ChatOpenAI):
     def invoke(self, input, config=None, **kwargs):
         return normalize_content(super().invoke(input, config, **kwargs))
 
+    def _create_chat_result(self, response, generation_info=None):
+        """Preserve only observed compatible-provider routing telemetry.
+
+        LangChain retains standard completion fields such as model name and
+        system fingerprint, but discards OpenRouter's provider, route and
+        fallback fields.  Those fields are needed to prove the route actually
+        used by a benchmark, so copy them only when the raw response supplies
+        well-typed values.  Missing telemetry deliberately stays missing.
+        """
+
+        chat_result = super()._create_chat_result(response, generation_info)
+        response_dict = response if isinstance(response, dict) else response.model_dump(
+            exclude={"choices": {"__all__": {"message": {"parsed"}}}}
+        )
+        observed: dict[str, str | bool] = {}
+        for key in ("provider", "route"):
+            value = response_dict.get(key)
+            if isinstance(value, str) and value:
+                observed[key] = value
+        fallback_used = response_dict.get("fallback_used")
+        if type(fallback_used) is bool:
+            observed["fallback_used"] = fallback_used
+        if observed:
+            for generation in chat_result.generations:
+                generation.message.response_metadata.update(observed)
+        return chat_result
+
     def with_structured_output(self, schema, *, method=None, **kwargs):
         caps = get_capabilities(self.model_name)
         if caps.preferred_structured_method == "none":

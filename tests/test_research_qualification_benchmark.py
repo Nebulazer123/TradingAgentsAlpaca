@@ -8,10 +8,12 @@ import stat
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
+from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.research.qualification_benchmark import LANE_ORDER, OPENROUTER_PROMPT_SHA256, ResearchQualificationBenchmarkError, _adapter_input, build_research_qualification_registration, execute_registered_openrouter_benchmark, run_registered_research_benchmark
 
 
@@ -287,33 +289,55 @@ def test_no_text_twin_cannot_change_the_registered_model(tmp_path):
         )
 
 
-def test_openrouter_execution_uses_registered_identity_telemetry_and_safe_pair(tmp_path):
+def test_openrouter_execution_uses_production_factory_telemetry_and_safe_pair(
+    tmp_path,
+    monkeypatch,
+):
     root, cases, registration = _fixture(tmp_path, wrong_expected=7)
     deterministic = _lane("deterministic_sec_xbrl", cases, root)
     calls = []
 
-    class Response:
-        def __init__(self, prompt, number):
-            payload = json.loads(prompt)
-            calls.append(payload)
-            source = payload["retained_source"]
-            self.content = json.loads(source)["facts"]["answer"] if source else "no-source-answer"
-            self.usage_metadata = {"input_tokens": 2, "output_tokens": 1}
-            self.response_metadata = {"provider": "openrouter", "model_name": "registered-model", "system_fingerprint": "fixture-v1", "route": "synthetic-source-adapter", "fallback_used": False, "id": f"response-{number}"}
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
-    class LLM:
-        def invoke(self, prompt):
-            return Response(prompt, len(calls))
+    def handler(request):
+        request_payload = json.loads(request.content)
+        prompt = request_payload["messages"][0]["content"]
+        payload = json.loads(prompt)
+        calls.append(payload)
+        source = payload["retained_source"]
+        answer = json.loads(source)["facts"]["answer"] if source else "no-source-answer"
+        return httpx.Response(
+            200,
+            json={
+                "id": f"response-{len(calls)}",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "registered-model",
+                "provider": "openrouter",
+                "route": "synthetic-source-adapter",
+                "fallback_used": False,
+                "system_fingerprint": "fixture-v1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": answer},
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            },
+        )
 
-    class Client:
-        def get_llm(self):
-            return LLM()
-
+    transport = httpx.MockTransport(handler)
     factory_calls = []
 
     def factory(**kwargs):
         factory_calls.append(kwargs)
-        return Client()
+        return create_llm_client(
+            **kwargs,
+            base_url="https://benchmark.test/v1",
+            http_client=httpx.Client(transport=transport),
+        )
 
     receipt = execute_registered_openrouter_benchmark(registration=registration, deterministic_result=deterministic, artifact_root=root, llm_factory=factory)
     assert factory_calls == [{"provider": "openrouter", "model": "registered-model"}] * 2
@@ -323,6 +347,42 @@ def test_openrouter_execution_uses_registered_identity_telemetry_and_safe_pair(t
     assert all(call["retained_source"] == "" for call in calls[1400:])
     model = next(row for row in receipt["lane_results"] if row["lane_id"] == "openrouter_source_bound")
     assert model["input_tokens"] == 2800 and model["output_tokens"] == 1400 and model["cost_usd"] == "0.0056"
+
+
+def test_openrouter_client_does_not_invent_missing_routing_telemetry(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "id": "response-1",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "registered-model",
+                "system_fingerprint": "fixture-v1",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "answer"},
+                    }
+                ],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            },
+        )
+
+    client = create_llm_client(
+        provider="openrouter",
+        model="registered-model",
+        base_url="https://benchmark.test/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    response = client.get_llm().invoke("source-free test")
+    assert response.response_metadata["model_name"] == "registered-model"
+    assert "provider" not in response.response_metadata
+    assert "route" not in response.response_metadata
+    assert "fallback_used" not in response.response_metadata
 
 
 def test_perfect_local_score_cannot_justify_any_model_calls(tmp_path):
