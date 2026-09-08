@@ -14,7 +14,6 @@ from tradingagents.evals.economic_tournament_statistics import (
     validate_economic_tournament_statistics,
 )
 
-
 MARKET_DATES = (
     "2026-01-09",
     "2026-01-16",

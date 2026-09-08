@@ -12,13 +12,13 @@ from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from urllib.parse import parse_qs, urlsplit
 
-from tradingagents.dataflows.pit.raw_artifacts import (
-    RawPointInTimeArtifact,
-    RawPointInTimeArtifactArchive,
-)
 from tradingagents.dataflows.pit.market_calendar import (
     MarketSessionCalendar,
     validate_market_session_calendar,
+)
+from tradingagents.dataflows.pit.raw_artifacts import (
+    RawPointInTimeArtifact,
+    RawPointInTimeArtifactArchive,
 )
 from tradingagents.dataflows.pit.records import PointInTimeDataError
 

@@ -21,7 +21,6 @@ from tradingagents.dataflows.pit import (
     validate_source_bound_execution_outcome,
 )
 
-
 MARKET_DATES = (
     "2026-01-09",
     "2026-01-12",
