@@ -9,6 +9,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+import cli.main as main
 from cli.main import app
 from tests.fixtures.economic_tournament import build_tournament_receipt
 from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
@@ -469,6 +470,54 @@ def test_economic_tournament_run_rejects_malformed_local_input_before_evidence_w
 
     assert result.exit_code == 2
     assert not evidence_root.exists()
+
+
+def test_holdout_tournament_is_denied_before_its_input_is_read(
+    tmp_path: Path, protocol_source, monkeypatch
+):
+    protocol, partitions = _partitioned_protocol(protocol_source)
+    protocol_path = tmp_path / "protocol.json"
+    partitions_path = tmp_path / "partitions.json"
+    tournament_path = tmp_path / "sealed-holdout-input.json"
+    protocol_path.write_text(json.dumps(protocol.to_dict()), encoding="utf-8")
+    partitions_path.write_text(json.dumps(partitions.to_dict()), encoding="utf-8")
+    tournament_path.write_text('{"must_not_be_read":true}', encoding="utf-8")
+    original_reader = main._economic_json_object
+    reads: list[Path] = []
+
+    def spy_reader(path: Path, **kwargs):
+        if path == tournament_path:
+            reads.append(path)
+            raise AssertionError("sealed holdout input was read")
+        return original_reader(path, **kwargs)
+
+    monkeypatch.setattr(main, "_economic_json_object", spy_reader)
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "economic-tournament-run",
+            "--protocol-path",
+            str(protocol_path),
+            "--partitions-path",
+            str(partitions_path),
+            "--tournament-input-path",
+            str(tournament_path),
+            "--pit-artifact-root",
+            str(tmp_path),
+            "--evidence-root",
+            str(tmp_path / "evidence"),
+            "--repo-root",
+            str(tmp_path),
+            "--effective-at",
+            NOW.isoformat(timespec="seconds"),
+            "--phase",
+            "holdout",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert reads == []
 
 
 def test_economic_tournament_run_rejects_malformed_candidate_availability_before_write(

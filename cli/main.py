@@ -3273,24 +3273,40 @@ def research_economic_tournament_run(
         "--effective-at",
         help="Canonical UTC timestamp for the immutable validation-only receipt.",
     ),
+    phase: str = typer.Option(
+        "validation",
+        "--phase",
+        help="Frozen lifecycle phase: development, validation, or holdout.",
+    ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Admit one sealed validation TA-Control result as analysis-only evidence."""
 
     protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
     partitions_payload = _economic_json_object(partitions_path, label="partitions-path")
-    tournament_payload = _economic_json_object(
-        tournament_input_path,
-        label="tournament-input-path",
-        max_bytes=32_000_000,
-        require_canonical=True,
-    )
     effective = _economic_effective_at(effective_at)
     try:
         protocol = validate_frozen_evaluation_protocol(protocol_payload)
+        if phase not in {"development", "validation", "holdout"}:
+            raise ValueError("phase must be development, validation, or holdout")
         eligibility = bind_validation_phase_eligibility(
             protocol=protocol,
             partitions=validate_market_date_partitions(partitions_payload),
+        )
+        adapter = EconomicEvaluationAdmissionAdapter(evidence_root, repo_root=repo_root)
+        if phase == "holdout" and not adapter.is_holdout_released(protocol.protocol_id):
+            raise EconomicEvaluationAdmissionError(
+                "holdout input is sealed until an immutable qualifying release exists"
+            )
+        if phase != "validation":
+            raise EconomicEvaluationAdmissionError(
+                "development and holdout evaluation wiring is not yet available"
+            )
+        tournament_payload = _economic_json_object(
+            tournament_input_path,
+            label="tournament-input-path",
+            max_bytes=32_000_000,
+            require_canonical=True,
         )
         tournament_input = validate_source_bound_tournament_input(
             tournament_payload,
@@ -3311,10 +3327,7 @@ def research_economic_tournament_run(
             tournament_input_id=tournament_input.input_id,
             tournament_input_sha256=tournament_input.input_sha256,
         )
-        admission = EconomicEvaluationAdmissionAdapter(
-            evidence_root,
-            repo_root=repo_root,
-        ).admit_evaluation_run(
+        admission = adapter.admit_evaluation_run(
             protocol.protocol_id,
             phase="validation",
             effective_at=effective,
