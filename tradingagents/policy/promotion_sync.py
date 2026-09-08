@@ -179,6 +179,9 @@ def build_current_readiness_packet(
     schedule_contract_path: str | Path,
     automation_root: str | Path,
     role_contract_path: str | Path,
+    expected_live_control_sha256: str,
+    expected_schedule_contract_sha256: str,
+    expected_role_contract_sha256: str,
     now: datetime.datetime,
 ) -> dict[str, object]:
     """Build an authority-free readiness packet from current verified files."""
@@ -186,6 +189,16 @@ def build_current_readiness_packet(
     if now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     generated_at = now.astimezone(UTC).isoformat(timespec="seconds")
+    expected_live_control_sha256 = _require_sha256(
+        expected_live_control_sha256, field="expected_live_control_sha256"
+    )
+    expected_schedule_contract_sha256 = _require_sha256(
+        expected_schedule_contract_sha256,
+        field="expected_schedule_contract_sha256",
+    )
+    expected_role_contract_sha256 = _require_sha256(
+        expected_role_contract_sha256, field="expected_role_contract_sha256"
+    )
     receipt_path = Path(supersession_receipt_path).resolve()
     state_path = Path(promotion_state_path).resolve()
     control_path = Path(live_control_path).resolve()
@@ -229,6 +242,30 @@ def build_current_readiness_packet(
         or prepared.get("reason") != "economic qualification pending"
     ):
         raise ValueError("prepared supersession receipt is invalid")
+    go_binding = artifacts.get("historical_go_packet")
+    tournament_binding = artifacts.get("expired_tournament_ledger")
+    if not isinstance(go_binding, Mapping) or not isinstance(
+        tournament_binding, Mapping
+    ):
+        raise ValueError("historical supersession artifact bindings are invalid")
+    go_path = Path(str(go_binding.get("path", ""))).resolve()
+    tournament_path = Path(str(tournament_binding.get("path", ""))).resolve()
+    go_bytes = go_path.read_bytes()
+    tournament_bytes = tournament_path.read_bytes()
+    if go_binding.get("sha256") != _sha256(go_bytes):
+        raise ValueError("historical GO packet digest mismatch")
+    if tournament_binding.get("sha256") != _sha256(tournament_bytes):
+        raise ValueError("expired tournament ledger digest mismatch")
+    if _read_json_object(go_bytes, field="historical GO packet").get("decision") != "GO":
+        raise ValueError("historical GO packet decision must be 'GO'")
+    from tradingagents.brokers.paper_tournament import (
+        fingerprint_expired_tournament_ledger,
+    )
+
+    if fingerprint_expired_tournament_ledger(
+        tournament_bytes, now=now
+    ) != prepared.get("expired_tournament_identity"):
+        raise ValueError("expired tournament identity mismatch")
 
     try:
         before_bytes = base64.b64decode(
@@ -292,6 +329,8 @@ def build_current_readiness_packet(
         raise ValueError("every current sleeve must remain paper-only and live-disabled")
 
     control_bytes = control_path.read_bytes()
+    if _sha256(control_bytes) != expected_live_control_sha256:
+        raise ValueError("live control digest does not match expected frozen control")
     control = _read_json_object(control_bytes, field="live control")
     if control.get("frozen") is not True:
         raise ValueError("live control is not frozen")
@@ -302,6 +341,13 @@ def build_current_readiness_packet(
         evaluate_schedule_contract,
         schedule_contract_snapshot_manifest,
     )
+
+    schedule_contract_file = Path(schedule_contract_path).resolve()
+    role_contract_file = Path(role_contract_path).resolve()
+    if _sha256(schedule_contract_file.read_bytes()) != expected_schedule_contract_sha256:
+        raise ValueError("schedule contract digest mismatch")
+    if _sha256(role_contract_file.read_bytes()) != expected_role_contract_sha256:
+        raise ValueError("role contract digest mismatch")
 
     snapshot = capture_schedule_contract_snapshot(
         contract_path=schedule_contract_path,
@@ -360,6 +406,14 @@ def build_current_readiness_packet(
             "path": str(control_path),
             "sha256": _sha256(control_bytes),
             "frozen": True,
+        },
+        "schedule_contract": {
+            "path": str(schedule_contract_file),
+            "sha256": expected_schedule_contract_sha256,
+        },
+        "role_contract": {
+            "path": str(role_contract_file),
+            "sha256": expected_role_contract_sha256,
         },
         "paused_automations": paused,
         "paused_automation_count": 10,

@@ -118,6 +118,15 @@ def _readiness_inputs(tmp_path):
         "schedule_contract_path": contract_path,
         "automation_root": automation_root,
         "role_contract_path": roles_path,
+        "expected_live_control_sha256": hashlib.sha256(
+            control_path.read_bytes()
+        ).hexdigest(),
+        "expected_schedule_contract_sha256": hashlib.sha256(
+            contract_path.read_bytes()
+        ).hexdigest(),
+        "expected_role_contract_sha256": hashlib.sha256(
+            roles_path.read_bytes()
+        ).hexdigest(),
         "now": SYNC_NOW,
     }
 
@@ -151,7 +160,40 @@ def test_current_readiness_packet_derives_non_authority_from_verified_files(tmp_
 def test_current_readiness_packet_rejects_unfrozen_or_active_evidence(tmp_path):
     kwargs = _readiness_inputs(tmp_path)
     _write_json_bytes(Path(kwargs["live_control_path"]), {"frozen": False})
+    kwargs["expected_live_control_sha256"] = hashlib.sha256(
+        Path(kwargs["live_control_path"]).read_bytes()
+    ).hexdigest()
     with pytest.raises(ValueError, match="not frozen"):
+        build_current_readiness_packet(**kwargs)
+
+
+def test_current_readiness_packet_rejects_wrong_frozen_control_identity(tmp_path):
+    kwargs = _readiness_inputs(tmp_path)
+    _write_json_bytes(
+        Path(kwargs["live_control_path"]),
+        {"frozen": True, "reason": "unrelated caller-created control"},
+    )
+
+    with pytest.raises(ValueError, match="does not match expected frozen control"):
+        build_current_readiness_packet(**kwargs)
+
+
+@pytest.mark.parametrize("operation", ["tournament-mutate", "go-delete"])
+def test_current_readiness_packet_reopens_historical_artifacts(tmp_path, operation):
+    kwargs = _readiness_inputs(tmp_path)
+    completed = json.loads(Path(kwargs["supersession_receipt_path"]).read_bytes())
+    go_path = Path(completed["artifacts"]["historical_go_packet"]["path"])
+    tournament_path = Path(
+        completed["artifacts"]["expired_tournament_ledger"]["path"]
+    )
+    if operation == "tournament-mutate":
+        tournament_path.write_text('{"tournament_id":"changed","ends_at":"2020-01-01T00:00:00+00:00"}')
+        expected = "digest mismatch"
+    else:
+        go_path.unlink()
+        expected = "No such file"
+
+    with pytest.raises((ValueError, OSError), match=expected):
         build_current_readiness_packet(**kwargs)
 
     kwargs = _readiness_inputs(tmp_path / "active")
@@ -197,6 +239,12 @@ def test_policy_readiness_status_cli_is_read_only_and_json(tmp_path):
             str(kwargs["automation_root"]),
             "--role-contract-path",
             str(kwargs["role_contract_path"]),
+            "--expected-live-control-sha256",
+            kwargs["expected_live_control_sha256"],
+            "--expected-schedule-contract-sha256",
+            kwargs["expected_schedule_contract_sha256"],
+            "--expected-role-contract-sha256",
+            kwargs["expected_role_contract_sha256"],
             "--generated-at",
             SYNC_NOW.isoformat(),
             "--json-output",

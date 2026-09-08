@@ -5441,6 +5441,15 @@ def policy_readiness_status(
     role_contract_path: Path = typer.Option(
         ..., "--role-contract-path", exists=True, readable=True
     ),
+    expected_live_control_sha256: str = typer.Option(
+        ..., "--expected-live-control-sha256"
+    ),
+    expected_schedule_contract_sha256: str = typer.Option(
+        ..., "--expected-schedule-contract-sha256"
+    ),
+    expected_role_contract_sha256: str = typer.Option(
+        ..., "--expected-role-contract-sha256"
+    ),
     generated_at: str | None = typer.Option(None, "--generated-at"),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
@@ -5461,6 +5470,9 @@ def policy_readiness_status(
             schedule_contract_path=schedule_contract_path,
             automation_root=automation_root,
             role_contract_path=role_contract_path,
+            expected_live_control_sha256=expected_live_control_sha256,
+            expected_schedule_contract_sha256=expected_schedule_contract_sha256,
+            expected_role_contract_sha256=expected_role_contract_sha256,
             now=moment,
         )
     except (OSError, UnicodeError, ValueError) as exc:
