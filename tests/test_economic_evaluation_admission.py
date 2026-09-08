@@ -29,6 +29,7 @@ from tradingagents.evals.economic_evaluation_admission import (
     EconomicEvaluationAdmissionError,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    bind_phase_eligibility,
     bind_validation_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
@@ -38,6 +39,7 @@ from tradingagents.evals.economic_evaluation_protocol import (
 from tradingagents.evals.economic_evaluation_result import (
     EconomicEvaluationResultError,
     LegacyEconomicValidationResult,
+    build_phase_evaluation_result,
     build_validation_evaluation_result,
     validate_economic_validation_result,
 )
@@ -1045,6 +1047,77 @@ def test_readiness_status_and_validation_report_are_read_only_and_protocol_bound
     released = adapter.readiness_status(protocol.protocol_id)
     assert released.state == "holdout_released_analysis_only"
     assert released.holdout_release_object_id == release.envelope.object_id
+
+
+def test_development_admission_reopens_its_exact_phase_bound_receipt(tmp_path):
+    adapter = _adapter(tmp_path)
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    adapter.admit_protocol(
+        protocol,
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    eligibility = bind_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+        phase="development",
+    )
+    tournament_input, archive = build_tournament_receipt(
+        tmp_path / "development-tournament-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+    event_count = str(len(eligibility.event_ids))
+    result = build_phase_evaluation_result(
+        protocol,
+        eligibility=eligibility,
+        arm_metrics={
+            arm_id: {
+                "net_return_after_costs": "0",
+                "benchmark_excess_after_costs": "0",
+                "max_drawdown": "0",
+                "turnover": "0",
+                "false_positive_rate": "0",
+                "decision_event_count": event_count,
+                "packet_event_cluster_count": event_count,
+                "market_event_cluster_count": event_count,
+                "cost_per_useful_decision": "0",
+            }
+            for arm_id in ("cash", "spy", "equal_weight", "momentum_quality", "pullback_support")
+        },
+    )
+    report = {
+        "schema_version": admission_module.ECONOMIC_PHASE_REPORT_SCHEMA,
+        "protocol_id": protocol.protocol_id,
+        "phase": "development",
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(eligibility.event_ids),
+        "result": result.to_dict(),
+        "result_id": result.result_id,
+        "result_sha256": result.result_sha256,
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+
+    run = adapter.admit_evaluation_run(
+        protocol.protocol_id,
+        phase="development",
+        effective_at=NOW,
+        frozen_validation_report=report,
+        pit_artifact_root=archive.root,
+        tournament_input=tournament_input,
+    )
+
+    readiness = adapter.readiness_status(protocol.protocol_id)
+    assert run.phase == "development"
+    assert readiness.development_run_object_id == run.envelope.object_id
+    assert readiness.validation_run_object_id is None
 
 
 @pytest.mark.parametrize(
