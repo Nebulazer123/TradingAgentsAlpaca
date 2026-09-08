@@ -261,6 +261,34 @@ def _tournament_expired(ends_at: object, *, now: datetime.datetime) -> bool:
     return now_timestamp is None or now_timestamp >= ends_at_timestamp
 
 
+def fingerprint_expired_tournament_ledger(
+    ledger_bytes: bytes,
+    *,
+    now: datetime.datetime,
+) -> dict[str, str]:
+    """Validate and fingerprint an expired ledger without mutating its root."""
+
+    if type(ledger_bytes) is not bytes or not ledger_bytes:
+        raise ValueError("expired tournament ledger bytes are required")
+    try:
+        ledger = json.loads(ledger_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("expired tournament ledger must be valid UTF-8 JSON") from exc
+    if not isinstance(ledger, Mapping):
+        raise ValueError("expired tournament ledger must be a JSON object")
+    tournament_id = ledger.get("tournament_id")
+    ends_at = ledger.get("ends_at")
+    if not isinstance(tournament_id, str) or not tournament_id.strip():
+        raise ValueError("expired tournament ledger tournament_id is invalid")
+    if _parse_timestamp(ends_at) is None or not _tournament_expired(ends_at, now=now):
+        raise ValueError("paper tournament ledger is not verifiably expired")
+    return {
+        "tournament_id": tournament_id,
+        "ends_at": str(ends_at),
+        "ledger_sha256": hashlib.sha256(ledger_bytes).hexdigest(),
+    }
+
+
 def _now() -> datetime.datetime:
     return datetime.datetime.now(tz=UTC)
 

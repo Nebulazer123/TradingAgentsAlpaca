@@ -23,6 +23,7 @@ limit-only checks) at submit time.
 
 from __future__ import annotations
 
+import base64
 import datetime
 import fcntl
 import hashlib
@@ -37,7 +38,10 @@ from typing import Any
 
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.promotion import (
+    SleevePromotionDecision,
     SleevePromotionEvidence,
+    _write_promotion_state_unlocked,
+    build_promotion_state,
     evaluate_sleeve_promotion,
 )
 from tradingagents.policy.strategy_promotion import INTERNAL_EVIDENCE_MAX_AGE_SECONDS
@@ -157,6 +161,297 @@ class PromotionSyncResult:
     unchanged: list[str]
     issues_by_sleeve: dict[str, list[str]] = field(default_factory=dict)
     summary: str = ""
+
+
+@dataclass(frozen=True)
+class LegacyReadinessSupersessionResult:
+    state: dict
+    prepared_receipt_path: Path
+    completed_receipt_path: Path
+    resumed: bool
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _require_sha256(value: str, *, field: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _write_immutable_json(path: Path, payload: Mapping[str, object]) -> None:
+    """Create a durable receipt without ever replacing an existing receipt."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    directory_descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+
+def _read_json_object(payload: bytes, *, field: str) -> dict:
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{field} must be valid UTF-8 JSON") from exc
+    if type(value) is not dict:
+        raise ValueError(f"{field} must be a JSON object")
+    return value
+
+
+def _paper_only_decisions(
+    state: Mapping[str, object], *, now_iso: str, reason: str
+) -> list[SleevePromotionDecision]:
+    decisions: list[SleevePromotionDecision] = []
+    sleeves = state["sleeves"]
+    assert isinstance(sleeves, dict)  # established by the strict validator
+    for sleeve_id, before_record in sleeves.items():
+        record = dict(before_record)
+        issues = list(record.get("issues") or [])
+        if reason not in issues:
+            issues.append(reason)
+        record.update(
+            {
+                "stage": "paper_only",
+                "live_enabled": False,
+                "demoted_at": now_iso,
+                "demotion_reason": reason,
+                "issues": issues,
+            }
+        )
+        decisions.append(
+            SleevePromotionDecision(
+                sleeve=sleeve_id,
+                stage="paper_only",
+                live_enabled=False,
+                passed=False,
+                gates={},
+                issues=issues,
+                state=record,
+            )
+        )
+    return decisions
+
+
+def supersede_legacy_readiness(
+    *,
+    go_packet_path: str | Path,
+    promotion_state_path: str | Path,
+    expired_tournament_ledger_path: str | Path,
+    receipt_path: str | Path,
+    expected_go_packet_sha256: str,
+    expected_promotion_state_sha256: str,
+    expected_expired_tournament_sha256: str,
+    now: datetime.datetime,
+    reason: str = "economic qualification pending",
+) -> LegacyReadinessSupersessionResult:
+    """Retire legacy readiness evidence without turning it into authority.
+
+    A prepared receipt makes an interrupted state replacement recoverable.  A
+    completed receipt is created only after the trusted promotion writer's
+    exact output is visible.  Historical inputs are read and reverified, never
+    rewritten or deleted.
+    """
+
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    if reason != "economic qualification pending":
+        raise ValueError("unverified economic verdicts cannot supersede readiness")
+    expected_go_packet_sha256 = _require_sha256(
+        expected_go_packet_sha256, field="expected_go_packet_sha256"
+    )
+    expected_promotion_state_sha256 = _require_sha256(
+        expected_promotion_state_sha256, field="expected_promotion_state_sha256"
+    )
+    expected_expired_tournament_sha256 = _require_sha256(
+        expected_expired_tournament_sha256,
+        field="expected_expired_tournament_sha256",
+    )
+    go_path = Path(go_packet_path).resolve()
+    state_path = Path(promotion_state_path).resolve()
+    tournament_path = Path(expired_tournament_ledger_path).resolve()
+    completed_path = Path(receipt_path).resolve()
+    prepared_path = completed_path.with_name(completed_path.name + ".prepared")
+    all_paths = {go_path, state_path, tournament_path, completed_path, prepared_path}
+    if len(all_paths) != 5:
+        raise ValueError("supersession inputs and receipts must use distinct paths")
+
+    now_iso = now.isoformat(timespec="seconds")
+    expected_artifacts = {
+        "historical_go_packet": {
+            "path": str(go_path),
+            "sha256": expected_go_packet_sha256,
+        },
+        "promotion_state_before": {
+            "path": str(state_path),
+            "sha256": expected_promotion_state_sha256,
+        },
+        "expired_tournament_ledger": {
+            "path": str(tournament_path),
+            "sha256": expected_expired_tournament_sha256,
+        },
+    }
+
+    with promotion_state_lock(state_path):
+        go_bytes = go_path.read_bytes()
+        tournament_bytes = tournament_path.read_bytes()
+        if _sha256(go_bytes) != expected_go_packet_sha256:
+            raise ValueError("historical GO packet digest mismatch")
+        if _sha256(tournament_bytes) != expected_expired_tournament_sha256:
+            raise ValueError("expired tournament ledger digest mismatch")
+        _read_json_object(go_bytes, field="historical GO packet")
+        from tradingagents.brokers.paper_tournament import (
+            fingerprint_expired_tournament_ledger,
+        )
+
+        tournament_identity = fingerprint_expired_tournament_ledger(
+            tournament_bytes, now=now
+        )
+        current_bytes = state_path.read_bytes()
+
+        prepared: dict | None = None
+        if prepared_path.exists():
+            prepared = _read_json_object(
+                prepared_path.read_bytes(), field="prepared supersession receipt"
+            )
+            if (
+                prepared.get("schema_version") != "1.0.0"
+                or prepared.get("status") != "prepared"
+                or prepared.get("artifacts") != expected_artifacts
+                or prepared.get("reason") != reason
+            ):
+                raise ValueError("prepared supersession receipt is foreign or stale")
+            operation_iso = prepared.get("prepared_at")
+            if type(operation_iso) is not str:
+                raise ValueError("prepared supersession receipt timestamp is invalid")
+            operation_now = datetime.datetime.fromisoformat(operation_iso)
+            if operation_now.tzinfo is None or operation_now.utcoffset() is None:
+                raise ValueError("prepared supersession receipt timestamp is invalid")
+            after_state = prepared.get("promotion_state_after")
+            if type(after_state) is not dict:
+                raise ValueError("prepared supersession receipt has no exact after-state")
+            try:
+                after_bytes = base64.b64decode(
+                    str(prepared.get("promotion_state_after_base64", "")),
+                    validate=True,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "prepared supersession after-state bytes are invalid"
+                ) from exc
+            if _read_json_object(after_bytes, field="promotion state after-image") != after_state:
+                raise ValueError("prepared supersession after-state bytes mismatch")
+            if prepared.get("promotion_state_after_sha256") != _sha256(after_bytes):
+                raise ValueError("prepared supersession after-state digest mismatch")
+            before_bytes = base64.b64decode(
+                str(prepared.get("promotion_state_before_base64", "")),
+                validate=True,
+            )
+            if _sha256(before_bytes) != expected_promotion_state_sha256:
+                raise ValueError("prepared supersession before-image mismatch")
+            decisions = _paper_only_decisions(
+                _validate_existing_promotion_state(
+                    _read_json_object(before_bytes, field="promotion state before-image")
+                ),
+                now_iso=operation_iso,
+                reason=reason,
+            )
+            if current_bytes not in {before_bytes, after_bytes}:
+                raise ValueError("promotion state changed outside prepared supersession")
+        else:
+            operation_iso = now_iso
+            operation_now = now
+            if _sha256(current_bytes) != expected_promotion_state_sha256:
+                raise ValueError("promotion state before-image digest mismatch")
+            before_bytes = current_bytes
+            before_state = _validate_existing_promotion_state(
+                _read_json_object(before_bytes, field="promotion state")
+            )
+            decisions = _paper_only_decisions(
+                before_state, now_iso=operation_iso, reason=reason
+            )
+            after_state = build_promotion_state(decisions, generated_at=operation_iso)
+            after_bytes = json.dumps(after_state, indent=2).encode("utf-8")
+            prepared = {
+                "schema_version": "1.0.0",
+                "status": "prepared",
+                "prepared_at": operation_iso,
+                "reason": reason,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_promote": False,
+                "can_submit_orders": False,
+                "artifacts": expected_artifacts,
+                "expired_tournament_identity": tournament_identity,
+                "promotion_state_before_base64": base64.b64encode(before_bytes).decode(
+                    "ascii"
+                ),
+                "promotion_state_after": after_state,
+                "promotion_state_after_base64": base64.b64encode(after_bytes).decode(
+                    "ascii"
+                ),
+                "promotion_state_after_sha256": _sha256(after_bytes),
+            }
+            _write_immutable_json(prepared_path, prepared)
+
+        if current_bytes == before_bytes:
+            # The lock is already held, so use the trusted writer's explicitly
+            # unlocked seam rather than creating an independent state writer.
+            _write_promotion_state_unlocked(state_path, decisions, now=operation_now)
+        written_bytes = state_path.read_bytes()
+        if written_bytes != after_bytes:
+            raise ValueError("trusted promotion replacement did not match prepared state")
+        if _sha256(go_path.read_bytes()) != expected_go_packet_sha256:
+            raise ValueError("historical GO packet changed during supersession")
+        if _sha256(tournament_path.read_bytes()) != expected_expired_tournament_sha256:
+            raise ValueError("expired tournament ledger changed during supersession")
+
+        prepared_sha256 = _sha256(prepared_path.read_bytes())
+        completed = {
+            "schema_version": "1.0.0",
+            "status": "completed",
+            "completed_at": operation_iso,
+            "reason": reason,
+            "analysis_only": True,
+            "execution_authority": "none",
+            "can_promote": False,
+            "can_submit_orders": False,
+            "artifacts": expected_artifacts,
+            "prepared_receipt": {
+                "path": str(prepared_path),
+                "sha256": prepared_sha256,
+            },
+            "promotion_state_after_sha256": _sha256(after_bytes),
+        }
+        if completed_path.exists():
+            if _read_json_object(
+                completed_path.read_bytes(), field="completed supersession receipt"
+            ) != completed:
+                raise ValueError("completed supersession receipt is foreign or stale")
+        else:
+            _write_immutable_json(completed_path, completed)
+        return LegacyReadinessSupersessionResult(
+            state=after_state,
+            prepared_receipt_path=prepared_path,
+            completed_receipt_path=completed_path,
+            resumed=current_bytes == after_bytes,
+        )
 
 
 def promotion_state_lock_path(state_path: str | Path) -> Path:

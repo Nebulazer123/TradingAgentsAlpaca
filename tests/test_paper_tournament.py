@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 from decimal import Decimal
 from pathlib import Path
@@ -22,6 +23,7 @@ from tradingagents.brokers.paper_tournament import (
     build_popular_strategy_scorecards,
     build_tournament_report,
     compact_tournament_ledger_payload,
+    fingerprint_expired_tournament_ledger,
     initialize_tournament,
     load_live_strategy_selection,
     maybe_write_live_strategy_selection,
@@ -2606,6 +2608,34 @@ def test_tournament_timestamp_parsing_and_expiry_boundaries_fail_closed():
     assert _tournament_expired("2026-06-05T15:10:00-05:00", now=equality)
     assert _parse_timestamp("2026-06-05T20:10:00") == equality
     assert _parse_timestamp("9999-12-31T23:59:59-23:59") is None
+
+
+def test_expired_tournament_fingerprint_is_read_only_and_fail_closed():
+    now = datetime.datetime(2026, 6, 5, 20, 10, tzinfo=datetime.timezone.utc)
+    ledger_bytes = json.dumps(
+        {
+            "tournament_id": "retired-paper-root",
+            "ends_at": "2026-06-05T20:10:00+00:00",
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    identity = fingerprint_expired_tournament_ledger(ledger_bytes, now=now)
+
+    assert identity["tournament_id"] == "retired-paper-root"
+    assert identity["ledger_sha256"] == hashlib.sha256(ledger_bytes).hexdigest()
+    with pytest.raises(ValueError, match="not verifiably expired"):
+        fingerprint_expired_tournament_ledger(
+            json.dumps(
+                {
+                    "tournament_id": "current-root",
+                    "ends_at": "2026-06-05T20:10:01+00:00",
+                }
+            ).encode("utf-8"),
+            now=now,
+        )
+    with pytest.raises(ValueError, match="valid UTF-8 JSON"):
+        fingerprint_expired_tournament_ledger(b"not-json", now=now)
 
 
 def _write_bound_active_selection(tournament_dir, *, strategy_id="pullback-support"):

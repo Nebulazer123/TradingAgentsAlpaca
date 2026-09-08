@@ -12,12 +12,137 @@ from tradingagents.brokers.alpaca_supervisor import (
 )
 from tradingagents.policy.io import atomic_write_text
 from tradingagents.policy.promotion_sync import (
+    supersede_legacy_readiness,
     sync_promotion_state_file,
     sync_promotion_state_from_tournament,
 )
 from tradingagents.policy.strategy_promotion import INTERNAL_EVIDENCE_MAX_AGE_SECONDS
 
 SYNC_NOW = datetime.datetime(2026, 6, 22, 12, 0, 0, tzinfo=datetime.timezone.utc)
+
+
+def _write_json_bytes(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(payload, sort_keys=True).encode("utf-8")
+    path.write_bytes(data)
+    return data
+
+
+def _legacy_supersession_inputs(tmp_path):
+    go_path = tmp_path / "historical-go.json"
+    state_path = tmp_path / "promotion-state.json"
+    tournament_path = tmp_path / "expired-tournament.json"
+    receipt_path = tmp_path / "supersession.json"
+    go_bytes = _write_json_bytes(go_path, {"status": "GO", "historical": True})
+    state = _incumbent_state()
+    state["sleeves"]["paper-sleeve"] = {
+        **state["sleeves"]["current-aggressive"],
+        "stage": "paper_only",
+        "live_enabled": False,
+    }
+    state_bytes = _write_json_bytes(state_path, state)
+    tournament_bytes = _write_json_bytes(
+        tournament_path,
+        {
+            "tournament_id": "retired-paper-root",
+            "ends_at": "2026-06-01T00:00:00+00:00",
+        },
+    )
+    kwargs = {
+        "go_packet_path": go_path,
+        "promotion_state_path": state_path,
+        "expired_tournament_ledger_path": tournament_path,
+        "receipt_path": receipt_path,
+        "expected_go_packet_sha256": hashlib.sha256(go_bytes).hexdigest(),
+        "expected_promotion_state_sha256": hashlib.sha256(state_bytes).hexdigest(),
+        "expected_expired_tournament_sha256": hashlib.sha256(
+            tournament_bytes
+        ).hexdigest(),
+        "now": SYNC_NOW,
+    }
+    return kwargs, go_bytes, state_bytes, tournament_bytes
+
+
+def test_legacy_readiness_supersession_is_immutable_paper_only_and_retryable(tmp_path):
+    kwargs, go_before, state_before, tournament_before = (
+        _legacy_supersession_inputs(tmp_path)
+    )
+
+    result = supersede_legacy_readiness(**kwargs)
+
+    assert result.resumed is False
+    assert result.prepared_receipt_path.exists()
+    assert result.completed_receipt_path.exists()
+    assert Path(kwargs["go_packet_path"]).read_bytes() == go_before
+    assert Path(kwargs["expired_tournament_ledger_path"]).read_bytes() == tournament_before
+    assert Path(kwargs["promotion_state_path"]).read_bytes() != state_before
+    assert all(
+        record["stage"] == "paper_only" and record["live_enabled"] is False
+        for record in result.state["sleeves"].values()
+    )
+    prepared_before = result.prepared_receipt_path.read_bytes()
+    completed_before = result.completed_receipt_path.read_bytes()
+    completed = json.loads(completed_before)
+    assert completed["execution_authority"] == "none"
+    assert completed["can_promote"] is False
+    assert completed["can_submit_orders"] is False
+
+    retry_kwargs = dict(kwargs)
+    retry_kwargs["now"] = SYNC_NOW + datetime.timedelta(days=1)
+    retry = supersede_legacy_readiness(**retry_kwargs)
+    assert retry.resumed is True
+    assert retry.prepared_receipt_path.read_bytes() == prepared_before
+    assert retry.completed_receipt_path.read_bytes() == completed_before
+
+
+def test_legacy_readiness_supersession_keeps_prepare_after_interrupted_write(
+    monkeypatch, tmp_path
+):
+    kwargs, _, state_before, _ = _legacy_supersession_inputs(tmp_path)
+
+    def fail_write(*args, **call_kwargs):
+        raise OSError("synthetic interruption")
+
+    with monkeypatch.context() as interruption:
+        interruption.setattr(
+            "tradingagents.policy.promotion_sync._write_promotion_state_unlocked",
+            fail_write,
+        )
+        with pytest.raises(OSError, match="synthetic interruption"):
+            supersede_legacy_readiness(**kwargs)
+
+    receipt_path = Path(kwargs["receipt_path"])
+    assert receipt_path.with_name(receipt_path.name + ".prepared").exists()
+    assert not receipt_path.exists()
+    assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
+
+    recovered = supersede_legacy_readiness(**kwargs)
+    assert recovered.resumed is False
+    assert receipt_path.exists()
+    assert all(
+        record["live_enabled"] is False
+        for record in recovered.state["sleeves"].values()
+    )
+
+
+def test_legacy_readiness_supersession_rejects_stale_or_unexpired_inputs(tmp_path):
+    kwargs, _, state_before, _ = _legacy_supersession_inputs(tmp_path)
+    kwargs["expected_promotion_state_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="before-image digest mismatch"):
+        supersede_legacy_readiness(**kwargs)
+    assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
+    assert not Path(kwargs["receipt_path"]).exists()
+
+    kwargs, _, state_before, _ = _legacy_supersession_inputs(tmp_path / "fresh")
+    tournament_path = Path(kwargs["expired_tournament_ledger_path"])
+    fresh_bytes = _write_json_bytes(
+        tournament_path,
+        {"tournament_id": "current-root", "ends_at": "2026-07-01T00:00:00+00:00"},
+    )
+    kwargs["expected_expired_tournament_sha256"] = hashlib.sha256(fresh_bytes).hexdigest()
+    with pytest.raises(ValueError, match="not verifiably expired"):
+        supersede_legacy_readiness(**kwargs)
+    assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
 
 
 def _iso(moment):
