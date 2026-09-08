@@ -12,7 +12,24 @@ import pytest
 from typer.testing import CliRunner
 
 from cli.main import app
-from tradingagents.research.qualification_benchmark import LANE_ORDER, ResearchQualificationBenchmarkError, _adapter_input, build_research_qualification_registration, run_registered_research_benchmark
+from tradingagents.research.qualification_benchmark import LANE_ORDER, OPENROUTER_PROMPT_SHA256, ResearchQualificationBenchmarkError, _adapter_input, build_research_qualification_registration, execute_registered_openrouter_benchmark, run_registered_research_benchmark
+
+
+def _specs():
+    specs = {}
+    for base in LANE_ORDER:
+        for lane_id in (base,) if base == "deterministic_sec_xbrl" else (base, f"{base}_no_text"):
+            model_lane = base in {"openrouter_source_bound", "tradingagents_full_graph", "different_model_reviewer"}
+            specs[lane_id] = {
+                "provider": "openrouter" if model_lane else "none",
+                "model": ("reviewer-model" if base == "different_model_reviewer" else "registered-model") if model_lane else "none",
+                "revision": "fixture-v1",
+                "route": "synthetic-source-adapter",
+                "prompt_sha256": OPENROUTER_PROMPT_SHA256 if base == "openrouter_source_bound" else hashlib.sha256(lane_id.encode()).hexdigest(),
+                "input_price_per_million_usd": "1" if model_lane else "0",
+                "output_price_per_million_usd": "2" if model_lane else "0",
+            }
+    return specs
 
 
 def _fixture(tmp_path: Path, *, wrong_expected: int = 0):
@@ -54,7 +71,7 @@ def _fixture(tmp_path: Path, *, wrong_expected: int = 0):
                 "expected_answer_sha256": hashlib.sha256(expected.encode()).hexdigest(),
             }
         )
-    registration = build_research_qualification_registration(cases, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+    registration = build_research_qualification_registration(cases, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs())
     return root, cases, registration
 
 
@@ -78,6 +95,7 @@ def _lane(lane_id, cases, root, *, cost="0", model="registered-model", wrong=0):
         outputs.append(_output(case, answer, lane_id, root))
     provider = "openrouter" if model_lane else "none"
     selected_model = model if model_lane else "none"
+    input_tokens = int(Decimal(cost) * Decimal(1_000_000)) if model_lane else 0
     return {
         "lane_id": lane_id,
         "requested_provider": provider,
@@ -87,9 +105,9 @@ def _lane(lane_id, cases, root, *, cost="0", model="registered-model", wrong=0):
         "actual_model": selected_model,
         "actual_revision": "fixture-v1",
         "route": "synthetic-source-adapter",
-        "prompt_sha256": hashlib.sha256(lane_id.encode()).hexdigest(),
+        "prompt_sha256": _specs()[lane_id]["prompt_sha256"],
         "fallback_used": False,
-        "input_tokens": 0,
+        "input_tokens": input_tokens,
         "output_tokens": 0,
         "latency_ms": 1,
         "cost_usd": cost,
@@ -159,13 +177,13 @@ def test_registration_rejects_duplicate_source_pages_and_case_units(tmp_path):
         case["artifact_id"] = f"retained-artifact-alias-{case['case_id']}"
         case["adapter_query"] = json.dumps({"fts_query": f"fake{case['case_id']}", "json_path": ["facts", "answer"]}, sort_keys=True, separators=(",", ":"))
     with pytest.raises(ResearchQualificationBenchmarkError, match="distinct retained source pages"):
-        build_research_qualification_registration(inflated, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+        build_research_qualification_registration(inflated, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs())
     duplicate = json.loads(json.dumps(cases))
     duplicate[1]["byte_start"], duplicate[1]["byte_end"], duplicate[1]["adapter_query"] = duplicate[0]["byte_start"], duplicate[0]["byte_end"], duplicate[0]["adapter_query"]
     duplicate[1]["artifact_id"] = "retained-artifact-alias-whitespace"
     duplicate[1]["adapter_query"] = "   " + duplicate[1]["adapter_query"]
     with pytest.raises(ResearchQualificationBenchmarkError, match="duplicate case content/query"):
-        build_research_qualification_registration(duplicate, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+        build_research_qualification_registration(duplicate, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs())
 
 
 def test_reviewer_gain_uses_paired_full_cohort_denominator(tmp_path):
@@ -203,19 +221,23 @@ def test_cost_budget_distinct_reviewer_and_injection_media_policies(tmp_path):
     receipt = run_registered_research_benchmark(registration=registration, lane_results=[deterministic, model, twin], artifact_root=root, lane_adapters=adapters)
     assert receipt["selected_lane"] == "deterministic_sec_xbrl"
     model["cost_usd"] = "1"
+    model["input_tokens"] = 1_000_000
     receipt = run_registered_research_benchmark(registration=registration, lane_results=[deterministic, model, twin], artifact_root=root, lane_adapters=adapters)
     assert receipt["selected_lane"] == "openrouter_source_bound"
     reviewer = _lane("different_model_reviewer", cases, root, model="registered-model")
     reviewer_twin = _lane("different_model_reviewer_no_text", cases, root, model="reviewer-model")
     adapters.update({reviewer["lane_id"]: _adapter(reviewer["case_outputs"]), reviewer_twin["lane_id"]: _adapter(reviewer_twin["case_outputs"])})
+    same_specs = _specs()
+    same_specs["different_model_reviewer"]["model"] = "registered-model"
+    same_registration = build_research_qualification_registration(cases, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=same_specs)
     with pytest.raises(ResearchQualificationBenchmarkError, match="distinct model"):
-        run_registered_research_benchmark(registration=registration, lane_results=[deterministic, model, twin, reviewer, reviewer_twin], artifact_root=root, lane_adapters=adapters)
+        run_registered_research_benchmark(registration=same_registration, lane_results=[deterministic, model, twin, reviewer, reviewer_twin], artifact_root=root, lane_adapters=adapters)
     uncovered = json.loads(json.dumps(cases))
     for case in uncovered:
         if case["case_kind"] == "injection_case":
             case["medium"] = "text"
     with pytest.raises(ResearchQualificationBenchmarkError, match="injection cases"):
-        build_research_qualification_registration(uncovered, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+        build_research_qualification_registration(uncovered, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs())
 
 
 def test_retained_bytes_tamper_and_symlink_are_rejected(tmp_path):
@@ -240,7 +262,7 @@ def test_bm25_miss_records_losing_lane_and_retains_baseline(tmp_path):
     query = json.loads(missed[0]["adapter_query"])
     query["fts_query"] = "absenttoken"
     missed[0]["adapter_query"] = json.dumps(query, sort_keys=True, separators=(",", ":"))
-    registration = build_research_qualification_registration(missed, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER})
+    registration = build_research_qualification_registration(missed, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs())
     deterministic = _lane("deterministic_sec_xbrl", missed, root)
     metadata = _lane("metadata_fts5_bm25", missed, root)
     metadata["case_outputs"][0]["answer"] = None
@@ -250,6 +272,53 @@ def test_bm25_miss_records_losing_lane_and_retains_baseline(tmp_path):
     metadata_result = next(row for row in receipt["lane_results"] if row["lane_id"] == "metadata_fts5_bm25")
     assert metadata_result["qualified"] is False
     assert metadata_result["case_outputs"][0]["answer_sha256"] is None
+
+
+def test_openrouter_execution_uses_registered_identity_telemetry_and_safe_pair(tmp_path):
+    root, cases, registration = _fixture(tmp_path)
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    calls = []
+
+    class Response:
+        def __init__(self, prompt, number):
+            payload = json.loads(prompt)
+            calls.append(payload)
+            source = payload["retained_source"]
+            self.content = json.loads(source)["facts"]["answer"] if source else "no-source-answer"
+            self.usage_metadata = {"input_tokens": 2, "output_tokens": 1}
+            self.response_metadata = {"provider": "openrouter", "model_name": "registered-model", "system_fingerprint": "fixture-v1", "route": "synthetic-source-adapter", "fallback_used": False, "id": f"response-{number}"}
+
+    class LLM:
+        def invoke(self, prompt):
+            return Response(prompt, len(calls))
+
+    class Client:
+        def get_llm(self):
+            return LLM()
+
+    factory_calls = []
+
+    def factory(**kwargs):
+        factory_calls.append(kwargs)
+        return Client()
+
+    receipt = execute_registered_openrouter_benchmark(registration=registration, deterministic_result=deterministic, artifact_root=root, llm_factory=factory)
+    assert factory_calls == [{"provider": "openrouter", "model": "registered-model"}] * 2
+    assert len(calls) == 2800
+    assert all("expected_answer" not in call["case"] and "severity" not in call["case"] for call in calls)
+    assert all(call["retained_source"] for call in calls[:1400])
+    assert all(call["retained_source"] == "" for call in calls[1400:])
+    model = next(row for row in receipt["lane_results"] if row["lane_id"] == "openrouter_source_bound")
+    assert model["input_tokens"] == 2800 and model["output_tokens"] == 1400 and model["cost_usd"] == "0.0056"
+
+
+def test_openrouter_factory_is_not_constructed_before_deterministic_admission(tmp_path):
+    root, cases, registration = _fixture(tmp_path, wrong_expected=8)
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    factory_calls = []
+    with pytest.raises(ResearchQualificationBenchmarkError, match="prerequisites"):
+        execute_registered_openrouter_benchmark(registration=registration, deterministic_result=deterministic, artifact_root=root, llm_factory=lambda **kwargs: factory_calls.append(kwargs))
+    assert factory_calls == []
 
 
 def test_cli_writes_owner_only_verified_receipt(tmp_path):

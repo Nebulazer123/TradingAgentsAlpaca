@@ -368,6 +368,7 @@ from tradingagents.research.provider_orchestrator import (
 )
 from tradingagents.research.qualification_benchmark import (
     ResearchQualificationBenchmarkError,
+    execute_registered_openrouter_benchmark,
     run_registered_research_benchmark,
     write_research_qualification_receipt,
 )
@@ -1474,16 +1475,32 @@ def research_stack_benchmark(
         "--output-path",
     ),
     json_output: bool = typer.Option(False, "--json-output"),
+    execute_openrouter: bool = typer.Option(
+        False,
+        "--execute-openrouter",
+        help="Explicitly execute the preregistered OpenRouter source/no-text pair after deterministic admission.",
+    ),
 ):
-    """Score registered lane evidence without invoking a provider or model."""
+    """Score lane evidence, optionally executing a registered OpenRouter pair."""
     try:
         registration = json.loads(registration_path.read_text(encoding="utf-8"))
         lane_results = json.loads(lane_results_path.read_text(encoding="utf-8"))
-        receipt = run_registered_research_benchmark(
-            registration=registration,
-            lane_results=lane_results,
-            artifact_root=artifact_root,
-        )
+        if execute_openrouter:
+            if type(lane_results) is not list or len(lane_results) != 1:
+                raise ResearchQualificationBenchmarkError(
+                    "OpenRouter execution requires exactly one deterministic lane result"
+                )
+            receipt = execute_registered_openrouter_benchmark(
+                registration=registration,
+                deterministic_result=lane_results[0],
+                artifact_root=artifact_root,
+            )
+        else:
+            receipt = run_registered_research_benchmark(
+                registration=registration,
+                lane_results=lane_results,
+                artifact_root=artifact_root,
+            )
         written = write_research_qualification_receipt(receipt, output_path)
     except (OSError, json.JSONDecodeError, ResearchQualificationBenchmarkError) as exc:
         raise typer.BadParameter(f"research benchmark rejected: {exc}") from exc

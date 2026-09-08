@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -36,6 +37,10 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_bytes(value)).hexdigest()
 
 
+OPENROUTER_INSTRUCTION = "Answer the registered question using only the supplied retained source. Return only the answer."
+OPENROUTER_PROMPT_SHA256 = _digest({"instruction": OPENROUTER_INSTRUCTION, "shape": ["case", "retained_source"]})
+
+
 def _map(value: object, fields: set[str], label: str) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ResearchQualificationBenchmarkError(f"{label} fields are not canonical")
@@ -63,11 +68,12 @@ def _decimal(value: object, label: str) -> Decimal:
 
 CASE_FIELDS = {"case_id", "variant_id", "case_kind", "medium", "severity", "ambiguous", "artifact_id", "artifact_path", "artifact_sha256", "byte_start", "byte_end", "adapter_query", "expected_answer", "expected_answer_sha256"}
 POLICY_FIELDS = {"minimum_accuracy_gain", "lane_cost_budgets_usd"}
+LANE_SPEC_FIELDS = {"provider", "model", "revision", "route", "prompt_sha256", "input_price_per_million_usd", "output_price_per_million_usd"}
 
 
 def _registration(value: object) -> dict[str, object]:
-    row = _map(value, {"schema_version", "registration_id", "registration_sha256", "cases", "comparison_policy", *AUTHORITY}, "registration")
-    if row["schema_version"] != "research_qualification_registration/v3":
+    row = _map(value, {"schema_version", "registration_id", "registration_sha256", "cases", "comparison_policy", "lane_specs", *AUTHORITY}, "registration")
+    if row["schema_version"] != "research_qualification_registration/v4":
         raise ResearchQualificationBenchmarkError("registration schema is invalid")
     if any(row[key] != expected for key, expected in AUTHORITY.items()):
         raise ResearchQualificationBenchmarkError("registration authority is invalid")
@@ -77,6 +83,23 @@ def _registration(value: object) -> dict[str, object]:
     if gain <= 0 or gain > 1 or not isinstance(budgets, Mapping) or set(budgets) != set(LANE_ORDER):
         raise ResearchQualificationBenchmarkError("comparison policy is invalid")
     policy = {"minimum_accuracy_gain": format(gain, "f"), "lane_cost_budgets_usd": {lane: format(_decimal(budgets[lane], f"{lane} budget"), "f") for lane in LANE_ORDER}}
+    raw_specs = row["lane_specs"]
+    expected_lanes = {*LANE_ORDER, *(f"{lane}_no_text" for lane in TEXT_LANES)}
+    if not isinstance(raw_specs, Mapping) or set(raw_specs) != expected_lanes:
+        raise ResearchQualificationBenchmarkError("registered lane identities are incomplete")
+    lane_specs = {}
+    for lane_id in sorted(expected_lanes):
+        spec = _map(raw_specs[lane_id], LANE_SPEC_FIELDS, f"{lane_id} lane spec")
+        for key in ("provider", "model", "revision", "route"):
+            _text(spec[key], f"{lane_id} {key}")
+        if type(spec["prompt_sha256"]) is not str or _SHA.fullmatch(spec["prompt_sha256"]) is None:
+            raise ResearchQualificationBenchmarkError("registered prompt digest is invalid")
+        for key in ("input_price_per_million_usd", "output_price_per_million_usd"):
+            spec[key] = format(_decimal(spec[key], f"{lane_id} {key}"), "f")
+        base = lane_id.removesuffix("_no_text")
+        if (base in MODEL_LANES) != (spec["provider"] == "openrouter"):
+            raise ResearchQualificationBenchmarkError("registered provider does not match lane")
+        lane_specs[lane_id] = spec
     raw_cases = row["cases"]
     if type(raw_cases) is not list:
         raise ResearchQualificationBenchmarkError("registration cases must be a list")
@@ -138,12 +161,20 @@ def _registration(value: object) -> dict[str, object]:
     digest = _digest(material)
     if row["registration_id"] != f"research-qualification-registration-{digest}" or row["registration_sha256"] != digest:
         raise ResearchQualificationBenchmarkError("registration identity is invalid")
-    row["cases"], row["comparison_policy"] = cases, policy
+    row["cases"], row["comparison_policy"], row["lane_specs"] = cases, policy, lane_specs
     return row
 
 
-def build_research_qualification_registration(cases: Sequence[Mapping[str, object]], *, minimum_accuracy_gain: str, lane_cost_budgets_usd: Mapping[str, str]) -> dict[str, object]:
-    payload = {"schema_version": "research_qualification_registration/v3", "registration_id": None, "registration_sha256": None, "cases": [dict(case) for case in cases], "comparison_policy": {"minimum_accuracy_gain": minimum_accuracy_gain, "lane_cost_budgets_usd": dict(lane_cost_budgets_usd)}, **AUTHORITY}
+def build_research_qualification_registration(cases: Sequence[Mapping[str, object]], *, minimum_accuracy_gain: str, lane_cost_budgets_usd: Mapping[str, str], lane_specs: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
+    payload = {
+        "schema_version": "research_qualification_registration/v4",
+        "registration_id": None,
+        "registration_sha256": None,
+        "cases": [dict(case) for case in cases],
+        "comparison_policy": {"minimum_accuracy_gain": minimum_accuracy_gain, "lane_cost_budgets_usd": dict(lane_cost_budgets_usd)},
+        "lane_specs": {key: dict(value) for key, value in lane_specs.items()},
+        **AUTHORITY,
+    }
     digest = _digest(payload)
     payload["registration_id"] = f"research-qualification-registration-{digest}"
     payload["registration_sha256"] = digest
@@ -247,12 +278,17 @@ def _adapter_input(case: Mapping[str, object], lane_id: str, source: bytes) -> t
     return safe, effective_source
 
 
-def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes], adapters: Mapping[str, LaneAdapter], local_answers: Mapping[str, str | None] | None = None) -> dict[str, object]:
+def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes], adapters: Mapping[str, LaneAdapter], lane_specs: Mapping[str, Mapping[str, object]], local_answers: Mapping[str, str | None] | None = None) -> dict[str, object]:
     lane = _map(raw, RESULT_FIELDS, "lane result")
     lane_id = _text(lane["lane_id"], "lane_id")
     base = lane_id.removesuffix("_no_text")
     if base not in LANE_ORDER or any(lane[k] != v for k, v in AUTHORITY.items()):
         raise ResearchQualificationBenchmarkError("lane identity or authority is invalid")
+    spec = lane_specs[lane_id]
+    observed_identity = (lane["actual_provider"], lane["actual_model"], lane["actual_revision"], lane["route"], lane["prompt_sha256"])
+    registered_identity = (spec["provider"], spec["model"], spec["revision"], spec["route"], spec["prompt_sha256"])
+    if observed_identity != registered_identity:
+        raise ResearchQualificationBenchmarkError("lane identity differs from registration")
     if lane["fallback_used"] is not False:
         raise ResearchQualificationBenchmarkError("fallback cannot qualify")
     for key in (
@@ -283,6 +319,9 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
         if type(lane[key]) is not int or lane[key] < 0:
             raise ResearchQualificationBenchmarkError("telemetry is invalid")
     cost = _decimal(lane["cost_usd"], "cost_usd")
+    derived_cost = (Decimal(lane["input_tokens"]) * Decimal(spec["input_price_per_million_usd"]) + Decimal(lane["output_tokens"]) * Decimal(spec["output_price_per_million_usd"])) / Decimal(1_000_000)
+    if cost != derived_cost:
+        raise ResearchQualificationBenchmarkError("lane cost does not match registered pricing and usage")
     expected = set(cases) if base != "different_model_reviewer" else {cid for cid, case in cases.items() if case["ambiguous"]}
     outputs = lane["case_outputs"]
     if type(outputs) is not list:
@@ -366,6 +405,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
         cases,
         sources,
         {},
+        frozen["lane_specs"],
         {case_id: _extract(cases[case_id], sources[case_id]) for case_id in cases},
     )
     if deterministic is None or deterministic["qualified"] is not True:
@@ -378,7 +418,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
         if lane_id == LANE_ORDER[0]:
             continue
         local_answers = metadata_answers if lane_id.removesuffix("_no_text") == "metadata_fts5_bm25" else None
-        scored.append(_score(row, cases, sources, adapters, local_answers))
+        scored.append(_score(row, cases, sources, adapters, frozen["lane_specs"], local_answers))
     by_id = {str(row["lane_id"]): row for row in scored}
     for lane in TEXT_LANES:
         if lane in by_id and f"{lane}_no_text" not in by_id:
@@ -415,7 +455,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
             selected = lane_id
             retained.append(lane_id)
     receipt = {
-        "schema_version": "research_qualification_benchmark/v3",
+        "schema_version": "research_qualification_benchmark/v4",
         "receipt_id": None,
         "receipt_sha256": None,
         "registration_id": frozen["registration_id"],
@@ -434,6 +474,85 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
     receipt["receipt_id"] = f"research-qualification-benchmark-{digest}"
     receipt["receipt_sha256"] = digest
     return receipt
+
+
+def execute_registered_openrouter_benchmark(
+    *,
+    registration: object,
+    deterministic_result: Mapping[str, object],
+    artifact_root: str | Path,
+    llm_factory: Callable[..., object] | None = None,
+) -> dict[str, object]:
+    """Execute the registered source-bound OpenRouter pair after local admission."""
+    frozen = _registration(registration)
+    run_registered_research_benchmark(registration=frozen, lane_results=[deterministic_result], artifact_root=artifact_root)
+    root = Path(artifact_root).expanduser().resolve(strict=True)
+    cases = {str(case["case_id"]): case for case in frozen["cases"]}
+    sources = {case_id: _source(root, case) for case_id, case in cases.items()}
+    if llm_factory is None:
+        from tradingagents.llm_clients.factory import create_llm_client
+
+        llm_factory = create_llm_client
+    captured: dict[str, list[dict[str, object]]] = {}
+    lane_results = [dict(deterministic_result)]
+    for lane_id in ("openrouter_source_bound", "openrouter_source_bound_no_text"):
+        spec = frozen["lane_specs"][lane_id]
+        if spec["provider"] != "openrouter" or spec["prompt_sha256"] != OPENROUTER_PROMPT_SHA256:
+            raise ResearchQualificationBenchmarkError("OpenRouter execution identity is not registered")
+        client = llm_factory(provider="openrouter", model=spec["model"])
+        llm = client.get_llm()  # type: ignore[attr-defined]
+        outputs, input_tokens, output_tokens, latency_ms, outcome_ids = [], 0, 0, 0, []
+        for case_id in sorted(cases):
+            safe, source = _adapter_input(cases[case_id], lane_id, sources[case_id])
+            prompt = _bytes({"instruction": OPENROUTER_INSTRUCTION, "case": safe, "retained_source": source.decode()}).decode()
+            started = time.monotonic_ns()
+            response = llm.invoke(prompt)
+            latency_ms += max(0, (time.monotonic_ns() - started) // 1_000_000)
+            metadata = getattr(response, "response_metadata", None)
+            usage = getattr(response, "usage_metadata", None)
+            if not isinstance(metadata, Mapping) or not isinstance(usage, Mapping):
+                raise ResearchQualificationBenchmarkError("OpenRouter response telemetry is unavailable")
+            actual = (metadata.get("provider"), metadata.get("model_name"), metadata.get("system_fingerprint"), metadata.get("route"))
+            if actual != (spec["provider"], spec["model"], spec["revision"], spec["route"]) or metadata.get("fallback_used") is not False:
+                raise ResearchQualificationBenchmarkError("OpenRouter response identity differs from registration")
+            in_count, out_count = usage.get("input_tokens"), usage.get("output_tokens")
+            if type(in_count) is not int or type(out_count) is not int or in_count < 0 or out_count < 0:
+                raise ResearchQualificationBenchmarkError("OpenRouter response usage is invalid")
+            input_tokens += in_count
+            output_tokens += out_count
+            outcome_id = _text(metadata.get("id"), "OpenRouter outcome id")
+            outcome_ids.append(outcome_id)
+            outputs.append(
+                {"case_id": case_id, "answer": _text(getattr(response, "content", None), "OpenRouter answer"), "source_artifact_id": cases[case_id]["artifact_id"], "byte_start": cases[case_id]["byte_start"], "byte_end": cases[case_id]["byte_end"], "input_sha256": safe["input_sha256"], "pair_id": safe["pair_id"]}
+            )
+        cost = (Decimal(input_tokens) * Decimal(spec["input_price_per_million_usd"]) + Decimal(output_tokens) * Decimal(spec["output_price_per_million_usd"])) / Decimal(1_000_000)
+        captured[lane_id] = outputs
+        lane_results.append(
+            {
+                "lane_id": lane_id,
+                "requested_provider": spec["provider"],
+                "requested_model": spec["model"],
+                "requested_revision": spec["revision"],
+                "actual_provider": spec["provider"],
+                "actual_model": spec["model"],
+                "actual_revision": spec["revision"],
+                "route": spec["route"],
+                "prompt_sha256": spec["prompt_sha256"],
+                "fallback_used": False,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "latency_ms": latency_ms,
+                "cost_usd": "0" if cost.is_zero() else format(cost.normalize(), "f"),
+                "privacy_mode": "registered_retained_source",
+                "outcome_ids": outcome_ids,
+                "checkpoint_id": f"registered-openrouter-{frozen['registration_sha256']}",
+                "case_outputs": outputs,
+                **AUTHORITY,
+            }
+        )
+    captured_by_id = {lane_id: {str(row["case_id"]): row for row in rows} for lane_id, rows in captured.items()}
+    adapters = {lane_id: (lambda case, _source, indexed=indexed: indexed[str(case["case_id"])]) for lane_id, indexed in captured_by_id.items()}
+    return run_registered_research_benchmark(registration=frozen, lane_results=lane_results, artifact_root=root, lane_adapters=adapters)
 
 
 def write_research_qualification_receipt(receipt: Mapping[str, object], path: str | Path) -> Path:
