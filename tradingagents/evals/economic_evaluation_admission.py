@@ -267,8 +267,10 @@ class EconomicEvaluationReadiness:
 
     protocol_id: str
     protocol_admission_object_id: str | None
+    development_run_object_id: str | None
     validation_run_object_id: str | None
     holdout_release_object_id: str | None
+    holdout_run_object_id: str | None
     evidence_sequence: int
     evidence_head_event_sha256: str
 
@@ -276,8 +278,10 @@ class EconomicEvaluationReadiness:
         _require_protocol_id(self.protocol_id)
         for value in (
             self.protocol_admission_object_id,
+            self.development_run_object_id,
             self.validation_run_object_id,
             self.holdout_release_object_id,
+            self.holdout_run_object_id,
         ):
             if value is not None and type(value) is not str:
                 raise EconomicEvaluationAdmissionError("readiness object identity is invalid")
@@ -285,8 +289,15 @@ class EconomicEvaluationReadiness:
             raise EconomicEvaluationAdmissionError("readiness evidence sequence is invalid")
         if _SHA256.fullmatch(self.evidence_head_event_sha256) is None:
             raise EconomicEvaluationAdmissionError("readiness evidence digest is invalid")
-        if self.validation_run_object_id is not None and self.protocol_admission_object_id is None:
-            raise EconomicEvaluationAdmissionError("validation run lacks an admitted protocol")
+        if any(
+            value is not None
+            for value in (
+                self.development_run_object_id,
+                self.validation_run_object_id,
+                self.holdout_run_object_id,
+            )
+        ) and self.protocol_admission_object_id is None:
+            raise EconomicEvaluationAdmissionError("evaluation run lacks an admitted protocol")
         if self.holdout_release_object_id is not None and self.validation_run_object_id is None:
             raise EconomicEvaluationAdmissionError("holdout release lacks a validation run")
 
@@ -298,7 +309,9 @@ class EconomicEvaluationReadiness:
             return "validation_not_admitted"
         if self.holdout_release_object_id is None:
             return "holdout_sealed"
-        return "holdout_released_analysis_only"
+        if self.holdout_run_object_id is None:
+            return "holdout_released_analysis_only"
+        return "holdout_completed_analysis_only"
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -1785,12 +1798,36 @@ class EconomicEvaluationAdmissionAdapter:
             return EconomicEvaluationReadiness(
                 protocol_id=identity,
                 protocol_admission_object_id=None,
+                development_run_object_id=None,
                 validation_run_object_id=None,
                 holdout_release_object_id=None,
+                holdout_run_object_id=None,
                 evidence_sequence=predecessor["sequence"],  # type: ignore[arg-type]
                 evidence_head_event_sha256=predecessor["event_sha256"],  # type: ignore[arg-type]
             )
         protocol_envelope, protocol = matches[0]
+        development_runs = [
+            _evaluation_run_from_envelope(
+                envelope,
+                protocol=protocol,
+                protocol_admission_object_id=protocol_envelope.object_id,
+                events=events,
+            )
+            for envelope in snapshot
+            if envelope.kind == ECONOMIC_EVALUATION_RUN_KIND
+            and _payload_mapping(envelope.payload, label="evaluation-run payload").get(
+                "protocol_id"
+            )
+            == identity
+            and _payload_mapping(envelope.payload, label="evaluation-run payload").get(
+                "phase"
+            )
+            == "development"
+        ]
+        if len(development_runs) > 1:
+            raise EconomicEvaluationAdmissionError(
+                "protocol identity has more than one immutable development run"
+            )
         validation_runs = [
             _evaluation_run_from_envelope(
                 envelope,
@@ -1805,6 +1842,11 @@ class EconomicEvaluationAdmissionAdapter:
                 label="evaluation-run payload",
             ).get("protocol_id")
             == identity
+            and _payload_mapping(
+                envelope.payload,
+                label="evaluation-run payload",
+            ).get("phase")
+            == "validation"
         ]
         if len(validation_runs) > 1:
             raise EconomicEvaluationAdmissionError(
@@ -1854,10 +1896,14 @@ class EconomicEvaluationAdmissionAdapter:
         return EconomicEvaluationReadiness(
             protocol_id=identity,
             protocol_admission_object_id=protocol_envelope.object_id,
+            development_run_object_id=(
+                development_runs[0].envelope.object_id if development_runs else None
+            ),
             validation_run_object_id=(
                 validation_run.envelope.object_id if validation_run is not None else None
             ),
             holdout_release_object_id=releases[0].object_id if releases else None,
+            holdout_run_object_id=None,
             evidence_sequence=predecessor["sequence"],  # type: ignore[arg-type]
             evidence_head_event_sha256=predecessor["event_sha256"],  # type: ignore[arg-type]
         )
