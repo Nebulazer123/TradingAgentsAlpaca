@@ -692,13 +692,16 @@ def test_frozen_protocol_binding_survives_resolution_and_drives_verified_counts(
     tmp_path,
 ):
     protocol = _protocol(protocol_source)
-    event = protocol.input_manifest.events[0]
+    event = next(
+        event
+        for event in protocol.input_manifest.events
+        if event.market_date == "2026-05-22"
+    )
     start = dt.date.fromisoformat(event.market_date)
-    from tradingagents.evals.agent_intelligence_ledger import _add_trading_days
-
-    end = _add_trading_days(
-        dt.datetime.fromisoformat(event.created_at), event.horizon_sessions
-    ).date()
+    market_dates = protocol.market_date_partitions.market_calendar.market_dates
+    event_index = market_dates.index(event.market_date)
+    end = dt.date.fromisoformat(market_dates[event_index + event.horizon_sessions])
+    assert end == dt.date(2026, 6, 1)
     recorded = dt.datetime.combine(
         end + dt.timedelta(days=1),
         dt.time(21),
@@ -712,16 +715,13 @@ def test_frozen_protocol_binding_survives_resolution_and_drives_verified_counts(
     receipts = []
     for symbol, final_close in ((event.symbol, "12"), (event.benchmark, "11")):
         bars = []
-        current = start
-        while current <= end:
-            if current.weekday() < 5:
-                bars.append(
-                    {
-                        "t": f"{current.isoformat()}T05:00:00Z",
-                        "c": "10" if not bars else final_close,
-                    }
-                )
-            current += dt.timedelta(days=1)
+        for current_text in market_dates[event_index : event_index + 6]:
+            bars.append(
+                {
+                    "t": f"{current_text}T05:00:00Z",
+                    "c": "10" if not bars else final_close,
+                }
+            )
         artifact = archive.admit(
             raw_bytes=json.dumps({"bars": {symbol: bars}}).encode(),
             source_uri=(
@@ -779,6 +779,10 @@ def test_frozen_protocol_binding_survives_resolution_and_drives_verified_counts(
         "source_bound_resolution_evidence/v3"
     )
     assert lookup.verify_forecast(resolved[0]) is True
+    closed_friday_due = dataclasses.replace(
+        resolved[0], resolve_after="2026-05-29T20:45:00+00:00"
+    )
+    assert lookup.verify_forecast(closed_friday_due) is False
     observation = LearningObservation.from_source_bound_forecast(
         resolved[0],
         recorded_at=recorded,

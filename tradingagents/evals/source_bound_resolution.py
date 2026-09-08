@@ -235,10 +235,19 @@ class SourceBoundWindowLookup:
         except (TypeError, ValueError, OverflowError):
             return None
         event_window = event.to_dict()["resolution_window"]
-        from tradingagents.evals.agent_intelligence_ledger import _add_trading_days
-
-        expected_resolve = _add_trading_days(
-            created.astimezone(dt.timezone.utc), event.horizon_sessions
+        market_dates = protocol.market_date_partitions.market_calendar.market_dates
+        try:
+            event_session_index = market_dates.index(event.market_date)
+            maturity_date = dt.date.fromisoformat(
+                market_dates[event_session_index + event.horizon_sessions]
+            )
+        except (ValueError, IndexError):
+            return None
+        created_utc = created.astimezone(dt.timezone.utc)
+        expected_resolve = created_utc.replace(
+            year=maturity_date.year,
+            month=maturity_date.month,
+            day=maturity_date.day,
         )
         if (
             resolve_moment.tzinfo is None
