@@ -337,6 +337,15 @@ def test_perfect_local_score_cannot_justify_any_model_calls(tmp_path):
     assert calls == []
     assert receipt["selected_lane"] == "deterministic_sec_xbrl"
     assert len(receipt["lane_results"]) == 1
+    assert receipt["openrouter_execution"] == {
+        "status": "not_run",
+        "reason": "registered_accuracy_gain_unattainable",
+    }
+    material = {**receipt, "receipt_id": None, "receipt_sha256": None}
+    digest = hashlib.sha256(json.dumps(
+        material, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()).hexdigest()
+    assert receipt["receipt_sha256"] == digest
 
 
 def test_openrouter_factory_is_not_constructed_before_deterministic_admission(tmp_path):

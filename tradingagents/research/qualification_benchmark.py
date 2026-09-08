@@ -498,6 +498,14 @@ def execute_registered_openrouter_benchmark(
     baseline = Decimal(local_receipt["lane_results"][0]["critical_field_accuracy"])
     required_gain = Decimal(frozen["comparison_policy"]["minimum_accuracy_gain"])
     if baseline + required_gain > 1:
+        local_receipt["openrouter_execution"] = {
+            "status": "not_run",
+            "reason": "registered_accuracy_gain_unattainable",
+        }
+        local_receipt["receipt_id"] = local_receipt["receipt_sha256"] = None
+        digest = _digest(local_receipt)
+        local_receipt["receipt_id"] = f"research-qualification-benchmark-{digest}"
+        local_receipt["receipt_sha256"] = digest
         return local_receipt
     root = Path(artifact_root).expanduser().resolve(strict=True)
     cases = {str(case["case_id"]): case for case in frozen["cases"]}
