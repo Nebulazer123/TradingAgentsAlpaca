@@ -113,6 +113,9 @@ _VALIDATION_REPORT_FIELDS = frozenset(
         *_AUTHORITY_FIELDS,
     }
 )
+_UNAVAILABLE_VALIDATION_REPORT_FIELDS = frozenset(
+    _VALIDATION_REPORT_FIELDS | {"availability_status", "qualification_status"}
+)
 _TOURNAMENT_INPUT_REFERENCE_FIELDS = frozenset({"input_id", "input_sha256"})
 _LEGACY_VALIDATION_REPORT_FIELDS = frozenset(
     {
@@ -549,7 +552,13 @@ def _frozen_validation_report(
             protocol=protocol,
             allow_legacy=allow_legacy,
         )
-    if set(report) != _VALIDATION_REPORT_FIELDS:
+    unavailable = "availability_status" in report
+    expected_fields = (
+        _UNAVAILABLE_VALIDATION_REPORT_FIELDS
+        if unavailable
+        else _VALIDATION_REPORT_FIELDS
+    )
+    if set(report) != expected_fields:
         raise EconomicEvaluationAdmissionError("frozen_validation_report fields are invalid")
     if report["schema_version"] != ECONOMIC_VALIDATION_REPORT_SCHEMA:
         raise EconomicEvaluationAdmissionError("validation report schema is invalid")
@@ -586,6 +595,21 @@ def _frozen_validation_report(
     if type(result) is not EconomicValidationResult:
         raise EconomicEvaluationAdmissionError(
             "legacy validation results are readable but nonqualifying"
+        )
+    if unavailable:
+        if (
+            report["availability_status"] != "unavailable"
+            or report["qualification_status"]
+            != "nonqualifying_unavailable_execution_evidence"
+            or result.availability_status != report["availability_status"]
+            or result.qualification_status != report["qualification_status"]
+        ):
+            raise EconomicEvaluationAdmissionError(
+                "unavailable validation report status is invalid"
+            )
+    elif result.availability_status != "available":
+        raise EconomicEvaluationAdmissionError(
+            "available validation report omits unavailable result status"
         )
     if (
         result.protocol_id != protocol.protocol_id
@@ -1084,6 +1108,8 @@ class EconomicEvaluationAdmissionAdapter:
 
         if report.get("schema_version") != ECONOMIC_VALIDATION_REPORT_SCHEMA:
             return None
+        if report.get("qualification_status") is not None:
+            return None
         eligibility = bind_validation_phase_eligibility(
             protocol=protocol,
             partitions=validate_market_date_partitions(report["market_date_partitions"]),
@@ -1494,7 +1520,7 @@ class EconomicEvaluationAdmissionAdapter:
                 protocol=protocol,
                 report=submitted_report,
             )
-            if reopened is None:
+            if reopened is None and submitted_report.get("qualification_status") is None:
                 raise EconomicEvaluationAdmissionError(
                     "current evaluation-run receipt is not qualifying"
                 )
@@ -1557,7 +1583,7 @@ class EconomicEvaluationAdmissionAdapter:
         if self._reopen_tournament_input(
             protocol=protocol,
             report=persisted_report,
-        ) is None:
+        ) is None and persisted_report.get("qualification_status") is None:
             raise EconomicEvaluationAdmissionError(
                 "persisted evaluation-run receipt is not qualifying"
             )

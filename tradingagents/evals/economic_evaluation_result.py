@@ -62,6 +62,8 @@ _COUNT_METRICS = frozenset(
     }
 )
 _COST_VARIANT_BPS = ("5", "10", "25", "50")
+_UNAVAILABLE_STATUS = "unavailable"
+_NONQUALIFYING_UNAVAILABLE = "nonqualifying_unavailable_execution_evidence"
 
 
 class EconomicEvaluationResultError(ValueError):
@@ -175,6 +177,36 @@ def _canonical_arm_metrics(
     return tuple(arms)
 
 
+def _canonical_unavailable_arm_metrics(value: object) -> tuple[Mapping[str, object], ...]:
+    """Preserve the frozen arm/metric shape without fabricating measurements."""
+
+    if not isinstance(value, Mapping) or set(value) != set(CONTROL_ARM_IDS):
+        raise EconomicEvaluationResultError(
+            "arm_metrics must contain the exact frozen control arms"
+        )
+    arms: list[Mapping[str, object]] = []
+    expected_metrics = frozenset(REQUIRED_METRICS)
+    for arm_id in CONTROL_ARM_IDS:
+        metrics = _exact_fields(
+            value[arm_id], expected_metrics, label=f"{arm_id} metrics"
+        )
+        if any(metrics[metric] is not None for metric in REQUIRED_METRICS):
+            raise EconomicEvaluationResultError(
+                "unavailable arm metrics must all be null"
+            )
+        arms.append(
+            MappingProxyType(
+                {
+                    "arm_id": arm_id,
+                    "metrics": MappingProxyType(
+                        {metric: None for metric in REQUIRED_METRICS}
+                    ),
+                }
+            )
+        )
+    return tuple(arms)
+
+
 def _canonical_cost_variants(
     value: object,
     *,
@@ -205,6 +237,80 @@ def _canonical_cost_variants(
             )
         )
     return tuple(variants)
+
+
+def _canonical_unavailable_cost_variants(value: object) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, Mapping) or set(value) != set(_COST_VARIANT_BPS):
+        raise EconomicEvaluationResultError(
+            "cost variants must contain the exact 5/10/25/50 bps cases"
+        )
+    variants: list[Mapping[str, object]] = []
+    for cost in _COST_VARIANT_BPS:
+        variants.append(
+            MappingProxyType(
+                {
+                    "cost_bps_per_side": cost,
+                    "half_spread_bps_per_side": _canonical_decimal_half(cost),
+                    "slippage_bps_per_side": _canonical_decimal_half(cost),
+                    "arm_metrics": _canonical_unavailable_arm_metrics(value[cost]),
+                }
+            )
+        )
+    return tuple(variants)
+
+
+def _canonical_unavailable_outcomes(value: object) -> tuple[Mapping[str, str], ...]:
+    expected = frozenset(
+        {
+            "market_date",
+            "symbol",
+            "decision_event_id",
+            "outcome_id",
+            "outcome_sha256",
+            "unavailable_reason",
+        }
+    )
+    if type(value) is tuple and all(
+        type(item) is SourceBoundExecutionOutcome for item in value
+    ):
+        rows = [
+            {
+                "market_date": item.decision_market_date,
+                "symbol": item.symbol,
+                "decision_event_id": item.decision_event_id,
+                "outcome_id": item.outcome_id,
+                "outcome_sha256": item.outcome_sha256,
+                "unavailable_reason": item.unavailable_reason,
+            }
+            for item in value
+            if item.gross_return is None
+        ]
+    elif type(value) is list:
+        rows = [
+            _exact_fields(item, expected, label="unavailable outcome")
+            for item in value
+        ]
+    else:
+        raise EconomicEvaluationResultError(
+            "unavailable result requires canonical unavailable outcomes"
+        )
+    if not rows:
+        raise EconomicEvaluationResultError(
+            "unavailable result requires at least one unavailable outcome"
+        )
+    for row in rows:
+        if any(type(row[field]) is not str or not row[field] for field in expected):
+            raise EconomicEvaluationResultError("unavailable outcome fields are invalid")
+        if not row["decision_event_id"].startswith("decision-event-"):
+            raise EconomicEvaluationResultError("unavailable decision event is invalid")
+        if not row["outcome_id"].startswith("source-bound-execution-outcome-"):
+            raise EconomicEvaluationResultError("unavailable outcome identity is invalid")
+        if _SHA256.fullmatch(row["outcome_sha256"]) is None:
+            raise EconomicEvaluationResultError("unavailable outcome digest is invalid")
+    canonical = sorted(rows, key=lambda row: (row["market_date"], row["symbol"]))
+    if rows != canonical or len({(row["market_date"], row["symbol"]) for row in rows}) != len(rows):
+        raise EconomicEvaluationResultError("unavailable outcomes are not canonical")
+    return tuple(MappingProxyType(dict(row)) for row in rows)  # type: ignore[arg-type]
 
 
 def _canonical_decimal_half(value: str) -> str:
@@ -359,6 +465,9 @@ class EconomicValidationResult:
     tournament_input_id: str | None
     tournament_input_sha256: str | None
     execution_outcome_refs: tuple[Mapping[str, str], ...] | None
+    availability_status: str
+    qualification_status: str
+    unavailable_outcomes: tuple[Mapping[str, str], ...] | None
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError(
@@ -389,7 +498,6 @@ class EconomicValidationResult:
             **_AUTHORITY_FIELDS,
         }
         if extended:
-            assert self.registered_statistics is not None
             assert self.tournament_input_id is not None
             assert self.tournament_input_sha256 is not None
             assert self.execution_outcome_refs is not None
@@ -420,7 +528,18 @@ class EconomicValidationResult:
                 }
                 for row in self.cost_variants
             ]
-            payload["registered_statistics"] = dict(self.registered_statistics)
+            payload["registered_statistics"] = (
+                None
+                if self.registered_statistics is None
+                else dict(self.registered_statistics)
+            )
+            if self.availability_status == _UNAVAILABLE_STATUS:
+                assert self.unavailable_outcomes is not None
+                payload["availability_status"] = self.availability_status
+                payload["qualification_status"] = self.qualification_status
+                payload["unavailable_outcomes"] = [
+                    dict(item) for item in self.unavailable_outcomes
+                ]
         return payload
 
     def canonical_json_bytes(self) -> bytes:
@@ -474,6 +593,9 @@ _RESULT_SERIALIZED_FIELDS = frozenset(
             "tournament_input_id",
             "tournament_input_sha256",
             "execution_outcome_refs",
+            "availability_status",
+            "qualification_status",
+            "unavailable_outcomes",
         }
     )
     + (
@@ -491,6 +613,10 @@ _TOURNAMENT_RESULT_SERIALIZED_FIELDS = frozenset(
         "tournament_input",
         "execution_outcomes",
     }
+)
+_UNAVAILABLE_TOURNAMENT_RESULT_SERIALIZED_FIELDS = frozenset(
+    _TOURNAMENT_RESULT_SERIALIZED_FIELDS
+    | {"availability_status", "qualification_status", "unavailable_outcomes"}
 )
 _LEGACY_RESULT_SERIALIZED_FIELDS = frozenset(
     {
@@ -533,6 +659,9 @@ def _result_material(
     tournament_input_id: str | None = None,
     tournament_input_sha256: str | None = None,
     execution_outcome_refs: tuple[Mapping[str, str], ...] | None = None,
+    availability_status: str = "available",
+    qualification_status: str = "qualifying",
+    unavailable_outcomes: tuple[Mapping[str, str], ...] | None = None,
     result_id: str | None = None,
     result_sha256: str | None = None,
 ) -> dict[str, object]:
@@ -559,8 +688,7 @@ def _result_material(
     }
     if cost_variants is not None:
         if (
-            registered_statistics is None
-            or tournament_input_id is None
+            tournament_input_id is None
             or tournament_input_sha256 is None
             or execution_outcome_refs is None
         ):
@@ -587,7 +715,24 @@ def _result_material(
             }
             for row in cost_variants
         ]
-        payload["registered_statistics"] = dict(registered_statistics)
+        payload["registered_statistics"] = (
+            None
+            if registered_statistics is None
+            else dict(registered_statistics)
+        )
+        if availability_status == _UNAVAILABLE_STATUS:
+            if (
+                qualification_status != _NONQUALIFYING_UNAVAILABLE
+                or unavailable_outcomes is None
+            ):
+                raise EconomicEvaluationResultError(
+                    "unavailable v3 result qualification is invalid"
+                )
+            payload["availability_status"] = availability_status
+            payload["qualification_status"] = qualification_status
+            payload["unavailable_outcomes"] = [
+                dict(item) for item in unavailable_outcomes
+            ]
     if result_id is not None:
         payload["result_id"] = result_id
     if result_sha256 is not None:
@@ -632,6 +777,7 @@ def build_validation_evaluation_result(
     tournament_input_id: str | None = None,
     tournament_input_sha256: str | None = None,
     execution_outcomes: tuple[SourceBoundExecutionOutcome, ...] | None = None,
+    unavailable: bool = False,
 ) -> EconomicValidationResult:
     """Build a complete result for the canonical, purged validation phase."""
 
@@ -654,25 +800,40 @@ def build_validation_evaluation_result(
         raise EconomicEvaluationResultError(
             "validation eligibility canonical validation failed"
         ) from exc
-    metrics = _canonical_arm_metrics(
-        arm_metrics,
-        validation_event_count=len(bound.event_ids),
+    metrics = (
+        _canonical_unavailable_arm_metrics(arm_metrics)
+        if unavailable
+        else _canonical_arm_metrics(
+            arm_metrics,
+            validation_event_count=len(bound.event_ids),
+        )
     )
     variants = None
     statistics = None
     outcome_refs = None
     if cost_variant_metrics is not None or registered_statistics is not None:
-        if cost_variant_metrics is None or type(registered_statistics) is not EconomicTournamentStatistics:
+        if cost_variant_metrics is None or (
+            not unavailable
+            and type(registered_statistics) is not EconomicTournamentStatistics
+        ):
             raise EconomicEvaluationResultError(
                 "extended tournament results require cost variants and exact statistics"
             )
-        variants = _canonical_cost_variants(
-            cost_variant_metrics,
-            validation_event_count=len(bound.event_ids),
+        variants = (
+            _canonical_unavailable_cost_variants(cost_variant_metrics)
+            if unavailable
+            else _canonical_cost_variants(
+                cost_variant_metrics,
+                validation_event_count=len(bound.event_ids),
+            )
         )
-        statistics = validate_economic_tournament_statistics(
-            registered_statistics.to_dict()
-        ).to_dict()
+        statistics = (
+            None
+            if unavailable
+            else validate_economic_tournament_statistics(
+                registered_statistics.to_dict()
+            ).to_dict()
+        )
         if (
             type(tournament_input_id) is not str
             or not tournament_input_id.startswith("economic-tournament-input-")
@@ -687,6 +848,11 @@ def build_validation_evaluation_result(
                 "v3 tournament input binding is invalid"
             )
         outcome_refs = _canonical_execution_outcome_refs(execution_outcomes)
+    unavailable_rows = (
+        _canonical_unavailable_outcomes(execution_outcomes)
+        if unavailable
+        else None
+    )
     return _build_result_from_components(
         protocol_id=validated.protocol_id,
         validation_partition_id=bound.partition_id,
@@ -698,6 +864,11 @@ def build_validation_evaluation_result(
         tournament_input_id=tournament_input_id,
         tournament_input_sha256=tournament_input_sha256,
         execution_outcome_refs=outcome_refs,
+        availability_status=_UNAVAILABLE_STATUS if unavailable else "available",
+        qualification_status=(
+            _NONQUALIFYING_UNAVAILABLE if unavailable else "qualifying"
+        ),
+        unavailable_outcomes=unavailable_rows,
     )
 
 
@@ -713,6 +884,9 @@ def _build_result_from_components(
     tournament_input_id: str | None = None,
     tournament_input_sha256: str | None = None,
     execution_outcome_refs: tuple[Mapping[str, str], ...] | None = None,
+    availability_status: str = "available",
+    qualification_status: str = "qualifying",
+    unavailable_outcomes: tuple[Mapping[str, str], ...] | None = None,
 ) -> EconomicValidationResult:
     material = _result_material(
         protocol_id=protocol_id,
@@ -725,6 +899,9 @@ def _build_result_from_components(
         tournament_input_id=tournament_input_id,
         tournament_input_sha256=tournament_input_sha256,
         execution_outcome_refs=execution_outcome_refs,
+        availability_status=availability_status,
+        qualification_status=qualification_status,
+        unavailable_outcomes=unavailable_outcomes,
     )
     result_id = "economic-evaluation-result-" + _sha256(material)
     digest_material = _result_material(
@@ -738,6 +915,9 @@ def _build_result_from_components(
         tournament_input_id=tournament_input_id,
         tournament_input_sha256=tournament_input_sha256,
         execution_outcome_refs=execution_outcome_refs,
+        availability_status=availability_status,
+        qualification_status=qualification_status,
+        unavailable_outcomes=unavailable_outcomes,
         result_id=result_id,
     )
     return _new_result(
@@ -753,6 +933,9 @@ def _build_result_from_components(
         tournament_input_id=tournament_input_id,
         tournament_input_sha256=tournament_input_sha256,
         execution_outcome_refs=execution_outcome_refs,
+        availability_status=availability_status,
+        qualification_status=qualification_status,
+        unavailable_outcomes=unavailable_outcomes,
     )
 
 
@@ -878,6 +1061,45 @@ def _validated_cost_variants(
     )
 
 
+def _validated_unavailable_cost_variants(value: object) -> tuple[Mapping[str, object], ...]:
+    if type(value) is not list or len(value) != len(_COST_VARIANT_BPS):
+        raise EconomicEvaluationResultError("validation cost variants are invalid")
+    variants: dict[str, Mapping[str, Mapping[str, object]]] = {}
+    expected = frozenset(
+        {
+            "cost_bps_per_side",
+            "commission_bps_per_side",
+            "half_spread_bps_per_side",
+            "slippage_bps_per_side",
+            "arm_metrics",
+        }
+    )
+    for raw_variant in value:
+        variant = _exact_fields(raw_variant, expected, label="cost variant")
+        cost = variant["cost_bps_per_side"]
+        if (
+            type(cost) is not str
+            or cost in variants
+            or variant["commission_bps_per_side"] != "0"
+            or variant["half_spread_bps_per_side"] != _canonical_decimal_half(cost)
+            or variant["slippage_bps_per_side"] != _canonical_decimal_half(cost)
+        ):
+            raise EconomicEvaluationResultError("cost variant components are invalid")
+        raw_arms = variant["arm_metrics"]
+        if type(raw_arms) is not list:
+            raise EconomicEvaluationResultError("cost variant arm metrics are invalid")
+        arm_map: dict[str, Mapping[str, object]] = {}
+        for raw_arm in raw_arms:
+            arm = _exact_fields(
+                raw_arm, frozenset({"arm_id", "metrics"}), label="cost variant arm"
+            )
+            if type(arm["arm_id"]) is not str or not isinstance(arm["metrics"], Mapping):
+                raise EconomicEvaluationResultError("cost variant arm is invalid")
+            arm_map[arm["arm_id"]] = arm["metrics"]  # type: ignore[assignment]
+        variants[cost] = arm_map
+    return _canonical_unavailable_cost_variants(variants)
+
+
 def _validate_legacy_economic_validation_result(
     value: object,
 ) -> LegacyEconomicValidationResult:
@@ -915,8 +1137,11 @@ def validate_economic_validation_result(
     if value.get("schema_version") == _LEGACY_ECONOMIC_VALIDATION_RESULT_SCHEMA:
         return _validate_legacy_economic_validation_result(value)
     extended = value.get("schema_version") == ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+    unavailable = extended and "availability_status" in value
     expected_fields = (
-        _TOURNAMENT_RESULT_SERIALIZED_FIELDS
+        _UNAVAILABLE_TOURNAMENT_RESULT_SERIALIZED_FIELDS
+        if unavailable
+        else _TOURNAMENT_RESULT_SERIALIZED_FIELDS
         if extended
         else _RESULT_SERIALIZED_FIELDS
     )
@@ -941,20 +1166,56 @@ def validate_economic_validation_result(
         raise EconomicEvaluationResultError("validation partition identity is invalid")
     if _SHA256.fullmatch(values["validation_partition_sha256"]) is None:
         raise EconomicEvaluationResultError("validation partition digest is invalid")
-    rebuilt_metrics = _validated_result_metrics(values, event_count=len(event_ids))
+    if unavailable:
+        if (
+            values["availability_status"] != _UNAVAILABLE_STATUS
+            or values["qualification_status"] != _NONQUALIFYING_UNAVAILABLE
+        ):
+            raise EconomicEvaluationResultError("unavailable result status is invalid")
+        raw_arms = values["arm_metrics"]
+        if type(raw_arms) is not list:
+            raise EconomicEvaluationResultError("validation arm metrics are invalid")
+        unavailable_arm_map = {
+            arm["arm_id"]: arm["metrics"]
+            for raw_arm in raw_arms
+            for arm in [
+                _exact_fields(
+                    raw_arm,
+                    frozenset({"arm_id", "metrics"}),
+                    label="arm result",
+                )
+            ]
+        }
+        rebuilt_metrics = _canonical_unavailable_arm_metrics(unavailable_arm_map)
+    else:
+        rebuilt_metrics = _validated_result_metrics(values, event_count=len(event_ids))
     variants = None
     statistics = None
     tournament_input_id = None
     tournament_input_sha256 = None
     outcome_refs = None
+    unavailable_rows = None
     if extended:
-        variants = _validated_cost_variants(
-            values["cost_variants"],
-            event_count=len(event_ids),
+        variants = (
+            _validated_unavailable_cost_variants(values["cost_variants"])
+            if unavailable
+            else _validated_cost_variants(
+                values["cost_variants"],
+                event_count=len(event_ids),
+            )
         )
-        statistics = validate_economic_tournament_statistics(
-            values["registered_statistics"]
-        ).to_dict()
+        if unavailable:
+            if values["registered_statistics"] is not None:
+                raise EconomicEvaluationResultError(
+                    "unavailable registered statistics must be null"
+                )
+            unavailable_rows = _canonical_unavailable_outcomes(
+                values["unavailable_outcomes"]
+            )
+        else:
+            statistics = validate_economic_tournament_statistics(
+                values["registered_statistics"]
+            ).to_dict()
         tournament = _exact_fields(
             values["tournament_input"],
             frozenset({"input_id", "input_sha256"}),
@@ -978,6 +1239,29 @@ def validate_economic_validation_result(
         outcome_refs = _canonical_execution_outcome_refs(
             values["execution_outcomes"]
         )
+        if unavailable:
+            referenced = {
+                (
+                    item["market_date"],
+                    item["symbol"],
+                    item["outcome_id"],
+                    item["outcome_sha256"],
+                )
+                for item in outcome_refs
+            }
+            if any(
+                (
+                    item["market_date"],
+                    item["symbol"],
+                    item["outcome_id"],
+                    item["outcome_sha256"],
+                )
+                not in referenced
+                for item in unavailable_rows or ()
+            ):
+                raise EconomicEvaluationResultError(
+                    "unavailable outcomes do not match execution outcome bindings"
+                )
     rebuilt = _build_result_from_components(
         protocol_id=protocol_id,
         validation_partition_id=values["validation_partition_id"],  # type: ignore[arg-type]
@@ -989,6 +1273,11 @@ def validate_economic_validation_result(
         tournament_input_id=tournament_input_id,
         tournament_input_sha256=tournament_input_sha256,
         execution_outcome_refs=outcome_refs,
+        availability_status=_UNAVAILABLE_STATUS if unavailable else "available",
+        qualification_status=(
+            _NONQUALIFYING_UNAVAILABLE if unavailable else "qualifying"
+        ),
+        unavailable_outcomes=unavailable_rows,
     )
     submitted = _canonical_json_bytes(values)
     if rebuilt.canonical_json_bytes() != submitted:

@@ -28,6 +28,10 @@ from tradingagents.evals.economic_evaluation_protocol import (
     build_frozen_evaluation_protocol,
     canonical_universe_id,
 )
+from tradingagents.evals.economic_evaluation_result import (
+    EconomicEvaluationResultError,
+    validate_economic_validation_result,
+)
 from tradingagents.evals.economic_tournament import (
     EconomicTournamentCandidate,
     EconomicTournamentError,
@@ -41,9 +45,13 @@ from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
 UNIVERSE = tuple(f"T{index:03d}" for index in range(75))
 
 
-def _event(symbol: str, market_date: str = "2026-01-09"):
+def _event(
+    symbol: str,
+    market_date: str = "2026-01-09",
+    universe: tuple[str, ...] = UNIVERSE,
+):
     return build_decision_event(
-        universe_id=canonical_universe_id(UNIVERSE), symbol=symbol,
+        universe_id=canonical_universe_id(universe), symbol=symbol,
         decision_at=f"{market_date}T20:55:00+00:00", market_date=market_date,
         horizon_sessions=5, horizon="5_sessions", benchmark="SPY",
         created_at=f"{market_date}T20:45:00+00:00",
@@ -168,6 +176,308 @@ def test_validation_tournament_uses_only_purged_pit_validation_events(
     assert result.to_dict()["tournament_input"]["input_id"] == receipt.input_id
     assert len(result.to_dict()["execution_outcomes"]) == 76
     assert "effective_sample_size" not in json.dumps(result.to_dict())
+    assert (
+        validate_economic_validation_result(
+            json.loads(result.canonical_json_bytes())
+        ).canonical_json_bytes()
+        == result.canonical_json_bytes()
+    )
+
+
+def test_validation_tournament_completes_unavailable_without_fabricated_metrics(
+    tmp_path, protocol_source
+):
+    protocol, partitions, _events_by_id = _protocol(protocol_source)
+    eligibility = bind_validation_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+    )
+    market_date = next(
+        event.market_date
+        for event in protocol.input_manifest.events
+        if event.decision_event_id in set(eligibility.event_ids)
+    )
+    receipt, _archive = build_tournament_receipt(
+        tmp_path / "unavailable-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+        unavailable_next_open=frozenset({(market_date, "T001")}),
+    )
+
+    result = evaluate_validation_ta_control(
+        protocol=protocol,
+        eligibility=eligibility,
+        candidates_by_event=dict(receipt.candidates_by_event),
+        execution_outcomes=receipt.outcomes,
+        tournament_input_id=receipt.input_id,
+        tournament_input_sha256=receipt.input_sha256,
+    )
+    payload = result.to_dict()
+    parsed = validate_economic_validation_result(json.loads(result.canonical_json_bytes()))
+
+    assert payload["schema_version"] == "economic_validation_result/v3"
+    assert payload["status"] == "completed"
+    assert payload["availability_status"] == "unavailable"
+    assert payload["qualification_status"] == (
+        "nonqualifying_unavailable_execution_evidence"
+    )
+    assert payload["unavailable_outcomes"] == [
+        {
+            "market_date": market_date,
+            "symbol": "T001",
+            "decision_event_id": next(
+                event.decision_event_id
+                for event in protocol.input_manifest.events
+                if event.market_date == market_date and event.symbol == "T001"
+            ),
+            "outcome_id": next(
+                outcome.outcome_id
+                for outcome in receipt.outcomes
+                if outcome.decision_market_date == market_date
+                and outcome.symbol == "T001"
+            ),
+            "outcome_sha256": next(
+                outcome.outcome_sha256
+                for outcome in receipt.outcomes
+                if outcome.decision_market_date == market_date
+                and outcome.symbol == "T001"
+            ),
+            "unavailable_reason": "required_next_open_unproven",
+        }
+    ]
+    assert all(
+        value is None
+        for arm in payload["arm_metrics"]
+        for value in arm["metrics"].values()
+    )
+    assert payload["registered_statistics"] is None
+    assert parsed.canonical_json_bytes() == result.canonical_json_bytes()
+    assert parsed.tournament_input_id == receipt.input_id
+    assert len(parsed.execution_outcome_refs) == 76
+    assert payload["analysis_only"] is True
+    assert payload["execution_authority"] == "none"
+    assert payload["can_submit_orders"] is False
+    tampered = json.loads(result.canonical_json_bytes())
+    tampered["arm_metrics"][0]["metrics"]["turnover"] = "0"
+    with pytest.raises(EconomicEvaluationResultError):
+        validate_economic_validation_result(tampered)
+
+
+def test_non_anchor_retained_outcome_contributes_once_to_weekly_portfolio(
+    tmp_path, protocol_source
+):
+    protocol, partitions, _events_by_id = _protocol(protocol_source)
+    eligibility = bind_validation_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+    )
+    market_date = next(
+        event.market_date
+        for event in protocol.input_manifest.events
+        if event.decision_event_id in set(eligibility.event_ids)
+    )
+    baseline, _ = build_tournament_receipt(
+        tmp_path / "baseline-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+    changed, _ = build_tournament_receipt(
+        tmp_path / "changed-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+        gross_return_overrides={(market_date, "T074"): "0.6"},
+    )
+
+    def evaluate(receipt):
+        return evaluate_validation_ta_control(
+            protocol=protocol,
+            eligibility=eligibility,
+            candidates_by_event=dict(receipt.candidates_by_event),
+            execution_outcomes=receipt.outcomes,
+            tournament_input_id=receipt.input_id,
+            tournament_input_sha256=receipt.input_sha256,
+        )
+
+    baseline_result = evaluate(baseline)
+    changed_result = evaluate(changed)
+    baseline_metrics = {
+        row["arm_id"]: row["metrics"] for row in baseline_result.arm_metrics
+    }
+    changed_metrics = {
+        row["arm_id"]: row["metrics"] for row in changed_result.arm_metrics
+    }
+
+    assert (
+        Decimal(changed_metrics["equal_weight"]["net_return_after_costs"])
+        - Decimal(baseline_metrics["equal_weight"]["net_return_after_costs"])
+        == Decimal("0.001333333333333333333333")
+    )
+    assert changed_metrics["equal_weight"]["decision_event_count"] == "75"
+    assert all(
+        changed_metrics[arm] == baseline_metrics[arm]
+        for arm in ("cash", "spy", "momentum_quality", "pullback_support")
+    )
+
+
+def _two_date_validation_protocol(tmp_path, protocol_source):
+    cohort, _old_partitions, _old_manifest = protocol_source
+    primary = cohort.primary_universe_75
+    decision_dates = tuple(
+        (dt.date(2026, 4, 10) + dt.timedelta(weeks=index)).isoformat()
+        for index in range(60)
+    )
+    events = tuple(
+        _event(symbol, market_date, primary)
+        for market_date in decision_dates
+        for symbol in primary
+    )
+    calendar_dates = tuple(
+        (
+            dt.date.fromisoformat(decision_dates[0])
+            + dt.timedelta(days=index)
+        ).isoformat()
+        for index in range(
+            (dt.date.fromisoformat(decision_dates[-1]) - dt.date.fromisoformat(decision_dates[0])).days
+            + 1
+        )
+        if (
+            dt.date.fromisoformat(decision_dates[0]) + dt.timedelta(days=index)
+        ).weekday()
+        < 5
+    )
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "partition-calendar",
+        clock=lambda: dt.datetime(2026, 4, 1, 12, 0, tzinfo=dt.UTC),
+    )
+    artifact = archive.admit(
+        raw_bytes=json.dumps(
+            [{"date": day, "open": "09:30", "close": "16:00"} for day in calendar_dates],
+            separators=(",", ":"),
+        ).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2026-04-01T12:00:00+00:00",
+    )
+    calendar = build_market_session_calendar(archive=archive, raw_artifact=artifact)
+    partitions = build_market_date_partitions(
+        market_calendar=calendar,
+        cadence="weekly",
+        registered_at="2026-04-01T12:01:00+00:00",
+        primary_universe=primary,
+        decision_market_dates=decision_dates,
+        events=events,
+    )
+    manifest = build_bitemporal_input_manifest(
+        dataset_id="two-date-validation-fixture",
+        as_of_cutoff="2027-06-01T21:00:00+00:00",
+        captured_at="2027-06-01T21:00:00+00:00",
+        events=events,
+    )
+    protocol = build_frozen_evaluation_protocol(
+        cohort=cohort,
+        market_date_partitions=partitions,
+        input_manifest=manifest,
+        primary_universe=primary,
+        sensitivity_universe_50=cohort.sensitivity_universe_50,
+        sensitivity_universe_100=cohort.sensitivity_universe_100,
+        evaluation_policy=StrategyEvaluationPolicy(
+            benchmark_symbol="SPY", holding_sessions=5, commission_bps_per_side="0",
+            half_spread_bps_per_side="5", slippage_bps_per_side="5", round_trip_sides=2,
+        ),
+        search_budget=EvaluationSearchBudget(5, 3, 25),
+        development_event_ids=partitions.development_event_ids,
+        validation_event_ids=partitions.validation_event_ids,
+        holdout_event_ids=partitions.holdout_event_ids,
+    )
+    eligibility = bind_validation_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+    )
+    assert len(eligibility.event_ids) == 150
+    return protocol, eligibility
+
+
+def test_two_date_partial_overlap_uses_production_drift_and_all_cost_variants(
+    tmp_path, protocol_source
+):
+    protocol, eligibility = _two_date_validation_protocol(tmp_path, protocol_source)
+    validation_dates = tuple(
+        sorted(
+            {
+                event.market_date
+                for event in protocol.input_manifest.events
+                if event.decision_event_id in set(eligibility.event_ids)
+            }
+        )
+    )
+    first_date, second_date = validation_dates
+    first_selected = frozenset(f"T{index:03d}" for index in range(15))
+    second_selected = frozenset(f"T{index:03d}" for index in range(1, 16))
+    return_overrides = {
+        (market_date, symbol): "0"
+        for market_date in validation_dates
+        for symbol in (*protocol.primary_universe, "SPY")
+    }
+    return_overrides[(first_date, "T000")] = "0.1"
+    return_overrides.update(
+        {(second_date, symbol): "0.2" for symbol in second_selected}
+    )
+    receipt, _archive = build_tournament_receipt(
+        tmp_path / "two-date-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+        gross_return_overrides=return_overrides,
+        momentum_symbols_by_date={
+            first_date: first_selected,
+            second_date: second_selected,
+        },
+    )
+
+    result = evaluate_validation_ta_control(
+        protocol=protocol,
+        eligibility=eligibility,
+        candidates_by_event=dict(receipt.candidates_by_event),
+        execution_outcomes=receipt.outcomes,
+        tournament_input_id=receipt.input_id,
+        tournament_input_sha256=receipt.input_sha256,
+    )
+    variants = {
+        row["cost_bps_per_side"]: {
+            arm["arm_id"]: arm["metrics"] for arm in row["arm_metrics"]
+        }
+        for row in result.cost_variants
+    }
+
+    assert variants["10"]["momentum_quality"]["turnover"] == "2.14569536423841059602649"
+    headline_diagnostics = {
+        row["arm_id"]: row for row in result.registered_statistics["arm_diagnostics"]
+    }
+    assert headline_diagnostics["momentum_quality"]["buy_notional"] == (
+        "1.072847682119205298013245"
+    )
+    assert headline_diagnostics["momentum_quality"]["sell_notional"] == (
+        "1.072847682119205298013245"
+    )
+    for bps in ("5", "10", "25", "50"):
+        c = Decimal(bps) / Decimal("10000")
+        expected = (
+            (Decimal("1") + Decimal(1) / Decimal(150) - c)
+            * (
+                Decimal("1.2")
+                - (Decimal("1") + Decimal(22) / Decimal(151)) * c
+            )
+            - Decimal("1")
+        )
+        expected_text = format(expected.quantize(Decimal("1e-24")).normalize(), "f")
+        assert (
+            variants[bps]["momentum_quality"]["net_return_after_costs"]
+            == expected_text
+        )
+        assert Decimal(
+            variants[bps]["momentum_quality"]["benchmark_excess_after_costs"]
+        ) == Decimal(expected_text) - Decimal(
+            variants[bps]["spy"]["net_return_after_costs"]
+        )
 
 
 def test_two_date_drift_rotation_uses_full_buy_and_sell_notional():

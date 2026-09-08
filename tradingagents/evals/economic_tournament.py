@@ -17,6 +17,7 @@ from tradingagents.evals.economic_evaluation_partition_binding import (
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     CONTROL_ARM_IDS,
+    REQUIRED_METRICS,
     DecisionEvent,
     FrozenEvaluationProtocol,
     validate_decision_event,
@@ -446,9 +447,24 @@ def evaluate_validation_ta_control(
             )
         unavailable = tuple(item.symbol for item in date_outcomes if item.gross_return is None)
         if unavailable:
-            raise EconomicTournamentError(
-                "v3 portfolio metrics are unavailable because required execution "
-                f"outcomes are null: {','.join(unavailable)}"
+            null_metrics = {
+                arm: {
+                    metric: None for metric in REQUIRED_METRICS
+                }
+                for arm in CONTROL_ARM_IDS
+            }
+            return build_validation_evaluation_result(
+                frozen,
+                arm_metrics=null_metrics,  # type: ignore[arg-type]
+                eligibility=bound,
+                cost_variant_metrics={
+                    cost: null_metrics for cost in ("5", "10", "25", "50")
+                },  # type: ignore[arg-type]
+                registered_statistics=None,
+                tournament_input_id=tournament_input_id,
+                tournament_input_sha256=tournament_input_sha256,
+                execution_outcomes=execution_outcomes,
+                unavailable=True,
             )
         returns = {
             item.symbol: Decimal(item.gross_return)

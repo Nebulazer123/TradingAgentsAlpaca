@@ -335,6 +335,102 @@ def test_economic_tournament_run_binds_only_purged_validation_results(
     assert final_payload["holdout_release_object_id"] == release_payload["holdout_release_object_id"]
 
 
+def test_economic_tournament_run_admits_unavailable_as_completed_nonqualifying(
+    tmp_path: Path, protocol_source
+):
+    protocol, partitions = _partitioned_protocol(protocol_source)
+    protocol_path = tmp_path / "protocol.json"
+    partitions_path = tmp_path / "partitions.json"
+    tournament_path = tmp_path / "unavailable-tournament-input.json"
+    protocol_path.write_text(json.dumps(protocol.to_dict()), encoding="utf-8")
+    partitions_path.write_text(json.dumps(partitions.to_dict()), encoding="utf-8")
+    eligibility = bind_validation_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+    )
+    market_date = next(
+        event.market_date
+        for event in protocol.input_manifest.events
+        if event.decision_event_id in set(eligibility.event_ids)
+    )
+    source_input, archive = build_tournament_receipt(
+        tmp_path / "unavailable-tournament-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+        unavailable_next_open=frozenset({(market_date, "T001")}),
+    )
+    tournament_path.write_bytes(source_input.canonical_json_bytes())
+    admitted = runner.invoke(app, _admit_args(tmp_path, protocol_path))
+    assert admitted.exit_code == 0, admitted.output
+    args = [
+        "research",
+        "economic-tournament-run",
+        "--protocol-path",
+        str(protocol_path),
+        "--partitions-path",
+        str(partitions_path),
+        "--tournament-input-path",
+        str(tournament_path),
+        "--pit-artifact-root",
+        str(archive.root),
+        "--evidence-root",
+        str(tmp_path / "evidence"),
+        "--repo-root",
+        str(tmp_path / "repo"),
+        "--effective-at",
+        NOW.isoformat(timespec="seconds"),
+        "--json-output",
+    ]
+
+    completed = runner.invoke(app, args)
+
+    assert completed.exit_code == 0, completed.output
+    payload = json.loads(completed.output)
+    assert payload["availability_status"] == "unavailable"
+    assert payload["qualification_status"] == (
+        "nonqualifying_unavailable_execution_evidence"
+    )
+    assert payload["evaluation_run_object_id"]
+    assert payload["analysis_only"] is True
+    assert payload["execution_authority"] == "none"
+    assert payload["can_submit_orders"] is False
+    status = runner.invoke(
+        app,
+        [
+            "research",
+            "economic-readiness-status",
+            "--protocol-id",
+            protocol.protocol_id,
+            "--evidence-root",
+            str(tmp_path / "evidence"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+            "--json-output",
+        ],
+    )
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.output)["state"] == "validation_not_admitted"
+    release = runner.invoke(
+        app,
+        [
+            "research",
+            "economic-holdout-release",
+            "--protocol-id",
+            protocol.protocol_id,
+            "--released-by",
+            "owner-corbin",
+            "--released-at",
+            NOW.isoformat(timespec="seconds"),
+            "--evidence-root",
+            str(tmp_path / "evidence"),
+            "--repo-root",
+            str(tmp_path / "repo"),
+            "--json-output",
+        ],
+    )
+    assert release.exit_code == 2
+
+
 def test_economic_tournament_run_rejects_malformed_local_input_before_evidence_write(
     tmp_path: Path, protocol_source
 ):

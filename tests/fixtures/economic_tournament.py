@@ -6,6 +6,7 @@ import datetime as dt
 import json
 from collections import OrderedDict
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 
 from tradingagents.dataflows.pit import (
@@ -144,6 +145,7 @@ def _candidate_row(
     *,
     event,
     security_id: str,
+    momentum_selected: frozenset[str] | None = None,
 ) -> tuple[dict[str, object], SecurityIdentity]:
     security, security_observation = _security(
         archive,
@@ -152,13 +154,15 @@ def _candidate_row(
         security_id=security_id,
         available_at=event.available_at,
     )
+    selected = momentum_selected is not None and event.symbol in momentum_selected
+    default_anchor = momentum_selected is None and event.symbol == "T000"
     candidate = {
         "symbol": event.symbol,
         "available_at": event.available_at,
-        "close_t_21": "110" if event.symbol == "T000" else None,
-        "close_t_252": None,
-        "trailing_operating_income": None,
-        "average_total_assets": None,
+        "close_t_21": "110" if selected or default_anchor else None,
+        "close_t_252": "100" if selected else None,
+        "trailing_operating_income": "10" if selected else None,
+        "average_total_assets": "100" if selected else None,
         "pullback_features": None,
     }
     clock_value[0] = dt.datetime.fromisoformat(event.available_at)
@@ -177,18 +181,33 @@ def _candidate_row(
         value_path=["value"],
     )
     field_sources = []
-    if event.symbol == "T000":
-        field_sources.append(
+    source_values = (
+        (
+            ("close_t_21", "110"),
+            ("close_t_252", "100"),
+            ("trailing_operating_income", "10"),
+            ("average_total_assets", "100"),
+        )
+        if selected
+        else (("close_t_21", "110"),)
+        if default_anchor
+        else ()
+    )
+    if source_values:
+        for field, value in sorted(
+            source_values
+        ):
+            field_sources.append(
             {
-                "field": "close_t_21",
-                "value": "110",
+                "field": field,
+                "value": value,
                 "observation": _observation(
                     artifact=artifact,
                     security=security,
-                    observed_value="110",
+                    observed_value=value,
                     available_at=event.available_at,
                     source_kind="economic_candidate_json",
-                    value_path=["value", "close_t_21"],
+                    value_path=["value", field],
                 ).to_dict(),
             }
         )
@@ -221,6 +240,7 @@ def _outcome_window(
     *,
     security: SecurityIdentity,
     market_date: str,
+    gross_return: str | None = None,
 ) -> SourceBoundAdjustedPriceWindow:
     session_dates = _next_weekdays(market_date)
     start, end = session_dates[0], session_dates[-1]
@@ -232,7 +252,11 @@ def _outcome_window(
                 security.symbol: [
                     {
                         "t": f"{session_date}T05:00:00Z",
-                        "c": str(11 + index),
+                        "c": (
+                            str(Decimal("10") * (Decimal("1") + Decimal(gross_return)))
+                            if gross_return is not None and index == len(session_dates) - 1
+                            else str(11 + index)
+                        ),
                     }
                     for index, session_date in enumerate(session_dates)
                 ]
@@ -266,6 +290,9 @@ def build_tournament_receipt(
     protocol: FrozenEvaluationProtocol,
     eligibility: ValidationPhaseEligibility,
     security_id_overrides: Mapping[str, str] | None = None,
+    unavailable_next_open: frozenset[tuple[str, str]] = frozenset(),
+    gross_return_overrides: Mapping[tuple[str, str], str] | None = None,
+    momentum_symbols_by_date: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[SourceBoundTournamentInput, RawPointInTimeArtifactArchive]:
     """Build a complete receipt while preserving the pre/post outcome boundary."""
 
@@ -276,6 +303,8 @@ def build_tournament_receipt(
         for row in protocol.cohort.ranking[: len(protocol.primary_universe)]
     }
     overrides = dict(security_id_overrides or {})
+    return_overrides = dict(gross_return_overrides or {})
+    momentum_overrides = dict(momentum_symbols_by_date or {})
     events_by_id = {
         event.decision_event_id: event for event in protocol.input_manifest.events
     }
@@ -299,6 +328,7 @@ def build_tournament_receipt(
                     event.symbol,
                     primary_security_ids[event.symbol],
                 ),
+                momentum_selected=momentum_overrides.get(market_date),
             )
             candidates.append(candidate)
             identities[security.symbol] = security
@@ -388,6 +418,7 @@ def build_tournament_receipt(
                 clock_value,
                 security=security,
                 market_date=market_date,
+                gross_return=return_overrides.get((market_date, symbol)),
             )
             official_open = resolve_market_session_open(
                 archive=archive,
@@ -409,15 +440,43 @@ def build_tournament_receipt(
                 ),
                 ExecutionPriceTwin(
                     price_basis="next_open",
-                    status="available",
+                    status=(
+                        "unavailable"
+                        if (market_date, symbol) in unavailable_next_open
+                        else "available"
+                    ),
                     security_id=security.security_id,
                     session_date=window.entry_date,
-                    observed_at=official_open,
-                    price="10",
-                    adjustment_status="total_return_adjusted",
-                    source_artifact_id=window.raw_artifact_id,
-                    source_artifact_sha256=window.raw_artifact_sha256,
-                    unavailable_reason=None,
+                    observed_at=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else official_open
+                    ),
+                    price=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else "10"
+                    ),
+                    adjustment_status=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else "total_return_adjusted"
+                    ),
+                    source_artifact_id=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else window.raw_artifact_id
+                    ),
+                    source_artifact_sha256=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else window.raw_artifact_sha256
+                    ),
+                    unavailable_reason=(
+                        "source_not_retained"
+                        if (market_date, symbol) in unavailable_next_open
+                        else None
+                    ),
                 ),
                 ExecutionPriceTwin(
                     price_basis="executable_quote",

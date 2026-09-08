@@ -3107,7 +3107,7 @@ def _economic_validation_report(
     """Wrap one canonical validation result in the immutable admission schema."""
 
     result_payload = result.to_dict()
-    return {
+    report = {
         "schema_version": "economic_validation_report/v3",
         "protocol_id": protocol_id,
         "market_date_partitions": partitions.to_dict(),
@@ -3123,6 +3123,10 @@ def _economic_validation_report(
         "execution_authority": "none",
         "can_submit_orders": False,
     }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
 
 
 def _economic_effective_at(value: str) -> datetime.datetime:
@@ -3338,6 +3342,8 @@ def research_economic_tournament_run(
         "evaluation_run_object_id": admission.envelope.object_id,
         "created": admission.created,
         "evidence_root": str(evidence_root),
+        "availability_status": result.availability_status,
+        "qualification_status": result.qualification_status,
     }
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
