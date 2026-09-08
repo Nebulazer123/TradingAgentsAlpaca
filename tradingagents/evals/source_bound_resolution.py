@@ -477,6 +477,8 @@ def load_source_bound_window_lookup(
     raw_artifact_archive: str | Path,
     raw_artifact_receipts: Sequence[str | Path],
     price_window_receipts: Sequence[str | Path],
+    economic_protocol_receipt: str | Path | None = None,
+    forecast_event_bindings_receipt: str | Path | None = None,
 ) -> SourceBoundWindowLookup:
     """Load an explicit no-fallback lookup from canonical local receipts."""
 
@@ -488,6 +490,23 @@ def load_source_bound_window_lookup(
         price_window_receipts, (bytes, str)
     ):
         raise PointInTimeDataError("price_window_receipts must be a receipt-path sequence")
+    if (economic_protocol_receipt is None) != (forecast_event_bindings_receipt is None):
+        raise PointInTimeDataError(
+            "economic protocol and forecast-event bindings must be supplied together"
+        )
+    protocol = None
+    bindings = None
+    if economic_protocol_receipt is not None:
+        from tradingagents.evals.economic_evaluation_protocol import (
+            validate_frozen_evaluation_protocol,
+        )
+
+        protocol = validate_frozen_evaluation_protocol(
+            _receipt_payload(economic_protocol_receipt, label="economic protocol")
+        )
+        bindings = _receipt_payload(
+            forecast_event_bindings_receipt, label="forecast-event bindings"
+        )
     archive = RawPointInTimeArtifactArchive(raw_artifact_archive)
     artifacts: dict[str, RawPointInTimeArtifact] = {}
     for receipt_path in raw_artifact_receipts:
@@ -508,4 +527,6 @@ def load_source_bound_window_lookup(
         archive=archive,
         raw_artifacts=artifacts,
         receipts=tuple(receipts),
+        economic_protocol=protocol,
+        forecast_event_bindings=bindings,
     )

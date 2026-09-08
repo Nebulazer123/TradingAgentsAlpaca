@@ -1580,6 +1580,37 @@ def research_agent_ledger_from_mirofish(
     console.print(f"Ledger: {ledger_path}")
 
 
+def _learning_pit_window_lookup(
+    *,
+    archive: Path | None,
+    raw_receipts: list[Path],
+    window_receipts: list[Path],
+    protocol: Path | None,
+    bindings: Path | None,
+    operation: str,
+):
+    if not any((archive is not None, raw_receipts, window_receipts,
+                protocol is not None, bindings is not None)):
+        return None
+    if archive is None or not raw_receipts or not window_receipts:
+        raise typer.BadParameter(
+            f"source-bound {operation} requires --pit-raw-artifact-archive plus at least "
+            "one --pit-raw-artifact-receipt and --pit-price-window-receipt"
+        )
+    try:
+        return load_source_bound_window_lookup(
+            raw_artifact_archive=archive,
+            raw_artifact_receipts=tuple(raw_receipts),
+            price_window_receipts=tuple(window_receipts),
+            economic_protocol_receipt=protocol,
+            forecast_event_bindings_receipt=bindings,
+        )
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(
+            f"source-bound PIT {operation} inputs are invalid: {exc}"
+        ) from exc
+
+
 @research_app.command("agent-ledger-resolve")
 def research_agent_ledger_resolve(
     ledger_path: Path = typer.Option(
@@ -1621,6 +1652,14 @@ def research_agent_ledger_resolve(
         readable=True,
         help="Canonical source-bound adjusted-price receipt JSON. Repeat for every window.",
     ),
+    pit_economic_protocol: Path | None = typer.Option(
+        None, "--pit-economic-protocol", exists=True, readable=True,
+        help="Exact frozen economic protocol JSON, paired with explicit forecast-event bindings.",
+    ),
+    pit_forecast_event_bindings: Path | None = typer.Option(
+        None, "--pit-forecast-event-bindings", exists=True, readable=True,
+        help="JSON forecast-ID to decision-event-ID mapping; never inferred from legacy rows.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     context_ticker: str = typer.Option("", "--context-ticker"),
     context_setup: str = typer.Option("", "--context-setup"),
@@ -1642,31 +1681,16 @@ def research_agent_ledger_resolve(
         ledger_path,
         learning_availability_root,
     )
-    pit_inputs_supplied = (
-        pit_raw_artifact_archive is not None
-        or bool(pit_raw_artifact_receipts)
-        or bool(pit_price_window_receipts)
+    window_lookup = _learning_pit_window_lookup(
+        archive=pit_raw_artifact_archive,
+        raw_receipts=pit_raw_artifact_receipts,
+        window_receipts=pit_price_window_receipts,
+        protocol=pit_economic_protocol,
+        bindings=pit_forecast_event_bindings,
+        operation="resolution",
     )
-    if pit_inputs_supplied and (
-        pit_raw_artifact_archive is None
-        or not pit_raw_artifact_receipts
-        or not pit_price_window_receipts
-    ):
-        raise typer.BadParameter(
-            "source-bound resolution requires --pit-raw-artifact-archive plus at least "
-            "one --pit-raw-artifact-receipt and --pit-price-window-receipt"
-        )
+    pit_inputs_supplied = window_lookup is not None
     if pit_inputs_supplied:
-        try:
-            window_lookup = load_source_bound_window_lookup(
-                raw_artifact_archive=pit_raw_artifact_archive,
-                raw_artifact_receipts=tuple(pit_raw_artifact_receipts),
-                price_window_receipts=tuple(pit_price_window_receipts),
-            )
-        except ValueError as exc:
-            raise typer.BadParameter(
-                f"source-bound PIT resolution inputs are invalid: {exc}"
-            ) from exc
         price_window_route = "source_bound_adjusted_pit_receipts"
     else:
         window_lookup = _ledger_window_lookup
@@ -1701,6 +1725,7 @@ def research_agent_ledger_resolve(
         resolved,
         path=summary_path,
         source_bound_verifier=window_lookup if pit_inputs_supplied else None,
+        ledger_path=ledger_path,
     )
     resolution_quality_path.parent.mkdir(parents=True, exist_ok=True)
     resolution_quality_path.write_text(
@@ -1799,6 +1824,14 @@ def research_ledger_quality_audit(
         readable=True,
         help="Canonical source-bound adjusted-price receipt JSON. Repeat for every window.",
     ),
+    pit_economic_protocol: Path | None = typer.Option(
+        None, "--pit-economic-protocol", exists=True, readable=True,
+        help="Exact frozen economic protocol JSON, paired with explicit forecast-event bindings.",
+    ),
+    pit_forecast_event_bindings: Path | None = typer.Option(
+        None, "--pit-forecast-event-bindings", exists=True, readable=True,
+        help="JSON forecast-ID to decision-event-ID mapping; never inferred from legacy rows.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     backup: bool = typer.Option(
         True,
@@ -1820,31 +1853,16 @@ def research_ledger_quality_audit(
         ledger_path,
         learning_availability_root,
     )
-    pit_inputs_supplied = (
-        pit_raw_artifact_archive is not None
-        or bool(pit_raw_artifact_receipts)
-        or bool(pit_price_window_receipts)
+    window_lookup = _learning_pit_window_lookup(
+        archive=pit_raw_artifact_archive,
+        raw_receipts=pit_raw_artifact_receipts,
+        window_receipts=pit_price_window_receipts,
+        protocol=pit_economic_protocol,
+        bindings=pit_forecast_event_bindings,
+        operation="audit",
     )
-    if pit_inputs_supplied and (
-        pit_raw_artifact_archive is None
-        or not pit_raw_artifact_receipts
-        or not pit_price_window_receipts
-    ):
-        raise typer.BadParameter(
-            "source-bound audit requires --pit-raw-artifact-archive plus at least "
-            "one --pit-raw-artifact-receipt and --pit-price-window-receipt"
-        )
+    pit_inputs_supplied = window_lookup is not None
     if pit_inputs_supplied:
-        try:
-            window_lookup = load_source_bound_window_lookup(
-                raw_artifact_archive=pit_raw_artifact_archive,
-                raw_artifact_receipts=tuple(pit_raw_artifact_receipts),
-                price_window_receipts=tuple(pit_price_window_receipts),
-            )
-        except ValueError as exc:
-            raise typer.BadParameter(
-                f"source-bound PIT audit inputs are invalid: {exc}"
-            ) from exc
         price_window_route = "source_bound_adjusted_pit_receipts"
     else:
         window_lookup = _ledger_window_lookup
@@ -1894,6 +1912,7 @@ def research_ledger_quality_audit(
         audited,
         path=summary_path,
         source_bound_verifier=window_lookup if pit_inputs_supplied else None,
+        ledger_path=ledger_path,
     )
     quality_summary = summarize_resolution_quality(quality_reports)
     quality_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2162,6 +2181,19 @@ def research_agent_ledger_reconcile(
         "--receipt-path",
         help="Optional path for an atomic write of the reconciliation receipt only.",
     ),
+    pit_raw_artifact_archive: Path | None = typer.Option(None, "--pit-raw-artifact-archive"),
+    pit_raw_artifact_receipts: list[Path] = typer.Option(
+        [], "--pit-raw-artifact-receipt", exists=True, readable=True,
+    ),
+    pit_price_window_receipts: list[Path] = typer.Option(
+        [], "--pit-price-window-receipt", exists=True, readable=True,
+    ),
+    pit_economic_protocol: Path | None = typer.Option(
+        None, "--pit-economic-protocol", exists=True, readable=True,
+    ),
+    pit_forecast_event_bindings: Path | None = typer.Option(
+        None, "--pit-forecast-event-bindings", exists=True, readable=True,
+    ),
 ):
     """Emit a read-only reconciliation receipt for one ledger byte snapshot.
 
@@ -2172,18 +2204,38 @@ def research_agent_ledger_reconcile(
     decision identity counts remain unavailable until a verified binding is
     present in the learning source contract.
     """
+    window_lookup = _learning_pit_window_lookup(
+        archive=pit_raw_artifact_archive,
+        raw_receipts=pit_raw_artifact_receipts,
+        window_receipts=pit_price_window_receipts,
+        protocol=pit_economic_protocol,
+        bindings=pit_forecast_event_bindings,
+        operation="reconciliation",
+    )
     try:
-        receipt = reconcile_ledger_file(ledger_path, summary_path=summary_path)
+        receipt = reconcile_ledger_file(
+            ledger_path, summary_path=summary_path, source_bound_verifier=window_lookup,
+        )
     except SummaryReadError as exc:
         raise typer.BadParameter(str(exc)) from exc
     except OSError as exc:
         raise typer.BadParameter(f"could not read ledger: {exc}") from exc
     if receipt_path is not None:
         try:
+            if pit_raw_artifact_archive is not None and receipt_path.resolve().is_relative_to(
+                pit_raw_artifact_archive.resolve()
+            ):
+                raise ReconciliationPathError("receipt path is inside the protected PIT archive")
+            source_paths = (
+                *pit_raw_artifact_receipts,
+                *pit_price_window_receipts,
+                *(path for path in (pit_economic_protocol, pit_forecast_event_bindings)
+                  if path is not None),
+            )
             write_reconciliation_receipt(
                 receipt,
                 receipt_path,
-                protected_paths=(ledger_path, summary_path),
+                protected_paths=(ledger_path, summary_path, *source_paths),
             )
         except ReconciliationPathError as exc:
             raise typer.BadParameter(f"rejected receipt path: {exc}") from exc

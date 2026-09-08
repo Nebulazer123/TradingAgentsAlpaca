@@ -1458,6 +1458,11 @@ def resolve_forecasts(
     return resolved
 
 
+def _ledger_jsonl_bytes(forecasts: Sequence[AgentForecast]) -> bytes:
+    text = "\n".join(json.dumps(forecast.as_dict(), sort_keys=True) for forecast in forecasts)
+    return ((text + "\n") if text else "").encode("utf-8")
+
+
 def write_ledger(
     forecasts: Sequence[AgentForecast],
     *,
@@ -1465,8 +1470,7 @@ def write_ledger(
 ) -> None:
     ledger_path = Path(path)
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    text = "\n".join(json.dumps(forecast.as_dict(), sort_keys=True) for forecast in forecasts)
-    ledger_path.write_text((text + "\n") if text else "", encoding="utf-8")
+    ledger_path.write_bytes(_ledger_jsonl_bytes(forecasts))
 
 
 def summarize_agent_scores(forecasts: Sequence[AgentForecast]) -> dict[str, Any]:
@@ -1933,14 +1937,32 @@ def write_summary(
     *,
     path: str | Path = DEFAULT_SUMMARY_PATH,
     source_bound_verifier: SourceBoundWindowLookup | None = None,
+    ledger_path: str | Path | None = None,
 ) -> Path:
     summary_path = Path(path)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary = summarize_agent_scores(forecasts)
     summary["influence_weights"] = agent_influence_weights(
         forecasts,
         source_bound_verifier=source_bound_verifier,
     )
+    if ledger_path is not None:
+        ledger_file = Path(ledger_path)
+        try:
+            aliases_ledger = summary_path.samefile(ledger_file)
+        except FileNotFoundError:
+            aliases_ledger = summary_path.resolve() == ledger_file.resolve()
+        if aliases_ledger:
+            raise ValueError("summary path aliases the source ledger")
+        ledger_bytes = ledger_file.read_bytes()
+        if ledger_bytes != _ledger_jsonl_bytes(forecasts):
+            raise ValueError("summary forecasts do not match the persisted ledger snapshot")
+        summary["ledger_fingerprint"] = {
+            "ledger_sha256": hashlib.sha256(ledger_bytes).hexdigest(),
+            "ledger_byte_length": len(ledger_bytes),
+            "valid_forecast_count": len(forecasts),
+            "resolved_row_count": sum(forecast.resolved for forecast in forecasts),
+        }
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True),
         encoding="utf-8",

@@ -596,6 +596,61 @@ def test_cli_prints_canonical_json_and_hermetic_summary_state(tmp_path):
     assert result.output.strip() == canonical_json_text(payload)
 
 
+@pytest.mark.parametrize("target_kind", ("raw_receipt", "window_receipt", "archive"))
+def test_cli_reconciliation_preserves_its_pit_inputs(tmp_path, target_kind):
+    from tests.test_source_bound_resolution import _window
+
+    archive, artifact, window = _window(tmp_path)
+    raw_path, window_path = tmp_path / "raw.json", tmp_path / "window.json"
+    raw_path.write_bytes(artifact.canonical_json_bytes())
+    window_path.write_bytes(window.canonical_json_bytes())
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_bytes(b"")
+    target = {"raw_receipt": raw_path, "window_receipt": window_path,
+              "archive": archive.root / "reconciliation.json"}[target_kind]
+    before = {path: path.read_bytes() for path in (raw_path, window_path)}
+    result = runner.invoke(app, [
+        "research", "agent-ledger-reconcile", "--ledger-path", str(ledger),
+        "--summary-path", str(tmp_path / "missing-summary.json"),
+        "--pit-raw-artifact-archive", str(archive.root),
+        "--pit-raw-artifact-receipt", str(raw_path),
+        "--pit-price-window-receipt", str(window_path),
+        "--receipt-path", str(target),
+    ])
+    assert result.exit_code == 2, result.output
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (archive.root / "reconciliation.json").exists()
+
+
+def test_summary_fingerprint_refuses_forecasts_from_a_different_ledger(tmp_path):
+    from tradingagents.evals.agent_intelligence_ledger import write_ledger, write_summary
+
+    ledger, summary = tmp_path / "ledger.jsonl", tmp_path / "summary.json"
+    stored, unrelated = _forecast("stored"), _forecast("different")
+    write_ledger([stored], path=ledger)
+    summary.write_bytes(b"preserve-existing-summary")
+    with pytest.raises(ValueError, match="do not match the persisted ledger"):
+        write_summary([unrelated], path=summary, ledger_path=ledger)
+    assert summary.read_bytes() == b"preserve-existing-summary"
+
+
+@pytest.mark.parametrize("alias_kind", ("direct", "hardlink"))
+def test_summary_fingerprint_cannot_replace_its_source_ledger(tmp_path, alias_kind):
+    from tradingagents.evals.agent_intelligence_ledger import write_ledger, write_summary
+
+    ledger = tmp_path / "ledger.jsonl"
+    forecasts = [_forecast()]
+    write_ledger(forecasts, path=ledger)
+    before = ledger.read_bytes()
+    target = ledger
+    if alias_kind == "hardlink":
+        target = tmp_path / "summary.json"
+        target.hardlink_to(ledger)
+    with pytest.raises(ValueError, match="summary path aliases the source ledger"):
+        write_summary(forecasts, path=target, ledger_path=ledger)
+    assert ledger.read_bytes() == before
+
+
 def test_cli_writes_only_the_receipt_atomically_when_asked(tmp_path):
     ledger_path = tmp_path / "ledger.jsonl"
     ledger_path.write_bytes(_mixed_ledger_bytes())
