@@ -190,8 +190,10 @@ def test_receipt_counts_synthetic_mixed_ledger_exactly():
         == ECONOMIC_IDENTITY_STATUS_UNAVAILABLE
     )
     assert receipt["economic_decision_identity_reason"] == (
-        "agent_forecast_v1_has_no_verified_economic_decision_event_binding"
+        "no_source_bound_verifier_with_frozen_economic_protocol"
     )
+    assert receipt["economic_decision_verified_resolved_row_count"] == 0
+    assert receipt["economic_decision_unbound_resolved_row_count"] == 6
     assert "provisional_effective_sample" not in receipt
 
 

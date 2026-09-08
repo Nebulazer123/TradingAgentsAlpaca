@@ -8,6 +8,7 @@ from the exact raw source bytes.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from collections.abc import Mapping, Sequence
 from decimal import Decimal, InvalidOperation
@@ -34,6 +35,21 @@ __all__ = [
 _RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v2"
 _RESOLUTION_EVIDENCE_FIELDS = frozenset(
     {"schema_version", "ticker", "benchmark", "alpha_threshold_pct"}
+)
+_ECONOMIC_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v3"
+_ECONOMIC_RESOLUTION_EVIDENCE_FIELDS = frozenset(
+    {*_RESOLUTION_EVIDENCE_FIELDS, "economic_decision"}
+)
+_ECONOMIC_DECISION_FIELDS = frozenset(
+    {
+        "protocol_id",
+        "input_manifest_id",
+        "input_manifest_sha256",
+        "decision_event_id",
+        "decision_at",
+        "market_date",
+        "source_packet_id",
+    }
 )
 
 
@@ -139,10 +155,90 @@ class SourceBoundWindowLookup:
         archive: RawPointInTimeArtifactArchive,
         artifacts: Mapping[str, RawPointInTimeArtifact],
         receipts: Mapping[tuple[str, str, str], SourceBoundAdjustedPriceWindow],
+        economic_protocol: object | None = None,
+        forecast_event_bindings: Mapping[str, str] | None = None,
     ) -> None:
         self._archive = archive
         self._artifacts = dict(artifacts)
         self._receipts = dict(receipts)
+        self._economic_protocol = None
+        self._events_by_id: dict[str, object] = {}
+        self._forecast_event_bindings: dict[str, str] = {}
+        if economic_protocol is None and forecast_event_bindings is None:
+            return
+        if economic_protocol is None or forecast_event_bindings is None:
+            raise PointInTimeDataError(
+                "economic protocol and forecast-event bindings must be supplied together"
+            )
+        from tradingagents.evals.economic_evaluation_protocol import (
+            FrozenEvaluationProtocol,
+            validate_frozen_evaluation_protocol,
+        )
+
+        if type(economic_protocol) is not FrozenEvaluationProtocol:
+            raise PointInTimeDataError(
+                "economic protocol must be an exact FrozenEvaluationProtocol"
+            )
+        try:
+            validated = validate_frozen_evaluation_protocol(economic_protocol.to_dict())
+        except (TypeError, ValueError) as exc:
+            raise PointInTimeDataError("economic protocol failed validation") from exc
+        if validated.canonical_json_bytes() != economic_protocol.canonical_json_bytes():
+            raise PointInTimeDataError("economic protocol is not canonical")
+        if not isinstance(forecast_event_bindings, Mapping):
+            raise PointInTimeDataError("forecast-event bindings must be a mapping")
+        events = {event.decision_event_id: event for event in validated.input_manifest.events}
+        bindings: dict[str, str] = {}
+        for forecast_id, event_id in forecast_event_bindings.items():
+            if (
+                type(forecast_id) is not str
+                or not forecast_id.strip()
+                or type(event_id) is not str
+                or event_id not in events
+            ):
+                raise PointInTimeDataError("forecast-event binding is invalid")
+            bindings[forecast_id] = event_id
+        self._economic_protocol = validated
+        self._events_by_id = events
+        self._forecast_event_bindings = bindings
+
+    def economic_decision_evidence(self, forecast: object) -> dict[str, str] | None:
+        """Return a binding only for an exact forecast-to-manifest mapping."""
+
+        protocol = self._economic_protocol
+        if protocol is None:
+            return None
+        forecast_id = getattr(forecast, "forecast_id", None)
+        event_id = self._forecast_event_bindings.get(forecast_id)
+        event = self._events_by_id.get(event_id or "")
+        if event is None:
+            return None
+        created_at = getattr(forecast, "created_at", None)
+        try:
+            created = dt.datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if created.tzinfo is None:
+            return None
+        created_date = created.astimezone(dt.timezone.utc).date().isoformat()
+        if (
+            getattr(forecast, "ticker", None) != event.symbol
+            or getattr(forecast, "benchmark", None) != event.benchmark
+            or getattr(forecast, "source_packet_id", None) != event.source_packet_id
+            or created_at != event.created_at
+            or getattr(forecast, "horizon", None) != event.horizon
+            or created_date != event.market_date
+        ):
+            return None
+        return {
+            "protocol_id": protocol.protocol_id,
+            "input_manifest_id": protocol.input_manifest_id,
+            "input_manifest_sha256": protocol.input_manifest_sha256,
+            "decision_event_id": event.decision_event_id,
+            "decision_at": event.decision_at,
+            "market_date": event.market_date,
+            "source_packet_id": event.source_packet_id,
+        }
 
     def __call__(
         self,
@@ -189,19 +285,40 @@ class SourceBoundWindowLookup:
             return False
         ticker_evidence = ticker_window.source_evidence
         benchmark_evidence = benchmark_window.source_evidence
-        if not isinstance(evidence, Mapping) or set(evidence) != _RESOLUTION_EVIDENCE_FIELDS:
+        if not isinstance(evidence, Mapping) or set(evidence) not in (
+            _RESOLUTION_EVIDENCE_FIELDS,
+            _ECONOMIC_RESOLUTION_EVIDENCE_FIELDS,
+        ):
             return False
+        schema_version = evidence.get("schema_version")
+        if schema_version not in (
+            _RESOLUTION_EVIDENCE_SCHEMA,
+            _ECONOMIC_RESOLUTION_EVIDENCE_SCHEMA,
+        ):
+            return False
+        economic_evidence = None
+        if schema_version == _ECONOMIC_RESOLUTION_EVIDENCE_SCHEMA:
+            economic_evidence = self.economic_decision_evidence(forecast)
+            if (
+                economic_evidence is None
+                or not isinstance(evidence.get("economic_decision"), Mapping)
+                or set(evidence["economic_decision"]) != _ECONOMIC_DECISION_FIELDS
+                or evidence["economic_decision"] != economic_evidence
+            ):
+                return False
         alpha_threshold = _alpha_threshold(evidence["alpha_threshold_pct"])
+        expected_evidence = {
+            "schema_version": schema_version,
+            "ticker": ticker_evidence,
+            "benchmark": benchmark_evidence,
+            "alpha_threshold_pct": evidence["alpha_threshold_pct"],
+        }
+        if economic_evidence is not None:
+            expected_evidence["economic_decision"] = economic_evidence
         if (
             alpha_threshold is None
             or evidence["alpha_threshold_pct"] != _canonical_alpha_threshold(alpha_threshold)
-            or evidence
-            != {
-                "schema_version": _RESOLUTION_EVIDENCE_SCHEMA,
-                "ticker": ticker_evidence,
-                "benchmark": benchmark_evidence,
-                "alpha_threshold_pct": evidence["alpha_threshold_pct"],
-            }
+            or evidence != expected_evidence
         ):
             return False
 
@@ -251,6 +368,8 @@ def build_source_bound_window_lookup(
     archive: RawPointInTimeArtifactArchive,
     raw_artifacts: Mapping[str, RawPointInTimeArtifact],
     receipts: Sequence[SourceBoundAdjustedPriceWindow],
+    economic_protocol: object | None = None,
+    forecast_event_bindings: Mapping[str, str] | None = None,
 ) -> SourceBoundWindowLookup:
     """Build a no-fallback lookup backed solely by re-verified PIT receipts."""
 
@@ -293,6 +412,8 @@ def build_source_bound_window_lookup(
         archive=archive,
         artifacts=artifacts,
         receipts=indexed,
+        economic_protocol=economic_protocol,
+        forecast_event_bindings=forecast_event_bindings,
     )
 
 

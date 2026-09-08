@@ -42,6 +42,18 @@ DEFAULT_AGENT_WEIGHT_CEILING = Decimal("1.50")
 DEFER_INVALID_FORECAST_TIMESTAMPS = "invalid_forecast_timestamps"
 NONQUALIFYING_LEGACY_PRICE_WINDOW = "legacy_yfinance_nonqualifying"
 _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v2"
+_ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v3"
+_ECONOMIC_DECISION_EVIDENCE_FIELDS = frozenset(
+    {
+        "protocol_id",
+        "input_manifest_id",
+        "input_manifest_sha256",
+        "decision_event_id",
+        "decision_at",
+        "market_date",
+        "source_packet_id",
+    }
+)
 _SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_SCHEMA = "source_bound_price_window_evidence/v1"
 _SOURCE_BOUND_PRICE_WINDOW_EVIDENCE_FIELDS = frozenset(
     {
@@ -180,6 +192,7 @@ def _source_bound_resolution_evidence(
     benchmark_window: Any,
     *,
     alpha_threshold_pct: Decimal,
+    economic_decision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Bind both return legs to the receipts that supplied their closes."""
 
@@ -190,12 +203,36 @@ def _source_bound_resolution_evidence(
     threshold = _canonical_alpha_threshold(alpha_threshold_pct)
     if threshold is None:
         return None
-    return {
-        "schema_version": _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+    evidence = {
+        "schema_version": (
+            _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA
+            if economic_decision is not None
+            else _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA
+        ),
         "ticker": ticker,
         "benchmark": benchmark,
         "alpha_threshold_pct": threshold,
     }
+    if economic_decision is not None:
+        if set(economic_decision) != _ECONOMIC_DECISION_EVIDENCE_FIELDS or not all(
+            isinstance(value, str) and value for value in economic_decision.values()
+        ):
+            return None
+        evidence["economic_decision"] = dict(economic_decision)
+    return evidence
+
+
+def _economic_decision_evidence(
+    window_lookup: WindowLookup,
+    forecast: AgentForecast,
+) -> Mapping[str, Any] | None:
+    """Use only the exact source-bound lookup's frozen-protocol binding."""
+
+    from tradingagents.evals.source_bound_resolution import SourceBoundWindowLookup
+
+    if type(window_lookup) is not SourceBoundWindowLookup:
+        return None
+    return window_lookup.economic_decision_evidence(forecast)
 
 
 def has_source_bound_resolution_evidence(forecast: AgentForecast) -> bool:
@@ -205,12 +242,36 @@ def has_source_bound_resolution_evidence(forecast: AgentForecast) -> bool:
     if (
         not isinstance(evidence, Mapping)
         or set(evidence)
-        != {"schema_version", "ticker", "benchmark", "alpha_threshold_pct"}
-        or evidence["schema_version"] != _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA
+        not in (
+            {"schema_version", "ticker", "benchmark", "alpha_threshold_pct"},
+            {
+                "schema_version",
+                "ticker",
+                "benchmark",
+                "alpha_threshold_pct",
+                "economic_decision",
+            },
+        )
+        or evidence["schema_version"]
+        not in (
+            _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+            _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+        )
     ):
         return False
     threshold = _canonical_alpha_threshold(evidence["alpha_threshold_pct"])
     if threshold is None or threshold != evidence["alpha_threshold_pct"]:
+        return False
+
+    if evidence["schema_version"] == _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        economic = evidence.get("economic_decision")
+        if (
+            not isinstance(economic, Mapping)
+            or set(economic) != _ECONOMIC_DECISION_EVIDENCE_FIELDS
+            or not all(isinstance(value, str) and value for value in economic.values())
+        ):
+            return False
+    elif "economic_decision" in evidence:
         return False
 
     return (
@@ -1172,6 +1233,9 @@ def resolve_forecasts_with_quality(
                     ticker_window,
                     benchmark_window,
                     alpha_threshold_pct=threshold,
+                    economic_decision=_economic_decision_evidence(
+                        window_lookup, forecast
+                    ),
                 ),
             )
         )
@@ -1299,6 +1363,9 @@ def audit_resolved_forecasts(
                         ticker_window,
                         benchmark_window,
                         alpha_threshold_pct=threshold,
+                        economic_decision=_economic_decision_evidence(
+                            window_lookup, forecast
+                        ),
                     )
                     if window_payload is not None
                     else None

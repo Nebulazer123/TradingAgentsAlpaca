@@ -70,7 +70,7 @@ LEDGER_FINGERPRINT_KEY = "ledger_fingerprint"
 EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE = "unavailable_pending_preregistered_estimator"
 ECONOMIC_IDENTITY_STATUS_UNAVAILABLE = "unavailable_no_verified_economic_identity_binding"
 ECONOMIC_IDENTITY_REASON = (
-    "agent_forecast_v1_has_no_verified_economic_decision_event_binding"
+    "no_source_bound_verifier_with_frozen_economic_protocol"
 )
 INFLUENCE_WEIGHTING_STATUS_LEGACY = "legacy_unregistered_row_weighted_estimator"
 
@@ -360,6 +360,64 @@ def _cluster_counts(
     return len(keys), unclusterable
 
 
+def _verified_economic_identity_report(
+    resolved_rows: Sequence[dict[str, Any]],
+    *,
+    source_bound_verifier: object | None,
+) -> dict[str, Any]:
+    """Count only v3 rows reverified against PIT bytes and a frozen protocol."""
+
+    if source_bound_verifier is None:
+        return {
+            "unique_economic_decision_event_id_count": None,
+            "unique_economic_decision_market_date_count": None,
+            "economic_decision_verified_resolved_row_count": 0,
+            "economic_decision_unbound_resolved_row_count": len(resolved_rows),
+            "economic_decision_identity_status": ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
+            "economic_decision_identity_reason": ECONOMIC_IDENTITY_REASON,
+        }
+    from tradingagents.evals.agent_intelligence_ledger import AgentForecast
+    from tradingagents.evals.source_bound_resolution import SourceBoundWindowLookup
+
+    if type(source_bound_verifier) is not SourceBoundWindowLookup:
+        raise TypeError("source_bound_verifier must be an exact SourceBoundWindowLookup")
+    event_ids: set[str] = set()
+    market_dates: set[str] = set()
+    verified_rows = 0
+    for row in resolved_rows:
+        forecast = AgentForecast(**row)
+        evidence = row.get("resolution_evidence")
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("schema_version") != "source_bound_resolution_evidence/v3"
+            or source_bound_verifier.verify_forecast(forecast) is not True
+        ):
+            continue
+        economic = evidence.get("economic_decision")
+        if not isinstance(economic, Mapping):
+            continue
+        event_id = economic.get("decision_event_id")
+        market_date = economic.get("market_date")
+        if type(event_id) is not str or type(market_date) is not str:
+            continue
+        event_ids.add(event_id)
+        market_dates.add(market_date)
+        verified_rows += 1
+    unbound = len(resolved_rows) - verified_rows
+    return {
+        "unique_economic_decision_event_id_count": len(event_ids),
+        "unique_economic_decision_market_date_count": len(market_dates),
+        "economic_decision_verified_resolved_row_count": verified_rows,
+        "economic_decision_unbound_resolved_row_count": unbound,
+        "economic_decision_identity_status": (
+            "verified" if unbound == 0 else "verified_with_unbound_rows"
+        ),
+        "economic_decision_identity_reason": (
+            None if unbound == 0 else "resolved_rows_without_reverified_v3_binding"
+        ),
+    }
+
+
 def dependence_block(rows: Iterable[Any]) -> dict[str, Any]:
     """Object-space dependence counters for constructed forecast rows.
 
@@ -447,8 +505,9 @@ def build_reconciliation_receipt(
     ledger_bytes: bytes,
     *,
     summary_payload: Any = None,
+    source_bound_verifier: object | None = None,
 ) -> dict[str, Any]:
-    """Reconcile one captured ledger byte snapshot into a v1 receipt.
+    """Reconcile one captured ledger byte snapshot into a v2 receipt.
 
     Records are split on LF bytes with one trailing CR tolerated for CRLF and
     strictly UTF-8 decoded individually; decode failures are corrupt without
@@ -562,10 +621,6 @@ def build_reconciliation_receipt(
         "provisional_market_event_cluster_count": market_clusters,
         "effective_sample_count": None,
         "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
-        "unique_economic_decision_event_id_count": None,
-        "unique_economic_decision_market_date_count": None,
-        "economic_decision_identity_status": ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
-        "economic_decision_identity_reason": ECONOMIC_IDENTITY_REASON,
         "raw_resolved_rows_are_independent_observations": False,
         "influence_weighting_status": INFLUENCE_WEIGHTING_STATUS_LEGACY,
         "summary_freshness": evaluate_summary_freshness(
@@ -576,6 +631,12 @@ def build_reconciliation_receipt(
             resolved_row_count=len(resolved_raw),
         ),
     }
+    receipt.update(
+        _verified_economic_identity_report(
+            resolved_raw,
+            source_bound_verifier=source_bound_verifier,
+        )
+    )
     receipt["receipt_sha256"] = hashlib.sha256(
         canonical_json_text(receipt).encode("utf-8")
     ).hexdigest()
@@ -607,6 +668,7 @@ def reconcile_ledger_file(
     ledger_path: str | Path,
     *,
     summary_path: str | Path | None = None,
+    source_bound_verifier: object | None = None,
 ) -> dict[str, Any]:
     """Reconcile a ledger path read-only, capturing its bytes exactly once.
 
@@ -644,7 +706,11 @@ def reconcile_ledger_file(
                 raise SummaryReadError(f"could not read summary {summary_file}: {exc}") from exc
             if summary_bytes is not None:
                 summary_payload = _decoded_summary_payload(summary_bytes)
-    return build_reconciliation_receipt(ledger_data, summary_payload=summary_payload)
+    return build_reconciliation_receipt(
+        ledger_data,
+        summary_payload=summary_payload,
+        source_bound_verifier=source_bound_verifier,
+    )
 
 
 def _paths_equivalent(first: Path, second: Path, *, strict: bool = False) -> bool:
