@@ -21,6 +21,7 @@ from tradingagents.dataflows.pit import (
     resolve_market_session_open,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import FrozenEvaluationProtocol
@@ -288,7 +289,7 @@ def build_tournament_receipt(
     root: Path,
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: EconomicPhaseEligibility | ValidationPhaseEligibility,
     security_id_overrides: Mapping[str, str] | None = None,
     unavailable_next_open: frozenset[tuple[str, str]] = frozenset(),
     gross_return_overrides: Mapping[tuple[str, str], str] | None = None,
@@ -312,6 +313,7 @@ def build_tournament_receipt(
     for event_id in eligibility.event_ids:
         event = events_by_id[event_id]
         grouped.setdefault(event.market_date, []).append(event)
+    grouped = OrderedDict((market_date, grouped[market_date]) for market_date in sorted(grouped))
     feature_inputs: list[dict[str, object]] = []
     identities_by_date: dict[str, dict[str, SecurityIdentity]] = {}
     for market_date, date_events in grouped.items():

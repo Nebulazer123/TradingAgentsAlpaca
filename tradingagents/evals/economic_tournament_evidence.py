@@ -837,7 +837,8 @@ def _context(
         event = events_by_id[event_id]
         grouped.setdefault(event.market_date, []).append(event)
     result: list[tuple[str, tuple[object, ...]]] = []
-    for market_date, date_events in grouped.items():
+    for market_date in sorted(grouped):
+        date_events = grouped[market_date]
         events_by_symbol = {item.symbol: item for item in date_events}
         if len(date_events) != 75 or set(events_by_symbol) != set(frozen.primary_universe):
             raise EconomicTournamentInputEvidenceError(

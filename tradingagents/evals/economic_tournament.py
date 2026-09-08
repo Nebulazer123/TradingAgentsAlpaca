@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
 from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
 from tradingagents.evals.economic_evaluation_partition_binding import (
@@ -203,7 +203,12 @@ def build_ta_control_allocations(
 
 
 def _text(value: Decimal) -> str:
-    value = value.quantize(Decimal("1e-24"))
+    # Development and holdout can compound across more weeks than the legacy
+    # validation fixture. Formatting remains canonical, but must not inherit
+    # the process-global Decimal precision while doing so.
+    with localcontext() as context:
+        context.prec = 96
+        value = value.quantize(Decimal("1e-24"))
     integral = value.to_integral_value()
     if abs(value - integral) < Decimal("1e-24"):
         value = integral

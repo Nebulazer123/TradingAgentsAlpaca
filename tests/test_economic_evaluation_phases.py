@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from tests.fixtures.economic_tournament import build_tournament_receipt
 from tests.test_economic_evaluation_admission import _protocol_from_receipts
 from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
-from tests.fixtures.economic_tournament import build_tournament_receipt
 from tradingagents.evals.economic_evaluation_partition_binding import (
     EconomicPartitionBindingError,
     bind_phase_eligibility,
