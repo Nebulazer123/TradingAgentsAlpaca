@@ -366,6 +366,11 @@ from tradingagents.research.provider_orchestrator import (
     DEFAULT_TICKER_EVIDENCE_NEEDS,
     build_ticker_provider_research_packets,
 )
+from tradingagents.research.qualification_benchmark import (
+    ResearchQualificationBenchmarkError,
+    run_registered_research_benchmark,
+    write_research_qualification_receipt,
+)
 from tradingagents.research.reddit_watchlists import build_reddit_watchlist_packet
 from tradingagents.research.release_calendar import build_release_calendar_packet
 from tradingagents.schemas.research import MarketMirrorScenarioPacket
@@ -1455,6 +1460,36 @@ def research_source_quality_review(
     console.print(f"Stale sources: {payload['stale_count']}")
     console.print(f"Missing/invalid timestamps: {payload['missing_or_invalid_count']}")
     console.print(f"Review: {payload['json_path']}")
+
+
+@research_app.command("research-stack-benchmark")
+def research_stack_benchmark(
+    registration_path: Path = typer.Option(..., "--registration-path"),
+    lane_results_path: Path = typer.Option(..., "--lane-results-path"),
+    output_path: Path = typer.Option(
+        Path("results/research_qualification/benchmark-receipt.json"),
+        "--output-path",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Score registered lane evidence without invoking a provider or model."""
+    try:
+        registration = json.loads(registration_path.read_text(encoding="utf-8"))
+        lane_results = json.loads(lane_results_path.read_text(encoding="utf-8"))
+        receipt = run_registered_research_benchmark(
+            registration=registration,
+            lane_results=lane_results,
+        )
+        written = write_research_qualification_receipt(receipt, output_path)
+    except (OSError, json.JSONDecodeError, ResearchQualificationBenchmarkError) as exc:
+        raise typer.BadParameter(f"research benchmark rejected: {exc}") from exc
+    payload = {**receipt, "receipt_path": str(written)}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    console.print(f"Research benchmark: {receipt['receipt_id']}")
+    console.print(f"Selected lane: {receipt['selected_lane']}")
+    console.print("Analysis-only; this receipt grants no execution authority.")
 
 
 @research_app.command("creator-workflow-status")
