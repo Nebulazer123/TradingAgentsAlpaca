@@ -12,6 +12,11 @@ from tradingagents.evals.economic_evaluation_partition_binding import (
     bind_validation_phase_eligibility,
     validate_phase_eligibility,
 )
+from tradingagents.evals.economic_evaluation_protocol import CONTROL_ARM_IDS
+from tradingagents.evals.economic_evaluation_result import (
+    build_phase_evaluation_result,
+    validate_economic_phase_result,
+)
 
 
 def test_phase_eligibility_binds_each_frozen_partition_and_keeps_validation_compatibility(
@@ -47,3 +52,37 @@ def test_phase_eligibility_binds_each_frozen_partition_and_keeps_validation_comp
 
     with pytest.raises(EconomicPartitionBindingError, match="phase"):
         bind_phase_eligibility(protocol=protocol, partitions=partitions, phase="paper")
+
+
+def test_phase_result_uses_a_new_phase_bound_schema(protocol_source):
+    cohort, partitions, manifest = protocol_source
+    protocol = _protocol_from_receipts(cohort, partitions, manifest)
+    eligibility = bind_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+        phase="development",
+    )
+    event_count = str(len(eligibility.event_ids))
+    metrics = {
+        arm_id: {
+            "net_return_after_costs": "0",
+            "benchmark_excess_after_costs": "0",
+            "max_drawdown": "0",
+            "turnover": "0",
+            "false_positive_rate": "0",
+            "decision_event_count": event_count,
+            "packet_event_cluster_count": event_count,
+            "market_event_cluster_count": event_count,
+            "cost_per_useful_decision": "0",
+        }
+        for arm_id in CONTROL_ARM_IDS
+    }
+    result = build_phase_evaluation_result(
+        protocol,
+        eligibility=eligibility,
+        arm_metrics=metrics,
+    )
+    assert result.to_dict()["schema_version"] == "economic_evaluation_result/v4"
+    assert result.to_dict()["phase"] == "development"
+    assert result.validation_event_ids == eligibility.event_ids
+    assert validate_economic_phase_result(result.to_dict()).canonical_json_bytes() == result.canonical_json_bytes()

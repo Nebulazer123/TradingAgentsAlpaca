@@ -18,7 +18,9 @@ from types import MappingProxyType
 
 from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
+    validate_phase_eligibility,
     validate_validation_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
@@ -35,15 +37,19 @@ from tradingagents.evals.economic_tournament_statistics import (
 __all__ = [
     "EconomicEvaluationResultError",
     "EconomicValidationResult",
+    "ECONOMIC_PHASE_RESULT_SCHEMA",
     "ECONOMIC_TOURNAMENT_RESULT_SCHEMA",
     "LegacyEconomicValidationResult",
+    "build_phase_evaluation_result",
     "build_validation_evaluation_result",
+    "validate_economic_phase_result",
     "validate_economic_validation_result",
 ]
 
 
 ECONOMIC_VALIDATION_RESULT_SCHEMA = "economic_validation_result/v2"
 ECONOMIC_TOURNAMENT_RESULT_SCHEMA = "economic_validation_result/v3"
+ECONOMIC_PHASE_RESULT_SCHEMA = "economic_evaluation_result/v4"
 _LEGACY_ECONOMIC_VALIDATION_RESULT_SCHEMA = "economic_validation_result/v1"
 _RESULT_STATUS = "completed"
 _AUTHORITY_FIELDS: dict[str, object] = {
@@ -456,6 +462,7 @@ class EconomicValidationResult:
     result_id: str
     result_sha256: str
     protocol_id: str
+    phase: str
     validation_partition_id: str
     validation_partition_sha256: str
     validation_event_ids: tuple[str, ...]
@@ -479,7 +486,9 @@ class EconomicValidationResult:
         extended = self.cost_variants is not None
         payload: dict[str, object] = {
             "schema_version": (
-                ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+                ECONOMIC_PHASE_RESULT_SCHEMA
+                if self.phase != "validation"
+                else ECONOMIC_TOURNAMENT_RESULT_SCHEMA
                 if extended
                 else ECONOMIC_VALIDATION_RESULT_SCHEMA
             ),
@@ -488,7 +497,7 @@ class EconomicValidationResult:
             "protocol_id": self.protocol_id,
             "validation_partition_id": self.validation_partition_id,
             "validation_partition_sha256": self.validation_partition_sha256,
-            "phase": "validation",
+            "phase": self.phase,
             "status": _RESULT_STATUS,
             "validation_event_ids": list(self.validation_event_ids),
             "arm_metrics": [
@@ -650,6 +659,7 @@ def _new_legacy_result(**fields: object) -> LegacyEconomicValidationResult:
 def _result_material(
     *,
     protocol_id: str,
+    phase: str,
     validation_partition_id: str,
     validation_partition_sha256: str,
     validation_event_ids: tuple[str, ...],
@@ -667,14 +677,16 @@ def _result_material(
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": (
-            ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+            ECONOMIC_PHASE_RESULT_SCHEMA
+            if phase != "validation"
+            else ECONOMIC_TOURNAMENT_RESULT_SCHEMA
             if cost_variants is not None
             else ECONOMIC_VALIDATION_RESULT_SCHEMA
         ),
         "protocol_id": protocol_id,
         "validation_partition_id": validation_partition_id,
         "validation_partition_sha256": validation_partition_sha256,
-        "phase": "validation",
+        "phase": phase,
         "status": _RESULT_STATUS,
         "validation_event_ids": list(validation_event_ids),
         "arm_metrics": [
@@ -872,9 +884,93 @@ def build_validation_evaluation_result(
     )
 
 
+def build_phase_evaluation_result(
+    protocol: FrozenEvaluationProtocol,
+    *,
+    arm_metrics: Mapping[str, Mapping[str, str]],
+    eligibility: EconomicPhaseEligibility,
+    cost_variant_metrics: Mapping[str, Mapping[str, Mapping[str, str]]] | None = None,
+    registered_statistics: EconomicTournamentStatistics | None = None,
+    tournament_input_id: str | None = None,
+    tournament_input_sha256: str | None = None,
+    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...] | None = None,
+    unavailable: bool = False,
+) -> EconomicValidationResult:
+    """Build a v4 result bound to one named frozen lifecycle phase."""
+
+    if type(protocol) is not FrozenEvaluationProtocol:
+        raise EconomicEvaluationResultError("protocol must be an exact FrozenEvaluationProtocol")
+    try:
+        validated = validate_frozen_evaluation_protocol(protocol.to_dict())
+        bound = validate_phase_eligibility(protocol=validated, eligibility=eligibility)
+    except (TypeError, ValueError) as exc:
+        raise EconomicEvaluationResultError("phase eligibility canonical validation failed") from exc
+    if bound.phase == "validation":
+        raise EconomicEvaluationResultError("validation must use the compatibility result builder")
+    metrics = (
+        _canonical_unavailable_arm_metrics(arm_metrics)
+        if unavailable
+        else _canonical_arm_metrics(arm_metrics, validation_event_count=len(bound.event_ids))
+    )
+    variants = None
+    statistics = None
+    outcome_refs = None
+    if cost_variant_metrics is not None or registered_statistics is not None:
+        if cost_variant_metrics is None or (
+            not unavailable and type(registered_statistics) is not EconomicTournamentStatistics
+        ):
+            raise EconomicEvaluationResultError(
+                "extended tournament results require cost variants and exact statistics"
+            )
+        variants = (
+            _canonical_unavailable_cost_variants(cost_variant_metrics)
+            if unavailable
+            else _canonical_cost_variants(
+                cost_variant_metrics, validation_event_count=len(bound.event_ids)
+            )
+        )
+        statistics = (
+            None
+            if unavailable
+            else validate_economic_tournament_statistics(
+                registered_statistics.to_dict()
+            ).to_dict()
+        )
+        if (
+            type(tournament_input_id) is not str
+            or not tournament_input_id.startswith("economic-tournament-input-")
+            or _SHA256.fullmatch(tournament_input_id.removeprefix("economic-tournament-input-")) is None
+            or type(tournament_input_sha256) is not str
+            or _SHA256.fullmatch(tournament_input_sha256) is None
+        ):
+            raise EconomicEvaluationResultError("v4 tournament input binding is invalid")
+        outcome_refs = _canonical_execution_outcome_refs(execution_outcomes)
+    return _build_result_from_components(
+        protocol_id=validated.protocol_id,
+        phase=bound.phase,
+        validation_partition_id=bound.partition_id,
+        validation_partition_sha256=bound.partition_sha256,
+        validation_event_ids=bound.event_ids,
+        arm_metrics=metrics,
+        cost_variants=variants,
+        registered_statistics=statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcome_refs=outcome_refs,
+        availability_status=_UNAVAILABLE_STATUS if unavailable else "available",
+        qualification_status=(
+            _NONQUALIFYING_UNAVAILABLE if unavailable else "qualifying"
+        ),
+        unavailable_outcomes=(
+            _canonical_unavailable_outcomes(execution_outcomes) if unavailable else None
+        ),
+    )
+
+
 def _build_result_from_components(
     *,
     protocol_id: str,
+    phase: str = "validation",
     validation_partition_id: str,
     validation_partition_sha256: str,
     validation_event_ids: tuple[str, ...],
@@ -890,6 +986,7 @@ def _build_result_from_components(
 ) -> EconomicValidationResult:
     material = _result_material(
         protocol_id=protocol_id,
+        phase=phase,
         validation_partition_id=validation_partition_id,
         validation_partition_sha256=validation_partition_sha256,
         validation_event_ids=validation_event_ids,
@@ -906,6 +1003,7 @@ def _build_result_from_components(
     result_id = "economic-evaluation-result-" + _sha256(material)
     digest_material = _result_material(
         protocol_id=protocol_id,
+        phase=phase,
         validation_partition_id=validation_partition_id,
         validation_partition_sha256=validation_partition_sha256,
         validation_event_ids=validation_event_ids,
@@ -924,6 +1022,7 @@ def _build_result_from_components(
         result_id=result_id,
         result_sha256=_sha256(digest_material),
         protocol_id=protocol_id,
+        phase=phase,
         validation_partition_id=validation_partition_id,
         validation_partition_sha256=validation_partition_sha256,
         validation_event_ids=validation_event_ids,
@@ -1136,7 +1235,11 @@ def validate_economic_validation_result(
         raise EconomicEvaluationResultError("validation result must be a JSON object")
     if value.get("schema_version") == _LEGACY_ECONOMIC_VALIDATION_RESULT_SCHEMA:
         return _validate_legacy_economic_validation_result(value)
-    extended = value.get("schema_version") == ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+    phase_schema = value.get("schema_version") == ECONOMIC_PHASE_RESULT_SCHEMA
+    extended = (
+        value.get("schema_version") == ECONOMIC_TOURNAMENT_RESULT_SCHEMA
+        or (phase_schema and "cost_variants" in value)
+    )
     unavailable = extended and "availability_status" in value
     expected_fields = (
         _UNAVAILABLE_TOURNAMENT_RESULT_SERIALIZED_FIELDS
@@ -1149,10 +1252,15 @@ def validate_economic_validation_result(
     if values["schema_version"] not in {
         ECONOMIC_VALIDATION_RESULT_SCHEMA,
         ECONOMIC_TOURNAMENT_RESULT_SCHEMA,
+        ECONOMIC_PHASE_RESULT_SCHEMA,
     }:
         raise EconomicEvaluationResultError("validation result schema is invalid")
-    if values["phase"] != "validation" or values["status"] != _RESULT_STATUS:
+    if values["status"] != _RESULT_STATUS:
         raise EconomicEvaluationResultError("validation result must be completed validation")
+    if (
+        not phase_schema and values["phase"] != "validation"
+    ) or (phase_schema and values["phase"] not in {"development", "holdout"}):
+        raise EconomicEvaluationResultError("result phase is invalid for its schema")
     _require_authority(values, label="validation result")
     protocol_id, event_ids = _validated_result_identity(values)
     if (
@@ -1264,6 +1372,7 @@ def validate_economic_validation_result(
                 )
     rebuilt = _build_result_from_components(
         protocol_id=protocol_id,
+        phase=values["phase"],  # type: ignore[arg-type]
         validation_partition_id=values["validation_partition_id"],  # type: ignore[arg-type]
         validation_partition_sha256=values["validation_partition_sha256"],  # type: ignore[arg-type]
         validation_event_ids=event_ids,
@@ -1285,3 +1394,16 @@ def validate_economic_validation_result(
             "validation result bytes do not match canonical rebuild"
         )
     return rebuilt
+
+
+def validate_economic_phase_result(value: object) -> EconomicValidationResult:
+    """Read only a v4 development or holdout result; legacy validation stays separate."""
+
+    result = validate_economic_validation_result(value)
+    if (
+        type(result) is not EconomicValidationResult
+        or result.phase not in {"development", "holdout"}
+        or result.to_dict()["schema_version"] != ECONOMIC_PHASE_RESULT_SCHEMA
+    ):
+        raise EconomicEvaluationResultError("phase result must be an exact v4 development or holdout result")
+    return result
