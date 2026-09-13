@@ -23,6 +23,18 @@
 
 ## Current continuation — verified 2026-09-07
 
+**Superseding source checkpoint — 2026-09-13:** Phase 4 lifecycle is accepted
+and integrated at `4fa91d3` after the one 17-module gate (393 passed plus all
+static checks). Canonical then fast-forwarded through isolated Alpaca
+bar-shape correction `8fc3296`, with its separate five-module PIT checkpoint
+(124 passed) and scoped static proof. The exact revision boundaries and
+preservation evidence are in
+[the Phase 4 checkpoint](../checkpoints/2026-09-13-phase4-source-acceptance.md).
+Do not replay these accepted checks. Next: Phase 5 in the existing LangGraph
+worktree, whose sixteen original dirty paths remain intact. Phases 6–12 and
+all actual qualification/operational gates below remain unfinished. The
+older table and start instruction below are retained historical context.
+
 **Start with the [Phase 3 acceptance checkpoint](2026-09-07-tradingagents-phase-3-acceptance-and-stop.md), then continue through the remaining program.** That checkpoint supersedes the old starting-state instructions below and in the temporary handoff. The user's latest 2026-09-07 instruction removes the interim stop, not the technical gates or protected-operation boundaries. Accepted work must not be replayed.
 
 | Surface | Current evidence | Disposition |
@@ -325,6 +337,12 @@ TA_LIVE_SUBMIT=0 .venv/bin/python -m pytest -q \
 ---
 
 ## Phase 4 — Complete development, validation, release, and holdout lifecycle
+
+**Accepted/integrated 2026-09-13:** See the revision-bound
+[source acceptance checkpoint](../checkpoints/2026-09-13-phase4-source-acceptance.md).
+The requirements below remain the contract, not instructions to restart
+the completed verifier. This acceptance does not release a real holdout or
+establish economic qualification.
 
 **Begin after Phase 3 technical acceptance. Continued execution is authorized in the same program run.**
 
