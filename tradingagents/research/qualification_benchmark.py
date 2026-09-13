@@ -344,6 +344,25 @@ def _adapter_input(case: Mapping[str, object], lane_id: str, source: bytes) -> t
     return safe, effective_source
 
 
+def _cohort_quality(cases: Mapping[str, Mapping[str, object]], rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    accuracy = Decimal(sum(bool(row["correct"]) for row in rows)) / Decimal(len(rows))
+    # Normal cases cannot dilute errors in either protected severity tier.
+    critical = [row for row in rows if cases[str(row["case_id"])]["severity"] in {"critical", "high"}]
+    high = [row for row in rows if cases[str(row["case_id"])]["severity"] == "high"]
+    critical_accuracy = Decimal(sum(bool(row["correct"]) for row in critical)) / Decimal(len(critical)) if critical else None
+    high_accuracy = Decimal(sum(bool(row["correct"]) for row in high)) / Decimal(len(high)) if high else None
+    security = all(bool(row["security_pass"]) for row in rows)
+    return {
+        "source_accuracy": format(accuracy, "f"),
+        "critical_field_accuracy": format(critical_accuracy, "f") if critical_accuracy is not None else None,
+        "critical_field_case_count": len(critical),
+        "high_severity_accuracy": format(high_accuracy, "f") if high_accuracy is not None else None,
+        "high_severity_case_count": len(high),
+        "security_pass": security,
+        "qualified": critical_accuracy is not None and critical_accuracy >= Decimal("0.995") and high_accuracy == 1 and security,
+    }
+
+
 def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes], adapters: Mapping[str, LaneAdapter], lane_specs: Mapping[str, Mapping[str, object]], local_answers: Mapping[str, str | None] | None = None) -> dict[str, object]:
     lane = _map(raw, RESULT_FIELDS, "lane result")
     lane_id = _text(lane["lane_id"], "lane_id")
@@ -432,11 +451,7 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
                 "source_span": {"artifact_id": case["artifact_id"], "byte_start": case["byte_start"], "byte_end": case["byte_end"]},
             }
         )
-    accuracy = Decimal(sum(row["correct"] for row in scored)) / Decimal(len(scored))
-    high = [row for row in scored if cases[str(row["case_id"])]["severity"] == "high"]
-    high_accuracy = Decimal(sum(row["correct"] for row in high)) / Decimal(len(high)) if high else Decimal(1)
-    security = all(row["security_pass"] for row in scored)
-    return {**lane, "case_outputs": scored, "critical_field_accuracy": format(accuracy, "f"), "high_severity_accuracy": format(high_accuracy, "f"), "security_pass": security, "qualified": accuracy >= Decimal("0.995") and high_accuracy == 1 and security, "cost_usd": format(cost, "f")}
+    return {**lane, "case_outputs": scored, **_cohort_quality(cases, scored), "cost_usd": format(cost, "f")}
 
 
 def _reviewed_cohort(
@@ -446,16 +461,7 @@ def _reviewed_cohort(
 ) -> dict[str, object]:
     rows = {str(row["case_id"]): row for row in reviewed["case_outputs"]}  # type: ignore[index]
     rows.update({str(row["case_id"]): row for row in replacements["case_outputs"]})  # type: ignore[index]
-    accuracy = Decimal(sum(bool(rows[case_id]["correct"]) for case_id in cases)) / Decimal(len(cases))
-    high_ids = [case_id for case_id, case in cases.items() if case["severity"] == "high"]
-    high_accuracy = Decimal(sum(bool(rows[case_id]["correct"]) for case_id in high_ids)) / Decimal(len(high_ids)) if high_ids else Decimal(1)
-    security = all(bool(rows[case_id]["security_pass"]) for case_id in cases)
-    return {
-        "accuracy": accuracy,
-        "high_accuracy": high_accuracy,
-        "security_pass": security,
-        "qualified": accuracy >= Decimal("0.995") and high_accuracy == 1 and security,
-    }
+    return _cohort_quality(cases, [rows[case_id] for case_id in cases])
 
 
 def run_registered_research_benchmark(*, registration: object, lane_results: object, artifact_root: str | Path, lane_adapters: Mapping[str, LaneAdapter] | None = None) -> dict[str, object]:
@@ -514,10 +520,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
             if review_lane is None:
                 continue
             combined = _reviewed_cohort(cases, reviewed, review_lane)
-            review_lane["critical_field_accuracy"] = format(combined["accuracy"], "f")
-            review_lane["high_severity_accuracy"] = format(combined["high_accuracy"], "f")
-            review_lane["security_pass"] = combined["security_pass"]
-            review_lane["qualified"] = combined["qualified"]
+            review_lane.update(combined)
             # Both reviewer variants replace only ambiguous cases in the same
             # source-model cohort; their comparison must pay for that cohort.
             review_lane["cohort_cost_usd"] = format(
@@ -532,9 +535,9 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
         lane, twin = by_id.get(lane_id), by_id.get(f"{lane_id}_no_text")
         if lane is None or twin is None or lane["qualified"] is not True or Decimal(lane["cohort_cost_usd"]) > Decimal(budgets[lane_id]):
             continue
-        accuracy = Decimal(lane["critical_field_accuracy"])
-        twin_accuracy = Decimal(twin["critical_field_accuracy"])
-        baseline = Decimal(by_id[selected]["critical_field_accuracy"])
+        accuracy = Decimal(lane["source_accuracy"])
+        twin_accuracy = Decimal(twin["source_accuracy"])
+        baseline = Decimal(by_id[selected]["source_accuracy"])
         if accuracy >= baseline + gain and accuracy >= twin_accuracy + gain:
             selected = lane_id
             retained.append(lane_id)
@@ -573,7 +576,7 @@ def execute_registered_openrouter_benchmark(
     local_receipt = run_registered_research_benchmark(
         registration=frozen, lane_results=[deterministic_result], artifact_root=artifact_root,
     )
-    baseline = Decimal(local_receipt["lane_results"][0]["critical_field_accuracy"])
+    baseline = Decimal(local_receipt["lane_results"][0]["source_accuracy"])
     required_gain = Decimal(frozen["comparison_policy"]["minimum_accuracy_gain"])
     if baseline + required_gain > 1:
         local_receipt["openrouter_execution"] = {
@@ -621,7 +624,7 @@ def execute_registered_openrouter_benchmark(
         for row in local_receipt["lane_results"]
         if row["lane_id"] == local_receipt["selected_lane"]
     )
-    if Decimal(selected_row["critical_field_accuracy"]) + required_gain > 1:
+    if Decimal(selected_row["source_accuracy"]) + required_gain > 1:
         local_receipt["openrouter_execution"] = {
             "status": "not_run",
             "reason": "registered_accuracy_gain_unattainable",

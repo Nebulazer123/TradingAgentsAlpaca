@@ -550,6 +550,61 @@ def test_openrouter_factory_is_not_constructed_before_deterministic_admission(tm
     assert factory_calls == []
 
 
+@pytest.mark.parametrize("coverage", ["diluted_critical_error", "no_critical_cases", "no_high_cases"])
+def test_deterministic_admission_requires_observed_severity_thresholds(tmp_path, coverage):
+    root, cases, _ = _fixture(tmp_path, wrong_expected=1 if coverage == "diluted_critical_error" else 0)
+    cases = [
+        {**case, "severity": (
+            "normal" if coverage == "no_critical_cases" else
+            "critical" if coverage == "no_high_cases" else
+            "high" if index == 0 else "critical" if index < 10 else "normal"
+        )}
+        for index, case in enumerate(cases)
+    ]
+    registration = build_research_qualification_registration(
+        cases, minimum_accuracy_gain="0.001",
+        lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs(),
+    )
+    calls = []
+    with pytest.raises(ResearchQualificationBenchmarkError, match="prerequisites"):
+        execute_registered_openrouter_benchmark(
+            registration=registration, deterministic_result=_lane("deterministic_sec_xbrl", cases, root),
+            artifact_root=root, llm_factory=lambda **kwargs: calls.append(kwargs),
+        )
+    assert calls == []
+
+
+def test_model_gain_uses_overall_accuracy_after_severity_gates_pass(tmp_path):
+    root, cases, _ = _fixture(tmp_path, wrong_expected=7)
+    cases = [{**case, "severity": "normal"} if 2 <= index < 9 else case for index, case in enumerate(cases)]
+    registration = build_research_qualification_registration(
+        cases, minimum_accuracy_gain="0.001",
+        lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs(),
+    )
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    receipt = run_registered_research_benchmark(
+        registration=registration, lane_results=[deterministic], artifact_root=root,
+    )
+    result = receipt["lane_results"][0]
+    assert result["critical_field_accuracy"] == "1"
+    assert result["critical_field_case_count"] == 1393
+    assert result["high_severity_accuracy"] == "1"
+    assert result["high_severity_case_count"] == 4
+    assert result["source_accuracy"] == "0.995"
+    calls = []
+
+    def factory(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("stop before model construction")
+
+    with pytest.raises(RuntimeError, match="before model construction"):
+        execute_registered_openrouter_benchmark(
+            registration=registration, deterministic_result=deterministic,
+            artifact_root=root, llm_factory=factory,
+        )
+    assert calls == [{"provider": "openrouter", "model": "registered-model"}]
+
+
 def test_cli_writes_owner_only_verified_receipt(tmp_path):
     root, cases, registration = _fixture(tmp_path)
     registration_path, lanes_path, output = tmp_path / "registration.json", tmp_path / "lanes.json", tmp_path / "receipt.json"
