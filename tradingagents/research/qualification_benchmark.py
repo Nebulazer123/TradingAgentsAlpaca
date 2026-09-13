@@ -495,6 +495,9 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
             local_answers = {case_id: None for case_id in cases}
         scored.append(_score(row, cases, sources, adapters, frozen["lane_specs"], local_answers))
     by_id = {str(row["lane_id"]): row for row in scored}
+    for lane in scored:
+        lane["cohort_cost_usd"] = lane["cost_usd"]
+        lane["cohort_cost_lane_ids"] = [lane["lane_id"]]
     for lane in TEXT_LANES:
         if lane in by_id and f"{lane}_no_text" not in by_id:
             raise ResearchQualificationBenchmarkError(f"{lane} requires its no-text twin")
@@ -515,13 +518,19 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
             review_lane["high_severity_accuracy"] = format(combined["high_accuracy"], "f")
             review_lane["security_pass"] = combined["security_pass"]
             review_lane["qualified"] = combined["qualified"]
+            # Both reviewer variants replace only ambiguous cases in the same
+            # source-model cohort; their comparison must pay for that cohort.
+            review_lane["cohort_cost_usd"] = format(
+                Decimal(reviewed["cost_usd"]) + Decimal(review_lane["cost_usd"]), "f"
+            )
+            review_lane["cohort_cost_lane_ids"] = [reviewed["lane_id"], review_lane["lane_id"]]
     policy = frozen["comparison_policy"]
     gain = Decimal(policy["minimum_accuracy_gain"])
     budgets = policy["lane_cost_budgets_usd"]
     selected, retained = LANE_ORDER[0], [LANE_ORDER[0]]
     for lane_id in LANE_ORDER[1:]:
         lane, twin = by_id.get(lane_id), by_id.get(f"{lane_id}_no_text")
-        if lane is None or twin is None or lane["qualified"] is not True or Decimal(lane["cost_usd"]) > Decimal(budgets[lane_id]):
+        if lane is None or twin is None or lane["qualified"] is not True or Decimal(lane["cohort_cost_usd"]) > Decimal(budgets[lane_id]):
             continue
         accuracy = Decimal(lane["critical_field_accuracy"])
         twin_accuracy = Decimal(twin["critical_field_accuracy"])

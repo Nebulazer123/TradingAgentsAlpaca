@@ -244,6 +244,38 @@ def test_cost_budget_distinct_reviewer_and_injection_media_policies(tmp_path):
         build_research_qualification_registration(uncovered, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs())
 
 
+@pytest.mark.parametrize("budget,selected", [("10", "openrouter_source_bound"), ("12", "different_model_reviewer")])
+def test_reviewer_budget_includes_the_full_cohort_source_model(tmp_path, budget, selected):
+    root, cases, _ = _fixture(tmp_path, wrong_expected=7)
+    registration = build_research_qualification_registration(
+        cases, minimum_accuracy_gain="0.001",
+        lane_cost_budgets_usd={lane: budget for lane in LANE_ORDER}, lane_specs=_specs(),
+    )
+    deterministic = _lane("deterministic_sec_xbrl", cases, root)
+    model = _lane("openrouter_source_bound", cases, root, cost="9")
+    ambiguous_ids = {case["case_id"] for case in cases if case["ambiguous"]}
+    for output in model["case_outputs"]:
+        if output["case_id"] in ambiguous_ids:
+            output["answer"] = "definitely-wrong"
+    model_twin = _lane("openrouter_source_bound_no_text", cases, root, cost="1", wrong=30)
+    reviewer = _lane("different_model_reviewer", cases, root, model="reviewer-model", cost="2")
+    reviewer_twin = _lane("different_model_reviewer_no_text", cases, root, model="reviewer-model", cost="3", wrong=4)
+    lanes = [deterministic, model, model_twin, reviewer, reviewer_twin]
+    receipt = run_registered_research_benchmark(
+        registration=registration, lane_results=lanes, artifact_root=root,
+        lane_adapters={lane["lane_id"]: _adapter(lane["case_outputs"]) for lane in lanes[1:]},
+    )
+    assert receipt["selected_lane"] == selected
+    results = {row["lane_id"]: row for row in receipt["lane_results"]}
+    assert results["different_model_reviewer"]["cost_usd"] == "2"
+    assert results["different_model_reviewer"]["cohort_cost_usd"] == "11"
+    assert results["different_model_reviewer_no_text"]["cohort_cost_usd"] == "12"
+    assert results["openrouter_source_bound"]["cohort_cost_usd"] == "9"
+    assert results["different_model_reviewer"]["cohort_cost_lane_ids"] == [
+        "openrouter_source_bound", "different_model_reviewer",
+    ]
+
+
 def test_retained_bytes_tamper_and_symlink_are_rejected(tmp_path):
     root, cases, registration = _fixture(tmp_path)
     deterministic = _lane("deterministic_sec_xbrl", cases, root)
