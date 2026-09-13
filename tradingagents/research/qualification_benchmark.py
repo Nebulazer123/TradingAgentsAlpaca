@@ -39,6 +39,8 @@ def _digest(value: object) -> str:
 
 OPENROUTER_INSTRUCTION = "Answer the registered question using only the supplied retained source. Return only the answer."
 OPENROUTER_PROMPT_SHA256 = _digest({"instruction": OPENROUTER_INSTRUCTION, "shape": ["case", "retained_source"]})
+REVIEWER_INSTRUCTION = "Independently resolve the registered ambiguous question using only the supplied retained source. Return only the answer."
+REVIEWER_PROMPT_SHA256 = _digest({"instruction": REVIEWER_INSTRUCTION, "shape": ["case", "retained_source"]})
 
 
 def _map(value: object, fields: set[str], label: str) -> dict[str, object]:
@@ -387,6 +389,8 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
     if cost != derived_cost:
         raise ResearchQualificationBenchmarkError("lane cost does not match registered pricing and usage")
     expected = set(cases) if base != "different_model_reviewer" else {cid for cid, case in cases.items() if case["ambiguous"]}
+    if not expected:
+        raise ResearchQualificationBenchmarkError("reviewer requires registered ambiguous cases")
     outputs = lane["case_outputs"]
     if type(outputs) is not list:
         raise ResearchQualificationBenchmarkError("case outputs are invalid")
@@ -553,8 +557,9 @@ def execute_registered_openrouter_benchmark(
     deterministic_result: Mapping[str, object],
     artifact_root: str | Path,
     llm_factory: Callable[..., object] | None = None,
+    execute_reviewer: bool = False,
 ) -> dict[str, object]:
-    """Execute the registered source-bound OpenRouter pair after local admission."""
+    """Execute registered OpenRouter pairs after local admission; no graph calls."""
     frozen = _registration(registration)
     local_receipt = run_registered_research_benchmark(
         registration=frozen, lane_results=[deterministic_result], artifact_root=artifact_root,
@@ -617,22 +622,36 @@ def execute_registered_openrouter_benchmark(
         local_receipt["receipt_id"] = f"research-qualification-benchmark-{digest}"
         local_receipt["receipt_sha256"] = digest
         return local_receipt
+    lane_ids = ["openrouter_source_bound", "openrouter_source_bound_no_text"]
+    ambiguous = {cid: case for cid, case in cases.items() if case["ambiguous"]}
+    if execute_reviewer and ambiguous:
+        reviewer_spec = frozen["lane_specs"]["different_model_reviewer"]
+        if reviewer_spec["model"] == frozen["lane_specs"]["openrouter_source_bound"]["model"]:
+            raise ResearchQualificationBenchmarkError("reviewer must use a distinct model")
+        lane_ids.extend(["different_model_reviewer", "different_model_reviewer_no_text"])
+    # Validate every requested pair before constructing even the first client.
+    for lane_id in lane_ids:
+        spec = frozen["lane_specs"][lane_id]
+        prompt_digest = REVIEWER_PROMPT_SHA256 if lane_id.startswith("different_model_reviewer") else OPENROUTER_PROMPT_SHA256
+        if spec["provider"] != "openrouter" or spec["prompt_sha256"] != prompt_digest:
+            raise ResearchQualificationBenchmarkError("OpenRouter execution identity is not registered")
     if llm_factory is None:
         from tradingagents.llm_clients.factory import create_llm_client
 
         llm_factory = create_llm_client
     captured: dict[str, list[dict[str, object]]] = {}
     lane_results = [dict(deterministic_result), *metadata_lane_results]
-    for lane_id in ("openrouter_source_bound", "openrouter_source_bound_no_text"):
+    for lane_id in lane_ids:
         spec = frozen["lane_specs"][lane_id]
-        if spec["provider"] != "openrouter" or spec["prompt_sha256"] != OPENROUTER_PROMPT_SHA256:
-            raise ResearchQualificationBenchmarkError("OpenRouter execution identity is not registered")
+        is_reviewer = lane_id.startswith("different_model_reviewer")
+        selected_cases = ambiguous if is_reviewer else cases
+        instruction = REVIEWER_INSTRUCTION if is_reviewer else OPENROUTER_INSTRUCTION
         client = llm_factory(provider="openrouter", model=spec["model"])
         llm = client.get_llm()  # type: ignore[attr-defined]
         outputs, input_tokens, output_tokens, latency_ms, outcome_ids = [], 0, 0, 0, []
-        for case_id in sorted(cases):
+        for case_id in sorted(selected_cases):
             safe, source = _adapter_input(cases[case_id], lane_id, sources[case_id])
-            prompt = _bytes({"instruction": OPENROUTER_INSTRUCTION, "case": safe, "retained_source": source.decode()}).decode()
+            prompt = _bytes({"instruction": instruction, "case": safe, "retained_source": source.decode()}).decode()
             started = time.monotonic_ns()
             response = llm.invoke(prompt)
             latency_ms += max(0, (time.monotonic_ns() - started) // 1_000_000)

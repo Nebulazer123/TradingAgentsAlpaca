@@ -1480,9 +1480,18 @@ def research_stack_benchmark(
         "--execute-openrouter",
         help="Explicitly execute the preregistered OpenRouter source/no-text pair after deterministic admission.",
     ),
+    execute_reviewer: bool = typer.Option(
+        False,
+        "--execute-reviewer",
+        help="With --execute-openrouter, also run the registered distinct-model pair on ambiguous cases only.",
+    ),
 ):
     """Score lane evidence, optionally executing a registered OpenRouter pair."""
     try:
+        if execute_reviewer and not execute_openrouter:
+            raise ResearchQualificationBenchmarkError(
+                "Reviewer execution requires --execute-openrouter"
+            )
         registration = json.loads(registration_path.read_text(encoding="utf-8"))
         lane_results = json.loads(lane_results_path.read_text(encoding="utf-8"))
         if execute_openrouter:
@@ -1494,6 +1503,7 @@ def research_stack_benchmark(
                 registration=registration,
                 deterministic_result=lane_results[0],
                 artifact_root=artifact_root,
+                execute_reviewer=execute_reviewer,
             )
         else:
             receipt = run_registered_research_benchmark(

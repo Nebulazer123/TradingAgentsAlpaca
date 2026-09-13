@@ -15,7 +15,7 @@ from typer.testing import CliRunner
 from cli.main import app
 from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.research import qualification_benchmark
-from tradingagents.research.qualification_benchmark import LANE_ORDER, OPENROUTER_PROMPT_SHA256, ResearchQualificationBenchmarkError, _adapter_input, build_research_qualification_registration, execute_registered_openrouter_benchmark, run_registered_research_benchmark
+from tradingagents.research.qualification_benchmark import LANE_ORDER, OPENROUTER_PROMPT_SHA256, REVIEWER_PROMPT_SHA256, ResearchQualificationBenchmarkError, _adapter_input, build_research_qualification_registration, execute_registered_openrouter_benchmark, run_registered_research_benchmark
 
 
 def _specs():
@@ -28,7 +28,7 @@ def _specs():
                 "model": ("reviewer-model" if base == "different_model_reviewer" else "registered-model") if model_lane else "none",
                 "revision": "fixture-v1",
                 "route": "synthetic-source-adapter",
-                "prompt_sha256": OPENROUTER_PROMPT_SHA256 if base == "openrouter_source_bound" else hashlib.sha256(lane_id.encode()).hexdigest(),
+                "prompt_sha256": (OPENROUTER_PROMPT_SHA256 if base == "openrouter_source_bound" else REVIEWER_PROMPT_SHA256 if base == "different_model_reviewer" else hashlib.sha256(lane_id.encode()).hexdigest()),
                 "input_price_per_million_usd": "1" if model_lane else "0",
                 "output_price_per_million_usd": "2" if model_lane else "0",
             }
@@ -290,11 +290,21 @@ def test_no_text_twin_cannot_change_the_registered_model(tmp_path):
         )
 
 
+@pytest.mark.parametrize("execute_reviewer,has_ambiguous", [(False, True), (True, True), (True, False)])
 def test_openrouter_execution_uses_production_factory_telemetry_and_safe_pair(
     tmp_path,
     monkeypatch,
+    execute_reviewer,
+    has_ambiguous,
 ):
     root, cases, registration = _fixture(tmp_path, wrong_expected=7)
+    if not has_ambiguous:
+        cases = [{**case, "ambiguous": False} for case in cases]
+        registration = build_research_qualification_registration(
+            cases, minimum_accuracy_gain="0.001",
+            lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs(),
+        )
+    reviewer_runs = execute_reviewer and has_ambiguous
     deterministic = _lane("deterministic_sec_xbrl", cases, root)
     calls = []
 
@@ -313,7 +323,7 @@ def test_openrouter_execution_uses_production_factory_telemetry_and_safe_pair(
                 "id": f"response-{len(calls)}",
                 "object": "chat.completion",
                 "created": 1,
-                "model": "registered-model",
+                "model": request_payload["model"],
                 "provider": "openrouter",
                 "route": "synthetic-source-adapter",
                 "fallback_used": False,
@@ -340,21 +350,75 @@ def test_openrouter_execution_uses_production_factory_telemetry_and_safe_pair(
             http_client=httpx.Client(transport=transport),
         )
 
-    receipt = execute_registered_openrouter_benchmark(registration=registration, deterministic_result=deterministic, artifact_root=root, llm_factory=factory)
-    assert factory_calls == [{"provider": "openrouter", "model": "registered-model"}] * 2
-    assert len(calls) == 2800
+    receipt = execute_registered_openrouter_benchmark(registration=registration, deterministic_result=deterministic, artifact_root=root, llm_factory=factory, execute_reviewer=execute_reviewer)
+    expected_factories = [{"provider": "openrouter", "model": "registered-model"}] * 2
+    if reviewer_runs:
+        expected_factories += [{"provider": "openrouter", "model": "reviewer-model"}] * 2
+    assert factory_calls == expected_factories
+    assert len(calls) == (2808 if reviewer_runs else 2800)
     assert all("expected_answer" not in call["case"] and "severity" not in call["case"] for call in calls)
     assert all(call["retained_source"] for call in calls[:1400])
-    assert all(call["retained_source"] == "" for call in calls[1400:])
-    assert [row["lane_id"] for row in receipt["lane_results"]] == [
+    assert all(call["retained_source"] == "" for call in calls[1400:2800])
+    expected_lanes = [
         "deterministic_sec_xbrl",
         "metadata_fts5_bm25",
         "metadata_fts5_bm25_no_text",
         "openrouter_source_bound",
         "openrouter_source_bound_no_text",
     ]
+    if reviewer_runs:
+        expected_lanes += ["different_model_reviewer", "different_model_reviewer_no_text"]
+        ambiguous_ids = {case["case_id"] for case in cases if case["ambiguous"]}
+        assert {call["case"]["case_id"] for call in calls[2800:2804]} == ambiguous_ids
+        assert {call["case"]["case_id"] for call in calls[2804:]} == ambiguous_ids
+        assert all(call["retained_source"] for call in calls[2800:2804])
+        assert all(call["retained_source"] == "" for call in calls[2804:])
+        for source_call, twin_call in zip(calls[2800:2804], calls[2804:], strict=True):
+            assert source_call["case"]["pair_id"] == twin_call["case"]["pair_id"]
+            assert source_call["case"]["input_sha256"] != twin_call["case"]["input_sha256"]
+        reviewer = next(row for row in receipt["lane_results"] if row["lane_id"] == "different_model_reviewer")
+        assert reviewer["input_tokens"] == 8 and reviewer["output_tokens"] == 4
+        assert reviewer["cost_usd"] == "0.000016"
+        assert len(reviewer["outcome_ids"]) == 4
+        assert reviewer["critical_field_accuracy"] == "0.995"
+    assert [row["lane_id"] for row in receipt["lane_results"]] == expected_lanes
     model = next(row for row in receipt["lane_results"] if row["lane_id"] == "openrouter_source_bound")
     assert model["input_tokens"] == 2800 and model["output_tokens"] == 1400 and model["cost_usd"] == "0.0056"
+
+
+@pytest.mark.parametrize("invalid", ["same_model", "reviewer_prompt", "source_twin_prompt"])
+def test_reviewer_registration_is_checked_before_any_client(tmp_path, invalid):
+    root, cases, _ = _fixture(tmp_path, wrong_expected=7)
+    specs = _specs()
+    if invalid == "same_model":
+        for lane_id in ("different_model_reviewer", "different_model_reviewer_no_text"):
+            specs[lane_id]["model"] = specs["openrouter_source_bound"]["model"]
+    else:
+        lane_id = "different_model_reviewer_no_text" if invalid == "reviewer_prompt" else "openrouter_source_bound_no_text"
+        specs[lane_id]["prompt_sha256"] = "0" * 64
+    registration = build_research_qualification_registration(
+        cases, minimum_accuracy_gain="0.001",
+        lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=specs,
+    )
+    calls = []
+    with pytest.raises(ResearchQualificationBenchmarkError, match="distinct model|not registered"):
+        execute_registered_openrouter_benchmark(
+            registration=registration, deterministic_result=_lane("deterministic_sec_xbrl", cases, root),
+            artifact_root=root, llm_factory=lambda **kwargs: calls.append(kwargs),
+            execute_reviewer=True,
+        )
+    assert calls == []
+
+
+def test_cli_reviewer_requires_explicit_source_model_execution():
+    result = CliRunner().invoke(app, [
+        "research", "research-stack-benchmark", "--execute-reviewer",
+        "--registration-path", "missing-registration.json", "--lane-results-path", "missing-lanes.json",
+        "--artifact-root", ".",
+    ])
+    assert result.exit_code == 2
+    assert "Reviewer execution requires" in result.output
+    assert "--execute-openrouter" in result.output
 
 
 def test_openrouter_client_does_not_invent_missing_routing_telemetry(monkeypatch):
