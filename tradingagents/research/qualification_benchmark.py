@@ -344,6 +344,34 @@ def _adapter_input(case: Mapping[str, object], lane_id: str, source: bytes) -> t
     return safe, effective_source
 
 
+def _sensitive_outbound_value(value: object) -> bool:
+    """Apply the existing privacy policy to structured keys as well as text."""
+    if contains_sensitive_text(value):
+        return True
+    if isinstance(value, Mapping):
+        return any(
+            contains_sensitive_text(f"{key}={item}") or _sensitive_outbound_value(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_sensitive_outbound_value(item) for item in value)
+    return False
+
+
+def _openrouter_prompt(safe_case: Mapping[str, object], source: bytes, instruction: str) -> str:
+    # The deterministic prerequisite has already validated each retained JSON
+    # source. Inspect parsed fields too: JSON quoting/escaping must not conceal
+    # e.g. an api_key field from the existing key=value privacy detector.
+    source_text = source.decode()
+    if (
+        _sensitive_outbound_value(safe_case)
+        or contains_sensitive_text(source_text)
+        or (source and _sensitive_outbound_value(_json_mapping(source, label="benchmark outbound source")))
+    ):
+        raise ResearchQualificationBenchmarkError("outbound benchmark input contains sensitive text")
+    return _bytes({"instruction": instruction, "case": safe_case, "retained_source": source_text}).decode()
+
+
 def _cohort_quality(cases: Mapping[str, Mapping[str, object]], rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
     accuracy = Decimal(sum(bool(row["correct"]) for row in rows)) / Decimal(len(rows))
     # Normal cases cannot dilute errors in either protected severity tier.
@@ -647,6 +675,17 @@ def execute_registered_openrouter_benchmark(
         prompt_digest = REVIEWER_PROMPT_SHA256 if lane_id.startswith("different_model_reviewer") else OPENROUTER_PROMPT_SHA256
         if spec["provider"] != "openrouter" or spec["prompt_sha256"] != prompt_digest:
             raise ResearchQualificationBenchmarkError("OpenRouter execution identity is not registered")
+    # Check all actual outbound payloads before any client or earlier case can
+    # execute. Reuse these exact prompts; do not silently redact bound evidence.
+    prompts = {}
+    for lane_id in lane_ids:
+        is_reviewer = lane_id.startswith("different_model_reviewer")
+        selected_cases = ambiguous if is_reviewer else cases
+        instruction = REVIEWER_INSTRUCTION if is_reviewer else OPENROUTER_INSTRUCTION
+        prompts[lane_id] = {
+            case_id: _openrouter_prompt(*_adapter_input(cases[case_id], lane_id, sources[case_id]), instruction)
+            for case_id in sorted(selected_cases)
+        }
     if llm_factory is None:
         from tradingagents.llm_clients.factory import create_llm_client
 
@@ -657,13 +696,12 @@ def execute_registered_openrouter_benchmark(
         spec = frozen["lane_specs"][lane_id]
         is_reviewer = lane_id.startswith("different_model_reviewer")
         selected_cases = ambiguous if is_reviewer else cases
-        instruction = REVIEWER_INSTRUCTION if is_reviewer else OPENROUTER_INSTRUCTION
         client = llm_factory(provider="openrouter", model=spec["model"])
         llm = client.get_llm()  # type: ignore[attr-defined]
         outputs, input_tokens, output_tokens, latency_ms, outcome_ids = [], 0, 0, 0, []
         for case_id in sorted(selected_cases):
-            safe, source = _adapter_input(cases[case_id], lane_id, sources[case_id])
-            prompt = _bytes({"instruction": instruction, "case": safe, "retained_source": source.decode()}).decode()
+            safe, _ = _adapter_input(cases[case_id], lane_id, sources[case_id])
+            prompt = prompts[lane_id][case_id]
             started = time.monotonic_ns()
             response = llm.invoke(prompt)
             latency_ms += max(0, (time.monotonic_ns() - started) // 1_000_000)

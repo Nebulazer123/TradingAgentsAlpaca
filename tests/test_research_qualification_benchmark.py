@@ -489,6 +489,46 @@ def test_openrouter_client_does_not_invent_missing_routing_telemetry(monkeypatch
     assert "fallback_used" not in response.response_metadata
 
 
+@pytest.mark.parametrize("location", ["retained_source", "retained_json_field", "case_metadata"])
+def test_sensitive_outbound_input_is_rejected_before_any_model_client(tmp_path, location):
+    root, cases, _ = _fixture(tmp_path, wrong_expected=7)
+    # A late case proves the whole cohort is preflighted, not merely the next
+    # request after earlier cases have already left the machine. The canary is
+    # synthetic and intentionally outside the deterministic answer field.
+    canary = "api_key=synthetic-private-canary"
+    if location in {"retained_source", "retained_json_field"}:
+        corpus_path = root / "corpus.jsonl"
+        corpus = corpus_path.read_bytes()
+        last = cases[-1]
+        document = json.loads(corpus[last["byte_start"]:last["byte_end"]])
+        document["private_context"] = canary if location == "retained_source" else {"api_key": "synthetic-private-canary"}
+        replacement = json.dumps(document, separators=(",", ":")).encode()
+        corpus = corpus[:last["byte_start"]] + replacement
+        corpus_path.write_bytes(corpus)
+        for case in cases:
+            case["artifact_sha256"] = hashlib.sha256(corpus).hexdigest()
+        last["byte_end"] = len(corpus)
+    else:
+        cases[-1]["variant_id"] = canary
+    registration = build_research_qualification_registration(
+        cases, minimum_accuracy_gain="0.001",
+        lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs(),
+    )
+    calls = []
+
+    def forbidden_factory(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("model client constructed before privacy preflight")
+
+    with pytest.raises(ResearchQualificationBenchmarkError, match="outbound.*sensitive"):
+        execute_registered_openrouter_benchmark(
+            registration=registration,
+            deterministic_result=_lane("deterministic_sec_xbrl", cases, root),
+            artifact_root=root, llm_factory=forbidden_factory, execute_reviewer=True,
+        )
+    assert calls == []
+
+
 def test_openrouter_executes_retained_fts_before_any_model_factory(tmp_path, monkeypatch):
     root, cases, registration = _fixture(tmp_path, wrong_expected=7)
     deterministic = _lane("deterministic_sec_xbrl", cases, root)
