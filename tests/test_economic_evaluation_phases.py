@@ -166,6 +166,10 @@ def test_phase_report_rejects_cross_phase_result_substitution(protocol_source):
     }
 
     assert admission_module._frozen_phase_report(report, protocol=protocol) == report
+    with pytest.raises(admission_module.EconomicEvaluationAdmissionError, match="phase"):
+        admission_module._frozen_report_for_phase(
+            report, protocol=protocol, phase="holdout"
+        )
     report["phase"] = "holdout"
     with pytest.raises(admission_module.EconomicEvaluationAdmissionError, match="event IDs"):
         admission_module._frozen_phase_report(report, protocol=protocol)

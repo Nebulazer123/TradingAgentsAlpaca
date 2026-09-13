@@ -3280,7 +3280,7 @@ def research_economic_tournament_run(
         "--tournament-input-path",
         exists=True,
         readable=True,
-        help="Complete source-bound candidate and realized-outcome evidence JSON for validation only.",
+        help="Complete source-bound candidate and realized-outcome evidence JSON for the selected phase.",
     ),
     pit_artifact_root: Path = typer.Option(
         ...,
@@ -3306,7 +3306,7 @@ def research_economic_tournament_run(
     effective_at: str = typer.Option(
         ...,
         "--effective-at",
-        help="Canonical UTC timestamp for the immutable validation-only receipt.",
+        help="Canonical UTC timestamp for the immutable phase receipt.",
     ),
     phase: str = typer.Option(
         "validation",
@@ -3315,7 +3315,7 @@ def research_economic_tournament_run(
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Admit one sealed validation TA-Control result as analysis-only evidence."""
+    """Admit one TA-Control phase result as analysis-only evidence."""
 
     protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
     partitions_payload = _economic_json_object(partitions_path, label="partitions-path")

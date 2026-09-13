@@ -308,6 +308,8 @@ class EconomicEvaluationReadiness:
         if self.protocol_admission_object_id is None:
             return "protocol_not_admitted"
         if self.validation_run_object_id is None:
+            if self.development_run_object_id is not None:
+                return "development_completed_analysis_only"
             return "validation_not_admitted"
         if self.holdout_release_object_id is None:
             return "holdout_sealed"
@@ -763,7 +765,10 @@ def _frozen_report_for_phase(
             allow_legacy=allow_legacy,
         )
     if phase in {"development", "holdout"}:
-        return _frozen_phase_report(value, protocol=protocol)
+        report = _frozen_phase_report(value, protocol=protocol)
+        if report["phase"] != phase:
+            raise EconomicEvaluationAdmissionError("report phase does not match evaluation-run phase")
+        return report
     raise EconomicEvaluationAdmissionError("evaluation-run phase is invalid")
 
 
@@ -1504,7 +1509,7 @@ class EconomicEvaluationAdmissionAdapter:
         pit_artifact_root: str | Path,
         tournament_input: SourceBoundTournamentInput | None = None,
     ) -> EconomicEvaluationRun:
-        """Admit a completed validation result before any holdout release."""
+        """Admit one completed phase result; holdout requires a qualifying release."""
 
         identity = _require_protocol_id(protocol_id)
         if phase not in {"development", "validation", "holdout"}:
@@ -1847,6 +1852,25 @@ class EconomicEvaluationAdmissionAdapter:
             raise EconomicEvaluationAdmissionError(
                 "protocol identity has more than one immutable development run"
             )
+        development_run = development_runs[0] if development_runs else None
+        if development_run is not None:
+            run_payload = _payload_mapping(
+                _thaw_json(development_run.envelope.payload),
+                label="readiness development-run payload",
+            )
+            report = _frozen_report_for_phase(
+                _validation_report_receipt_value(
+                    run_payload["frozen_validation_report"],
+                    label="readiness development report",
+                ),
+                protocol=protocol,
+                phase="development",
+            )
+            if self._reopen_phase_tournament_input(
+                protocol=protocol,
+                report=report,
+            ) is None:
+                development_run = None
         validation_runs = [
             _evaluation_run_from_envelope(
                 envelope,
@@ -1960,7 +1984,7 @@ class EconomicEvaluationAdmissionAdapter:
             protocol_id=identity,
             protocol_admission_object_id=protocol_envelope.object_id,
             development_run_object_id=(
-                development_runs[0].envelope.object_id if development_runs else None
+                development_run.envelope.object_id if development_run is not None else None
             ),
             validation_run_object_id=(
                 validation_run.envelope.object_id if validation_run is not None else None

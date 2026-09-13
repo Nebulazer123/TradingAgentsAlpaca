@@ -1087,7 +1087,7 @@ def test_readiness_status_and_validation_report_are_read_only_and_protocol_bound
     assert released.holdout_release_object_id == release.envelope.object_id
 
 
-def test_development_admission_reopens_its_exact_phase_bound_receipt(tmp_path):
+def test_development_admission_reopens_its_exact_phase_bound_receipt(tmp_path, monkeypatch):
     adapter = _adapter(tmp_path)
     protocol, partitions = _partitioned_protocol(tmp_path)
     adapter.admit_protocol(
@@ -1156,6 +1156,14 @@ def test_development_admission_reopens_its_exact_phase_bound_receipt(tmp_path):
     assert run.phase == "development"
     assert readiness.development_run_object_id == run.envelope.object_id
     assert readiness.validation_run_object_id is None
+    assert readiness.state == "development_completed_analysis_only"
+
+    def missing_custody(**_kwargs):
+        raise FileNotFoundError("retained development source is missing")
+
+    monkeypatch.setattr(adapter._tournament_archive, "reopen", missing_custody)
+    with pytest.raises(EconomicEvaluationAdmissionError, match="custody"):
+        adapter.readiness_status(protocol.protocol_id)
 
 
 def test_released_holdout_admission_reopens_its_exact_phase_bound_receipt(tmp_path):
