@@ -83,6 +83,28 @@ Cost budgets currently govern lane selection, not authorization or a guaranteed
 pre-call spending ceiling; real execution must remain held until the separate
 model/spend controls and genuine corpus prerequisites are satisfied.
 
+## Exact-clean-source proof completed
+
+At `2026-09-14T02:22:08.034018Z`, clean source
+`f59a40cb84acd5723808e5ac96098ffde44702e6` passed the separate proof without
+mocking Git identity. All 1,400 synthetic cases passed source preflight; one
+source-bound and one no-text case each executed the real twelve-role graph,
+SQLite persistence and three packet boundaries. Twenty-four production-client
+responses used HTTP mock transport, with socket connections explicitly blocked.
+Both final answers and every retained response hash matched. This is not real
+model qualification or a 1,400-case full-graph run.
+
+Before and after, four frozen owners, ten PAUSED automation files, all 24 original
+Alpaca response hashes/private permissions and the original Phase 5 ZIP matched.
+No source, ledger, schedule, account, live-control or historical data was changed
+by the probe. Receipt: canonical SDD
+`phase7-clean-source-probe-20260913/proof-receipt.json`, SHA-256
+`62c66f442d6fd9f3ae585ae850ef687d1a8e3c7e258d979a32b8ddc01f197bec`.
+The nine-module gate receipt SHA-256 is
+`dae49074480a20298a4a0adc59ac8096dcf868c9c11265b4d70ff8fd256fc17b`.
+Local fast-forward integration may reuse these unchanged-source results; the
+following documentation-only commit does not require another identical gate.
+
 ## Earlier combined baseline
 
 This is an isolated source checkpoint, **not completed Task 7.1 or Phase 7

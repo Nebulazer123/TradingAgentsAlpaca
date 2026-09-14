@@ -23,6 +23,19 @@
 
 ## Current continuation — verified 2026-09-07
 
+**Latest source checkpoint — 2026-09-13, Phase 7 runner:** The retained-only
+full-role benchmark is implemented on clean source `f59a40c`, with 341 passing
+affected tests and an unmocked clean-Git proof of both actual twelve-role graph
+variants using synthetic HTTP responses. See
+[the Phase 7 source checkpoint](../checkpoints/2026-09-13-phase7-benchmark-source-preparation.md).
+The real 500/300/400/200 corpus, model qualification and Phase 7 acceptance remain
+open. The authorized Alpaca paper capture is preserved, but cannot establish
+historical source availability. Do not replay that collection or earlier gates.
+After local source integration, continue Phase 8's isolated readiness-source
+review/integration; actual state transitions still require their evidence and
+authority prerequisites. Keep Task 6.2, concurrency qualification, later economic
+and operational gates open, and preserve the full program and frozen controls.
+
 **Latest source checkpoint — 2026-09-13, Task 6.1:** Reviewed learning source
 `c11a9c4` is combined with canonical `bc579d4`; 205 affected tests, scoped statics,
 exact CLI merge preservation, and frozen-owner checks pass. See
