@@ -723,7 +723,9 @@ def _learning_protocol_resolution_fixture(
                 }
             )
         artifact = archive.admit(
-            raw_bytes=json.dumps({"bars": {symbol: bars}}).encode(),
+            raw_bytes=json.dumps(
+                {"symbol": symbol, "next_page_token": None, "bars": bars}
+            ).encode(),
             source_uri=(
                 f"https://data.alpaca.markets/v2/stocks/{symbol}/bars?"
                 "timeframe=1Day&feed=iex&adjustment=all"

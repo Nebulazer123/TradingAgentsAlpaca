@@ -64,16 +64,16 @@ def _source_bound_verifier_for(tmp_path):
         artifact = archive.admit(
             raw_bytes=json.dumps(
                 {
-                    "bars": {
-                        symbol: [
-                            {"t": "2026-06-01T05:00:00Z", "c": first_close},
-                            {"t": "2026-06-02T05:00:00Z", "c": "101"},
-                            {"t": "2026-06-03T05:00:00Z", "c": "102"},
-                            {"t": "2026-06-04T05:00:00Z", "c": "103"},
-                            {"t": "2026-06-05T05:00:00Z", "c": "104"},
-                            {"t": "2026-06-08T05:00:00Z", "c": last_close},
-                        ]
-                    }
+                    "symbol": symbol,
+                    "next_page_token": None,
+                    "bars": [
+                        {"t": "2026-06-01T05:00:00Z", "c": first_close},
+                        {"t": "2026-06-02T05:00:00Z", "c": "101"},
+                        {"t": "2026-06-03T05:00:00Z", "c": "102"},
+                        {"t": "2026-06-04T05:00:00Z", "c": "103"},
+                        {"t": "2026-06-05T05:00:00Z", "c": "104"},
+                        {"t": "2026-06-08T05:00:00Z", "c": last_close},
+                    ],
                 }
             ).encode("utf-8"),
             source_uri=(

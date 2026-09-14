@@ -249,19 +249,19 @@ def _outcome_window(
     clock_value[0] = dt.datetime.fromisoformat(retrieved_at)
     raw_bytes = _canonical_bytes(
         {
-            "bars": {
-                security.symbol: [
-                    {
-                        "t": f"{session_date}T05:00:00Z",
-                        "c": (
-                            str(Decimal("10") * (Decimal("1") + Decimal(gross_return)))
-                            if gross_return is not None and index == len(session_dates) - 1
-                            else str(11 + index)
-                        ),
-                    }
-                    for index, session_date in enumerate(session_dates)
-                ]
-            }
+            "symbol": security.symbol,
+            "next_page_token": None,
+            "bars": [
+                {
+                    "t": f"{session_date}T05:00:00Z",
+                    "c": (
+                        str(Decimal("10") * (Decimal("1") + Decimal(gross_return)))
+                        if gross_return is not None and index == len(session_dates) - 1
+                        else str(11 + index)
+                    ),
+                }
+                for index, session_date in enumerate(session_dates)
+            ],
         }
     )
     artifact = archive.admit(

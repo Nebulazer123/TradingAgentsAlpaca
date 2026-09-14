@@ -135,6 +135,8 @@ def _source_material(
     if artifact.content_type != "application/json":
         raise PointInTimeDataError("Alpaca price source must be JSON")
     query = parse_qs(parsed.query, keep_blank_values=True)
+    if "page_token" in query:
+        raise PointInTimeDataError("Alpaca price source cannot start from a continuation page")
     source_start, source_end = _requested_source_bounds(requested_start, requested_end)
     if (
         query.get("timeframe") != ["1Day"]
@@ -160,9 +162,13 @@ def _bars(
         payload = json.loads(raw_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PointInTimeDataError("Alpaca price source bytes are not JSON") from exc
-    if not isinstance(payload, Mapping) or not isinstance(payload.get("bars"), Mapping):
-        raise PointInTimeDataError("Alpaca price source must contain symbol-indexed bars")
-    symbol_bars = payload["bars"].get(symbol)
+    if not isinstance(payload, Mapping) or payload.get("symbol") != symbol:
+        raise PointInTimeDataError("Alpaca price source symbol does not match the requested route")
+    if "next_page_token" not in payload or payload["next_page_token"] is not None:
+        raise PointInTimeDataError("Alpaca price source must be a complete, unpaginated response")
+    # The single-symbol REST route returns a list. A symbol-indexed mapping
+    # belongs to the multi-symbol REST route or an SDK conversion, not these bytes.
+    symbol_bars = payload.get("bars")
     if type(symbol_bars) is not list or not symbol_bars:
         raise PointInTimeDataError("Alpaca price source has no bars for requested symbol")
     parsed: list[tuple[str, str]] = []

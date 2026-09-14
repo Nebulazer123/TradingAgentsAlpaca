@@ -52,12 +52,12 @@ def _receipts(tmp_path):
     price_artifact = archive.admit(
         raw_bytes=json.dumps(
             {
-                "bars": {
-                    "T000": [
-                        {"t": f"{market_date}T05:00:00Z", "c": str(11 + index)}
-                        for index, market_date in enumerate(MARKET_DATES[1:6])
-                    ]
-                }
+                "symbol": "T000",
+                "next_page_token": None,
+                "bars": [
+                    {"t": f"{market_date}T05:00:00Z", "c": str(11 + index)}
+                    for index, market_date in enumerate(MARKET_DATES[1:6])
+                ],
             }
         ).encode(),
         source_uri=(

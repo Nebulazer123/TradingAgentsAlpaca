@@ -24,13 +24,13 @@ def _window(tmp_path, *, symbol: str = "T000", last_close: str = "12"):
     artifact = archive.admit(
         raw_bytes=json.dumps(
             {
-                "bars": {
-                    symbol: [
-                        {"t": "2026-01-05T05:00:00Z", "c": "10"},
-                        {"t": "2026-01-06T05:00:00Z", "c": "11"},
-                        {"t": "2026-01-07T05:00:00Z", "c": last_close},
-                    ]
-                }
+                "symbol": symbol,
+                "next_page_token": None,
+                "bars": [
+                    {"t": "2026-01-05T05:00:00Z", "c": "10"},
+                    {"t": "2026-01-06T05:00:00Z", "c": "11"},
+                    {"t": "2026-01-07T05:00:00Z", "c": last_close},
+                ],
             }
         ).encode(),
         source_uri=(

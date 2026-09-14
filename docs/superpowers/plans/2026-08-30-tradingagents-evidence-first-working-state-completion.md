@@ -23,6 +23,20 @@
 
 ## Current continuation — verified 2026-09-07
 
+**Latest source checkpoint — 2026-09-14, adjusted-price REST repair:** The first
+full Phase 10 candidate `5771809` was deliberately stopped only after two new
+regressions demonstrated a route/body mismatch in the adjusted-price parser.
+Its final receipt records pytest exit -15 with unchanged source and protected
+owners, not a passing full gate. The isolated repair accepts the actual
+single-symbol REST list, binds its response symbol and rejects incomplete or
+continuation-only pages; exact source/custody/economic guards remain. Eight
+synthetic literals were corrected without changing their data or assertions.
+The 13 new contract tests and seven-module 155-test affected gate pass. See
+[the repair checkpoint](../checkpoints/2026-09-14-adjusted-price-rest-contract.md).
+One corrected full source gate is still required before Phase 10 acceptance.
+The retained broad multi-symbol capture is still not an accepted adjusted-window
+input, and no actual learning, economic or operational qualification is claimed.
+
 **Latest source checkpoint — 2026-09-13, Phase 8 runner:** Reviewed `0b38a8e`
 is combined with canonical `3901c2c`. Two additional boundary defects are repaired:
 completion/rollback evidence is checked before promotion replacement, and current

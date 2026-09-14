@@ -31,13 +31,13 @@ def _artifact(
     artifact = archive.admit(
         raw_bytes=json.dumps(
             {
-                "bars": {
-                    symbol: [
-                        {"t": "2026-01-05T05:00:00Z", "c": "10"},
-                        {"t": "2026-01-06T05:00:00Z", "c": "11"},
-                        {"t": "2026-01-07T05:00:00Z", "c": "12"},
-                    ]
-                }
+                "symbol": symbol,
+                "next_page_token": None,
+                "bars": [
+                    {"t": "2026-01-05T05:00:00Z", "c": "10"},
+                    {"t": "2026-01-06T05:00:00Z", "c": "11"},
+                    {"t": "2026-01-07T05:00:00Z", "c": "12"},
+                ],
             }
         ).encode(),
         source_uri=(
@@ -151,12 +151,12 @@ def test_five_session_window_uses_exact_next_calendar_sessions(tmp_path):
     price_artifact = archive.admit(
         raw_bytes=json.dumps(
             {
-                "bars": {
-                    "T000": [
-                        {"t": f"{date}T05:00:00Z", "c": str(10 + index)}
-                        for index, date in enumerate(dates[1:])
-                    ]
-                }
+                "symbol": "T000",
+                "next_page_token": None,
+                "bars": [
+                    {"t": f"{date}T05:00:00Z", "c": str(10 + index)}
+                    for index, date in enumerate(dates[1:])
+                ],
             }
         ).encode(),
         source_uri=(

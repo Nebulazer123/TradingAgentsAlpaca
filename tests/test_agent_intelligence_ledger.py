@@ -243,15 +243,15 @@ def _write_source_bound_receipts(
             current += datetime.timedelta(days=1)
         raw_bytes = json.dumps(
             {
-                "bars": {
-                    symbol: [
-                        {
-                            "t": f"{market_date.isoformat()}T05:00:00Z",
-                            "c": first_close if position == 0 else last_close,
-                        }
-                        for position, market_date in enumerate(market_dates)
-                    ]
-                }
+                "symbol": symbol,
+                "next_page_token": None,
+                "bars": [
+                    {
+                        "t": f"{market_date.isoformat()}T05:00:00Z",
+                        "c": first_close if position == 0 else last_close,
+                    }
+                    for position, market_date in enumerate(market_dates)
+                ],
             }
         ).encode("utf-8")
         artifact = archive.admit(
