@@ -7,17 +7,16 @@ import datetime as dt
 import hashlib
 import json
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from tradingagents.dataflows.pit.market_calendar import (
     MarketSessionCalendar,
     validate_market_session_calendar,
 )
 from tradingagents.dataflows.pit.records import PointInTimeDataError
-from tradingagents.evals.economic_evaluation_protocol import (
-    DecisionEvent,
-    canonical_universe_id,
-    validate_decision_event,
-)
+
+if TYPE_CHECKING:
+    from tradingagents.evals.economic_evaluation_protocol import DecisionEvent
 
 _AUTHORITY = {
     "analysis_only": True,
@@ -28,6 +27,26 @@ _SCHEMA = "market_date_partitions/v2"
 _PURGE_SESSIONS = 5
 _CADENCE = "weekly"
 _PRIMARY_UNIVERSE_SIZE = 75
+_PROTOCOL_CONTRACTS: tuple[object, object, object] | None = None
+
+
+def _protocol_contracts() -> tuple[object, object, object]:
+    """Bind protocol contracts only after PIT package initialization completes."""
+
+    global _PROTOCOL_CONTRACTS
+    if _PROTOCOL_CONTRACTS is None:
+        from tradingagents.evals.economic_evaluation_protocol import (
+            DecisionEvent,
+            canonical_universe_id,
+            validate_decision_event,
+        )
+
+        _PROTOCOL_CONTRACTS = (
+            DecisionEvent,
+            canonical_universe_id,
+            validate_decision_event,
+        )
+    return _PROTOCOL_CONTRACTS
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -223,6 +242,8 @@ def _weekly_decision_dates(
 
 
 def _canonical_primary_universe(value: object) -> tuple[tuple[str, ...], str]:
+    _, canonical_universe_id, _ = _protocol_contracts()
+
     if type(value) is not tuple or len(value) != _PRIMARY_UNIVERSE_SIZE:
         raise PointInTimeDataError("primary_universe must be an exact 75-symbol tuple")
     try:
@@ -240,6 +261,8 @@ def _canonical_events(
     primary_universe_id: str,
     registered_at: dt.datetime,
 ) -> tuple[DecisionEvent, ...]:
+    DecisionEvent, _, validate_decision_event = _protocol_contracts()
+
     if type(value) is not tuple or not value:
         raise PointInTimeDataError("events must be a nonempty exact tuple")
     validated: list[DecisionEvent] = []
@@ -482,6 +505,8 @@ def build_market_date_partitions(
 
 def validate_market_date_partitions(value: object) -> MarketDatePartitions:
     """Rebuild full market-date partitions from source-bound decision events."""
+
+    _, _, validate_decision_event = _protocol_contracts()
 
     if not isinstance(value, Mapping) or set(value) != _SERIALIZED_FIELDS:
         raise PointInTimeDataError("market-date partition fields are invalid")

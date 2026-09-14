@@ -30,9 +30,9 @@ Dependence semantics (fixed for this increment):
   unavailable until a preregistered estimator exists. Raw resolved rows are
   never independent observations.
 - Canonical economic decision-event and decision-market-date counts stay
-  unavailable unless a verified economic identity binding is present. The
-  current ledger schema has no such binding, so neither ``created_at`` nor a
-  provisional cluster key is promoted into economic identity.
+  unavailable unless a verified economic identity binding is present. Legacy
+  rows lack that binding, so neither ``created_at`` nor a provisional cluster
+  key is promoted into economic identity.
 - ``influence_weighting_status`` labels the row-weighted influence
   estimator legacy/unregistered in every receipt and dependence block.
 

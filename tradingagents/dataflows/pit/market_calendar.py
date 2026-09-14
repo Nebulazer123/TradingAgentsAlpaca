@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from tradingagents.dataflows.pit.raw_artifacts import (
     RawPointInTimeArtifact,
@@ -20,6 +21,7 @@ from tradingagents.dataflows.pit.records import PointInTimeDataError
 __all__ = [
     "MarketSessionCalendar",
     "build_market_session_calendar",
+    "resolve_market_session_open",
     "validate_market_session_calendar",
 ]
 
@@ -376,3 +378,24 @@ def _resolve_source_session(
         "regular_session_open": canonical_open,
         "regular_session_close": canonical_close,
     }
+
+
+def resolve_market_session_open(
+    *,
+    archive: RawPointInTimeArtifactArchive,
+    market_calendar: MarketSessionCalendar,
+    session_date: str,
+) -> str:
+    """Replay one official regular-session open from retained calendar bytes."""
+
+    _rebuilt, source = _resolve_source_session(
+        archive=archive,
+        market_calendar=market_calendar,
+        session_date=session_date,
+    )
+    local_open = dt.datetime.combine(
+        dt.date.fromisoformat(session_date),
+        dt.time.fromisoformat(source["regular_session_open"]),
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    return local_open.astimezone(dt.UTC).isoformat(timespec="seconds")

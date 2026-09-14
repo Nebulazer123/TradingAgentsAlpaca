@@ -437,7 +437,7 @@ def test_source_verifiable_cohort_rejects_bad_bar_sets_and_numeric_limits(tmp_pa
         [*bars, bars[-1]],
         list(reversed(bars)),
     )
-    for index, changed_bars in enumerate(mutations):
+    for changed_bars in mutations:
         changed = copy.deepcopy(payload)
         _replace_bars(
             archive,

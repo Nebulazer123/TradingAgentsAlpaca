@@ -165,7 +165,7 @@ def test_alpaca_observation_binds_exact_bar_identity_feed_adjustment_and_session
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=split"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-01-05T05:00:00Z", "c": 102.25}]}},
@@ -202,11 +202,85 @@ def test_alpaca_observation_binds_exact_bar_identity_feed_adjustment_and_session
     )
 
 
+@pytest.mark.parametrize("single_symbol", [True, False], ids=["single", "multi"])
+def test_alpaca_observation_accepts_documented_endpoint_response_pair(
+    tmp_path, single_symbol,
+):
+    # Synthetic values in the documented wire shapes, not a captured account receipt.
+    bar = {"t": "2026-01-05T05:00:00Z", "o": 101, "h": 103, "l": 100,
+           "c": 102.25, "v": 1000, "n": 100, "vw": 102}
+    if single_symbol:
+        route = "AAPL/bars?"
+        payload = {"bars": [bar], "symbol": "AAPL", "next_page_token": None}
+        bar_path = ("bars", 0)
+    else:
+        route = "bars?symbols=MSFT%2CAAPL&"
+        payload = {"bars": {"MSFT": [{**bar, "c": 999}], "AAPL": [bar]},
+                   "next_page_token": None}
+        bar_path = ("bars", "AAPL", 0)
+    archive, artifact = _archive(
+        tmp_path,
+        uri=f"https://data.alpaca.markets/v2/stocks/{route}timeframe=1Day&feed=sip&adjustment=raw",
+        payload=payload,
+    )
+    observation = build_alpaca_market_observation(
+        security_identity=_security(), archive=archive, raw_artifact=artifact,
+        market_calendar=_calendar(archive, "2026-01-05"),
+        bar_path=bar_path, value_field="c",
+    )
+    assert observation.observed_value == "102.25"
+    assert observation.source_span["paths"]["observed_value"] == (*bar_path, "c")
+    assert observation.source_span["paths"]["event_time"] == (*bar_path, "t")
+    assert observation.raw_artifact_sha256 == artifact.raw_artifact_sha256
+    assert observation.availability_time == artifact.retrieved_at
+    assert observation.retrieval_time == artifact.archive_recorded_at
+
+
+@pytest.mark.parametrize(
+    ("route", "shape", "response_symbol", "bar_path"),
+    [
+        ("AAPL/bars?", "single", "MSFT", ("bars", 0)),
+        ("AAPL/bars?", "single", None, ("bars", 0)),
+        ("AAPL/bars?", "multi", "AAPL", ("bars", "AAPL", 0)),
+        ("AAPL/bars?", "multi", "AAPL", ("bars", 0)),
+        ("bars?symbols=AAPL&", "single", "AAPL", ("bars", "AAPL", 0)),
+        ("bars?symbols=MSFT&", "multi", None, ("bars", "AAPL", 0)),
+        ("bars?symbols=AAPL,AAPL&", "multi", None, ("bars", "AAPL", 0)),
+        ("bars?symbols=AAPL&symbols=MSFT&", "multi", None, ("bars", "AAPL", 0)),
+        ("bars?", "multi", None, ("bars", "AAPL", 0)),
+        ("bars?symbols=AAPL,&", "multi", None, ("bars", "AAPL", 0)),
+        ("bars?symbols=AAPL,MSFT&", "multi", None, ("bars", "MSFT", 0)),
+        ("AAPL/bars/extra?", "single", "AAPL", ("bars", 0)),
+        ("../stocks/AAPL/bars?", "single", "AAPL", ("bars", 0)),
+        ("AAPL/bars?", "single", "AAPL", ("bars", True)),
+        ("AAPL/bars?", "single", "AAPL", ("bars", -1)),
+    ],
+)
+def test_alpaca_observation_rejects_crossed_endpoint_identity_or_selector(
+    tmp_path, route, shape, response_symbol, bar_path,
+):
+    bar = {"t": "2026-01-05T05:00:00Z", "c": 102.25}
+    payload = {"bars": [bar] if shape == "single" else {"AAPL": [bar], "MSFT": [bar]}}
+    if response_symbol is not None:
+        payload["symbol"] = response_symbol
+    archive, artifact = _archive(
+        tmp_path,
+        uri=f"https://data.alpaca.markets/v2/stocks/{route}timeframe=1Day&feed=sip&adjustment=raw",
+        payload=payload,
+    )
+    with pytest.raises(PointInTimeDataError):
+        build_alpaca_market_observation(
+            security_identity=_security(), archive=archive, raw_artifact=artifact,
+            market_calendar=_calendar(archive, "2026-01-05"),
+            bar_path=bar_path, value_field="c",
+        )
+
+
 def test_official_observations_reject_missing_raw_source_facts(tmp_path):
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=sip&adjustment=all"
         ),
         payload={"bars": {"AAPL": []}},
@@ -237,25 +311,25 @@ def test_official_observations_reject_missing_raw_source_facts(tmp_path):
     ("uri", "payload", "bar_path", "identity"),
     [
         (
-            "https://data.alpaca.markets/v2/stocks/MSFT/bars?timeframe=1Day&feed=iex&adjustment=raw",
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=MSFT&timeframe=1Day&feed=iex&adjustment=raw",
             {"bars": {"MSFT": [{"t": "2026-01-05T05:00:00Z", "c": 10}]}},
             ("bars", "MSFT", 0),
             _security(),
         ),
         (
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=1Day&feed=iex&adjustment=raw",
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&timeframe=1Day&feed=iex&adjustment=raw",
             {"bars": {"AAPL": [{"t": "2019-12-31T05:00:00Z", "c": 10}]}},
             ("bars", "AAPL", 0),
             _security(),
         ),
         (
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=1Day&feed=iex&feed=sip&adjustment=raw",
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&timeframe=1Day&feed=iex&feed=sip&adjustment=raw",
             {"bars": {"AAPL": [{"t": "2026-01-05T05:00:00Z", "c": 10}]}},
             ("bars", "AAPL", 0),
             _security(),
         ),
         (
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=Bogus&feed=iex&adjustment=raw",
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&timeframe=Bogus&feed=iex&adjustment=raw",
             {"bars": {"AAPL": [{"t": "2026-01-05T15:00:00Z", "c": 10}]}},
             ("bars", "AAPL", 0),
             _security(),
@@ -294,7 +368,7 @@ def test_alpaca_observation_rejects_duplicate_json_keys_as_ambiguous(tmp_path):
             b'"bars":{"AAPL":[{"t":"2026-01-05T05:00:00Z","c":999}]}}'
         ),
         source_uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         content_type="application/json",
@@ -317,7 +391,7 @@ def test_alpaca_intraday_observation_uses_proven_interval_completion(tmp_path):
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Hour&feed=sip&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-01-05T19:30:00Z", "v": 0}]}},
@@ -354,7 +428,7 @@ def test_alpaca_daily_completion_uses_new_york_dst_offset(tmp_path):
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-07-06T04:00:00Z", "c": 10}]}},
@@ -381,7 +455,7 @@ def test_alpaca_observation_uses_source_early_close_and_rejects_post_close_bar(
     daily_archive, daily_artifact = _archive(
         tmp_path / "daily",
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-11-27T05:00:00Z", "c": 10}]}},
@@ -415,7 +489,7 @@ def test_alpaca_observation_uses_source_early_close_and_rejects_post_close_bar(
     late_archive, late_artifact = _archive(
         tmp_path / "post-close",
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=5Min&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-11-27T18:00:00Z", "c": 10}]}},
@@ -454,7 +528,7 @@ def test_alpaca_observation_rejects_absent_or_malformed_source_session_hours(
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-01-05T05:00:00Z", "c": 10}]}},
@@ -533,7 +607,7 @@ def test_alpaca_observation_rejects_unproven_session_or_interval(
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             f"timeframe={timeframe}&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": event_time, "c": 10}]}},
@@ -557,7 +631,7 @@ def test_alpaca_observation_rejects_retrieval_before_bar_completion(tmp_path):
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-01-05T05:00:00Z", "c": 10}]}},
@@ -595,7 +669,7 @@ def test_alpaca_observation_preserves_decimal_source_numbers_losslessly(
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         raw_bytes=(
@@ -622,7 +696,7 @@ def test_official_observations_reject_compact_extreme_decimal_exponents(tmp_path
     archive, artifact = _archive(
         tmp_path / "alpaca",
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         raw_bytes=(
@@ -689,7 +763,7 @@ def test_alpaca_observation_rejects_wrong_numeric_type_or_domain(
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-01-05T05:00:00Z", field: value}]}},
@@ -711,7 +785,7 @@ def test_alpaca_observation_requires_exact_source_bound_calendar(tmp_path):
     archive, artifact = _archive(
         tmp_path,
         uri=(
-            "https://data.alpaca.markets/v2/stocks/AAPL/bars?"
+            "https://data.alpaca.markets/v2/stocks/bars?symbols=AAPL&"
             "timeframe=1Day&feed=iex&adjustment=raw"
         ),
         payload={"bars": {"AAPL": [{"t": "2026-01-05T05:00:00Z", "c": 10}]}},

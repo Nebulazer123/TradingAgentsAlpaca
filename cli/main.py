@@ -197,7 +197,7 @@ from tradingagents.evals.economic_evaluation_admission import (
     EconomicEvaluationAdmissionError,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
-    bind_validation_phase_eligibility,
+    bind_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     validate_frozen_evaluation_protocol,
@@ -205,7 +205,7 @@ from tradingagents.evals.economic_evaluation_protocol import (
 from tradingagents.evals.economic_tournament import (
     EconomicTournamentCandidate,
     EconomicTournamentOutcome,
-    evaluate_validation_ta_control,
+    evaluate_phase_ta_control,
 )
 from tradingagents.evals.economic_tournament_evidence import (
     SourceBoundTournamentInput,
@@ -258,6 +258,10 @@ from tradingagents.graph.analyst_execution import (
     build_analyst_execution_plan,
     get_initial_analyst_node,
     sync_analyst_tracker_from_chunk,
+)
+from tradingagents.graph.checkpoint_runtime_identity import (
+    CheckpointRuntimeIdentityError,
+    build_analysis_checkpoint_identity,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.model_catalog import get_model_context_window_tokens
@@ -3161,7 +3165,7 @@ def _economic_validation_report(
     """Wrap one canonical validation result in the immutable admission schema."""
 
     result_payload = result.to_dict()
-    return {
+    report = {
         "schema_version": "economic_validation_report/v3",
         "protocol_id": protocol_id,
         "market_date_partitions": partitions.to_dict(),
@@ -3177,6 +3181,45 @@ def _economic_validation_report(
         "execution_authority": "none",
         "can_submit_orders": False,
     }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
+
+
+def _economic_phase_report(
+    *,
+    protocol_id: str,
+    phase: str,
+    partitions: object,
+    event_ids: tuple[str, ...],
+    result: object,
+    tournament_input: SourceBoundTournamentInput,
+) -> dict[str, object]:
+    """Wrap one development or holdout result in its explicit v4 report."""
+
+    result_payload = result.to_dict()
+    report = {
+        "schema_version": "economic_evaluation_report/v4",
+        "protocol_id": protocol_id,
+        "phase": phase,
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(event_ids),
+        "result": result_payload,
+        "result_id": result_payload["result_id"],
+        "result_sha256": result_payload["result_sha256"],
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
 
 
 def _economic_effective_at(value: str) -> datetime.datetime:
@@ -3295,7 +3338,7 @@ def research_economic_tournament_run(
         "--tournament-input-path",
         exists=True,
         readable=True,
-        help="Complete source-bound candidate and realized-outcome evidence JSON for validation only.",
+        help="Complete source-bound candidate and realized-outcome evidence JSON for the selected phase.",
     ),
     pit_artifact_root: Path = typer.Option(
         ...,
@@ -3321,26 +3364,39 @@ def research_economic_tournament_run(
     effective_at: str = typer.Option(
         ...,
         "--effective-at",
-        help="Canonical UTC timestamp for the immutable validation-only receipt.",
+        help="Canonical UTC timestamp for the immutable phase receipt.",
+    ),
+    phase: str = typer.Option(
+        "validation",
+        "--phase",
+        help="Frozen lifecycle phase: development, validation, or holdout.",
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Admit one sealed validation TA-Control result as analysis-only evidence."""
+    """Admit one TA-Control phase result as analysis-only evidence."""
 
     protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
     partitions_payload = _economic_json_object(partitions_path, label="partitions-path")
-    tournament_payload = _economic_json_object(
-        tournament_input_path,
-        label="tournament-input-path",
-        max_bytes=32_000_000,
-        require_canonical=True,
-    )
     effective = _economic_effective_at(effective_at)
     try:
         protocol = validate_frozen_evaluation_protocol(protocol_payload)
-        eligibility = bind_validation_phase_eligibility(
+        if phase not in {"development", "validation", "holdout"}:
+            raise ValueError("phase must be development, validation, or holdout")
+        eligibility = bind_phase_eligibility(
             protocol=protocol,
             partitions=validate_market_date_partitions(partitions_payload),
+            phase=phase,
+        )
+        adapter = EconomicEvaluationAdmissionAdapter(evidence_root, repo_root=repo_root)
+        if phase == "holdout" and not adapter.is_holdout_released(protocol.protocol_id):
+            raise EconomicEvaluationAdmissionError(
+                "holdout input is sealed until an immutable qualifying release exists"
+            )
+        tournament_payload = _economic_json_object(
+            tournament_input_path,
+            label="tournament-input-path",
+            max_bytes=32_000_000,
+            require_canonical=True,
         )
         tournament_input = validate_source_bound_tournament_input(
             tournament_payload,
@@ -3353,27 +3409,37 @@ def research_economic_tournament_run(
             protocol=protocol,
             eligibility=eligibility,
         )
-        result = evaluate_validation_ta_control(
+        result = evaluate_phase_ta_control(
             protocol=protocol,
             eligibility=eligibility,
             candidates_by_event=dict(tournament_input.candidates_by_event),
-            outcomes=tournament_input.outcomes,
+            execution_outcomes=tournament_input.outcomes,
+            tournament_input_id=tournament_input.input_id,
+            tournament_input_sha256=tournament_input.input_sha256,
         )
-        admission = EconomicEvaluationAdmissionAdapter(
-            evidence_root,
-            repo_root=repo_root,
-        ).admit_evaluation_run(
+        admission = adapter.admit_evaluation_run(
             protocol.protocol_id,
-            phase="validation",
+            phase=phase,
             effective_at=effective,
             pit_artifact_root=pit_artifact_root,
             tournament_input=tournament_input,
-            frozen_validation_report=_economic_validation_report(
-                protocol_id=protocol.protocol_id,
-                partitions=eligibility.partitions,
-                validation_event_ids=eligibility.event_ids,
-                result=result,
-                tournament_input=tournament_input,
+            frozen_validation_report=(
+                _economic_validation_report(
+                    protocol_id=protocol.protocol_id,
+                    partitions=eligibility.partitions,
+                    validation_event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
+                if phase == "validation"
+                else _economic_phase_report(
+                    protocol_id=protocol.protocol_id,
+                    phase=phase,
+                    partitions=eligibility.partitions,
+                    event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
             ),
         )
     except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
@@ -3390,6 +3456,8 @@ def research_economic_tournament_run(
         "evaluation_run_object_id": admission.envelope.object_id,
         "created": admission.created,
         "evidence_root": str(evidence_root),
+        "availability_status": result.availability_status,
+        "qualification_status": result.qualification_status,
     }
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
@@ -3499,8 +3567,10 @@ def research_economic_readiness_status(
         "protocol_id": readiness.protocol_id,
         "state": readiness.state,
         "protocol_admission_object_id": readiness.protocol_admission_object_id,
+        "development_run_object_id": readiness.development_run_object_id,
         "validation_run_object_id": readiness.validation_run_object_id,
         "holdout_release_object_id": readiness.holdout_release_object_id,
+        "holdout_run_object_id": readiness.holdout_run_object_id,
         "evidence_sequence": readiness.evidence_sequence,
         "evidence_head_event_sha256": readiness.evidence_head_event_sha256,
         "evidence_root": str(evidence_root),
@@ -6416,6 +6486,21 @@ def _run_overnight_ticker_analysis(
     )
     if overrides:
         config.update(overrides)
+    if overrides.get("checkpoint_enabled", True) is not True:
+        raise CheckpointRuntimeIdentityError(
+            "overnight analysis requires evidence-safe checkpointing"
+        )
+    # Build the complete source/model/data identity before any graph or
+    # client construction.  A failure is intentionally not downgraded to
+    # an unsigned or non-checkpointed qualifying run.
+    config["checkpoint_run_identity"] = build_analysis_checkpoint_identity(
+        config=config,
+        selected_analysts=tuple(selected_analysts),
+        asset_type="stock",
+        ticker=symbol,
+        trade_date=trade_date,
+    )
+    config["checkpoint_enabled"] = True
     graph = TradingAgentsGraph(
         selected_analysts,
         config=config,
@@ -6446,6 +6531,7 @@ def _run_overnight_ticker_analysis(
         "final_trade_decision": final_decision,
         "investment_plan": final_state.get("investment_plan", ""),
         "trader_investment_plan": final_state.get("trader_investment_plan", ""),
+        "checkpoint_receipt": final_state.get("checkpoint_receipt"),
         "reports": {
             "market": final_state.get("market_report", ""),
             "sentiment": final_state.get("sentiment_report", ""),
@@ -9961,6 +10047,16 @@ def get_analysis_date():
             )
 
 
+def _save_analysis_checkpoint_receipt(final_state, save_path: Path) -> None:
+    """Persist the entrypoint's receipt without inventing a generic default."""
+    receipt = final_state.get("checkpoint_receipt")
+    if receipt is not None:
+        (save_path / "checkpoint_receipt.json").write_text(
+            json.dumps(receipt, sort_keys=True, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
     """Save complete analysis report to disk with organized subfolders."""
     save_path.mkdir(parents=True, exist_ok=True)
@@ -10048,6 +10144,7 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
     # Write consolidated report
     header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     (save_path / "complete_report.md").write_text(header + "\n\n".join(sections), encoding="utf-8")
+    _save_analysis_checkpoint_receipt(final_state, save_path)
     return save_path / "complete_report.md"
 
 
@@ -10284,11 +10381,23 @@ def run_analysis(checkpoint: bool = False):
     )
     analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
 
+    if checkpoint:
+        # This deliberately precedes graph/client construction.  Qualifying
+        # analysis must not silently fall back when source/model/data identity
+        # discovery cannot prove a compatible resume namespace.
+        config["checkpoint_run_identity"] = build_analysis_checkpoint_identity(
+            config=config,
+            selected_analysts=selected_analyst_keys,
+            asset_type=selections["asset_type"],
+            ticker=selections["ticker"],
+            trade_date=selections["analysis_date"],
+        )
+
     # Initialize the graph with callbacks bound to LLMs
     graph = TradingAgentsGraph(
         selected_analyst_keys,
         config=config,
-        debug=True,
+        debug=not checkpoint,
         callbacks=[stats_handler],
     )
 
@@ -10377,21 +10486,36 @@ def run_analysis(checkpoint: bool = False):
         )
         update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
 
-        # Initialize state and get graph args with callbacks
-        init_agent_state = graph.propagator.create_initial_state(
-            selections["ticker"],
-            selections["analysis_date"],
-            asset_type=selections["asset_type"],
-            past_context="",
-        )
-        # Pass callbacks to graph config for tool execution tracking
-        # (LLM tracking is handled separately via LLM constructor)
-        args = graph.propagator.get_graph_args(callbacks=[stats_handler])
+        # The hardened path owns state construction/resume through
+        # ``propagate``.  The explicit opt-out retains the historical
+        # interactive stream behavior for nonqualifying/manual experimentation.
+        if checkpoint:
+            init_agent_state = None
+            args = None
+        else:
+            init_agent_state = graph.propagator.create_initial_state(
+                selections["ticker"],
+                selections["analysis_date"],
+                asset_type=selections["asset_type"],
+                past_context="",
+            )
+            # Pass callbacks to graph config for tool execution tracking
+            # (LLM tracking is handled separately via LLM constructor)
+            args = graph.propagator.get_graph_args(callbacks=[stats_handler])
 
         # Stream the analysis
         trace = []
         try:
-            graph_stream = graph.graph.stream(init_agent_state, **args)
+            if checkpoint:
+                checkpoint_final_state, _ = graph.propagate(
+                    selections["ticker"],
+                    selections["analysis_date"],
+                    asset_type=selections["asset_type"],
+                )
+                graph_stream = [checkpoint_final_state]
+            else:
+                assert args is not None
+                graph_stream = graph.graph.stream(init_agent_state, **args)
             for chunk in graph_stream:
                 # Process all messages in chunk, deduplicating by message ID
                 for message in chunk.get("messages", []):
@@ -10503,7 +10627,18 @@ def run_analysis(checkpoint: bool = False):
         final_state = {}
         for chunk in trace:
             final_state.update(chunk)
-        graph.process_signal(final_state["final_trade_decision"])
+        if not checkpoint:
+            graph.process_signal(final_state["final_trade_decision"])
+            final_state["checkpoint_receipt"] = {
+                "mode": "disabled",
+                "identity_digest": None,
+                "checkpoint_step": None,
+                "qualifying": False,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
+        _save_analysis_checkpoint_receipt(final_state, report_dir)
 
         # Update all agent statuses to completed
         for agent in message_buffer.agent_status:
@@ -10551,21 +10686,117 @@ def run_analysis(checkpoint: bool = False):
 @app.command()
 def analyze(
     checkpoint: bool = typer.Option(
-        False,
-        "--checkpoint",
-        help="Enable checkpoint/resume: save state after each node so a crashed run can resume.",
-    ),
-    clear_checkpoints: bool = typer.Option(
-        False,
-        "--clear-checkpoints",
-        help="Delete all saved checkpoints before running (force fresh start).",
+        True,
+        "--checkpoint/--no-checkpoint",
+        help="Use evidence-safe checkpoint/resume (default); --no-checkpoint is nonqualifying.",
     ),
 ):
-    if clear_checkpoints:
-        from tradingagents.graph.checkpointer import clear_all_checkpoints
-        n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
-        console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
+    """Start interactive analysis with evidence-safe checkpointing by default."""
     run_analysis(checkpoint=checkpoint)
+
+
+@app.command("checkpoint-status")
+def checkpoint_status_command(
+    ticker: str = typer.Option(..., "--ticker", help="Ticker stored in the checkpoint."),
+    trade_date: str = typer.Option(..., "--trade-date", help="Checkpoint trade date."),
+    identity_digest: str = typer.Option(
+        ...,
+        "--identity-digest",
+        help="Complete checkpoint run-identity SHA-256.",
+    ),
+):
+    """Print a bounded, analysis-only status receipt for one exact checkpoint."""
+    from tradingagents.graph.checkpointer import checkpoint_status
+
+    receipt = checkpoint_status(
+        DEFAULT_CONFIG["data_cache_dir"],
+        ticker,
+        trade_date,
+        identity_digest,
+    )
+    console.print(json.dumps(receipt.to_dict(), sort_keys=True))
+
+
+@app.command("checkpoint-clear")
+def checkpoint_clear_command(
+    ticker: str = typer.Option(..., "--ticker", help="Ticker stored in the checkpoint."),
+    trade_date: str = typer.Option(..., "--trade-date", help="Checkpoint trade date."),
+    identity_digest: str = typer.Option(
+        ...,
+        "--identity-digest",
+        help="Complete checkpoint run-identity SHA-256.",
+    ),
+):
+    """Clear only one exact checkpoint identity; no broad recovery is implied."""
+    from tradingagents.graph.checkpointer import clear_checkpoint
+
+    cleared = clear_checkpoint(
+        DEFAULT_CONFIG["data_cache_dir"],
+        ticker,
+        trade_date,
+        identity_digest,
+    )
+    console.print(
+        json.dumps(
+            {
+                "ticker": ticker.upper(),
+                "trade_date": trade_date,
+                "identity_digest": identity_digest,
+                "cleared": cleared,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("checkpoint-retention-report")
+def checkpoint_retention_report_command(
+    max_age_days: int = typer.Option(
+        7,
+        "--max-age-days",
+        min=1,
+        help="Report checkpoints older than this many days; does not delete them.",
+    ),
+):
+    """Report stale checkpoint candidates for later exact, owner-directed clearing."""
+    from tradingagents.graph.checkpointer import checkpoint_retention_report
+
+    report = checkpoint_retention_report(
+        DEFAULT_CONFIG["data_cache_dir"],
+        max_age_days=max_age_days,
+    )
+    console.print(json.dumps(report.to_dict(), sort_keys=True))
+
+
+@app.command("checkpoint-maintenance-clear-all")
+def checkpoint_maintenance_clear_all_command(
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Explicitly authorize bounded checkpoint-root maintenance deletion.",
+    ),
+):
+    """Explicit maintenance-only broad cleanup beneath the configured checkpoint root."""
+    if not confirm:
+        raise typer.BadParameter("--confirm is required for broad checkpoint maintenance")
+    from tradingagents.graph.checkpointer import clear_all_checkpoints
+
+    count = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"], confirm=True)
+    console.print(
+        json.dumps(
+            {
+                "cleared_databases": count,
+                "maintenance_operation": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 @alpaca_app.command("check")

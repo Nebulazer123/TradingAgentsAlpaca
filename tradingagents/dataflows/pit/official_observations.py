@@ -258,20 +258,33 @@ def _single_query_value(
     return values[0]
 
 
-def _alpaca_symbol(parsed_url, *, expected_symbol: str) -> None:
-    segments = [segment for segment in parsed_url.path.split("/") if segment]
-    try:
-        stocks_index = segments.index("stocks")
-    except ValueError as exc:
-        raise PointInTimeDataError("Alpaca URL does not bind a stock symbol") from exc
-    if (
-        stocks_index + 2 >= len(segments)
-        or segments[stocks_index + 1] != expected_symbol
-        or segments[stocks_index + 2] != "bars"
-    ):
+def _alpaca_bar_path(
+    parsed_url,
+    *,
+    query: Mapping[str, list[str]],
+    payload: Mapping[str, object],
+    expected_symbol: str,
+    bar_path: Sequence[str | int],
+) -> tuple[str | int, ...]:
+    """Bind the exact selector to the endpoint's single- or multi-symbol shape."""
+
+    selected = _json_path(bar_path, label="Alpaca bar_path")
+    if parsed_url.path == f"/v2/stocks/{expected_symbol}/bars":
+        if payload.get("symbol") != expected_symbol:
+            raise PointInTimeDataError("Alpaca response symbol does not match the security")
+        prefix = ("bars",)
+    elif parsed_url.path == "/v2/stocks/bars":
+        symbols = _single_query_value(query, "symbols").split(",")
+        if not all(symbols) or len(set(symbols)) != len(symbols) or expected_symbol not in symbols:
+            raise PointInTimeDataError("Alpaca URL does not unambiguously request the security symbol")
+        prefix = ("bars", expected_symbol)
+    else:
         raise PointInTimeDataError(
-            "Alpaca URL symbol does not match the bound security identity"
+            "Alpaca URL is not a supported bars endpoint for the security symbol"
         )
+    if len(selected) != len(prefix) + 1 or selected[:-1] != prefix or type(selected[-1]) is not int:
+        raise PointInTimeDataError("Alpaca bar_path must bind one bar for the security symbol")
+    return selected
 
 
 def _bar_completion(
@@ -453,7 +466,6 @@ def build_alpaca_market_observation(
         or raw_artifact.content_type != "application/json"
     ):
         raise PointInTimeDataError("raw artifact is not Alpaca market-data JSON")
-    _alpaca_symbol(parsed_url, expected_symbol=identity.symbol)
     query = parse_qs(parsed_url.query, keep_blank_values=True)
     feed = _single_query_value(query, "feed")
     adjustment = _single_query_value(query, "adjustment")
@@ -461,16 +473,10 @@ def build_alpaca_market_observation(
     if feed not in {"iex", "sip"} or adjustment not in _ALPACA_ADJUSTMENT_STATUS:
         raise PointInTimeDataError("Alpaca URL has unsupported feed or adjustment")
     payload = _json_mapping(raw_bytes, label="Alpaca")
-    selected_bar_path = _json_path(bar_path, label="Alpaca bar_path")
-    if (
-        len(selected_bar_path) != 3
-        or selected_bar_path[0] != "bars"
-        or selected_bar_path[1] != identity.symbol
-        or type(selected_bar_path[2]) is not int
-    ):
-        raise PointInTimeDataError(
-            "Alpaca bar_path must bind one bar for the security symbol"
-        )
+    selected_bar_path = _alpaca_bar_path(
+        parsed_url, query=query, payload=payload,
+        expected_symbol=identity.symbol, bar_path=bar_path,
+    )
     selected_bar = _select_json(
         payload,
         selected_bar_path,
