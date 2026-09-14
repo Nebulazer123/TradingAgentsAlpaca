@@ -252,6 +252,10 @@ from tradingagents.graph.analyst_execution import (
     get_initial_analyst_node,
     sync_analyst_tracker_from_chunk,
 )
+from tradingagents.graph.checkpoint_runtime_identity import (
+    CheckpointRuntimeIdentityError,
+    build_analysis_checkpoint_identity,
+)
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.model_catalog import get_model_context_window_tokens
 from tradingagents.orchestration.authority import ActionClass, authority_for
@@ -6224,6 +6228,21 @@ def _run_overnight_ticker_analysis(
     )
     if overrides:
         config.update(overrides)
+    if overrides.get("checkpoint_enabled", True) is not True:
+        raise CheckpointRuntimeIdentityError(
+            "overnight analysis requires evidence-safe checkpointing"
+        )
+    # Build the complete source/model/data identity before any graph or
+    # client construction.  A failure is intentionally not downgraded to
+    # an unsigned or non-checkpointed qualifying run.
+    config["checkpoint_run_identity"] = build_analysis_checkpoint_identity(
+        config=config,
+        selected_analysts=tuple(selected_analysts),
+        asset_type="stock",
+        ticker=symbol,
+        trade_date=trade_date,
+    )
+    config["checkpoint_enabled"] = True
     graph = TradingAgentsGraph(
         selected_analysts,
         config=config,
@@ -6254,6 +6273,7 @@ def _run_overnight_ticker_analysis(
         "final_trade_decision": final_decision,
         "investment_plan": final_state.get("investment_plan", ""),
         "trader_investment_plan": final_state.get("trader_investment_plan", ""),
+        "checkpoint_receipt": final_state.get("checkpoint_receipt"),
         "reports": {
             "market": final_state.get("market_report", ""),
             "sentiment": final_state.get("sentiment_report", ""),
@@ -9769,6 +9789,16 @@ def get_analysis_date():
             )
 
 
+def _save_analysis_checkpoint_receipt(final_state, save_path: Path) -> None:
+    """Persist the entrypoint's receipt without inventing a generic default."""
+    receipt = final_state.get("checkpoint_receipt")
+    if receipt is not None:
+        (save_path / "checkpoint_receipt.json").write_text(
+            json.dumps(receipt, sort_keys=True, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
     """Save complete analysis report to disk with organized subfolders."""
     save_path.mkdir(parents=True, exist_ok=True)
@@ -9856,6 +9886,7 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
     # Write consolidated report
     header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     (save_path / "complete_report.md").write_text(header + "\n\n".join(sections), encoding="utf-8")
+    _save_analysis_checkpoint_receipt(final_state, save_path)
     return save_path / "complete_report.md"
 
 
@@ -10092,11 +10123,23 @@ def run_analysis(checkpoint: bool = False):
     )
     analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
 
+    if checkpoint:
+        # This deliberately precedes graph/client construction.  Qualifying
+        # analysis must not silently fall back when source/model/data identity
+        # discovery cannot prove a compatible resume namespace.
+        config["checkpoint_run_identity"] = build_analysis_checkpoint_identity(
+            config=config,
+            selected_analysts=selected_analyst_keys,
+            asset_type=selections["asset_type"],
+            ticker=selections["ticker"],
+            trade_date=selections["analysis_date"],
+        )
+
     # Initialize the graph with callbacks bound to LLMs
     graph = TradingAgentsGraph(
         selected_analyst_keys,
         config=config,
-        debug=True,
+        debug=not checkpoint,
         callbacks=[stats_handler],
     )
 
@@ -10185,21 +10228,36 @@ def run_analysis(checkpoint: bool = False):
         )
         update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
 
-        # Initialize state and get graph args with callbacks
-        init_agent_state = graph.propagator.create_initial_state(
-            selections["ticker"],
-            selections["analysis_date"],
-            asset_type=selections["asset_type"],
-            past_context="",
-        )
-        # Pass callbacks to graph config for tool execution tracking
-        # (LLM tracking is handled separately via LLM constructor)
-        args = graph.propagator.get_graph_args(callbacks=[stats_handler])
+        # The hardened path owns state construction/resume through
+        # ``propagate``.  The explicit opt-out retains the historical
+        # interactive stream behavior for nonqualifying/manual experimentation.
+        if checkpoint:
+            init_agent_state = None
+            args = None
+        else:
+            init_agent_state = graph.propagator.create_initial_state(
+                selections["ticker"],
+                selections["analysis_date"],
+                asset_type=selections["asset_type"],
+                past_context="",
+            )
+            # Pass callbacks to graph config for tool execution tracking
+            # (LLM tracking is handled separately via LLM constructor)
+            args = graph.propagator.get_graph_args(callbacks=[stats_handler])
 
         # Stream the analysis
         trace = []
         try:
-            graph_stream = graph.graph.stream(init_agent_state, **args)
+            if checkpoint:
+                checkpoint_final_state, _ = graph.propagate(
+                    selections["ticker"],
+                    selections["analysis_date"],
+                    asset_type=selections["asset_type"],
+                )
+                graph_stream = [checkpoint_final_state]
+            else:
+                assert args is not None
+                graph_stream = graph.graph.stream(init_agent_state, **args)
             for chunk in graph_stream:
                 # Process all messages in chunk, deduplicating by message ID
                 for message in chunk.get("messages", []):
@@ -10311,7 +10369,18 @@ def run_analysis(checkpoint: bool = False):
         final_state = {}
         for chunk in trace:
             final_state.update(chunk)
-        graph.process_signal(final_state["final_trade_decision"])
+        if not checkpoint:
+            graph.process_signal(final_state["final_trade_decision"])
+            final_state["checkpoint_receipt"] = {
+                "mode": "disabled",
+                "identity_digest": None,
+                "checkpoint_step": None,
+                "qualifying": False,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
+        _save_analysis_checkpoint_receipt(final_state, report_dir)
 
         # Update all agent statuses to completed
         for agent in message_buffer.agent_status:
@@ -10359,21 +10428,117 @@ def run_analysis(checkpoint: bool = False):
 @app.command()
 def analyze(
     checkpoint: bool = typer.Option(
-        False,
-        "--checkpoint",
-        help="Enable checkpoint/resume: save state after each node so a crashed run can resume.",
-    ),
-    clear_checkpoints: bool = typer.Option(
-        False,
-        "--clear-checkpoints",
-        help="Delete all saved checkpoints before running (force fresh start).",
+        True,
+        "--checkpoint/--no-checkpoint",
+        help="Use evidence-safe checkpoint/resume (default); --no-checkpoint is nonqualifying.",
     ),
 ):
-    if clear_checkpoints:
-        from tradingagents.graph.checkpointer import clear_all_checkpoints
-        n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
-        console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
+    """Start interactive analysis with evidence-safe checkpointing by default."""
     run_analysis(checkpoint=checkpoint)
+
+
+@app.command("checkpoint-status")
+def checkpoint_status_command(
+    ticker: str = typer.Option(..., "--ticker", help="Ticker stored in the checkpoint."),
+    trade_date: str = typer.Option(..., "--trade-date", help="Checkpoint trade date."),
+    identity_digest: str = typer.Option(
+        ...,
+        "--identity-digest",
+        help="Complete checkpoint run-identity SHA-256.",
+    ),
+):
+    """Print a bounded, analysis-only status receipt for one exact checkpoint."""
+    from tradingagents.graph.checkpointer import checkpoint_status
+
+    receipt = checkpoint_status(
+        DEFAULT_CONFIG["data_cache_dir"],
+        ticker,
+        trade_date,
+        identity_digest,
+    )
+    console.print(json.dumps(receipt.to_dict(), sort_keys=True))
+
+
+@app.command("checkpoint-clear")
+def checkpoint_clear_command(
+    ticker: str = typer.Option(..., "--ticker", help="Ticker stored in the checkpoint."),
+    trade_date: str = typer.Option(..., "--trade-date", help="Checkpoint trade date."),
+    identity_digest: str = typer.Option(
+        ...,
+        "--identity-digest",
+        help="Complete checkpoint run-identity SHA-256.",
+    ),
+):
+    """Clear only one exact checkpoint identity; no broad recovery is implied."""
+    from tradingagents.graph.checkpointer import clear_checkpoint
+
+    cleared = clear_checkpoint(
+        DEFAULT_CONFIG["data_cache_dir"],
+        ticker,
+        trade_date,
+        identity_digest,
+    )
+    console.print(
+        json.dumps(
+            {
+                "ticker": ticker.upper(),
+                "trade_date": trade_date,
+                "identity_digest": identity_digest,
+                "cleared": cleared,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("checkpoint-retention-report")
+def checkpoint_retention_report_command(
+    max_age_days: int = typer.Option(
+        7,
+        "--max-age-days",
+        min=1,
+        help="Report checkpoints older than this many days; does not delete them.",
+    ),
+):
+    """Report stale checkpoint candidates for later exact, owner-directed clearing."""
+    from tradingagents.graph.checkpointer import checkpoint_retention_report
+
+    report = checkpoint_retention_report(
+        DEFAULT_CONFIG["data_cache_dir"],
+        max_age_days=max_age_days,
+    )
+    console.print(json.dumps(report.to_dict(), sort_keys=True))
+
+
+@app.command("checkpoint-maintenance-clear-all")
+def checkpoint_maintenance_clear_all_command(
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Explicitly authorize bounded checkpoint-root maintenance deletion.",
+    ),
+):
+    """Explicit maintenance-only broad cleanup beneath the configured checkpoint root."""
+    if not confirm:
+        raise typer.BadParameter("--confirm is required for broad checkpoint maintenance")
+    from tradingagents.graph.checkpointer import clear_all_checkpoints
+
+    count = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"], confirm=True)
+    console.print(
+        json.dumps(
+            {
+                "cleared_databases": count,
+                "maintenance_operation": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 @alpaca_app.command("check")

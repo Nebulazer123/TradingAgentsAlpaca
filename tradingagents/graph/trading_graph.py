@@ -13,9 +13,11 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
+from langchain_core.messages import BaseMessage
 from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import *
+from tradingagents.agents.utils.agent_states import InvestDebateState, RiskDebateState
 
 # Import the new abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
@@ -43,12 +45,28 @@ from tradingagents.evals.learning_context import (
 from tradingagents.llm_clients import create_llm_client
 from tradingagents.orchestration.work_packets import build_packet_id
 
-from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
+from .checkpoint_identity import (
+    CheckpointRunIdentity,
+    CheckpointRunIdentityError,
+    validate_checkpoint_run_identity,
+)
+from .checkpoint_runtime_identity import (
+    build_analysis_checkpoint_identity,
+    validate_checkpoint_predecessors,
+)
+from .checkpointer import (
+    checkpoint_step,
+    clear_checkpoint,
+    find_incompatible_checkpoint,
+    get_checkpointer,
+    thread_id,
+)
 from .conditional_logic import ConditionalLogic
 from .packet_nodes import (
     DECISION_PACKET_REF_SCHEMA_VERSION,
     PACKET_HANDOFF_SCHEMA_VERSION,
     build_graph_run_id,
+    validate_checkpoint_packet_references,
 )
 from .propagation import Propagator
 from .reflection import Reflector
@@ -93,6 +111,34 @@ def _checkpoint_run_start(value: Any) -> str:
     ):
         raise ValueError("checkpoint run_started_at must be canonical UTC seconds")
     return value
+
+
+def _checkpoint_canonical_fields(values: Mapping[str, Any]) -> None:
+    """Validate saved channel shapes without normalizing or rebuilding state."""
+    for field in (
+        "market_report", "sentiment_report", "news_report", "fundamentals_report",
+        "investment_plan", "trader_investment_plan", "final_trade_decision", "past_context",
+    ):
+        if not isinstance(values.get(field), str):
+            raise ValueError(f"checkpoint {field} must be a string")
+    if values["past_context"] != "":
+        raise ValueError("checkpoint past_context must not contain legacy memory")
+    if "sender" in values and not isinstance(values["sender"], str):
+        raise ValueError("checkpoint sender must be a string")
+    messages = values.get("messages")
+    if not isinstance(messages, list) or any(not isinstance(message, BaseMessage) for message in messages):
+        raise ValueError("checkpoint messages must contain canonical messages")
+    for field, schema in (("investment_debate_state", InvestDebateState), ("risk_debate_state", RiskDebateState)):
+        debate = values.get(field)
+        allowed = set(schema.__annotations__)
+        # Real debate nodes omit judge_decision until the manager runs.
+        required = allowed - {"judge_decision"}
+        if not isinstance(debate, Mapping) or not required <= set(debate) <= allowed:
+            raise ValueError(f"checkpoint {field} has invalid fields")
+        for key, value in debate.items():
+            valid = type(value) is int and value >= 0 if key == "count" else isinstance(value, str)
+            if not valid:
+                raise ValueError(f"checkpoint {field}.{key} has an invalid value")
 
 
 def _checkpoint_packet_refs(value: Any, *, run_id: str) -> list[dict]:
@@ -152,6 +198,84 @@ def _checkpoint_packet_refs(value: Any, *, run_id: str) -> list[dict]:
     return normalized
 
 
+def _checkpoint_identity_mismatch(
+    expected: CheckpointRunIdentity,
+    stored: CheckpointRunIdentity,
+    *,
+    defer_decision_predecessor: bool = False,
+) -> str | None:
+    """Return the first mismatched field without exposing stored values."""
+
+    for field, expected_value in expected.to_dict().items():
+        if field == "identity_sha256":
+            continue
+        if defer_decision_predecessor and field == "decision_ledger_predecessor":
+            continue
+        if stored.to_dict()[field] != expected_value:
+            return field
+    return None
+
+
+def _validate_checkpoint_identity_state(
+    values: Mapping[str, Any],
+    *,
+    expected: CheckpointRunIdentity,
+) -> None:
+    """Fail closed unless stored canonical identity is exactly the accepted one."""
+
+    try:
+        stored = validate_checkpoint_run_identity(values.get("checkpoint_run_identity"))
+    except CheckpointRunIdentityError as exc:
+        raise ValueError("checkpoint run identity is invalid") from exc
+    mismatch = _checkpoint_identity_mismatch(expected, stored)
+    if mismatch is not None:
+        raise ValueError(
+            "checkpoint identity mismatch at "
+            f"{mismatch}; start a fresh run or explicitly clear this exact checkpoint"
+        )
+
+
+def _canonical_checkpoint_identity(value: object) -> CheckpointRunIdentity:
+    """Rebuild any supplied identity so object mutation cannot bypass validation."""
+
+    serialized = value.to_dict() if isinstance(value, CheckpointRunIdentity) else value
+    try:
+        return validate_checkpoint_run_identity(serialized)
+    except CheckpointRunIdentityError as exc:
+        raise ValueError(
+            "checkpoint_run_identity must be a complete canonical identity"
+        ) from exc
+
+
+def _validate_checkpoint_identity_configuration(
+    identity: CheckpointRunIdentity,
+    *,
+    config: Mapping[str, Any],
+    selected_analysts: tuple[str, ...],
+) -> None:
+    """Ensure a supplied checkpoint identity describes this graph before setup."""
+
+    try:
+        expected = build_analysis_checkpoint_identity(
+            config=config,
+            selected_analysts=selected_analysts,
+            asset_type=identity.asset_type,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "checkpoint_run_identity cannot be verified against the graph configuration"
+        ) from exc
+    # The complete source/configuration must match before constructing clients.
+    # A pre-run decision head may precede this run's own packet events; validate
+    # that exception against the actual saved run in _run_graph, before effects.
+    mismatch = _checkpoint_identity_mismatch(expected, identity, defer_decision_predecessor=True)
+    if mismatch is not None:
+        raise ValueError(
+            "checkpoint identity mismatch at "
+            f"{mismatch}; start a fresh run with the resolved graph configuration"
+        )
+
+
 class TradingAgentsGraph:
     """Main class that orchestrates the trading agents framework."""
 
@@ -173,10 +297,20 @@ class TradingAgentsGraph:
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
-        self._learning_context_options = self._validate_learning_context_config()
         if selected_analysts is None:
             selected_analysts = ["market", "social", "news", "fundamentals"]
         self.selected_analysts = tuple(selected_analysts)
+        if self.config.get("checkpoint_enabled"):
+            checkpoint_identity = _canonical_checkpoint_identity(
+                self.config.get("checkpoint_run_identity")
+            )
+            _validate_checkpoint_identity_configuration(
+                checkpoint_identity,
+                config=self.config,
+                selected_analysts=self.selected_analysts,
+            )
+            self.config["checkpoint_run_identity"] = checkpoint_identity
+        self._learning_context_options = self._validate_learning_context_config()
         self._checkpoint_shape = {
             "schema_version": self.config.get(
                 "checkpoint_signature_schema_version",
@@ -617,6 +751,11 @@ class TradingAgentsGraph:
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
+    def _checkpoint_identity(self) -> CheckpointRunIdentity:
+        """Return the caller-supplied complete identity required for checkpointing."""
+
+        return _canonical_checkpoint_identity(self.config.get("checkpoint_run_identity"))
+
     def propagate(self, company_name, trade_date, asset_type: str = "stock"):
         """Run the trading agents graph for a company on a specific date.
 
@@ -627,18 +766,46 @@ class TradingAgentsGraph:
         a per-ticker SqliteSaver so a crashed run can resume from the last
         successful node only under the same ticker, date, and graph shape.
         """
-        checkpoint_signature = self._run_signature(asset_type)
-        if not isinstance(checkpoint_signature, str):
-            if isinstance(self, TradingAgentsGraph):
-                raise ValueError("graph run signature must be a string")
-            # Preserve legacy duck-typed callers of this unbound method. Real
-            # TradingAgentsGraph instances always use the frozen graph shape.
-            checkpoint_signature = "standalone-v1"
+        checkpoint_identity = (
+            self._checkpoint_identity() if self.config.get("checkpoint_enabled") else None
+        )
+        self._checkpoint_receipt = None
+        if checkpoint_identity is None:
+            checkpoint_signature = self._run_signature(asset_type)
+            if not isinstance(checkpoint_signature, str):
+                if isinstance(self, TradingAgentsGraph):
+                    raise ValueError("graph run signature must be a string")
+                # Preserve legacy duck-typed callers of this unbound method. Real
+                # TradingAgentsGraph instances always use the frozen graph shape.
+                checkpoint_signature = "standalone-v1"
+        else:
+            checkpoint_signature = checkpoint_identity.identity_sha256
+
+        if checkpoint_identity is not None and checkpoint_identity.asset_type != asset_type:
+            raise ValueError(
+                "checkpoint identity mismatch at asset_type; "
+                "start a fresh run with the requested asset type"
+            )
+
+        if checkpoint_identity is not None:
+            mismatch = find_incompatible_checkpoint(
+                self.config["data_cache_dir"],
+                company_name,
+                str(trade_date),
+                checkpoint_identity,
+            )
+            if mismatch is not None:
+                raise ValueError(
+                    "checkpoint identity mismatch at "
+                    f"{mismatch}; start a fresh run or explicitly clear this exact checkpoint"
+                )
 
         self.ticker = company_name
 
-        # Resolve any pending memory-log entries for this ticker before the pipeline runs.
-        self._resolve_pending_entries(company_name)
+        # Checkpointed runs defer this side effect until saved-state validation
+        # proves that this is a genuinely fresh run, not a resume or corruption.
+        if checkpoint_identity is None:
+            self._resolve_pending_entries(company_name)
 
         # Recompile with a checkpointer if the user opted in.
         if self.config.get("checkpoint_enabled"):
@@ -652,7 +819,7 @@ class TradingAgentsGraph:
                 self.config["data_cache_dir"],
                 company_name,
                 str(trade_date),
-                checkpoint_signature,
+                checkpoint_identity.identity_sha256,
             )
             if step is not None:
                 logger.info(
@@ -660,13 +827,22 @@ class TradingAgentsGraph:
                 )
             else:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
+            self._checkpoint_receipt = {
+                "mode": "resumed" if step is not None else "fresh",
+                "identity_digest": checkpoint_identity.identity_sha256,
+                "checkpoint_step": step,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
 
         try:
             return self._run_graph(
                 company_name,
                 trade_date,
                 asset_type=asset_type,
-                checkpoint_signature=checkpoint_signature,
+                checkpoint_identity=checkpoint_identity,
+                run_signature=checkpoint_signature,
             )
         finally:
             if self._checkpointer_ctx is not None:
@@ -679,11 +855,21 @@ class TradingAgentsGraph:
         company_name,
         trade_date,
         asset_type: str = "stock",
-        checkpoint_signature: str | None = None,
+        checkpoint_identity: CheckpointRunIdentity | None = None,
+        run_signature: str | None = None,
     ):
         """Execute the graph and write the resulting state to disk and memory log."""
-        if checkpoint_signature is None:
-            checkpoint_signature = self._run_signature(asset_type)
+        if self.config.get("checkpoint_enabled"):
+            if not isinstance(checkpoint_identity, CheckpointRunIdentity):
+                raise ValueError("checkpoint_run_identity is required when checkpointing")
+            checkpoint_identity = _canonical_checkpoint_identity(checkpoint_identity)
+            checkpoint_signature = checkpoint_identity.identity_sha256
+        else:
+            checkpoint_signature = (
+                run_signature
+                if run_signature is not None
+                else self._run_signature(asset_type)
+            )
         expected_run_id = build_graph_run_id(
             company_name,
             str(trade_date),
@@ -696,18 +882,38 @@ class TradingAgentsGraph:
 
         # Only an identical ticker, date, and graph-shape signature may resume.
         if self.config.get("checkpoint_enabled"):
-            tid = thread_id(company_name, str(trade_date), checkpoint_signature)
+            tid = thread_id(
+                company_name,
+                str(trade_date),
+                checkpoint_identity.identity_sha256,
+            )
             args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = tid
             snapshot = self.graph.get_state(args["config"])
             raw_values = getattr(snapshot, "values", None)
+            persisted = (getattr(self, "_checkpoint_receipt", None) or {}).get("mode") == "resumed"
+            if raw_values is not None and not isinstance(raw_values, Mapping):
+                raise ValueError("checkpoint values must be a mapping")
+            if persisted and not raw_values:
+                raise ValueError("checkpoint saved state is missing or empty")
             if raw_values:
-                if not isinstance(raw_values, Mapping):
-                    raise ValueError("checkpoint values must be a mapping")
                 checkpoint_values = raw_values
+                _validate_checkpoint_identity_state(
+                    raw_values,
+                    expected=checkpoint_identity,
+                )
                 if raw_values.get("run_id") != expected_run_id:
                     raise ValueError(
                         "checkpoint run_id does not match the logical graph run"
                     )
+                for field, expected_value in (
+                    ("company_of_interest", company_name),
+                    ("trade_date", str(trade_date)),
+                    ("asset_type", asset_type),
+                ):
+                    if raw_values.get(field) != expected_value:
+                        raise ValueError(
+                            f"checkpoint {field} does not match the logical graph run"
+                        )
                 _checkpoint_run_start(raw_values.get("run_started_at"))
                 _checkpoint_packet_refs(
                     raw_values.get("decision_packet_refs"),
@@ -717,8 +923,23 @@ class TradingAgentsGraph:
                     raise ValueError(
                         "checkpoint learning_context must be a string"
                     )
+                _checkpoint_canonical_fields(raw_values)
+
+        if checkpoint_identity is not None:
+            authenticated_events = validate_checkpoint_predecessors(
+                self.config, checkpoint_identity, run_id=expected_run_id,
+                resuming=checkpoint_values is not None,
+            )
+            if checkpoint_values is not None:
+                results_root = Path(self.config["results_dir"])
+                validate_checkpoint_packet_references(
+                    checkpoint_values, ledger_root=results_root / "control_plane/decisions",
+                    evidence_root=results_root, authenticated_events=authenticated_events,
+                )
 
         if checkpoint_values is None:
+            if self.config.get("checkpoint_enabled"):
+                self._resolve_pending_entries(company_name)
             # Construct exactly one fresh state only after checkpoint inspection.
             invocation_state = self.propagator.create_initial_state(
                 company_name,
@@ -727,6 +948,8 @@ class TradingAgentsGraph:
                 past_context="",
                 run_id=expected_run_id,
             )
+            if checkpoint_identity is not None:
+                invocation_state["checkpoint_run_identity"] = checkpoint_identity.to_dict()
 
         if self.debug:
             trace = []
@@ -745,6 +968,11 @@ class TradingAgentsGraph:
             final_state = self.graph.invoke(invocation_state, **args)
 
         # Store current state for reflection.
+        if checkpoint_identity is not None and getattr(
+            self, "_checkpoint_receipt", None
+        ) is not None:
+            final_state = dict(final_state)
+            final_state["checkpoint_receipt"] = dict(self._checkpoint_receipt)
         self.curr_state = final_state
 
         # Log state to disk.
@@ -763,14 +991,14 @@ class TradingAgentsGraph:
                 self.config["data_cache_dir"],
                 company_name,
                 str(trade_date),
-                checkpoint_signature,
+                checkpoint_identity.identity_sha256,
             )
 
         return final_state, self.process_signal(final_state["final_trade_decision"])
 
     def _log_state(self, trade_date, final_state):
         """Log the final state to a JSON file."""
-        self.log_states_dict[str(trade_date)] = {
+        state_record = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
             "market_report": final_state["market_report"],
@@ -799,6 +1027,9 @@ class TradingAgentsGraph:
             "investment_plan": final_state["investment_plan"],
             "final_trade_decision": final_state["final_trade_decision"],
         }
+        if "checkpoint_receipt" in final_state:
+            state_record["checkpoint_receipt"] = final_state["checkpoint_receipt"]
+        self.log_states_dict[str(trade_date)] = state_record
 
         # Save to file. Reject ticker values that would escape the
         # results directory when joined as a path component.

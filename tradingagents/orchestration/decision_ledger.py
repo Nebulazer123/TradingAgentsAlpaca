@@ -296,6 +296,47 @@ class DecisionLedger:
             self._verify_latest(events)
             return events
 
+    def read_authenticated_events(self) -> tuple[LedgerEvent, ...]:
+        """Read authenticated journal/packet bindings without creating or repairing.
+
+        Checkpoint identity needs provenance, not evidence dereferencing or latest
+        pointer repair. A pointer interrupted after journal fsync remains for the
+        existing idempotent packet replay to recover. A busy store fails closed.
+        """
+        if self._path_state(self.root, label="ledger root") is None:
+            return ()
+        self._require_real_directory(self.root, label="ledger root")
+        state = self._path_state(self._lock_path, label="ledger lock")
+        if state is None:
+            if any(self.root.iterdir()):
+                raise LedgerCorruptionError("ledger provenance exists without its lock")
+            return ()
+        self._require_regular_state(state, label="ledger lock")
+        try:
+            descriptor = os.open(self._lock_path, os.O_RDONLY | _NOFOLLOW)
+        except OSError as exc:
+            raise LedgerCorruptionError("ledger lock could not be read safely") from exc
+        try:
+            self._require_regular_descriptor(descriptor, label="ledger lock")
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (state.st_dev, state.st_ino):
+                raise LedgerCorruptionError("ledger lock changed during inspection")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise LedgerCorruptionError("ledger is busy or unavailable for inspection") from exc
+            events = self._replay(evidence_root=None, verify_evidence=False)
+            if events or self._path_state(self._latest_dir, label="latest directory") is not None:
+                # An absent pointer may be an interrupted publication. A present
+                # pointer must match: it can expose rollback of the journal.
+                self._verify_latest(events, allow_missing=True)
+            return events
+        finally:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+
     def read_authenticated_packet(
         self,
         packet_id: str,
@@ -342,6 +383,46 @@ class DecisionLedger:
             events = self._replay(evidence_root=evidence_root)
             self._redurable_journal_if_present()
             self._repair_latest(events)
+            return events
+
+    def recover_missing_latest_pointer(
+        self,
+        *,
+        packet_id: str,
+        kind: str,
+        run_id: str,
+        evidence_root: str | Path | None = None,
+    ) -> tuple[LedgerEvent, ...]:
+        """Repair only a missing current pointer after authenticating all others.
+
+        This is the narrow crash-recovery path for a node that wrote its
+        immutable event but crashed before the derived latest pointer. It never
+        repairs a stale, malformed, or unrelated pointer.
+        """
+
+        if kind not in ALLOWED_PACKET_KINDS:
+            raise LedgerCorruptionError("latest pointer kind is not allowed")
+        if packet_id != build_packet_id(run_id, kind):
+            raise LedgerCorruptionError("missing latest pointer has invalid packet identity")
+        with self._locked():
+            self._ensure_managed_directories()
+            events = self._replay(evidence_root=evidence_root)
+            self._redurable_journal_if_present()
+            target = self._last_events(events).get(kind)
+            if (
+                target is None
+                or target.packet_id != packet_id
+                or target.run_id != run_id
+            ):
+                raise LedgerCorruptionError(
+                    "missing latest pointer has no matching current event"
+                )
+            path = self._pointer_path(kind)
+            if self._path_state(path, label="latest pointer") is not None:
+                raise LedgerCorruptionError("latest pointer is not missing")
+            self._verify_latest(events, skip_kind=kind)
+            self._publish_pointer(target)
+            self._verify_latest(events)
             return events
 
     def _after_packet_fsync(self, packet_path: Path) -> None:
@@ -818,13 +899,21 @@ class DecisionLedger:
         if removed:
             self._fsync_directory(self._latest_dir)
 
-    def _verify_latest(self, events: tuple[LedgerEvent, ...]) -> None:
+    def _verify_latest(
+        self,
+        events: tuple[LedgerEvent, ...],
+        *,
+        skip_kind: str | None = None,
+        allow_missing: bool = False,
+    ) -> None:
         self._require_real_directory(
             self._latest_dir,
             label="latest directory",
         )
         expected = self._last_events(events)
         for kind in sorted(ALLOWED_PACKET_KINDS):
+            if kind == skip_kind:
+                continue
             path = self._pointer_path(kind)
             state = self._path_state(path, label="latest pointer")
             event = expected.get(kind)
@@ -835,6 +924,8 @@ class DecisionLedger:
                     )
                 continue
             if state is None:
+                if allow_missing:
+                    continue
                 raise LedgerCorruptionError(
                     f"latest pointer is missing for {kind}"
                 )

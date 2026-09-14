@@ -28,6 +28,7 @@ from tradingagents.evals.learning_context import (
     learning_context_from_store,
     normalize_learning_as_of,
 )
+from tradingagents.graph.checkpoint_identity import build_checkpoint_run_identity
 from tradingagents.graph.packet_nodes import build_graph_run_id
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -1030,6 +1031,7 @@ def _bare_run_graph(tmp_path, factory):
     graph.config = {
         "checkpoint_enabled": False,
         "data_cache_dir": str(tmp_path / "cache"),
+        "results_dir": str(tmp_path / "results"),
     }
     graph.graph = _RuntimeGraph()
     graph.propagator = Propagator(
@@ -1060,7 +1062,7 @@ def test_normal_fresh_graph_builds_once_and_forces_empty_legacy_memory(tmp_path)
     state, signal = graph._run_graph(
         "NFLX",
         "2026-07-18",
-        checkpoint_signature="signature",
+        run_signature="signature",
     )
 
     assert calls == [("NFLX", "2026-07-18", "stock")]
@@ -1070,20 +1072,59 @@ def test_normal_fresh_graph_builds_once_and_forces_empty_legacy_memory(tmp_path)
 
 
 def test_checkpoint_resume_never_rebuilds_learning(tmp_path, monkeypatch):
+    from langchain_core.messages import HumanMessage
+
+    from tradingagents.graph.checkpoint_runtime_identity import capture_checkpoint_predecessors
     calls = []
     graph = _bare_run_graph(
         tmp_path,
         lambda *_args: calls.append(True) or "new",
     )
     graph.config["checkpoint_enabled"] = True
-    run_id = build_graph_run_id("NFLX", "2026-07-18", "stock", "signature")
+    identity = build_checkpoint_run_identity(
+        identity_schema_version=2,
+        clean_source_revision="a" * 40,
+        source_tree_dirty=False,
+        uv_lock_sha256="b" * 64,
+        selected_analysts=("market",),
+        asset_type="stock",
+        max_debate_rounds=1,
+        max_risk_discuss_rounds=1,
+        max_analyst_tool_rounds=8,
+        max_recur_limit=100,
+        analyst_concurrency_limit=1,
+        tool_free_analysts=(),
+        requested_provider="openrouter",
+        requested_quick_model="openai/gpt-5-mini",
+        requested_deep_model="anthropic/claude-sonnet-4-5",
+        backend_route_identity="https://router.example/v1?region=us",
+        output_language="English",
+        provider_reasoning_settings={},
+        graph_topology_sha256="c" * 64,
+        agent_prompt_surface_sha256="d" * 64,
+        bound_tool_surface_sha256="e" * 64,
+        data_route_surface_sha256="f" * 64,
+        packet_handoff_schema_version=1,
+        learning_context_policy_identity="learning-context-policy-v2",
+        trade_date_cutoff_policy_identity="market-date-cutoff-v1",
+        **capture_checkpoint_predecessors(graph.config),
+    )
+    run_id = build_graph_run_id(
+        "NFLX", "2026-07-18", "stock", identity.identity_sha256
+    )
     graph.graph.saved = {
+        **Propagator().create_initial_state("NFLX", "2026-07-18", run_id=run_id, learning_context="saved"),
+        "messages": [HumanMessage(content="NFLX")],
         "run_id": run_id,
         "run_started_at": "2026-07-18T12:00:00+00:00",
         "decision_packet_refs": [],
         "learning_context": "saved",
+        "company_of_interest": "NFLX",
+        "trade_date": "2026-07-18",
+        "asset_type": "stock",
         "past_context": "",
         "final_trade_decision": "HOLD",
+        "checkpoint_run_identity": identity.to_dict(),
     }
     monkeypatch.setattr(
         "tradingagents.graph.trading_graph.thread_id",
@@ -1097,7 +1138,7 @@ def test_checkpoint_resume_never_rebuilds_learning(tmp_path, monkeypatch):
     state, _ = graph._run_graph(
         "NFLX",
         "2026-07-18",
-        checkpoint_signature="signature",
+        checkpoint_identity=identity,
     )
 
     assert calls == []
