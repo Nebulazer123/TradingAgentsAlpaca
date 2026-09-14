@@ -23,6 +23,19 @@
 
 ## Current continuation — verified 2026-09-07
 
+**Latest data checkpoint — 2026-09-14, authorized read-only collection:** The
+user answered the pending SEC/additional Alpaca collection request. That bounded
+collection is complete: 298 retained responses, 297 raw archive objects, 81 SEC
+filings, complete raw/adjusted 60-session grids for 42 ledger tickers plus SPY,
+and 43 current-cutoff exploratory adjusted-price windows. Offline byte/custody
+and preservation checks pass; no source gate was replayed. See
+[the source collection checkpoint](../checkpoints/2026-09-14-prospective-source-collection.md)
+for exact receipts and explicit QQQ/XOM gaps. These inputs do not establish
+historical custody, effective-dated security identity, an eligible ranked
+100/75/50 cohort, old forecast mappings or real benchmark/economic readiness.
+No actual ledger/promotion, model, trading, holdout or automation transition
+occurred. Preserve the original ordered plan and all operational boundaries.
+
 **Latest source checkpoint — 2026-09-14, final source gate accepted:** Clean
 canonical `81b7463cbfe612bdbb9c7c0f25b0a3e05a1349da` passed the single corrected
 complete gate: **5,005 tests and 75 subtests passed, one live-API test skipped**,
@@ -36,8 +49,8 @@ for exact receipt/hash identities, scope and remaining acceptance requirements.
 Do not continue polling or replay this accepted run for documentation changes.
 Real Task 6.2, research/economic qualification, actual legacy supersession and
 the future operational campaign remain open; no new external, model, holdout,
-paper-submit or automation authority is implied. Additional SEC/Alpaca universe
-collection remains the existing unanswered request. Preserve the full goal,
+paper-submit or automation authority is implied. The separately authorized
+SEC/Alpaca collection is recorded above. Preserve the full goal,
 frozen live control, ten PAUSED automations, captured data and both handoffs.
 
 **Earlier source checkpoint — 2026-09-14, adjusted-price REST repair:** The first
