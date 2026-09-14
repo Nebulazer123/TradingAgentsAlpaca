@@ -156,7 +156,19 @@ _SOURCE_BOUND_LEG_FIELDS = frozenset(
 )
 _LEGACY_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v1"
 _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v2"
+_ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v3"
 _SOURCE_BOUND_LEG_EVIDENCE_SCHEMA = "source_bound_price_window_evidence/v1"
+_ECONOMIC_DECISION_FIELDS = frozenset(
+    {
+        "protocol_id",
+        "input_manifest_id",
+        "input_manifest_sha256",
+        "decision_event_id",
+        "decision_at",
+        "market_date",
+        "source_packet_id",
+    }
+)
 _LIFECYCLE_CONTEXT_FIELDS = frozenset(
     {"agent", "direction", "setup", "regime", "sector"}
 )
@@ -359,6 +371,8 @@ def _validate_source_bound_resolution_evidence(value: Any) -> None:
         expected_fields = _LEGACY_RESOLUTION_EVIDENCE_FIELDS
     elif schema_version == _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
         expected_fields = _RESOLUTION_EVIDENCE_FIELDS
+    elif schema_version == _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        expected_fields = frozenset({*_RESOLUTION_EVIDENCE_FIELDS, "economic_decision"})
     else:
         raise LearningAvailabilityError("resolution_evidence schema_version is invalid")
     _require_exact_fields(
@@ -366,7 +380,10 @@ def _validate_source_bound_resolution_evidence(value: Any) -> None:
         expected_fields,
         label="resolution_evidence",
     )
-    if schema_version == _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+    if schema_version in (
+        _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+        _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+    ):
         alpha_threshold = value["alpha_threshold_pct"]
         if type(alpha_threshold) is not str:
             raise LearningAvailabilityError("resolution_evidence alpha_threshold_pct is invalid")
@@ -382,6 +399,30 @@ def _validate_source_bound_resolution_evidence(value: Any) -> None:
             or alpha_threshold != format(parsed_threshold.normalize(), "f")
         ):
             raise LearningAvailabilityError("resolution_evidence alpha_threshold_pct is invalid")
+    if schema_version == _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        economic = value["economic_decision"]
+        if not isinstance(economic, Mapping):
+            raise LearningAvailabilityError("economic_decision must be an object")
+        _require_exact_fields(
+            economic,
+            _ECONOMIC_DECISION_FIELDS,
+            label="economic_decision",
+        )
+        for field, field_value in economic.items():
+            _required_canonical_text(field_value, field=f"economic_decision {field}")
+        if _LOWER_SHA256.fullmatch(economic["input_manifest_sha256"]) is None:
+            raise LearningAvailabilityError(
+                "economic_decision input_manifest_sha256 must be a SHA-256 digest"
+            )
+        if not economic["decision_event_id"].startswith("decision-event-"):
+            raise LearningAvailabilityError("economic_decision decision_event_id is invalid")
+        _stored_utc(economic["decision_at"], field="economic_decision decision_at")
+        try:
+            dt.date.fromisoformat(economic["market_date"])
+        except ValueError as exc:
+            raise LearningAvailabilityError(
+                "economic_decision market_date is invalid"
+            ) from exc
     for leg_name in ("ticker", "benchmark"):
         leg = value[leg_name]
         if not isinstance(leg, Mapping):

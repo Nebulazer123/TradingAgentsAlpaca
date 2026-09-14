@@ -19,7 +19,8 @@ from tradingagents.evals.agent_intelligence_ledger import (
     summarize_agent_scores,
 )
 from tradingagents.evals.agent_intelligence_reconciliation import (
-    EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+    ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
+    EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
     INFLUENCE_WEIGHTING_STATUS_LEGACY,
     SCHEMA_VERSION,
     SUMMARY_FRESHNESS_CURRENT,
@@ -166,6 +167,10 @@ def test_receipt_counts_synthetic_mixed_ledger_exactly():
     assert receipt["valid_forecast_count"] == 9
     assert receipt["corrupt_line_count"] == 2
     assert receipt["resolved_row_count"] == 6
+    assert receipt["pending_row_count"] == 3
+    assert receipt["resolved_high_quality_count"] == 0
+    assert receipt["resolved_degraded_quality_count"] == 0
+    assert receipt["resolved_suspect_quality_count"] == 0
     assert receipt["duplicate_forecast_id_row_count"] == 1
     assert receipt["conflicting_forecast_id_count"] == 1
     assert receipt["packet_event_cluster_count"] == 3
@@ -175,9 +180,70 @@ def test_receipt_counts_synthetic_mixed_ledger_exactly():
     assert receipt["packet_event_non_null_window_cluster_count"] == 2
     assert receipt["market_event_cluster_count"] == 2
     assert receipt["market_event_unclusterable_count"] == 1
-    assert receipt["provisional_effective_sample"] == 2
-    assert receipt["provisional_effective_sample_basis"] == "conservative_market_event_cluster_count"
-    assert receipt["effective_sample_status"] == EFFECTIVE_SAMPLE_STATUS_PROVISIONAL
+    assert receipt["provisional_market_event_cluster_count"] == 2
+    assert receipt["effective_sample_count"] is None
+    assert receipt["effective_sample_status"] == EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE
+    assert receipt["unique_economic_decision_event_id_count"] is None
+    assert receipt["unique_economic_decision_market_date_count"] is None
+    assert (
+        receipt["economic_decision_identity_status"]
+        == ECONOMIC_IDENTITY_STATUS_UNAVAILABLE
+    )
+    assert receipt["economic_decision_identity_reason"] == (
+        "no_source_bound_verifier_with_frozen_economic_protocol"
+    )
+    assert receipt["economic_decision_verified_resolved_row_count"] == 0
+    assert receipt["economic_decision_unbound_resolved_row_count"] == 6
+    assert "provisional_effective_sample" not in receipt
+
+
+def test_legacy_source_bound_lookup_does_not_turn_unknown_identity_into_zero(tmp_path):
+    from tradingagents.dataflows.pit import RawPointInTimeArtifactArchive
+    from tradingagents.evals.source_bound_resolution import (
+        build_source_bound_window_lookup,
+    )
+
+    lookup = build_source_bound_window_lookup(
+        archive=RawPointInTimeArtifactArchive(tmp_path / "legacy-pit"),
+        raw_artifacts={},
+        receipts=(),
+    )
+
+    receipt = build_reconciliation_receipt(
+        _mixed_ledger_bytes(), source_bound_verifier=lookup
+    )
+
+    assert lookup.has_frozen_economic_protocol is False
+    assert receipt["unique_economic_decision_event_id_count"] is None
+    assert receipt["unique_economic_decision_market_date_count"] is None
+    assert receipt["economic_decision_verified_resolved_row_count"] == 0
+    assert receipt["economic_decision_unbound_resolved_row_count"] == 6
+    assert receipt["economic_decision_identity_status"] == (
+        ECONOMIC_IDENTITY_STATUS_UNAVAILABLE
+    )
+    assert receipt["economic_decision_identity_reason"] == (
+        "no_source_bound_verifier_with_frozen_economic_protocol"
+    )
+
+
+def test_receipt_reports_resolved_quality_classes_without_relabeling_rows():
+    rows = [
+        _forecast("af-high", resolved=True, label_quality="high"),
+        _forecast("af-degraded", resolved=True, label_quality="degraded"),
+        _forecast("af-suspect", resolved=True, label_quality="suspect"),
+        _forecast("af-unaudited", resolved=True, label_quality=None),
+        _forecast("af-pending", label_quality="high"),
+    ]
+
+    receipt = build_reconciliation_receipt(
+        ("\n".join(_line(row) for row in rows) + "\n").encode("utf-8")
+    )
+
+    assert receipt["resolved_row_count"] == 4
+    assert receipt["pending_row_count"] == 1
+    assert receipt["resolved_high_quality_count"] == 1
+    assert receipt["resolved_degraded_quality_count"] == 1
+    assert receipt["resolved_suspect_quality_count"] == 1
 
 
 def test_receipt_sha256_covers_whole_receipt_without_the_hash_field():
@@ -196,7 +262,12 @@ def test_receipt_sha256_covers_whole_receipt_without_the_hash_field():
         "packet_event_unclusterable_count",
         "market_event_cluster_count",
         "market_event_unclusterable_count",
-        "provisional_effective_sample",
+        "provisional_market_event_cluster_count",
+        "effective_sample_count",
+        "unique_economic_decision_event_id_count",
+        "unique_economic_decision_market_date_count",
+        "economic_decision_identity_status",
+        "economic_decision_identity_reason",
         "summary_freshness",
         "receipt_sha256",
     } <= set(receipt)
@@ -435,9 +506,9 @@ def test_dependence_block_clusters_resolved_rows_and_labels_provisional_bound():
         "packet_event_non_null_window_cluster_count": 1,
         "market_event_cluster_count": 1,
         "market_event_unclusterable_count": 0,
-        "provisional_effective_sample": 1,
-        "provisional_effective_sample_basis": "conservative_market_event_cluster_count",
-        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+        "provisional_market_event_cluster_count": 1,
+        "effective_sample_count": None,
+        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
         "raw_resolved_rows_are_independent_observations": False,
         "influence_weighting_status": INFLUENCE_WEIGHTING_STATUS_LEGACY,
     }
@@ -453,10 +524,11 @@ def test_summarize_agent_scores_exposes_deterministic_dependence_block():
     summary = summarize_agent_scores(rows)
 
     assert summary["dependence"] == dependence_block(rows)
-    assert summary["dependence"]["provisional_effective_sample"] == 1
+    assert summary["dependence"]["provisional_market_event_cluster_count"] == 1
+    assert summary["dependence"]["effective_sample_count"] is None
     assert (
         summary["dependence"]["effective_sample_status"]
-        == "provisional_pending_preregistered_estimator"
+        == "unavailable_pending_preregistered_estimator"
     )
     assert summary["dependence"]["raw_resolved_rows_are_independent_observations"] is False
 
@@ -514,11 +586,69 @@ def test_cli_prints_canonical_json_and_hermetic_summary_state(tmp_path):
     assert payload["resolved_row_count"] == 6
     assert payload["packet_event_cluster_count"] == 3
     assert payload["market_event_cluster_count"] == 2
-    assert payload["provisional_effective_sample"] == 2
+    assert payload["provisional_market_event_cluster_count"] == 2
+    assert payload["effective_sample_count"] is None
+    assert payload["unique_economic_decision_event_id_count"] is None
+    assert payload["unique_economic_decision_market_date_count"] is None
     assert payload["summary_freshness"] == SUMMARY_FRESHNESS_MISSING
     assert payload["influence_weighting_status"] == INFLUENCE_WEIGHTING_STATUS_LEGACY
     assert INFLUENCE_WEIGHTING_STATUS_LEGACY in result.output
     assert result.output.strip() == canonical_json_text(payload)
+
+
+@pytest.mark.parametrize("target_kind", ("raw_receipt", "window_receipt", "archive"))
+def test_cli_reconciliation_preserves_its_pit_inputs(tmp_path, target_kind):
+    from tests.test_source_bound_resolution import _window
+
+    archive, artifact, window = _window(tmp_path)
+    raw_path, window_path = tmp_path / "raw.json", tmp_path / "window.json"
+    raw_path.write_bytes(artifact.canonical_json_bytes())
+    window_path.write_bytes(window.canonical_json_bytes())
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_bytes(b"")
+    target = {"raw_receipt": raw_path, "window_receipt": window_path,
+              "archive": archive.root / "reconciliation.json"}[target_kind]
+    before = {path: path.read_bytes() for path in (raw_path, window_path)}
+    result = runner.invoke(app, [
+        "research", "agent-ledger-reconcile", "--ledger-path", str(ledger),
+        "--summary-path", str(tmp_path / "missing-summary.json"),
+        "--pit-raw-artifact-archive", str(archive.root),
+        "--pit-raw-artifact-receipt", str(raw_path),
+        "--pit-price-window-receipt", str(window_path),
+        "--receipt-path", str(target),
+    ])
+    assert result.exit_code == 2, result.output
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (archive.root / "reconciliation.json").exists()
+
+
+def test_summary_fingerprint_refuses_forecasts_from_a_different_ledger(tmp_path):
+    from tradingagents.evals.agent_intelligence_ledger import write_ledger, write_summary
+
+    ledger, summary = tmp_path / "ledger.jsonl", tmp_path / "summary.json"
+    stored, unrelated = _forecast("stored"), _forecast("different")
+    write_ledger([stored], path=ledger)
+    summary.write_bytes(b"preserve-existing-summary")
+    with pytest.raises(ValueError, match="do not match the persisted ledger"):
+        write_summary([unrelated], path=summary, ledger_path=ledger)
+    assert summary.read_bytes() == b"preserve-existing-summary"
+
+
+@pytest.mark.parametrize("alias_kind", ("direct", "hardlink"))
+def test_summary_fingerprint_cannot_replace_its_source_ledger(tmp_path, alias_kind):
+    from tradingagents.evals.agent_intelligence_ledger import write_ledger, write_summary
+
+    ledger = tmp_path / "ledger.jsonl"
+    forecasts = [_forecast()]
+    write_ledger(forecasts, path=ledger)
+    before = ledger.read_bytes()
+    target = ledger
+    if alias_kind == "hardlink":
+        target = tmp_path / "summary.json"
+        target.hardlink_to(ledger)
+    with pytest.raises(ValueError, match="summary path aliases the source ledger"):
+        write_summary(forecasts, path=target, ledger_path=ledger)
+    assert ledger.read_bytes() == before
 
 
 def test_cli_writes_only_the_receipt_atomically_when_asked(tmp_path):
@@ -804,6 +934,29 @@ def _raw_row(**overrides):
 def _spliced_row_line(forecast_id, **overrides):
     return json.dumps(
         _forecast(forecast_id, **overrides).as_dict(), sort_keys=True, separators=(",", ":")
+    )
+
+
+def test_arbitrary_economic_identity_keys_are_not_counted_as_verified_bindings():
+    row = _forecast(
+        "af-unverified-economic-identity",
+        resolved=True,
+        resolution_window=dict(WINDOW_A),
+    ).as_dict()
+    row["decision_event_id"] = "decision-event-" + "a" * 64
+    row["decision_market_date"] = "2026-06-01"
+
+    receipt = build_reconciliation_receipt(
+        (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+    )
+
+    assert receipt["valid_forecast_count"] == 0
+    assert receipt["corrupt_line_count"] == 1
+    assert receipt["unique_economic_decision_event_id_count"] is None
+    assert receipt["unique_economic_decision_market_date_count"] is None
+    assert (
+        receipt["economic_decision_identity_status"]
+        == ECONOMIC_IDENTITY_STATUS_UNAVAILABLE
     )
 
 

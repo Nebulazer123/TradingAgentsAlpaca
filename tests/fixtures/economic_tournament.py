@@ -6,15 +6,22 @@ import datetime as dt
 import json
 from collections import OrderedDict
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 
 from tradingagents.dataflows.pit import (
+    ExecutionPriceTwin,
     PointInTimeObservation,
     RawPointInTimeArtifactArchive,
     SecurityIdentity,
+    SourceBoundAdjustedPriceWindow,
+    build_market_session_calendar,
     build_source_bound_adjusted_price_window,
+    build_source_bound_execution_outcome,
+    resolve_market_session_open,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import FrozenEvaluationProtocol
@@ -139,6 +146,7 @@ def _candidate_row(
     *,
     event,
     security_id: str,
+    momentum_selected: frozenset[str] | None = None,
 ) -> tuple[dict[str, object], SecurityIdentity]:
     security, security_observation = _security(
         archive,
@@ -147,13 +155,15 @@ def _candidate_row(
         security_id=security_id,
         available_at=event.available_at,
     )
+    selected = momentum_selected is not None and event.symbol in momentum_selected
+    default_anchor = momentum_selected is None and event.symbol == "T000"
     candidate = {
         "symbol": event.symbol,
         "available_at": event.available_at,
-        "close_t_21": "110" if event.symbol == "T000" else None,
-        "close_t_252": None,
-        "trailing_operating_income": None,
-        "average_total_assets": None,
+        "close_t_21": "110" if selected or default_anchor else None,
+        "close_t_252": "100" if selected else None,
+        "trailing_operating_income": "10" if selected else None,
+        "average_total_assets": "100" if selected else None,
         "pullback_features": None,
     }
     clock_value[0] = dt.datetime.fromisoformat(event.available_at)
@@ -172,18 +182,33 @@ def _candidate_row(
         value_path=["value"],
     )
     field_sources = []
-    if event.symbol == "T000":
-        field_sources.append(
+    source_values = (
+        (
+            ("close_t_21", "110"),
+            ("close_t_252", "100"),
+            ("trailing_operating_income", "10"),
+            ("average_total_assets", "100"),
+        )
+        if selected
+        else (("close_t_21", "110"),)
+        if default_anchor
+        else ()
+    )
+    if source_values:
+        for field, value in sorted(
+            source_values
+        ):
+            field_sources.append(
             {
-                "field": "close_t_21",
-                "value": "110",
+                "field": field,
+                "value": value,
                 "observation": _observation(
                     artifact=artifact,
                     security=security,
-                    observed_value="110",
+                    observed_value=value,
                     available_at=event.available_at,
                     source_kind="economic_candidate_json",
-                    value_path=["value", "close_t_21"],
+                    value_path=["value", field],
                 ).to_dict(),
             }
         )
@@ -200,14 +225,14 @@ def _candidate_row(
     )
 
 
-def _next_weekdays(market_date: str) -> tuple[str, str]:
+def _next_weekdays(market_date: str, count: int = 5) -> tuple[str, ...]:
     day = dt.date.fromisoformat(market_date)
     dates: list[str] = []
-    while len(dates) < 2:
+    while len(dates) < count:
         day += dt.timedelta(days=1)
         if day.weekday() < 5:
             dates.append(day.isoformat())
-    return dates[0], dates[1]
+    return tuple(dates)
 
 
 def _outcome_window(
@@ -216,16 +241,25 @@ def _outcome_window(
     *,
     security: SecurityIdentity,
     market_date: str,
-) -> dict[str, object]:
-    start, end = _next_weekdays(market_date)
+    gross_return: str | None = None,
+) -> SourceBoundAdjustedPriceWindow:
+    session_dates = _next_weekdays(market_date)
+    start, end = session_dates[0], session_dates[-1]
     retrieved_at = f"{end}T20:00:00+00:00"
     clock_value[0] = dt.datetime.fromisoformat(retrieved_at)
     raw_bytes = _canonical_bytes(
         {
             "bars": {
                 security.symbol: [
-                    {"t": f"{start}T05:00:00Z", "c": "10"},
-                    {"t": f"{end}T05:00:00Z", "c": "11"},
+                    {
+                        "t": f"{session_date}T05:00:00Z",
+                        "c": (
+                            str(Decimal("10") * (Decimal("1") + Decimal(gross_return)))
+                            if gross_return is not None and index == len(session_dates) - 1
+                            else str(11 + index)
+                        ),
+                    }
+                    for index, session_date in enumerate(session_dates)
                 ]
             }
         }
@@ -248,15 +282,18 @@ def _outcome_window(
         requested_start=start,
         requested_end=end,
         decision_cutoff=f"{end}T21:00:00+00:00",
-    ).to_dict()
+    )
 
 
 def build_tournament_receipt(
     root: Path,
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: EconomicPhaseEligibility | ValidationPhaseEligibility,
     security_id_overrides: Mapping[str, str] | None = None,
+    unavailable_next_open: frozenset[tuple[str, str]] = frozenset(),
+    gross_return_overrides: Mapping[tuple[str, str], str] | None = None,
+    momentum_symbols_by_date: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[SourceBoundTournamentInput, RawPointInTimeArtifactArchive]:
     """Build a complete receipt while preserving the pre/post outcome boundary."""
 
@@ -267,6 +304,8 @@ def build_tournament_receipt(
         for row in protocol.cohort.ranking[: len(protocol.primary_universe)]
     }
     overrides = dict(security_id_overrides or {})
+    return_overrides = dict(gross_return_overrides or {})
+    momentum_overrides = dict(momentum_symbols_by_date or {})
     events_by_id = {
         event.decision_event_id: event for event in protocol.input_manifest.events
     }
@@ -274,6 +313,7 @@ def build_tournament_receipt(
     for event_id in eligibility.event_ids:
         event = events_by_id[event_id]
         grouped.setdefault(event.market_date, []).append(event)
+    grouped = OrderedDict((market_date, grouped[market_date]) for market_date in sorted(grouped))
     feature_inputs: list[dict[str, object]] = []
     identities_by_date: dict[str, dict[str, SecurityIdentity]] = {}
     for market_date, date_events in grouped.items():
@@ -290,6 +330,7 @@ def build_tournament_receipt(
                     event.symbol,
                     primary_security_ids[event.symbol],
                 ),
+                momentum_selected=momentum_overrides.get(market_date),
             )
             candidates.append(candidate)
             identities[security.symbol] = security
@@ -339,25 +380,155 @@ def build_tournament_receipt(
         eligibility=eligibility,
         market_date_inputs=tuple(feature_inputs),
     )
+    calendar_dates = tuple(
+        sorted(
+            {
+                date
+                for market_date in grouped
+                for date in (market_date, *_next_weekdays(market_date))
+            }
+        )
+    )
+    clock_value[0] = dt.datetime.fromisoformat(
+        f"{calendar_dates[-1]}T22:00:00+00:00"
+    )
+    calendar_artifact = archive.admit(
+        raw_bytes=_canonical_bytes(
+            [
+                {"date": date, "open": "09:30", "close": "16:00"}
+                for date in calendar_dates
+            ]
+        ),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at=clock_value[0].isoformat(timespec="seconds"),
+    )
+    market_calendar = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=calendar_artifact,
+    )
     outcome_inputs = []
-    for market_date in grouped:
+    for market_date, date_events in grouped.items():
         identities = identities_by_date[market_date]
+        events_for_date = {event.symbol: event for event in date_events}
+        first_event = events_for_date[protocol.primary_universe[0]]
+        date_outcomes = []
+        for symbol in sorted((*protocol.primary_universe, "SPY")):
+            security = identities[symbol]
+            window = _outcome_window(
+                archive,
+                clock_value,
+                security=security,
+                market_date=market_date,
+                gross_return=return_overrides.get((market_date, symbol)),
+            )
+            official_open = resolve_market_session_open(
+                archive=archive,
+                market_calendar=market_calendar,
+                session_date=window.entry_date,
+            )
+            twins = (
+                ExecutionPriceTwin(
+                    price_basis="mid_price",
+                    status="unavailable",
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=None,
+                    price=None,
+                    adjustment_status=None,
+                    source_artifact_id=None,
+                    source_artifact_sha256=None,
+                    unavailable_reason="source_not_retained",
+                ),
+                ExecutionPriceTwin(
+                    price_basis="next_open",
+                    status=(
+                        "unavailable"
+                        if (market_date, symbol) in unavailable_next_open
+                        else "available"
+                    ),
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else official_open
+                    ),
+                    price=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else "10"
+                    ),
+                    adjustment_status=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else "total_return_adjusted"
+                    ),
+                    source_artifact_id=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else window.raw_artifact_id
+                    ),
+                    source_artifact_sha256=(
+                        None
+                        if (market_date, symbol) in unavailable_next_open
+                        else window.raw_artifact_sha256
+                    ),
+                    unavailable_reason=(
+                        "source_not_retained"
+                        if (market_date, symbol) in unavailable_next_open
+                        else None
+                    ),
+                ),
+                ExecutionPriceTwin(
+                    price_basis="executable_quote",
+                    status="unavailable",
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=None,
+                    price=None,
+                    adjustment_status=None,
+                    source_artifact_id=None,
+                    source_artifact_sha256=None,
+                    unavailable_reason="source_not_retained",
+                ),
+                ExecutionPriceTwin(
+                    price_basis="observed_paper_fill",
+                    status="unavailable",
+                    security_id=security.security_id,
+                    session_date=window.entry_date,
+                    observed_at=None,
+                    price=None,
+                    adjustment_status=None,
+                    source_artifact_id=None,
+                    source_artifact_sha256=None,
+                    unavailable_reason="source_not_retained",
+                ),
+            )
+            event = first_event if symbol == "SPY" else events_for_date[symbol]
+            execution = build_source_bound_execution_outcome(
+                decision_event_id=event.decision_event_id,
+                decision_market_date=market_date,
+                decision_cutoff=event.decision_at,
+                security=security,
+                market_calendar=market_calendar,
+                adjusted_price_window=window,
+                entry_session_open_at=official_open,
+                corporate_actions=(),
+                terminal_proceeds=None,
+                price_twins=twins,
+            )
+            date_outcomes.append(
+                {
+                    "execution_outcome": execution.to_dict(),
+                    "price_window": window.to_dict(),
+                }
+            )
         outcome_inputs.append(
             {
                 "market_date": market_date,
-                "outcomes": [
-                    {
-                        "symbol": symbol,
-                        "return": "0.1",
-                        "price_window": _outcome_window(
-                            archive,
-                            clock_value,
-                            security=identities[symbol],
-                            market_date=market_date,
-                        ),
-                    }
-                    for symbol in sorted((*protocol.primary_universe, "SPY"))
-                ],
+                "market_calendar": market_calendar.to_dict(),
+                "outcomes": date_outcomes,
             }
         )
     outcomes = build_source_bound_tournament_outcomes(

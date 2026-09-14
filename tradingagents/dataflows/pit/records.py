@@ -14,6 +14,7 @@ import json
 import math
 import re
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -695,6 +696,84 @@ _ACTION_FIELDS = frozenset(
 )
 
 
+def _positive_decimal_text(value: object, *, field_name: str) -> str:
+    if type(value) is not str:
+        raise PointInTimeDataError(f"{field_name} must be a canonical positive decimal")
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise PointInTimeDataError(
+            f"{field_name} must be a canonical positive decimal"
+        ) from exc
+    canonical = format(parsed.normalize(), "f")
+    if not parsed.is_finite() or parsed <= 0 or value != canonical:
+        raise PointInTimeDataError(
+            f"{field_name} must be a canonical positive decimal"
+        )
+    return value
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TerminalProceeds:
+    """Verified per-share proceeds for a terminal security event."""
+
+    security_id: str
+    effective_date: str
+    amount_per_share: str
+    currency: str
+    source_artifact_id: str
+    source_artifact_sha256: str
+    schema_version: str = dataclasses.field(
+        init=False, default="terminal_proceeds/v1"
+    )
+    analysis_only: bool = dataclasses.field(init=False, default=True)
+    execution_authority: str = dataclasses.field(init=False, default="none")
+    can_submit_orders: bool = dataclasses.field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        _identifier(self.security_id, field_name="security_id")
+        _date(self.effective_date, field_name="effective_date")
+        _positive_decimal_text(
+            self.amount_per_share, field_name="amount_per_share"
+        )
+        if self.currency != "USD":
+            raise PointInTimeDataError("terminal proceeds currency must be USD")
+        _identifier(self.source_artifact_id, field_name="source_artifact_id")
+        _digest(
+            self.source_artifact_sha256,
+            field_name="source_artifact_sha256",
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "security_id": self.security_id,
+            "effective_date": self.effective_date,
+            "amount_per_share": self.amount_per_share,
+            "currency": self.currency,
+            "source_artifact_id": self.source_artifact_id,
+            "source_artifact_sha256": self.source_artifact_sha256,
+            **_AUTHORITY,
+        }
+
+    def canonical_json_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.to_dict())
+
+
+_TERMINAL_PROCEEDS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "security_id",
+        "effective_date",
+        "amount_per_share",
+        "currency",
+        "source_artifact_id",
+        "source_artifact_sha256",
+        *_AUTHORITY,
+    }
+)
+
+
 def validate_security_identity(value: object) -> SecurityIdentity:
     values = _exact_fields(value, _SECURITY_FIELDS, field_name="security identity")
     if values["schema_version"] != "security_identity/v1":
@@ -757,4 +836,28 @@ def validate_corporate_action(value: object) -> CorporateAction:
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(values):
         raise PointInTimeDataError("corporate action bytes do not match canonical rebuild")
+    return rebuilt
+
+
+def validate_terminal_proceeds(value: object) -> TerminalProceeds:
+    values = _exact_fields(
+        value,
+        _TERMINAL_PROCEEDS_FIELDS,
+        field_name="terminal proceeds",
+    )
+    if values["schema_version"] != "terminal_proceeds/v1":
+        raise PointInTimeDataError("terminal proceeds schema_version is fixed")
+    _validate_authority(values, field_name="terminal proceeds")
+    rebuilt = TerminalProceeds(
+        security_id=values["security_id"],
+        effective_date=values["effective_date"],
+        amount_per_share=values["amount_per_share"],
+        currency=values["currency"],
+        source_artifact_id=values["source_artifact_id"],
+        source_artifact_sha256=values["source_artifact_sha256"],
+    )
+    if rebuilt.canonical_json_bytes() != _canonical_json_bytes(values):
+        raise PointInTimeDataError(
+            "terminal proceeds bytes do not match canonical rebuild"
+        )
     return rebuilt

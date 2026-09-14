@@ -12,6 +12,10 @@ from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from urllib.parse import parse_qs, urlsplit
 
+from tradingagents.dataflows.pit.market_calendar import (
+    MarketSessionCalendar,
+    validate_market_session_calendar,
+)
 from tradingagents.dataflows.pit.raw_artifacts import (
     RawPointInTimeArtifact,
     RawPointInTimeArtifactArchive,
@@ -21,6 +25,7 @@ from tradingagents.dataflows.pit.records import PointInTimeDataError
 __all__ = [
     "SourceBoundAdjustedPriceWindow",
     "build_source_bound_adjusted_price_window",
+    "validate_five_session_adjusted_price_window",
     "validate_source_bound_adjusted_price_window",
     "verify_source_bound_adjusted_price_window",
 ]
@@ -499,3 +504,39 @@ def verify_source_bound_adjusted_price_window(
     if rebuilt.canonical_json_bytes() != window.canonical_json_bytes():
         raise PointInTimeDataError("price window does not match its immutable source bytes")
     return rebuilt
+
+
+def validate_five_session_adjusted_price_window(
+    *,
+    value: object,
+    market_calendar: MarketSessionCalendar,
+    decision_market_date: str,
+) -> SourceBoundAdjustedPriceWindow:
+    """Bind one adjusted outcome window to the next five admitted sessions.
+
+    The first row is the next regular session after the registered decision
+    date and the fifth row is the exit session.  The calendar receipt remains
+    the authority for session membership; this helper performs no retrieval.
+    """
+
+    window = validate_source_bound_adjusted_price_window(value)
+    if type(market_calendar) is not MarketSessionCalendar:
+        raise PointInTimeDataError(
+            "market_calendar must be an exact MarketSessionCalendar"
+        )
+    calendar = validate_market_session_calendar(market_calendar.to_dict())
+    decision_date = _date(decision_market_date, label="decision_market_date")
+    later_sessions = tuple(
+        market_date for market_date in calendar.market_dates if market_date > decision_date
+    )
+    if len(later_sessions) < 5:
+        raise PointInTimeDataError(
+            "market calendar does not prove five post-decision sessions"
+        )
+    expected = later_sessions[:5]
+    observed = tuple(market_date for market_date, _close in window.daily_closes)
+    if observed != expected:
+        raise PointInTimeDataError(
+            "adjusted price window must contain the exact next five calendar sessions"
+        )
+    return window

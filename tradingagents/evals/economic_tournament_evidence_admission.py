@@ -13,11 +13,17 @@ from pathlib import Path
 
 from tradingagents.dataflows.pit import (
     RawPointInTimeArtifactArchive,
+    build_market_session_calendar,
+    resolve_market_session_open,
+    validate_market_session_calendar,
     validate_point_in_time_observation,
+    validate_security_identity,
     validate_source_bound_adjusted_price_window,
+    validate_source_bound_execution_outcome,
     verify_source_bound_adjusted_price_window,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import FrozenEvaluationProtocol
@@ -50,6 +56,7 @@ _MAX_JSON_DEPTH = 64
 _MAX_JSON_NODES = 1_000_000
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CUSTODY_SCHEMA = "economic_tournament_receipt_custody/v1"
+_Eligibility = EconomicPhaseEligibility | ValidationPhaseEligibility
 
 
 def _plain_json(value: object) -> object:
@@ -231,7 +238,7 @@ def verify_source_bound_tournament_input(
     archive: RawPointInTimeArtifactArchive,
     value: object,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: _Eligibility,
 ) -> SourceBoundTournamentInput:
     """Reopen raw bytes and rebuild every declared value and price window."""
 
@@ -290,12 +297,42 @@ def verify_source_bound_tournament_input(
             benchmark.get("benchmark_observation"),
             source_values=source_values,
         )
-    for date_evidence in receipt.outcome_receipt.date_evidence:
+    for feature_date, date_evidence in zip(
+        receipt.features.date_evidence,
+        receipt.outcome_receipt.date_evidence,
+        strict=True,
+    ):
         outcomes = date_evidence.get("outcomes")
         if type(outcomes) is not tuple:
             raise EconomicTournamentInputEvidenceError(
                 "canonical tournament outcomes are invalid"
             )
+        try:
+            calendar = validate_market_session_calendar(
+                _plain_json(date_evidence.get("market_calendar"))
+            )
+            calendar_artifact = archive.read_artifact(calendar.raw_artifact_id)
+            verified_calendar = build_market_session_calendar(
+                archive=archive,
+                raw_artifact=calendar_artifact,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise EconomicTournamentInputEvidenceError(
+                "tournament market calendar raw artifact cannot be verified"
+            ) from exc
+        if verified_calendar.canonical_json_bytes() != calendar.canonical_json_bytes():
+            raise EconomicTournamentInputEvidenceError(
+                "tournament market calendar bytes are not exact"
+            )
+        identities: dict[str, object] = {}
+        for candidate in feature_date["candidates"]:
+            security = validate_security_identity(_plain_json(candidate["security"]))
+            identities[security.symbol] = security
+        benchmark = feature_date["benchmark"]
+        benchmark_security = validate_security_identity(
+            _plain_json(benchmark["security"])
+        )
+        identities[benchmark_security.symbol] = benchmark_security
         for outcome in outcomes:
             if not isinstance(outcome, Mapping):
                 raise EconomicTournamentInputEvidenceError(
@@ -311,6 +348,20 @@ def verify_source_bound_tournament_input(
                     raw_artifact=artifact,
                     value=window.to_dict(),
                 )
+                raw_execution = _plain_json(outcome.get("execution_outcome"))
+                symbol = raw_execution.get("symbol")
+                security = identities[symbol]
+                execution = validate_source_bound_execution_outcome(
+                    raw_execution,
+                    security=security,
+                    market_calendar=calendar,
+                    adjusted_price_window=verified,
+                )
+                official_open = resolve_market_session_open(
+                    archive=archive,
+                    market_calendar=calendar,
+                    session_date=execution.entry_session_date,
+                )
             except (OSError, TypeError, ValueError) as exc:
                 raise EconomicTournamentInputEvidenceError(
                     "tournament outcome raw artifact cannot be verified"
@@ -318,6 +369,10 @@ def verify_source_bound_tournament_input(
             if verified.canonical_json_bytes() != window.canonical_json_bytes():
                 raise EconomicTournamentInputEvidenceError(
                     "tournament outcome price window bytes are not exact"
+                )
+            if execution.entry_session_open_at != official_open:
+                raise EconomicTournamentInputEvidenceError(
+                    "tournament execution open does not replay from raw calendar bytes"
                 )
     return receipt
 
@@ -399,7 +454,7 @@ class EconomicTournamentReceiptArchive:
         input_id: str,
         input_sha256: str,
         protocol: FrozenEvaluationProtocol,
-        eligibility: ValidationPhaseEligibility,
+        eligibility: _Eligibility,
     ) -> SourceBoundTournamentInput:
         """Reopen both complete receipts and all retained PIT source bytes."""
 

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import cli.main as cli_main
+from tradingagents.graph.checkpoint_runtime_identity import CheckpointRuntimeIdentityError
 from tradingagents.research.original_workflow import (
     build_creator_workflow_status,
     write_creator_workflow_artifacts,
@@ -69,6 +70,19 @@ def test_creator_workflow_writer_preserves_full_role_artifacts(tmp_path):
     }
 
 
+def test_saved_report_preserves_supplied_checkpoint_receipt_without_inventing_one(tmp_path):
+    state = _creator_final_state()
+    cli_main.save_report_to_disk(state, "TEST", tmp_path / "generic")
+    assert not (tmp_path / "generic/checkpoint_receipt.json").exists()
+
+    receipt = {
+        "mode": "fresh", "identity_digest": "a" * 64, "checkpoint_step": None,
+        "analysis_only": True, "execution_authority": "none", "can_submit_orders": False,
+    }
+    cli_main.save_report_to_disk({**state, "checkpoint_receipt": receipt}, "TEST", tmp_path / "checkpointed")
+    assert json.loads((tmp_path / "checkpointed/checkpoint_receipt.json").read_text()) == receipt
+
+
 def test_overnight_graph_result_includes_creator_workflow_artifact_refs(monkeypatch, tmp_path):
     class FakeGraph:
         def __init__(self, *args, **kwargs):
@@ -79,9 +93,23 @@ def test_overnight_graph_result_includes_creator_workflow_artifact_refs(monkeypa
             assert symbol == "NVDA"
             assert trade_date == "2026-06-03"
             assert asset_type == "stock"
-            return _creator_final_state(), "Overweight"
+            state = _creator_final_state()
+            state["checkpoint_receipt"] = {
+                "mode": "fresh",
+                "identity_digest": "a" * 64,
+                "checkpoint_step": None,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
+            return state, "Overweight"
 
     monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeGraph)
+    monkeypatch.setattr(
+        cli_main,
+        "build_analysis_checkpoint_identity",
+        lambda **_kwargs: object(),
+    )
 
     result = cli_main._run_overnight_ticker_analysis(
         "NVDA",
@@ -100,6 +128,14 @@ def test_overnight_graph_result_includes_creator_workflow_artifact_refs(monkeypa
     assert Path(workflow["packet_path"]).exists()
     assert Path(workflow["complete_report_path"]).exists()
     assert Path(workflow["packet_path"]).parent == tmp_path / "agent_runs" / "NVDA"
+    assert result["checkpoint_receipt"] == {
+        "mode": "fresh",
+        "identity_digest": "a" * 64,
+        "checkpoint_step": None,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -137,6 +173,11 @@ def test_overnight_graph_rejects_incomplete_analysis_before_writing_artifacts(
             return state, "Hold"
 
     monkeypatch.setattr(cli_main, "TradingAgentsGraph", FakeGraph)
+    monkeypatch.setattr(
+        cli_main,
+        "build_analysis_checkpoint_identity",
+        lambda **_kwargs: object(),
+    )
 
     with pytest.raises(
         cli_main.OvernightGraphIncompleteAnalysis,
@@ -155,6 +196,65 @@ def test_overnight_graph_rejects_incomplete_analysis_before_writing_artifacts(
                 ],
                 "llm_provider": "ollama",
             },
+        )
+
+    assert not (tmp_path / "agent_runs" / "NVDA").exists()
+
+
+def test_overnight_checkpoint_identity_failure_blocks_graph_and_artifact_writes(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        cli_main,
+        "build_analysis_checkpoint_identity",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            CheckpointRuntimeIdentityError("source tree is dirty")
+        ),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "TradingAgentsGraph",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("identity failure must block graph construction")
+        ),
+    )
+
+    with pytest.raises(CheckpointRuntimeIdentityError, match="dirty"):
+        cli_main._run_overnight_ticker_analysis(
+            "NVDA",
+            "2026-06-03",
+            tmp_path,
+            graph_config_overrides={
+                "_selected_analysts": ["market", "social", "news", "fundamentals"],
+                "llm_provider": "openrouter",
+                "quick_think_llm": "openai/gpt-5-mini",
+                "deep_think_llm": "anthropic/claude-sonnet-4-5",
+                "backend_url": "https://router.example/v1?region=us",
+            },
+        )
+
+    assert not (tmp_path / "agent_runs" / "NVDA").exists()
+
+
+def test_overnight_analysis_rejects_an_explicit_no_checkpoint_override(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        cli_main,
+        "TradingAgentsGraph",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no-checkpoint override must block graph construction")
+        ),
+    )
+
+    with pytest.raises(CheckpointRuntimeIdentityError, match="requires evidence-safe"):
+        cli_main._run_overnight_ticker_analysis(
+            "NVDA",
+            "2026-06-03",
+            tmp_path,
+            graph_config_overrides={"checkpoint_enabled": False},
         )
 
     assert not (tmp_path / "agent_runs" / "NVDA").exists()

@@ -226,6 +226,26 @@ def test_source_bound_window_lookup_rejects_malformed_outer_containers(tmp_path)
             raw_artifacts={artifact.raw_artifact_id: artifact},
             receipts=None,
         )
+    with pytest.raises(
+        PointInTimeDataError,
+        match="economic protocol and forecast-event bindings must be supplied together",
+    ):
+        build_source_bound_window_lookup(
+            archive=archive,
+            raw_artifacts={artifact.raw_artifact_id: artifact},
+            receipts=(receipt,),
+            forecast_event_bindings={"af-1": "decision-event-" + "a" * 64},
+        )
+    with pytest.raises(
+        PointInTimeDataError,
+        match="economic protocol and forecast-event bindings must be supplied together",
+    ):
+        build_source_bound_window_lookup(
+            archive=archive,
+            raw_artifacts={artifact.raw_artifact_id: artifact},
+            receipts=(receipt,),
+            economic_protocol=object(),
+        )
 
 
 def test_source_bound_window_lookup_loads_only_canonical_receipts(tmp_path):

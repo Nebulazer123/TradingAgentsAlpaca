@@ -244,9 +244,7 @@ def _json_path(value: object, *, label: str) -> tuple[str | int, ...]:
             type(component) is str
             and component
             and len(component) <= _MAX_JSON_PATH_COMPONENT_CHARS
-        ):
-            path.append(component)
-        elif type(component) is int and 0 <= component <= _MAX_CANDIDATES:
+        ) or (type(component) is int and 0 <= component <= _MAX_CANDIDATES):
             path.append(component)
         else:
             raise PointInTimeDataError(f"{label} contains an invalid component")

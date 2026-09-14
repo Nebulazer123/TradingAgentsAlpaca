@@ -16,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-import tradingagents.evals.economic_evaluation_protocol as economic_protocol
 from tests.test_point_in_time_cohort import (
     _build_from_fixture,
     _source_cohort_fixture,
@@ -25,8 +24,15 @@ from tradingagents.dataflows.pit import (
     RawPointInTimeArtifactArchive,
     build_market_date_partitions,
     build_market_session_calendar,
+    build_source_bound_adjusted_price_window,
+)
+from tradingagents.evals import economic_evaluation_protocol as economic_protocol
+from tradingagents.evals.agent_intelligence_ledger import (
+    AgentForecast,
+    resolve_forecasts_with_quality,
 )
 from tradingagents.evals.agent_intelligence_reconciliation import (
+    build_reconciliation_receipt,
     market_event_key,
     packet_event_key,
 )
@@ -44,6 +50,8 @@ from tradingagents.evals.economic_evaluation_protocol import (
     validate_decision_event,
     validate_frozen_evaluation_protocol,
 )
+from tradingagents.evals.learning_availability import LearningObservation
+from tradingagents.evals.source_bound_resolution import build_source_bound_window_lookup
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
 
 PRIMARY_UNIVERSE = tuple(f"T{i:03d}" for i in range(75))
@@ -677,6 +685,264 @@ def test_protocol_freezes_ta_control_constants_and_sealed_partitions(protocol_so
     ) == protocol
     with pytest.raises(TypeError):
         protocol.evaluation_policy["benchmark_symbol"] = "QQQ"  # type: ignore[index]
+
+
+def _learning_protocol_resolution_fixture(
+    protocol_source,
+    tmp_path,
+):
+    protocol = _protocol(protocol_source)
+    event = next(
+        event
+        for event in protocol.input_manifest.events
+        if event.market_date == "2026-05-22"
+    )
+    start = dt.date.fromisoformat(event.market_date)
+    market_dates = protocol.market_date_partitions.market_calendar.market_dates
+    event_index = market_dates.index(event.market_date)
+    end = dt.date.fromisoformat(market_dates[event_index + event.horizon_sessions])
+    assert end == dt.date(2026, 6, 1)
+    recorded = dt.datetime.combine(
+        end + dt.timedelta(days=1),
+        dt.time(21),
+        tzinfo=dt.UTC,
+    )
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "learning-pit",
+        clock=lambda: recorded,
+    )
+    artifacts = {}
+    receipts = []
+    for symbol, final_close in ((event.symbol, "12"), (event.benchmark, "11")):
+        bars = []
+        for current_text in market_dates[event_index : event_index + 6]:
+            bars.append(
+                {
+                    "t": f"{current_text}T05:00:00Z",
+                    "c": "10" if not bars else final_close,
+                }
+            )
+        artifact = archive.admit(
+            raw_bytes=json.dumps({"bars": {symbol: bars}}).encode(),
+            source_uri=(
+                f"https://data.alpaca.markets/v2/stocks/{symbol}/bars?"
+                "timeframe=1Day&feed=iex&adjustment=all"
+                f"&start={start.isoformat()}T00:00:00Z"
+                f"&end={(end + dt.timedelta(days=1)).isoformat()}T00:00:00Z"
+            ),
+            content_type="application/json",
+            retrieved_at=recorded.isoformat(timespec="seconds"),
+        )
+        artifacts[artifact.raw_artifact_id] = artifact
+        receipts.append(
+            build_source_bound_adjusted_price_window(
+                archive=archive,
+                raw_artifact=artifact,
+                security_id=f"security-{symbol.lower()}",
+                symbol=symbol,
+                requested_start=start.isoformat(),
+                requested_end=end.isoformat(),
+                decision_cutoff=recorded.isoformat(timespec="seconds"),
+            )
+        )
+    forecast = AgentForecast(
+        forecast_id="af-economic-binding",
+        agent="market_analyst",
+        ticker=event.symbol,
+        claim="source-bound economic identity",
+        forecast_type="market_report_direction",
+        horizon=event.horizon,
+        probability="0.60",
+        expected_outcome="outperform",
+        direction="bullish",
+        benchmark=event.benchmark,
+        created_at=event.created_at,
+        resolve_after=f"{end.isoformat()}T20:45:00+00:00",
+        source_packet_id=event.source_packet_id,
+    )
+    lookup = build_source_bound_window_lookup(
+        archive=archive,
+        raw_artifacts=artifacts,
+        receipts=tuple(receipts),
+        economic_protocol=protocol,
+        forecast_event_bindings={forecast.forecast_id: event.decision_event_id},
+    )
+    return protocol, event, forecast, lookup, recorded, artifacts, receipts
+
+
+def test_frozen_protocol_binding_survives_resolution_and_drives_verified_counts(
+    protocol_source,
+    tmp_path,
+):
+    protocol, event, forecast, lookup, recorded, _, _ = (
+        _learning_protocol_resolution_fixture(protocol_source, tmp_path)
+    )
+
+    resolved, reports = resolve_forecasts_with_quality(
+        [forecast],
+        window_lookup=lookup,
+        now=recorded,
+    )
+
+    assert reports[0].status == "resolvable"
+    assert resolved[0].resolution_evidence["schema_version"] == (
+        "source_bound_resolution_evidence/v3"
+    )
+    assert lookup.verify_forecast(resolved[0]) is True
+    closed_friday_due = dataclasses.replace(
+        resolved[0], resolve_after="2026-05-29T20:45:00+00:00"
+    )
+    assert lookup.verify_forecast(closed_friday_due) is False
+    observation = LearningObservation.from_source_bound_forecast(
+        resolved[0],
+        recorded_at=recorded,
+        verifier=lookup,
+    )
+    assert observation.payload["resolution_evidence"]["economic_decision"] == {
+        "protocol_id": protocol.protocol_id,
+        "input_manifest_id": protocol.input_manifest_id,
+        "input_manifest_sha256": protocol.input_manifest_sha256,
+        "decision_event_id": event.decision_event_id,
+        "decision_at": event.decision_at,
+        "market_date": event.market_date,
+        "source_packet_id": event.source_packet_id,
+    }
+    ledger_bytes = (json.dumps(resolved[0].as_dict(), sort_keys=True) + "\n").encode()
+    receipt = build_reconciliation_receipt(
+        ledger_bytes,
+        source_bound_verifier=lookup,
+    )
+    assert receipt["unique_economic_decision_event_id_count"] == 1
+    assert receipt["unique_economic_decision_market_date_count"] == 1
+    assert receipt["economic_decision_verified_resolved_row_count"] == 1
+    assert receipt["economic_decision_unbound_resolved_row_count"] == 0
+    assert receipt["economic_decision_identity_status"] == "verified"
+
+    unrelated_window = dataclasses.replace(
+        resolved[0], resolve_after="2099-01-01T00:00:00+00:00"
+    )
+    assert lookup.verify_forecast(unrelated_window) is False
+    unrelated_receipt = build_reconciliation_receipt(
+        (json.dumps(unrelated_window.as_dict(), sort_keys=True) + "\n").encode(),
+        source_bound_verifier=lookup,
+    )
+    assert unrelated_receipt["unique_economic_decision_event_id_count"] == 0
+    assert unrelated_receipt["economic_decision_verified_resolved_row_count"] == 0
+    assert unrelated_receipt["economic_decision_unbound_resolved_row_count"] == 1
+
+    forged = resolved[0].as_dict()
+    forged["resolution_evidence"]["economic_decision"]["market_date"] = "2026-01-01"
+    forged_receipt = build_reconciliation_receipt(
+        (json.dumps(forged, sort_keys=True) + "\n").encode(),
+        source_bound_verifier=lookup,
+    )
+    assert forged_receipt["unique_economic_decision_event_id_count"] == 0
+    assert forged_receipt["unique_economic_decision_market_date_count"] == 0
+    assert forged_receipt["economic_decision_verified_resolved_row_count"] == 0
+    assert forged_receipt["economic_decision_unbound_resolved_row_count"] == 1
+    assert forged_receipt["economic_decision_identity_status"] == (
+        "verified_with_unbound_rows"
+    )
+
+    legacy_v2 = resolved[0].as_dict()
+    legacy_v2["forecast_id"] = "af-legacy-v2"
+    legacy_v2["resolution_evidence"].pop("economic_decision")
+    legacy_v2["resolution_evidence"]["schema_version"] = (
+        "source_bound_resolution_evidence/v2"
+    )
+    mixed_receipt = build_reconciliation_receipt(
+        (
+            json.dumps(resolved[0].as_dict(), sort_keys=True)
+            + "\n"
+            + json.dumps(legacy_v2, sort_keys=True)
+            + "\n"
+        ).encode(),
+        source_bound_verifier=lookup,
+    )
+    assert mixed_receipt["unique_economic_decision_event_id_count"] == 1
+    assert mixed_receipt["unique_economic_decision_market_date_count"] == 1
+    assert mixed_receipt["economic_decision_verified_resolved_row_count"] == 1
+    assert mixed_receipt["economic_decision_unbound_resolved_row_count"] == 1
+    assert mixed_receipt["economic_decision_identity_status"] == (
+        "verified_with_unbound_rows"
+    )
+
+
+def test_learning_cli_uses_frozen_protocol_receipts_without_fabricating_bindings(
+    protocol_source, tmp_path, monkeypatch,
+):
+    from typer.testing import CliRunner
+
+    from cli import main as cli_main
+
+    protocol, event, forecast, _, recorded, artifacts, receipts = (
+        _learning_protocol_resolution_fixture(protocol_source, tmp_path)
+    )
+    monkeypatch.setattr(cli_main, "_learning_producer_now", lambda: recorded)
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text(json.dumps(forecast.as_dict()) + "\n")
+    summary = tmp_path / "summary.json"
+    quality = tmp_path / "quality.json"
+    protocol_path = tmp_path / "protocol.json"
+    protocol_path.write_bytes(protocol.canonical_json_bytes())
+    bindings_path = tmp_path / "bindings.json"
+    bindings = {forecast.forecast_id: event.decision_event_id}
+    bindings_path.write_text(json.dumps(bindings))
+    source_args = ["--pit-raw-artifact-archive", str(tmp_path / "learning-pit")]
+    for index, artifact in enumerate(artifacts.values()):
+        path = tmp_path / f"raw-{index}.json"
+        path.write_bytes(artifact.canonical_json_bytes())
+        source_args += ["--pit-raw-artifact-receipt", str(path)]
+    for index, receipt in enumerate(receipts):
+        path = tmp_path / f"window-{index}.json"
+        path.write_bytes(receipt.canonical_json_bytes())
+        source_args += ["--pit-price-window-receipt", str(path)]
+    binding_args = [
+        "--pit-economic-protocol", str(protocol_path),
+        "--pit-forecast-event-bindings", str(bindings_path),
+    ]
+    common = ["--ledger-path", str(ledger), "--summary-path", str(summary)]
+    resolver = ["research", "agent-ledger-resolve", *common,
+                "--resolution-quality-path", str(quality), "--json-output"]
+    runner = CliRunner()
+    resolved = runner.invoke(cli_main.app, [*resolver, *source_args, *binding_args])
+    assert resolved.exit_code == 0, resolved.output
+    assert json.loads(resolved.output)["newly_resolved_count"] == 1
+    assert json.loads(ledger.read_text())["resolution_evidence"]["schema_version"] == (
+        "source_bound_resolution_evidence/v3"
+    )
+    snapshot = ledger.read_bytes()
+    reconciliation = ["research", "agent-ledger-reconcile", *common]
+    verified = runner.invoke(cli_main.app, [*reconciliation, *source_args, *binding_args])
+    assert verified.exit_code == 0, verified.output
+    payload = json.loads(verified.output)
+    assert payload["unique_economic_decision_event_id_count"] == 1
+    assert payload["unique_economic_decision_market_date_count"] == 1
+    assert payload["economic_decision_identity_status"] == "verified"
+    assert payload["summary_freshness"] == "current"
+    assert ledger.read_bytes() == snapshot
+
+    legacy = runner.invoke(cli_main.app, reconciliation)
+    assert legacy.exit_code == 0, legacy.output
+    assert json.loads(legacy.output)["unique_economic_decision_event_id_count"] is None
+
+    audit = ["research", "ledger-quality-audit", *common,
+             "--quality-path", str(quality), "--no-backup", "--json-output"]
+    audited = runner.invoke(cli_main.app, [*audit, *source_args, *binding_args])
+    assert audited.exit_code == 0, audited.output
+    fixed = runner.invoke(cli_main.app, [*resolver, *source_args, *binding_args])
+    assert fixed.exit_code == 0, fixed.output
+    assert json.loads(fixed.output)["newly_resolved_count"] == 0
+
+    bindings_path.write_text(json.dumps({forecast.forecast_id: "foreign-event"}))
+    before = {path: path.read_bytes() for path in (ledger, summary, quality)}
+    audit_with_backup = ["--backup" if arg == "--no-backup" else arg for arg in audit]
+    for command in (resolver, reconciliation, audit_with_backup):
+        rejected = runner.invoke(cli_main.app, [*command, *source_args, *binding_args])
+        assert rejected.exit_code == 2, rejected.output
+        assert "forecast-event" in rejected.output and "invalid" in rejected.output
+        assert {path: path.read_bytes() for path in before} == before
+    assert not list(tmp_path.glob("*.backup-*"))
 
 
 def test_public_frozen_dataclasses_cannot_bypass_their_builders_or_alias_state(

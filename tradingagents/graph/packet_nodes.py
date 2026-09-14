@@ -426,6 +426,38 @@ def _validate_durable_reference(
     return expected_ref
 
 
+def validate_checkpoint_packet_references(
+    state: Mapping[str, Any], *, ledger_root: Path, evidence_root: Path,
+    authenticated_events: tuple[LedgerEvent, ...],
+) -> None:
+    """Verify a saved prefix without packet writes or latest-pointer repair.
+
+    The caller supplies the same authenticated journal snapshot used to validate
+    checkpoint predecessors. This reuses the packet boundary's exact reference,
+    lineage and retained-evidence checks before any resumed graph invocation.
+    """
+    raw_refs = state.get("decision_packet_refs")
+    if not isinstance(raw_refs, list) or len(raw_refs) > len(_KIND_ORDER):
+        raise ValueError("checkpoint decision_packet_refs must be an ordered prefix")
+    if not raw_refs:
+        return
+    try:
+        run_id = _canonical_text(state.get("run_id"), field="run_id")
+        started_at = _canonical_utc_seconds(state.get("run_started_at"), field="run_started_at")
+        stable_ledger_root = _lexical_root(ledger_root, label="ledger root")
+        stable_evidence_root = _lexical_root(evidence_root, label="evidence root")
+        for reference, kind in zip(raw_refs, _KIND_ORDER[:len(raw_refs)], strict=True):
+            parent = _PARENT_KIND[kind]
+            _validate_durable_reference(
+                reference, expected_kind=kind,
+                expected_parent_ids=() if parent is None else (build_packet_id(run_id, parent),),
+                run_id=run_id, run_started_at=started_at, ledger_root=stable_ledger_root,
+                evidence_root=stable_evidence_root, events=authenticated_events,
+            )
+    except ValueError as exc:
+        raise ValueError(f"checkpoint packet reference is invalid: {exc}") from exc
+
+
 def _validated_state_refs(
     state: Mapping[str, Any],
     *,
@@ -456,8 +488,18 @@ def _validated_state_refs(
 
     try:
         events = ledger.verify(evidence_root=evidence_root)
-    except LedgerCorruptionError:
-        raise
+    except LedgerCorruptionError as exc:
+        # A process may crash after the immutable event is durable but before
+        # its derived latest pointer is repaired. Recover only that exact,
+        # current event after strictly authenticating every other pointer.
+        if str(exc) != f"latest pointer is missing for {kind}":
+            raise
+        events = ledger.recover_missing_latest_pointer(
+            packet_id=build_packet_id(run_id, kind),
+            kind=kind,
+            run_id=run_id,
+            evidence_root=evidence_root,
+        )
     validated = []
     for reference, reference_kind in zip(raw_refs, allowed_kinds, strict=True):
         parent_kind = _PARENT_KIND[reference_kind]
