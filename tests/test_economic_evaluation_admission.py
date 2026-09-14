@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hashlib
 import json
+import lzma
 import subprocess
 
 import pytest
 
+from tests.fixtures.economic_tournament import build_tournament_receipt
+from tests.test_economic_evaluation_protocol import protocol_source as protocol_source
+from tests.test_point_in_time_cohort import (
+    _build_from_fixture,
+    _source_cohort_fixture,
+)
 from tradingagents.dataflows.pit import (
     RawPointInTimeArtifactArchive,
     build_market_date_partitions,
@@ -21,18 +29,17 @@ from tradingagents.evals.economic_evaluation_admission import (
     EconomicEvaluationAdmissionError,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    bind_phase_eligibility,
     bind_validation_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     EvaluationSearchBudget,
-    build_bitemporal_input_manifest,
-    build_decision_event,
     build_frozen_evaluation_protocol,
-    canonical_universe_id,
 )
 from tradingagents.evals.economic_evaluation_result import (
     EconomicEvaluationResultError,
     LegacyEconomicValidationResult,
+    build_phase_evaluation_result,
     build_validation_evaluation_result,
     validate_economic_validation_result,
 )
@@ -43,37 +50,31 @@ from tradingagents.strategy._immutable_evidence_store import (
 from tradingagents.strategy.evaluator import StrategyEvaluationPolicy
 
 NOW = dt.datetime(2026, 1, 9, 21, 30, tzinfo=dt.UTC)
+_PROTOCOL_SOURCE = None
+_PROTOCOL_CACHE = None
+_TOURNAMENT_INPUT_CACHE = None
+_TOURNAMENT_ROOT = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _bind_protocol_source(protocol_source, tmp_path_factory):
+    global _PROTOCOL_CACHE, _PROTOCOL_SOURCE, _TOURNAMENT_INPUT_CACHE, _TOURNAMENT_ROOT
+    _PROTOCOL_SOURCE = protocol_source
+    _PROTOCOL_CACHE = None
+    _TOURNAMENT_INPUT_CACHE = None
+    _TOURNAMENT_ROOT = tmp_path_factory.mktemp("economic-admission") / "tournament-pit"
 
 
 def _protocol():
-    primary = tuple(f"T{i:03d}" for i in range(75))
-    events = tuple(
-        build_decision_event(
-            universe_id=canonical_universe_id(primary),
-            symbol=symbol,
-            decision_at="2026-01-09T20:55:00+00:00",
-            market_date="2026-01-09",
-            horizon_sessions=5,
-            horizon="5_sessions",
-            benchmark="SPY",
-            created_at="2026-01-09T20:45:00+00:00",
-            resolution_window={"start_at": "2026-01-09T20:55:00+00:00"},
-            observation_start="2026-01-09T19:00:00+00:00",
-            observation_end="2026-01-09T20:50:00+00:00",
-            available_at="2026-01-09T20:50:00+00:00",
-            recorded_at="2026-01-09T20:52:00+00:00",
-            source_packet_id=f"packet-{symbol.lower()}",
-            source_artifact_id=f"artifact-{symbol.lower()}",
-            source_artifact_sha256=hashlib.sha256(symbol.encode()).hexdigest(),
-        )
-        for symbol in ("T000", "T001", "T002")
-    )
-    manifest = build_bitemporal_input_manifest(
-        dataset_id="pit-admission-fixture",
-        as_of_cutoff="2026-01-09T21:00:00+00:00",
-        captured_at="2026-01-09T21:00:00+00:00",
-        events=events,
-    )
+    global _PROTOCOL_CACHE
+    assert _PROTOCOL_SOURCE is not None
+    if _PROTOCOL_CACHE is None:
+        cohort, partitions, manifest = _PROTOCOL_SOURCE
+        _PROTOCOL_CACHE = _protocol_from_receipts(cohort, partitions, manifest)
+    return _PROTOCOL_CACHE
+
+
+def _protocol_from_receipts(cohort, partitions, manifest):
     policy = StrategyEvaluationPolicy(
         benchmark_symbol="SPY",
         holding_sessions=5,
@@ -83,85 +84,28 @@ def _protocol():
         round_trip_sides=2,
     )
     return build_frozen_evaluation_protocol(
+        cohort=cohort,
+        market_date_partitions=partitions,
         input_manifest=manifest,
-        primary_universe=primary,
-        sensitivity_universe_50=primary[:50],
-        sensitivity_universe_100=tuple(f"T{i:03d}" for i in range(100)),
-        evaluation_policy=policy,
-        search_budget=EvaluationSearchBudget(5, 3, 25),
-        development_event_ids=(manifest.events[0].decision_event_id,),
-        validation_event_ids=(manifest.events[1].decision_event_id,),
-        holdout_event_ids=(manifest.events[2].decision_event_id,),
-    )
-
-
-def _partitioned_protocol(tmp_path):
-    primary = tuple(f"T{i:03d}" for i in range(75))
-    day = dt.date(2025, 10, 1)
-    market_dates: list[str] = []
-    while len(market_dates) < 60:
-        if day.weekday() < 5:
-            market_dates.append(day.isoformat())
-        day += dt.timedelta(days=1)
-    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
-    artifact = archive.admit(
-        raw_bytes=json.dumps([{"date": date} for date in market_dates]).encode(),
-        source_uri="https://paper-api.alpaca.markets/v2/calendar",
-        content_type="application/json",
-        retrieved_at=NOW.isoformat(timespec="seconds"),
-    )
-    calendar = build_market_session_calendar(archive=archive, raw_artifact=artifact)
-    events = tuple(
-        build_decision_event(
-            universe_id=canonical_universe_id(primary),
-            symbol=primary[index],
-            decision_at=f"{market_date}T20:55:00+00:00",
-            market_date=market_date,
-            horizon_sessions=5,
-            horizon="5_sessions",
-            benchmark="SPY",
-            created_at=f"{market_date}T20:45:00+00:00",
-            resolution_window={"start_at": f"{market_date}T20:55:00+00:00"},
-            observation_start=f"{market_date}T19:00:00+00:00",
-            observation_end=f"{market_date}T20:50:00+00:00",
-            available_at=f"{market_date}T20:50:00+00:00",
-            recorded_at=f"{market_date}T20:52:00+00:00",
-            source_packet_id=f"packet-{market_date}",
-            source_artifact_id=f"artifact-{market_date}",
-            source_artifact_sha256=hashlib.sha256(market_date.encode()).hexdigest(),
-        )
-        for index, market_date in enumerate(market_dates)
-    )
-    partitions = build_market_date_partitions(
-        market_calendar=calendar,
-        events=events,
-    )
-    manifest = build_bitemporal_input_manifest(
-        dataset_id="pit-admission-partitioned-fixture",
-        as_of_cutoff=NOW.isoformat(timespec="seconds"),
-        captured_at=NOW.isoformat(timespec="seconds"),
-        events=events,
-    )
-    policy = StrategyEvaluationPolicy(
-        benchmark_symbol="SPY",
-        holding_sessions=5,
-        commission_bps_per_side="0",
-        half_spread_bps_per_side="5",
-        slippage_bps_per_side="5",
-        round_trip_sides=2,
-    )
-    protocol = build_frozen_evaluation_protocol(
-        input_manifest=manifest,
-        primary_universe=primary,
-        sensitivity_universe_50=primary[:50],
-        sensitivity_universe_100=tuple(f"T{i:03d}" for i in range(100)),
+        primary_universe=cohort.primary_universe_75,
+        sensitivity_universe_50=cohort.sensitivity_universe_50,
+        sensitivity_universe_100=cohort.sensitivity_universe_100,
         evaluation_policy=policy,
         search_budget=EvaluationSearchBudget(5, 3, 25),
         development_event_ids=partitions.development_event_ids,
         validation_event_ids=partitions.validation_event_ids,
         holdout_event_ids=partitions.holdout_event_ids,
     )
-    return protocol, partitions
+
+
+def _partitioned_protocol(tmp_path):
+    assert _PROTOCOL_SOURCE is not None
+    return _protocol(), _PROTOCOL_SOURCE[1]
+
+
+def _tournament_artifact_root():
+    assert _TOURNAMENT_ROOT is not None
+    return _TOURNAMENT_ROOT
 
 
 def _adapter(tmp_path):
@@ -193,6 +137,270 @@ def _source_revision(tmp_path) -> str:
     return result.stdout.strip()
 
 
+def _chunks_for_compressed_receipt(compressed: bytes) -> list[str]:
+    encoded = base64.b64encode(compressed).decode("ascii")
+    return [
+        encoded[offset : offset + admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS]
+        for offset in range(
+            0,
+            len(encoded),
+            admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS,
+        )
+    ]
+
+
+def _receipt_for_raw_bytes(
+    raw: bytes,
+    *,
+    check: int = lzma.CHECK_CRC64,
+    filters=None,
+) -> list[str]:
+    return _chunks_for_compressed_receipt(
+        lzma.compress(
+            raw,
+            format=lzma.FORMAT_XZ,
+            check=check,
+            filters=(
+                admission_module._RECEIPT_LZMA_FILTERS
+                if filters is None
+                else filters
+            ),
+        )
+    )
+
+
+def _forged_envelope_payload(envelope, payload):
+    forged = object.__new__(type(envelope))
+    for field_name in type(envelope).__dataclass_fields__:
+        object.__setattr__(forged, field_name, getattr(envelope, field_name))
+    object.__setattr__(forged, "payload", payload)
+    return forged
+
+
+def test_receipt_writer_rejects_raw_oversize_before_compression(monkeypatch):
+    monkeypatch.setattr(
+        admission_module,
+        "_canonical_json_bytes",
+        lambda _value: b"x" * (admission_module._MAX_PROTOCOL_RECEIPT_BYTES + 1),
+    )
+
+    def unexpected_compression(*_args, **_kwargs):
+        pytest.fail("oversized raw receipt reached compression")
+
+    monkeypatch.setattr(admission_module.lzma, "compress", unexpected_compression)
+
+    with pytest.raises(EconomicEvaluationAdmissionError, match="too large"):
+        admission_module._receipt_chunks({"oversized": True})
+
+
+def test_receipt_writer_rejects_compressed_output_outside_store_envelope(monkeypatch):
+    monkeypatch.setattr(
+        admission_module.lzma,
+        "compress",
+        lambda *_args, **_kwargs: b"x"
+        * (admission_module._MAX_RECEIPT_COMPRESSED_BYTES + 1),
+    )
+
+    with pytest.raises(EconomicEvaluationAdmissionError, match="too large"):
+        admission_module._receipt_chunks({"small": True})
+
+
+def test_receipt_writer_reuses_bounded_canonical_compression(monkeypatch):
+    admission_module._compressed_receipt_chunks.cache_clear()
+    compress = admission_module.lzma.compress
+    calls = []
+
+    def recording_compress(*args, **kwargs):
+        calls.append((args, kwargs))
+        return compress(*args, **kwargs)
+
+    monkeypatch.setattr(admission_module.lzma, "compress", recording_compress)
+    first = admission_module._receipt_chunks({"canonical": [1, 2, 3]})
+    second = admission_module._receipt_chunks({"canonical": [1, 2, 3]})
+
+    assert first == second
+    assert first is not second
+    assert len(calls) == 1
+    assert calls[0][1]["filters"] == admission_module._RECEIPT_LZMA_FILTERS
+
+
+def test_protocol_receipt_reuses_exact_frozen_protocol_identity(monkeypatch):
+    protocol = _protocol()
+    monkeypatch.setattr(admission_module, "_PROTOCOL_RECEIPT_CACHE", None)
+    chunks = admission_module._receipt_chunks
+    calls = []
+
+    def recording_chunks(value):
+        calls.append(value)
+        return chunks(value)
+
+    monkeypatch.setattr(admission_module, "_receipt_chunks", recording_chunks)
+    first = admission_module._protocol_receipt_chunks(protocol)
+    second = admission_module._protocol_receipt_chunks(protocol)
+
+    assert first == second
+    assert first is not second
+    assert calls == [protocol.to_dict()]
+
+
+def test_receipt_decoder_rejects_nonlist_count_size_and_rechunking():
+    valid = admission_module._receipt_chunks({"canonical": True})
+    encoded = "".join(valid)
+    invalid_receipts = (
+        tuple(valid),
+        ["A" * admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS]
+        * (admission_module._MAX_RECEIPT_CHUNKS + 1),
+        ["A" * admission_module._PROTOCOL_RECEIPT_CHUNK_CHARS]
+        * admission_module._MAX_RECEIPT_CHUNKS,
+        [encoded[:4], encoded[4:]],
+    )
+
+    for receipt in invalid_receipts:
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(receipt, label="test")
+
+
+def test_receipt_decoder_rejects_noncanonical_base64_and_lzma_profile():
+    noncanonical_base64 = "AB=="
+    assert base64.b64decode(noncanonical_base64) == base64.b64decode("AA==")
+
+    alternate_lzma = _receipt_for_raw_bytes(
+        admission_module._canonical_json_bytes({"canonical": True}),
+        check=lzma.CHECK_CRC32,
+    )
+
+    for receipt in ([noncanonical_base64], alternate_lzma):
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(receipt, label="test")
+
+
+def test_receipt_decoder_rejects_high_dictionary_before_output_allocation():
+    high_dictionary_filters = (
+        {
+            "id": lzma.FILTER_LZMA2,
+            "dict_size": 64 * 1024 * 1024,
+            "lc": 3,
+            "lp": 0,
+            "pb": 2,
+            "mode": lzma.MODE_FAST,
+            "nice_len": 32,
+            "mf": lzma.MF_HC3,
+            "depth": 4,
+        },
+    )
+    receipt = _receipt_for_raw_bytes(b'{"canonical":true}', filters=high_dictionary_filters)
+
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._receipt_value(receipt, label="test")
+
+
+def test_receipt_decoder_rejects_constants_and_excessive_json_depth():
+    malformed_values = (
+        b"NaN",
+        b"[" * 1_100 + b"0" + b"]" * 1_100,
+    )
+
+    for raw in malformed_values:
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(
+                _receipt_for_raw_bytes(raw),
+                label="test",
+            )
+
+
+def test_receipt_decoder_rejects_truncation_trailing_concatenation_and_output_limit(
+    monkeypatch,
+):
+    canonical = admission_module._receipt_chunks({"canonical": True})
+    compressed = base64.b64decode("".join(canonical), validate=True)
+    invalid_streams = (
+        compressed[:-1],
+        compressed + b"trailing",
+        compressed + compressed,
+    )
+    for stream in invalid_streams:
+        with pytest.raises(EconomicEvaluationAdmissionError):
+            admission_module._receipt_value(
+                _chunks_for_compressed_receipt(stream),
+                label="test",
+            )
+
+    raw = admission_module._canonical_json_bytes("x" * 100)
+    receipt = _receipt_for_raw_bytes(raw)
+    monkeypatch.setattr(admission_module, "_MAX_PROTOCOL_RECEIPT_BYTES", len(raw) - 1)
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._receipt_value(receipt, label="test")
+
+
+def test_persisted_protocol_and_validation_report_reads_reject_alternate_codec(tmp_path):
+    adapter = _adapter(tmp_path)
+    protocol, _partitions = _partitioned_protocol(tmp_path)
+    admitted = adapter.admit_protocol(
+        protocol,
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    forged_protocol_payload = admission_module._thaw_json(admitted.envelope.payload)
+    forged_protocol_payload["protocol"] = _receipt_for_raw_bytes(
+        protocol.canonical_json_bytes(),
+        check=lzma.CHECK_CRC32,
+    )
+    forged_protocol = _forged_envelope_payload(
+        admitted.envelope,
+        forged_protocol_payload,
+    )
+    _snapshot, events = adapter._store.verify_with_events()
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._admitted_protocol_from_envelope(
+            forged_protocol,
+            events=events,
+        )
+
+    forged_run_payload = {
+        "schema_version": admission_module.ECONOMIC_EVALUATION_RUN_SCHEMA,
+        "protocol_id": protocol.protocol_id,
+        "protocol_admission_object_id": admitted.envelope.object_id,
+        "phase": "validation",
+        "frozen_validation_report": _receipt_for_raw_bytes(
+            b'{"malformed":"alternate-codec"}',
+            check=lzma.CHECK_CRC32,
+        ),
+        "validation_report_sha256": "0" * 64,
+        "store_predecessor": {
+            "sequence": 1,
+            "object_id": admitted.envelope.object_id,
+            "event_sha256": "0" * 64,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    forged_run = _forged_envelope_payload(admitted.envelope, forged_run_payload)
+    object.__setattr__(
+        forged_run,
+        "kind",
+        admission_module.ECONOMIC_EVALUATION_RUN_KIND,
+    )
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._evaluation_run_from_envelope(
+            forged_run,
+            protocol=protocol,
+            protocol_admission_object_id=admitted.envelope.object_id,
+            events=events,
+        )
+
+
+def test_current_validation_report_mapping_cannot_bypass_receipt_codec():
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        admission_module._validation_report_receipt_value(
+            {
+                "schema_version": admission_module.ECONOMIC_VALIDATION_REPORT_SCHEMA,
+            },
+            label="test validation report",
+        )
+
+
 def test_admission_binds_complete_protocol_source_bytes_and_store_predecessor(tmp_path):
     protocol = _protocol()
     admission = _adapter(tmp_path).admit_protocol(
@@ -209,6 +417,15 @@ def test_admission_binds_complete_protocol_source_bytes_and_store_predecessor(tm
     assert admission.predecessor_event_sha256 == "0" * 64
     assert admission.envelope.kind == "economic-evaluation-protocol"
     assert admission.envelope.payload["source_revision"] == _source_revision(tmp_path)
+    assert admission.envelope.payload["cohort_id"] == protocol.cohort_id
+    assert admission.envelope.payload["cohort_sha256"] == protocol.cohort_sha256
+    assert admission.envelope.payload["partition_id"] == protocol.partition_id
+    assert admission.envelope.payload["partition_sha256"] == protocol.partition_sha256
+    assert lzma.decompress(
+        base64.b64decode(
+            "".join(admission.envelope.payload["protocol"]), validate=True
+        )
+    ) == protocol.canonical_json_bytes()
     assert admission.envelope.payload["analysis_only"] is True
     assert admission.envelope.payload["can_submit_orders"] is False
 
@@ -232,6 +449,92 @@ def test_same_admitted_protocol_is_idempotent_but_not_reissued(tmp_path):
     assert first.created is True
     assert second.created is False
     assert second.envelope.object_id == first.envelope.object_id
+
+
+def test_admission_rejects_same_manifest_rebound_to_a_different_cohort(tmp_path):
+    assert _PROTOCOL_SOURCE is not None
+    cohort, partitions, manifest = _PROTOCOL_SOURCE
+    adapter = _adapter(tmp_path)
+    adapter.admit_protocol(
+        _protocol(),
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+
+    symbol_overrides = {
+        99 - position: symbol
+        for position, symbol in enumerate(cohort.sensitivity_universe_100)
+    }
+    archive, calendar, payload = _source_cohort_fixture(
+        tmp_path / "different-cohort",
+        symbol_overrides=symbol_overrides,
+        archive_recorded_at=dt.datetime(2026, 3, 31, 20, 32, tzinfo=dt.UTC),
+    )
+    different_cohort = _build_from_fixture(archive, calendar, payload)
+    rebound = _protocol_from_receipts(different_cohort, partitions, manifest)
+    assert rebound.protocol_id != _protocol().protocol_id
+    assert rebound.primary_universe == _protocol().primary_universe
+
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        adapter.admit_protocol(
+            rebound,
+            source_revision=_source_revision(tmp_path),
+            effective_at=NOW,
+            source_paths=("evaluation.py",),
+        )
+
+
+def test_admission_rejects_same_manifest_rebound_to_a_different_partition(tmp_path):
+    assert _PROTOCOL_SOURCE is not None
+    cohort, partitions, manifest = _PROTOCOL_SOURCE
+    adapter = _adapter(tmp_path)
+    adapter.admit_protocol(
+        _protocol(),
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+
+    archive = RawPointInTimeArtifactArchive(
+        tmp_path / "different-partition-calendar",
+        clock=lambda: dt.datetime(2026, 4, 1, 12, 0, tzinfo=dt.UTC),
+    )
+    artifact = archive.admit(
+        raw_bytes=json.dumps(
+            [
+                {"close": "16:00", "date": day, "open": "09:30"}
+                for day in partitions.market_calendar.market_dates
+            ],
+            indent=1,
+        ).encode(),
+        source_uri="https://paper-api.alpaca.markets/v2/calendar",
+        content_type="application/json",
+        retrieved_at="2026-04-01T12:00:00+00:00",
+    )
+    different_calendar = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=artifact,
+    )
+    different_partitions = build_market_date_partitions(
+        market_calendar=different_calendar,
+        cadence=partitions.cadence,
+        registered_at=partitions.registered_at,
+        primary_universe=partitions.primary_universe,
+        decision_market_dates=partitions.decision_market_dates,
+        events=partitions.events,
+    )
+    rebound = _protocol_from_receipts(cohort, different_partitions, manifest)
+    assert rebound.protocol_id != _protocol().protocol_id
+    assert rebound.input_manifest_id == _protocol().input_manifest_id
+
+    with pytest.raises(EconomicEvaluationAdmissionError):
+        adapter.admit_protocol(
+            rebound,
+            source_revision=_source_revision(tmp_path),
+            effective_at=NOW,
+            source_paths=("evaluation.py",),
+        )
 
 
 def test_admission_rejects_changed_provenance_for_an_existing_protocol(tmp_path):
@@ -351,7 +654,24 @@ def test_admission_rejects_an_orphaned_economic_protocol_object(tmp_path):
         )
 
 
-def _validation_report(protocol, partitions):
+def _source_bound_tournament_input(protocol, partitions, tmp_path):
+    global _TOURNAMENT_INPUT_CACHE
+    assert _TOURNAMENT_ROOT is not None
+    if _TOURNAMENT_INPUT_CACHE is not None:
+        return _TOURNAMENT_INPUT_CACHE
+    eligibility = bind_validation_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+    )
+    _TOURNAMENT_INPUT_CACHE, _archive = build_tournament_receipt(
+        _TOURNAMENT_ROOT,
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+    return _TOURNAMENT_INPUT_CACHE
+
+
+def _validation_report(protocol, partitions, tmp_path):
     eligibility = bind_validation_phase_eligibility(
         protocol=protocol,
         partitions=partitions,
@@ -381,14 +701,19 @@ def _validation_report(protocol, partitions):
             )
         },
     )
+    tournament_input = _source_bound_tournament_input(protocol, partitions, tmp_path)
     return {
-        "schema_version": "economic_validation_report/v2",
+        "schema_version": "economic_validation_report/v3",
         "protocol_id": protocol.protocol_id,
         "market_date_partitions": partitions.to_dict(),
         "validation_event_ids": list(eligibility.event_ids),
         "result": result.to_dict(),
         "result_id": result.result_id,
         "result_sha256": result.result_sha256,
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
         "analysis_only": True,
         "execution_authority": "none",
         "can_submit_orders": False,
@@ -494,7 +819,7 @@ def _append_legacy_validation_run_and_holdout_release(adapter, protocol, report)
 
 def test_validation_result_is_complete_canonical_and_alias_resistant(tmp_path):
     protocol, partitions = _partitioned_protocol(tmp_path)
-    result = _validation_report(protocol, partitions)["result"]
+    result = _validation_report(protocol, partitions, tmp_path)["result"]
     parsed = validate_economic_validation_result(json.loads(json.dumps(result)))
 
     assert parsed.protocol_id == protocol.protocol_id
@@ -553,6 +878,7 @@ def test_legacy_result_and_report_remain_readable_but_are_nonqualifying(tmp_path
             phase="validation",
             effective_at=NOW,
             frozen_validation_report=report,
+            pit_artifact_root=_tournament_artifact_root(),
         )
 
 
@@ -598,14 +924,16 @@ def test_holdout_release_requires_admitted_protocol_and_freezes_validation_repor
         protocol.protocol_id,
         phase="validation",
         effective_at=NOW,
-        frozen_validation_report=_validation_report(protocol, partitions),
+        frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=_source_bound_tournament_input(protocol, partitions, tmp_path),
     )
 
     release = adapter.release_holdout(
         protocol.protocol_id,
         released_by="owner-corbin",
         released_at=NOW,
-        frozen_validation_report=_validation_report(protocol, partitions),
+        frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
     )
 
     assert release.created is True
@@ -628,12 +956,14 @@ def test_holdout_release_is_idempotent_only_for_the_same_frozen_report(tmp_path)
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
-    report = _validation_report(protocol, partitions)
+    report = _validation_report(protocol, partitions, tmp_path)
     adapter.admit_evaluation_run(
         protocol.protocol_id,
         phase="validation",
         effective_at=NOW,
         frozen_validation_report=report,
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=_source_bound_tournament_input(protocol, partitions, tmp_path),
     )
     first = adapter.release_holdout(
         protocol.protocol_id,
@@ -671,7 +1001,7 @@ def test_holdout_release_rejects_missing_protocol_and_report_not_bound_to_valida
             protocol.protocol_id,
             released_by="owner-corbin",
             released_at=NOW,
-            frozen_validation_report=_validation_report(protocol, partitions),
+            frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
         )
 
     adapter.admit_protocol(
@@ -680,7 +1010,7 @@ def test_holdout_release_rejects_missing_protocol_and_report_not_bound_to_valida
         effective_at=NOW,
         source_paths=("evaluation.py",),
     )
-    report = _validation_report(protocol, partitions)
+    report = _validation_report(protocol, partitions, tmp_path)
     report["validation_event_ids"] = []
     with pytest.raises(EconomicEvaluationAdmissionError):
         adapter.release_holdout(
@@ -708,7 +1038,7 @@ def test_holdout_release_rejects_a_report_without_an_immutable_validation_run(
             protocol.protocol_id,
             released_by="owner-corbin",
             released_at=NOW,
-            frozen_validation_report=_validation_report(protocol, partitions),
+            frozen_validation_report=_validation_report(protocol, partitions, tmp_path),
         )
 
 
@@ -732,12 +1062,14 @@ def test_readiness_status_and_validation_report_are_read_only_and_protocol_bound
     assert admitted.state == "validation_not_admitted"
     assert admitted.protocol_admission_object_id == protocol_admission.envelope.object_id
 
-    report = _validation_report(protocol, partitions)
+    report = _validation_report(protocol, partitions, tmp_path)
     run = adapter.admit_evaluation_run(
         protocol.protocol_id,
         phase="validation",
         effective_at=NOW,
         frozen_validation_report=report,
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=_source_bound_tournament_input(protocol, partitions, tmp_path),
     )
     sealed = adapter.readiness_status(protocol.protocol_id)
     assert sealed.state == "holdout_sealed"
@@ -753,6 +1085,172 @@ def test_readiness_status_and_validation_report_are_read_only_and_protocol_bound
     released = adapter.readiness_status(protocol.protocol_id)
     assert released.state == "holdout_released_analysis_only"
     assert released.holdout_release_object_id == release.envelope.object_id
+
+
+def test_development_admission_reopens_its_exact_phase_bound_receipt(tmp_path, monkeypatch):
+    adapter = _adapter(tmp_path)
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    adapter.admit_protocol(
+        protocol,
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    eligibility = bind_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+        phase="development",
+    )
+    tournament_input, archive = build_tournament_receipt(
+        tmp_path / "development-tournament-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+    event_count = str(len(eligibility.event_ids))
+    result = build_phase_evaluation_result(
+        protocol,
+        eligibility=eligibility,
+        arm_metrics={
+            arm_id: {
+                "net_return_after_costs": "0",
+                "benchmark_excess_after_costs": "0",
+                "max_drawdown": "0",
+                "turnover": "0",
+                "false_positive_rate": "0",
+                "decision_event_count": event_count,
+                "packet_event_cluster_count": event_count,
+                "market_event_cluster_count": event_count,
+                "cost_per_useful_decision": "0",
+            }
+            for arm_id in ("cash", "spy", "equal_weight", "momentum_quality", "pullback_support")
+        },
+    )
+    report = {
+        "schema_version": admission_module.ECONOMIC_PHASE_REPORT_SCHEMA,
+        "protocol_id": protocol.protocol_id,
+        "phase": "development",
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(eligibility.event_ids),
+        "result": result.to_dict(),
+        "result_id": result.result_id,
+        "result_sha256": result.result_sha256,
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+
+    run = adapter.admit_evaluation_run(
+        protocol.protocol_id,
+        phase="development",
+        effective_at=NOW,
+        frozen_validation_report=report,
+        pit_artifact_root=archive.root,
+        tournament_input=tournament_input,
+    )
+
+    readiness = adapter.readiness_status(protocol.protocol_id)
+    assert run.phase == "development"
+    assert readiness.development_run_object_id == run.envelope.object_id
+    assert readiness.validation_run_object_id is None
+    assert readiness.state == "development_completed_analysis_only"
+
+    def missing_custody(**_kwargs):
+        raise FileNotFoundError("retained development source is missing")
+
+    monkeypatch.setattr(adapter._tournament_archive, "reopen", missing_custody)
+    with pytest.raises(EconomicEvaluationAdmissionError, match="custody"):
+        adapter.readiness_status(protocol.protocol_id)
+
+
+def test_released_holdout_admission_reopens_its_exact_phase_bound_receipt(tmp_path):
+    adapter = _adapter(tmp_path)
+    protocol, partitions = _partitioned_protocol(tmp_path)
+    adapter.admit_protocol(
+        protocol,
+        source_revision=_source_revision(tmp_path),
+        effective_at=NOW,
+        source_paths=("evaluation.py",),
+    )
+    validation_input = _source_bound_tournament_input(protocol, partitions, tmp_path)
+    validation_report = _validation_report(protocol, partitions, tmp_path)
+    adapter.admit_evaluation_run(
+        protocol.protocol_id,
+        phase="validation",
+        effective_at=NOW,
+        frozen_validation_report=validation_report,
+        pit_artifact_root=_tournament_artifact_root(),
+        tournament_input=validation_input,
+    )
+    adapter.release_holdout(
+        protocol.protocol_id,
+        released_by="owner-corbin",
+        released_at=NOW,
+        frozen_validation_report=validation_report,
+    )
+    eligibility = bind_phase_eligibility(
+        protocol=protocol,
+        partitions=partitions,
+        phase="holdout",
+    )
+    tournament_input, archive = build_tournament_receipt(
+        tmp_path / "holdout-tournament-pit",
+        protocol=protocol,
+        eligibility=eligibility,
+    )
+    event_count = str(len(eligibility.event_ids))
+    result = build_phase_evaluation_result(
+        protocol,
+        eligibility=eligibility,
+        arm_metrics={
+            arm_id: {
+                "net_return_after_costs": "0",
+                "benchmark_excess_after_costs": "0",
+                "max_drawdown": "0",
+                "turnover": "0",
+                "false_positive_rate": "0",
+                "decision_event_count": event_count,
+                "packet_event_cluster_count": event_count,
+                "market_event_cluster_count": event_count,
+                "cost_per_useful_decision": "0",
+            }
+            for arm_id in ("cash", "spy", "equal_weight", "momentum_quality", "pullback_support")
+        },
+    )
+    report = {
+        "schema_version": admission_module.ECONOMIC_PHASE_REPORT_SCHEMA,
+        "protocol_id": protocol.protocol_id,
+        "phase": "holdout",
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(eligibility.event_ids),
+        "result": result.to_dict(),
+        "result_id": result.result_id,
+        "result_sha256": result.result_sha256,
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+
+    run = adapter.admit_evaluation_run(
+        protocol.protocol_id,
+        phase="holdout",
+        effective_at=NOW,
+        frozen_validation_report=report,
+        pit_artifact_root=archive.root,
+        tournament_input=tournament_input,
+    )
+
+    readiness = adapter.readiness_status(protocol.protocol_id)
+    assert run.phase == "holdout"
+    assert readiness.state == "holdout_completed_analysis_only"
+    assert readiness.holdout_run_object_id == run.envelope.object_id
 
 
 @pytest.mark.parametrize(

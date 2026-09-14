@@ -3,27 +3,50 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import hashlib
 import json
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from tradingagents.dataflows.pit.market_calendar import (
     MarketSessionCalendar,
     validate_market_session_calendar,
 )
 from tradingagents.dataflows.pit.records import PointInTimeDataError
-from tradingagents.evals.economic_evaluation_protocol import (
-    DecisionEvent,
-    validate_decision_event,
-)
+
+if TYPE_CHECKING:
+    from tradingagents.evals.economic_evaluation_protocol import DecisionEvent
 
 _AUTHORITY = {
     "analysis_only": True,
     "execution_authority": "none",
     "can_submit_orders": False,
 }
-_SCHEMA = "market_date_partitions/v1"
+_SCHEMA = "market_date_partitions/v2"
 _PURGE_SESSIONS = 5
+_CADENCE = "weekly"
+_PRIMARY_UNIVERSE_SIZE = 75
+_PROTOCOL_CONTRACTS: tuple[object, object, object] | None = None
+
+
+def _protocol_contracts() -> tuple[object, object, object]:
+    """Bind protocol contracts only after PIT package initialization completes."""
+
+    global _PROTOCOL_CONTRACTS
+    if _PROTOCOL_CONTRACTS is None:
+        from tradingagents.evals.economic_evaluation_protocol import (
+            DecisionEvent,
+            canonical_universe_id,
+            validate_decision_event,
+        )
+
+        _PROTOCOL_CONTRACTS = (
+            DecisionEvent,
+            canonical_universe_id,
+            validate_decision_event,
+        )
+    return _PROTOCOL_CONTRACTS
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -57,7 +80,11 @@ class MarketDatePartitions:
     partition_id: str
     partition_sha256: str
     market_calendar: MarketSessionCalendar
-    market_dates: tuple[str, ...]
+    cadence: str
+    registered_at: str
+    primary_universe: tuple[str, ...]
+    primary_universe_id: str
+    decision_market_dates: tuple[str, ...]
     events: tuple[DecisionEvent, ...]
     development_market_dates: tuple[str, ...]
     validation_market_dates: tuple[str, ...]
@@ -86,7 +113,11 @@ class MarketDatePartitions:
             "partition_id": self.partition_id,
             "partition_sha256": self.partition_sha256,
             "market_calendar": self.market_calendar.to_dict(),
-            "market_dates": list(self.market_dates),
+            "cadence": self.cadence,
+            "registered_at": self.registered_at,
+            "primary_universe": list(self.primary_universe),
+            "primary_universe_id": self.primary_universe_id,
+            "decision_market_dates": list(self.decision_market_dates),
             "events": [event.to_dict() for event in self.events],
             "development_market_dates": list(self.development_market_dates),
             "validation_market_dates": list(self.validation_market_dates),
@@ -142,23 +173,146 @@ def _new_partitions(**fields: object) -> MarketDatePartitions:
     return partitions
 
 
-def _canonical_events(value: object, *, market_dates: tuple[str, ...]) -> tuple[DecisionEvent, ...]:
+def _canonical_timestamp(value: object, *, label: str) -> tuple[str, dt.datetime]:
+    if type(value) is not str:
+        raise PointInTimeDataError(f"{label} must use canonical UTC seconds")
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise PointInTimeDataError(f"{label} must use canonical UTC seconds") from exc
+    if parsed.tzinfo != dt.UTC or parsed.isoformat(timespec="seconds") != value:
+        raise PointInTimeDataError(f"{label} must use canonical UTC seconds")
+    return value, parsed
+
+
+def _weekly_decision_dates(
+    value: object,
+    *,
+    market_dates: tuple[str, ...],
+) -> tuple[str, ...]:
+    if type(value) is not tuple or not value:
+        raise PointInTimeDataError("decision_market_dates must be a nonempty exact tuple")
+    known_market_dates = frozenset(market_dates)
+    parsed_dates: list[dt.date] = []
+    for index, raw_date in enumerate(value):
+        if type(raw_date) is not str:
+            raise PointInTimeDataError(
+                f"decision_market_dates[{index}] must be an ISO market date"
+            )
+        try:
+            parsed = dt.date.fromisoformat(raw_date)
+        except ValueError as exc:
+            raise PointInTimeDataError(
+                f"decision_market_dates[{index}] must be an ISO market date"
+            ) from exc
+        if parsed.isoformat() != raw_date or raw_date not in known_market_dates:
+            raise PointInTimeDataError(
+                "every decision market date must be registered in the source calendar"
+            )
+        parsed_dates.append(parsed)
+    dates = tuple(item.isoformat() for item in parsed_dates)
+    if dates != tuple(sorted(dates)) or len(set(dates)) != len(dates):
+        raise PointInTimeDataError(
+            "decision market dates must be unique and chronological"
+        )
+
+    sessions_by_week: dict[tuple[int, int], list[str]] = {}
+    for market_date in market_dates:
+        session = dt.date.fromisoformat(market_date)
+        iso = session.isocalendar()
+        sessions_by_week.setdefault((iso.year, iso.week), []).append(market_date)
+    previous_week_start: dt.date | None = None
+    for parsed, market_date in zip(parsed_dates, dates, strict=True):
+        iso = parsed.isocalendar()
+        week_key = (iso.year, iso.week)
+        if market_date != sessions_by_week[week_key][-1]:
+            raise PointInTimeDataError(
+                "weekly decision dates must be the final registered market session of each week"
+            )
+        week_start = parsed - dt.timedelta(days=parsed.weekday())
+        if (
+            previous_week_start is not None
+            and week_start - previous_week_start != dt.timedelta(days=7)
+        ):
+            raise PointInTimeDataError(
+                "weekly decision dates must cover consecutive source-calendar weeks"
+            )
+        previous_week_start = week_start
+    return dates
+
+
+def _canonical_primary_universe(value: object) -> tuple[tuple[str, ...], str]:
+    _, canonical_universe_id, _ = _protocol_contracts()
+
+    if type(value) is not tuple or len(value) != _PRIMARY_UNIVERSE_SIZE:
+        raise PointInTimeDataError("primary_universe must be an exact 75-symbol tuple")
+    try:
+        universe_id = canonical_universe_id(value)
+    except (TypeError, ValueError) as exc:
+        raise PointInTimeDataError("primary_universe is invalid") from exc
+    return value, universe_id
+
+
+def _canonical_events(
+    value: object,
+    *,
+    decision_market_dates: tuple[str, ...],
+    primary_universe: tuple[str, ...],
+    primary_universe_id: str,
+    registered_at: dt.datetime,
+) -> tuple[DecisionEvent, ...]:
+    DecisionEvent, _, validate_decision_event = _protocol_contracts()
+
     if type(value) is not tuple or not value:
         raise PointInTimeDataError("events must be a nonempty exact tuple")
     validated: list[DecisionEvent] = []
     event_ids: set[str] = set()
-    known_dates = set(market_dates)
+    known_dates = set(decision_market_dates)
+    events_by_date: dict[str, list[DecisionEvent]] = {
+        market_date: [] for market_date in decision_market_dates
+    }
     for index, event in enumerate(value):
         if type(event) is not DecisionEvent:
             raise PointInTimeDataError(f"events[{index}] must be a DecisionEvent")
         parsed = validate_decision_event(event.to_dict())
         if parsed.market_date not in known_dates:
-            raise PointInTimeDataError("event market_date is not in the calendar")
+            raise PointInTimeDataError("event market_date is not a registered decision date")
         if parsed.decision_event_id in event_ids:
             raise PointInTimeDataError("events must not duplicate decision_event_id")
+        if parsed.universe_id != primary_universe_id:
+            raise PointInTimeDataError(
+                "every event must use the registered primary universe identity"
+            )
+        if parsed.symbol not in primary_universe:
+            raise PointInTimeDataError(
+                "every event symbol must belong to the registered primary universe"
+            )
+        if dt.datetime.fromisoformat(parsed.decision_at) <= registered_at:
+            raise PointInTimeDataError(
+                "decision dates must be registered before their decision events"
+            )
         event_ids.add(parsed.decision_event_id)
         validated.append(parsed)
-    return tuple(sorted(validated, key=lambda event: event.decision_event_id))
+        events_by_date[parsed.market_date].append(parsed)
+    expected_symbols = set(primary_universe)
+    for market_date, date_events in events_by_date.items():
+        symbols = [event.symbol for event in date_events]
+        if len(date_events) != _PRIMARY_UNIVERSE_SIZE or set(symbols) != expected_symbols:
+            raise PointInTimeDataError(
+                f"decision date {market_date} must contain exactly one event "
+                "for each primary symbol"
+            )
+        if len(symbols) != len(set(symbols)):
+            raise PointInTimeDataError(
+                f"decision date {market_date} must not duplicate a primary symbol"
+            )
+    if len(validated) != len(decision_market_dates) * _PRIMARY_UNIVERSE_SIZE:
+        raise PointInTimeDataError(
+            "events must exhaust the 75-symbol primary universe on every decision date"
+        )
+    return tuple(
+        sorted(validated, key=lambda event: (event.market_date, event.decision_event_id))
+    )
 
 
 def _event_ids_for_dates(
@@ -174,21 +328,50 @@ def _event_ids_for_dates(
 def build_market_date_partitions(
     *,
     market_calendar: MarketSessionCalendar,
+    cadence: str,
+    registered_at: str,
+    primary_universe: tuple[str, ...],
+    decision_market_dates: tuple[str, ...],
     events: tuple[DecisionEvent, ...],
 ) -> MarketDatePartitions:
-    """Split one source-backed market calendar and enforce boundary masks."""
+    """Split preregistered weekly decisions and enforce boundary masks."""
 
     if type(market_calendar) is not MarketSessionCalendar:
         raise PointInTimeDataError("market_calendar must be an exact MarketSessionCalendar")
+    if cadence != _CADENCE or type(cadence) is not str:
+        raise PointInTimeDataError("cadence is fixed to 'weekly'")
     calendar = validate_market_session_calendar(market_calendar.to_dict())
-    dates = calendar.market_dates
-    validated_events = _canonical_events(events, market_dates=dates)
+    registration_text, registration = _canonical_timestamp(
+        registered_at,
+        label="registered_at",
+    )
+    primary, primary_id = _canonical_primary_universe(primary_universe)
+    dates = _weekly_decision_dates(
+        decision_market_dates,
+        market_dates=calendar.market_dates,
+    )
+    validated_events = _canonical_events(
+        events,
+        decision_market_dates=dates,
+        primary_universe=primary,
+        primary_universe_id=primary_id,
+        registered_at=registration,
+    )
     total = len(dates)
     development_end = total * 60 // 100
     validation_end = development_end + total * 20 // 100
     development_dates = dates[:development_end]
     validation_dates = dates[development_end:validation_end]
     holdout_dates = dates[validation_end:]
+    if not (
+        development_dates
+        and validation_dates
+        and holdout_dates
+        and development_dates[-1] < validation_dates[0] < holdout_dates[0]
+    ):
+        raise PointInTimeDataError(
+            "partitions must be nonempty, chronological, and future-leak free"
+        )
     if (
         len(development_dates) <= _PURGE_SESSIONS
         or len(validation_dates) <= _PURGE_SESSIONS * 2
@@ -246,7 +429,11 @@ def build_market_date_partitions(
         raise PointInTimeDataError("each partition must retain an eligible decision event")
     fields: dict[str, object] = {
         "market_calendar": calendar,
-        "market_dates": dates,
+        "cadence": _CADENCE,
+        "registered_at": registration_text,
+        "primary_universe": primary,
+        "primary_universe_id": primary_id,
+        "decision_market_dates": dates,
         "events": validated_events,
         "development_market_dates": development_dates,
         "validation_market_dates": validation_dates,
@@ -269,7 +456,11 @@ def build_market_date_partitions(
     identity = {
         "schema_version": _SCHEMA,
         "market_calendar": calendar.to_dict(),
-        "market_dates": list(dates),
+        "cadence": _CADENCE,
+        "registered_at": registration_text,
+        "primary_universe": list(primary),
+        "primary_universe_id": primary_id,
+        "decision_market_dates": list(dates),
         "events": [event.to_dict() for event in validated_events],
         "development_market_dates": list(development_dates),
         "validation_market_dates": list(validation_dates),
@@ -315,6 +506,8 @@ def build_market_date_partitions(
 def validate_market_date_partitions(value: object) -> MarketDatePartitions:
     """Rebuild full market-date partitions from source-bound decision events."""
 
+    _, _, validate_decision_event = _protocol_contracts()
+
     if not isinstance(value, Mapping) or set(value) != _SERIALIZED_FIELDS:
         raise PointInTimeDataError("market-date partition fields are invalid")
     payload = dict(value)
@@ -322,16 +515,19 @@ def validate_market_date_partitions(value: object) -> MarketDatePartitions:
         raise PointInTimeDataError("market-date partition schema is invalid")
     _authority(payload, label="market-date partitions")
     if (
-        type(payload["market_dates"]) is not list
+        type(payload["decision_market_dates"]) is not list
+        or type(payload["primary_universe"]) is not list
         or type(payload["events"]) is not list
         or not isinstance(payload["market_calendar"], Mapping)
     ):
         raise PointInTimeDataError("market-date partition source material is invalid")
     calendar = validate_market_session_calendar(payload["market_calendar"])
-    if tuple(payload["market_dates"]) != calendar.market_dates:
-        raise PointInTimeDataError("partition market dates do not match market calendar")
     rebuilt = build_market_date_partitions(
         market_calendar=calendar,
+        cadence=payload["cadence"],  # type: ignore[arg-type]
+        registered_at=payload["registered_at"],  # type: ignore[arg-type]
+        primary_universe=tuple(payload["primary_universe"]),  # type: ignore[arg-type]
+        decision_market_dates=tuple(payload["decision_market_dates"]),  # type: ignore[arg-type]
         events=tuple(validate_decision_event(event) for event in payload["events"]),
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(payload):

@@ -14,8 +14,10 @@ import json
 import math
 import re
 from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import Any
+from zoneinfo import ZoneInfo
 
 _UTC = dt.timezone.utc
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -24,6 +26,21 @@ _SYMBOL = re.compile(r"[A-Z][A-Z0-9.-]{0,14}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,255}")
 _FIGI = re.compile(r"[A-Z0-9]{12}")
 _EXCHANGE = re.compile(r"[A-Z0-9_-]{1,32}")
+_SESSION_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:00")
+_MARKET_FEEDS = frozenset({"iex", "sip"})
+_ADJUSTMENT_MODES = {
+    "raw": "unadjusted",
+    "split": "split_adjusted",
+    "all": "total_return_adjusted",
+}
+_ALPACA_TIMEFRAME_SECONDS = {
+    "1Min": 60,
+    "5Min": 300,
+    "15Min": 900,
+    "30Min": 1_800,
+    "1Hour": 3_600,
+}
+_MARKET_TZ = ZoneInfo("America/New_York")
 _AUTHORITY = {
     "analysis_only": True,
     "execution_authority": "none",
@@ -122,6 +139,224 @@ def _source_hashes(value: object) -> MappingProxyType:
     for name, digest in frozen.items():
         _identifier(name, field_name="source_hashes key")
         _digest(digest, field_name=f"source_hashes.{name}")
+    return frozen
+
+
+def _validate_json_paths(
+    paths: object,
+    *,
+    expected_roles: frozenset[str] | None,
+) -> None:
+    if not isinstance(paths, MappingProxyType) or not paths:
+        raise PointInTimeDataError("source_span.paths must be a nonempty mapping")
+    if expected_roles is not None and set(paths) != expected_roles:
+        raise PointInTimeDataError("source_span.paths roles are invalid for source_kind")
+    for label, path in paths.items():
+        _identifier(label, field_name="source_span.paths key")
+        if type(path) is not tuple or not path:
+            raise PointInTimeDataError(f"source_span.paths.{label} must be a nonempty JSON path")
+        for component in path:
+            if type(component) is str and component:
+                continue
+            if type(component) is int and component >= 0:
+                continue
+            raise PointInTimeDataError(
+                f"source_span.paths.{label} contains an invalid JSON path component"
+            )
+
+
+def _validate_alpaca_derivation(
+    frozen: MappingProxyType,
+    *,
+    event_time: dt.datetime,
+    publication_time: dt.datetime,
+) -> None:
+    _identifier(
+        frozen["market_calendar_id"],
+        field_name="source_span.market_calendar_id",
+    )
+    _digest(
+        frozen["market_calendar_sha256"],
+        field_name="source_span.market_calendar_sha256",
+    )
+    timeframe = frozen["timeframe"]
+    if type(timeframe) is not str or timeframe not in {
+        *_ALPACA_TIMEFRAME_SECONDS,
+        "1Day",
+    }:
+        raise PointInTimeDataError("source_span.timeframe is not supported")
+    derivation = frozen["publication_derivation"]
+    expected_fields = frozenset(
+        {
+            "method",
+            "completion_time",
+            "market_timezone",
+            "regular_session_open",
+            "regular_session_close",
+            "bar_duration_seconds",
+            "calendar_raw_artifact_id",
+            "calendar_raw_artifact_sha256",
+            "calendar_date_path",
+            "calendar_open_path",
+            "calendar_close_path",
+        }
+    )
+    if not isinstance(derivation, MappingProxyType) or set(derivation) != expected_fields:
+        raise PointInTimeDataError("source_span publication derivation fields are invalid")
+    if derivation["market_timezone"] != "America/New_York":
+        raise PointInTimeDataError("source_span publication derivation session is invalid")
+    calendar_artifact_id = _identifier(
+        derivation["calendar_raw_artifact_id"],
+        field_name="source_span.publication_derivation.calendar_raw_artifact_id",
+    )
+    if not calendar_artifact_id.startswith("pit-raw-artifact-"):
+        raise PointInTimeDataError("calendar raw artifact identity is invalid")
+    _digest(
+        derivation["calendar_raw_artifact_sha256"],
+        field_name="source_span.publication_derivation.calendar_raw_artifact_sha256",
+    )
+    row_indexes: set[int] = set()
+    for field_name, source_field in (
+        ("calendar_date_path", "date"),
+        ("calendar_open_path", "open"),
+        ("calendar_close_path", "close"),
+    ):
+        path = derivation[field_name]
+        if (
+            type(path) is not tuple
+            or len(path) != 2
+            or type(path[0]) is not int
+            or path[0] < 0
+            or path[1] != source_field
+        ):
+            raise PointInTimeDataError(
+                f"source_span.publication_derivation.{field_name} is invalid"
+            )
+        row_indexes.add(path[0])
+    if len(row_indexes) != 1:
+        raise PointInTimeDataError("calendar session paths must select one source row")
+    source_open = derivation["regular_session_open"]
+    source_close = derivation["regular_session_close"]
+    if (
+        type(source_open) is not str
+        or _SESSION_TIME.fullmatch(source_open) is None
+        or type(source_close) is not str
+        or _SESSION_TIME.fullmatch(source_close) is None
+    ):
+        raise PointInTimeDataError("source-derived regular session hours are invalid")
+    regular_open = dt.time.fromisoformat(source_open)
+    regular_close = dt.time.fromisoformat(source_close)
+    if regular_open >= regular_close:
+        raise PointInTimeDataError("source-derived session open must precede close")
+
+    local_event = event_time.astimezone(_MARKET_TZ)
+    local_date = local_event.date()
+    local_time = local_event.timetz().replace(tzinfo=None)
+    if timeframe == "1Day":
+        if (
+            local_time != dt.time(0, 0)
+            or derivation["method"] != "registered_regular_session_close"
+            or derivation["bar_duration_seconds"] is not None
+        ):
+            raise PointInTimeDataError("daily publication derivation is invalid")
+        expected_publication = dt.datetime.combine(
+            local_date,
+            regular_close,
+            tzinfo=_MARKET_TZ,
+        ).astimezone(_UTC)
+    else:
+        duration = _ALPACA_TIMEFRAME_SECONDS[timeframe]
+        if (
+            derivation["method"] != "bar_start_plus_timeframe"
+            or derivation["bar_duration_seconds"] != duration
+            or not (regular_open <= local_time < regular_close)
+        ):
+            raise PointInTimeDataError("intraday publication derivation is invalid")
+        expected_publication = event_time + dt.timedelta(seconds=duration)
+        local_completion = expected_publication.astimezone(_MARKET_TZ)
+        if (
+            local_completion.date() != local_date
+            or local_completion.timetz().replace(tzinfo=None) > regular_close
+        ):
+            raise PointInTimeDataError("intraday bar overruns the regular session")
+
+    completion = _timestamp(
+        derivation["completion_time"],
+        field_name="source_span.publication_derivation.completion_time",
+    )
+    if completion != expected_publication or publication_time != expected_publication:
+        raise PointInTimeDataError("publication time does not match its bound derivation")
+
+
+def _source_span(
+    value: object,
+    *,
+    raw_artifact_sha256: str,
+    event_time: dt.datetime,
+    publication_time: dt.datetime,
+    is_market: bool,
+) -> MappingProxyType:
+    frozen = _freeze_json(value, field_name="source_span")
+    if not isinstance(frozen, MappingProxyType):
+        raise PointInTimeDataError("source_span must be a nonempty mapping")
+    common_fields = frozenset({"source_kind", "span_type", "source_sha256"})
+    if not common_fields.issubset(frozen):
+        raise PointInTimeDataError("source_span lacks canonical source binding fields")
+    _identifier(frozen["source_kind"], field_name="source_span.source_kind")
+    span_digest = _digest(
+        frozen["source_sha256"],
+        field_name="source_span.source_sha256",
+    )
+    if span_digest != raw_artifact_sha256:
+        raise PointInTimeDataError("source_span is not bound to raw_artifact_sha256")
+
+    span_type = frozen["span_type"]
+    if span_type == "byte_range":
+        if frozen["source_kind"] in {"sec_json_xbrl", "alpaca_market_data"}:
+            raise PointInTimeDataError(
+                "official observation source_kind requires exact JSON paths"
+            )
+        expected = common_fields | frozenset({"start_byte", "end_byte"})
+        if set(frozen) != expected:
+            raise PointInTimeDataError("byte-range source_span fields are invalid")
+        start = frozen["start_byte"]
+        end = frozen["end_byte"]
+        if type(start) is not int or type(end) is not int or start < 0 or end <= start:
+            raise PointInTimeDataError("byte-range source_span bounds are invalid")
+        return frozen
+
+    if span_type != "json_paths":
+        raise PointInTimeDataError("source_span must be an exact byte range or JSON path set")
+    source_kind = frozen["source_kind"]
+    if source_kind == "sec_json_xbrl":
+        if is_market or set(frozen) != common_fields | {"paths"}:
+            raise PointInTimeDataError("SEC source_span fields are invalid")
+        expected_roles = frozenset(
+            {"source_identity", "observed_value", "event_time", "publication_time"}
+        )
+    elif source_kind == "alpaca_market_data":
+        expected = common_fields | frozenset(
+            {
+                "paths",
+                "market_calendar_id",
+                "market_calendar_sha256",
+                "timeframe",
+                "publication_derivation",
+            }
+        )
+        if not is_market or set(frozen) != expected:
+            raise PointInTimeDataError("Alpaca source_span fields are invalid")
+        expected_roles = frozenset({"observed_value", "event_time"})
+        _validate_alpaca_derivation(
+            frozen,
+            event_time=event_time,
+            publication_time=publication_time,
+        )
+    else:
+        if set(frozen) != common_fields | {"paths"}:
+            raise PointInTimeDataError("JSON-path source_span fields are invalid")
+        expected_roles = None
+    _validate_json_paths(frozen["paths"], expected_roles=expected_roles)
     return frozen
 
 
@@ -247,29 +482,56 @@ class PointInTimeObservation:
     """One raw-artifact observation with event, publication, and availability times."""
 
     security_id: str
+    identity_effective_from: str
+    identity_effective_to: str | None
     event_time: str
     publication_time: str
     availability_time: str
     retrieval_time: str
     raw_artifact_id: str
     raw_artifact_sha256: str
+    observed_value: object
+    market_data_feed: str | None
+    adjustment_mode: str | None
+    market_session: str | None
+    session_date: str | None
     adjustment_status: str
     source_span: Mapping[str, object]
-    schema_version: str = dataclasses.field(init=False, default="point_in_time_observation/v1")
+    schema_version: str = dataclasses.field(init=False, default="point_in_time_observation/v2")
     analysis_only: bool = dataclasses.field(init=False, default=True)
     execution_authority: str = dataclasses.field(init=False, default="none")
     can_submit_orders: bool = dataclasses.field(init=False, default=False)
 
     def __post_init__(self) -> None:
         _identifier(self.security_id, field_name="security_id")
+        identity_start = _date(
+            self.identity_effective_from,
+            field_name="identity_effective_from",
+        )
+        identity_end = (
+            None
+            if self.identity_effective_to is None
+            else _date(self.identity_effective_to, field_name="identity_effective_to")
+        )
+        if identity_end is not None and identity_end < identity_start:
+            raise PointInTimeDataError(
+                "identity_effective_to cannot precede identity_effective_from"
+            )
         event = _timestamp(self.event_time, field_name="event_time")
         publication = _timestamp(self.publication_time, field_name="publication_time")
         availability = _timestamp(self.availability_time, field_name="availability_time")
         retrieval = _timestamp(self.retrieval_time, field_name="retrieval_time")
         if event > publication or publication > availability or availability > retrieval:
             raise PointInTimeDataError("observation times must be event <= publication <= availability <= retrieval")
+        if event.date() < identity_start or (
+            identity_end is not None and event.date() > identity_end
+        ):
+            raise PointInTimeDataError("observation event is outside the bound security identity")
         _identifier(self.raw_artifact_id, field_name="raw_artifact_id")
-        _digest(self.raw_artifact_sha256, field_name="raw_artifact_sha256")
+        raw_digest = _digest(
+            self.raw_artifact_sha256,
+            field_name="raw_artifact_sha256",
+        )
         if self.adjustment_status not in {
             "unadjusted",
             "split_adjusted",
@@ -277,21 +539,73 @@ class PointInTimeObservation:
             "corporate_action_adjusted",
         }:
             raise PointInTimeDataError("adjustment_status is not recognized")
-        frozen = _freeze_json(self.source_span, field_name="source_span")
-        if not isinstance(frozen, MappingProxyType) or not frozen:
-            raise PointInTimeDataError("source_span must be a nonempty mapping")
-        object.__setattr__(self, "source_span", frozen)
+        if self.market_data_feed is None:
+            if any(
+                value is not None
+                for value in (
+                    self.adjustment_mode,
+                    self.market_session,
+                    self.session_date,
+                )
+            ):
+                raise PointInTimeDataError(
+                    "nonmarket observations cannot carry partial market identity"
+                )
+        else:
+            if self.market_data_feed not in _MARKET_FEEDS:
+                raise PointInTimeDataError("market_data_feed is not recognized")
+            expected_status = _ADJUSTMENT_MODES.get(self.adjustment_mode)
+            if expected_status is None or expected_status != self.adjustment_status:
+                raise PointInTimeDataError(
+                    "adjustment_mode does not match adjustment_status"
+                )
+            if self.market_session != "regular":
+                raise PointInTimeDataError("market_session must bind the regular session")
+            session = _date(self.session_date, field_name="session_date")
+            if session != event.date():
+                raise PointInTimeDataError(
+                    "session_date does not match the selected market observation"
+                )
+            if session < identity_start or (
+                identity_end is not None and session > identity_end
+            ):
+                raise PointInTimeDataError(
+                    "session_date is outside the bound security identity"
+                )
+        object.__setattr__(
+            self,
+            "observed_value",
+            _freeze_json(self.observed_value, field_name="observed_value"),
+        )
+        object.__setattr__(
+            self,
+            "source_span",
+            _source_span(
+                self.source_span,
+                raw_artifact_sha256=raw_digest,
+                event_time=event,
+                publication_time=publication,
+                is_market=self.market_data_feed is not None,
+            ),
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {
             "schema_version": self.schema_version,
             "security_id": self.security_id,
+            "identity_effective_from": self.identity_effective_from,
+            "identity_effective_to": self.identity_effective_to,
             "event_time": self.event_time,
             "publication_time": self.publication_time,
             "availability_time": self.availability_time,
             "retrieval_time": self.retrieval_time,
             "raw_artifact_id": self.raw_artifact_id,
             "raw_artifact_sha256": self.raw_artifact_sha256,
+            "observed_value": _thaw_json(self.observed_value),
+            "market_data_feed": self.market_data_feed,
+            "adjustment_mode": self.adjustment_mode,
+            "market_session": self.market_session,
+            "session_date": self.session_date,
             "adjustment_status": self.adjustment_status,
             "source_span": _thaw_json(self.source_span),
             **_AUTHORITY,
@@ -305,12 +619,19 @@ _OBSERVATION_FIELDS = frozenset(
     {
         "schema_version",
         "security_id",
+        "identity_effective_from",
+        "identity_effective_to",
         "event_time",
         "publication_time",
         "availability_time",
         "retrieval_time",
         "raw_artifact_id",
         "raw_artifact_sha256",
+        "observed_value",
+        "market_data_feed",
+        "adjustment_mode",
+        "market_session",
+        "session_date",
         "adjustment_status",
         "source_span",
         *_AUTHORITY,
@@ -375,6 +696,84 @@ _ACTION_FIELDS = frozenset(
 )
 
 
+def _positive_decimal_text(value: object, *, field_name: str) -> str:
+    if type(value) is not str:
+        raise PointInTimeDataError(f"{field_name} must be a canonical positive decimal")
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise PointInTimeDataError(
+            f"{field_name} must be a canonical positive decimal"
+        ) from exc
+    canonical = format(parsed.normalize(), "f")
+    if not parsed.is_finite() or parsed <= 0 or value != canonical:
+        raise PointInTimeDataError(
+            f"{field_name} must be a canonical positive decimal"
+        )
+    return value
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TerminalProceeds:
+    """Verified per-share proceeds for a terminal security event."""
+
+    security_id: str
+    effective_date: str
+    amount_per_share: str
+    currency: str
+    source_artifact_id: str
+    source_artifact_sha256: str
+    schema_version: str = dataclasses.field(
+        init=False, default="terminal_proceeds/v1"
+    )
+    analysis_only: bool = dataclasses.field(init=False, default=True)
+    execution_authority: str = dataclasses.field(init=False, default="none")
+    can_submit_orders: bool = dataclasses.field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        _identifier(self.security_id, field_name="security_id")
+        _date(self.effective_date, field_name="effective_date")
+        _positive_decimal_text(
+            self.amount_per_share, field_name="amount_per_share"
+        )
+        if self.currency != "USD":
+            raise PointInTimeDataError("terminal proceeds currency must be USD")
+        _identifier(self.source_artifact_id, field_name="source_artifact_id")
+        _digest(
+            self.source_artifact_sha256,
+            field_name="source_artifact_sha256",
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version,
+            "security_id": self.security_id,
+            "effective_date": self.effective_date,
+            "amount_per_share": self.amount_per_share,
+            "currency": self.currency,
+            "source_artifact_id": self.source_artifact_id,
+            "source_artifact_sha256": self.source_artifact_sha256,
+            **_AUTHORITY,
+        }
+
+    def canonical_json_bytes(self) -> bytes:
+        return _canonical_json_bytes(self.to_dict())
+
+
+_TERMINAL_PROCEEDS_FIELDS = frozenset(
+    {
+        "schema_version",
+        "security_id",
+        "effective_date",
+        "amount_per_share",
+        "currency",
+        "source_artifact_id",
+        "source_artifact_sha256",
+        *_AUTHORITY,
+    }
+)
+
+
 def validate_security_identity(value: object) -> SecurityIdentity:
     values = _exact_fields(value, _SECURITY_FIELDS, field_name="security identity")
     if values["schema_version"] != "security_identity/v1":
@@ -401,17 +800,24 @@ def validate_security_identity(value: object) -> SecurityIdentity:
 
 def validate_point_in_time_observation(value: object) -> PointInTimeObservation:
     values = _exact_fields(value, _OBSERVATION_FIELDS, field_name="point-in-time observation")
-    if values["schema_version"] != "point_in_time_observation/v1":
+    if values["schema_version"] != "point_in_time_observation/v2":
         raise PointInTimeDataError("point-in-time observation schema_version is fixed")
     _validate_authority(values, field_name="point-in-time observation")
     rebuilt = PointInTimeObservation(
         security_id=values["security_id"],
+        identity_effective_from=values["identity_effective_from"],
+        identity_effective_to=values["identity_effective_to"],
         event_time=values["event_time"],
         publication_time=values["publication_time"],
         availability_time=values["availability_time"],
         retrieval_time=values["retrieval_time"],
         raw_artifact_id=values["raw_artifact_id"],
         raw_artifact_sha256=values["raw_artifact_sha256"],
+        observed_value=values["observed_value"],
+        market_data_feed=values["market_data_feed"],
+        adjustment_mode=values["adjustment_mode"],
+        market_session=values["market_session"],
+        session_date=values["session_date"],
         adjustment_status=values["adjustment_status"],
         source_span=values["source_span"],
     )
@@ -430,4 +836,28 @@ def validate_corporate_action(value: object) -> CorporateAction:
     )
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(values):
         raise PointInTimeDataError("corporate action bytes do not match canonical rebuild")
+    return rebuilt
+
+
+def validate_terminal_proceeds(value: object) -> TerminalProceeds:
+    values = _exact_fields(
+        value,
+        _TERMINAL_PROCEEDS_FIELDS,
+        field_name="terminal proceeds",
+    )
+    if values["schema_version"] != "terminal_proceeds/v1":
+        raise PointInTimeDataError("terminal proceeds schema_version is fixed")
+    _validate_authority(values, field_name="terminal proceeds")
+    rebuilt = TerminalProceeds(
+        security_id=values["security_id"],
+        effective_date=values["effective_date"],
+        amount_per_share=values["amount_per_share"],
+        currency=values["currency"],
+        source_artifact_id=values["source_artifact_id"],
+        source_artifact_sha256=values["source_artifact_sha256"],
+    )
+    if rebuilt.canonical_json_bytes() != _canonical_json_bytes(values):
+        raise PointInTimeDataError(
+            "terminal proceeds bytes do not match canonical rebuild"
+        )
     return rebuilt

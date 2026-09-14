@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping
 from types import MappingProxyType
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from tradingagents.dataflows.pit.raw_artifacts import (
     RawPointInTimeArtifact,
@@ -20,6 +21,7 @@ from tradingagents.dataflows.pit.records import PointInTimeDataError
 __all__ = [
     "MarketSessionCalendar",
     "build_market_session_calendar",
+    "resolve_market_session_open",
     "validate_market_session_calendar",
 ]
 
@@ -37,6 +39,7 @@ _ALPACA_CALENDAR_HOSTS = frozenset(
     {"api.alpaca.markets", "paper-api.alpaca.markets"}
 )
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_SOURCE_SESSION_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -51,6 +54,53 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _decode_calendar_rows(raw_bytes: bytes) -> list[Mapping[str, object]]:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise PointInTimeDataError(
+                    "market calendar source JSON contains a duplicate key"
+                )
+            result[key] = value
+        return result
+
+    def reject_nonfinite_constant(_value: str) -> object:
+        raise PointInTimeDataError(
+            "market calendar source JSON contains a nonfinite number"
+        )
+
+    try:
+        raw_calendar = json.loads(
+            raw_bytes,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonfinite_constant,
+        )
+    except PointInTimeDataError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PointInTimeDataError(
+            "market calendar source bytes are not JSON"
+        ) from exc
+    if type(raw_calendar) is not list:
+        raise PointInTimeDataError("market calendar source must be a JSON list")
+    rows: list[Mapping[str, object]] = []
+    for index, row in enumerate(raw_calendar):
+        if not isinstance(row, Mapping) or type(row.get("date")) is not str:
+            raise PointInTimeDataError(f"market calendar row {index} has no date")
+        rows.append(row)
+    return rows
+
+
+def _source_session_time(value: object, *, label: str) -> tuple[dt.time, str]:
+    if type(value) is not str or _SOURCE_SESSION_TIME.fullmatch(value) is None:
+        raise PointInTimeDataError(
+            f"market calendar {label} must use canonical source HH:MM time"
+        )
+    parsed = dt.time.fromisoformat(value)
+    return parsed, f"{value}:00"
 
 
 def _market_dates(value: object) -> tuple[str, ...]:
@@ -213,17 +263,8 @@ def build_market_session_calendar(
         or raw_artifact.content_type != "application/json"
     ):
         raise PointInTimeDataError("market calendar must be an Alpaca calendar receipt")
-    try:
-        raw_calendar = json.loads(raw_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PointInTimeDataError("market calendar source bytes are not JSON") from exc
-    if type(raw_calendar) is not list:
-        raise PointInTimeDataError("market calendar source must be a JSON list")
-    market_dates = []
-    for index, row in enumerate(raw_calendar):
-        if not isinstance(row, Mapping) or type(row.get("date")) is not str:
-            raise PointInTimeDataError(f"market calendar row {index} has no date")
-        market_dates.append(row["date"])
+    raw_calendar = _decode_calendar_rows(raw_bytes)
+    market_dates = [row["date"] for row in raw_calendar]
     span = _source_span(
         {
             "span_type": "byte_range",
@@ -267,3 +308,94 @@ def validate_market_session_calendar(value: object) -> MarketSessionCalendar:
     if rebuilt.canonical_json_bytes() != _canonical_json_bytes(payload):
         raise PointInTimeDataError("market calendar bytes do not match canonical rebuild")
     return rebuilt
+
+
+def _resolve_source_session(
+    *,
+    archive: RawPointInTimeArtifactArchive,
+    market_calendar: MarketSessionCalendar,
+    session_date: str,
+) -> tuple[MarketSessionCalendar, dict[str, object]]:
+    """Reopen a bound calendar and select one exact source session row."""
+
+    if type(archive) is not RawPointInTimeArtifactArchive:
+        raise PointInTimeDataError("archive must be an exact raw PIT artifact archive")
+    if type(market_calendar) is not MarketSessionCalendar:
+        raise PointInTimeDataError(
+            "market_calendar must be an exact MarketSessionCalendar"
+        )
+    try:
+        parsed_date = dt.date.fromisoformat(session_date)
+    except (TypeError, ValueError) as exc:
+        raise PointInTimeDataError("session_date must be an ISO date") from exc
+    if parsed_date.isoformat() != session_date:
+        raise PointInTimeDataError("session_date must be an ISO date")
+
+    calendar_artifact = archive.read_artifact(market_calendar.raw_artifact_id)
+    if calendar_artifact.raw_artifact_sha256 != market_calendar.raw_artifact_sha256:
+        raise PointInTimeDataError(
+            "market_calendar raw artifact digest does not match its receipt"
+        )
+    rebuilt = build_market_session_calendar(
+        archive=archive,
+        raw_artifact=calendar_artifact,
+    )
+    if rebuilt.canonical_json_bytes() != market_calendar.canonical_json_bytes():
+        raise PointInTimeDataError(
+            "market_calendar does not match its retained source bytes"
+        )
+
+    raw_bytes = archive.read_bytes(calendar_artifact)
+    rows = _decode_calendar_rows(raw_bytes)
+    matches = [
+        (index, row)
+        for index, row in enumerate(rows)
+        if row["date"] == session_date
+    ]
+    if len(matches) != 1:
+        raise PointInTimeDataError(
+            "market calendar must contain exactly one selected session row"
+        )
+    row_index, row = matches[0]
+    source_open, canonical_open = _source_session_time(
+        row.get("open"),
+        label="open",
+    )
+    source_close, canonical_close = _source_session_time(
+        row.get("close"),
+        label="close",
+    )
+    if source_open >= source_close:
+        raise PointInTimeDataError(
+            "market calendar session open must precede close"
+        )
+    return rebuilt, {
+        "calendar_raw_artifact_id": calendar_artifact.raw_artifact_id,
+        "calendar_raw_artifact_sha256": calendar_artifact.raw_artifact_sha256,
+        "calendar_date_path": (row_index, "date"),
+        "calendar_open_path": (row_index, "open"),
+        "calendar_close_path": (row_index, "close"),
+        "regular_session_open": canonical_open,
+        "regular_session_close": canonical_close,
+    }
+
+
+def resolve_market_session_open(
+    *,
+    archive: RawPointInTimeArtifactArchive,
+    market_calendar: MarketSessionCalendar,
+    session_date: str,
+) -> str:
+    """Replay one official regular-session open from retained calendar bytes."""
+
+    _rebuilt, source = _resolve_source_session(
+        archive=archive,
+        market_calendar=market_calendar,
+        session_date=session_date,
+    )
+    local_open = dt.datetime.combine(
+        dt.date.fromisoformat(session_date),
+        dt.time.fromisoformat(source["regular_session_open"]),
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    return local_open.astimezone(dt.UTC).isoformat(timespec="seconds")

@@ -142,10 +142,10 @@ from tradingagents.dataflows.alpaca_reference import (
 )
 from tradingagents.dataflows.integration_registry import build_integration_registry_report
 from tradingagents.dataflows.pit import (
-    PointInTimeCohortCandidate,
-    build_point_in_time_cohort,
+    RawPointInTimeArtifactArchive,
+    build_source_verifiable_point_in_time_cohort,
     validate_market_date_partitions,
-    validate_security_identity,
+    validate_market_session_calendar,
 )
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evals.agent_intelligence_brain import (
@@ -197,7 +197,7 @@ from tradingagents.evals.economic_evaluation_admission import (
     EconomicEvaluationAdmissionError,
 )
 from tradingagents.evals.economic_evaluation_partition_binding import (
-    bind_validation_phase_eligibility,
+    bind_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     validate_frozen_evaluation_protocol,
@@ -205,7 +205,14 @@ from tradingagents.evals.economic_evaluation_protocol import (
 from tradingagents.evals.economic_tournament import (
     EconomicTournamentCandidate,
     EconomicTournamentOutcome,
-    evaluate_validation_ta_control,
+    evaluate_phase_ta_control,
+)
+from tradingagents.evals.economic_tournament_evidence import (
+    SourceBoundTournamentInput,
+    validate_source_bound_tournament_input,
+)
+from tradingagents.evals.economic_tournament_evidence_admission import (
+    verify_source_bound_tournament_input,
 )
 from tradingagents.evals.email_clarity import evaluate_email_clarity, write_email_clarity_eval
 from tradingagents.evals.execution_board import (
@@ -2686,15 +2693,108 @@ def research_decision_quality_report(
     console.print(f"Rating calibration: {rating_calibration_path}")
 
 
-def _economic_json_object(path: Path, *, label: str) -> dict[str, object]:
-    """Load one explicit JSON receipt without accepting an implicit default."""
+def _economic_json_object(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = 16_000_000,
+    require_canonical: bool = False,
+) -> dict[str, object]:
+    """Load one bounded strict JSON receipt without ambiguous decoder behavior."""
+
+    max_depth = 32
+    max_nodes = 1_000_000
+    max_objects = 200_000
+    max_lists = 200_000
+    max_strings = 1_000_000
+    max_container_items = 10_000
+    max_string_chars = 4_096
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise typer.BadParameter(f"{label} contains a duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(_value: str) -> object:
+        raise typer.BadParameter(f"{label} contains a nonfinite JSON number")
+
+    def bounded_integer(text: str) -> int:
+        if len(text.removeprefix("-")) > 128:
+            raise typer.BadParameter(f"{label} contains an over-limit JSON number")
+        return int(text)
+
+    def bounded_float(text: str) -> float:
+        parts = text.lower().split("e", 1)
+        coefficient = parts[0].replace("-", "").replace(".", "")
+        exponent = parts[1] if len(parts) == 2 else "0"
+        if (
+            len(coefficient.lstrip("0") or "0") > 128
+            or len(exponent.removeprefix("-").removeprefix("+")) > 4
+            or abs(int(exponent)) > 128
+        ):
+            raise typer.BadParameter(f"{label} contains an over-limit JSON number")
+        return float(text)
 
     try:
-        payload = json.loads(path.read_bytes())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise typer.BadParameter(f"{label} must be readable JSON") from exc
+        if path.stat().st_size > max_bytes:
+            raise typer.BadParameter(f"{label} exceeds the {max_bytes}-byte limit")
+        raw_bytes = path.read_bytes()
+        if len(raw_bytes) > max_bytes:
+            raise typer.BadParameter(f"{label} exceeds the {max_bytes}-byte limit")
+        payload = json.loads(
+            raw_bytes,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_int=bounded_integer,
+            parse_float=bounded_float,
+            parse_constant=reject_nonfinite,
+        )
+    except typer.BadParameter:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise typer.BadParameter(f"{label} must be bounded strict JSON") from exc
     if not isinstance(payload, dict):
         raise typer.BadParameter(f"{label} must contain a JSON object")
+    objects = 0
+    lists = 0
+    strings = 0
+    nodes = 0
+    stack: list[tuple[object, int]] = [(payload, 0)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            raise typer.BadParameter(f"{label} exceeds JSON depth/node limits")
+        if isinstance(value, dict):
+            objects += 1
+            if objects > max_objects or len(value) > max_container_items:
+                raise typer.BadParameter(f"{label} exceeds JSON object limits")
+            for key, item in value.items():
+                strings += 1
+                if strings > max_strings or len(key) > max_string_chars:
+                    raise typer.BadParameter(f"{label} exceeds JSON string limits")
+                stack.append((item, depth + 1))
+        elif isinstance(value, list):
+            lists += 1
+            if lists > max_lists or len(value) > max_container_items:
+                raise typer.BadParameter(f"{label} exceeds JSON list limits")
+            stack.extend((item, depth + 1) for item in value)
+        elif isinstance(value, str):
+            strings += 1
+            if strings > max_strings or len(value) > max_string_chars:
+                raise typer.BadParameter(f"{label} exceeds JSON string limits")
+    if require_canonical:
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if raw_bytes != canonical:
+            raise typer.BadParameter(f"{label} must use canonical JSON bytes")
     return payload
 
 
@@ -2711,57 +2811,32 @@ def _economic_exact_object(
     return value
 
 
-def _economic_cohort_from_input(payload: dict[str, object]):
-    """Rebuild one PIT cohort from explicit, source-bound candidate JSON."""
+def _economic_cohort_from_input(
+    payload: dict[str, object],
+    *,
+    archive: object,
+    market_calendar: object,
+):
+    """Open exact source references and derive one source-verifiable cohort."""
 
     values = _economic_exact_object(
         payload,
         label="cohort candidate input",
-        fields=frozenset({"market_date", "as_of_cutoff", "candidates"}),
+        fields=frozenset(
+            {"market_date", "as_of_cutoff", "selection_time", "candidates"}
+        ),
     )
     raw_candidates = values["candidates"]
     if type(raw_candidates) is not list:
         raise typer.BadParameter("cohort candidate input candidates must be a JSON list")
-    candidates: list[PointInTimeCohortCandidate] = []
-    candidate_fields = frozenset(
-        {
-            "security",
-            "prior_complete_close",
-            "session_dollar_volumes",
-            "selection_artifact_id",
-            "selection_artifact_sha256",
-        }
-    )
-    for index, raw_candidate in enumerate(raw_candidates):
-        candidate = _economic_exact_object(
-            raw_candidate,
-            label=f"cohort candidate input candidates[{index}]",
-            fields=candidate_fields,
-        )
-        volumes = candidate["session_dollar_volumes"]
-        if type(volumes) is not list:
-            raise typer.BadParameter(
-                f"cohort candidate input candidates[{index}] volumes must be a JSON list"
-            )
-        try:
-            candidates.append(
-                PointInTimeCohortCandidate(
-                    security=validate_security_identity(candidate["security"]),
-                    prior_complete_close=candidate["prior_complete_close"],
-                    session_dollar_volumes=tuple(volumes),
-                    selection_artifact_id=candidate["selection_artifact_id"],
-                    selection_artifact_sha256=candidate["selection_artifact_sha256"],
-                )
-            )
-        except (TypeError, ValueError) as exc:
-            raise typer.BadParameter(
-                f"cohort candidate input candidates[{index}] are invalid: {exc}"
-            ) from exc
     try:
-        return build_point_in_time_cohort(
+        return build_source_verifiable_point_in_time_cohort(
+            archive=archive,
+            market_calendar=validate_market_session_calendar(market_calendar),
             market_date=values["market_date"],
             as_of_cutoff=values["as_of_cutoff"],
-            candidates=tuple(candidates),
+            selection_time=values["selection_time"],
+            candidates=tuple(raw_candidates),
         )
     except (TypeError, ValueError) as exc:
         raise typer.BadParameter(f"cohort candidate input is invalid: {exc}") from exc
@@ -3031,22 +3106,66 @@ def _economic_validation_report(
     partitions: object,
     validation_event_ids: tuple[str, ...],
     result: object,
+    tournament_input: SourceBoundTournamentInput,
 ) -> dict[str, object]:
     """Wrap one canonical validation result in the immutable admission schema."""
 
     result_payload = result.to_dict()
-    return {
-        "schema_version": "economic_validation_report/v2",
+    report = {
+        "schema_version": "economic_validation_report/v3",
         "protocol_id": protocol_id,
         "market_date_partitions": partitions.to_dict(),
         "validation_event_ids": list(validation_event_ids),
         "result": result_payload,
         "result_id": result_payload["result_id"],
         "result_sha256": result_payload["result_sha256"],
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
         "analysis_only": True,
         "execution_authority": "none",
         "can_submit_orders": False,
     }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
+
+
+def _economic_phase_report(
+    *,
+    protocol_id: str,
+    phase: str,
+    partitions: object,
+    event_ids: tuple[str, ...],
+    result: object,
+    tournament_input: SourceBoundTournamentInput,
+) -> dict[str, object]:
+    """Wrap one development or holdout result in its explicit v4 report."""
+
+    result_payload = result.to_dict()
+    report = {
+        "schema_version": "economic_evaluation_report/v4",
+        "protocol_id": protocol_id,
+        "phase": phase,
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(event_ids),
+        "result": result_payload,
+        "result_id": result_payload["result_id"],
+        "result_sha256": result_payload["result_sha256"],
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
 
 
 def _economic_effective_at(value: str) -> datetime.datetime:
@@ -3073,7 +3192,22 @@ def research_economic_cohort_build(
         "--candidate-input-path",
         exists=True,
         readable=True,
-        help="Explicit source-bound PIT cohort candidate JSON input.",
+        help="Security identities plus registered retained-source profiles; caller-authored qualification facts and paths are rejected.",
+    ),
+    pit_artifact_root: Path = typer.Option(
+        ...,
+        "--pit-artifact-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Immutable PIT raw-artifact archive reopened for every cohort candidate.",
+    ),
+    market_calendar_path: Path = typer.Option(
+        ...,
+        "--market-calendar-path",
+        exists=True,
+        readable=True,
+        help="Canonical source-bound market-session calendar receipt.",
     ),
     output_path: Path = typer.Option(
         ...,
@@ -3082,10 +3216,25 @@ def research_economic_cohort_build(
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Build an analysis-only PIT cohort receipt without reading a provider or broker."""
+    """Build one analysis-only cohort by reopening retained local source bytes."""
+
+    from tradingagents.dataflows.pit.raw_artifacts import (
+        RawPointInTimeArtifactArchive as CohortArtifactArchive,
+    )
 
     cohort = _economic_cohort_from_input(
-        _economic_json_object(candidate_input_path, label="candidate-input-path")
+        _economic_json_object(
+            candidate_input_path,
+            label="candidate-input-path",
+            max_bytes=4_000_000,
+        ),
+        archive=CohortArtifactArchive(pit_artifact_root),
+        market_calendar=_economic_json_object(
+            market_calendar_path,
+            label="market-calendar-path",
+            max_bytes=2_000_000,
+            require_canonical=True,
+        ),
     )
     written = _write_economic_receipt(
         output_path,
@@ -3098,6 +3247,12 @@ def research_economic_cohort_build(
         "can_submit_orders": False,
         "cohort_id": cohort.cohort_id,
         "cohort_sha256": cohort.cohort_sha256,
+        "sensitivity_universe_100_id": cohort.sensitivity_universe_100_id,
+        "sensitivity_universe_100_sha256": cohort.sensitivity_universe_100_sha256,
+        "primary_universe_75_id": cohort.primary_universe_75_id,
+        "primary_universe_75_sha256": cohort.primary_universe_75_sha256,
+        "sensitivity_universe_50_id": cohort.sensitivity_universe_50_id,
+        "sensitivity_universe_50_sha256": cohort.sensitivity_universe_50_sha256,
         "receipt_path": str(written),
     }
     if json_output:
@@ -3129,7 +3284,15 @@ def research_economic_tournament_run(
         "--tournament-input-path",
         exists=True,
         readable=True,
-        help="Canonical candidates and realized-outcomes JSON for validation only.",
+        help="Complete source-bound candidate and realized-outcome evidence JSON for the selected phase.",
+    ),
+    pit_artifact_root: Path = typer.Option(
+        ...,
+        "--pit-artifact-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Immutable PIT raw-artifact archive that must verify every tournament input.",
     ),
     evidence_root: Path = typer.Option(
         Path("results/economic_evaluation/evidence"),
@@ -3147,47 +3310,82 @@ def research_economic_tournament_run(
     effective_at: str = typer.Option(
         ...,
         "--effective-at",
-        help="Canonical UTC timestamp for the immutable validation-only receipt.",
+        help="Canonical UTC timestamp for the immutable phase receipt.",
+    ),
+    phase: str = typer.Option(
+        "validation",
+        "--phase",
+        help="Frozen lifecycle phase: development, validation, or holdout.",
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Admit one sealed validation TA-Control result as analysis-only evidence."""
+    """Admit one TA-Control phase result as analysis-only evidence."""
 
     protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
     partitions_payload = _economic_json_object(partitions_path, label="partitions-path")
-    tournament_payload = _economic_json_object(
-        tournament_input_path,
-        label="tournament-input-path",
-    )
     effective = _economic_effective_at(effective_at)
     try:
         protocol = validate_frozen_evaluation_protocol(protocol_payload)
-        eligibility = bind_validation_phase_eligibility(
+        if phase not in {"development", "validation", "holdout"}:
+            raise ValueError("phase must be development, validation, or holdout")
+        eligibility = bind_phase_eligibility(
             protocol=protocol,
             partitions=validate_market_date_partitions(partitions_payload),
+            phase=phase,
         )
-        candidates_by_event, outcomes = _economic_tournament_inputs(
+        adapter = EconomicEvaluationAdmissionAdapter(evidence_root, repo_root=repo_root)
+        if phase == "holdout" and not adapter.is_holdout_released(protocol.protocol_id):
+            raise EconomicEvaluationAdmissionError(
+                "holdout input is sealed until an immutable qualifying release exists"
+            )
+        tournament_payload = _economic_json_object(
+            tournament_input_path,
+            label="tournament-input-path",
+            max_bytes=32_000_000,
+            require_canonical=True,
+        )
+        tournament_input = validate_source_bound_tournament_input(
             tournament_payload,
-            expected_event_ids=eligibility.event_ids,
-        )
-        result = evaluate_validation_ta_control(
             protocol=protocol,
             eligibility=eligibility,
-            candidates_by_event=candidates_by_event,
-            outcomes=outcomes,
         )
-        admission = EconomicEvaluationAdmissionAdapter(
-            evidence_root,
-            repo_root=repo_root,
-        ).admit_evaluation_run(
+        tournament_input = verify_source_bound_tournament_input(
+            archive=RawPointInTimeArtifactArchive(pit_artifact_root),
+            value=tournament_input.to_dict(),
+            protocol=protocol,
+            eligibility=eligibility,
+        )
+        result = evaluate_phase_ta_control(
+            protocol=protocol,
+            eligibility=eligibility,
+            candidates_by_event=dict(tournament_input.candidates_by_event),
+            execution_outcomes=tournament_input.outcomes,
+            tournament_input_id=tournament_input.input_id,
+            tournament_input_sha256=tournament_input.input_sha256,
+        )
+        admission = adapter.admit_evaluation_run(
             protocol.protocol_id,
-            phase="validation",
+            phase=phase,
             effective_at=effective,
-            frozen_validation_report=_economic_validation_report(
-                protocol_id=protocol.protocol_id,
-                partitions=eligibility.partitions,
-                validation_event_ids=eligibility.event_ids,
-                result=result,
+            pit_artifact_root=pit_artifact_root,
+            tournament_input=tournament_input,
+            frozen_validation_report=(
+                _economic_validation_report(
+                    protocol_id=protocol.protocol_id,
+                    partitions=eligibility.partitions,
+                    validation_event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
+                if phase == "validation"
+                else _economic_phase_report(
+                    protocol_id=protocol.protocol_id,
+                    phase=phase,
+                    partitions=eligibility.partitions,
+                    event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
             ),
         )
     except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
@@ -3199,9 +3397,13 @@ def research_economic_tournament_run(
         "protocol_id": result.protocol_id,
         "validation_result_id": result.result_id,
         "validation_partition_id": result.validation_partition_id,
+        "tournament_input_id": tournament_input.input_id,
+        "tournament_input_sha256": tournament_input.input_sha256,
         "evaluation_run_object_id": admission.envelope.object_id,
         "created": admission.created,
         "evidence_root": str(evidence_root),
+        "availability_status": result.availability_status,
+        "qualification_status": result.qualification_status,
     }
     if json_output:
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
@@ -3311,8 +3513,10 @@ def research_economic_readiness_status(
         "protocol_id": readiness.protocol_id,
         "state": readiness.state,
         "protocol_admission_object_id": readiness.protocol_admission_object_id,
+        "development_run_object_id": readiness.development_run_object_id,
         "validation_run_object_id": readiness.validation_run_object_id,
         "holdout_release_object_id": readiness.holdout_release_object_id,
+        "holdout_run_object_id": readiness.holdout_run_object_id,
         "evidence_sequence": readiness.evidence_sequence,
         "evidence_head_event_sha256": readiness.evidence_head_event_sha256,
         "evidence_root": str(evidence_root),

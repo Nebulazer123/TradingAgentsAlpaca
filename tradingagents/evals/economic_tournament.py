@@ -6,15 +6,22 @@ broker, runtime, filesystem, scheduler, or network dependency.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 
+from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
 from tradingagents.evals.economic_evaluation_partition_binding import (
+    EconomicPhaseEligibility,
     ValidationPhaseEligibility,
+    bind_phase_eligibility,
+    bind_validation_phase_eligibility,
+    validate_phase_eligibility,
     validate_validation_phase_eligibility,
 )
 from tradingagents.evals.economic_evaluation_protocol import (
     CONTROL_ARM_IDS,
+    REQUIRED_METRICS,
     DecisionEvent,
     FrozenEvaluationProtocol,
     validate_decision_event,
@@ -22,7 +29,12 @@ from tradingagents.evals.economic_evaluation_protocol import (
 )
 from tradingagents.evals.economic_evaluation_result import (
     EconomicValidationResult,
+    build_phase_evaluation_result,
     build_validation_evaluation_result,
+)
+from tradingagents.evals.economic_tournament_statistics import (
+    WeeklyArmObservation,
+    build_economic_tournament_statistics,
 )
 from tradingagents.sleeves.pullback_support import PullbackFeatures, evaluate_pullback_support
 
@@ -32,6 +44,7 @@ __all__ = [
     "ControlArmAllocation",
     "EconomicTournamentOutcome",
     "build_ta_control_allocations",
+    "evaluate_phase_ta_control",
     "evaluate_validation_ta_control",
 ]
 
@@ -97,7 +110,7 @@ class ControlArmAllocation:
 
 @dataclass(frozen=True, slots=True)
 class EconomicTournamentOutcome:
-    """One realized, source-bound outcome vector for a frozen decision event."""
+    """Legacy v1/v2 tuple outcome retained for read compatibility only."""
 
     decision_event_id: str
     realized_returns: tuple[tuple[str, str], ...]
@@ -183,41 +196,189 @@ def build_ta_control_allocations(
     return (
         ControlArmAllocation("cash", (), "1"),
         ControlArmAllocation("spy", ("SPY",), "0"),
-        ControlArmAllocation("equal_weight", frozen.primary_universe, "0"),
+        ControlArmAllocation("equal_weight", tuple(sorted(frozen.primary_universe)), "0"),
         ControlArmAllocation("momentum_quality", momentum, _cash_weight(len(momentum), capacity=15)),
         ControlArmAllocation("pullback_support", pullback, _cash_weight(len(pullback), capacity=15)),
     )
 
 
 def _text(value: Decimal) -> str:
-    text = format(value, "f")
-    return text.rstrip("0").rstrip(".") if "." in text else text
+    # Development and holdout can compound across more weeks than the legacy
+    # validation fixture. Formatting remains canonical, but must not inherit
+    # the process-global Decimal precision while doing so.
+    with localcontext() as context:
+        context.prec = 96
+        value = value.quantize(Decimal("1e-24"))
+    integral = value.to_integral_value()
+    if abs(value - integral) < Decimal("1e-24"):
+        value = integral
+    return "0" if value.is_zero() else format(value.normalize(), "f")
 
 
-def _arm_return(allocation: ControlArmAllocation, outcome: EconomicTournamentOutcome) -> tuple[Decimal, Decimal, Decimal]:
-    selected = allocation.selected_symbols
+def _target_weights(allocation: ControlArmAllocation) -> dict[str, Decimal]:
     invested = Decimal("1") - Decimal(allocation.cash_weight)
-    if not selected:
-        return Decimal("0"), Decimal("0"), Decimal("0")
-    gross = sum((outcome.return_for(symbol) for symbol in selected), Decimal("0")) / Decimal(len(selected))
-    turnover = invested * Decimal("2")
-    return gross, turnover, invested
+    result = {"CASH": Decimal(allocation.cash_weight)}
+    if allocation.selected_symbols:
+        weight = invested / Decimal(len(allocation.selected_symbols))
+        for symbol in allocation.selected_symbols[:-1]:
+            result[symbol] = weight
+        result[allocation.selected_symbols[-1]] = invested - weight * Decimal(
+            len(allocation.selected_symbols) - 1
+        )
+    return result
 
 
-def evaluate_validation_ta_control(
+def _traded_notional(
+    current: dict[str, Decimal],
+    target: dict[str, Decimal],
+) -> tuple[Decimal, Decimal]:
+    names = (set(current) | set(target)) - {"CASH"}
+    changes = {
+        name: target.get(name, Decimal("0")) - current.get(name, Decimal("0"))
+        for name in names
+    }
+    buys = sum((value for value in changes.values() if value > 0), Decimal("0"))
+    sells = sum((-value for value in changes.values() if value < 0), Decimal("0"))
+    return buys, sells
+
+
+def _post_return_holdings(
+    target: dict[str, Decimal],
+    returns: dict[str, Decimal],
+) -> dict[str, Decimal]:
+    values = {
+        symbol: (
+            weight
+            if symbol == "CASH"
+            else weight * (Decimal("1") + returns[symbol])
+        )
+        for symbol, weight in target.items()
+    }
+    total = sum(values.values(), Decimal("0"))
+    if total <= 0:
+        raise EconomicTournamentError(
+            "post-return portfolio value must remain positive"
+        )
+    return {symbol: value / total for symbol, value in values.items()}
+
+
+def _compound(values: list[Decimal]) -> Decimal:
+    capital = Decimal("1")
+    for value in values:
+        capital *= Decimal("1") + value
+    return capital - Decimal("1")
+
+
+def _variant_metrics(
+    *,
+    weekly: dict[
+        str,
+        list[tuple[str, Decimal, Decimal, Decimal, dict[str, Decimal]]],
+    ],
+    cost_bps_per_side: Decimal,
+    decision_event_count: int,
+    packet_clusters: int,
+    market_clusters: int,
+) -> tuple[
+    dict[str, dict[str, str]],
+    dict[str, tuple[WeeklyArmObservation, ...]],
+]:
+    per_side_cost = cost_bps_per_side / Decimal("10000")
+    metrics: dict[str, dict[str, str]] = {}
+    observations: dict[str, tuple[WeeklyArmObservation, ...]] = {}
+    spy_net = [
+        gross - (buy_notional + sell_notional) * per_side_cost
+        for _date, gross, buy_notional, sell_notional, _positions in weekly["spy"]
+    ]
+    benchmark_compound = _compound(spy_net)
+    for arm in CONTROL_ARM_IDS:
+        capital = Decimal("1")
+        peak = capital
+        drawdown = Decimal("0")
+        total_turnover = Decimal("0")
+        total_buy_notional = Decimal("0")
+        total_sell_notional = Decimal("0")
+        total_cost = Decimal("0")
+        false_positives = 0
+        useful = 0
+        net_returns: list[Decimal] = []
+        rows: list[WeeklyArmObservation] = []
+        for index, (
+            market_date,
+            gross,
+            buy_notional,
+            sell_notional,
+            positions,
+        ) in enumerate(weekly[arm]):
+            turnover = buy_notional + sell_notional
+            cost = turnover * per_side_cost
+            net = gross - cost
+            net_returns.append(net)
+            total_turnover += turnover
+            total_buy_notional += buy_notional
+            total_sell_notional += sell_notional
+            total_cost += cost
+            capital *= Decimal("1") + net
+            peak = max(peak, capital)
+            drawdown = min(drawdown, capital / peak - Decimal("1"))
+            invested = Decimal("1") - positions.get("CASH", Decimal("0"))
+            if net > 0:
+                useful += 1
+            elif invested > 0:
+                false_positives += 1
+            rows.append(
+                WeeklyArmObservation(
+                    market_date=market_date,
+                    gross_return=_text(gross),
+                    net_return=_text(net),
+                    benchmark_net_return=_text(spy_net[index]),
+                    turnover=_text(turnover),
+                    buy_notional=_text(buy_notional),
+                    sell_notional=_text(sell_notional),
+                    cost_drag=_text(cost),
+                    false_positive=net <= 0 and invested > 0,
+                    positions=tuple(
+                        sorted((symbol, _text(weight)) for symbol, weight in positions.items())
+                    ),
+                )
+            )
+        metrics[arm] = {
+            "net_return_after_costs": _text(capital - Decimal("1")),
+            "benchmark_excess_after_costs": _text(
+                capital - Decimal("1") - benchmark_compound
+            ),
+            "max_drawdown": _text(drawdown),
+            "turnover": _text(total_turnover),
+            "false_positive_rate": _text(
+                Decimal(false_positives) / Decimal(len(rows))
+            ),
+            "decision_event_count": str(decision_event_count),
+            "packet_event_cluster_count": str(packet_clusters),
+            "market_event_cluster_count": str(market_clusters),
+            "cost_per_useful_decision": _text(
+                total_cost / Decimal(useful) if useful else total_cost
+            ),
+        }
+        observations[arm] = tuple(rows)
+    return metrics, observations
+
+
+def evaluate_phase_ta_control(
     *,
     protocol: FrozenEvaluationProtocol,
-    eligibility: ValidationPhaseEligibility,
+    eligibility: EconomicPhaseEligibility,
     candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
-    outcomes: tuple[EconomicTournamentOutcome, ...],
+    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...],
+    tournament_input_id: str,
+    tournament_input_sha256: str,
 ) -> EconomicValidationResult:
-    """Evaluate the sealed validation events and build canonical arm metrics."""
+    """Evaluate one named frozen phase into registered weekly portfolios."""
 
     if type(protocol) is not FrozenEvaluationProtocol:
         raise EconomicTournamentError("protocol must be an exact frozen value")
     frozen = validate_frozen_evaluation_protocol(protocol.to_dict())
     try:
-        bound = validate_validation_phase_eligibility(
+        bound = validate_phase_eligibility(
             protocol=frozen,
             eligibility=eligibility,
         )
@@ -225,64 +386,228 @@ def evaluate_validation_ta_control(
         raise EconomicTournamentError(str(exc)) from exc
     expected_ids = bound.event_ids
     if type(candidates_by_event) is not dict or set(candidates_by_event) != set(expected_ids):
-        raise EconomicTournamentError("candidate inputs must exactly cover validation events")
-    if type(outcomes) is not tuple or tuple(item.decision_event_id for item in outcomes) != expected_ids:
-        raise EconomicTournamentError("outcomes must be canonically ordered validation events")
+        raise EconomicTournamentError("candidate inputs must exactly cover phase events")
+    if type(execution_outcomes) is not tuple or any(
+        type(item) is not SourceBoundExecutionOutcome for item in execution_outcomes
+    ):
+        raise EconomicTournamentError(
+            "v3 evaluation requires exact source-bound execution outcomes"
+        )
     events = {event.decision_event_id: event for event in frozen.input_manifest.events}
-    metrics: dict[str, dict[str, str]] = {}
-    per_arm: dict[str, list[tuple[Decimal, Decimal, Decimal]]] = {arm: [] for arm in CONTROL_ARM_IDS}
-    for outcome in outcomes:
-        event = events[outcome.decision_event_id]
-        required_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
-        if tuple(symbol for symbol, _value in outcome.realized_returns) != required_symbols:
-            raise EconomicTournamentError("outcome must cover primary universe and SPY exactly")
-        for allocation in build_ta_control_allocations(
-            protocol=frozen,
-            decision_event=event,
-            candidates=candidates_by_event[event.decision_event_id],
+    grouped_by_date: dict[str, list[object]] = {}
+    for event_id in expected_ids:
+        event = events[event_id]
+        grouped_by_date.setdefault(event.market_date, []).append(event)
+    grouped = OrderedDict(
+        (market_date, grouped_by_date[market_date])
+        for market_date in sorted(grouped_by_date)
+    )
+    required_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
+    outcomes_by_date: dict[str, list[SourceBoundExecutionOutcome]] = {}
+    for outcome in execution_outcomes:
+        outcomes_by_date.setdefault(outcome.decision_market_date, []).append(outcome)
+    if set(outcomes_by_date) != set(grouped):
+        raise EconomicTournamentError(
+            "execution outcomes must cover the exact phase market dates"
+        )
+    weekly: dict[
+        str,
+        list[tuple[str, Decimal, Decimal, Decimal, dict[str, Decimal]]],
+    ] = {
+        arm: [] for arm in CONTROL_ARM_IDS
+    }
+    previous = {arm: {"CASH": Decimal("1")} for arm in CONTROL_ARM_IDS}
+    raw_source_rows = 0
+    for market_date, date_events in grouped.items():
+        event_symbols = tuple(item.symbol for item in date_events)
+        if tuple(sorted(event_symbols)) != tuple(sorted(frozen.primary_universe)):
+            raise EconomicTournamentError(
+                "each weekly market date must use every primary symbol event exactly once"
+            )
+        if len({item.decision_event_id for item in date_events}) != len(date_events):
+            raise EconomicTournamentError("weekly decision events must be unique")
+        first_event = date_events[0]
+        first_candidates = candidates_by_event[first_event.decision_event_id]
+        if any(
+            candidates_by_event[item.decision_event_id] != first_candidates
+            for item in date_events
         ):
-            per_arm[allocation.arm_id].append(_arm_return(allocation, outcome))
-    policy_cost = Decimal(frozen.evaluation_policy["commission_bps_per_side"]) + Decimal(frozen.evaluation_policy["half_spread_bps_per_side"]) + Decimal(frozen.evaluation_policy["slippage_bps_per_side"])
-    per_side_cost = policy_cost / Decimal("10000")
-    benchmark_returns = per_arm["spy"]
+            raise EconomicTournamentError(
+                "weekly symbol events must share one immutable candidate cross-section"
+            )
+        date_outcomes = tuple(outcomes_by_date[market_date])
+        if tuple(item.symbol for item in date_outcomes) != required_symbols:
+            raise EconomicTournamentError(
+                "execution outcomes must cover primary universe and SPY exactly"
+            )
+        events_by_symbol = {item.symbol: item for item in date_events}
+        benchmark_event_id = events_by_symbol[
+            frozen.primary_universe[0]
+        ].decision_event_id
+        if any(
+            outcome.decision_event_id
+            != (
+                benchmark_event_id
+                if outcome.symbol == "SPY"
+                else events_by_symbol[outcome.symbol].decision_event_id
+            )
+            for outcome in date_outcomes
+        ):
+            raise EconomicTournamentError(
+                "execution outcomes do not bind the matching symbol events"
+            )
+        unavailable = tuple(item.symbol for item in date_outcomes if item.gross_return is None)
+        if unavailable:
+            null_metrics = {
+                arm: {
+                    metric: None for metric in REQUIRED_METRICS
+                }
+                for arm in CONTROL_ARM_IDS
+            }
+            if bound.phase == "validation":
+                return build_validation_evaluation_result(
+                    frozen,
+                    arm_metrics=null_metrics,  # type: ignore[arg-type]
+                    eligibility=bind_validation_phase_eligibility(
+                        protocol=frozen, partitions=bound.partitions
+                    ),
+                    cost_variant_metrics={
+                        cost: null_metrics for cost in ("5", "10", "25", "50")
+                    },  # type: ignore[arg-type]
+                    registered_statistics=None,
+                    tournament_input_id=tournament_input_id,
+                    tournament_input_sha256=tournament_input_sha256,
+                    execution_outcomes=execution_outcomes,
+                    unavailable=True,
+                )
+            return build_phase_evaluation_result(
+                frozen,
+                arm_metrics=null_metrics,  # type: ignore[arg-type]
+                eligibility=bound,
+                cost_variant_metrics={
+                    cost: null_metrics for cost in ("5", "10", "25", "50")
+                },  # type: ignore[arg-type]
+                registered_statistics=None,
+                tournament_input_id=tournament_input_id,
+                tournament_input_sha256=tournament_input_sha256,
+                execution_outcomes=execution_outcomes,
+                unavailable=True,
+            )
+        returns = {
+            item.symbol: Decimal(item.gross_return)
+            for item in date_outcomes
+            if item.gross_return is not None
+        }
+        allocations = build_ta_control_allocations(
+            protocol=frozen,
+            decision_event=first_event,
+            candidates=first_candidates,
+        )
+        for allocation in allocations:
+            target = _target_weights(allocation)
+            buys, sells = _traded_notional(previous[allocation.arm_id], target)
+            gross = sum(
+                (
+                    weight * returns[symbol]
+                    for symbol, weight in target.items()
+                    if symbol != "CASH"
+                ),
+                Decimal("0"),
+            )
+            weekly[allocation.arm_id].append(
+                (market_date, gross, buys, sells, target)
+            )
+            previous[allocation.arm_id] = _post_return_holdings(target, returns)
+        raw_source_rows += len(first_candidates) + len(date_outcomes)
+
+    for arm in CONTROL_ARM_IDS:
+        final_buys, final_sells = _traded_notional(
+            previous[arm], {"CASH": Decimal("1")}
+        )
+        market_date, gross, buys, sells, positions = weekly[arm][-1]
+        weekly[arm][-1] = (
+            market_date,
+            gross,
+            buys + final_buys,
+            sells + final_sells,
+            positions,
+        )
+
     packet_clusters = len({events[event_id].packet_event_cluster_id for event_id in expected_ids})
     market_clusters = len({events[event_id].market_event_cluster_id for event_id in expected_ids})
-    for arm in CONTROL_ARM_IDS:
-        capital = Decimal("1")
-        peak = capital
-        drawdown = Decimal("0")
-        total_turnover = Decimal("0")
-        total_cost = Decimal("0")
-        false_positives = 0
-        useful = 0
-        net_returns: list[Decimal] = []
-        for gross, turnover, invested in per_arm[arm]:
-            cost = turnover * per_side_cost
-            net = gross - cost
-            net_returns.append(net)
-            total_turnover += turnover
-            total_cost += cost
-            capital *= Decimal("1") + net
-            peak = max(peak, capital)
-            drawdown = min(drawdown, capital / peak - Decimal("1"))
-            if net > 0:
-                useful += 1
-            elif invested > 0:
-                false_positives += 1
-        benchmark_net = [gross - turnover * per_side_cost for gross, turnover, _ in benchmark_returns]
-        metrics[arm] = {
-            "net_return_after_costs": _text(capital - Decimal("1")),
-            "benchmark_excess_after_costs": _text(sum(net_returns, Decimal("0")) - sum(benchmark_net, Decimal("0"))),
-            "max_drawdown": _text(drawdown),
-            "turnover": _text(total_turnover),
-            "false_positive_rate": _text(Decimal(false_positives) / Decimal(len(expected_ids))),
-            "decision_event_count": str(len(expected_ids)),
-            "packet_event_cluster_count": str(packet_clusters),
-            "market_event_cluster_count": str(market_clusters),
-            "cost_per_useful_decision": _text(total_cost / Decimal(useful) if useful else total_cost),
-        }
-    return build_validation_evaluation_result(
+    variants: dict[str, dict[str, dict[str, str]]] = {}
+    headline_observations: dict[str, tuple[WeeklyArmObservation, ...]] | None = None
+    for cost in ("5", "10", "25", "50"):
+        variant, observations = _variant_metrics(
+            weekly=weekly,
+            cost_bps_per_side=Decimal(cost),
+            decision_event_count=len(expected_ids),
+            packet_clusters=packet_clusters,
+            market_clusters=market_clusters,
+        )
+        variants[cost] = variant
+        if cost == "10":
+            headline_observations = observations
+    assert headline_observations is not None
+    statistics = build_economic_tournament_statistics(
+        raw_source_row_count=raw_source_rows,
+        decision_event_count=len(expected_ids),
+        packet_event_cluster_count=packet_clusters,
+        market_event_cluster_count=market_clusters,
+        observations_by_arm=headline_observations,
+    )
+    if bound.phase == "validation":
+        return build_validation_evaluation_result(
+            frozen,
+            arm_metrics=variants["10"],
+            eligibility=bind_validation_phase_eligibility(
+                protocol=frozen, partitions=bound.partitions
+            ),
+            cost_variant_metrics=variants,
+            registered_statistics=statistics,
+            tournament_input_id=tournament_input_id,
+            tournament_input_sha256=tournament_input_sha256,
+            execution_outcomes=execution_outcomes,
+        )
+    return build_phase_evaluation_result(
         frozen,
-        arm_metrics=metrics,
+        arm_metrics=variants["10"],
         eligibility=bound,
+        cost_variant_metrics=variants,
+        registered_statistics=statistics,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
+        execution_outcomes=execution_outcomes,
+    )
+
+
+def evaluate_validation_ta_control(
+    *,
+    protocol: FrozenEvaluationProtocol,
+    eligibility: ValidationPhaseEligibility,
+    candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
+    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...],
+    tournament_input_id: str,
+    tournament_input_sha256: str,
+) -> EconomicValidationResult:
+    """Compatibility wrapper for the historical validation-only entry point."""
+
+    if type(protocol) is not FrozenEvaluationProtocol:
+        raise EconomicTournamentError("protocol must be an exact frozen value")
+    frozen = validate_frozen_evaluation_protocol(protocol.to_dict())
+    try:
+        bound = validate_validation_phase_eligibility(protocol=frozen, eligibility=eligibility)
+    except ValueError as exc:
+        raise EconomicTournamentError(str(exc)) from exc
+    return evaluate_phase_ta_control(
+        protocol=frozen,
+        eligibility=bind_phase_eligibility(
+            protocol=frozen,
+            partitions=bound.partitions,
+            phase="validation",
+        ),
+        candidates_by_event=candidates_by_event,
+        execution_outcomes=execution_outcomes,
+        tournament_input_id=tournament_input_id,
+        tournament_input_sha256=tournament_input_sha256,
     )

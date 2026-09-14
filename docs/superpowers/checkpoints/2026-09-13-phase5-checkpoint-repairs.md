@@ -1,8 +1,9 @@
 # Phase 5 checkpoint repairs — source checkpoint
 
-Status: repaired and focused-verified in the existing LangGraph worktree.
-Updated-canonical merge, affected verification and canonical integration remain
-pending. This is not complete program, model, economic, or operational readiness.
+Status: Tasks 5.1–5.4 source acceptance passed on the combined candidate.
+Source checkpoint `b40683e` was merged with accepted canonical `7c5b9a7` in the
+existing LangGraph worktree. Git ancestry records its canonical integration.
+Task 5.5, complete program, model, economic, and operational readiness remain open.
 
 ## Preserved work and authority
 
@@ -95,7 +96,35 @@ one case; it is not before-fix evidence. Its overlap is excluded from acceptance
 the separate runtime gate and final frozen-source seven-module gate provide the
 current proof. All those sessions are terminal; do not restart them.
 
-Next: preserve this source checkpoint in Git, merge updated canonical into this
-branch, inspect the combined diff and run Task 5.4's six-module affected gate and
-statics. Concurrency stays at 1 until a registered real cohort and model-call
-authority permit Task 5.5. Phase 10's complete repository gate is still required.
+## Combined-candidate acceptance
+
+The automatic merge had no conflicts. A read-only AST comparison verified exact
+preservation of all nine checkpoint-changed and seven canonical-changed CLI
+definitions, all new imports, and no duplicate definitions. Helper:
+`check_phase5_cli_merge_20260913.py` in canonical SDD.
+
+The first six-module affected gate passed 284 tests and found one stale inventory
+mapping: the same two local result/error `queue.put` calls moved from 6298/6310
+to 6504/6516. Exact source inspection confirmed unchanged operations and existing
+non-trading classifications. Only those two expected locations changed; unknown,
+missing and duplicate mutation detection remain strict. The original test bytes
+remain in the preservation archive.
+
+The corrected required affected gate passed **285 tests in 20.65s**:
+`phase5-merged-affected-corrected-20260913.xml`. Modules: learning context, analyst
+execution, analyst concurrency, graph tool routing, Alpaca CLI, and authority-role
+alignment. It reported two non-fatal AST-source `SyntaxWarning` messages about
+an existing invalid escape sequence. Eighteen-path Ruff, CLI/application
+compileall, offline lock check, and staged/working-tree whitespace checks passed;
+the inventory-only correction also passed its focused static check.
+
+The 333-test checkpoint proof belongs to `b40683e`; the merged-candidate gate and
+exact-definition comparison cover integration with `7c5b9a7`. Unchanged Phase 4
+and unchanged checkpoint modules were not broadly retested just for the merge.
+This preserves revision-specific evidence rather than claiming every prior test
+was rerun on the combined candidate. Phase 10's final complete gate remains due.
+
+Next: Phase 6 source integration and legitimate source-bound learning evidence.
+Concurrency stays at 1 until a registered real cohort and model-call authority
+permit Task 5.5. No model, broker, holdout, or scheduler authority follows from
+source acceptance.
