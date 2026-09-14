@@ -216,6 +216,50 @@ def test_current_readiness_packet_rejects_tampered_promotion_state(tmp_path):
         build_current_readiness_packet(**kwargs)
 
 
+@pytest.mark.parametrize("owner", ["control", "promotion", "automation"])
+def test_readiness_rejects_owner_change_during_schedule_capture(monkeypatch, tmp_path, owner):
+    from tradingagents.evals import automation_health_audit
+
+    kwargs = _readiness_inputs(tmp_path)
+    capture = automation_health_audit.capture_schedule_contract_snapshot
+    if owner == "automation":
+        target = next(Path(kwargs["automation_root"]).glob("*/automation.toml"))
+    else:
+        target = Path(kwargs["live_control_path" if owner == "control" else "promotion_state_path"])
+    changed = target.read_bytes() + b"\n"
+
+    def capture_then_change(**inputs):
+        snapshot = capture(**inputs)
+        target.write_bytes(changed)
+        return snapshot
+
+    monkeypatch.setattr(automation_health_audit, "capture_schedule_contract_snapshot", capture_then_change)
+    with pytest.raises(ValueError, match="changed during readiness"):
+        build_current_readiness_packet(**kwargs)
+    assert target.read_bytes() == changed  # Never repair another writer's change.
+
+
+def test_readiness_binds_captured_contract_bytes_not_just_preflight_reads(monkeypatch, tmp_path):
+    from tradingagents.evals import automation_health_audit
+
+    kwargs = _readiness_inputs(tmp_path)
+    capture = automation_health_audit.capture_schedule_contract_snapshot
+    target = Path(kwargs["schedule_contract_path"])
+    original = target.read_bytes()
+
+    def capture_different_bytes(**inputs):
+        target.write_bytes(original + b"\n")
+        try:
+            return capture(**inputs)
+        finally:
+            target.write_bytes(original)
+
+    monkeypatch.setattr(automation_health_audit, "capture_schedule_contract_snapshot", capture_different_bytes)
+    with pytest.raises(ValueError, match="captured schedule contract digest"):
+        build_current_readiness_packet(**kwargs)
+    assert target.read_bytes() == original
+
+
 def test_policy_readiness_status_cli_is_read_only_and_json(tmp_path):
     from typer.testing import CliRunner
 
@@ -317,6 +361,66 @@ def test_legacy_readiness_supersession_keeps_prepare_after_interrupted_write(
         record["live_enabled"] is False
         for record in recovered.state["sleeves"].values()
     )
+
+
+@pytest.mark.parametrize("has_prepared", [False, True])
+def test_foreign_completed_supersession_rejects_before_any_state_write(
+    monkeypatch, tmp_path, has_prepared
+):
+    from tradingagents.policy import promotion_sync
+
+    kwargs, go_before, state_before, tournament_before = _legacy_supersession_inputs(tmp_path)
+    receipt_path = Path(kwargs["receipt_path"])
+    prepared_path = receipt_path.with_name(receipt_path.name + ".prepared")
+    if has_prepared:
+        with monkeypatch.context() as interruption:
+            def fail_write(*_args, **_kwargs):
+                raise OSError("synthetic interruption")
+            interruption.setattr(promotion_sync, "_write_promotion_state_unlocked", fail_write)
+            with pytest.raises(OSError, match="synthetic interruption"):
+                supersede_legacy_readiness(**kwargs)
+    prepared_before = prepared_path.read_bytes() if has_prepared else None
+    foreign_bytes = _write_json_bytes(receipt_path, {"status": "completed", "foreign": True})
+    writer = promotion_sync._write_promotion_state_unlocked
+    writes = []
+
+    def observed_write(*args, **call_kwargs):
+        writes.append(True)
+        return writer(*args, **call_kwargs)
+
+    monkeypatch.setattr(promotion_sync, "_write_promotion_state_unlocked", observed_write)
+    with pytest.raises(ValueError, match="completed supersession"):
+        supersede_legacy_readiness(**kwargs)
+    assert writes == []
+    assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
+    assert Path(kwargs["go_packet_path"]).read_bytes() == go_before
+    assert Path(kwargs["expired_tournament_ledger_path"]).read_bytes() == tournament_before
+    assert receipt_path.read_bytes() == foreign_bytes
+    assert (prepared_path.read_bytes() if prepared_path.exists() else None) == prepared_before
+
+
+def test_completed_supersession_does_not_reapply_after_state_rollback(monkeypatch, tmp_path):
+    from tradingagents.policy import promotion_sync
+
+    kwargs, _, state_before, _ = _legacy_supersession_inputs(tmp_path)
+    result = supersede_legacy_readiness(**kwargs)
+    completed_before = result.completed_receipt_path.read_bytes()
+    prepared_before = result.prepared_receipt_path.read_bytes()
+    Path(kwargs["promotion_state_path"]).write_bytes(state_before)
+    writes = []
+    writer = promotion_sync._write_promotion_state_unlocked
+
+    def observed_write(*args, **call_kwargs):
+        writes.append(True)
+        return writer(*args, **call_kwargs)
+
+    monkeypatch.setattr(promotion_sync, "_write_promotion_state_unlocked", observed_write)
+    with pytest.raises(ValueError, match="completed supersession"):
+        supersede_legacy_readiness(**kwargs)
+    assert writes == []
+    assert Path(kwargs["promotion_state_path"]).read_bytes() == state_before
+    assert result.completed_receipt_path.read_bytes() == completed_before
+    assert result.prepared_receipt_path.read_bytes() == prepared_before
 
 
 def test_legacy_readiness_recovery_rederives_after_state_from_before_image(

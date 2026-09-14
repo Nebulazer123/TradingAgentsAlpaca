@@ -27,6 +27,7 @@ from tradingagents.graph.packet_nodes import (
 from tradingagents.graph.propagation import Propagator
 from tradingagents.orchestration.decision_ledger import (
     DecisionLedger,
+    LedgerCorruptionError,
     PacketCollisionError,
 )
 
@@ -732,6 +733,153 @@ def test_crash_after_ledger_record_retries_same_packet_and_event(
     assert len(
         DecisionLedger(ledger_root).verify(evidence_root=evidence_root)
     ) == 1
+
+
+@pytest.mark.parametrize("node_index", (0, 1, 2))
+@pytest.mark.parametrize(
+    "crash_point",
+    (
+        "before_evidence_publication",
+        "after_evidence_publication",
+        "after_packet_publication",
+        "after_ledger_record",
+        "before_node_return",
+    ),
+)
+def test_every_packet_kind_replays_each_durable_crash_boundary_once(
+    tmp_path,
+    monkeypatch,
+    node_index,
+    crash_point,
+):
+    """A current LangGraph node may replay after any durable-write crash point."""
+
+    from tradingagents.graph import packet_nodes as packet_nodes_module
+
+    state = _state()
+    ledger_root, evidence_root, nodes = _node_triplet(tmp_path)
+    for prior_node in nodes[:node_index]:
+        state.update(prior_node(state))
+    node = nodes[node_index]
+    kind = ("research_evidence", "trader_proposal", "portfolio_decision")[node_index]
+    crashed = False
+
+    if crash_point in {"before_evidence_publication", "after_evidence_publication"}:
+        real_publish = packet_nodes_module._publish_evidence
+
+        def publish_with_crash(**kwargs):
+            nonlocal crashed
+            if crash_point == "before_evidence_publication" and not crashed:
+                crashed = True
+                raise RuntimeError(crash_point)
+            result = real_publish(**kwargs)
+            if crash_point == "after_evidence_publication" and not crashed:
+                crashed = True
+                raise RuntimeError(crash_point)
+            return result
+
+        monkeypatch.setattr(packet_nodes_module, "_publish_evidence", publish_with_crash)
+    elif crash_point == "after_packet_publication":
+        real_after_packet = packet_nodes_module.DecisionLedger._after_packet_fsync
+
+        def after_packet_with_crash(self, packet_path):
+            nonlocal crashed
+            real_after_packet(self, packet_path)
+            if not crashed:
+                crashed = True
+                raise RuntimeError(crash_point)
+
+        monkeypatch.setattr(
+            packet_nodes_module.DecisionLedger,
+            "_after_packet_fsync",
+            after_packet_with_crash,
+        )
+    elif crash_point == "after_ledger_record":
+        real_after_event = packet_nodes_module.DecisionLedger._after_event_fsync
+
+        def after_event_with_crash(self, event):
+            nonlocal crashed
+            real_after_event(self, event)
+            if not crashed:
+                crashed = True
+                raise RuntimeError(crash_point)
+
+        monkeypatch.setattr(
+            packet_nodes_module.DecisionLedger,
+            "_after_event_fsync",
+            after_event_with_crash,
+        )
+    else:
+        real_validate = packet_nodes_module._validate_durable_reference
+
+        def validate_with_crash(reference, **kwargs):
+            nonlocal crashed
+            if kwargs["expected_kind"] == kind and not crashed:
+                crashed = True
+                raise RuntimeError(crash_point)
+            return real_validate(reference, **kwargs)
+
+        monkeypatch.setattr(
+            packet_nodes_module,
+            "_validate_durable_reference",
+            validate_with_crash,
+        )
+
+    with pytest.raises(RuntimeError, match=crash_point):
+        node(state)
+    result = node(state)
+    state.update(result)
+
+    events = DecisionLedger(ledger_root).verify(evidence_root=evidence_root)
+    expected_kinds = [
+        "research_evidence",
+        "trader_proposal",
+        "portfolio_decision",
+    ][: node_index + 1]
+    assert [event.kind for event in events] == expected_kinds
+    assert [reference["kind"] for reference in result["decision_packet_refs"]] == expected_kinds
+    assert len(result["decision_packet_refs"]) == len(expected_kinds)
+    assert len(list((ledger_root / "packets").glob("*.json"))) == len(expected_kinds)
+    assert len(list(evidence_root.rglob(f"{kind}-*.json"))) == 1
+    assert all(reference["analysis_only"] is True for reference in result["decision_packet_refs"])
+    assert all(
+        reference["execution_authority"] == "none"
+        and reference["can_submit_orders"] is False
+        for reference in result["decision_packet_refs"]
+    )
+
+
+def test_targeted_pointer_recovery_rejects_another_malformed_pointer(tmp_path):
+    state = _state()
+    ledger_root, _evidence_root, nodes = _node_triplet(tmp_path)
+    for node in nodes:
+        state.update(node(state))
+    current_pointer = ledger_root / "latest" / "research_evidence.json"
+    unrelated_pointer = ledger_root / "latest" / "trader_proposal.json"
+    current_pointer.unlink()
+    unrelated_pointer.write_text("malformed unrelated pointer")
+    retry_state = _state()
+
+    with pytest.raises(LedgerCorruptionError, match="stale or malformed"):
+        nodes[0](retry_state)
+
+    assert not current_pointer.exists()
+    assert unrelated_pointer.read_text() == "malformed unrelated pointer"
+
+
+def test_targeted_pointer_recovery_rejects_another_run_latest_event(tmp_path):
+    state = _state()
+    ledger_root, _evidence_root, nodes = _node_triplet(tmp_path)
+    nodes[0](state)
+    other_state = _state(run_id="graph-" + "2" * 64)
+    nodes[0](other_state)
+    pointer = ledger_root / "latest" / "research_evidence.json"
+    pointer.unlink()
+
+    with pytest.raises(LedgerCorruptionError, match="no matching"):
+        nodes[0](_state())
+
+    assert not pointer.exists()
 
 
 def test_real_checkpoint_resume_reuses_run_clock_packet_and_evidence(

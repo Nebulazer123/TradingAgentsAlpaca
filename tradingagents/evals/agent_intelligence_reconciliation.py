@@ -1,6 +1,6 @@
 """Read-only agent ledger reconciliation and dependence bounds.
 
-This module derives a deterministic ``agent_intelligence_reconciliation/v1``
+This module derives a deterministic ``agent_intelligence_reconciliation/v2``
 receipt from exactly one captured byte snapshot of the Agent Intelligence
 Ledger JSONL. It never mutates the ledger, never rewrites raw forecast
 history, and never replaces the derived agent score summary.
@@ -25,9 +25,14 @@ Dependence semantics (fixed for this increment):
   unclusterable and never replaced with an invented identity.
 - Both clusterings cover rows whose ``resolved`` field is exactly ``True``:
   dependence bounds describe the resolved sample, not pending rows.
-- ``provisional_effective_sample`` equals the conservative market-event
-  cluster count and is explicitly provisional until a preregistered
-  estimator exists. Raw resolved rows are never independent observations.
+- Conservative market-event clusters are reported only as provisional
+  dependence groups. They are not an effective sample size; that count stays
+  unavailable until a preregistered estimator exists. Raw resolved rows are
+  never independent observations.
+- Canonical economic decision-event and decision-market-date counts stay
+  unavailable unless a verified economic identity binding is present. Legacy
+  rows lack that binding, so neither ``created_at`` nor a provisional cluster
+  key is promoted into economic identity.
 - ``influence_weighting_status`` labels the row-weighted influence
   estimator legacy/unregistered in every receipt and dependence block.
 
@@ -55,15 +60,18 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "agent_intelligence_reconciliation/v1"
+SCHEMA_VERSION = "agent_intelligence_reconciliation/v2"
 SUMMARY_FRESHNESS_MISSING = "missing"
 SUMMARY_FRESHNESS_MALFORMED = "malformed"
 SUMMARY_FRESHNESS_UNVERIFIABLE_LEGACY = "unverifiable_legacy_summary"
 SUMMARY_FRESHNESS_STALE = "stale"
 SUMMARY_FRESHNESS_CURRENT = "current"
 LEDGER_FINGERPRINT_KEY = "ledger_fingerprint"
-PROVISIONAL_EFFECTIVE_SAMPLE_BASIS = "conservative_market_event_cluster_count"
-EFFECTIVE_SAMPLE_STATUS_PROVISIONAL = "provisional_pending_preregistered_estimator"
+EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE = "unavailable_pending_preregistered_estimator"
+ECONOMIC_IDENTITY_STATUS_UNAVAILABLE = "unavailable_no_verified_economic_identity_binding"
+ECONOMIC_IDENTITY_REASON = (
+    "no_source_bound_verifier_with_frozen_economic_protocol"
+)
 INFLUENCE_WEIGHTING_STATUS_LEGACY = "legacy_unregistered_row_weighted_estimator"
 
 UTC = datetime.timezone.utc
@@ -352,6 +360,73 @@ def _cluster_counts(
     return len(keys), unclusterable
 
 
+def _verified_economic_identity_report(
+    resolved_rows: Sequence[dict[str, Any]],
+    *,
+    source_bound_verifier: object | None,
+) -> dict[str, Any]:
+    """Count only v3 rows reverified against PIT bytes and a frozen protocol."""
+
+    if source_bound_verifier is None:
+        return {
+            "unique_economic_decision_event_id_count": None,
+            "unique_economic_decision_market_date_count": None,
+            "economic_decision_verified_resolved_row_count": 0,
+            "economic_decision_unbound_resolved_row_count": len(resolved_rows),
+            "economic_decision_identity_status": ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
+            "economic_decision_identity_reason": ECONOMIC_IDENTITY_REASON,
+        }
+    from tradingagents.evals.agent_intelligence_ledger import AgentForecast
+    from tradingagents.evals.source_bound_resolution import SourceBoundWindowLookup
+
+    if type(source_bound_verifier) is not SourceBoundWindowLookup:
+        raise TypeError("source_bound_verifier must be an exact SourceBoundWindowLookup")
+    if not source_bound_verifier.has_frozen_economic_protocol:
+        return {
+            "unique_economic_decision_event_id_count": None,
+            "unique_economic_decision_market_date_count": None,
+            "economic_decision_verified_resolved_row_count": 0,
+            "economic_decision_unbound_resolved_row_count": len(resolved_rows),
+            "economic_decision_identity_status": ECONOMIC_IDENTITY_STATUS_UNAVAILABLE,
+            "economic_decision_identity_reason": ECONOMIC_IDENTITY_REASON,
+        }
+    event_ids: set[str] = set()
+    market_dates: set[str] = set()
+    verified_rows = 0
+    for row in resolved_rows:
+        forecast = AgentForecast(**row)
+        evidence = row.get("resolution_evidence")
+        if (
+            not isinstance(evidence, Mapping)
+            or evidence.get("schema_version") != "source_bound_resolution_evidence/v3"
+            or source_bound_verifier.verify_forecast(forecast) is not True
+        ):
+            continue
+        economic = evidence.get("economic_decision")
+        if not isinstance(economic, Mapping):
+            continue
+        event_id = economic.get("decision_event_id")
+        market_date = economic.get("market_date")
+        if type(event_id) is not str or type(market_date) is not str:
+            continue
+        event_ids.add(event_id)
+        market_dates.add(market_date)
+        verified_rows += 1
+    unbound = len(resolved_rows) - verified_rows
+    return {
+        "unique_economic_decision_event_id_count": len(event_ids),
+        "unique_economic_decision_market_date_count": len(market_dates),
+        "economic_decision_verified_resolved_row_count": verified_rows,
+        "economic_decision_unbound_resolved_row_count": unbound,
+        "economic_decision_identity_status": (
+            "verified" if unbound == 0 else "verified_with_unbound_rows"
+        ),
+        "economic_decision_identity_reason": (
+            None if unbound == 0 else "resolved_rows_without_reverified_v3_binding"
+        ),
+    }
+
+
 def dependence_block(rows: Iterable[Any]) -> dict[str, Any]:
     """Object-space dependence counters for constructed forecast rows.
 
@@ -386,9 +461,9 @@ def dependence_block(rows: Iterable[Any]) -> dict[str, Any]:
         "packet_event_non_null_window_cluster_count": non_null_window_clusters,
         "market_event_cluster_count": market_clusters,
         "market_event_unclusterable_count": market_unclusterable,
-        "provisional_effective_sample": market_clusters,
-        "provisional_effective_sample_basis": PROVISIONAL_EFFECTIVE_SAMPLE_BASIS,
-        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+        "provisional_market_event_cluster_count": market_clusters,
+        "effective_sample_count": None,
+        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
         "raw_resolved_rows_are_independent_observations": False,
         "influence_weighting_status": INFLUENCE_WEIGHTING_STATUS_LEGACY,
     }
@@ -439,8 +514,9 @@ def build_reconciliation_receipt(
     ledger_bytes: bytes,
     *,
     summary_payload: Any = None,
+    source_bound_verifier: object | None = None,
 ) -> dict[str, Any]:
-    """Reconcile one captured ledger byte snapshot into a v1 receipt.
+    """Reconcile one captured ledger byte snapshot into a v2 receipt.
 
     Records are split on LF bytes with one trailing CR tolerated for CRLF and
     strictly UTF-8 decoded individually; decode failures are corrupt without
@@ -497,6 +573,7 @@ def build_reconciliation_receipt(
             conflicting_forecast_id_count += 1
 
     resolved_raw = [row for row in valid_raw if row.get("resolved") is True]
+    pending_raw = [row for row in valid_raw if row.get("resolved") is False]
     packet_clusters, packet_unclusterable = _cluster_counts(
         resolved_raw, packet_event_key
     )
@@ -533,6 +610,16 @@ def build_reconciliation_receipt(
         "duplicate_forecast_id_row_count": duplicate_forecast_id_row_count,
         "conflicting_forecast_id_count": conflicting_forecast_id_count,
         "resolved_row_count": len(resolved_raw),
+        "pending_row_count": len(pending_raw),
+        "resolved_high_quality_count": sum(
+            row.get("label_quality") == "high" for row in resolved_raw
+        ),
+        "resolved_degraded_quality_count": sum(
+            row.get("label_quality") == "degraded" for row in resolved_raw
+        ),
+        "resolved_suspect_quality_count": sum(
+            row.get("label_quality") == "suspect" for row in resolved_raw
+        ),
         "packet_event_cluster_count": packet_clusters,
         "packet_event_unclusterable_count": packet_unclusterable,
         "packet_event_null_window_resolved_row_count": len(explicit_null_window_rows),
@@ -540,9 +627,9 @@ def build_reconciliation_receipt(
         "packet_event_non_null_window_cluster_count": non_null_window_cluster_count,
         "market_event_cluster_count": market_clusters,
         "market_event_unclusterable_count": market_unclusterable,
-        "provisional_effective_sample": market_clusters,
-        "provisional_effective_sample_basis": PROVISIONAL_EFFECTIVE_SAMPLE_BASIS,
-        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_PROVISIONAL,
+        "provisional_market_event_cluster_count": market_clusters,
+        "effective_sample_count": None,
+        "effective_sample_status": EFFECTIVE_SAMPLE_STATUS_UNAVAILABLE,
         "raw_resolved_rows_are_independent_observations": False,
         "influence_weighting_status": INFLUENCE_WEIGHTING_STATUS_LEGACY,
         "summary_freshness": evaluate_summary_freshness(
@@ -553,6 +640,12 @@ def build_reconciliation_receipt(
             resolved_row_count=len(resolved_raw),
         ),
     }
+    receipt.update(
+        _verified_economic_identity_report(
+            resolved_raw,
+            source_bound_verifier=source_bound_verifier,
+        )
+    )
     receipt["receipt_sha256"] = hashlib.sha256(
         canonical_json_text(receipt).encode("utf-8")
     ).hexdigest()
@@ -584,6 +677,7 @@ def reconcile_ledger_file(
     ledger_path: str | Path,
     *,
     summary_path: str | Path | None = None,
+    source_bound_verifier: object | None = None,
 ) -> dict[str, Any]:
     """Reconcile a ledger path read-only, capturing its bytes exactly once.
 
@@ -621,7 +715,11 @@ def reconcile_ledger_file(
                 raise SummaryReadError(f"could not read summary {summary_file}: {exc}") from exc
             if summary_bytes is not None:
                 summary_payload = _decoded_summary_payload(summary_bytes)
-    return build_reconciliation_receipt(ledger_data, summary_payload=summary_payload)
+    return build_reconciliation_receipt(
+        ledger_data,
+        summary_payload=summary_payload,
+        source_bound_verifier=source_bound_verifier,
+    )
 
 
 def _paths_equivalent(first: Path, second: Path, *, strict: bool = False) -> bool:

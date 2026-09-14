@@ -1,5 +1,6 @@
 # TradingAgents/graph/setup.py
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ from langgraph.prebuilt import ToolNode
 from langgraph.types import Send
 
 from tradingagents.agents import *
+from tradingagents.agents.analysts.retained_analyst import create_retained_analyst
 from tradingagents.agents.utils.agent_states import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
@@ -33,6 +35,7 @@ class GraphSetup:
         tool_free_analysts: set[str] | None = None,
         ledger_root: str | Path = "results/control_plane/decisions",
         evidence_root: str | Path = "results",
+        retained_analyst_context: str | None = None,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -43,6 +46,17 @@ class GraphSetup:
         self.tool_free_analysts = tool_free_analysts or set()
         self.ledger_root = Path(ledger_root)
         self.evidence_root = Path(evidence_root)
+        self.retained_analyst_context = retained_analyst_context
+        if retained_analyst_context is not None:
+            if type(retained_analyst_context) is not str:
+                raise ValueError("retained_analyst_context must be text or None")
+            if tool_nodes:
+                raise ValueError("retained analyst mode cannot register tool nodes")
+            if not self.ledger_root.is_absolute() or not self.evidence_root.is_absolute():
+                raise ValueError("retained analyst mode requires explicit absolute destinations")
+            ledger, evidence = self.ledger_root.resolve(), self.evidence_root.resolve()
+            if ledger == evidence or not ledger.is_relative_to(evidence):
+                raise ValueError("retained analyst ledger must be inside its evidence destination")
 
     def setup_graph(
         self, selected_analysts=None
@@ -63,6 +77,13 @@ class GraphSetup:
             selected_analysts,
             concurrency_limit=self.analyst_concurrency_limit,
         )
+        if self.retained_analyst_context is not None:
+            retained_specs = {spec.key: replace(spec, tool_node=None) for spec in plan.specs}
+            plan = replace(
+                plan,
+                specs=[retained_specs[spec.key] for spec in plan.specs],
+                batches=[[retained_specs[spec.key] for spec in batch] for batch in plan.batches],
+            )
 
         analyst_factories = {
             "market": lambda: (
@@ -82,6 +103,15 @@ class GraphSetup:
                 else create_fundamentals_analyst(self.quick_thinking_llm)
             ),
         }
+        if self.retained_analyst_context is not None:
+            # Only analyst inputs differ. Retain the real researcher, manager,
+            # trader, risk, portfolio-manager and packet topology below.
+            analyst_factories = {
+                spec.key: lambda key=spec.key: create_retained_analyst(
+                    self.quick_thinking_llm, key, self.retained_analyst_context,
+                )
+                for spec in plan.specs
+            }
 
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(self.quick_thinking_llm)

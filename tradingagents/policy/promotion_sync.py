@@ -356,6 +356,10 @@ def build_current_readiness_packet(
         captured_at=now,
     )
     manifest = schedule_contract_snapshot_manifest(snapshot)
+    if manifest.get("contract", {}).get("sha256") != expected_schedule_contract_sha256:
+        raise ValueError("captured schedule contract digest mismatch")
+    if manifest.get("role_contract", {}).get("sha256") != expected_role_contract_sha256:
+        raise ValueError("captured role contract digest mismatch")
     schedule = evaluate_schedule_contract(
         deployment_phase=PREDEPLOYMENT_PAUSED_PHASE,
         captured_snapshot=snapshot,
@@ -386,6 +390,30 @@ def build_current_readiness_packet(
             automation_sources, key=lambda item: str(item.get("automation_id"))
         )
     ]
+    # Recheck the exact evidence used above once at the packet boundary. This
+    # is not an atomic filesystem snapshot or ongoing monitoring: any observed
+    # change invalidates this attempt instead of returning stale current claims.
+    retained_sources = [
+        (receipt_path, _sha256(completed_bytes), "completed supersession receipt"),
+        (prepared_path, _sha256(prepared_bytes), "prepared supersession receipt"),
+        (go_path, _sha256(go_bytes), "historical GO packet"),
+        (tournament_path, _sha256(tournament_bytes), "expired tournament ledger"),
+        (state_path, state_sha256, "promotion state"),
+        (control_path, expected_live_control_sha256, "live control"),
+        (schedule_contract_file, expected_schedule_contract_sha256, "schedule contract"),
+        (role_contract_file, expected_role_contract_sha256, "role contract"),
+    ]
+    retained_sources.extend(
+        (Path(source["path"]), source["sha256"], "automation configuration")
+        for source in automation_sources
+    )
+    for retained_path, expected_digest, label in retained_sources:
+        try:
+            observed = _sha256(retained_path.read_bytes())
+        except OSError as exc:
+            raise ValueError(f"{label} changed during readiness") from exc
+        if observed != expected_digest:
+            raise ValueError(f"{label} changed during readiness")
     return {
         "schema_version": "trading_readiness_packet/v1",
         "generated_at": generated_at,
@@ -582,11 +610,19 @@ def supersede_legacy_readiness(
             tournament_bytes, now=now
         )
         current_bytes = state_path.read_bytes()
+        completed_before = (
+            _read_json_object(completed_path.read_bytes(), field="completed supersession receipt")
+            if completed_path.exists()
+            else None
+        )
+        if completed_before is not None and not prepared_path.exists():
+            raise ValueError("completed supersession receipt has no retained preparation")
 
         prepared: dict | None = None
         if prepared_path.exists():
+            prepared_bytes = prepared_path.read_bytes()
             prepared = _read_json_object(
-                prepared_path.read_bytes(), field="prepared supersession receipt"
+                prepared_bytes, field="prepared supersession receipt"
             )
             if (
                 prepared.get("schema_version") != "1.0.0"
@@ -690,20 +726,8 @@ def supersede_legacy_readiness(
                 "promotion_state_after_sha256": _sha256(after_bytes),
             }
             _write_immutable_json(prepared_path, prepared)
+            prepared_bytes = json.dumps(prepared, indent=2, sort_keys=True).encode("utf-8")
 
-        if current_bytes == before_bytes:
-            # The lock is already held, so use the trusted writer's explicitly
-            # unlocked seam rather than creating an independent state writer.
-            _write_promotion_state_unlocked(state_path, decisions, now=operation_now)
-        written_bytes = state_path.read_bytes()
-        if written_bytes != after_bytes:
-            raise ValueError("trusted promotion replacement did not match prepared state")
-        if _sha256(go_path.read_bytes()) != expected_go_packet_sha256:
-            raise ValueError("historical GO packet changed during supersession")
-        if _sha256(tournament_path.read_bytes()) != expected_expired_tournament_sha256:
-            raise ValueError("expired tournament ledger changed during supersession")
-
-        prepared_sha256 = _sha256(prepared_path.read_bytes())
         completed = {
             "schema_version": "1.0.0",
             "status": "completed",
@@ -716,10 +740,31 @@ def supersede_legacy_readiness(
             "artifacts": expected_artifacts,
             "prepared_receipt": {
                 "path": str(prepared_path),
-                "sha256": prepared_sha256,
+                "sha256": _sha256(prepared_bytes),
             },
             "promotion_state_after_sha256": _sha256(after_bytes),
         }
+        # Completed evidence is read-only retry evidence, never permission to
+        # reapply a transition after rollback or repair a foreign receipt.
+        if completed_before is not None and (
+            completed_before != completed or current_bytes != after_bytes
+        ):
+            raise ValueError("completed supersession receipt is foreign or its state rolled back")
+        if prepared_path.read_bytes() != prepared_bytes:
+            raise ValueError("prepared supersession receipt changed before replacement")
+        if current_bytes == before_bytes:
+            # The lock is already held, so use the trusted writer's explicitly
+            # unlocked seam rather than creating an independent state writer.
+            _write_promotion_state_unlocked(state_path, decisions, now=operation_now)
+        written_bytes = state_path.read_bytes()
+        if written_bytes != after_bytes:
+            raise ValueError("trusted promotion replacement did not match prepared state")
+        if _sha256(go_path.read_bytes()) != expected_go_packet_sha256:
+            raise ValueError("historical GO packet changed during supersession")
+        if _sha256(tournament_path.read_bytes()) != expected_expired_tournament_sha256:
+            raise ValueError("expired tournament ledger changed during supersession")
+        if prepared_path.read_bytes() != prepared_bytes:
+            raise ValueError("prepared supersession receipt changed during replacement")
         if completed_path.exists():
             if _read_json_object(
                 completed_path.read_bytes(), field="completed supersession receipt"
