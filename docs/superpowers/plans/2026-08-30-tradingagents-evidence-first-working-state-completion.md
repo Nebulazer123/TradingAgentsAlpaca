@@ -23,7 +23,24 @@
 
 ## Current continuation — verified 2026-09-07
 
-**Latest source checkpoint — 2026-09-14, adjusted-price REST repair:** The first
+**Latest source checkpoint — 2026-09-14, final source gate accepted:** Clean
+canonical `81b7463cbfe612bdbb9c7c0f25b0a3e05a1349da` passed the single corrected
+complete gate: **5,005 tests and 75 subtests passed, one live-API test skipped**,
+11 disclosed warnings, plus all required statics. Session 24109 is terminal
+exit 0; its runner and pytest PIDs are absent. Source and protected owners were
+unchanged. The refreshed canonical index was checked for all 75 changed
+source/test paths: 73 match and two fixture paths remain intentionally excluded
+with direct source/test evidence. See
+[the final source checkpoint](../checkpoints/2026-09-14-final-source-gate.md)
+for exact receipt/hash identities, scope and remaining acceptance requirements.
+Do not continue polling or replay this accepted run for documentation changes.
+Real Task 6.2, research/economic qualification, actual legacy supersession and
+the future operational campaign remain open; no new external, model, holdout,
+paper-submit or automation authority is implied. Additional SEC/Alpaca universe
+collection remains the existing unanswered request. Preserve the full goal,
+frozen live control, ten PAUSED automations, captured data and both handoffs.
+
+**Earlier source checkpoint — 2026-09-14, adjusted-price REST repair:** The first
 full Phase 10 candidate `5771809` was deliberately stopped only after two new
 regressions demonstrated a route/body mismatch in the adjusted-price parser.
 Its final receipt records pytest exit -15 with unchanged source and protected
@@ -33,7 +50,7 @@ continuation-only pages; exact source/custody/economic guards remain. Eight
 synthetic literals were corrected without changing their data or assertions.
 The 13 new contract tests and seven-module 155-test affected gate pass. See
 [the repair checkpoint](../checkpoints/2026-09-14-adjusted-price-rest-contract.md).
-One corrected full source gate is still required before Phase 10 acceptance.
+The corrected full source gate subsequently passed as recorded above.
 The retained broad multi-symbol capture is still not an accepted adjusted-window
 input, and no actual learning, economic or operational qualification is claimed.
 
@@ -783,7 +800,7 @@ Do not change automation status. Prepare, but do not execute, the future activat
 - [ ] Existing learning ledger reaches a deterministic source-bound fixed point with suspect/degraded/dependence disclosures.
 - [ ] Minimum research-stack benchmark selects the simplest registered winning lane or records a valid no-model result.
 - [ ] July `GO`, old promotion state, and expired tournament are preserved and superseded; every sleeve is paper-only/live-disabled.
-- [ ] Final source candidate passes the single complete repository gate and is re-indexed.
+- [x] Final source candidate `81b7463` passes the single corrected complete repository gate and is re-indexed; exact scope/coverage is in the 2026-09-14 final source checkpoint. Real evidence and operational acceptance remain separate.
 - [ ] One clean qualifier and five clean trial sessions produce exactly one terminal non-authorizing readiness record.
 - [ ] `results/policy/live_control.json` still hashes to `a3fc5ddb...fb07`.
 - [ ] All ten TradingAgents automations are still `PAUSED` with the accepted hashes.
