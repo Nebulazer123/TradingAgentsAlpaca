@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import math
 import os
 import re
 import sqlite3
@@ -17,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from langchain_core.messages import BaseMessage, message_to_dict
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from tradingagents.dataflows.utils import safe_ticker_component
@@ -28,6 +30,34 @@ from tradingagents.graph.checkpoint_identity import (
 
 _IDENTITY_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+def _json_checkpoint_metadata(value: Any) -> Any:
+    """Encode message-bearing write metadata without changing typed state.
+
+    The locked SQLite saver JSON-encodes metadata separately from its typed
+    checkpoint serializer. LangGraph can include BaseMessage values in writes.
+    Keep their complete standard message envelope there; do not stringify
+    arbitrary objects, discard writes, or alter the serialized channel values.
+    """
+    if isinstance(value, BaseMessage):
+        return _json_checkpoint_metadata(message_to_dict(value))
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise ValueError("checkpoint metadata keys must be strings")
+        return {key: _json_checkpoint_metadata(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_checkpoint_metadata(item) for item in value]
+    if value is None or type(value) in (str, int, bool):
+        return value
+    if type(value) is float and math.isfinite(value):
+        return value
+    raise ValueError("checkpoint metadata contains an unsupported value")
+
+
+class _MessageMetadataSqliteSaver(SqliteSaver):
+    def put(self, config, checkpoint, metadata, new_versions):
+        return super().put(config, checkpoint, _json_checkpoint_metadata(metadata), new_versions)
 
 
 class CheckpointCustodyError(RuntimeError):
@@ -292,7 +322,7 @@ def get_checkpointer(data_dir: str | Path, ticker: str) -> Generator[SqliteSaver
     db = _db_path(data_dir, ticker)
     conn = _open_sqlite_connection(db, db.parent, check_same_thread=False)
     try:
-        saver = SqliteSaver(conn)
+        saver = _MessageMetadataSqliteSaver(conn)
         saver.setup()
         _secure_sqlite_files(db, db.parent)
         yield saver

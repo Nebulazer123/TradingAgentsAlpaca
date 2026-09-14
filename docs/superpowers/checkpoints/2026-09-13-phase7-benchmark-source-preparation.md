@@ -1,5 +1,90 @@
 # Phase 7 benchmark source preparation — 2026-09-13
 
+## Full-role adapter source checkpoint
+
+The source runner now implements the actual retained-only full graph. This is
+**source preparation, not real Task 7.1 qualification**. The earlier baseline
+sections below are historical; they do not describe the latest adapter as absent.
+Canonical integration requires the clean-source proof described below.
+
+New owners are `tradingagents/research/qualification_full_graph.py` (supplemental
+registration, all-case preflight, isolated graph execution and receipts) and
+`tradingagents/research/qualification_graph_model.py` (strict observed callbacks,
+structured roles and private response custody). The existing benchmark executor
+and CLI require explicit `--execute-openrouter --execute-full-graph`, an explicit
+supplemental registration, and a new isolated run root. Default scoring stays
+model-free. Deterministic and FTS prerequisites run first; a graph whose registered
+gain is unattainable is not invoked. No real execution was authorized or run.
+
+The immutable supplemental registration binds all 1,400 exact sorted case IDs to
+explicit stock/date context, the base registration, clean Git revision and lock.
+No ticker/date is inferred from a question, and the existing v4 base registration
+is not rewritten. Both graph variants bind identical model/pricing settings.
+Every source/no-text projection receives privacy preflight before any model
+client; each case binds its exact input, variant and isolated learning/decision
+predecessors into the accepted checkpoint identity. Concurrency remains 1;
+English, temperature 0, no SDK retries and required structured output are bound.
+Ambient non-English settings reject rather than being silently changed.
+
+The production analyst/researcher/manager/trader/risk/portfolio-manager topology
+executes twelve role calls and emits three linked analysis-only packets. The
+Portfolio Manager supplies `benchmark_answer` in its existing structured response;
+there is no extra answer model. Callback role order, outcome uniqueness, actual
+provider/model/revision/route, no fallback, tokens and derived cost are checked.
+All callbacks retain private `0600` LangChain message representations, not claimed
+original HTTP bodies, with exact file SHA-256 links in the case receipt. Returned
+and parsed answers must match the observed response. Sensitive final response
+fields reject before a successful case receipt. No old case is resumed/overwritten;
+failed namespaces remain for inspection.
+
+A real graph exposed a locked SQLite saver compatibility defect: metadata writes
+contained `AIMessage`, which its separate JSON encoder could not serialize.
+`tradingagents/graph/checkpointer.py` now converts message-bearing metadata to
+complete standard message envelopes, rejects unsupported/noncanonical values,
+and leaves typed checkpoint channel serialization unchanged. No dependency
+upgrade, discarded write metadata or old-checkpoint rewrite was used. Authority
+inventory has an exact local-SQLite classification for this `put` call; two
+unchanged CLI queue classifications moved to 6651/6663. Guards were not weakened.
+
+Verification on this source candidate:
+
+- Final nine-module affected gate: **341 passed in 32.10s**, exit 0, with two
+  existing AST invalid-escape warnings. Modules: research qualification/full graph,
+  checkpoint message metadata/resume/CLI/runtime identity, graph packet handoffs,
+  retained context and authority alignment. Canonical Python 3.13.14, feature
+  `PYTHONPATH`, `TA_LIVE_SUBMIT=0`, and `-m 'not integration and not network'`.
+  Receipt: canonical SDD `phase7-full-graph-source-gate-corrected-20260913.xml`.
+- Its preceding run had 340 pass and one unclassified local-SQLite occurrence;
+  adding the exact classification was the only intervening candidate change.
+- Response custody RED: three intended failures (missing files/hash links and
+  sensitive final response accepted); GREEN: three pass in 1.80s.
+- Earlier real-SDK 503 regression proved three unwanted automatic attempts;
+  all source/reviewer/full-graph factories now pass `max_retries=0` and
+  `temperature=0`, and source/reviewer prompt contracts include those settings.
+  Historical registrations/receipts remain immutable; newly executed lanes must
+  register the new contract. A two-failure intermediate run contained only stale
+  factory-argument expectations, since corrected without changing production.
+- Scoped nine-path Ruff, five-source compileall, offline `uv lock --check`, and
+  `git diff --check` passed. The lock hash remains
+  `3467e3497c8bf436ef9a4f939ccf0d4460906c61268565d6e275b21cb41413d2`.
+
+The 1,400-case CLI test preserves the full minimums and executes both 2,800-case
+lane orchestrations using synthetic responses; its per-case graph executor alone
+is stubbed. Separate tests execute both actual twelve-role graphs with production
+client/HTTP mock transport, real SQLite and packet stores. Their source-revision
+probe is mocked, so a separate exact-clean-Git proof is required before integration.
+No synthetic result is presented as a real registered corpus or model evaluation.
+
+Solo source/quality/security review covered context and source binding, no answer
+key projection, all-case privacy, default-off execution, isolated destinations,
+actual callback/parsed-response consistency, no hidden retry, packet authentication
+and immutable checkpoint evidence. No independent reviewer or subagent was used.
+Cost budgets currently govern lane selection, not authorization or a guaranteed
+pre-call spending ceiling; real execution must remain held until the separate
+model/spend controls and genuine corpus prerequisites are satisfied.
+
+## Earlier combined baseline
+
 This is an isolated source checkpoint, **not completed Task 7.1 or Phase 7
 acceptance**. Reviewed benchmark source `d907483` is combined with accepted
 canonical `1c502e8` in the existing benchmark worktree. Canonical integration

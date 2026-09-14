@@ -1489,6 +1489,18 @@ def research_stack_benchmark(
         "--execute-reviewer",
         help="With --execute-openrouter, also run the registered distinct-model pair on ambiguous cases only.",
     ),
+    execute_full_graph: bool = typer.Option(
+        False, "--execute-full-graph",
+        help="With --execute-openrouter, run the registered retained-only full graph pair only if simpler lanes leave attainable gain.",
+    ),
+    full_graph_registration_path: Path | None = typer.Option(
+        None, "--full-graph-registration-path", exists=True, readable=True,
+        help="Supplemental registration binding exact per-case stock/date context and source revision.",
+    ),
+    full_graph_run_root: Path | None = typer.Option(
+        None, "--full-graph-run-root",
+        help="New isolated run directory, separate from the retained artifact root; existing runs are never overwritten.",
+    ),
 ):
     """Score lane evidence, optionally executing a registered OpenRouter pair."""
     try:
@@ -1496,6 +1508,18 @@ def research_stack_benchmark(
             raise ResearchQualificationBenchmarkError(
                 "Reviewer execution requires --execute-openrouter"
             )
+        if execute_full_graph and not execute_openrouter:
+            raise ResearchQualificationBenchmarkError("Full-graph execution requires --execute-openrouter")
+        if execute_full_graph != (full_graph_registration_path is not None and full_graph_run_root is not None) or (
+            not execute_full_graph and (full_graph_registration_path is not None or full_graph_run_root is not None)
+        ):
+            raise ResearchQualificationBenchmarkError("Full-graph execution requires its explicit registration and new run root")
+        if execute_openrouter:
+            destination = output_path.expanduser().absolute()
+            if destination.exists() or destination.is_symlink() or destination.resolve().is_relative_to(artifact_root.resolve()):
+                raise ResearchQualificationBenchmarkError("Model execution requires a new output path outside source artifacts")
+            if full_graph_run_root is not None and destination.resolve().is_relative_to(full_graph_run_root.resolve()):
+                raise ResearchQualificationBenchmarkError("Benchmark output must be outside the full-graph run namespace")
         registration = json.loads(registration_path.read_text(encoding="utf-8"))
         lane_results = json.loads(lane_results_path.read_text(encoding="utf-8"))
         if execute_openrouter:
@@ -1508,6 +1532,9 @@ def research_stack_benchmark(
                 deterministic_result=lane_results[0],
                 artifact_root=artifact_root,
                 execute_reviewer=execute_reviewer,
+                execute_full_graph=execute_full_graph,
+                full_graph_registration=(json.loads(full_graph_registration_path.read_text(encoding="utf-8")) if full_graph_registration_path is not None else None),
+                full_graph_run_root=full_graph_run_root,
             )
         else:
             receipt = run_registered_research_benchmark(

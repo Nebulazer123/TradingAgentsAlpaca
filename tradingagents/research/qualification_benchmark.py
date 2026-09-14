@@ -38,9 +38,9 @@ def _digest(value: object) -> str:
 
 
 OPENROUTER_INSTRUCTION = "Answer the registered question using only the supplied retained source. Return only the answer."
-OPENROUTER_PROMPT_SHA256 = _digest({"instruction": OPENROUTER_INSTRUCTION, "shape": ["case", "retained_source"]})
+OPENROUTER_PROMPT_SHA256 = _digest({"instruction": OPENROUTER_INSTRUCTION, "shape": ["case", "retained_source"], "temperature": 0, "max_retries": 0})
 REVIEWER_INSTRUCTION = "Independently resolve the registered ambiguous question using only the supplied retained source. Return only the answer."
-REVIEWER_PROMPT_SHA256 = _digest({"instruction": REVIEWER_INSTRUCTION, "shape": ["case", "retained_source"]})
+REVIEWER_PROMPT_SHA256 = _digest({"instruction": REVIEWER_INSTRUCTION, "shape": ["case", "retained_source"], "temperature": 0, "max_retries": 0})
 
 
 def _map(value: object, fields: set[str], label: str) -> dict[str, object]:
@@ -598,9 +598,16 @@ def execute_registered_openrouter_benchmark(
     artifact_root: str | Path,
     llm_factory: Callable[..., object] | None = None,
     execute_reviewer: bool = False,
+    execute_full_graph: bool = False,
+    full_graph_registration: object | None = None,
+    full_graph_run_root: str | Path | None = None,
 ) -> dict[str, object]:
-    """Execute registered OpenRouter pairs after local admission; no graph calls."""
+    """Execute registered model pairs after local admission, graph only explicitly."""
     frozen = _registration(registration)
+    if execute_full_graph != (full_graph_registration is not None and full_graph_run_root is not None) or (
+        not execute_full_graph and (full_graph_registration is not None or full_graph_run_root is not None)
+    ):
+        raise ResearchQualificationBenchmarkError("full-graph execution requires its explicit registration and new run root")
     local_receipt = run_registered_research_benchmark(
         registration=frozen, lane_results=[deterministic_result], artifact_root=artifact_root,
     )
@@ -611,6 +618,8 @@ def execute_registered_openrouter_benchmark(
             "status": "not_run",
             "reason": "registered_accuracy_gain_unattainable",
         }
+        if execute_full_graph:
+            local_receipt["full_graph_execution"] = {"status": "not_run", "reason": "registered_accuracy_gain_unattainable", **AUTHORITY}
         local_receipt["receipt_id"] = local_receipt["receipt_sha256"] = None
         digest = _digest(local_receipt)
         local_receipt["receipt_id"] = f"research-qualification-benchmark-{digest}"
@@ -657,11 +666,21 @@ def execute_registered_openrouter_benchmark(
             "status": "not_run",
             "reason": "registered_accuracy_gain_unattainable",
         }
+        if execute_full_graph:
+            local_receipt["full_graph_execution"] = {"status": "not_run", "reason": "registered_accuracy_gain_unattainable", **AUTHORITY}
         local_receipt["receipt_id"] = local_receipt["receipt_sha256"] = None
         digest = _digest(local_receipt)
         local_receipt["receipt_id"] = f"research-qualification-benchmark-{digest}"
         local_receipt["receipt_sha256"] = digest
         return local_receipt
+    prepared_graph = None
+    if execute_full_graph:
+        from tradingagents.research.qualification_full_graph import prepare_full_graph_execution
+
+        prepared_graph = prepare_full_graph_execution(
+            research_registration=frozen, graph_registration=full_graph_registration,
+            artifact_root=root, run_root=full_graph_run_root,
+        )
     lane_ids = ["openrouter_source_bound", "openrouter_source_bound_no_text"]
     ambiguous = {cid: case for cid, case in cases.items() if case["ambiguous"]}
     if execute_reviewer and ambiguous:
@@ -696,7 +715,7 @@ def execute_registered_openrouter_benchmark(
         spec = frozen["lane_specs"][lane_id]
         is_reviewer = lane_id.startswith("different_model_reviewer")
         selected_cases = ambiguous if is_reviewer else cases
-        client = llm_factory(provider="openrouter", model=spec["model"])
+        client = llm_factory(provider="openrouter", model=spec["model"], temperature=0, max_retries=0)
         llm = client.get_llm()  # type: ignore[attr-defined]
         outputs, input_tokens, output_tokens, latency_ms, outcome_ids = [], 0, 0, 0, []
         for case_id in sorted(selected_cases):
@@ -749,7 +768,26 @@ def execute_registered_openrouter_benchmark(
         )
     captured_by_id = {lane_id: {str(row["case_id"]): row for row in rows} for lane_id, rows in captured.items()}
     adapters = {lane_id: (lambda case, _source, indexed=indexed: indexed[str(case["case_id"])]) for lane_id, indexed in captured_by_id.items()}
-    return run_registered_research_benchmark(registration=frozen, lane_results=lane_results, artifact_root=root, lane_adapters=adapters)
+    receipt = run_registered_research_benchmark(registration=frozen, lane_results=lane_results, artifact_root=root, lane_adapters=adapters)
+    if prepared_graph is not None:
+        selected = next(row for row in receipt["lane_results"] if row["lane_id"] == receipt["selected_lane"])
+        if Decimal(selected["source_accuracy"]) + required_gain > 1:
+            execution = {"status": "not_run", "reason": "registered_accuracy_gain_unattainable", **AUTHORITY}
+        else:
+            from tradingagents.research.qualification_full_graph import execute_prepared_full_graph
+
+            graph_lanes, graph_outputs, execution = execute_prepared_full_graph(prepared_graph, llm_factory=llm_factory)
+            lane_results.extend(graph_lanes)
+            for lane_id, rows in graph_outputs.items():
+                indexed = {str(row["case_id"]): row for row in rows}
+                adapters[lane_id] = lambda case, _source, indexed=indexed: indexed[str(case["case_id"])]
+            receipt = run_registered_research_benchmark(registration=frozen, lane_results=lane_results, artifact_root=root, lane_adapters=adapters)
+        receipt["full_graph_execution"] = execution
+        receipt["receipt_id"] = receipt["receipt_sha256"] = None
+        digest = _digest(receipt)
+        receipt["receipt_id"] = f"research-qualification-benchmark-{digest}"
+        receipt["receipt_sha256"] = digest
+    return receipt
 
 
 def write_research_qualification_receipt(receipt: Mapping[str, object], path: str | Path) -> Path:

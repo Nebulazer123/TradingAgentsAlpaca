@@ -561,10 +561,10 @@ def _production_http_mutation_occurrences(
 _HTTP_MUTATION_CLASSIFICATIONS: dict[tuple[str, int, str, str], str] = {
     # These are deliberately exact source locations, rather than a module or
     # receiver allow-list.  A new raw write must get reviewed classification.
-    ("cli/main.py", 6624, "_overnight_ticker_process_main", "raw-http-put"): (
+    ("cli/main.py", 6651, "_overnight_ticker_process_main", "raw-http-put"): (
         "non-trading-local-process-result-queue"
     ),
-    ("cli/main.py", 6636, "_overnight_ticker_process_main", "raw-http-put"): (
+    ("cli/main.py", 6663, "_overnight_ticker_process_main", "raw-http-put"): (
         "non-trading-local-process-error-queue"
     ),
     ("tradingagents/brokers/alpaca.py", 72, "_AlpacaTransport.get_json", "raw-http-request"): (
@@ -575,6 +575,9 @@ _HTTP_MUTATION_CLASSIFICATIONS: dict[tuple[str, int, str, str], str] = {
     ),
     ("tradingagents/dataflows/_official_common.py", 368, "_request_json", "raw-http-post"): (
         "non-trading-external-official-research-post"
+    ),
+    ("tradingagents/graph/checkpointer.py", 60, "_MessageMetadataSqliteSaver.put", "raw-http-put"): (
+        "non-trading-local-sqlite-checkpoint-metadata-write"
     ),
     ("tradingagents/orchestration/n8n_api_sync.py", 171, "N8NDataTableApiClient.request", "raw-urllib-mutation-dispatch"): (
         "non-trading-external-n8n-data-table-generic-method-transport"

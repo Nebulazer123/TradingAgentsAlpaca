@@ -383,9 +383,9 @@ def test_openrouter_execution_uses_production_factory_telemetry_and_safe_pair(
         )
 
     receipt = execute_registered_openrouter_benchmark(registration=registration, deterministic_result=deterministic, artifact_root=root, llm_factory=factory, execute_reviewer=execute_reviewer)
-    expected_factories = [{"provider": "openrouter", "model": "registered-model"}] * 2
+    expected_factories = [{"provider": "openrouter", "model": "registered-model", "temperature": 0, "max_retries": 0}] * 2
     if reviewer_runs:
-        expected_factories += [{"provider": "openrouter", "model": "reviewer-model"}] * 2
+        expected_factories += [{"provider": "openrouter", "model": "reviewer-model", "temperature": 0, "max_retries": 0}] * 2
     assert factory_calls == expected_factories
     assert len(calls) == (2808 if reviewer_runs else 2800)
     assert all("expected_answer" not in call["case"] and "severity" not in call["case"] for call in calls)
@@ -555,7 +555,7 @@ def test_openrouter_executes_retained_fts_before_any_model_factory(tmp_path, mon
             llm_factory=factory,
         )
     assert retrieval_calls == ["fts5_bm25", "fts5_bm25"]
-    assert factory_calls == [{"provider": "openrouter", "model": "registered-model"}]
+    assert factory_calls == [{"provider": "openrouter", "model": "registered-model", "temperature": 0, "max_retries": 0}]
 
 
 def test_perfect_local_score_cannot_justify_any_model_calls(tmp_path):
@@ -642,7 +642,7 @@ def test_model_gain_uses_overall_accuracy_after_severity_gates_pass(tmp_path):
             registration=registration, deterministic_result=deterministic,
             artifact_root=root, llm_factory=factory,
         )
-    assert calls == [{"provider": "openrouter", "model": "registered-model"}]
+    assert calls == [{"provider": "openrouter", "model": "registered-model", "temperature": 0, "max_retries": 0}]
 
 
 def test_cli_writes_owner_only_verified_receipt(tmp_path):
