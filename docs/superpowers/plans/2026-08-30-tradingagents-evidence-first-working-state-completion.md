@@ -672,6 +672,68 @@ Do not purchase data, install a managed graph/vector database, add agents, fine-
 
 ---
 
+### Task 7.1 continuation: real source inputs, not fixture-only qualification
+
+The 2026-09-14 offline inventory binds 81 retained SEC HTML filings to 205,989
+original-byte spans. This is preparation, not the 1,400-case qualification corpus.
+See canonical SDD `benchmark-real-source-compatibility-20260914.md` and
+`results/research_benchmark_preparation/20260914-sec-span-inventory/verification.json`.
+The original case counts, media, source/no-text comparisons, severity thresholds,
+privacy and no-authority requirements remain unchanged.
+
+**Immediate source slice:** correct scalar JSON and shared-page retrieval
+semantics in `tradingagents/research/qualification_benchmark.py`, with focused
+coverage in `tests/test_research_qualification_source_inputs.py` and the existing
+`tests/test_research_qualification_benchmark.py` integration tests. Reuse the
+existing isolated benchmark worktree; do not change the running 76199c1 repair
+candidate or launch another broad verifier while that gate is active.
+
+**Interfaces remain unchanged:** `_extract(case, raw) -> str` consumes an exact
+retained source span and registered selector, never the answer key.
+`_bm25_answers(cases, sources) -> dict[str, str | None]` searches the complete
+retained source corpus and returns a per-question answer only for the matching
+retrieved source unit.
+
+- [x] Prove finite JSON decimals currently fail despite the source loader
+  returning `Decimal`. Cover positive/negative fractions, exponent notation,
+  negative zero, and retained source resource limits. Normalize using the
+  existing PIT decimal routine, without a float conversion or accepting booleans,
+  containers, null or nonfinite values.
+- [x] Prove two distinct registered questions on one original page currently
+  compete as duplicate indexed documents and one loses merely by case-ID order.
+  Index each `(artifact_sha256, byte_start, byte_end)` once; extract using the
+  current question's selector only after the returned unit matches its source.
+  Reject inconsistent bytes for one unit and keep genuinely distinct spans and
+  source artifacts distinct. Do not require artificial unique search tokens or
+  pad the corpus with duplicate pages.
+- [x] Run the two focused reproductions RED, the new source-input module GREEN,
+  then the affected benchmark/full-graph modules once on the corrected slice.
+  Reuse all unchanged prior broad evidence without claiming it covers new source.
+  Record solo review, exact candidate/source hashes and focused receipts; retain
+  the isolated branch pending the subsequent real-media work and phase gate.
+
+Source-slice evidence: seven RED failures became 16 GREEN passes; expanded
+source-input, registered benchmark and actual full-graph modules passed 72 tests
+in 42.26 seconds. Two actual retained SEC company-facts decimal selections reject
+on old source and match on corrected source; both questions retrieve correctly
+from their one shared original response. See
+`docs/superpowers/checkpoints/2026-09-14-benchmark-real-inputs.md`.
+This isolated source is not covered by the concurrent 76199c1 wrapper gate and
+has not been integrated or declared final-source/benchmark qualification.
+
+**Remaining real-media acceptance is still open:** the v4 direct extractor is
+JSON-only and rejects all 81 original HTML filings. A faithful raw-media or
+authenticated derivative route must bind original hashes, byte/page identity,
+transformation/version and source-visible content for every compared lane;
+preserve historical registrations; and handle genuine HTML tables/inline XBRL,
+PDF/image, repository documents and tool output. Expected answers stay separate
+from source preparation. XBRL context, unit, sign, scale, continuation and format
+must be derived from original bytes, not guessed from the ticker or inserted
+gold labels. Raw CSS page-break cues do not establish 500 distinct pages.
+Do not call the immediate numeric/retrieval fixes complete multimedia support.
+Real questions, checked labels, full registered media coverage and actual
+deterministic/FTS qualification remain required before any model execution.
+
 ## Phase 8 — Supersede stale readiness and promotion state
 
 ### Task 8.1: Add bounded legacy supersession
