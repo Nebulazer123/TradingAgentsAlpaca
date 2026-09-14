@@ -83,9 +83,11 @@ cd /Users/corbinfloyd/Documents/TradingAgents
 The complete pytest and Ruff commands are broad checkpoint gates, not per-edit
 defaults. Use the smallest affected test group while a behavior slice is changing.
 
-The local n8n runner listens on `127.0.0.1:8765`. Its launchd configuration and
-wrapper point to this repository root. Mac scheduled jobs use
-`scripts/mac/ta_job.sh`; installation lives in `scripts/mac/install_launchd.sh`.
+The local n8n runner listens on `127.0.0.1:8765`; its separate launchd service
+points to this repository root. The ten Codex job schedules are governed by
+`config/automation_schedule_contract.json` and call `scripts/mac/ta_job.sh` where
+specified. `scripts/mac/install_launchd.sh` is a retired, non-mutating entry point;
+do not use an old macOS timetable to bypass the canonical deployment gates.
 
 ## Configuration and Evidence
 
