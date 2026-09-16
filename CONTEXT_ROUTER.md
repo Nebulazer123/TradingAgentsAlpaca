@@ -1,11 +1,13 @@
 # TradingAgents Context Router
 
-> **Current canonical root (2026-08-10):**
-> `/Users/corbinfloyd/Documents/TradingAgents`. Begin with `START_HERE.md`, then
-> refresh compact context using
-> `.venv/bin/python scripts/automation_context_snapshot.py --write`. Older
-> Windows commands and dated status notes below are retained as operational
-> history; current Mac runtime evidence is authoritative for present state.
+> **Historical operational reference:** This file retains dated status notes
+> and commands for provenance. Labels such as “Current,” “Latest,” “Next gate,”
+> and old model/schedule/live-control claims below refer to their recorded dates;
+> they do not establish present state or authorize an action. Read only the
+> section relevant to a historical question. Start current work with `AGENTS.md`
+> and `START_HERE.md`; follow their conditional compact-context refresh rules.
+> The canonical root remains `/Users/corbinfloyd/Documents/TradingAgents`.
+> Fresh runtime evidence is authoritative for current operational state.
 
 Purpose: give Codex a compact starting point for recurring TradingAgents/Alpaca
 work without rereading the whole repo, old packets, or long handoff docs.

@@ -13,15 +13,20 @@ archives all live beneath this root.
 ## Session Start
 
 1. Run `pwd` and `git status --short --branch`.
-2. Read `START_HERE.md` and the current section of `CONTEXT_ROUTER.md`.
-3. Read `results/_context/latest-summary.json` and `results/_context/latest-flags.json`.
-4. Refresh compact context with `.venv/bin/python scripts/automation_context_snapshot.py --write`
-   only when those files are missing or stale, or when the task changes the
-   runtime/generated-packet inputs they summarize; then reread them.
-5. Open only the raw packet named by compact context when a flag calls for detail.
+2. Read `START_HERE.md` for workspace identity, then the source or guidance relevant to the task.
+3. For runtime, operational, or safety-sensitive work, read
+   `results/_context/latest-summary.json` and `results/_context/latest-flags.json`.
+   Open only the raw packet named by compact context when a flag calls for detail.
+4. When the authorized task needs a context refresh, use
+   `.venv/bin/python scripts/automation_context_snapshot.py --write` only if those
+   files are missing or stale, or the task changes the runtime/generated-packet
+   inputs they summarize; then reread them. A read-only audit does not require a write.
+5. Consult only the relevant section of `CONTEXT_ROUTER.md` for historical
+   operational context. Its dated status is not current authority.
 
 `results/_context/` is the fast index to runtime state. Timestamped files under
-`results/` are the supporting evidence.
+`results/` support it. Source-only work retains the safety-fingerprint practice
+below without loading unrelated operational history.
 
 ## Repository Map
 
@@ -89,6 +94,10 @@ wrapper point to this repository root. Mac scheduled jobs use
 
 ## Configuration and Evidence
 
+Keep research memory in local redacted packets. Zep remains disabled by the
+settled project decision; re-enable it only if the user explicitly changes that
+decision. This does not require a new memory service for ordinary work.
+
 Local credentials live in `.env` with mode `0600`. Local risk configuration may
 live in ignored configuration files. Versioned example files describe expected
 shape. Current operational state comes from the live files on disk, active
@@ -127,18 +136,11 @@ architecture queries reflect the checkout.
 
 ## Optional Ox Alpha Help
 
-Ox Alpha is optional external implementation/review help, not a default second
-orchestration layer. Use it only when one bounded Ox session replaces work the
-primary Codex task would otherwise perform: either one isolated implementation
-slice or one genuinely distinct checkpoint review. Do not use Ox as writer,
-fixer, verifier, and repeated acceptance reviewer on the same unchanged diff.
-
-When Ox is explicitly useful, use the verified direct model
-`oxalpha/x-preview-f-free` with variant `high`, exactly one writer, and at most
-one retry for a provider failure. Wait in one long interval, request a concise
-final checkpoint, and inspect the local diff and focused test receipt instead of
-streaming or rereading its full transcript. The primary verifier remains the
-single owner of affected tests for that revision.
+Use Ox only when the user explicitly requests it. Read
+`/Users/corbinfloyd/.codex/references/opencode-ox.md` for the current route,
+compatibility preflight, and safety boundaries. Keep one writer per worktree and
+one owner of affected tests for a revision; inspect the resulting diff and
+focused evidence.
 
 Keep source, tests, and durable documentation in Git. Keep generated results,
 credentials, environments, caches, and recovery archives in their established
