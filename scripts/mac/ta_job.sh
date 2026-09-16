@@ -68,7 +68,7 @@ case "$JOB" in
     run "$PY" scripts/mac/deliver_outbox.py
     ;;
   tournament)
-    run "$PY" -m cli.main alpaca paper-tournament run --all --json-output
+    run "$PY" -m cli.main alpaca paper-tournament run --all --dry-run --json-output
     ;;
   overnight)
     run "$PY" -m cli.main alpaca check
