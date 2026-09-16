@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -145,6 +146,329 @@ def default_automation_root() -> Path:
     if os.name == "nt":
         return Path(r"C:\cm\automations")
     return Path.home() / ".codex" / "automations"
+
+
+SCHEDULE_CONTRACT_REQUIRED_FIELDS = {
+    "role",
+    "allowed_status_phase",
+    "rrule",
+    "model",
+    "reasoning_effort",
+    "notification_policy",
+    "prompt_sha256",
+    "required_prompt_phrases",
+    "forbidden_prompt_phrases",
+    "expected_artifact_patterns",
+    "depends_on",
+    "no_submit",
+}
+
+SCHEDULE_DEPLOYMENT_PROOF_REQUIREMENTS = {
+    "contract_match",
+    "api_returned_next_run_central_and_utc",
+    "current_no_submit_shadow_evidence",
+    "current_artifact_health",
+}
+
+SENTINEL_ID = "tradingagents-autonomous-safety-sentinel"
+SUPERVISOR_ID = "tradingagents-market-supervisor"
+BOARD_ID = "tradingagents-autonomous-execution-board"
+EXECUTION_DEPENDENCY_MAX_GAP_MINUTES = {
+    (SENTINEL_ID, SUPERVISOR_ID): 30,
+    (SENTINEL_ID, BOARD_ID): 30,
+    (SUPERVISOR_ID, BOARD_ID): 30,
+}
+
+
+def _schedule_contract_failure(issue: str) -> dict[str, Any]:
+    """Return an explicitly non-authorizing contract evaluation result."""
+
+    return {
+        "status": "invalid_contract",
+        "contract_status": "fail",
+        "automation_count": 0,
+        "configured_count": 0,
+        "paused_count": 0,
+        "safe_predeployment": False,
+        "deployment_proven": False,
+        "issues": [issue],
+        "automations": [],
+    }
+
+
+def _schedule_contract_issues(contract: Any) -> list[str]:
+    if not isinstance(contract, Mapping):
+        return ["contract_unreadable"]
+    if contract.get("schema_version") != 1:
+        return ["contract_schema"]
+    if contract.get("kind") != "tradingagents_automation_schedule_contract":
+        return ["contract_kind"]
+    if contract.get("timezone") != "America/Chicago":
+        return ["contract_timezone"]
+    policy = contract.get("deployment_policy")
+    automations = contract.get("automations")
+    if not isinstance(policy, Mapping):
+        return ["contract_deployment_policy"]
+    if (
+        policy.get("allowed_status_phase") != "predeployment_paused"
+        or policy.get("safe_statuses") != ["PAUSED"]
+        or policy.get("paused_is_safe_but_not_deployed") is not True
+        or not isinstance(policy.get("deployment_proof_requires"), list)
+        or not SCHEDULE_DEPLOYMENT_PROOF_REQUIREMENTS.issubset(
+            set(policy["deployment_proof_requires"])
+        )
+    ):
+        return ["contract_deployment_policy"]
+    if not isinstance(automations, Mapping) or len(automations) != 10:
+        return ["contract_automation_count"]
+    issues: list[str] = []
+    for automation_id, record in automations.items():
+        if not isinstance(automation_id, str) or not automation_id.startswith("tradingagents-"):
+            issues.append("contract_automation_id")
+            continue
+        if not isinstance(record, Mapping):
+            issues.append("contract_automation_record")
+            continue
+        missing = SCHEDULE_CONTRACT_REQUIRED_FIELDS - set(record)
+        if missing:
+            issues.append("contract_automation_fields")
+            continue
+        if not all(
+            isinstance(record.get(field), str) and record[field]
+            for field in (
+                "role",
+                "allowed_status_phase",
+                "rrule",
+                "model",
+                "reasoning_effort",
+                "notification_policy",
+                "prompt_sha256",
+            )
+        ):
+            issues.append("contract_automation_scalar")
+        if not all(
+            isinstance(record.get(field), list)
+            and all(isinstance(item, str) and item for item in record[field])
+            for field in ("required_prompt_phrases", "forbidden_prompt_phrases", "expected_artifact_patterns", "depends_on")
+        ):
+            issues.append("contract_automation_lists")
+        if not isinstance(record.get("no_submit"), bool) or record["no_submit"] is not True:
+            issues.append("contract_no_submit")
+        if record.get("allowed_status_phase") != "predeployment_paused":
+            issues.append("contract_status_phase")
+    if issues:
+        return sorted(set(issues))
+
+    automation_ids = set(automations)
+    if (
+        SUPERVISOR_ID not in automation_ids
+        or SENTINEL_ID not in automation_ids
+        or BOARD_ID not in automation_ids
+        or SENTINEL_ID not in automations[SUPERVISOR_ID]["depends_on"]
+        or not {SENTINEL_ID, SUPERVISOR_ID}.issubset(
+            set(automations[BOARD_ID]["depends_on"])
+        )
+    ):
+        issues.append("contract_required_dependencies")
+    for _automation_id, record in automations.items():
+        if not set(record["depends_on"]).issubset(automation_ids):
+            issues.append("contract_unknown_dependency")
+    dependency_graph = {
+        automation_id: set(record["depends_on"])
+        for automation_id, record in automations.items()
+    }
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def has_cycle(automation_id: str) -> bool:
+        if automation_id in visiting:
+            return True
+        if automation_id in visited:
+            return False
+        visiting.add(automation_id)
+        if any(has_cycle(dependency) for dependency in dependency_graph[automation_id]):
+            return True
+        visiting.remove(automation_id)
+        visited.add(automation_id)
+        return False
+
+    if not issues and any(has_cycle(automation_id) for automation_id in dependency_graph):
+        issues.append("contract_dependency_cycle")
+    if not issues:
+        scheduled_occurrences = {
+            automation_id: _contract_local_occurrences(record["rrule"])
+            for automation_id, record in automations.items()
+        }
+        for automation_id, dependencies in dependency_graph.items():
+            for dependency in dependencies:
+                dependency_occurrences = scheduled_occurrences[dependency]
+                dependent_occurrences = scheduled_occurrences[automation_id]
+                dependency_minutes = [minute for _day, minute in dependency_occurrences]
+                dependent_minutes = [minute for _day, minute in dependent_occurrences]
+                max_gap = EXECUTION_DEPENDENCY_MAX_GAP_MINUTES.get(
+                    (dependency, automation_id)
+                )
+                if (
+                    not dependency_minutes
+                    or not dependent_minutes
+                    or min(dependency_minutes) >= min(dependent_minutes)
+                    or max_gap is not None
+                    and any(
+                        not any(
+                            dependency_day == dependent_day
+                            and 0 < dependent_minute - dependency_minute <= max_gap
+                            for dependency_day, dependency_minute in dependency_occurrences
+                        )
+                        for dependent_day, dependent_minute in dependent_occurrences
+                    )
+                ):
+                    issues.append("contract_dependency_order")
+    return sorted(set(issues))
+
+
+def _contract_local_occurrences(rrule: str) -> list[tuple[int, int]]:
+    """Return every weekday and Central wall-clock minute in a weekly RRULE."""
+
+    rule = _parse_rrule(rrule)
+    hours = _int_list(rule.get("BYHOUR"), ())
+    minutes = _int_list(rule.get("BYMINUTE"), ())
+    weekdays = _weekday_list(rule.get("BYDAY"))
+    if not hours or not minutes or not weekdays:
+        return []
+    return sorted(
+        {
+            (weekday, hour * 60 + minute)
+            for weekday in weekdays
+            for hour in hours
+            for minute in minutes
+        }
+    )
+
+
+def evaluate_schedule_contract(
+    *,
+    contract_path: str | Path,
+    automation_root: str | Path | None = None,
+    role_contract_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Compare the ten external TOMLs to the versioned CT schedule contract.
+
+    This is a source-only read.  It deliberately does not infer deployment or
+    health from a paused record: next-run API evidence, fresh no-submit shadow
+    evidence, and current artifacts remain separate activation gates.
+    """
+
+    source = Path(contract_path)
+    try:
+        contract = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return _schedule_contract_failure("contract_unreadable")
+    issues = _schedule_contract_issues(contract)
+    if issues:
+        return _schedule_contract_failure(issues[0])
+
+    records = cast(Mapping[str, Mapping[str, Any]], contract["automations"])
+    root = Path(automation_root) if automation_root is not None else default_automation_root()
+    role_path = Path(role_contract_path) if role_contract_path is not None else source.parent / "automation_roles.json"
+    try:
+        role_document = json.loads(role_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        role_document = {}
+    assignments = role_document.get("automations") if isinstance(role_document, Mapping) else {}
+    if not isinstance(assignments, Mapping):
+        assignments = {}
+    rows: list[dict[str, Any]] = []
+    configured_count = 0
+    paused_count = 0
+    for automation_id in sorted(records):
+        expected = records[automation_id]
+        config_path = root / automation_id / "automation.toml"
+        actual = _read_toml(config_path)
+        mismatches: list[dict[str, Any]] = []
+        if not actual:
+            mismatches.append(
+                {"field": "automation_toml", "expected": "readable", "actual": "missing_or_invalid"}
+            )
+        else:
+            configured_count += 1
+            if _is_paused_config(actual):
+                paused_count += 1
+            for field in ("rrule", "model", "reasoning_effort", "notification_policy"):
+                if actual.get(field) != expected[field]:
+                    mismatches.append(
+                        {"field": field, "expected": expected[field], "actual": actual.get(field)}
+                    )
+            prompt = actual.get("prompt")
+            if not isinstance(prompt, str):
+                mismatches.append(
+                    {"field": "prompt", "expected": "nonempty_string", "actual": type(prompt).__name__}
+                )
+            else:
+                prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+                if prompt_digest != expected["prompt_sha256"]:
+                    mismatches.append(
+                        {"field": "prompt_sha256", "expected": expected["prompt_sha256"], "actual": prompt_digest}
+                    )
+                missing_phrases = [phrase for phrase in expected["required_prompt_phrases"] if phrase not in prompt]
+                forbidden_phrases = [phrase for phrase in expected["forbidden_prompt_phrases"] if phrase in prompt]
+                if missing_phrases or forbidden_phrases:
+                    mismatches.append(
+                        {
+                            "field": "prompt_semantic",
+                            "expected": {
+                                "required": expected["required_prompt_phrases"],
+                                "forbidden": expected["forbidden_prompt_phrases"],
+                            },
+                            "actual": {
+                                "missing_required": missing_phrases,
+                                "present_forbidden": forbidden_phrases,
+                            },
+                        }
+                    )
+            if expected["no_submit"] and str(actual.get("status") or "").upper() != "PAUSED":
+                mismatches.append(
+                    {
+                        "field": "no_submit_predeployment_status",
+                        "expected": "PAUSED",
+                        "actual": actual.get("status"),
+                    }
+                )
+        actual_role = assignments.get(automation_id)
+        if actual_role != expected["role"]:
+            mismatches.append(
+                {"field": "role", "expected": expected["role"], "actual": actual_role}
+            )
+        rows.append(
+            {
+                "automation_id": automation_id,
+                "role": expected["role"],
+                "allowed_status_phase": expected["allowed_status_phase"],
+                "status": "mismatch" if mismatches else "match",
+                "deployment_status": "not_deployed",
+                "config_status": actual.get("status") if actual else None,
+                "mismatches": mismatches,
+                "expected_artifact_patterns": expected["expected_artifact_patterns"],
+                "depends_on": expected["depends_on"],
+                "no_submit": expected["no_submit"],
+            }
+        )
+    known_ids = set(records)
+    discovered_ids = {path.parent.name for path in root.glob("tradingagents-*/automation.toml")}
+    unexpected_ids = sorted(discovered_ids - known_ids)
+    if unexpected_ids:
+        issues.append("unexpected_automation_ids")
+    return {
+        "status": "not_deployed",
+        "contract_status": "pass",
+        "automation_count": len(rows),
+        "configured_count": configured_count,
+        "paused_count": paused_count,
+        "safe_predeployment": configured_count == len(rows) and paused_count == len(rows),
+        "deployment_proven": False,
+        "issues": sorted(set(issues)),
+        "unexpected_automation_ids": unexpected_ids,
+        "automations": rows,
+    }
 
 
 def _coerce_count(value: Any, *, fallback: Any | None = None) -> int:
