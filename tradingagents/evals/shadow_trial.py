@@ -19,9 +19,12 @@ from __future__ import annotations
 import datetime as dt
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import os
+import re
 import stat
+import sys
 import threading
 import time
 from collections.abc import Iterator, Mapping
@@ -30,6 +33,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evals.automation_health_audit import (
     FROZEN_OBSERVER_ACTIVE_AUTOMATION_IDS,
     FROZEN_OBSERVER_PAUSED_AUTOMATION_IDS,
@@ -38,7 +42,13 @@ from tradingagents.evals.automation_health_audit import (
     evaluate_schedule_contract,
     schedule_contract_snapshot_manifest,
 )
+from tradingagents.evals.runtime_identity import (
+    RuntimeIdentityError,
+    capture_runtime_identity,
+    validate_runtime_identity,
+)
 from tradingagents.evals.safety_sentinel import broker_snapshot_shape_reasons
+from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
 from tradingagents.strategy._immutable_evidence_store import (
     MANUAL_SHADOW_DAY_RESULT_KIND,
     MANUAL_SHADOW_DAY_START_KIND,
@@ -58,6 +68,10 @@ START_SCHEMA = "manual_shadow_day_start_v1"
 DAY_SCHEMA = "manual_shadow_day_result_v1"
 REPORT_SCHEMA = "manual_shadow_final_report_v1"
 ARTIFACT_KEYS = ("safety_sentinel", "paper_tournament", "daily_chain_manifest")
+OPERATOR_ABORT_REASON = "shadow_day_aborted_by_operator"
+PENDING_DAY_EXPIRED_REASON = "pending_day_expired_without_adjudication"
+RUNTIME_IDENTITY_MISMATCH_REASON = "runtime_identity_mismatch"
+ABORT_NOTES_LIMIT = 500
 DAILY_CHAIN_STAGES = (
     "overnight_research",
     "premarket_brief",
@@ -86,6 +100,39 @@ DAILY_CHAIN_STAGE_KINDS = {
     "broker_reconciliation": "broker_reconciliation_observer",
     "paper_tournament": "paper_tournament_run",
 }
+# ``manifest_written`` is deliberately not a daily-chain producer stage.  It
+# names the interruption window after the chain manifest is sealed but before
+# its one permitted adjudication.
+SHADOW_DAY_STOP_STAGES = ("day_start", *DAILY_CHAIN_STAGES, "manifest_written")
+# Approved causal order of one shadow day, derived from the canonical frozen
+# automation schedule rather than the roster tuple above: overnight research,
+# morning brief, pre-open validation, then the sentinel bind (:20), hourly
+# dry-run (:35), loss review, BOARD (:50), self-heal handoff+plan (:03),
+# the in-session paper tick (:10), its reconciliation afterwards, and the
+# post-close daily report.  Manifest sealing and adjudication continue the
+# same nondecreasing sequence after ``daily_report``.
+DAILY_CHAIN_TEMPORAL_ORDER = (
+    "overnight_research",
+    "premarket_brief",
+    "preopen_validation",
+    "safety_sentinel",
+    "hourly_supervisor",
+    "loss_review",
+    "execution_board",
+    "self_heal_handoff",
+    "self_heal_plan",
+    "paper_tournament",
+    "broker_reconciliation",
+    "daily_report",
+)
+# Producer-precision exception: one self-healer automation run emits both
+# packets back-to-back within the same process, so identical second-resolution
+# stamps are a genuine tie.  Every other consecutive pair crosses separately
+# scheduled producers, whose equal stamps would be coincidence, not semantics.
+_DAILY_CHAIN_LEGITIMATE_TIES = frozenset({("self_heal_handoff", "self_heal_plan")})
+# Exchange wall-time zone used by the admitted calendar's HH:MM open/close
+# fields (mirrors the paper-tournament lease convention).
+_EXCHANGE_TZ = ZoneInfo("America/New_York")
 
 
 def _has_nonempty_error(value: object) -> bool:
@@ -598,6 +645,7 @@ _START_FIELDS = frozenset(
         "live_control",
         "schedule",
         "calendar",
+        "runtime_identity",
     }
 )
 _DAY_FIELDS = frozenset(
@@ -613,8 +661,12 @@ _DAY_FIELDS = frozenset(
         "live_control",
         "schedule",
         "calendar",
+        "runtime_identity",
         "artifacts",
         "reasons",
+        "closure_kind",
+        "stopped_at_stage",
+        "notes",
     }
 )
 _REPORT_FIELDS = frozenset(
@@ -775,6 +827,117 @@ def _canonical_role_contract_path() -> Path:
 
 def _canonical_automation_root() -> Path:
     return Path("/Users/corbinfloyd/.codex/automations")
+
+
+_RUNTIME_IDENTITY_REQUIRED_FILES = (
+    "pyproject.toml",
+    "uv.lock",
+    "requirements.txt",
+    "requirements-crawler.txt",
+)
+_OVERNIGHT_ROUTE_SOURCES: tuple[tuple[str, str, str], ...] = (
+    ("llm_provider", "TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER", "llm_provider"),
+    ("quick_think_llm", "TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM", "quick_think_llm"),
+    ("deep_think_llm", "TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM", "deep_think_llm"),
+)
+_CUSTOM_MODEL_PLACEHOLDER = "custom"
+
+
+def _installed_package_inventory() -> list[str]:
+    """Deterministically list installed distributions as normalized name==version."""
+
+    entries: set[str] = set()
+    for distribution in importlib.metadata.distributions():
+        raw_name = distribution.metadata.get("Name")
+        raw_version = distribution.version
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            continue
+        if not isinstance(raw_version, str) or not raw_version.strip():
+            continue
+        normalized = re.sub(r"[-_.]+", "-", raw_name).strip().lower()
+        if not normalized:
+            continue
+        entries.add(f"{normalized}=={raw_version.strip().lower()}")
+    return sorted(entries)
+
+
+def _allowlisted_overnight_route() -> dict[str, str]:
+    """Resolve the configured overnight model route for runtime identity.
+
+    Each name follows the existing overnight routing precedence (the
+    ``TRADINGAGENTS_OVERNIGHT_*`` environment variable first, then the shared
+    default configuration) and must be a catalog allowlisted
+    provider/quick-model/deep-model name.  This binds exactly the configured
+    route: backend URLs, CLI-only argument layers, health-probed auto-Ollama
+    model overrides, and disabled-graph fallbacks are resolved execution
+    inputs that this no-argument seam cannot observe, so they are deliberately
+    not part of the stored identity.
+    """
+
+    route: dict[str, str] = {}
+    for label, env_key, config_key in _OVERNIGHT_ROUTE_SOURCES:
+        raw = os.environ.get(env_key)
+        value = raw if raw else str(DEFAULT_CONFIG.get(config_key, ""))
+        normalized = value.strip()
+        if not normalized:
+            raise RuntimeIdentityError(
+                f"overnight route {label} resolved to an empty model name"
+            )
+        route[label] = normalized
+    options = MODEL_OPTIONS.get(route["llm_provider"].lower())
+    if options is None:
+        raise RuntimeIdentityError(
+            f"overnight route provider {route['llm_provider']!r} is not allowlisted"
+        )
+    for label, mode in (
+        ("quick_think_llm", "quick"),
+        ("deep_think_llm", "deep"),
+    ):
+        allowed = {
+            name for _, name in options.get(mode, []) if name != _CUSTOM_MODEL_PLACEHOLDER
+        }
+        if route[label] not in allowed:
+            raise RuntimeIdentityError(
+                f"overnight route {label} {route[label]!r} is not allowlisted"
+            )
+    return route
+
+
+def _runtime_identity_capture() -> dict[str, object]:
+    """Private production seam capturing strict runtime identity.
+
+    Binds exactly this task worktree with its required lockfiles, the canonical
+    schedule/role contracts and frozen live control, all ten canonical
+    automation TOMLs under the external automation root boundary, the current
+    Python executable plus its normalized installed inventory, the allowlisted
+    overnight model route, and the pinned shadow-day schema constants.  Any
+    dirty, missing, symlinked, or non-allowlisted input raises
+    ``RuntimeIdentityError`` instead of producing a weaker identity.
+    """
+
+    root = _repo_root()
+    automations_root = _absolute(_canonical_automation_root())
+    return capture_runtime_identity(
+        repo_root=root,
+        required_files={name: root / name for name in _RUNTIME_IDENTITY_REQUIRED_FILES},
+        schedule_contract=_canonical_schedule_contract_path(),
+        role_contract=_canonical_role_contract_path(),
+        automation_tomls={
+            automation_id: automations_root / automation_id / "automation.toml"
+            for automation_id in sorted(EXPECTED_AUTOMATION_IDS)
+        },
+        live_control=_canonical_live_control_path(),
+        provider_routes={},
+        schema_versions={
+            "manual_shadow_day_start": START_SCHEMA,
+            "manual_shadow_day_result": DAY_SCHEMA,
+            "manual_shadow_final_report": REPORT_SCHEMA,
+        },
+        python_executable=sys.executable,
+        package_inventory=_installed_package_inventory(),
+        overnight_route=_allowlisted_overnight_route(),
+        automation_root=automations_root,
+    )
 
 
 def _as_utc(value: dt.datetime) -> dt.datetime:
@@ -1844,6 +2007,74 @@ def _valid_schedule_binding(value: object) -> bool:
     )
 
 
+def _validated_stored_runtime_identity(value: object, *, label: str) -> dict[str, object]:
+    """Strictly validate a stored runtime identity without recapturing anything."""
+
+    try:
+        return validate_runtime_identity(_plain_json(value))
+    except RuntimeIdentityError as exc:
+        raise ValueError(f"{label} runtime identity is invalid: {exc}") from exc
+
+
+def _captured_runtime_identity() -> dict[str, object]:
+    """Capture one fresh strict runtime identity; any failure refuses loudly."""
+
+    try:
+        return validate_runtime_identity(_runtime_identity_capture())
+    except RuntimeIdentityError as exc:
+        raise ValueError(f"runtime identity capture refused: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - identity capture must fail closed.
+        raise ValueError(f"runtime identity capture failed: {type(exc).__name__}") from exc
+
+
+def _schedule_source_digests(schedule: object) -> dict[str, object] | None:
+    """Project raw-byte contract/role/TOML digests from one schedule binding."""
+
+    if not isinstance(schedule, Mapping):
+        return None
+    source = _schedule_configuration_identity(schedule.get("source_manifest"))
+    if source is None:
+        return None
+    return {
+        "schedule_contract_sha256": source["contract"]["sha256"],
+        "role_contract_sha256": source["role_contract"]["sha256"],
+        "automation_tomls_sha256": {
+            str(row["automation_id"]): row["sha256"]
+            for row in source["automation_tomls"]
+        },
+    }
+
+
+def _identity_binds_authority_sources(
+    identity: Mapping[str, object] | None,
+    *,
+    control: object,
+    schedule: object,
+) -> bool:
+    """True only when identity digests match these exact authority-source bindings."""
+
+    if not isinstance(control, Mapping) or not isinstance(identity, Mapping):
+        return False
+    digests = _schedule_source_digests(schedule)
+    if digests is None:
+        return False
+    automation_digests = identity.get("automation_tomls_sha256")
+    return (
+        identity.get("live_control_sha256") == control.get("sha256")
+        and identity.get("schedule_contract_sha256")
+        == digests["schedule_contract_sha256"]
+        and identity.get("role_contract_sha256") == digests["role_contract_sha256"]
+        and isinstance(automation_digests, Mapping)
+        and _plain_json(automation_digests) == digests["automation_tomls_sha256"]
+    )
+
+
+def _predecessor_runtime_identity(days: tuple[EvidenceEnvelope, ...]) -> object | None:
+    """Stored immediate predecessor-day identity; replay never recaptures."""
+
+    return days[-1].payload.get("runtime_identity") if days else None
+
+
 def _capture_calendar_evidence(market_date: str) -> dict[str, object]:
     """Capture the canonical read-only calendar response inside Task 3.
 
@@ -1984,6 +2215,273 @@ def _paper_order_ids(payload: Mapping[str, object]) -> list[str]:
     return ids
 
 
+_PAPERBOT_CLIENT_ORDER_PREFIX = "ta-paperbot-"
+_RECONCILIATION_TERMINAL_ORDER_STATUSES = frozenset(
+    {"filled", "canceled", "expired", "rejected"}
+)
+
+
+def _reconciliation_tournament_entries(snapshot: object, *keys: str) -> list[Mapping] | None:
+    """Collect ta-paperbot-* order mappings from named snapshot lists.
+
+    Binding needs positive evidence: every named list must be present in the
+    snapshot mapping, be a list/tuple, and contain only Mapping items.
+    Returns None when any of that fails so callers treat it as invalid
+    evidence instead of silently assuming a proven empty set.
+    """
+
+    if not isinstance(snapshot, Mapping):
+        return None
+    collected: list[Mapping] = []
+    for key in keys:
+        if key not in snapshot:
+            return None
+        entries = snapshot[key]
+        if not isinstance(entries, (list, tuple)):
+            return None
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                return None
+            client_order_id = entry.get("client_order_id")
+            if (
+                isinstance(client_order_id, str)
+                and client_order_id.startswith(_PAPERBOT_CLIENT_ORDER_PREFIX)
+            ):
+                collected.append(entry)
+    return collected
+
+
+def _manifest_reconciliation_binding_reasons(
+    paper_payload: object,
+    reconciliation_payload: object,
+) -> list[str]:
+    """Prove one-to-one identity between paper orders and the post-paper snapshot.
+
+    Every ``ta-paperbot-*`` order in the paper packet must appear exactly once
+    in the reconciliation's full paper-order evidence with the matching broker
+    id, client order id, symbol, side, type, and creation timestamp; matched
+    orders must be terminal; and the reconciliation capture must follow the
+    last paper submission.  Any defect is incomplete — never clean.  A day
+    that legitimately produced no tournament signal stays clean only when
+    valid complete order evidence explicitly proves no tournament orders.
+    """
+
+    reasons: list[str] = []
+    if not isinstance(paper_payload, Mapping) or not isinstance(reconciliation_payload, Mapping):
+        return reasons
+    submitted = paper_payload.get("submitted")
+    packet_orders = [
+        item
+        for item in (submitted if isinstance(submitted, (list, tuple)) else ())
+        if isinstance(item, Mapping)
+        and isinstance(item.get("client_order_id"), str)
+        and item["client_order_id"].startswith(_PAPERBOT_CLIENT_ORDER_PREFIX)
+    ]
+    paper_snapshot = reconciliation_payload.get("paper")
+
+    if not packet_orders:
+        # A quiet day is clean only when complete order evidence proves that
+        # the account holds no tournament orders; missing or malformed
+        # evidence is ambiguous and therefore incomplete.
+        if not isinstance(paper_snapshot, Mapping):
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        if _parse_timestamp(paper_snapshot.get("captured_at")) is None:
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        all_orders_evidence = paper_snapshot.get("all_orders")
+        if not isinstance(all_orders_evidence, (list, tuple)) or any(
+            not isinstance(entry, Mapping) for entry in all_orders_evidence
+        ):
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        observed_all = _reconciliation_tournament_entries(paper_snapshot, "all_orders")
+        observed_open = _reconciliation_tournament_entries(paper_snapshot, "open_orders")
+        if observed_all is None or observed_open is None:
+            return ["broker_reconciliation_tournament_evidence_invalid"]
+        if observed_all or observed_open:
+            return ["broker_reconciliation_unbound_tournament_order_present"]
+        return []
+
+    invalid = "broker_reconciliation_tournament_evidence_invalid"
+    if not isinstance(paper_snapshot, Mapping):
+        return [invalid]
+    captured_at = _parse_timestamp(paper_snapshot.get("captured_at"))
+    all_orders = paper_snapshot.get("all_orders")
+    if captured_at is None or not isinstance(all_orders, (list, tuple)):
+        return [invalid]
+    for entry in all_orders:
+        if not isinstance(entry, Mapping):
+            return [invalid]
+    observed: dict[str, list[Mapping]] = {}
+    for entry in all_orders:
+        client_order_id = entry.get("client_order_id")
+        if isinstance(client_order_id, str) and client_order_id.startswith(
+            _PAPERBOT_CLIENT_ORDER_PREFIX
+        ):
+            observed.setdefault(client_order_id, []).append(entry)
+    open_entries = _reconciliation_tournament_entries(paper_snapshot, "open_orders")
+    if open_entries is None:
+        reasons.append(invalid)
+    for entries in observed.values():
+        if len(entries) > 1:
+            reasons.append("broker_reconciliation_duplicate_tournament_order")
+    if open_entries:
+        reasons.append("broker_reconciliation_open_tournament_order_present")
+    packet_ids = [str(item["client_order_id"]) for item in packet_orders]
+    if len(set(packet_ids)) != len(packet_ids):
+        reasons.append("broker_reconciliation_duplicate_paper_packet_order")
+    for client_order_id in sorted({*packet_ids}):
+        if client_order_id not in observed:
+            reasons.append("broker_reconciliation_missing_tournament_order")
+    for client_order_id in sorted(observed):
+        if client_order_id not in set(packet_ids):
+            reasons.append("broker_reconciliation_extra_tournament_order")
+    latest_submission: dt.datetime | None = None
+    timestamp_invalid = False
+    for item in packet_orders:
+        submitted_at = _parse_timestamp(item.get("created_at"))
+        if submitted_at is None:
+            timestamp_invalid = True
+            continue
+        if latest_submission is None or submitted_at > latest_submission:
+            latest_submission = submitted_at
+        matches = observed.get(str(item["client_order_id"]), [])
+        if len(matches) != 1:
+            continue
+        remote = matches[0]
+        remote_at = _parse_timestamp(remote.get("created_at"))
+        remote_status = str(remote.get("status") or "").strip().lower()
+        if remote_status not in _RECONCILIATION_TERMINAL_ORDER_STATUSES:
+            reasons.append("broker_reconciliation_nonterminal_tournament_order")
+        if (
+            remote.get("id") != item.get("id")
+            or str(remote.get("symbol") or "").upper() != str(item.get("symbol") or "").upper()
+            or str(remote.get("side") or "").lower() != str(item.get("side") or "").lower()
+            or str(remote.get("type") or "").lower() != str(item.get("type") or "").lower()
+            or remote_at is None
+            or remote_at != submitted_at
+        ):
+            reasons.append("broker_reconciliation_mismatched_tournament_order")
+    if timestamp_invalid:
+        reasons.append("broker_reconciliation_paper_submission_timestamp_invalid")
+    if latest_submission is not None and captured_at < latest_submission:
+        reasons.append("broker_reconciliation_captured_before_last_paper_submission")
+    return reasons
+
+
+def _parse_exchange_wall_time(value: object) -> dt.time | None:
+    """Accept only a strict ASCII 24-hour HH:MM exchange session wall time."""
+
+    if type(value) is not str or len(value) != 5 or value[2] != ":":
+        return None
+    hour_text, minute_text = value[:2], value[3:]
+    # ``isdigit()`` alone admits Unicode digit characters: some (superscripts)
+    # then crash ``int()``, others (Arabic-Indic) silently convert.  Only
+    # ASCII digits are exchange wall times; anything else fails closed.
+    if (
+        not hour_text.isascii()
+        or not hour_text.isdigit()
+        or not minute_text.isascii()
+        or not minute_text.isdigit()
+    ):
+        return None
+    hour = int(hour_text)
+    minute = int(minute_text)
+    if hour > 23 or minute > 59:
+        return None
+    return dt.time(hour=hour, minute=minute)
+
+
+def _admitted_regular_session_bounds(
+    start_payload: Mapping[str, object],
+) -> tuple[dt.datetime, dt.datetime] | None:
+    """Derive the admitted regular session's UTC bounds from start-day evidence.
+
+    The window comes only from the authenticated calendar evidence captured at
+    day start (strict HH:MM exchange wall times for exactly the market date);
+    there is no fixed inferred wall-clock window.  Any absence or malformation
+    returns None so callers fail closed instead of guessing a session.
+    """
+
+    calendar = start_payload.get("calendar")
+    sessions = calendar.get("sessions") if isinstance(calendar, Mapping) else None
+    if not isinstance(sessions, (list, tuple)) or len(sessions) != 1:
+        return None
+    entry = sessions[0]
+    market_date = start_payload.get("market_date")
+    if (
+        not isinstance(entry, Mapping)
+        or not isinstance(market_date, str)
+        or entry.get("date") != market_date
+    ):
+        return None
+    open_time = _parse_exchange_wall_time(entry.get("open"))
+    close_time = _parse_exchange_wall_time(entry.get("close"))
+    if open_time is None or close_time is None or open_time >= close_time:
+        return None
+    try:
+        day = dt.date.fromisoformat(market_date)
+        open_at = dt.datetime.combine(day, open_time, tzinfo=_EXCHANGE_TZ).astimezone(UTC)
+        close_at = dt.datetime.combine(day, close_time, tzinfo=_EXCHANGE_TZ).astimezone(UTC)
+    except ValueError:
+        return None
+    return open_at, close_at
+
+
+def _stage_sequence_reasons(
+    stage_times: Mapping[str, object],
+    *,
+    manifest_at: dt.datetime | None,
+    start_payload: Mapping[str, object],
+) -> list[str]:
+    """Enforce the causal daily-chain order over captured stage timestamps.
+
+    Consecutive stages in ``DAILY_CHAIN_TEMPORAL_ORDER`` must be strictly
+    increasing except for the documented same-process self-heal producer tie;
+    the sealed manifest must not precede any bound stage; the paper tick must
+    fall inside the regular session derived from the admitted calendar; and
+    the daily report must follow that session close.  Every defect is an
+    incompleteness — the day can never be clean while one is present.
+    """
+
+    reasons: list[str] = []
+    previous_name: str | None = None
+    previous_at: dt.datetime | None = None
+    for name in DAILY_CHAIN_TEMPORAL_ORDER:
+        at = stage_times.get(name)
+        if not isinstance(at, dt.datetime):
+            previous_name, previous_at = name, None
+            continue
+        if previous_at is not None:
+            if at < previous_at:
+                reasons.append("daily_chain_stage_order_backward")
+            elif (
+                at == previous_at
+                and (previous_name, name) not in _DAILY_CHAIN_LEGITIMATE_TIES
+            ):
+                reasons.append("daily_chain_stage_order_tie_illegitimate")
+        previous_name, previous_at = name, at
+    observed_times = [
+        value for value in stage_times.values() if isinstance(value, dt.datetime)
+    ]
+    if manifest_at is not None and any(value > manifest_at for value in observed_times):
+        # The manifest seals evidence that already exists in time; a stamp
+        # earlier than any bound stage means the wrapper was backfilled.
+        # Equality stays legitimate: sealing happens immediately after the
+        # final read at second resolution.
+        reasons.append("daily_chain_manifest_precedes_stage")
+    bounds = _admitted_regular_session_bounds(start_payload)
+    if bounds is None:
+        reasons.append("daily_chain_session_window_unavailable")
+    else:
+        open_at, close_at = bounds
+        paper_at = stage_times.get("paper_tournament")
+        if isinstance(paper_at, dt.datetime) and not (open_at <= paper_at < close_at):
+            reasons.append("paper_tournament_stage_outside_regular_session")
+        report_at = stage_times.get("daily_report")
+        if isinstance(report_at, dt.datetime) and report_at < close_at:
+            reasons.append("daily_report_stage_before_session_close")
+    return reasons
+
+
 def create_shadow_day_manifest(
     *,
     start_object_id: str,
@@ -2098,6 +2596,7 @@ def _manifest_reasons(
         ),
         "preopen_validation": stages["preopen_validation"],
     }
+    stage_times: dict[str, dt.datetime] = {}
     for stage in DAILY_CHAIN_STAGES:
         value = stages[stage]
         try:
@@ -2122,6 +2621,8 @@ def _manifest_reasons(
         stage_time = _parse_timestamp(stage_record["generated_at"])
         if stage_time is None or stage_time < start_at or stage_time > now:
             incomplete.append(f"{stage}_stage_timestamp_invalid")
+        if stage_time is not None:
+            stage_times[stage] = stage_time
         # Existing persisted producers are intentionally not force-shaped into
         # a synthetic common packet.  Require the native safe semantics for
         # each role, including explicit dry-run evidence for hourly work.
@@ -2146,9 +2647,27 @@ def _manifest_reasons(
             or stage_payload.get("shadow_start_object_id") != start.object_id
         ):
             failed.append(f"{stage}_stage_cross_run")
+    incomplete.extend(
+        _stage_sequence_reasons(
+            stage_times,
+            manifest_at=generated_at,
+            start_payload=start_payload,
+        )
+    )
     reconciliation = manifest["broker_reconciliation"]
     if not isinstance(reconciliation, Mapping) or reconciliation.get("kind") != "broker_reconciliation_observer" or reconciliation.get("read_only") is not True or reconciliation.get("submitted_count") != 0 or reconciliation.get("cancelled_count") != 0 or not _is_non_authorizing(reconciliation):
         failed.append("broker_reconciliation_invalid")
+    # The embedded copy must equal the bound stage payload under structural
+    # JSON equality: a manifest whose embedded reconciliation diverges from
+    # the captured broker_reconciliation stage file is forged and fails closed.
+    reconciliation_stage = stages.get("broker_reconciliation")
+    reconciliation_stage_payload = (
+        reconciliation_stage.get("payload")
+        if isinstance(reconciliation_stage, Mapping)
+        else None
+    )
+    if reconciliation_stage_payload != reconciliation:
+        failed.append("broker_reconciliation_embedded_copy_mismatch")
     paper = stages.get("paper_tournament") if isinstance(stages, Mapping) else None
     paper_payload = paper.get("payload") if isinstance(paper, Mapping) else None
     paper_order_ids = manifest["paper_order_ids"]
@@ -2162,6 +2681,12 @@ def _manifest_reasons(
         or paper_order_ids != _paper_order_ids(paper_payload)
     ):
         failed.append("paper_order_manifest_mismatch")
+    incomplete.extend(
+        _manifest_reconciliation_binding_reasons(
+            paper_payload if isinstance(paper_payload, Mapping) else None,
+            reconciliation,
+        )
+    )
     return sorted(set(failed)), sorted(set(incomplete))
 
 
@@ -2294,6 +2819,47 @@ def _validate_start_envelope(envelope: EvidenceEnvelope, *, now: dt.datetime) ->
         raise ValueError("shadow start schedule proof is invalid")
     if not _valid_calendar_binding(payload["calendar"], market_date=market_date, now=recorded_at):
         raise ValueError("shadow start calendar proof is invalid")
+    identity = _validated_stored_runtime_identity(
+        payload["runtime_identity"], label="shadow start"
+    )
+    if not _identity_binds_authority_sources(
+        identity, control=payload["live_control"], schedule=payload["schedule"]
+    ):
+        raise ValueError(
+            "shadow start runtime identity does not bind the captured authority sources"
+        )
+
+
+def _evaluate_runtime_identity_binding(
+    start: EvidenceEnvelope,
+    payload: Mapping[str, object],
+    *,
+    failed: list[str],
+    closure_kind: object,
+    predecessor_identity: object,
+) -> None:
+    """Compare only stored start/day/predecessor identities; never recapture."""
+
+    identity = _validated_stored_runtime_identity(
+        payload.get("runtime_identity"), label="shadow day"
+    )
+    start_identity = _validated_stored_runtime_identity(
+        start.payload.get("runtime_identity"), label="admitted start"
+    )
+    if identity != start_identity:
+        failed.append(RUNTIME_IDENTITY_MISMATCH_REASON)
+    if predecessor_identity is not None:
+        previous = _validated_stored_runtime_identity(
+            predecessor_identity, label="predecessor day"
+        )
+        if identity != previous:
+            failed.append(RUNTIME_IDENTITY_MISMATCH_REASON)
+    if closure_kind is None and not _identity_binds_authority_sources(
+        identity,
+        control=payload.get("live_control"),
+        schedule=payload.get("schedule"),
+    ):
+        failed.append(RUNTIME_IDENTITY_MISMATCH_REASON)
 
 
 def _evaluate_day_payload(
@@ -2301,6 +2867,7 @@ def _evaluate_day_payload(
     payload: Mapping[str, object],
     *,
     now: dt.datetime,
+    predecessor_identity: object = None,
 ) -> tuple[list[str], list[str]]:
     failed: list[str] = []
     incomplete: list[str] = []
@@ -2310,9 +2877,29 @@ def _evaluate_day_payload(
     for field in ("run_id", "market_date", "role", "predecessor_object_id"):
         if payload[field] != start_payload[field]:
             failed.append(f"{field}_start_binding_mismatch")
+    closure_kind = payload["closure_kind"]
+    if closure_kind == "operator_abort":
+        failed.append(OPERATOR_ABORT_REASON)
+    elif closure_kind == "pending_expired":
+        incomplete.append(PENDING_DAY_EXPIRED_REASON)
+    elif closure_kind is not None:
+        failed.append("shadow_day_closure_kind_invalid")
     market_date = start_payload["market_date"]
     if not isinstance(market_date, str):
         return ["start_market_date_invalid"], incomplete
+    if closure_kind == "pending_expired":
+        # An expired pending day records exactly its own documented expiry
+        # fact plus any stored-predecessor identity drift.  Missing evidence
+        # stays missing in the bound payload; it is never scored as fresh
+        # incompletes because the day never had a chance to produce it.
+        _evaluate_runtime_identity_binding(
+            start,
+            payload,
+            failed=failed,
+            closure_kind=closure_kind,
+            predecessor_identity=predecessor_identity,
+        )
+        return sorted(set(failed)), sorted(set(incomplete))
     if _current_central_date(now) != market_date:
         incomplete.append("current_central_date_mismatch")
     control = payload["live_control"]
@@ -2333,6 +2920,13 @@ def _evaluate_day_payload(
         )
     ):
         failed.append("schedule_evaluation_hash_changed")
+    _evaluate_runtime_identity_binding(
+        start,
+        payload,
+        failed=failed,
+        closure_kind=closure_kind,
+        predecessor_identity=predecessor_identity,
+    )
     if not _valid_calendar_binding(payload["calendar"], market_date=market_date, now=now):
         incomplete.append("calendar_evidence_unavailable_or_invalid")
     artifacts = payload["artifacts"]
@@ -2379,11 +2973,42 @@ def _validate_day_envelope(
     if recorded_at is None or recorded_at > now:
         raise ValueError("shadow day is backfilled or future")
     market_date = payload["market_date"]
-    if _parse_market_date(market_date) is None or _current_central_date(recorded_at) != market_date:
+    if _parse_market_date(market_date) is None:
         raise ValueError("shadow day date is invalid")
+    closure_kind = payload["closure_kind"]
+    stopped_at_stage = payload["stopped_at_stage"]
+    notes = payload["notes"]
+    recorded_central_date = _current_central_date(recorded_at)
+    if closure_kind is None:
+        if stopped_at_stage is not None or notes is not None:
+            raise ValueError("unclosed shadow day carries operator closure fields")
+        if recorded_central_date != market_date:
+            raise ValueError("shadow day date is invalid")
+    elif closure_kind == "operator_abort":
+        if (
+            stopped_at_stage not in SHADOW_DAY_STOP_STAGES
+            or type(notes) is not str
+            or not notes.strip()
+            or len(notes) > ABORT_NOTES_LIMIT
+        ):
+            raise ValueError("aborted shadow day stop stage or notes are invalid")
+        if recorded_central_date != market_date:
+            raise ValueError("aborted shadow day must close on its own Central date")
+    elif closure_kind == "pending_expired":
+        if stopped_at_stage is not None or notes is not None:
+            raise ValueError("expired shadow day carries operator closure fields")
+        if recorded_central_date <= market_date:
+            raise ValueError("expired shadow day must close after its market date")
+    else:
+        raise ValueError("shadow day closure kind is invalid")
     if not isinstance(payload["reasons"], (list, tuple)) or any(type(item) is not str for item in payload["reasons"]):
         raise ValueError("shadow day reasons are invalid")
-    failed, incomplete = _evaluate_day_payload(start, payload, now=recorded_at)
+    failed, incomplete = _evaluate_day_payload(
+        start,
+        payload,
+        now=recorded_at,
+        predecessor_identity=_predecessor_runtime_identity(earlier_days),
+    )
     expected_status = "failed" if failed else ("incomplete" if incomplete else "clean")
     if payload["status"] != expected_status:
         raise ValueError("shadow day status does not match bound evidence")
@@ -2605,6 +3230,13 @@ def create_shadow_day_start_manifest(
     )
     if not _valid_calendar_binding(calendar, market_date=market_date, now=now):
         raise ValueError("calendar gate failed")
+    # Identity is captured and strictly validated before any ledger surface is
+    # initialized, so a dirty/unavailable/malformed runtime admits no object.
+    identity = _captured_runtime_identity()
+    if not _identity_binds_authority_sources(identity, control=control, schedule=schedule):
+        raise ValueError(
+            "runtime identity does not bind the captured authority sources"
+        )
     prior = _store_envelopes(initialize=True)
     days, pending, last_day, report = _LedgerState(prior, now=now)
     if pending is not None or report is not None:
@@ -2622,28 +3254,51 @@ def create_shadow_day_start_manifest(
         "live_control": control,
         "schedule": schedule,
         "calendar": calendar,
+        "runtime_identity": identity,
     }
+
+    return _admit_shadow_envelope(
+        kind=MANUAL_SHADOW_DAY_START_KIND,
+        payload=payload,
+        now=now,
+        effective_at=effective_at,
+    )
+
+
+def _admit_shadow_envelope(
+    *,
+    kind: str,
+    payload: Mapping[str, object],
+    now: dt.datetime,
+    effective_at: str,
+) -> EvidenceAdmission:
+    """Run the single anchored admission transaction for one semantic facade.
+
+    Every shadow facade reuses exactly this append path: locked trusted head,
+    replay validation, semantic candidate validation, exclusive object write,
+    journaled event append, committed-head advance, and rollback detection.
+    """
 
     try:
         with _locked_anchor_parent() as parent_fd:
             opened = _open_anchored_ledger(parent_fd, initialize=True)
             if opened is None:  # pragma: no cover - initialize=True always opens.
                 raise ValueError("trusted-head anchor initialization failed")
-            anchor, envelopes, events, head = opened
+            anchor, envelopes, _events, head = opened
             _LedgerState(envelopes, now=now)
             ledger_id = anchor["ledger_id"]
             if not isinstance(ledger_id, str):
                 raise ValueError("trusted-head ledger identity is invalid")
             retry_digest = hashlib.sha256(
                 _retry_material_bytes(
-                    kind=MANUAL_SHADOW_DAY_START_KIND,
+                    kind=kind,
                     effective_at=effective_at,
                     payload=payload,
                 )
             ).hexdigest()
             envelope = EvidenceEnvelope(
-                kind=MANUAL_SHADOW_DAY_START_KIND,
-                object_id=f"{MANUAL_SHADOW_DAY_START_KIND}-{retry_digest}",
+                kind=kind,
+                object_id=f"{kind}-{retry_digest}",
                 effective_at=effective_at,
                 recorded_at=effective_at,
                 retry_material_sha256=retry_digest,
@@ -2666,7 +3321,7 @@ def create_shadow_day_start_manifest(
                 previous_event_sha256=head.event_sha256,
                 admission_route=ledger_id,
             )
-            pending = {
+            pending_next = {
                 "prior_head": _head_mapping(head),
                 "sequence": event.sequence,
                 "kind": event.kind,
@@ -2674,7 +3329,7 @@ def create_shadow_day_start_manifest(
                 "retry_material_sha256": event.retry_material_sha256,
                 "admission_route": ledger_id,
             }
-            anchor["pending_next"] = pending
+            anchor["pending_next"] = pending_next
             _write_anchor(parent_fd, anchor)
 
             root_fd = _open_manual_shadow_root(parent_fd, create=True)
@@ -2765,9 +3420,9 @@ def create_shadow_day_start_manifest(
             )
             _LedgerState(current, now=now)
             if not (
-                current_head.sequence == pending["sequence"]
-                and current_head.kind == pending["kind"]
-                and current_head.object_id == pending["object_id"]
+                current_head.sequence == pending_next["sequence"]
+                and current_head.kind == pending_next["kind"]
+                and current_head.object_id == pending_next["object_id"]
                 and current_head.admission_route == ledger_id
             ):
                 raise ValueError("shadow ledger admission did not reach the anchored head")
@@ -2815,6 +3470,7 @@ def adjudicate_shadow_day(
         _capture_calendar_evidence(market_date),
         market_date=market_date,
     )
+    identity = _captured_runtime_identity()
     artifact_paths = artifacts if isinstance(artifacts, Mapping) else {}
     artifact_bindings = {key: _artifact_binding(artifact_paths.get(key)) for key in ARTIFACT_KEYS}
     provisional: dict[str, object] = {
@@ -2829,10 +3485,19 @@ def adjudicate_shadow_day(
         "live_control": control,
         "schedule": schedule,
         "calendar": calendar,
+        "runtime_identity": identity,
         "artifacts": artifact_bindings,
         "reasons": [],
+        "closure_kind": None,
+        "stopped_at_stage": None,
+        "notes": None,
     }
-    failed, incomplete = _evaluate_day_payload(start, provisional, now=now)
+    failed, incomplete = _evaluate_day_payload(
+        start,
+        provisional,
+        now=now,
+        predecessor_identity=_predecessor_runtime_identity(days),
+    )
     unknown_artifacts = set(artifact_paths) - set(ARTIFACT_KEYS)
     if unknown_artifacts:
         incomplete.append("unknown_artifact_keys")
@@ -2841,171 +3506,174 @@ def adjudicate_shadow_day(
     provisional["phase"] = _day_phase(start=start, status=status, earlier_days=days)
     provisional["reasons"] = sorted(set([*failed, *incomplete]))
 
-    try:
-        with _locked_anchor_parent() as parent_fd:
-            opened = _open_anchored_ledger(parent_fd, initialize=True)
-            if opened is None:  # pragma: no cover - initialize=True always opens.
-                raise ValueError("trusted-head anchor initialization failed")
-            anchor, envelopes, _events, head = opened
-            _LedgerState(envelopes, now=now)
-            ledger_id = anchor["ledger_id"]
-            if not isinstance(ledger_id, str):
-                raise ValueError("trusted-head ledger identity is invalid")
-            retry_digest = hashlib.sha256(
-                _retry_material_bytes(
-                    kind=MANUAL_SHADOW_DAY_RESULT_KIND,
-                    effective_at=effective_at,
-                    payload=provisional,
-                )
-            ).hexdigest()
-            envelope = EvidenceEnvelope(
-                kind=MANUAL_SHADOW_DAY_RESULT_KIND,
-                object_id=f"{MANUAL_SHADOW_DAY_RESULT_KIND}-{retry_digest}",
-                effective_at=effective_at,
-                recorded_at=effective_at,
-                retry_material_sha256=retry_digest,
-                payload_sha256=hashlib.sha256(
-                    _payload_bytes(provisional)
-                ).hexdigest(),
-                payload=provisional,
-                admission_route=ledger_id,
-            )
-            # Keep admission inside this semantic facade.  A reusable
-            # candidate appender would recreate the rejected raw route.
-            _validate_semantic_envelope(envelopes, envelope)
-            envelope_bytes = envelope.canonical_json_bytes()
-            event = EvidenceEvent(
-                sequence=head.sequence + 1,
-                kind=envelope.kind,
-                object_id=envelope.object_id,
-                object_sha256=hashlib.sha256(envelope_bytes).hexdigest(),
-                retry_material_sha256=envelope.retry_material_sha256,
-                effective_at=envelope.effective_at,
-                recorded_at=envelope.recorded_at,
-                previous_event_sha256=head.event_sha256,
-                admission_route=ledger_id,
-            )
-            pending = {
-                "prior_head": _head_mapping(head),
-                "sequence": event.sequence,
-                "kind": event.kind,
-                "object_id": event.object_id,
-                "retry_material_sha256": event.retry_material_sha256,
-                "admission_route": ledger_id,
-            }
-            anchor["pending_next"] = pending
-            _write_anchor(parent_fd, anchor)
+    return _admit_shadow_envelope(
+        kind=MANUAL_SHADOW_DAY_RESULT_KIND,
+        payload=provisional,
+        now=now,
+        effective_at=effective_at,
+    )
 
-            root_fd = _open_manual_shadow_root(parent_fd, create=True)
-            if root_fd is None:  # pragma: no cover - create=True always opens.
-                raise ValueError("manual-shadow ledger root could not be opened")
-            objects_fd: int | None = None
-            kind_fd: int | None = None
-            try:
-                objects_fd = _open_ledger_directory(
-                    root_fd,
-                    "objects",
-                    label="manual-shadow objects directory",
-                    create=True,
-                )
-                if objects_fd is None:  # pragma: no cover - create=True always opens.
-                    raise ValueError("manual-shadow objects directory is missing")
-                kind_fd = _open_ledger_directory(
-                    objects_fd,
-                    envelope.kind,
-                    label="manual-shadow object kind directory",
-                    create=True,
-                )
-                if kind_fd is None:  # pragma: no cover - create=True always opens.
-                    raise ValueError("manual-shadow object kind directory is missing")
-                _write_exclusive_ledger_file(
-                    kind_fd,
-                    f"{envelope.object_id}.json",
-                    envelope_bytes,
-                    label="manual-shadow evidence object",
-                )
-                line = event.canonical_json_bytes() + b"\n"
-                if len(line) - 1 > _MAX_LEDGER_FILE_BYTES:
-                    raise ValueError("manual-shadow event journal line is too large")
-                state = _ledger_entry_state(
-                    root_fd,
-                    "events.jsonl",
-                    label="manual-shadow event journal",
-                )
-                if state is not None:
-                    _require_ledger_file_state(
-                        state,
-                        label="manual-shadow event journal",
-                    )
-                journal_fd = os.open(
-                    "events.jsonl",
-                    os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW,
-                    0o600,
-                    dir_fd=root_fd,
-                )
-                try:
-                    journal_state = os.fstat(journal_fd)
-                    _require_ledger_file_state(
-                        journal_state,
-                        label="manual-shadow event journal",
-                    )
-                    current_state = _ledger_entry_state(
-                        root_fd,
-                        "events.jsonl",
-                        label="manual-shadow event journal",
-                    )
-                    if current_state is None or (
-                        current_state.st_dev,
-                        current_state.st_ino,
-                    ) != (journal_state.st_dev, journal_state.st_ino):
-                        raise ValueError(
-                            "manual-shadow event journal changed while opening"
-                        )
-                    offset = 0
-                    while offset < len(line):
-                        written = os.write(journal_fd, line[offset:])
-                        if written <= 0:
-                            raise OSError("incomplete manual-shadow event write")
-                        offset += written
-                    os.fsync(journal_fd)
-                finally:
-                    os.close(journal_fd)
-                os.fsync(root_fd)
-            finally:
-                if kind_fd is not None:
-                    os.close(kind_fd)
-                if objects_fd is not None:
-                    os.close(objects_fd)
-                os.close(root_fd)
 
-            current, _current_events, current_head = _replay_manual_shadow_ledger(
-                parent_fd,
-                ledger_id=ledger_id,
-            )
-            _LedgerState(current, now=now)
-            if not (
-                current_head.sequence == pending["sequence"]
-                and current_head.kind == pending["kind"]
-                and current_head.object_id == pending["object_id"]
-                and current_head.admission_route == ledger_id
-            ):
-                raise ValueError("shadow ledger admission did not reach the anchored head")
-            anchor["committed_head"] = _head_mapping(current_head)
-            anchor["pending_next"] = None
-            _write_anchor(parent_fd, anchor)
-            return EvidenceAdmission(
-                envelope=envelope,
-                path=(
-                    _absolute(_manual_shadow_root())
-                    / "objects"
-                    / envelope.kind
-                    / f"{envelope.object_id}.json"
-                ),
-                event=event,
-                created=True,
-            )
-    except (OSError, StrategyEvidenceStoreError) as exc:
-        raise ValueError(f"shadow ledger admission failed: {exc}") from exc
+def _closure_day_payload(
+    *,
+    start: EvidenceEnvelope,
+    start_payload: Mapping[str, object],
+    days: tuple[EvidenceEnvelope, ...],
+    now: dt.datetime,
+    closure_kind: str,
+    stopped_at_stage: str | None,
+    notes: str | None,
+    artifact_paths: Mapping[str, Path] | None,
+) -> dict[str, object]:
+    """Build one terminal non-clean day payload bound to current local proof.
+
+    Fresh control, schedule, and calendar captures are bound at closure time;
+    artifacts bind only files that actually exist right now; and the admitted
+    start identity is inherited verbatim instead of recaptured.  Nothing is
+    manufactured for stages that never produced evidence.
+    """
+
+    control, _ = _control_binding(now)
+    schedule, _ = _schedule_binding(captured_at=now)
+    market_date = start_payload["market_date"]
+    calendar = _calendar_binding(
+        _capture_calendar_evidence(market_date),
+        market_date=market_date,
+    )
+    supplied = artifact_paths if isinstance(artifact_paths, Mapping) else {}
+    artifact_bindings = {key: _artifact_binding(supplied.get(key)) for key in ARTIFACT_KEYS}
+    provisional: dict[str, object] = {
+        "payload_schema": DAY_SCHEMA,
+        "start_object_id": start.object_id,
+        "run_id": start_payload["run_id"],
+        "market_date": market_date,
+        "role": start_payload["role"],
+        "status": "incomplete",
+        "phase": "repair_required",
+        "predecessor_object_id": start_payload["predecessor_object_id"],
+        "live_control": control,
+        "schedule": schedule,
+        "calendar": calendar,
+        "runtime_identity": _plain_json(start_payload["runtime_identity"]),
+        "artifacts": artifact_bindings,
+        "reasons": [],
+        "closure_kind": closure_kind,
+        "stopped_at_stage": stopped_at_stage,
+        "notes": notes,
+    }
+    failed, incomplete = _evaluate_day_payload(
+        start,
+        provisional,
+        now=now,
+        predecessor_identity=_predecessor_runtime_identity(days),
+    )
+    unknown_artifacts = set(supplied) - set(ARTIFACT_KEYS)
+    if unknown_artifacts:
+        incomplete.append("unknown_artifact_keys")
+    status = "failed" if failed else ("incomplete" if incomplete else "clean")
+    provisional["status"] = status
+    provisional["phase"] = _day_phase(start=start, status=status, earlier_days=days)
+    provisional["reasons"] = sorted(set([*failed, *incomplete]))
+    return provisional
+
+
+def abort_shadow_day(
+    *,
+    start_object_id: str,
+    stopped_at_stage: str,
+    notes: str,
+    artifacts: Mapping[str, Path] | None = None,
+) -> EvidenceAdmission:
+    """Crash-safe terminal closure of today's authenticated pending start.
+
+    The admitted day result is always terminal (never clean), carries phase
+    ``repair_required``, records the interrupted stage plus every present
+    artifact binding, and grants zero broker, schedule, control, or execution
+    authority.
+    """
+
+    now, effective_at = _now_stamp()
+    if type(start_object_id) is not str or not start_object_id:
+        raise ValueError("start_object_id is invalid")
+    if stopped_at_stage not in SHADOW_DAY_STOP_STAGES:
+        raise ValueError("stopped_at_stage is not a known interruption stage")
+    if (
+        type(notes) is not str
+        or not notes.strip()
+        or len(notes) > ABORT_NOTES_LIMIT
+    ):
+        raise ValueError(f"abort notes are required (at most {ABORT_NOTES_LIMIT} characters)")
+    prior = _store_envelopes()
+    days, pending, _last_day, report = _LedgerState(prior, now=now)
+    if report is not None or pending is None or pending.object_id != start_object_id:
+        raise ValueError("shadow start has no admissible pending abort transition")
+    start = _require_known_start(prior, start_object_id)
+    start_payload = start.payload
+    market_date = start_payload["market_date"]
+    run_id = start_payload["run_id"]
+    if not isinstance(market_date, str) or not isinstance(run_id, str):
+        raise ValueError("shadow start payload is invalid")
+    if _current_central_date(now) != market_date:
+        raise ValueError("shadow day can be aborted only on its current Central date")
+    payload = _closure_day_payload(
+        start=start,
+        start_payload=start_payload,
+        days=days,
+        now=now,
+        closure_kind="operator_abort",
+        stopped_at_stage=stopped_at_stage,
+        notes=notes,
+        artifact_paths=artifacts,
+    )
+    return _admit_shadow_envelope(
+        kind=MANUAL_SHADOW_DAY_RESULT_KIND,
+        payload=payload,
+        now=now,
+        effective_at=effective_at,
+    )
+
+
+def expire_pending_shadow_day() -> EvidenceAdmission | None:
+    """Close a stale pending start whose Central market date has passed.
+
+    The stale start converts into exactly one immutable ``incomplete`` day
+    result with reason ``pending_day_expired_without_adjudication`` and phase
+    ``repair_required``.  Missing evidence stays missing; nothing is backfilled.
+    Returns ``None`` when no pending start has expired, so repeated calls are
+    safe.
+    """
+
+    now, effective_at = _now_stamp()
+    # A no-op expiry probe is observational only: unlike admission, it must
+    # not create the anchor lock or initialize an empty ledger.
+    prior = _store_envelopes_readonly()
+    days, pending, _last_day, report = _LedgerState(prior, now=now)
+    if report is not None or pending is None:
+        return None
+    start_payload = pending.payload
+    market_date = start_payload["market_date"]
+    parsed_market_date = _parse_market_date(market_date)
+    if parsed_market_date is None or not isinstance(start_payload.get("run_id"), str):
+        raise ValueError("shadow start payload is invalid")
+    current_central_date = _parse_market_date(_current_central_date(now))
+    if current_central_date is None or parsed_market_date >= current_central_date:
+        return None
+    payload = _closure_day_payload(
+        start=pending,
+        start_payload=start_payload,
+        days=days,
+        now=now,
+        closure_kind="pending_expired",
+        stopped_at_stage=None,
+        notes=None,
+        artifact_paths=None,
+    )
+    return _admit_shadow_envelope(
+        kind=MANUAL_SHADOW_DAY_RESULT_KIND,
+        payload=payload,
+        now=now,
+        effective_at=effective_at,
+    )
 
 
 def _clean_trial_streak(days: tuple[EvidenceEnvelope, ...]) -> int:
@@ -3127,167 +3795,10 @@ def build_shadow_streak_report(*, final_no_go: bool = False) -> dict[str, object
         "reasons": [] if candidate else ["full_ledger_not_terminal_candidate"],
     }
 
-    try:
-        with _locked_anchor_parent() as parent_fd:
-            opened = _open_anchored_ledger(parent_fd, initialize=True)
-            if opened is None:  # pragma: no cover - initialize=True always opens.
-                raise ValueError("trusted-head anchor initialization failed")
-            anchor, envelopes, _events, head = opened
-            _LedgerState(envelopes, now=now)
-            ledger_id = anchor["ledger_id"]
-            if not isinstance(ledger_id, str):
-                raise ValueError("trusted-head ledger identity is invalid")
-            retry_digest = hashlib.sha256(
-                _retry_material_bytes(
-                    kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
-                    effective_at=effective_at,
-                    payload=payload,
-                )
-            ).hexdigest()
-            envelope = EvidenceEnvelope(
-                kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
-                object_id=f"{MANUAL_SHADOW_FINAL_REPORT_KIND}-{retry_digest}",
-                effective_at=effective_at,
-                recorded_at=effective_at,
-                retry_material_sha256=retry_digest,
-                payload_sha256=hashlib.sha256(_payload_bytes(payload)).hexdigest(),
-                payload=payload,
-                admission_route=ledger_id,
-            )
-            # Keep admission inside this semantic facade.  A reusable
-            # candidate appender would recreate the rejected raw route.
-            _validate_semantic_envelope(envelopes, envelope)
-            envelope_bytes = envelope.canonical_json_bytes()
-            event = EvidenceEvent(
-                sequence=head.sequence + 1,
-                kind=envelope.kind,
-                object_id=envelope.object_id,
-                object_sha256=hashlib.sha256(envelope_bytes).hexdigest(),
-                retry_material_sha256=envelope.retry_material_sha256,
-                effective_at=envelope.effective_at,
-                recorded_at=envelope.recorded_at,
-                previous_event_sha256=head.event_sha256,
-                admission_route=ledger_id,
-            )
-            pending = {
-                "prior_head": _head_mapping(head),
-                "sequence": event.sequence,
-                "kind": event.kind,
-                "object_id": event.object_id,
-                "retry_material_sha256": event.retry_material_sha256,
-                "admission_route": ledger_id,
-            }
-            anchor["pending_next"] = pending
-            _write_anchor(parent_fd, anchor)
-
-            root_fd = _open_manual_shadow_root(parent_fd, create=True)
-            if root_fd is None:  # pragma: no cover - create=True always opens.
-                raise ValueError("manual-shadow ledger root could not be opened")
-            objects_fd: int | None = None
-            kind_fd: int | None = None
-            try:
-                objects_fd = _open_ledger_directory(
-                    root_fd,
-                    "objects",
-                    label="manual-shadow objects directory",
-                    create=True,
-                )
-                if objects_fd is None:  # pragma: no cover - create=True always opens.
-                    raise ValueError("manual-shadow objects directory is missing")
-                kind_fd = _open_ledger_directory(
-                    objects_fd,
-                    envelope.kind,
-                    label="manual-shadow object kind directory",
-                    create=True,
-                )
-                if kind_fd is None:  # pragma: no cover - create=True always opens.
-                    raise ValueError("manual-shadow object kind directory is missing")
-                _write_exclusive_ledger_file(
-                    kind_fd,
-                    f"{envelope.object_id}.json",
-                    envelope_bytes,
-                    label="manual-shadow evidence object",
-                )
-                line = event.canonical_json_bytes() + b"\n"
-                if len(line) - 1 > _MAX_LEDGER_FILE_BYTES:
-                    raise ValueError("manual-shadow event journal line is too large")
-                state = _ledger_entry_state(
-                    root_fd,
-                    "events.jsonl",
-                    label="manual-shadow event journal",
-                )
-                if state is not None:
-                    _require_ledger_file_state(
-                        state,
-                        label="manual-shadow event journal",
-                    )
-                journal_fd = os.open(
-                    "events.jsonl",
-                    os.O_APPEND | os.O_CREAT | os.O_WRONLY | _NOFOLLOW,
-                    0o600,
-                    dir_fd=root_fd,
-                )
-                try:
-                    journal_state = os.fstat(journal_fd)
-                    _require_ledger_file_state(
-                        journal_state,
-                        label="manual-shadow event journal",
-                    )
-                    current_state = _ledger_entry_state(
-                        root_fd,
-                        "events.jsonl",
-                        label="manual-shadow event journal",
-                    )
-                    if current_state is None or (
-                        current_state.st_dev,
-                        current_state.st_ino,
-                    ) != (journal_state.st_dev, journal_state.st_ino):
-                        raise ValueError(
-                            "manual-shadow event journal changed while opening"
-                        )
-                    offset = 0
-                    while offset < len(line):
-                        written = os.write(journal_fd, line[offset:])
-                        if written <= 0:
-                            raise OSError("incomplete manual-shadow event write")
-                        offset += written
-                    os.fsync(journal_fd)
-                finally:
-                    os.close(journal_fd)
-                os.fsync(root_fd)
-            finally:
-                if kind_fd is not None:
-                    os.close(kind_fd)
-                if objects_fd is not None:
-                    os.close(objects_fd)
-                os.close(root_fd)
-
-            current, _current_events, current_head = _replay_manual_shadow_ledger(
-                parent_fd,
-                ledger_id=ledger_id,
-            )
-            _LedgerState(current, now=now)
-            if not (
-                current_head.sequence == pending["sequence"]
-                and current_head.kind == pending["kind"]
-                and current_head.object_id == pending["object_id"]
-                and current_head.admission_route == ledger_id
-            ):
-                raise ValueError("shadow ledger admission did not reach the anchored head")
-            anchor["committed_head"] = _head_mapping(current_head)
-            anchor["pending_next"] = None
-            _write_anchor(parent_fd, anchor)
-            admission = EvidenceAdmission(
-                envelope=envelope,
-                path=(
-                    _absolute(_manual_shadow_root())
-                    / "objects"
-                    / envelope.kind
-                    / f"{envelope.object_id}.json"
-                ),
-                event=event,
-                created=True,
-            )
-    except (OSError, StrategyEvidenceStoreError) as exc:
-        raise ValueError(f"shadow ledger admission failed: {exc}") from exc
+    admission = _admit_shadow_envelope(
+        kind=MANUAL_SHADOW_FINAL_REPORT_KIND,
+        payload=payload,
+        now=now,
+        effective_at=effective_at,
+    )
     return _record_view(admission.envelope, path=admission.path)

@@ -8,19 +8,20 @@ This is the single canonical Git repository and runnable application root. The
 old nested application, Windows transfer, separate public clone, and development
 worktrees were consolidated or preserved as recoverable archives on 2026-08-10.
 
-## First minute
+## Start with the task
 
 ```zsh
 cd /Users/corbinfloyd/Documents/TradingAgents
 git status --short --branch
-.venv/bin/python scripts/automation_context_snapshot.py --write
-sed -n '1,220p' results/_context/latest-summary.json
-sed -n '1,220p' results/_context/latest-flags.json
-.venv/bin/python -m cli.main --help
 ```
 
-Read `AGENTS.md` for working guidance, `CONTEXT_ROUTER.md` for operational
-context, and `docs/consolidation/REPOSITORY_MAP.md` for the durable source map.
+Read `AGENTS.md` for working guidance. Use
+`docs/consolidation/REPOSITORY_MAP.md` when a source map helps. For runtime,
+operational, or safety-sensitive work, read the existing compact summary and
+flags under `results/_context/`, then only the raw packets they identify.
+Refresh compact context only under the conditions in `AGENTS.md`; startup does
+not require a write or a CLI invocation. Use `CONTEXT_ROUTER.md` selectively for
+historical operational context, not as a current status report.
 
 ## What is current
 

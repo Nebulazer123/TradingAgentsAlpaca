@@ -29,7 +29,6 @@ from tradingagents.policy.live_control import (
     write_live_control_state,
 )
 from tradingagents.policy.live_gate import evaluate_go_live_guard
-from tradingagents.policy.promotion_sync import sync_promotion_state_file
 from tradingagents.research.loss_review_evidence import build_loss_review_evidence_packet
 from tradingagents.research.provider_orchestrator import TickerProviderResearchResult
 
@@ -478,51 +477,6 @@ def _build_fixture_recovery_request(
                     returncode=1,
                 )
             return _CommandResult(stdout="focused subprocess passed")
-        if "sync-promotion" in command:
-            arm_live = (
-                "--arm-live" in command and "--no-arm-live" not in command
-            )
-            ci_green = (
-                "--ci-green" in command and "--no-ci-green" not in command
-            )
-            generated_at = dt.datetime.fromisoformat(
-                command[command.index("--generated-at") + 1]
-            )
-            canonical_input_path = command[
-                command.index("--state-path") + 1
-            ]
-            output_state_path = command[
-                command.index("--output-state-path") + 1
-            ]
-            result = sync_promotion_state_file(
-                command[command.index("--report-path") + 1],
-                canonical_input_path,
-                output_state_path=output_state_path,
-                tiny_live_tranche_usd=Decimal("25.00"),
-                arm_live=arm_live,
-                ci_green=ci_green,
-                now=generated_at,
-            )
-            return _CommandResult(
-                stdout=json.dumps(
-                    {
-                        "summary": result.summary,
-                        "promoted": result.promoted,
-                        "demoted": result.demoted,
-                        "issues_by_sleeve": result.issues_by_sleeve,
-                        "state_path": output_state_path,
-                        "canonical_state_path": canonical_input_path,
-                        "report_path": command[
-                            command.index("--report-path") + 1
-                        ],
-                        "arm_live": arm_live,
-                        "ci_green": ci_green,
-                        "can_submit_orders": False,
-                        "execution_authority": "none",
-                        "state": result.state,
-                    }
-                )
-            )
         raise AssertionError(command)
 
     context = {
@@ -708,7 +662,27 @@ def _commands_containing(
     return [command for command in invocations if marker in command]
 
 
-def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
+def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(
+    tmp_path,
+    monkeypatch,
+):
+    from tests._owner_approval_testing import (
+        build_owner_approval,
+        install_isolated_owner_trust,
+    )
+
+    owner = install_isolated_owner_trust(
+        monkeypatch,
+        tmp_path / "owner-approval",
+        seed=b"autonomous-recovery-integration-owner-seed",
+    )
+    from tradingagents.orchestration import self_heal as self_heal_module
+
+    monkeypatch.setattr(
+        self_heal_module,
+        "_owner_approval_authority_utc_now",
+        lambda: NOW,
+    )
     production_before = _snapshot_production_authority()
     focused_runs: list[dict] = []
     harness = _build_fixture_recovery_request(
@@ -766,6 +740,39 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
         ):
             raise SystemExit("inspect frozen live gate before Task 5")
 
+    blocked = coordinate_verified_recovery(
+        **args,
+        control_path=control_path,
+        receipt_dir=receipt_dir,
+        recovery_root=recovery_root,
+        now=NOW,
+    )
+
+    assert blocked["status"] == "external_blocked"
+    assert blocked["phase"] == "sync_promotion"
+    assert _sha256(canonical_path) == canonical_before_sha256
+    assert list(receipt_dir.glob("verified-rearm-*.json")) == []
+    blocked_control, _blocked_issues = load_live_control_state(
+        control_path,
+        now=NOW,
+    )
+    assert blocked_control["frozen"] is True
+    prepare_path = run_root / "packets" / "promotion_prepare.json"
+    prepare = json.loads(prepare_path.read_text(encoding="utf-8"))
+    owner_request = prepare["owner_approval_request"]
+    args["promotion_owner_approval"] = build_owner_approval(
+        private_key_hex=owner.private_hex,
+        action=owner_request["action"],
+        issued_at=NOW,
+        ttl_minutes=90,
+        subject=owner_request["subject"],
+        source_binding=owner_request["source_binding"],
+        risk_envelope_ref=owner_request["risk_envelope_binding"]["ref"],
+        risk_envelope_sha256=owner_request["risk_envelope_binding"][
+            "sha256"
+        ],
+    )
+
     with pytest.raises(
         SystemExit,
         match="inspect frozen live gate before Task 5",
@@ -794,12 +801,11 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
     )
     assert len(reconcile_invocations) == 1
     assert len(focused_invocations) == 1
-    assert len(promotion_invocations) == 1
+    assert promotion_invocations == []
     assert set(RECOVERY_FOCUSED_TESTS).issubset(focused_invocations[0])
     assert invocations.index(reconcile_invocations[0]) < invocations.index(
         focused_invocations[0]
-    ) < invocations.index(promotion_invocations[0])
-    assert "--ci-green" in promotion_invocations[0]
+    )
     assert pre_promotion_observations == [
         {
             "has_live_enabled_sleeve": False,
@@ -827,8 +833,10 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
         name: path.read_bytes() for name, path in phase_paths.items()
     }
 
+    resume_args = dict(args)
+    resume_args.pop("promotion_owner_approval")
     resumed = coordinate_verified_recovery(
-        **args,
+        **resume_args,
         control_path=control_path,
         receipt_dir=receipt_dir,
         recovery_root=recovery_root,
@@ -867,7 +875,7 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
         == 1
     )
     assert len(_commands_containing(invocations, "pytest")) == 1
-    assert len(_commands_containing(invocations, "sync-promotion")) == 1
+    assert not _commands_containing(invocations, "sync-promotion")
     assert broker.write_calls == []
     assert broker.read_calls
     assert {
@@ -946,6 +954,9 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
     }
     assert prepare["recovery_commit"] == recovery_commit
     assert commit["recovery_commit"] == recovery_commit
+    assert commit["owner_approval"]["owner_approval_id"] == args[
+        "promotion_owner_approval"
+    ]["approval_id"]
     assert prepare["expected_stage_sha256"] == stage_sha256
     assert commit["staged_sha256"] == stage_sha256
     assert promotion["staged_state_sha256"] == stage_sha256
@@ -1004,15 +1015,16 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
     assert receipt["control_binding"]["control_path"] == str(
         control_path.resolve()
     )
-    admitted_guard = _live_buy_guard(
+    unapproved_guard = _live_buy_guard(
         root=tmp_path,
         state_path=canonical_path,
     )
-    assert admitted_guard.allowed is True
-    assert admitted_guard.checks["live_not_frozen"] is True
-    assert admitted_guard.checks["dead_man_fresh"] is True
-    assert admitted_guard.checks["promotion_state_loaded"] is True
-    assert admitted_guard.checks["promotion"] is True
+    assert unapproved_guard.allowed is False
+    assert unapproved_guard.checks["owner_approval"] is False
+    assert any(
+        "owner approval required" in issue.reason
+        for issue in unapproved_guard.issues
+    )
     expected_closure = {
         "incident": incident_path,
         "reconciliation": reconciliation_path,
@@ -1063,7 +1075,7 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
     assert "rearm.json" in packets_before_duplicate
 
     duplicate = coordinate_verified_recovery(
-        **args,
+        **resume_args,
         control_path=control_path,
         receipt_dir=receipt_dir,
         recovery_root=recovery_root,
@@ -1089,7 +1101,7 @@ def test_clean_nflx_recovery_closes_the_exact_task6_task5_chain(tmp_path):
         == 1
     )
     assert len(_commands_containing(invocations, "pytest")) == 1
-    assert len(_commands_containing(invocations, "sync-promotion")) == 1
+    assert not _commands_containing(invocations, "sync-promotion")
     assert len(list(receipt_dir.glob("verified-rearm-*.json"))) == 1
     assert {
         path: _sha256(path)

@@ -1,4 +1,6 @@
 import datetime
+import hashlib
+import inspect
 import json
 from dataclasses import replace
 from decimal import Decimal
@@ -8,12 +10,18 @@ from typer.testing import CliRunner
 
 import cli.main as cli_main
 from cli.main import app
+from tradingagents.dataflows.pit import (
+    RawPointInTimeArtifactArchive,
+    build_source_bound_adjusted_price_window,
+)
 from tradingagents.evals.agent_intelligence_ledger import (
     DEFER_INVALID_FORECAST_TIMESTAMPS,
+    AgentForecast,
     agent_influence_weights,
     append_forecasts,
     audit_resolved_forecasts,
     calibrated_rating_probabilities_from_packet,
+    downgrade_nonqualifying_resolution_labels,
     forecasts_from_creator_workflow_packet,
     forecasts_from_mirofish_handoff_packet,
     forecasts_from_overnight_packet,
@@ -33,6 +41,7 @@ from tradingagents.evals.resolution_quality import (
     expected_entry_session,
     expected_exit_session,
 )
+from tradingagents.evals.source_bound_resolution import load_source_bound_window_lookup
 from tradingagents.research.original_workflow import write_creator_workflow_artifacts
 
 runner = CliRunner()
@@ -89,6 +98,201 @@ def _window_lookup_for(closes: dict, *, drop_final: frozenset = frozenset()):
         )
 
     return lookup
+
+
+def _source_bound_window_lookup_for(
+    closes: dict,
+    *,
+    drop_final: frozenset = frozenset(),
+):
+    legacy_lookup = _window_lookup_for(closes, drop_final=drop_final)
+
+    class SourceBoundLookup:
+        def __call__(self, symbol, start_date, end_date):
+            window = legacy_lookup(symbol, start_date, end_date)
+            if window is None:
+                return None
+            digest = hashlib.sha256(symbol.encode("ascii")).hexdigest()
+            return replace(
+                window,
+                source_evidence={
+                    "schema_version": "source_bound_price_window_evidence/v1",
+                    "window_id": f"spw-{symbol.lower()}",
+                    "window_sha256": digest,
+                    "security_id": f"security-{symbol.lower()}",
+                    "raw_artifact_id": f"pit-{symbol.lower()}",
+                    "raw_artifact_sha256": digest,
+                    "decision_cutoff": "2026-06-12T00:00:00+00:00",
+                    "retrieved_at": "2026-06-11T00:00:00+00:00",
+                    "feed": "iex",
+                    "adjustment_mode": "all",
+                    "adjustment_status": "total_return_adjusted",
+                },
+            )
+
+        def verify_forecast(self, forecast):
+            window = forecast.resolution_window
+            if not isinstance(window, dict):
+                return False
+            ticker = self(
+                forecast.ticker,
+                window["intended_start"],
+                window["intended_end"],
+            )
+            benchmark = self(
+                forecast.benchmark,
+                window["intended_start"],
+                window["intended_end"],
+            )
+            return (
+                ticker is not None
+                and benchmark is not None
+                and forecast.resolution_evidence
+                == {
+                    "schema_version": "source_bound_resolution_evidence/v2",
+                    "ticker": ticker.source_evidence,
+                    "benchmark": benchmark.source_evidence,
+                    "alpha_threshold_pct": "1.5",
+                }
+            )
+
+    return SourceBoundLookup()
+
+
+def _with_source_bound_learning_evidence(
+    forecast: AgentForecast,
+    *,
+    label_quality: str = LABEL_QUALITY_HIGH,
+    lookup=None,
+) -> AgentForecast:
+    if lookup is None:
+        lookup = _source_bound_window_lookup_for(
+            {forecast.ticker: ("100", "110"), forecast.benchmark: ("100", "102")}
+        )
+    start_date = forecast.created_at[:10]
+    end_date = forecast.resolve_after[:10]
+    ticker = lookup(forecast.ticker, start_date, end_date)
+    benchmark = lookup(forecast.benchmark, start_date, end_date)
+    assert ticker is not None and benchmark is not None
+    return replace(
+        forecast,
+        label_quality=label_quality,
+        resolution_window=forecast.resolution_window
+        or {
+            "intended_start": start_date,
+            "intended_end": end_date,
+        },
+        resolution_evidence={
+            "schema_version": "source_bound_resolution_evidence/v2",
+            "ticker": ticker.source_evidence,
+            "benchmark": benchmark.source_evidence,
+            "alpha_threshold_pct": "1.5",
+        },
+    )
+
+
+def _with_verified_source_bound_result(
+    forecast: AgentForecast,
+    *,
+    direction: str,
+) -> AgentForecast:
+    probability = Decimal(forecast.probability)
+    outcome = direction == "bullish"
+    return replace(
+        forecast,
+        direction=direction,
+        resolved=True,
+        outcome=outcome,
+        actual_return="10.00",
+        benchmark_return="2.00",
+        relative_return="8.00",
+        brier_score=str(
+            ((probability - (Decimal("1") if outcome else Decimal("0"))) ** 2).quantize(
+                Decimal("0.0001")
+            )
+        ),
+        agent_score_delta=str(
+            (
+                probability - Decimal("0.50")
+                if outcome
+                else -(probability - Decimal("0.50"))
+            ).quantize(Decimal("0.01"))
+        ),
+    )
+
+
+def _write_source_bound_receipts(
+    tmp_path: Path,
+    *,
+    forecast: AgentForecast,
+) -> tuple[Path, tuple[Path, ...], tuple[Path, ...]]:
+    archive = RawPointInTimeArtifactArchive(tmp_path / "pit-artifacts")
+    requested_start = datetime.date.fromisoformat(forecast.created_at[:10])
+    requested_end = datetime.date.fromisoformat(forecast.resolve_after[:10])
+    source_end = requested_end + datetime.timedelta(days=1)
+    raw_receipt_paths = []
+    price_receipt_paths = []
+    for index, (symbol, first_close, last_close) in enumerate(
+        ((forecast.ticker, "100", "110"), (forecast.benchmark, "100", "102"))
+    ):
+        market_dates = []
+        current = requested_start
+        while current <= requested_end:
+            if current.weekday() < 5:
+                market_dates.append(current)
+            current += datetime.timedelta(days=1)
+        raw_bytes = json.dumps(
+            {
+                "symbol": symbol,
+                "next_page_token": None,
+                "bars": [
+                    {
+                        "t": f"{market_date.isoformat()}T05:00:00Z",
+                        "c": first_close if position == 0 else last_close,
+                    }
+                    for position, market_date in enumerate(market_dates)
+                ],
+            }
+        ).encode("utf-8")
+        artifact = archive.admit(
+            raw_bytes=raw_bytes,
+            source_uri=(
+                f"https://data.alpaca.markets/v2/stocks/{symbol}/bars?"
+                "timeframe=1Day&feed=iex&adjustment=all"
+                f"&start={requested_start.isoformat()}T00:00:00Z"
+                f"&end={source_end.isoformat()}T00:00:00Z"
+            ),
+            content_type="application/json",
+            retrieved_at="2026-06-11T00:00:00+00:00",
+        )
+        receipt = build_source_bound_adjusted_price_window(
+            archive=archive,
+            raw_artifact=artifact,
+            security_id=f"security-{symbol.lower()}",
+            symbol=symbol,
+            requested_start=requested_start.isoformat(),
+            requested_end=requested_end.isoformat(),
+            decision_cutoff="2026-06-12T00:00:00+00:00",
+        )
+        raw_path = tmp_path / f"raw-{index}.json"
+        price_path = tmp_path / f"price-{index}.json"
+        raw_path.write_bytes(artifact.canonical_json_bytes())
+        price_path.write_bytes(receipt.canonical_json_bytes())
+        raw_receipt_paths.append(raw_path)
+        price_receipt_paths.append(price_path)
+    return archive.root, tuple(raw_receipt_paths), tuple(price_receipt_paths)
+
+
+def _source_bound_verifier(tmp_path: Path, forecast: AgentForecast):
+    archive_root, raw_receipt_paths, price_receipt_paths = _write_source_bound_receipts(
+        tmp_path,
+        forecast=forecast,
+    )
+    return load_source_bound_window_lookup(
+        raw_artifact_archive=archive_root,
+        raw_artifact_receipts=raw_receipt_paths,
+        price_window_receipts=price_receipt_paths,
+    )
 
 
 def _overnight_packet():
@@ -389,36 +593,33 @@ def test_resolve_forecasts_sweeps_due_forecasts_across_all_tickers():
     assert all(forecast.resolution_note == "resolved against relative return window" for forecast in resolved)
 
 
-def test_agent_influence_weights_reward_useful_agents_and_downrank_noisy_agents():
+def test_agent_influence_weights_reward_useful_agents_and_downrank_noisy_agents(tmp_path: Path):
     forecasts = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
+    verifier = _source_bound_verifier(tmp_path, forecasts[0])
     resolved = []
     for forecast in forecasts:
         if forecast.agent == "market_analyst":
             resolved.append(
-                replace(
-                    forecast,
-                    resolved=True,
-                    outcome=True,
-                    brier_score="0.1156",
-                    agent_score_delta="0.16",
-                    relative_return="8.00",
+                _with_source_bound_learning_evidence(
+                    _with_verified_source_bound_result(forecast, direction="bullish"),
+                    lookup=verifier,
                 )
             )
         elif forecast.agent == "news_analyst":
             resolved.append(
-                replace(
-                    forecast,
-                    resolved=True,
-                    outcome=False,
-                    brier_score="0.4356",
-                    agent_score_delta="-0.16",
-                    relative_return="-2.00",
+                _with_source_bound_learning_evidence(
+                    _with_verified_source_bound_result(forecast, direction="bearish"),
+                    lookup=verifier,
                 )
             )
         else:
             resolved.append(forecast)
 
-    weights = agent_influence_weights(resolved, min_resolved=1)
+    weights = agent_influence_weights(
+        resolved,
+        source_bound_verifier=verifier,
+        min_resolved=1,
+    )
     context = render_agent_influence_context(weights)
 
     assert Decimal(weights["agents"]["market_analyst"]["weight"]) > Decimal("1.00")
@@ -430,60 +631,130 @@ def test_agent_influence_weights_reward_useful_agents_and_downrank_noisy_agents(
     assert "cannot bypass live gates" in context
 
 
-def test_agent_influence_weights_use_setup_sector_regime_and_evidence_context():
+def test_legacy_suspect_wins_cannot_change_agent_influence_weight():
+    forecast = next(
+        item
+        for item in forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
+        if item.agent == "market_analyst"
+    )
+    legacy_wins = [
+        replace(
+            forecast,
+            forecast_id=f"af-legacy-win-{index}",
+            resolved=True,
+            outcome=True,
+            brier_score="0.0100",
+            agent_score_delta="0.49",
+            relative_return="20.00",
+            label_quality=LABEL_QUALITY_SUSPECT,
+            quality_flags=["legacy_yfinance_nonqualifying"],
+            resolution_evidence=None,
+        )
+        for index in range(3)
+    ]
+
+    weights = agent_influence_weights(legacy_wins, min_resolved=1)
+
+    assert weights["qualifying_resolved_count"] == 0
+    assert weights["agents"]["market_analyst"] == {
+        "weight": "1.00",
+        "state": "insufficient_history",
+        "resolved_count": 0,
+        "reason": "no source-bound qualifying resolved forecasts",
+    }
+
+
+def test_forged_source_bound_metadata_cannot_change_agent_influence_weight():
+    forecast = next(
+        item
+        for item in forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
+        if item.agent == "market_analyst"
+    )
+    forged_highs = [
+        _with_source_bound_learning_evidence(
+            replace(
+                forecast,
+                forecast_id=f"af-forged-source-bound-{index}",
+                resolved=True,
+                outcome=True,
+                brier_score="0.0100",
+                agent_score_delta="0.49",
+                relative_return="20.00",
+            )
+        )
+        for index in range(3)
+    ]
+
+    weights = agent_influence_weights(forged_highs, min_resolved=1)
+
+    assert "_admitted_source_bound_forecasts" not in inspect.signature(
+        agent_influence_weights
+    ).parameters
+    assert "_admission_proof" not in inspect.signature(agent_influence_weights).parameters
+    assert weights["qualifying_resolved_count"] == 0
+    assert weights["agents"]["market_analyst"]["weight"] == "1.00"
+    assert weights["agents"]["market_analyst"]["state"] == "insufficient_history"
+
+
+def test_agent_influence_weights_use_setup_sector_regime_and_evidence_context(tmp_path: Path):
     base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
     market_forecast = next(forecast for forecast in base if forecast.agent == "market_analyst")
     news_forecast = next(forecast for forecast in base if forecast.agent == "news_analyst")
+    verifier = _source_bound_verifier(tmp_path, market_forecast)
     forecasts = []
     for index in range(3):
         forecasts.append(
-            replace(
-                market_forecast,
-                forecast_id=f"af-market-good-{index}",
-                setup="pullback_support",
-                sector="semiconductors",
-                regime="risk_on",
-                evidence_sources=["market_report", "news_report"],
-                resolved=True,
-                outcome=True,
-                brier_score="0.1000",
-                agent_score_delta="0.18",
-                relative_return="3.00",
+            _with_source_bound_learning_evidence(
+                _with_verified_source_bound_result(
+                    replace(
+                        market_forecast,
+                        forecast_id=f"af-market-good-{index}",
+                        setup="pullback_support",
+                        sector="semiconductors",
+                        regime="risk_on",
+                        evidence_sources=["market_report", "news_report"],
+                    ),
+                    direction="bullish",
+                ),
+                lookup=verifier,
             )
         )
         forecasts.append(
-            replace(
-                market_forecast,
-                forecast_id=f"af-market-bad-{index}",
-                setup="breakout_chase",
-                sector="banks",
-                regime="risk_off",
-                evidence_sources=["market_report", "news_report"],
-                resolved=True,
-                outcome=False,
-                brier_score="0.4900",
-                agent_score_delta="-0.18",
-                relative_return="-2.00",
+            _with_source_bound_learning_evidence(
+                _with_verified_source_bound_result(
+                    replace(
+                        market_forecast,
+                        forecast_id=f"af-market-bad-{index}",
+                        setup="breakout_chase",
+                        sector="banks",
+                        regime="risk_off",
+                        evidence_sources=["market_report", "news_report"],
+                    ),
+                    direction="bearish",
+                ),
+                lookup=verifier,
             )
         )
         forecasts.append(
-            replace(
-                news_forecast,
-                forecast_id=f"af-news-bad-{index}",
-                setup="pullback_support",
-                sector="semiconductors",
-                regime="risk_on",
-                evidence_sources=["news_report"],
-                resolved=True,
-                outcome=False,
-                brier_score="0.4900",
-                agent_score_delta="-0.16",
-                relative_return="-1.00",
+            _with_source_bound_learning_evidence(
+                _with_verified_source_bound_result(
+                    replace(
+                        news_forecast,
+                        forecast_id=f"af-news-bad-{index}",
+                        setup="pullback_support",
+                        sector="semiconductors",
+                        regime="risk_on",
+                        evidence_sources=["news_report"],
+                    ),
+                    direction="bearish",
+                ),
+                lookup=verifier,
             )
         )
 
     weights = agent_influence_weights(
         forecasts,
+        source_bound_verifier=verifier,
         min_resolved=2,
         setup="pullback_support",
         sector="semiconductors",
@@ -511,6 +782,7 @@ def test_agent_ledger_summary_cli_accepts_context_filters(tmp_path: Path):
     forecasts = []
     for index in range(3):
         forecasts.append(
+            _with_source_bound_learning_evidence(
             replace(
                 market_forecast,
                 forecast_id=f"af-cli-market-good-{index}",
@@ -524,8 +796,10 @@ def test_agent_ledger_summary_cli_accepts_context_filters(tmp_path: Path):
                 agent_score_delta="0.18",
                 relative_return="3.00",
             )
+            )
         )
         forecasts.append(
+            _with_source_bound_learning_evidence(
             replace(
                 news_forecast,
                 forecast_id=f"af-cli-news-bad-{index}",
@@ -538,6 +812,7 @@ def test_agent_ledger_summary_cli_accepts_context_filters(tmp_path: Path):
                 brier_score="0.4900",
                 agent_score_delta="-0.16",
                 relative_return="-1.00",
+            )
             )
         )
     ledger_path = tmp_path / "ledger.jsonl"
@@ -567,10 +842,10 @@ def test_agent_ledger_summary_cli_accepts_context_filters(tmp_path: Path):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["influence_weights"]["context"]["matched_resolved_count"] == 6
-    assert payload["influence_weights"]["agents"]["market_analyst"]["state"] == "contextual_earned_weight"
-    assert Decimal(payload["influence_weights"]["agents"]["market_analyst"]["weight"]) > Decimal("1.00")
-    assert Decimal(payload["influence_weights"]["agents"]["news_analyst"]["weight"]) < Decimal("1.00")
+    assert payload["influence_weights"]["context"]["matched_resolved_count"] == 0
+    assert payload["influence_weights"]["agents"]["market_analyst"]["state"] == "insufficient_history"
+    assert payload["influence_weights"]["agents"]["market_analyst"]["weight"] == "1.00"
+    assert payload["influence_weights"]["agents"]["news_analyst"]["weight"] == "1.00"
     assert summary_path.exists()
 
 
@@ -699,21 +974,176 @@ def test_agent_ledger_resolve_cli_sweeps_existing_ledger_across_tickers(monkeypa
     payload = json.loads(result.stdout)
     assert payload["newly_resolved_count"] == 2
     assert payload["resolved_forecast_count"] == 2
-    assert payload["resolution_quality"]["label_quality_counts"][LABEL_QUALITY_HIGH] == 2
+    assert payload["resolution_quality"]["label_quality_counts"] == {
+        LABEL_QUALITY_SUSPECT: 2
+    }
     assert payload["resolution_quality"]["deferred_count"] == 0
     assert payload["learning_availability_root"] == str(availability_root)
-    assert payload["learning_observed_count"] == 2
-    assert payload["learning_newly_recorded_count"] == 2
+    assert payload["learning_observed_count"] == 0
+    assert payload["learning_newly_recorded_count"] == 0
     assert summary_path.exists()
     assert quality_path.exists()
     rows = load_ledger(ledger_path)
-    assert all(row.label_quality == LABEL_QUALITY_HIGH for row in rows)
+    assert all(row.label_quality == LABEL_QUALITY_SUSPECT for row in rows)
+    assert all("legacy_yfinance_nonqualifying" in row.quality_flags for row in rows)
     assert all(row.resolution_window["final_bar_available"] is True for row in rows)
-    observations = LearningAvailabilityLedger(availability_root).verify()
-    assert len(observations) == 2
-    assert {row.recorded_at for row in observations} == {
-        row.effective_at for row in observations
-    }
+    assert not availability_root.exists()
+
+
+def test_agent_ledger_resolve_cli_loads_and_reverifies_real_source_receipts(tmp_path: Path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    summary_path = tmp_path / "summary.json"
+    quality_path = tmp_path / "resolution-quality.json"
+    availability_root = tmp_path / "learning-availability"
+    forecast = replace(
+        forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0],
+        forecast_id="af-cli-real-source-bound",
+        ticker="NVDA",
+    )
+    append_forecasts([forecast], path=ledger_path)
+    archive_root, raw_receipts, price_receipts = _write_source_bound_receipts(
+        tmp_path,
+        forecast=forecast,
+    )
+    args = [
+        "research",
+        "agent-ledger-resolve",
+        "--ledger-path",
+        str(ledger_path),
+        "--summary-path",
+        str(summary_path),
+        "--resolution-quality-path",
+        str(quality_path),
+        "--learning-availability-root",
+        str(availability_root),
+        "--pit-raw-artifact-archive",
+        str(archive_root),
+    ]
+    for receipt in raw_receipts:
+        args.extend(("--pit-raw-artifact-receipt", str(receipt)))
+    for receipt in price_receipts:
+        args.extend(("--pit-price-window-receipt", str(receipt)))
+    args.append("--json-output")
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["price_window_route"] == "source_bound_adjusted_pit_receipts"
+    assert payload["learning_newly_recorded_count"] == 1
+    observation = LearningAvailabilityLedger(availability_root).verify()[0]
+    evidence = observation.payload["resolution_evidence"]
+    assert evidence["ticker"]["security_id"] == "security-nvda"
+    assert evidence["benchmark"]["security_id"] == "security-qqq"
+    assert evidence["ticker"]["raw_artifact_sha256"] != evidence["benchmark"]["raw_artifact_sha256"]
+
+
+def test_source_bound_resolution_retains_the_exact_alpha_threshold(tmp_path: Path):
+    forecast = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0]
+    verifier = _source_bound_verifier(tmp_path, forecast)
+
+    resolved, _reports = resolve_forecasts_with_quality(
+        [forecast],
+        window_lookup=verifier,
+        now=datetime.datetime(2026, 6, 12, tzinfo=datetime.timezone.utc),
+        alpha_threshold_pct="9.0",
+    )
+
+    result = resolved[0]
+    assert result.outcome is False
+    assert result.resolution_evidence is not None
+    assert result.resolution_evidence["alpha_threshold_pct"] == "9"
+    assert verifier.verify_forecast(result) is True
+    assert verifier.verify_forecast(
+        replace(
+            result,
+            resolution_evidence={
+                **result.resolution_evidence,
+                "alpha_threshold_pct": "1.5",
+            },
+        )
+    ) is False
+
+
+def test_legacy_downgrade_preserves_existing_source_bound_resolution_evidence():
+    forecast = replace(
+        forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0],
+        forecast_id="af-source-bound-preserved",
+        ticker="NVDA",
+    )
+    resolved, _reports = resolve_forecasts_with_quality(
+        [forecast],
+        window_lookup=_source_bound_window_lookup_for(
+            {"NVDA": ("100", "110"), "QQQ": ("100", "102")}
+        ),
+        now=datetime.datetime(2026, 6, 12, tzinfo=datetime.timezone.utc),
+    )
+
+    retained, retained_reports = downgrade_nonqualifying_resolution_labels(
+        resolved,
+        (),
+    )
+
+    assert retained[0].label_quality == LABEL_QUALITY_HIGH
+    assert retained[0].resolution_evidence is not None
+    assert retained_reports == []
+
+
+def test_agent_ledger_resolve_rejects_invalid_source_receipts_before_writing(tmp_path: Path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    raw_archive = tmp_path / "pit-artifacts"
+    raw_receipt = tmp_path / "raw-artifact.json"
+    price_receipt = tmp_path / "price-window.json"
+    raw_receipt.write_text("{}", encoding="utf-8")
+    price_receipt.write_text("{}", encoding="utf-8")
+    forecast = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0]
+    append_forecasts([forecast], path=ledger_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "agent-ledger-resolve",
+            "--ledger-path",
+            str(ledger_path),
+            "--pit-raw-artifact-archive",
+            str(raw_archive),
+            "--pit-raw-artifact-receipt",
+            str(raw_receipt),
+            "--pit-price-window-receipt",
+            str(price_receipt),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "source-bound PIT resolution inputs are invalid" in result.output
+    row = load_ledger(ledger_path)[0]
+    assert row.resolved is False
+    assert row.resolution_evidence is None
+
+
+def test_agent_ledger_resolve_rejects_partial_source_inputs_before_writing(tmp_path: Path):
+    ledger_path = tmp_path / "ledger.jsonl"
+    append_forecasts(
+        [forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")[0]],
+        path=ledger_path,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "research",
+            "agent-ledger-resolve",
+            "--ledger-path",
+            str(ledger_path),
+            "--pit-raw-artifact-archive",
+            str(tmp_path / "pit-artifacts"),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "source-bound resolution requires" in result.output
+    assert load_ledger(ledger_path)[0].resolved is False
 
 
 def test_agent_ledger_resolve_cli_defers_stale_ticker_windows_with_reason(
@@ -771,14 +1201,11 @@ def test_agent_ledger_resolve_recovers_write_to_availability_crash_gap(
     ledger_path = tmp_path / "ledger.jsonl"
     availability_root = tmp_path / "learning_availability"
     base = forecasts_from_overnight_packet(_overnight_packet(), benchmark="QQQ")
-    append_forecasts(
-        [replace(base[0], forecast_id="af-crash-gap", ticker="NFLX")],
-        path=ledger_path,
-    )
-    monkeypatch.setattr(
-        cli_main,
-        "_ledger_window_lookup",
-        _window_lookup_for({"NFLX": ("100", "110"), "QQQ": ("100", "102")}),
+    forecast = replace(base[0], forecast_id="af-crash-gap", ticker="NFLX")
+    append_forecasts([forecast], path=ledger_path)
+    archive_root, raw_receipts, price_receipts = _write_source_bound_receipts(
+        tmp_path,
+        forecast=forecast,
     )
     real_observe = cli_main.observe_forecasts
 
@@ -797,8 +1224,14 @@ def test_agent_ledger_resolve_recovers_write_to_availability_crash_gap(
         str(tmp_path / "quality.json"),
         "--learning-availability-root",
         str(availability_root),
-        "--json-output",
+        "--pit-raw-artifact-archive",
+        str(archive_root),
     ]
+    for receipt in raw_receipts:
+        args.extend(("--pit-raw-artifact-receipt", str(receipt)))
+    for receipt in price_receipts:
+        args.extend(("--pit-price-window-receipt", str(receipt)))
+    args.extend(("--json-output",))
     crashed = runner.invoke(app, args)
     assert crashed.exit_code == 1
     assert load_ledger(ledger_path)[0].resolved is True
@@ -879,21 +1312,22 @@ def test_ledger_quality_audit_cli_annotates_resolved_rows_and_backs_up(
     assert payload["resolved_forecast_count"] == 2
     assert payload["corrupt_ledger_line_count"] == 1
     assert payload["resolution_quality"]["label_quality_counts"] == {
-        LABEL_QUALITY_HIGH: 1,
-        LABEL_QUALITY_SUSPECT: 1,
+        LABEL_QUALITY_SUSPECT: 2
     }
-    assert payload["suspect_forecast_ids"] == ["af-audit-msft"]
+    assert payload["suspect_forecast_ids"] == ["af-audit-nvda", "af-audit-msft"]
     assert payload["learning_availability_root"] == str(availability_root)
-    assert payload["learning_observed_count"] == 2
-    assert payload["learning_newly_recorded_count"] == 2
+    assert payload["learning_observed_count"] == 0
+    assert payload["learning_newly_recorded_count"] == 0
     assert quality_path.exists()
     backups = list(tmp_path.glob("ledger.backup-quality-audit-*.jsonl"))
     assert len(backups) == 1
     by_ticker = {row.ticker: row for row in load_ledger(ledger_path)}
-    assert by_ticker["NVDA"].label_quality == LABEL_QUALITY_HIGH
+    assert by_ticker["NVDA"].label_quality == LABEL_QUALITY_SUSPECT
     assert by_ticker["MSFT"].label_quality == LABEL_QUALITY_SUSPECT
+    assert "legacy_yfinance_nonqualifying" in by_ticker["NVDA"].quality_flags
     assert "reaudit_outcome_mismatch" in by_ticker["MSFT"].quality_flags
     assert by_ticker["MSFT"].outcome is True  # annotated, never rewritten
+    assert not availability_root.exists()
 
 
 def _drifted_timestamp_forecast(**overrides):

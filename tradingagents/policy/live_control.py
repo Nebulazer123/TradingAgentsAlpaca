@@ -17,7 +17,7 @@ from tradingagents.policy.io import atomic_write_text
 
 UTC = datetime.timezone.utc
 _NORMAL_LIVE_COMMITMENTS_FIELD = "normal_live_submission_commitments"
-_NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION = 2
+_NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION = 4
 _NORMAL_LIVE_COMMITMENT_PENDING = "pending"
 _NORMAL_LIVE_COMMITMENT_RESOLVED = "resolved"
 _NORMAL_LIVE_COMMITMENT_OUTCOMES = frozenset(
@@ -106,6 +106,10 @@ def _validate_normal_live_commitment(item: dict[str, Any]) -> dict[str, Any]:
         "client_order_id",
         "control_preimage_sha256",
         "rate_reservation_sha256",
+        "owner_approval_id",
+        "owner_approval_transaction_binding_sha256",
+        "risk_envelope_ref",
+        "risk_envelope_sha256",
         "committed_at",
         "state",
         "outcome",
@@ -123,8 +127,16 @@ def _validate_normal_live_commitment(item: dict[str, Any]) -> dict[str, Any]:
             "order_payload_sha256",
             "control_preimage_sha256",
             "rate_reservation_sha256",
+            "owner_approval_id",
+            "owner_approval_transaction_binding_sha256",
         )
     ) or type(item["client_order_id"]) is not str or not item["client_order_id"]:
+        raise ValueError("normal live submission commitment is invalid")
+    if (
+        type(item["risk_envelope_ref"]) is not str
+        or not item["risk_envelope_ref"].strip()
+        or not _is_sha256(item["risk_envelope_sha256"])
+    ):
         raise ValueError("normal live submission commitment is invalid")
     expected_id = _commitment_id(
         intent_full_sha256=item["intent_full_sha256"],
@@ -132,6 +144,9 @@ def _validate_normal_live_commitment(item: dict[str, Any]) -> dict[str, Any]:
         client_order_id=item["client_order_id"],
         control_preimage_sha256=item["control_preimage_sha256"],
         rate_reservation_sha256=item["rate_reservation_sha256"],
+        owner_approval_id=item["owner_approval_id"],
+        risk_envelope_ref=item["risk_envelope_ref"],
+        risk_envelope_sha256=item["risk_envelope_sha256"],
     )
     if item["commitment_id"] != expected_id:
         raise ValueError("normal live submission commitment identity is invalid")
@@ -182,6 +197,9 @@ def _commitment_id(
     client_order_id: str,
     control_preimage_sha256: str,
     rate_reservation_sha256: str,
+    owner_approval_id: str,
+    risk_envelope_ref: str,
+    risk_envelope_sha256: str,
 ) -> str:
     payload = {
         "intent_full_sha256": intent_full_sha256,
@@ -189,28 +207,33 @@ def _commitment_id(
         "client_order_id": client_order_id,
         "control_preimage_sha256": control_preimage_sha256,
         "rate_reservation_sha256": rate_reservation_sha256,
+        "owner_approval_id": owner_approval_id,
+        "risk_envelope_ref": risk_envelope_ref,
+        "risk_envelope_sha256": risk_envelope_sha256,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
 
 
-def commit_normal_live_submission_locked(
+def prepare_normal_live_submission_candidate_locked(
     path: str | Path,
     *,
     intent_full_sha256: str,
     order_payload_sha256: str,
     client_order_id: str,
     rate_reservation_sha256: str,
+    owner_approval_id: str,
+    owner_approval_transaction_binding_sha256: str,
+    risk_envelope_ref: str,
+    risk_envelope_sha256: str,
     now: datetime.datetime,
-) -> dict[str, str]:
-    """Durably pre-commit one exact live POST while the control lock is held.
+) -> dict[str, object]:
+    """Build, but do not write, the exact pending commitment image.
 
-    The caller must hold :func:`live_control_lock`.  This is the irrevocable
-    decision point: a freeze that wins before it is written prevents all
-    broker I/O; a freeze that follows it preserves the exact in-flight record
-    and cannot turn the already-committed action into an unrecorded POST.
-    Network I/O is intentionally outside the control lock.
+    The caller holds the live-control lock.  This produces the one immutable
+    candidate that an owner approval may authorize; the later commit operation
+    applies these already-determined bytes and never derives a fresh image.
     """
 
     control_path = Path(path)
@@ -230,9 +253,15 @@ def commit_normal_live_submission_locked(
             intent_full_sha256,
             order_payload_sha256,
             rate_reservation_sha256,
+            owner_approval_id,
+            owner_approval_transaction_binding_sha256,
+            risk_envelope_sha256,
         )
     ) or (
-        type(client_order_id) is not str or not client_order_id
+        type(client_order_id) is not str
+        or not client_order_id
+        or type(risk_envelope_ref) is not str
+        or not risk_envelope_ref.strip()
     ):
         raise ValueError("normal live submission commitment is invalid")
     moment = now.astimezone(UTC) if now.tzinfo is not None else now.replace(tzinfo=UTC)
@@ -245,21 +274,13 @@ def commit_normal_live_submission_locked(
         client_order_id=client_order_id,
         control_preimage_sha256=control_preimage_sha256,
         rate_reservation_sha256=rate_reservation_sha256,
+        owner_approval_id=owner_approval_id,
+        risk_envelope_ref=risk_envelope_ref,
+        risk_envelope_sha256=risk_envelope_sha256,
     )
     commitments = _read_normal_live_commitments(state)
-    active = [item for item in commitments if item["state"] == _NORMAL_LIVE_COMMITMENT_PENDING]
-    if active:
-        if len(active) != 1 or any(
-            active[0].get(field) != expected
-            for field, expected in (
-                ("intent_full_sha256", intent_full_sha256),
-                ("order_payload_sha256", order_payload_sha256),
-                ("client_order_id", client_order_id),
-                ("rate_reservation_sha256", rate_reservation_sha256),
-            )
-        ):
-            raise ValueError("normal live submission already has an unresolved commitment")
-        return dict(active[0])
+    if any(item["state"] == _NORMAL_LIVE_COMMITMENT_PENDING for item in commitments):
+        raise ValueError("normal live submission already has an unresolved commitment")
     commitment = {
         "schema_version": _NORMAL_LIVE_COMMITMENT_SCHEMA_VERSION,
         "commitment_id": commitment_id,
@@ -268,14 +289,173 @@ def commit_normal_live_submission_locked(
         "client_order_id": client_order_id,
         "control_preimage_sha256": control_preimage_sha256,
         "rate_reservation_sha256": rate_reservation_sha256,
+        "owner_approval_id": owner_approval_id,
+        "owner_approval_transaction_binding_sha256": (
+            owner_approval_transaction_binding_sha256
+        ),
+        "risk_envelope_ref": risk_envelope_ref,
+        "risk_envelope_sha256": risk_envelope_sha256,
         "committed_at": moment.isoformat(timespec="seconds"),
         "state": _NORMAL_LIVE_COMMITMENT_PENDING,
         "outcome": None,
     }
-    commitments.append(commitment)
-    state[_NORMAL_LIVE_COMMITMENTS_FIELD] = commitments
-    atomic_write_text(control_path, json.dumps(state, indent=2))
-    return commitment
+    after_state = dict(state)
+    after_state[_NORMAL_LIVE_COMMITMENTS_FIELD] = [*commitments, commitment]
+    control_after_json = json.dumps(after_state, indent=2)
+    return {
+        "schema_version": 1,
+        "control_state_path": str(control_path),
+        "control_preimage_sha256": control_preimage_sha256,
+        "control_after_sha256": hashlib.sha256(
+            control_after_json.encode("utf-8")
+        ).hexdigest(),
+        "control_after_json": control_after_json,
+        "commitment": commitment,
+    }
+
+
+def commit_normal_live_submission_candidate_locked(
+    path: str | Path, *, candidate: Mapping[str, object]
+) -> dict[str, str]:
+    """Apply exactly one previously prepared live-control candidate.
+
+    The preimage may either still be the captured one (crash before write) or
+    already equal the captured after-image (idempotent retry).  Any other
+    current control/rate/commitment image fails closed.
+    """
+
+    control_path = Path(path)
+    required = {
+        "schema_version",
+        "control_state_path",
+        "control_preimage_sha256",
+        "control_after_sha256",
+        "control_after_json",
+        "commitment",
+    }
+    if (
+        not isinstance(candidate, Mapping)
+        or set(candidate) != required
+        or candidate.get("schema_version") != 1
+        or candidate.get("control_state_path") != str(control_path)
+        or not _is_sha256(candidate.get("control_preimage_sha256"))
+        or not _is_sha256(candidate.get("control_after_sha256"))
+        or type(candidate.get("control_after_json")) is not str
+        or not isinstance(candidate.get("commitment"), Mapping)
+    ):
+        raise ValueError("normal live submission candidate is invalid")
+    after_json = str(candidate["control_after_json"])
+    if hashlib.sha256(after_json.encode("utf-8")).hexdigest() != candidate[
+        "control_after_sha256"
+    ]:
+        raise ValueError("normal live submission candidate afterimage is invalid")
+    commitment = dict(candidate["commitment"])
+    try:
+        raw = control_path.read_bytes()
+        current_state = json.loads(raw)
+        after_state = json.loads(after_json)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("normal live submission candidate image is unavailable") from exc
+    if not isinstance(current_state, dict) or not isinstance(after_state, dict):
+        raise ValueError("normal live submission candidate image is invalid")
+    if hashlib.sha256(raw).hexdigest() == candidate["control_preimage_sha256"]:
+        after_commitments = _read_normal_live_commitments(after_state)
+        if len([item for item in after_commitments if item == commitment]) != 1:
+            raise ValueError("normal live submission candidate commitment is invalid")
+        atomic_write_text(control_path, after_json)
+        return commitment
+    if hashlib.sha256(raw).hexdigest() == candidate["control_after_sha256"]:
+        commitments = _read_normal_live_commitments(current_state)
+        matches = [item for item in commitments if item == commitment]
+        if len(matches) == 1:
+            return dict(matches[0])
+    # A lookup-only restart may find the candidate's commitment already
+    # terminal.  Resolution is the sole permitted successor to the prepared
+    # pending image, so retain every immutable field from the candidate and
+    # permit only state/outcome/resolved_at to have changed.  This does not
+    # create a new order capability; the caller must still use the resolved
+    # record for broker lookup and refuses a missing order without POST.
+    commitments = _read_normal_live_commitments(current_state)
+    terminal_matches = [
+        item
+        for item in commitments
+        if item.get("commitment_id") == commitment.get("commitment_id")
+    ]
+    if len(terminal_matches) == 1:
+        terminal = terminal_matches[0]
+        immutable_fields = set(commitment) - {"state", "outcome"}
+        if (
+            terminal.get("state") == _NORMAL_LIVE_COMMITMENT_RESOLVED
+            and set(terminal) == immutable_fields | {"state", "outcome", "resolved_at"}
+            and all(terminal.get(field) == commitment[field] for field in immutable_fields)
+            and terminal.get("outcome") in _NORMAL_LIVE_COMMITMENT_OUTCOMES
+            and type(terminal.get("resolved_at")) is str
+        ):
+            if _commitment_time(
+                terminal["resolved_at"], label="resolved_at"
+            ) < _commitment_time(commitment["committed_at"], label="committed_at"):
+                raise ValueError("normal live submission terminal time is invalid")
+            return dict(terminal)
+    raise ValueError("normal live submission candidate no longer matches control state")
+
+
+def commit_normal_live_submission_locked(
+    path: str | Path,
+    *,
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+    rate_reservation_sha256: str,
+    owner_approval_id: str,
+    owner_approval_transaction_binding_sha256: str,
+    risk_envelope_ref: str,
+    risk_envelope_sha256: str,
+    now: datetime.datetime,
+    candidate: Mapping[str, object] | None = None,
+) -> dict[str, str]:
+    """Durably pre-commit one exact live POST while the control lock is held.
+
+    The caller must hold :func:`live_control_lock`.  This is the irrevocable
+    decision point: a freeze that wins before it is written prevents all
+    broker I/O; a freeze that follows it preserves the exact in-flight record
+    and cannot turn the already-committed action into an unrecorded POST.
+    Network I/O is intentionally outside the control lock.
+    """
+
+    if candidate is None:
+        candidate = prepare_normal_live_submission_candidate_locked(
+            path,
+            intent_full_sha256=intent_full_sha256,
+            order_payload_sha256=order_payload_sha256,
+            client_order_id=client_order_id,
+            rate_reservation_sha256=rate_reservation_sha256,
+            owner_approval_id=owner_approval_id,
+            owner_approval_transaction_binding_sha256=(
+                owner_approval_transaction_binding_sha256
+            ),
+            risk_envelope_ref=risk_envelope_ref,
+            risk_envelope_sha256=risk_envelope_sha256,
+            now=now,
+        )
+    commitment = candidate.get("commitment") if isinstance(candidate, Mapping) else None
+    if not isinstance(commitment, Mapping) or any(
+        commitment.get(key) != expected
+        for key, expected in (
+            ("intent_full_sha256", intent_full_sha256),
+            ("order_payload_sha256", order_payload_sha256),
+            ("client_order_id", client_order_id),
+            ("rate_reservation_sha256", rate_reservation_sha256),
+            ("owner_approval_id", owner_approval_id),
+            (
+                "owner_approval_transaction_binding_sha256",
+                owner_approval_transaction_binding_sha256,
+            ),
+            ("risk_envelope_ref", risk_envelope_ref),
+            ("risk_envelope_sha256", risk_envelope_sha256),
+        )
+    ):
+        raise ValueError("normal live submission candidate does not match request")
+    return commit_normal_live_submission_candidate_locked(path, candidate=candidate)
 
 
 def resolve_normal_live_submission_commitment(
@@ -340,13 +520,42 @@ def verify_pending_normal_live_submission_commitment(
     """
 
     with live_control_lock(path):
-        _verify_pending_normal_live_submission_commitment_locked(
+        _verify_normal_live_submission_commitment_locked(
             path,
             commitment=commitment,
             intent_full_sha256=intent_full_sha256,
             order_payload_sha256=order_payload_sha256,
             client_order_id=client_order_id,
             rate_reservation_sha256=rate_reservation_sha256,
+            require_pending=True,
+        )
+
+
+def verify_normal_live_submission_commitment_for_recovery(
+    path: str | Path,
+    *,
+    commitment: Mapping[str, object],
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+    rate_reservation_sha256: str,
+) -> None:
+    """Verify an exact pending or resolved record for lookup-only recovery.
+
+    This validator grants no raw-POST authority.  The transport boundary keeps
+    using :func:`verify_pending_normal_live_submission_commitment`, so a
+    resolved record can only support an idempotent broker lookup.
+    """
+
+    with live_control_lock(path):
+        _verify_normal_live_submission_commitment_locked(
+            path,
+            commitment=commitment,
+            intent_full_sha256=intent_full_sha256,
+            order_payload_sha256=order_payload_sha256,
+            client_order_id=client_order_id,
+            rate_reservation_sha256=rate_reservation_sha256,
+            require_pending=False,
         )
 
 
@@ -361,23 +570,40 @@ def _verify_pending_normal_live_submission_commitment_locked(
 ) -> None:
     """Verify an exact pending record while the caller already owns control lock."""
 
+    _verify_normal_live_submission_commitment_locked(
+        path,
+        commitment=commitment,
+        intent_full_sha256=intent_full_sha256,
+        order_payload_sha256=order_payload_sha256,
+        client_order_id=client_order_id,
+        rate_reservation_sha256=rate_reservation_sha256,
+        require_pending=True,
+    )
+
+
+def _verify_normal_live_submission_commitment_locked(
+    path: str | Path,
+    *,
+    commitment: Mapping[str, object],
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+    rate_reservation_sha256: str,
+    require_pending: bool,
+) -> None:
+    """Verify an exact durable record while the caller owns control lock."""
+
     if not isinstance(commitment, Mapping):
         raise ValueError("normal live submission commitment is invalid")
-    required = {
-        "commitment_id",
-        "intent_full_sha256",
-        "order_payload_sha256",
-        "client_order_id",
-        "control_preimage_sha256",
-        "rate_reservation_sha256",
-    }
-    if any(commitment.get(field) != expected for field, expected in (
-        ("intent_full_sha256", intent_full_sha256),
-        ("order_payload_sha256", order_payload_sha256),
-        ("client_order_id", client_order_id),
-        ("rate_reservation_sha256", rate_reservation_sha256),
-    )) or not all(
-        type(commitment.get(field)) is str for field in required
+    supplied = _validate_normal_live_commitment(dict(commitment))
+    if any(
+        supplied.get(field) != expected
+        for field, expected in (
+            ("intent_full_sha256", intent_full_sha256),
+            ("order_payload_sha256", order_payload_sha256),
+            ("client_order_id", client_order_id),
+            ("rate_reservation_sha256", rate_reservation_sha256),
+        )
     ):
         raise ValueError("normal live submission commitment does not bind the exact order")
     control_path = Path(path)
@@ -391,14 +617,13 @@ def _verify_pending_normal_live_submission_commitment_locked(
     matches = [
         item
         for item in commitments
-        if item["commitment_id"] == commitment["commitment_id"]
+        if item["commitment_id"] == supplied["commitment_id"]
     ]
     if len(matches) != 1:
         raise ValueError("normal live submission commitment is unavailable")
     matched = matches[0]
-    if matched["state"] != _NORMAL_LIVE_COMMITMENT_PENDING or any(
-        matched[field] != commitment.get(field)
-        for field in required
+    if matched != supplied or (
+        require_pending and matched["state"] != _NORMAL_LIVE_COMMITMENT_PENDING
     ):
         raise ValueError("normal live submission commitment is unavailable")
 

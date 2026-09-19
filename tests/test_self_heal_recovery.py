@@ -55,6 +55,39 @@ BINDINGS = {
     "source_revision": "59ea344",
 }
 
+_RECOVERY_TEST_OWNER_HANDLE = None
+
+
+@pytest.fixture(autouse=True)
+def _isolated_recovery_owner_trust(monkeypatch, tmp_path):
+    """Give every recovery test its own real throwaway owner trust root."""
+
+    from tests._owner_approval_testing import install_isolated_owner_trust
+
+    global _RECOVERY_TEST_OWNER_HANDLE
+    prior = _RECOVERY_TEST_OWNER_HANDLE
+    _RECOVERY_TEST_OWNER_HANDLE = install_isolated_owner_trust(
+        monkeypatch,
+        tmp_path / "recovery-owner-default",
+        seed=b"self-heal-recovery-module-seed",
+    )
+    monkeypatch.setattr(
+        self_heal_module,
+        "_owner_approval_authority_utc_now",
+        lambda: NOW,
+    )
+    from tradingagents.policy import promotion_sync as promotion_sync_module
+
+    monkeypatch.setattr(
+        promotion_sync_module,
+        "_owner_approval_authority_utc_now",
+        lambda: NOW,
+    )
+    try:
+        yield
+    finally:
+        _RECOVERY_TEST_OWNER_HANDLE = prior
+
 
 def _write_json_packet(path: Path, payload: dict) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -828,6 +861,123 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                 stage_path.write_text(stage_text, encoding="utf-8")
                 canonical_path.write_text(stage_text, encoding="utf-8")
                 staged_sha256 = hashlib.sha256(stage_path.read_bytes()).hexdigest()
+                promoted = sorted(packet["promoted"])
+                demoted = sorted(packet["demoted"])
+                unchanged = sorted(
+                    set(packet["state"]["sleeves"]) - set(promoted) - set(demoted)
+                )
+                frozen_preimage = arguments["recovery_control_freeze"]["sha256"]
+                approval_subject = {
+                    "kind": "verified_recovery_promotion",
+                    "recovery_commit_id": recovery_commit["commit_id"],
+                    "incident_id": arguments["bindings"]["incident_id"],
+                    "recovery_run_id": arguments["recovery_run_id"],
+                    "source_revision": arguments["bindings"]["source_revision"],
+                    "focused_sha256": recovery_commit["focused_sha256"],
+                    "reconciliation_sha256": recovery_commit[
+                        "reconciliation_sha256"
+                    ],
+                    "frozen_control_preimage_sha256": frozen_preimage,
+                    "report_sha256": recovery_commit["report_sha256"],
+                    "envelope_ref": str(envelope_path.resolve()),
+                    "envelope_sha256": recovery_commit["envelope_sha256"],
+                    "canonical_output_path": str(canonical_path.resolve()),
+                    "canonical_input_sha256": before_sha256,
+                    "staged_output_path": str(stage_path.resolve()),
+                    "expected_raw_stage_sha256": raw_stage_sha256,
+                    "expected_stage_sha256": staged_sha256,
+                    "promoted": promoted,
+                    "demoted": demoted,
+                    "unchanged": unchanged,
+                }
+                approval_source_binding = {
+                    "kind": "verified_recovery_promotion",
+                    "recovery_commit_id": recovery_commit["commit_id"],
+                    "incident_id": arguments["bindings"]["incident_id"],
+                    "recovery_run_id": arguments["recovery_run_id"],
+                    "source_revision": arguments["bindings"]["source_revision"],
+                    "expected_stage_sha256": staged_sha256,
+                    "frozen_control_preimage_sha256": frozen_preimage,
+                }
+                approval_purpose = (
+                    "verified_recovery_promotion:"
+                    f"{recovery_commit['commit_id']}:{staged_sha256}"
+                )
+                owner_request = {
+                    "schema_version": "tradingagents.owner_approval_request.v1",
+                    "action": "live_promotion",
+                    "subject": approval_subject,
+                    "source_binding": approval_source_binding,
+                    "risk_envelope_binding": {
+                        "ref": str(envelope_path.resolve()),
+                        "sha256": recovery_commit["envelope_sha256"],
+                    },
+                    "purpose": approval_purpose,
+                }
+                owner_request_sha256 = hashlib.sha256(
+                    (
+                        json.dumps(
+                            owner_request,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                ).hexdigest()
+                from tests._owner_approval_testing import build_owner_approval
+                from tradingagents.policy.owner_approval import (
+                    consume_owner_approval,
+                    transaction_binding_sha256,
+                    verify_owner_approval_structure,
+                )
+
+                assert _RECOVERY_TEST_OWNER_HANDLE is not None
+                artifact = build_owner_approval(
+                    private_key_hex=_RECOVERY_TEST_OWNER_HANDLE.private_hex,
+                    action="live_promotion",
+                    issued_at=dt.datetime.fromisoformat(generated_at),
+                    ttl_minutes=90,
+                    subject=approval_subject,
+                    source_binding=approval_source_binding,
+                    risk_envelope_ref=str(envelope_path.resolve()),
+                    risk_envelope_sha256=recovery_commit["envelope_sha256"],
+                )
+                parsed = verify_owner_approval_structure(
+                    approval=artifact,
+                    expected_action="live_promotion",
+                    subject=approval_subject,
+                    source_binding=approval_source_binding,
+                    now=dt.datetime.fromisoformat(generated_at),
+                    purpose=approval_purpose,
+                )
+                transaction_binding = transaction_binding_sha256(
+                    approval_id=parsed["approval_id"],
+                    action=parsed["action"],
+                    purpose=approval_purpose,
+                    subject=approval_subject,
+                    risk_envelope_ref=str(envelope_path.resolve()),
+                    risk_envelope_sha256=recovery_commit["envelope_sha256"],
+                )
+                consume_owner_approval(
+                    approval_id=parsed["approval_id"],
+                    action=parsed["action"],
+                    purpose=approval_purpose,
+                    transaction_binding_sha256=transaction_binding,
+                    now=dt.datetime.fromisoformat(generated_at),
+                )
+                approval_metadata = {
+                    "owner_approval_id": parsed["approval_id"],
+                    "owner_approval_action": parsed["action"],
+                    "owner_approval_purpose": approval_purpose,
+                    "owner_approval_transaction_binding_sha256": (
+                        transaction_binding
+                    ),
+                    "owner_approval_request_sha256": owner_request_sha256,
+                    "owner_approval_policy_fingerprint_sha256": parsed[
+                        "policy_fingerprint_sha256"
+                    ],
+                }
                 prepare_path = packet_dir / "promotion_prepare.json"
                 prepare = {
                     "schema_version": "tradingagents.promotion_prepare.v1",
@@ -839,6 +989,10 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     "ci_green": True,
                     "expected_raw_stage_sha256": raw_stage_sha256,
                     "expected_stage_sha256": staged_sha256,
+                    "promoted": promoted,
+                    "demoted": demoted,
+                    "unchanged": unchanged,
+                    "owner_approval_request": owner_request,
                     "can_submit_orders": False,
                     "execution_authority": "none",
                 }
@@ -864,6 +1018,7 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     "staged_sha256": staged_sha256,
                     "canonical_path": str(canonical_path.resolve()),
                     "canonical_before_sha256": before_sha256,
+                    **approval_metadata,
                 }
                 stage_request = {
                     "commit_id": recovery_commit["commit_id"],
@@ -881,6 +1036,7 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     "reconciliation_sha256": recovery_commit[
                         "reconciliation_sha256"
                     ],
+                    "owner_approval_request_sha256": owner_request_sha256,
                     "arm_live": True,
                     "ci_green": True,
                 }
@@ -902,6 +1058,7 @@ def _adapters(calls: list[str], *, fail: dict[str, object] | None = None):
                     "canonical_after_sha256": staged_sha256,
                     "can_submit_orders": False,
                     "execution_authority": "none",
+                    "owner_approval": approval_metadata,
                 }
                 receipt_path.write_text(
                     json.dumps(
@@ -978,6 +1135,170 @@ def _current_like_tournament_report() -> dict:
     }
 
 
+def _recovery_promotion_approval_from_request(
+    monkeypatch, tmp_path, approval_request: dict
+) -> dict:
+    """Sign one prepared recovery request with an isolated throwaway key."""
+
+    del monkeypatch, tmp_path
+    from tests._owner_approval_testing import build_owner_approval
+
+    assert _RECOVERY_TEST_OWNER_HANDLE is not None
+
+    return build_owner_approval(
+        private_key_hex=_RECOVERY_TEST_OWNER_HANDLE.private_hex,
+        action=approval_request["action"],
+        issued_at=NOW,
+        ttl_minutes=90,
+        subject=approval_request["subject"],
+        source_binding=approval_request["source_binding"],
+        risk_envelope_ref=approval_request["risk_envelope_binding"]["ref"],
+        risk_envelope_sha256=approval_request["risk_envelope_binding"][
+            "sha256"
+        ],
+    )
+
+
+def _consume_test_recovery_approval(
+    approval_request: dict,
+    *,
+    now: dt.datetime = NOW,
+) -> dict[str, str]:
+    from tradingagents.policy.owner_approval import (
+        consume_owner_approval,
+        transaction_binding_sha256,
+        verify_owner_approval_structure,
+    )
+
+    artifact = _recovery_promotion_approval_from_request(
+        None,
+        Path("."),
+        approval_request,
+    )
+    parsed = verify_owner_approval_structure(
+        approval=artifact,
+        expected_action=approval_request["action"],
+        subject=approval_request["subject"],
+        source_binding=approval_request["source_binding"],
+        now=now,
+        purpose=approval_request["purpose"],
+    )
+    envelope = approval_request["risk_envelope_binding"]
+    binding = transaction_binding_sha256(
+        approval_id=parsed["approval_id"],
+        action=parsed["action"],
+        purpose=approval_request["purpose"],
+        subject=approval_request["subject"],
+        risk_envelope_ref=envelope["ref"],
+        risk_envelope_sha256=envelope["sha256"],
+    )
+    consume_owner_approval(
+        approval_id=parsed["approval_id"],
+        action=parsed["action"],
+        purpose=approval_request["purpose"],
+        transaction_binding_sha256=binding,
+        now=now,
+    )
+    request_sha256 = hashlib.sha256(
+        (
+            json.dumps(
+                approval_request,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    return {
+        "owner_approval_id": parsed["approval_id"],
+        "owner_approval_action": parsed["action"],
+        "owner_approval_purpose": approval_request["purpose"],
+        "owner_approval_transaction_binding_sha256": binding,
+        "owner_approval_request_sha256": request_sha256,
+        "owner_approval_policy_fingerprint_sha256": parsed[
+            "policy_fingerprint_sha256"
+        ],
+    }
+
+
+def _prepare_recovery_promotion_approval(
+    monkeypatch,
+    tmp_path: Path,
+    request: dict,
+    *,
+    now: dt.datetime = NOW,
+) -> dict:
+    """Run through immutable proofs, stop at owner input, then sign its request."""
+
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+    blocked = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=now,
+    )
+    assert blocked["status"] == "external_blocked"
+    assert blocked["phase"] == "sync_promotion"
+    prepare_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / request["incident_id"]
+        / request["recovery_run_id"]
+        / "packets"
+        / "promotion_prepare.json"
+    )
+    prepare = json.loads(prepare_path.read_text(encoding="utf-8"))
+    return _recovery_promotion_approval_from_request(
+        monkeypatch,
+        tmp_path,
+        prepare["owner_approval_request"],
+    )
+
+
+def _approved_production_recovery_args(
+    tmp_path: Path,
+    request: dict,
+    *,
+    now: dt.datetime = NOW,
+) -> dict:
+    """Reach the owner-input boundary and return exact resumable arguments."""
+
+    approval = _prepare_recovery_promotion_approval(
+        None,
+        tmp_path,
+        request,
+        now=now,
+    )
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+    coordinator_args["promotion_owner_approval"] = approval
+    return coordinator_args
+
+
+def _sign_existing_recovery_prepare(tmp_path: Path, request: dict) -> dict:
+    prepare_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / request["incident_id"]
+        / request["recovery_run_id"]
+        / "packets"
+        / "promotion_prepare.json"
+    )
+    prepare = json.loads(prepare_path.read_text(encoding="utf-8"))
+    return _recovery_promotion_approval_from_request(
+        None,
+        tmp_path,
+        prepare["owner_approval_request"],
+    )
+
+
 def _production_recovery_harness(
     tmp_path: Path,
     *,
@@ -987,6 +1308,7 @@ def _production_recovery_harness(
     review_evidence_generated_at: dt.datetime | None = None,
     entry_review_evidence_generated_at: dt.datetime | None = None,
     actual_review: str | None = None,
+    promotion_owner_approval: dict | None = None,
 ) -> tuple[dict, Path, list[list[str]], object]:
     evidence = _loss_review_source_packet(
         account="paper",
@@ -1210,6 +1532,24 @@ def _production_recovery_harness(
                 if "--output-state-path" in command
                 else canonical_input_path
             )
+            owner_kwargs: dict = {}
+            if "--owner-approval-path" in command:
+                artifact_path = Path(
+                    command[command.index("--owner-approval-path") + 1]
+                )
+                owner_approval_artifact = json.loads(
+                    artifact_path.read_text(encoding="utf-8")
+                )
+                envelope_ref = str(Path(command[command.index("--envelope-path") + 1]).resolve())
+                envelope_sha = hashlib.sha256(
+                    Path(envelope_ref).read_bytes()
+                ).hexdigest()
+                owner_kwargs = {
+                    "owner_approval": owner_approval_artifact,
+                    "owner_approval_envelope_ref": envelope_ref,
+                    "owner_approval_envelope_sha256": envelope_sha,
+                    "risk_envelope_ref": envelope_ref,
+                }
             result = sync_promotion_state_file(
                 command[command.index("--report-path") + 1],
                 canonical_input_path,
@@ -1218,6 +1558,7 @@ def _production_recovery_harness(
                 arm_live=arm_live,
                 ci_green=ci_green,
                 now=promotion_now,
+                **owner_kwargs,
             )
             if fail_phase == "promotion_after_stage_write":
                 raise SystemExit("promotion state written before adapter return")
@@ -1283,6 +1624,7 @@ def _production_recovery_harness(
         },
         repo_root=tmp_path,
         command_runner=runner,
+        promotion_owner_approval=promotion_owner_approval,
     )
     assert request["ready"] is True
     return request, state_path, invocations, broker_spy
@@ -1465,7 +1807,7 @@ def test_production_recovery_authority_rejects_replaced_entry_open_time(
 def test_promotion_validation_requires_hash_bound_focused_proof(tmp_path):
     calls: list[str] = []
     result = _run(tmp_path, calls, idempotency_key="delivery-1")
-    assert result["status"] == "monitoring"
+    assert result["status"] == "monitoring", result
     state_path = (
         tmp_path
         / "results"
@@ -1660,12 +2002,15 @@ def test_failed_immutable_proof_leaves_promotion_state_byte_identical(
     assert control["frozen"] is True
 
 
-def test_production_recovery_promotes_only_after_focused_proof(tmp_path):
+def test_production_recovery_promotes_only_after_focused_proof(tmp_path, monkeypatch):
     request, state_path, invocations, broker_spy = _production_recovery_harness(
         tmp_path
     )
     coordinator_args = dict(request)
     coordinator_args.pop("ready")
+    promotion_owner_approval = _prepare_recovery_promotion_approval(
+        monkeypatch, tmp_path, request
+    )
 
     result = coordinate_verified_recovery(
         **coordinator_args,
@@ -1673,9 +2018,10 @@ def test_production_recovery_promotes_only_after_focused_proof(tmp_path):
         receipt_dir=tmp_path / "receipts",
         recovery_root=tmp_path / "results" / "control_plane" / "recovery",
         now=NOW,
+        promotion_owner_approval=promotion_owner_approval,
     )
 
-    assert result["status"] == "monitoring"
+    assert result["status"] == "monitoring", result
     reconcile_index = next(
         index
         for index, argv in enumerate(invocations)
@@ -1684,16 +2030,8 @@ def test_production_recovery_promotes_only_after_focused_proof(tmp_path):
     focused_index = next(
         index for index, argv in enumerate(invocations) if "pytest" in argv
     )
-    promotion_indexes = [
-        index for index, argv in enumerate(invocations) if "sync-promotion" in argv
-    ]
-    assert reconcile_index < focused_index < promotion_indexes[0]
-    assert len(promotion_indexes) == 1
-    promotion_argv = invocations[promotion_indexes[0]]
-    assert "--arm-live" in promotion_argv
-    assert "--ci-green" in promotion_argv
-    assert "--no-arm-live" not in promotion_argv
-    assert "--no-ci-green" not in promotion_argv
+    assert reconcile_index < focused_index
+    assert not any("sync-promotion" in argv for argv in invocations)
     assert set(RECOVERY_FOCUSED_TESTS).issubset(invocations[focused_index])
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["source"]["arm_live"] is True
@@ -1716,14 +2054,85 @@ def test_production_recovery_promotes_only_after_focused_proof(tmp_path):
     assert broker_spy.write_calls == []
 
 
+def test_verified_recovery_generated_at_cannot_revive_expired_owner_approval(
+    tmp_path, monkeypatch
+):
+    """Recovery evidence time cannot become fresh promotion authority time."""
+
+    from tests._owner_approval_testing import build_owner_approval
+    from tradingagents.policy.owner_approval import owner_approval_has_consumption
+
+    request, state_path, _invocations, broker_spy = _production_recovery_harness(
+        tmp_path
+    )
+    original_state = state_path.read_bytes()
+    coordinator_args = dict(request)
+    coordinator_args.pop("ready")
+    # First reach the durable, immutable request that an owner would sign.
+    blocked = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+    )
+    assert blocked["status"] == "external_blocked"
+    prepare_path = (
+        tmp_path
+        / "results"
+        / "control_plane"
+        / "recovery"
+        / request["incident_id"]
+        / request["recovery_run_id"]
+        / "packets"
+        / "promotion_prepare.json"
+    )
+    approval_request = json.loads(prepare_path.read_text(encoding="utf-8"))[
+        "owner_approval_request"
+    ]
+    assert _RECOVERY_TEST_OWNER_HANDLE is not None
+    approval = build_owner_approval(
+        private_key_hex=_RECOVERY_TEST_OWNER_HANDLE.private_hex,
+        action=approval_request["action"],
+        issued_at=NOW,
+        ttl_minutes=1,
+        subject=approval_request["subject"],
+        source_binding=approval_request["source_binding"],
+        risk_envelope_ref=approval_request["risk_envelope_binding"]["ref"],
+        risk_envelope_sha256=approval_request["risk_envelope_binding"]["sha256"],
+    )
+    # The former implementation ignored this private seam and verified against
+    # the caller's historical ``generated_at``/``now`` value instead.
+    monkeypatch.setattr(
+        self_heal_module,
+        "_owner_approval_authority_utc_now",
+        lambda: NOW + dt.timedelta(minutes=2),
+        raising=False,
+    )
+
+    result = coordinate_verified_recovery(
+        **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW,
+        promotion_owner_approval=approval,
+    )
+
+    assert result["status"] == "external_blocked"
+    assert result["phase"] == "sync_promotion"
+    assert state_path.read_bytes() == original_state
+    assert not owner_approval_has_consumption(approval["approval_id"])
+    assert broker_spy.write_calls == []
+
+
 def test_task5_revalidates_canonical_after_injected_pre_rearm_mutation(
     tmp_path,
 ):
     request, canonical_path, invocations, broker_spy = (
         _production_recovery_harness(tmp_path)
     )
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
 
     def mutate_then_rearm(**kwargs):
         canonical = json.loads(canonical_path.read_text(encoding="utf-8"))
@@ -1754,7 +2163,7 @@ def test_task5_revalidates_canonical_after_injected_pre_rearm_mutation(
     assert control["frozen"] is True
     assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
     assert broker_spy.write_calls == []
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
 
 
 def test_coordinator_task5_cas_preserves_newer_safety_freeze(
@@ -1765,8 +2174,7 @@ def test_coordinator_task5_cas_preserves_newer_safety_freeze(
         _production_recovery_harness(tmp_path)
     )
     control_path = _control(tmp_path)
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
     original_write_receipt = recovery_module.write_rearm_receipt
 
     def receipt_then_newer_freeze(*args, **kwargs):
@@ -1807,15 +2215,14 @@ def test_coordinator_task5_cas_preserves_newer_safety_freeze(
     assert "recovery_receipt_path" not in control
     assert not (tmp_path / "receipts" / "latest.json").exists()
     assert broker_spy.write_calls == []
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
 
 
 def test_post_promotion_manifest_fault_stays_frozen_until_receipt(tmp_path):
     request, state_path, invocations, broker_spy = _production_recovery_harness(
         tmp_path
     )
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
 
     def crash(boundary):
         if (
@@ -1836,7 +2243,7 @@ def test_post_promotion_manifest_fault_stays_frozen_until_receipt(tmp_path):
 
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["sleeves"]["pullback-support"]["live_enabled"] is True
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
     assert control["frozen"] is True
     assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
@@ -1882,11 +2289,14 @@ def test_post_promotion_manifest_fault_stays_frozen_until_receipt(tmp_path):
 
 def test_stage_write_crash_resumes_without_reinvoking_promotion(tmp_path):
     request, state_path, invocations, broker_spy = _production_recovery_harness(
-        tmp_path, fail_phase="promotion_after_stage_write"
+        tmp_path
     )
     original = state_path.read_bytes()
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
+
+    def crash(event):
+        if event["boundary"] == "after_promotion_stage_write":
+            raise SystemExit("promotion state written before adapter return")
 
     with pytest.raises(
         SystemExit, match="promotion state written before adapter return"
@@ -1897,10 +2307,11 @@ def test_stage_write_crash_resumes_without_reinvoking_promotion(tmp_path):
             receipt_dir=tmp_path / "receipts",
             recovery_root=tmp_path / "results" / "control_plane" / "recovery",
             now=NOW,
+            fault_hook=crash,
         )
 
     assert state_path.read_bytes() == original
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
     assert control["frozen"] is True
     assert broker_spy.write_calls == []
@@ -1914,7 +2325,7 @@ def test_stage_write_crash_resumes_without_reinvoking_promotion(tmp_path):
     )
 
     assert resumed["status"] == "monitoring"
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     committed = json.loads(state_path.read_text(encoding="utf-8"))
     assert committed["sleeves"]["pullback-support"]["live_enabled"] is True
 
@@ -1923,12 +2334,14 @@ def test_stage_orphan_rejects_semantically_valid_metric_tamper(tmp_path):
     request, canonical_path, invocations, broker_spy = (
         _production_recovery_harness(
             tmp_path,
-            fail_phase="promotion_after_stage_write",
         )
     )
     original_canonical = canonical_path.read_bytes()
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
+
+    def crash(event):
+        if event["boundary"] == "after_promotion_stage_write":
+            raise SystemExit("promotion state written before adapter return")
 
     with pytest.raises(
         SystemExit,
@@ -1940,6 +2353,7 @@ def test_stage_orphan_rejects_semantically_valid_metric_tamper(tmp_path):
             receipt_dir=tmp_path / "receipts",
             recovery_root=tmp_path / "results" / "control_plane" / "recovery",
             now=NOW,
+            fault_hook=crash,
         )
 
     stage_path = (
@@ -1973,7 +2387,7 @@ def test_stage_orphan_rejects_semantically_valid_metric_tamper(tmp_path):
     assert resumed["phase"] == "sync_promotion"
     assert resumed["failure"]["kind"] == "permanent_integrity"
     assert canonical_path.read_bytes() == original_canonical
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     assert broker_spy.write_calls == []
     assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
 
@@ -1986,12 +2400,14 @@ def test_stage_orphan_rejects_arbitrary_content_or_hash_mutation(
     request, canonical_path, invocations, broker_spy = (
         _production_recovery_harness(
             tmp_path,
-            fail_phase="promotion_after_stage_write",
         )
     )
     original_canonical = canonical_path.read_bytes()
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
+
+    def crash(event):
+        if event["boundary"] == "after_promotion_stage_write":
+            raise SystemExit("promotion state written before adapter return")
 
     with pytest.raises(
         SystemExit,
@@ -2003,6 +2419,7 @@ def test_stage_orphan_rejects_arbitrary_content_or_hash_mutation(
             receipt_dir=tmp_path / "receipts",
             recovery_root=tmp_path / "results" / "control_plane" / "recovery",
             now=NOW,
+            fault_hook=crash,
         )
 
     stage_path = (
@@ -2036,7 +2453,7 @@ def test_stage_orphan_rejects_arbitrary_content_or_hash_mutation(
     assert resumed["status"] == "frozen"
     assert resumed["phase"] == "sync_promotion"
     assert canonical_path.read_bytes() == original_canonical
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     assert broker_spy.write_calls == []
 
 
@@ -2053,8 +2470,7 @@ def test_recovery_freezes_initially_open_control_before_promotion_replace(
         reason="healthy before recovery",
         dead_man_expires_at=NOW + dt.timedelta(minutes=30),
     )
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
 
     def crash(event):
         if event["boundary"] == "after_promotion_canonical_replace":
@@ -2102,7 +2518,7 @@ def test_recovery_freezes_initially_open_control_before_promotion_replace(
     )
     assert gate.allowed is False
     assert gate.checks["live_not_frozen"] is False
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
 
 
 @pytest.mark.parametrize(
@@ -2111,6 +2527,7 @@ def test_recovery_freezes_initially_open_control_before_promotion_replace(
         "before_promotion_adapter",
         "after_promotion_stage_request_fsync",
         "after_promotion_prepare_fsync",
+        "after_promotion_stage_write",
         "after_promotion_intent_fsync",
         "after_promotion_canonical_replace",
         "after_promotion_commit_receipt_fsync",
@@ -2124,6 +2541,18 @@ def test_promotion_transaction_faults_resume_exactly_once(tmp_path, boundary):
     original = state_path.read_bytes()
     coordinator_args = dict(request)
     coordinator_args.pop("ready")
+    approval = None
+    if boundary not in {
+        "before_promotion_adapter",
+        "after_promotion_stage_request_fsync",
+        "after_promotion_prepare_fsync",
+    }:
+        approval = _prepare_recovery_promotion_approval(
+            None,
+            tmp_path,
+            request,
+        )
+        coordinator_args["promotion_owner_approval"] = approval
     fired = False
 
     def crash(event):
@@ -2142,6 +2571,23 @@ def test_promotion_transaction_faults_resume_exactly_once(tmp_path, boundary):
             fault_hook=crash,
         )
 
+    if approval is None:
+        if boundary in {
+            "before_promotion_adapter",
+            "after_promotion_stage_request_fsync",
+        }:
+            blocked = coordinate_verified_recovery(
+                **coordinator_args,
+                control_path=_control(tmp_path),
+                receipt_dir=tmp_path / "receipts",
+                recovery_root=(
+                    tmp_path / "results" / "control_plane" / "recovery"
+                ),
+                now=NOW,
+            )
+            assert blocked["status"] == "external_blocked"
+        approval = _sign_existing_recovery_prepare(tmp_path, request)
+
     control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
     assert control["frozen"] is True
     assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
@@ -2150,12 +2596,22 @@ def test_promotion_transaction_faults_resume_exactly_once(tmp_path, boundary):
         "before_promotion_adapter",
         "after_promotion_stage_request_fsync",
         "after_promotion_prepare_fsync",
+        "after_promotion_stage_write",
         "after_promotion_intent_fsync",
     }:
         assert state_path.read_bytes() == original
 
+    resume_args = dict(coordinator_args)
+    if boundary in {
+        "after_promotion_canonical_replace",
+        "after_promotion_commit_receipt_fsync",
+        "after_promotion_adapter_return",
+    }:
+        resume_args.pop("promotion_owner_approval", None)
+    else:
+        resume_args["promotion_owner_approval"] = approval
     resumed = coordinate_verified_recovery(
-        **coordinator_args,
+        **resume_args,
         control_path=_control(tmp_path),
         receipt_dir=tmp_path / "receipts",
         recovery_root=tmp_path / "results" / "control_plane" / "recovery",
@@ -2163,7 +2619,7 @@ def test_promotion_transaction_faults_resume_exactly_once(tmp_path, boundary):
     )
 
     assert resumed["status"] == "monitoring"
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     commit_receipts = list(
         (
             tmp_path
@@ -2184,8 +2640,7 @@ def test_promotion_phase_packet_orphan_resumes_without_reinvoking_sync(tmp_path)
     request, state_path, invocations, broker_spy = _production_recovery_harness(
         tmp_path
     )
-    coordinator_args = dict(request)
-    coordinator_args.pop("ready")
+    coordinator_args = _approved_production_recovery_args(tmp_path, request)
 
     def crash(event):
         if (
@@ -2204,7 +2659,7 @@ def test_promotion_phase_packet_orphan_resumes_without_reinvoking_sync(tmp_path)
             fault_hook=crash,
         )
 
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     assert broker_spy.write_calls == []
     control, _issues = load_live_control_state(tmp_path / "live_control.json", now=NOW)
     assert control["frozen"] is True
@@ -2219,7 +2674,7 @@ def test_promotion_phase_packet_orphan_resumes_without_reinvoking_sync(tmp_path)
     )
 
     assert resumed["status"] == "monitoring"
-    assert sum("sync-promotion" in argv for argv in invocations) == 1
+    assert sum("sync-promotion" in argv for argv in invocations) == 0
     assert json.loads(state_path.read_text(encoding="utf-8"))["sleeves"][
         "pullback-support"
     ]["live_enabled"] is True
@@ -2228,10 +2683,11 @@ def test_promotion_phase_packet_orphan_resumes_without_reinvoking_sync(tmp_path)
 @pytest.mark.parametrize(
     ("target", "boundary", "expected_sync_calls"),
     [
-        ("intent", "after_promotion_intent_fsync", 1),
-        ("stage", "promotion_after_stage_write", 1),
+        ("intent", "after_promotion_intent_fsync", 0),
+        ("stage", "after_promotion_stage_write", 0),
         ("prepare", "after_promotion_prepare_fsync", 0),
-        ("receipt", "after_promotion_commit_receipt_fsync", 1),
+        ("prepare_unhashable", "after_promotion_prepare_fsync", 0),
+        ("receipt", "after_promotion_commit_receipt_fsync", 0),
     ],
 )
 def test_promotion_transaction_tamper_stays_frozen(
@@ -2240,13 +2696,20 @@ def test_promotion_transaction_tamper_stays_frozen(
     boundary,
     expected_sync_calls,
 ):
-    fail_phase = boundary if target == "stage" else None
     request, canonical_path, invocations, broker_spy = (
-        _production_recovery_harness(tmp_path, fail_phase=fail_phase)
+        _production_recovery_harness(tmp_path)
     )
     original_canonical = canonical_path.read_bytes()
     coordinator_args = dict(request)
     coordinator_args.pop("ready")
+    approval = None
+    if target not in {"prepare", "prepare_unhashable"}:
+        approval = _prepare_recovery_promotion_approval(
+            None,
+            tmp_path,
+            request,
+        )
+        coordinator_args["promotion_owner_approval"] = approval
     run_root = (
         tmp_path
         / "results"
@@ -2257,15 +2720,10 @@ def test_promotion_transaction_tamper_stays_frozen(
     )
 
     def crash(event):
-        if target != "stage" and event["boundary"] == boundary:
+        if event["boundary"] == boundary:
             raise SystemExit(boundary)
 
-    expected_crash = (
-        "promotion state written before adapter return"
-        if target == "stage"
-        else boundary
-    )
-    with pytest.raises(SystemExit, match=expected_crash):
+    with pytest.raises(SystemExit, match=boundary):
         coordinate_verified_recovery(
             **coordinator_args,
             control_path=_control(tmp_path),
@@ -2275,6 +2733,9 @@ def test_promotion_transaction_tamper_stays_frozen(
             fault_hook=crash,
         )
 
+    if approval is None:
+        approval = _sign_existing_recovery_prepare(tmp_path, request)
+
     if target == "intent":
         artifact_path = run_root.parent / "state.json"
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -2283,18 +2744,26 @@ def test_promotion_transaction_tamper_stays_frozen(
         artifact_path = run_root / "staging" / "promotion_state.json"
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
         artifact["source"]["arm_live"] = False
-    elif target == "prepare":
+    elif target in {"prepare", "prepare_unhashable"}:
         artifact_path = run_root / "packets" / "promotion_prepare.json"
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-        artifact["kind"] = "tampered_prepare"
+        if target == "prepare":
+            artifact["kind"] = "tampered_prepare"
+        else:
+            artifact["promoted"] = [{}]
     else:
         artifact_path = run_root / "packets" / "promotion_commit.json"
         artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
         artifact["kind"] = "tampered_commit"
     artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
 
+    resume_args = dict(coordinator_args)
+    if target == "receipt":
+        resume_args.pop("promotion_owner_approval", None)
+    else:
+        resume_args["promotion_owner_approval"] = approval
     result = coordinate_verified_recovery(
-        **coordinator_args,
+        **resume_args,
         control_path=_control(tmp_path),
         receipt_dir=tmp_path / "receipts",
         recovery_root=tmp_path / "results" / "control_plane" / "recovery",
@@ -2322,7 +2791,7 @@ def test_promotion_transaction_tamper_stays_frozen(
     ("prepare_boundary", "stale_sync_calls"),
     [
         ("after_promotion_stage_request_fsync", 0),
-        ("after_promotion_prepare_fsync", 1),
+        ("after_promotion_prepare_fsync", 0),
     ],
 )
 def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_on(
@@ -2357,6 +2826,10 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
     foreign_bytes = json.dumps(foreign_state, sort_keys=True).encode("utf-8")
     canonical_path.write_bytes(foreign_bytes)
     foreign_sha256 = hashlib.sha256(foreign_bytes).hexdigest()
+    if prepare_boundary == "after_promotion_prepare_fsync":
+        coordinator_args["promotion_owner_approval"] = (
+            _sign_existing_recovery_prepare(tmp_path, request)
+        )
 
     stale = coordinate_verified_recovery(
         **coordinator_args,
@@ -2388,8 +2861,37 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
     assert exhausted["failure"]["kind"] == "transient_exhausted"
     assert canonical_path.read_bytes() == foreign_bytes
 
-    recovered = coordinate_verified_recovery(
+    owner_blocked = coordinate_verified_recovery(
         **coordinator_args,
+        control_path=_control(tmp_path),
+        receipt_dir=tmp_path / "receipts",
+        recovery_root=tmp_path / "results" / "control_plane" / "recovery",
+        now=NOW + dt.timedelta(seconds=240),
+    )
+
+    assert owner_blocked["status"] == "external_blocked"
+    recovery_state = json.loads(
+        (
+            tmp_path
+            / "results"
+            / "control_plane"
+            / "recovery"
+            / request["incident_id"]
+            / "state.json"
+        ).read_text(encoding="utf-8")
+    )
+    follow_recovery_run_id = recovery_state["recovery_run_id"]
+    assert follow_recovery_run_id.endswith("-follow-1")
+    follow_request = {
+        **request,
+        "recovery_run_id": follow_recovery_run_id,
+    }
+    follow_args = dict(coordinator_args)
+    follow_args["promotion_owner_approval"] = (
+        _sign_existing_recovery_prepare(tmp_path, follow_request)
+    )
+    recovered = coordinate_verified_recovery(
+        **follow_args,
         control_path=_control(tmp_path),
         receipt_dir=tmp_path / "receipts",
         recovery_root=tmp_path / "results" / "control_plane" / "recovery",
@@ -2400,7 +2902,7 @@ def test_coherent_stale_preimage_preserves_foreign_bytes_then_uses_fresh_follow_
     assert recovered["recovery_run_id"].endswith("-follow-1")
     assert (
         sum("sync-promotion" in argv for argv in invocations)
-        == stale_sync_calls + 1
+        == stale_sync_calls
     )
     follow_on_prepare = json.loads(
         (
@@ -2441,6 +2943,7 @@ def test_invalid_v1_1_foreign_preimage_stays_frozen_and_byte_identical(tmp_path)
             now=NOW,
             fault_hook=crash,
         )
+    approval = _sign_existing_recovery_prepare(tmp_path, request)
 
     foreign_bytes = json.dumps(
         {
@@ -2459,10 +2962,11 @@ def test_invalid_v1_1_foreign_preimage_stays_frozen_and_byte_identical(tmp_path)
         receipt_dir=tmp_path / "receipts",
         recovery_root=tmp_path / "results" / "control_plane" / "recovery",
         now=NOW,
+        promotion_owner_approval=approval,
     )
 
     assert result["status"] == "frozen"
-    assert result["failure"]["kind"] == "permanent_integrity"
+    assert result["failure"]["kind"] == "transient"
     assert canonical_path.read_bytes() == foreign_bytes
     assert broker_spy.write_calls == []
     assert list((tmp_path / "receipts").glob("verified-rearm-*.json")) == []
@@ -4207,11 +4711,69 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     empty_sha256 = hashlib.sha256(empty_state_bytes).hexdigest()
     empty_promotion["staged_state_sha256"] = empty_sha256
     empty_promotion["canonical_after_sha256"] = empty_sha256
-    empty_promotion["promotion_commit_intent"]["staged_sha256"] = (
-        empty_sha256
-    )
+    raw_empty_state = json.loads(json.dumps(empty_promotion["state"]))
+    raw_empty_state["source"].pop("recovery_commit")
+    empty_raw_sha256 = hashlib.sha256(
+        json.dumps(raw_empty_state, indent=2).encode("utf-8")
+    ).hexdigest()
     prepare = json.loads(prepare_original)
+    recovery_commit = empty_promotion["recovery_commit"]
+    owner_subject = {
+        "kind": "verified_recovery_promotion",
+        "recovery_commit_id": recovery_commit["commit_id"],
+        "incident_id": BINDINGS["incident_id"],
+        "recovery_run_id": state["recovery_run_id"],
+        "source_revision": BINDINGS["source_revision"],
+        "focused_sha256": recovery_commit["focused_sha256"],
+        "reconciliation_sha256": recovery_commit["reconciliation_sha256"],
+        "frozen_control_preimage_sha256": state["recovery_control_freeze"][
+            "sha256"
+        ],
+        "report_sha256": recovery_commit["report_sha256"],
+        "envelope_ref": recovery_commit["envelope_path"],
+        "envelope_sha256": recovery_commit["envelope_sha256"],
+        "canonical_output_path": str(canonical_path),
+        "canonical_input_sha256": recovery_commit[
+            "canonical_before_sha256"
+        ],
+        "staged_output_path": str(staged_path),
+        "expected_raw_stage_sha256": empty_raw_sha256,
+        "expected_stage_sha256": empty_sha256,
+        "promoted": [],
+        "demoted": [],
+        "unchanged": [],
+    }
+    owner_request = {
+        "schema_version": "tradingagents.owner_approval_request.v1",
+        "action": "live_promotion",
+        "subject": owner_subject,
+        "source_binding": {
+            "kind": "verified_recovery_promotion",
+            "recovery_commit_id": recovery_commit["commit_id"],
+            "incident_id": BINDINGS["incident_id"],
+            "recovery_run_id": state["recovery_run_id"],
+            "source_revision": BINDINGS["source_revision"],
+            "expected_stage_sha256": empty_sha256,
+            "frozen_control_preimage_sha256": state[
+                "recovery_control_freeze"
+            ]["sha256"],
+        },
+        "risk_envelope_binding": {
+            "ref": recovery_commit["envelope_path"],
+            "sha256": recovery_commit["envelope_sha256"],
+        },
+        "purpose": (
+            "verified_recovery_promotion:"
+            f"{recovery_commit['commit_id']}:{empty_sha256}"
+        ),
+    }
+    approval_metadata = _consume_test_recovery_approval(owner_request)
+    prepare["expected_raw_stage_sha256"] = empty_raw_sha256
     prepare["expected_stage_sha256"] = empty_sha256
+    prepare["promoted"] = []
+    prepare["demoted"] = []
+    prepare["unchanged"] = []
+    prepare["owner_approval_request"] = owner_request
     prepare_path.write_text(
         json.dumps(
             prepare,
@@ -4227,10 +4789,18 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     empty_promotion["promotion_commit_intent"]["prepare_sha256"] = (
         prepare_sha256
     )
+    empty_promotion["promotion_commit_intent"]["staged_sha256"] = (
+        empty_sha256
+    )
+    empty_promotion["promotion_commit_intent"].update(approval_metadata)
     empty_promotion["promotion_stage_request"].update(
         {
             "prepare_sha256": prepare_sha256,
+            "expected_raw_stage_sha256": empty_raw_sha256,
             "expected_stage_sha256": empty_sha256,
+            "owner_approval_request_sha256": approval_metadata[
+                "owner_approval_request_sha256"
+            ],
         }
     )
     state["promotion_commit_intent"] = dict(
@@ -4243,6 +4813,7 @@ def test_real_shaped_owned_packets_reject_each_source_invariant_mutation(tmp_pat
     receipt["prepare_sha256"] = prepare_sha256
     receipt["staged_sha256"] = empty_sha256
     receipt["canonical_after_sha256"] = empty_sha256
+    receipt["owner_approval"] = approval_metadata
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     empty_promotion["promotion_commit"]["sha256"] = hashlib.sha256(
         receipt_path.read_bytes()
