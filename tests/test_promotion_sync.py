@@ -284,9 +284,12 @@ def test_sync_demotes_live_incumbent_when_report_generated_at_stale():
     assert now - datetime.datetime(
         2026, 6, 20, 21, 12, 35, tzinfo=datetime.timezone.utc
     ) > datetime.timedelta(days=7)
+    report = _fresh_report()
+    report["live_strategy_candidate"]["strategy_id"] = "current-aggressive"
 
-    result = _sync_incumbent(_fresh_report(), now=now)
+    result = _sync_incumbent(report, now=now)
 
+    assert result.promoted == []
     assert result.demoted == ["current-aggressive"]
     record = result.state["sleeves"]["current-aggressive"]
     assert record["stage"] == "paper_only"
@@ -298,9 +301,11 @@ def test_sync_demotes_live_incumbent_when_report_generated_at_stale():
 def test_sync_demotes_live_incumbent_when_report_generated_at_invalid():
     report = _fresh_report()
     report["generated_at"] = "not-a-timestamp"
+    report["live_strategy_candidate"]["strategy_id"] = "current-aggressive"
 
     result = _sync_incumbent(report)
 
+    assert result.promoted == []
     assert result.demoted == ["current-aggressive"]
     record = result.state["sleeves"]["current-aggressive"]
     assert record["stage"] == "paper_only"
@@ -312,15 +317,32 @@ def test_sync_demotes_live_incumbent_when_report_generated_at_invalid():
 def test_sync_demotes_live_incumbent_when_report_generated_at_future():
     report = _fresh_report()
     report["generated_at"] = "2026-06-23T00:00:00+00:00"
+    report["live_strategy_candidate"]["strategy_id"] = "current-aggressive"
 
     result = _sync_incumbent(report)
 
+    assert result.promoted == []
     assert result.demoted == ["current-aggressive"]
     record = result.state["sleeves"]["current-aggressive"]
     assert record["stage"] == "paper_only"
     assert record["live_enabled"] is False
     assert "future" in record["demotion_reason"]
     assert "turned negative" not in record["demotion_reason"]
+
+
+def test_sync_does_not_repromote_incumbent_when_report_timestamp_missing():
+    report = _fresh_report()
+    report.pop("generated_at")
+    report["live_strategy_candidate"]["strategy_id"] = "current-aggressive"
+
+    result = _sync_incumbent(report)
+
+    assert result.promoted == []
+    assert result.demoted == ["current-aggressive"]
+    record = result.state["sleeves"]["current-aggressive"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert "missing" in record["demotion_reason"]
 
 
 @pytest.mark.parametrize(
@@ -346,6 +368,79 @@ def test_sync_demotes_quality_floor_breaching_incumbent(overrides, metric):
     assert "quality floor" in record["demotion_reason"]
     assert metric in record["demotion_reason"]
     assert "turned negative" not in record["demotion_reason"]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "metric"),
+    [
+        ({"tracked_days": "unknown"}, "tracked_days"),
+        ({"max_drawdown_pct": "not-a-number"}, "max_drawdown_pct"),
+        ({"win_rate_pct": "not-a-number"}, "win_rate_pct"),
+    ],
+)
+def test_sync_demotes_malformed_quality_metric_without_repromotion(overrides, metric):
+    report = _fresh_report()
+    report["live_strategy_candidate"]["strategy_id"] = "current-aggressive"
+    for ranking in report["rankings"]:
+        if ranking["strategy_id"] == "current-aggressive":
+            ranking.update(overrides)
+
+    result = _sync_incumbent(report)
+
+    assert result.promoted == []
+    assert result.demoted == ["current-aggressive"]
+    record = result.state["sleeves"]["current-aggressive"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert "quality floor" in record["demotion_reason"]
+    assert "invalid" in record["demotion_reason"]
+    assert metric in record["demotion_reason"]
+
+
+def test_sync_malformed_candidate_tracked_days_stays_fail_closed():
+    report = _fresh_report()
+    for ranking in report["rankings"]:
+        if ranking["strategy_id"] == "pullback-support":
+            ranking["tracked_days"] = "unknown"
+
+    result = _sync_incumbent(report)
+
+    assert result.promoted == []
+    record = result.state["sleeves"]["pullback-support"]
+    assert record["stage"] == "paper_only"
+    assert record["live_enabled"] is False
+    assert record["evidence_metrics"]["tracked_days"] == 0
+    assert any(
+        "tracked_days" in issue and "invalid" in issue
+        for issue in record["issues"]
+    )
+
+
+def test_sync_file_writes_demotion_for_malformed_quality_metric(tmp_path):
+    report = _fresh_report()
+    for ranking in report["rankings"]:
+        if ranking["strategy_id"] == "current-aggressive":
+            ranking["tracked_days"] = "unknown"
+
+    report_path = tmp_path / "latest.json"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    state_path = tmp_path / "promotion_state.json"
+    state_path.write_text(json.dumps(_incumbent_state()), encoding="utf-8")
+
+    result = sync_promotion_state_file(
+        report_path,
+        state_path,
+        tiny_live_tranche_usd=Decimal("25"),
+        arm_live=True,
+        ci_green=True,
+        now=SYNC_NOW,
+    )
+
+    assert result.demoted == ["current-aggressive"]
+    written = json.loads(state_path.read_text(encoding="utf-8"))
+    record = written["sleeves"]["current-aggressive"]
+    assert record["live_enabled"] is False
+    assert "invalid" in record["demotion_reason"]
 
 
 def test_resolve_live_sleeve_prefers_backed_selection():
