@@ -1146,7 +1146,9 @@ def test_sync_demotes_quality_floor_breaching_incumbent(overrides, metric):
     [
         ({"tracked_days": "unknown"}, "tracked_days"),
         ({"max_drawdown_pct": "not-a-number"}, "max_drawdown_pct"),
+        ({"max_drawdown_pct": "NaN"}, "max_drawdown_pct"),
         ({"win_rate_pct": "not-a-number"}, "win_rate_pct"),
+        ({"win_rate_pct": "Infinity"}, "win_rate_pct"),
     ],
 )
 def test_sync_demotes_malformed_quality_metric_without_repromotion(overrides, metric):
