@@ -1092,6 +1092,7 @@ def test_sync_stale_incumbent_demotes_and_blocks_candidate_in_same_call():
     ("generated_at", "expected_fragment"),
     [
         (None, "missing"),
+        ("not-a-timestamp", "invalid"),
         (_iso(SYNC_NOW + datetime.timedelta(seconds=1)), "future"),
         (_iso(SYNC_NOW - datetime.timedelta(days=8)), "stale"),
     ],
@@ -1189,6 +1190,7 @@ def test_sync_malformed_candidate_tracked_days_stays_fail_closed():
 
 def test_sync_file_writes_demotion_for_malformed_quality_metric(tmp_path):
     report = _fresh_report()
+    report["live_strategy_candidate"] = {"status": "none"}
     for ranking in report["rankings"]:
         if ranking["strategy_id"] == "current-aggressive":
             ranking["tracked_days"] = "unknown"
