@@ -1,6 +1,13 @@
 name: Promotion sync validation
 
 on:
+  push:
+    paths:
+      - "tradingagents/policy/promotion_sync.py"
+      - "tests/test_promotion_sync.py"
+      - ".github/workflows/promotion-sync-validation.yml"
+      - "pyproject.toml"
+      - "uv.lock"
   pull_request:
     branches: [master]
     paths:
