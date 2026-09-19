@@ -174,6 +174,21 @@ def _as_decimal(value: Any, default: str = "0") -> Decimal:
         return Decimal(default)
 
 
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _quality_decimal(value: Any) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() else None
+
+
 def _ranking_for(report: Mapping, sleeve_id: str) -> Mapping | None:
     for ranking in report.get("rankings") or []:
         if ranking.get("strategy_id") == sleeve_id:
@@ -183,18 +198,32 @@ def _ranking_for(report: Mapping, sleeve_id: str) -> Mapping | None:
 
 def _quality_gate_issues(ranking: Mapping) -> list[str]:
     issues: list[str] = []
-    tracked_days = int(ranking.get("tracked_days") or 0)
+
+    raw_tracked_days = ranking.get("tracked_days")
+    try:
+        tracked_days = int(raw_tracked_days or 0)
+    except (TypeError, ValueError, OverflowError):
+        tracked_days = 0
+        issues.append(f"tracked_days {raw_tracked_days!r} is invalid")
     if tracked_days < MIN_TRACKED_DAYS:
         issues.append(
             f"tracked_days {tracked_days} is below the {MIN_TRACKED_DAYS}-day floor"
         )
-    drawdown = _as_decimal(ranking.get("max_drawdown_pct"))
-    if drawdown < MAX_DRAWDOWN_FLOOR_PCT:
+
+    raw_drawdown = ranking.get("max_drawdown_pct")
+    drawdown = _quality_decimal(raw_drawdown)
+    if drawdown is None:
+        issues.append(f"max_drawdown_pct {raw_drawdown!r} is invalid")
+    elif drawdown < MAX_DRAWDOWN_FLOOR_PCT:
         issues.append(
             f"max_drawdown_pct {drawdown} breaches the {MAX_DRAWDOWN_FLOOR_PCT}% floor"
         )
-    win_rate = _as_decimal(ranking.get("win_rate_pct"))
-    if win_rate < MIN_WIN_RATE_PCT:
+
+    raw_win_rate = ranking.get("win_rate_pct")
+    win_rate = _quality_decimal(raw_win_rate)
+    if win_rate is None:
+        issues.append(f"win_rate_pct {raw_win_rate!r} is invalid")
+    elif win_rate < MIN_WIN_RATE_PCT:
         issues.append(
             f"win_rate_pct {win_rate} is below the {MIN_WIN_RATE_PCT}% floor"
         )
@@ -220,7 +249,7 @@ def build_tournament_promotion_evidence(
         incumbent = _ranking_for(report, incumbent_sleeve_id)
         if incumbent is not None:
             incumbent_return_pct = _as_decimal(incumbent.get("total_return_pct"))
-    tracked_days = int(ranking.get("tracked_days") or 0)
+    tracked_days = _as_int(ranking.get("tracked_days") or 0)
     return SleevePromotionEvidence(
         sleeve=sleeve_id,
         preregistered=sleeve_id in PREREGISTERED_TOURNAMENT_SLEEVES,
@@ -587,8 +616,9 @@ def sync_promotion_state_from_tournament(
             new_sleeves[sleeve_id] = record
             unchanged.append(sleeve_id)
 
-    # 2. Evaluate the tournament candidate for promotion.
-    if candidate_id:
+    # 2. Evaluate the tournament candidate for promotion only when the report
+    #    itself is fresh and this sync did not just demote that same sleeve.
+    if candidate_id and evidence_issue is None and candidate_id not in demoted:
         ranking = _ranking_for(report, candidate_id)
         quality_issues = _quality_gate_issues(ranking or {})
         evidence = build_tournament_promotion_evidence(
@@ -622,7 +652,7 @@ def sync_promotion_state_from_tournament(
                     "total_return_pct": str(ranking.get("total_return_pct")),
                     "max_drawdown_pct": str(ranking.get("max_drawdown_pct")),
                     "win_rate_pct": str(ranking.get("win_rate_pct")),
-                    "tracked_days": int(ranking.get("tracked_days") or 0),
+                    "tracked_days": _as_int(ranking.get("tracked_days") or 0),
                 }
             new_sleeves[candidate_id] = state
             issues_by_sleeve[candidate_id] = all_issues
