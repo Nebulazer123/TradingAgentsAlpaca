@@ -1,10 +1,11 @@
 # TradingAgents Methods and Automations
 
-> **Current workspace:** `/Users/corbinfloyd/Documents/TradingAgents`. Mac jobs
-> are defined in `scripts/mac/ta_job.sh` and installed through
-> `scripts/mac/install_launchd.sh`. The dated Windows automation material below
-> is retained as history; current automation state comes from the active Mac
-> launchd jobs and the current Codex automation definitions.
+> **Current workspace:** `/Users/corbinfloyd/Documents/TradingAgents`. Mac job
+> behavior is defined in `scripts/mac/ta_job.sh`; the old
+> `scripts/mac/install_launchd.sh` installer is retired and refuses to install
+> or change schedules. The dated Windows automation material below is retained
+> as history; the supported schedule is Codex-managed and current automation
+> state comes from its definitions and deployment evidence.
 
 Generated for the local TradingAgents checkout at:
 
