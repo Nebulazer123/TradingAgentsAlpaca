@@ -40,7 +40,7 @@ def test_extract_preserves_exact_finite_decimal_source_values(raw, expected):
 @pytest.mark.parametrize("raw", [
     b'{"value":true}', b'{"value":null}', b'{"value":[]}',
     b'{"value":{}}', b'{"value":NaN}', b'{"value":Infinity}',
-    b'{"value":1e999999}', b'{"value":1,"value":2}',
+    b'{"value":1e999999}', b'{"value":0e999999}', b'{"value":1,"value":2}',
 ])
 def test_extract_rejects_nonscalar_nonfinite_unbounded_or_duplicate_source(raw):
     with pytest.raises(ResearchQualificationBenchmarkError):
