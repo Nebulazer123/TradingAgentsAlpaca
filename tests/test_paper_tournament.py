@@ -2686,6 +2686,33 @@ def test_nontrial_tournament_selection_behavior_remains_compatible(tmp_path):
     assert selection["strategy_id"] == report["live_strategy_candidate"]["strategy_id"]
 
 
+def test_nontrial_dry_run_preserves_the_report_bound_to_an_active_selection(monkeypatch, tmp_path):
+    report = _write_bound_active_selection(tmp_path)
+    paper_client = _FakePaperClient()
+    _configure_current_submit(monkeypatch, paper_client)
+    run_now = datetime.datetime(2026, 6, 5, 20, 11, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: run_now)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "paper-tournament",
+            "run",
+            "--strategy",
+            STRATEGY_CURRENT_AGGRESSIVE,
+            "--json-output",
+            "--log-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    selection = load_live_strategy_selection(tmp_path, now=run_now)
+    assert selection is not None
+    assert selection["strategy_id"] == report["live_strategy_candidate"]["strategy_id"]
+
+
 def test_bound_preexpiry_selection_is_rejected_after_tournament_window(tmp_path):
     report = _write_bound_active_selection(tmp_path)
 

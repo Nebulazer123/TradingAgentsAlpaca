@@ -80,8 +80,8 @@ def _canonical_timestamp(value: object, *, label: str) -> str:
             f"{label} must use canonical UTC seconds"
         ) from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.UTC)
-    if parsed.tzinfo != dt.UTC or parsed.strftime(_TIMESTAMP_FORMAT) != value:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    if parsed.tzinfo != dt.timezone.utc or parsed.strftime(_TIMESTAMP_FORMAT) != value:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds")
     return value
 
@@ -89,7 +89,7 @@ def _canonical_timestamp(value: object, *, label: str) -> str:
 def _clock_timestamp(value: object) -> str:
     if (
         type(value) is not dt.datetime
-        or value.tzinfo != dt.UTC
+        or value.tzinfo != dt.timezone.utc
         or value.microsecond != 0
     ):
         raise PointInTimeDataError(
@@ -99,7 +99,7 @@ def _clock_timestamp(value: object) -> str:
 
 
 def _exact_utc_now() -> dt.datetime:
-    return dt.datetime.now(dt.UTC).replace(microsecond=0)
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
 
 def _source_uri(value: object) -> str:

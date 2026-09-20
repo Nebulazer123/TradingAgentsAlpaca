@@ -54,7 +54,7 @@ def _calendar(tmp_path, market_dates: tuple[str, ...]):
     ).encode()
     archive = RawPointInTimeArtifactArchive(
         tmp_path / "partition-calendar",
-        clock=lambda: dt.datetime(2026, 4, 1, 12, 0, tzinfo=dt.UTC),
+        clock=lambda: dt.datetime(2026, 4, 1, 12, 0, tzinfo=dt.timezone.utc),
     )
     artifact = archive.admit(
         raw_bytes=raw_bytes,

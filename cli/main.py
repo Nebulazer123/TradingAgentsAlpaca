@@ -12289,7 +12289,8 @@ def alpaca_paper_tournament_run(
             selection_path = str(selection) if selection else None
             if selection_path:
                 ledger["live_strategy_selection"] = report["live_strategy_candidate"]
-        ledger["latest_report"] = report
+        if not dry_run or report.get("ledger_type") == "qualification_paper_trial":
+            ledger["latest_report"] = report
         ledger_path = write_tournament_ledger(ledger, log_dir)
     packet = {
         "kind": "paper_tournament_run",

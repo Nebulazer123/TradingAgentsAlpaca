@@ -65,7 +65,7 @@ def _timestamp(value: object, *, label: str) -> str:
     except ValueError as exc:
         raise PointInTimeDataError(f"{label} must be canonical UTC seconds") from exc
     if (
-        parsed.tzinfo != dt.UTC
+        parsed.tzinfo != dt.timezone.utc
         or parsed.microsecond
         or parsed.isoformat(timespec="seconds") != value
     ):
@@ -185,7 +185,7 @@ def _bars(
             timestamp = dt.datetime.fromisoformat(normalized)
         except ValueError as exc:
             raise PointInTimeDataError(f"Alpaca bar {index} timestamp is invalid") from exc
-        if timestamp.tzinfo != dt.UTC or timestamp.microsecond:
+        if timestamp.tzinfo != dt.timezone.utc or timestamp.microsecond:
             raise PointInTimeDataError(f"Alpaca bar {index} timestamp is invalid")
         market_date = timestamp.date().isoformat()
         if timestamp.weekday() >= 5:

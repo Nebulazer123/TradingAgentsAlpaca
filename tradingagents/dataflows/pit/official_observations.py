@@ -97,7 +97,7 @@ def _timestamp(value: object, *, label: str) -> str:
         parsed = dt.datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise PointInTimeDataError(f"{label} is not a source UTC timestamp") from exc
-    if parsed.tzinfo != dt.UTC or parsed.microsecond:
+    if parsed.tzinfo != dt.timezone.utc or parsed.microsecond:
         raise PointInTimeDataError(f"{label} is not a source UTC timestamp")
     return parsed.isoformat(timespec="seconds")
 
@@ -319,7 +319,7 @@ def _bar_completion(
             local_date,
             regular_close,
             tzinfo=_MARKET_TZ,
-        ).astimezone(dt.UTC)
+        ).astimezone(dt.timezone.utc)
         method = "registered_regular_session_close"
         duration: int | None = None
     else:

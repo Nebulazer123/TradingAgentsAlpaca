@@ -398,4 +398,4 @@ def resolve_market_session_open(
         dt.time.fromisoformat(source["regular_session_open"]),
         tzinfo=ZoneInfo("America/New_York"),
     )
-    return local_open.astimezone(dt.UTC).isoformat(timespec="seconds")
+    return local_open.astimezone(dt.timezone.utc).isoformat(timespec="seconds")

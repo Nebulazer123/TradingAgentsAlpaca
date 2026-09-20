@@ -180,7 +180,7 @@ def _canonical_timestamp(value: object, *, label: str) -> tuple[str, dt.datetime
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as exc:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds") from exc
-    if parsed.tzinfo != dt.UTC or parsed.isoformat(timespec="seconds") != value:
+    if parsed.tzinfo != dt.timezone.utc or parsed.isoformat(timespec="seconds") != value:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds")
     return value, parsed
 

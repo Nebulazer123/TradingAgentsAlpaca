@@ -124,13 +124,13 @@ def _timestamp(value: object, *, label: str) -> dt.datetime:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as exc:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds") from exc
-    if parsed.tzinfo != dt.UTC or parsed.isoformat(timespec="seconds") != value:
+    if parsed.tzinfo != dt.timezone.utc or parsed.isoformat(timespec="seconds") != value:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds")
     return parsed
 
 
 def _timestamp_text(value: dt.datetime) -> str:
-    return value.astimezone(dt.UTC).isoformat(timespec="seconds")
+    return value.astimezone(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def _date(value: object, *, label: str) -> str:
@@ -479,7 +479,7 @@ def _calendar_context(
         session_date = dt.date.fromisoformat(date_value)
         local_open = dt.datetime.combine(session_date, open_time, tzinfo=_MARKET_TZ)
         local_close = dt.datetime.combine(session_date, close_time, tzinfo=_MARKET_TZ)
-        hours[date_value] = (local_open.astimezone(dt.UTC), local_close.astimezone(dt.UTC))
+        hours[date_value] = (local_open.astimezone(dt.timezone.utc), local_close.astimezone(dt.timezone.utc))
     if tuple(hours) != expected_dates:
         raise PointInTimeDataError("market calendar requested sessions are incomplete")
     close_times = {date: hours[date][1] for date in session_dates}
@@ -490,7 +490,7 @@ def _calendar_context(
         dt.date.fromisoformat(market_date),
         dt.time(0, 0),
         tzinfo=_MARKET_TZ,
-    ).astimezone(dt.UTC)
+    ).astimezone(dt.timezone.utc)
     if not selection_window_open <= as_of_cutoff <= selection_time <= market_open:
         raise PointInTimeDataError(
             "as_of_cutoff and selection_time must be ordered within the pre-open window"
@@ -776,7 +776,7 @@ def _market_source(
             raise PointInTimeDataError(f"Alpaca bar row {index} timestamp is invalid") from exc
         local_time = bar_time.astimezone(_MARKET_TZ)
         if (
-            bar_time.tzinfo != dt.UTC
+            bar_time.tzinfo != dt.timezone.utc
             or bar_time.microsecond
             or local_time.timetz().replace(tzinfo=None) != dt.time(0, 0)
         ):

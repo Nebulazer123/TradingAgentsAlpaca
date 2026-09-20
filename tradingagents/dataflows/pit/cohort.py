@@ -141,7 +141,7 @@ def _timestamp(value: object, *, label: str) -> str:
         parsed = dt.datetime.fromisoformat(value)
     except ValueError as exc:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds") from exc
-    if parsed.tzinfo != dt.UTC or parsed.isoformat(timespec="seconds") != value:
+    if parsed.tzinfo != dt.timezone.utc or parsed.isoformat(timespec="seconds") != value:
         raise PointInTimeDataError(f"{label} must use canonical UTC seconds")
     return value
 
@@ -720,7 +720,7 @@ def _selection_bounds(
         dt.date.fromisoformat(market_date),
         dt.time(0, 0),
         tzinfo=_MARKET_TZ,
-    ).astimezone(dt.UTC)
+    ).astimezone(dt.timezone.utc)
     if window_open != local_midnight or window_close != session_open:
         raise PointInTimeDataError(
             "cohort selection window must be local midnight through registered open"
