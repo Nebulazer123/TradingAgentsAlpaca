@@ -28,6 +28,7 @@ from tradingagents.evals.learning_context import (
     learning_context_from_store,
     normalize_learning_as_of,
 )
+from tradingagents.graph.checkpoint_identity import build_checkpoint_run_identity
 from tradingagents.graph.packet_nodes import build_graph_run_id
 from tradingagents.graph.propagation import Propagator
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -55,6 +56,30 @@ def _window(**changes: object) -> dict[str, object]:
     }
     values.update(changes)
     return values
+
+
+def _resolution_evidence() -> dict[str, object]:
+    def leg(*, marker: str) -> dict[str, str]:
+        return {
+            "schema_version": "source_bound_price_window_evidence/v1",
+            "window_id": f"spw-{marker}",
+            "window_sha256": marker * 64,
+            "security_id": f"security-{marker}",
+            "raw_artifact_id": f"pit-{marker}",
+            "raw_artifact_sha256": marker * 64,
+            "decision_cutoff": "2026-07-18T15:00:00+00:00",
+            "retrieved_at": "2026-07-18T14:00:00+00:00",
+            "feed": "iex",
+            "adjustment_mode": "all",
+            "adjustment_status": "total_return_adjusted",
+        }
+
+    return {
+        "schema_version": "source_bound_resolution_evidence/v2",
+        "ticker": leg(marker="a"),
+        "benchmark": leg(marker="b"),
+        "alpha_threshold_pct": "1.5",
+    }
 
 
 def _forecast(index: int = 1, **changes: object) -> AgentForecast:
@@ -88,6 +113,7 @@ def _forecast(index: int = 1, **changes: object) -> AgentForecast:
         "label_quality": "high",
         "quality_flags": [],
         "resolution_window": _window(),
+        "resolution_evidence": _resolution_evidence(),
     }
     values.update(changes)
     return AgentForecast(**values)
@@ -99,9 +125,43 @@ def _forecast_observation(
     recorded_at: dt.datetime = dt.datetime(2026, 7, 18, 15, 5, tzinfo=UTC),
     **changes: object,
 ) -> LearningObservation:
-    return LearningObservation.from_forecast(
-        _forecast(index, **changes),
+    forecast = _forecast(index, **changes)
+    payload_fields = (
+        "forecast_id",
+        "agent",
+        "ticker",
+        "forecast_type",
+        "horizon",
+        "probability",
+        "direction",
+        "benchmark",
+        "sector",
+        "evidence_sources",
+        "evidence_refs",
+        "setup",
+        "regime",
+        "created_at",
+        "resolve_after",
+        "source_packet_id",
+        "resolved",
+        "outcome",
+        "actual_return",
+        "benchmark_return",
+        "relative_return",
+        "brier_score",
+        "agent_score_delta",
+        "resolved_at",
+        "label_quality",
+        "quality_flags",
+        "resolution_window",
+        "resolution_evidence",
+    )
+    return LearningObservation._create(
+        source_kind="forecast_resolution_quality_source_bound",
+        source_id=forecast.forecast_id,
+        effective_at=forecast.resolved_at,
         recorded_at=recorded_at,
+        payload={field: getattr(forecast, field) for field in payload_fields},
     )
 
 
@@ -329,6 +389,28 @@ def test_latest_snapshot_is_selected_before_quality_and_never_falls_back():
         min_resolved=1,
     )
 
+    assert context.source_forecast_ids == ()
+
+
+def test_legacy_source_bound_evidence_stays_readable_but_never_enters_context(tmp_path):
+    current_evidence = _resolution_evidence()
+    legacy_observation = _forecast_observation(
+        resolution_evidence={
+            "schema_version": "source_bound_resolution_evidence/v1",
+            "ticker": current_evidence["ticker"],
+            "benchmark": current_evidence["benchmark"],
+        }
+    )
+    root = tmp_path / "availability"
+    LearningAvailabilityLedger(root).record(legacy_observation)
+
+    assert LearningAvailabilityLedger(root).verify() == (legacy_observation,)
+    context = learning_context_from_store(
+        availability_root=root,
+        as_of=AS_OF,
+        ticker="NFLX",
+        min_resolved=1,
+    )
     assert context.source_forecast_ids == ()
 
 
@@ -949,6 +1031,7 @@ def _bare_run_graph(tmp_path, factory):
     graph.config = {
         "checkpoint_enabled": False,
         "data_cache_dir": str(tmp_path / "cache"),
+        "results_dir": str(tmp_path / "results"),
     }
     graph.graph = _RuntimeGraph()
     graph.propagator = Propagator(
@@ -979,7 +1062,7 @@ def test_normal_fresh_graph_builds_once_and_forces_empty_legacy_memory(tmp_path)
     state, signal = graph._run_graph(
         "NFLX",
         "2026-07-18",
-        checkpoint_signature="signature",
+        run_signature="signature",
     )
 
     assert calls == [("NFLX", "2026-07-18", "stock")]
@@ -989,20 +1072,59 @@ def test_normal_fresh_graph_builds_once_and_forces_empty_legacy_memory(tmp_path)
 
 
 def test_checkpoint_resume_never_rebuilds_learning(tmp_path, monkeypatch):
+    from langchain_core.messages import HumanMessage
+
+    from tradingagents.graph.checkpoint_runtime_identity import capture_checkpoint_predecessors
     calls = []
     graph = _bare_run_graph(
         tmp_path,
         lambda *_args: calls.append(True) or "new",
     )
     graph.config["checkpoint_enabled"] = True
-    run_id = build_graph_run_id("NFLX", "2026-07-18", "stock", "signature")
+    identity = build_checkpoint_run_identity(
+        identity_schema_version=2,
+        clean_source_revision="a" * 40,
+        source_tree_dirty=False,
+        uv_lock_sha256="b" * 64,
+        selected_analysts=("market",),
+        asset_type="stock",
+        max_debate_rounds=1,
+        max_risk_discuss_rounds=1,
+        max_analyst_tool_rounds=8,
+        max_recur_limit=100,
+        analyst_concurrency_limit=1,
+        tool_free_analysts=(),
+        requested_provider="openrouter",
+        requested_quick_model="openai/gpt-5-mini",
+        requested_deep_model="anthropic/claude-sonnet-4-5",
+        backend_route_identity="https://router.example/v1?region=us",
+        output_language="English",
+        provider_reasoning_settings={},
+        graph_topology_sha256="c" * 64,
+        agent_prompt_surface_sha256="d" * 64,
+        bound_tool_surface_sha256="e" * 64,
+        data_route_surface_sha256="f" * 64,
+        packet_handoff_schema_version=1,
+        learning_context_policy_identity="learning-context-policy-v2",
+        trade_date_cutoff_policy_identity="market-date-cutoff-v1",
+        **capture_checkpoint_predecessors(graph.config),
+    )
+    run_id = build_graph_run_id(
+        "NFLX", "2026-07-18", "stock", identity.identity_sha256
+    )
     graph.graph.saved = {
+        **Propagator().create_initial_state("NFLX", "2026-07-18", run_id=run_id, learning_context="saved"),
+        "messages": [HumanMessage(content="NFLX")],
         "run_id": run_id,
         "run_started_at": "2026-07-18T12:00:00+00:00",
         "decision_packet_refs": [],
         "learning_context": "saved",
+        "company_of_interest": "NFLX",
+        "trade_date": "2026-07-18",
+        "asset_type": "stock",
         "past_context": "",
         "final_trade_decision": "HOLD",
+        "checkpoint_run_identity": identity.to_dict(),
     }
     monkeypatch.setattr(
         "tradingagents.graph.trading_graph.thread_id",
@@ -1016,7 +1138,7 @@ def test_checkpoint_resume_never_rebuilds_learning(tmp_path, monkeypatch):
     state, _ = graph._run_graph(
         "NFLX",
         "2026-07-18",
-        checkpoint_signature="signature",
+        checkpoint_identity=identity,
     )
 
     assert calls == []

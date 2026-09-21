@@ -15,7 +15,8 @@ from typing import Any
 
 from tradingagents.evals.agent_intelligence_ledger import (
     AgentForecast,
-    agent_influence_weights,
+    _admitted_source_bound_influence_weights,
+    has_source_bound_resolution_evidence,
 )
 from tradingagents.evals.hypothesis_lifecycle import (
     EVENT_HYPOTHESIS_EVIDENCE_INSUFFICIENT,
@@ -26,6 +27,7 @@ from tradingagents.evals.hypothesis_lifecycle import (
     EVENT_PRIOR_RETRACTED,
 )
 from tradingagents.evals.learning_availability import (
+    SOURCE_KIND_SOURCE_BOUND_FORECAST_RESOLUTION,
     AvailabilityCorruptionError,
     LearningAvailabilityError,
     LearningAvailabilityLedger,
@@ -614,6 +616,11 @@ def _forecast_from_observation(
         label_quality=quality,
         quality_flags=flags,
         resolution_window=dict(payload["resolution_window"]),
+        resolution_evidence=(
+            dict(payload["resolution_evidence"])
+            if "resolution_evidence" in payload
+            else None
+        ),
     )
 
 
@@ -627,7 +634,7 @@ def _forecast_rows(
     forecast_observations = [
         item
         for item in observations
-        if item.source_kind == "forecast_resolution_quality"
+        if item.source_kind == SOURCE_KIND_SOURCE_BOUND_FORECAST_RESOLUTION
     ]
     duplicate_ids = {
         item
@@ -655,12 +662,16 @@ def _forecast_rows(
             as_of=as_of,
             filters=filters,
         )
-        if forecast is not None and forecast.forecast_id == forecast_id:
+        if (
+            forecast is not None
+            and has_source_bound_resolution_evidence(forecast)
+            and forecast.forecast_id == forecast_id
+        ):
             accepted.append((latest[0], forecast))
     forecasts = [forecast for _, forecast in accepted]
     if not forecasts:
         return []
-    weights = agent_influence_weights(
+    weights = _admitted_source_bound_influence_weights(
         forecasts,
         min_resolved=min_resolved,
         ticker=filters["ticker"],

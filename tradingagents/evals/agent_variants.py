@@ -31,6 +31,7 @@ from tradingagents.evals.agent_intelligence_ledger import (
     AgentForecast,
     agent_influence_weights,
 )
+from tradingagents.evals.source_bound_resolution import SourceBoundWindowLookup
 
 VARIANT_SEPARATOR = "::"
 FIELD_SEPARATOR = "+"
@@ -125,6 +126,7 @@ def _weight_sort_key(entry: dict[str, Any]) -> tuple[Any, ...]:
 def variant_scoreboard(
     forecasts: Sequence[AgentForecast],
     *,
+    source_bound_verifier: SourceBoundWindowLookup | None = None,
     min_resolved: int = 3,
 ) -> dict[str, Any]:
     """Rank agent variants per role on resolved-forecast evidence.
@@ -134,7 +136,11 @@ def variant_scoreboard(
     a ``leader`` when its top entry actually earned its weight.
     """
 
-    weights = agent_influence_weights(forecasts, min_resolved=min_resolved)
+    weights = agent_influence_weights(
+        forecasts,
+        source_bound_verifier=source_bound_verifier,
+        min_resolved=min_resolved,
+    )
     grouped: dict[str, list[dict[str, Any]]] = {}
     for agent_name in sorted(weights["agents"]):
         item = weights["agents"][agent_name]

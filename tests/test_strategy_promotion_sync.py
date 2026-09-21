@@ -25,6 +25,215 @@ from tradingagents.policy.strategy_promotion_sync import (
     StrategyPromotionSyncReceipt,
 )
 
+# Keep references to the production entry points before the legacy-suite
+# compatibility fixture wraps them.  Direct crash-boundary tests below must
+# prove the actual owner-approval semantics rather than a test helper that can
+# silently mint a replacement artifact on retry.
+_PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE = (
+    sync_module.sync_strategy_promotion_state_file
+)
+_PRODUCTION_ACTIVATE_NORMAL_LIVE_INTENT = sync_module.activate_normal_live_intent
+
+
+def _direct_owner_approval(
+    handle,
+    *,
+    proposal,
+    kind: str,
+    issued_at: datetime,
+    ttl_minutes: int,
+    intent: AuthorizedNormalTradeIntent | None = None,
+) -> dict[str, object]:
+    """Build an explicit test artifact without invoking the autouse wrapper."""
+
+    from tests._owner_approval_testing import build_owner_approval
+
+    subject: dict[str, str] = {
+        "kind": kind,
+        "proposal_id": proposal.proposal_id,
+        "sleeve": proposal.sleeve,
+    }
+    if kind == "strategy_promotion_sync":
+        subject["proposed_stage"] = proposal.proposed_stage
+        source_binding = {
+            "proposal_sha256": sync_module._digest(proposal.canonical_json_bytes())
+        }
+    else:
+        assert intent is not None
+        subject["intent_full_sha256"] = sync_module._digest(
+            intent.canonical_json_bytes()
+        )
+        source_binding = {
+            "promotion_state_sha256": str(intent.promotion_state_sha256)
+        }
+    return build_owner_approval(
+        private_key_hex=handle.private_hex,
+        action="live_promotion",
+        issued_at=issued_at,
+        ttl_minutes=ttl_minutes,
+        subject=subject,
+        source_binding=source_binding,
+        risk_envelope_ref=str(proposal.risk_attestation.risk_envelope_ref),
+        risk_envelope_sha256=str(proposal.risk_attestation.risk_envelope_sha256),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _supply_genuine_owner_approvals(tmp_path, monkeypatch):
+    """Test-only compatibility layer for this legacy promotion-sync suite.
+
+    Live-eligibility sync and normal-live activation are now owner-gated
+    (enforced directly by tests/test_owner_approval_boundaries.py).  This
+    suite predates the boundary, so the layer signs genuine Ed25519
+    approvals per call and rebinds the two sync-module entry points.
+    Production policy is untouched.
+    """
+
+    from tests._owner_approval_testing import (
+        build_owner_approval,
+        install_isolated_owner_trust,
+    )
+
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "owner", seed=b"sync-anchor"
+    )
+    private_hex = handle.private_hex
+    authority_moment = {
+        # Direct production-boundary tests use the capped chain below.  The
+        # compatibility wrappers replace this with their evidence clock before
+        # each fresh owner verification/consumption.
+        "value": datetime(2030, 3, 27, 16, 13, tzinfo=timezone.utc)
+    }
+    monkeypatch.setattr(
+        sync_module,
+        "_owner_approval_authority_utc_now",
+        lambda: authority_moment["value"],
+    )
+
+    # Each privileged call mints a DISTINCT artifact without touching any
+    # caller-supplied clock: sign at base minus an increasing whole-second
+    # offset, with ttl_minutes=90 so every artifact stays current.
+    sequence = {"offset_seconds": 0}
+
+    def _issued_at(base_clock):
+        moment = base_clock() - timedelta(seconds=sequence["offset_seconds"])
+        sequence["offset_seconds"] += 1
+        return moment.replace(microsecond=0)
+
+    def _kwargs(kind, proposal, intent, issued_at):
+        envelope = proposal.risk_attestation
+        subject = {
+            "kind": kind,
+            "proposal_id": proposal.proposal_id,
+            "sleeve": proposal.sleeve,
+        }
+        if kind == "strategy_promotion_sync":
+            subject["proposed_stage"] = proposal.proposed_stage
+            source = {
+                "proposal_sha256": sync_module._digest(
+                    proposal.canonical_json_bytes()
+                )
+            }
+        else:
+            subject["intent_full_sha256"] = sync_module._digest(
+                intent.canonical_json_bytes()
+            )
+            source = {
+                "promotion_state_sha256": str(intent.promotion_state_sha256)
+            }
+        approval = build_owner_approval(
+            private_key_hex=private_hex,
+            action="live_promotion",
+            issued_at=issued_at,
+            ttl_minutes=90,
+            subject=subject,
+            source_binding=source,
+            risk_envelope_ref=str(envelope.risk_envelope_ref),
+            risk_envelope_sha256=str(envelope.risk_envelope_sha256),
+        )
+        return {"owner_approval": approval}
+
+    real_sync = sync_module.sync_strategy_promotion_state_file
+    real_activate = sync_module.activate_normal_live_intent
+
+    def guarded_sync(**kwargs):
+        proposal = kwargs.get("proposal")
+        base_clock = kwargs.get("clock") or (
+            lambda: datetime.now(timezone.utc).replace(microsecond=0)
+        )
+        authority_moment["value"] = base_clock()
+        if kwargs.get("owner_approval") is None and getattr(
+            proposal, "proposed_stage", None
+        ) == "tiny_live_eligible":
+            issued_at = _issued_at(base_clock)
+            kwargs.update(_kwargs("strategy_promotion_sync", proposal, None, issued_at))
+        # A handful of long-lived immutable-store tests deliberately seed a
+        # prepare created before this suite gained owner-consumption records.
+        # Make that fixture a real crash-recovery state: it gets the same exact
+        # sidecar + ledger entry a first invocation would have produced.  This
+        # preserves the test's intended file/evidence assertion without letting
+        # a bare prepare reach the production receipt path.
+        if getattr(proposal, "proposed_stage", None) == "tiny_live_eligible":
+            try:
+                sync_module._capture_state_path_anchor(kwargs["state_path"])
+            except ValueError:
+                return real_sync(**kwargs)
+            try:
+                state_file = Path(kwargs["state_path"]).resolve()
+                clock = kwargs.get("clock") or (
+                    lambda: datetime.now(timezone.utc).replace(microsecond=0)
+                )
+                store = sync_module.ImmutableStrategyEvidenceStore(
+                    kwargs["proposal_ledger_root"], clock=clock
+                )
+                proposal_sha256 = sync_module._digest(proposal.canonical_json_bytes())
+                prepared = sync_module._matching_prepared_replacement(
+                    store=store,
+                    proposal=proposal,
+                    proposal_sha256=proposal_sha256,
+                    state_file=state_file,
+                    canonical_before_sha256=None,
+                    canonical_after_sha256=None,
+                )
+                if prepared is not None:
+                    transaction = sync_module._strategy_sync_owner_transaction(
+                        proposal=proposal,
+                        proposal_sha256=proposal_sha256,
+                        state_file=state_file,
+                        canonical_before_sha256=prepared.canonical_before_sha256,
+                        canonical_after_sha256=prepared.canonical_after_sha256,
+                        promoted=prepared.promoted,
+                        demoted=prepared.demoted,
+                        unchanged=prepared.unchanged,
+                    )
+                    sync_module._prepare_or_recover_live_eligibility_owner_approval(
+                        prepare_path=sync_module.owner_approval_prepare_path(state_file),
+                        proposal=proposal,
+                        owner_approval=kwargs["owner_approval"],
+                        now=clock(),
+                        kind="strategy_promotion_sync",
+                        purpose=f"strategy_sync:{proposal.proposal_id}",
+                        transaction=transaction,
+                    )
+            except (AttributeError, KeyError, TypeError):
+                pass
+        return real_sync(**kwargs)
+
+    def guarded_activate(proposal, intent, **kwargs):
+        base_clock = kwargs.get("clock") or (
+            lambda: datetime.now(timezone.utc).replace(microsecond=0)
+        )
+        authority_moment["value"] = base_clock()
+        if kwargs.get("owner_approval") is None:
+            issued_at = _issued_at(base_clock)
+            kwargs.update(_kwargs("normal_live_activation", proposal, intent, issued_at))
+        return real_activate(proposal, intent, **kwargs)
+
+    monkeypatch.setattr(sync_module, "sync_strategy_promotion_state_file", guarded_sync)
+    monkeypatch.setattr(sync_module, "activate_normal_live_intent", guarded_activate)
+    yield
+
+
 _ISOLATED_SOURCE_TAMPER_ENV = "TRADINGAGENTS_ISOLATED_SOURCE_TAMPER"
 _ISOLATED_SOURCE_TAMPER_READY_ENV = "TRADINGAGENTS_ISOLATED_SOURCE_TAMPER_READY"
 _ISOLATED_SOURCE_TAMPER_CONTINUE_ENV = "TRADINGAGENTS_ISOLATED_SOURCE_TAMPER_CONTINUE"
@@ -168,7 +377,7 @@ def _copy_isolated_source_tamper_repo(tmp_path: Path) -> Path:
             or name.endswith(".pyc")
         }
 
-    for name in ("tradingagents", "tests", "config"):
+    for name in ("tradingagents", "tests", "config", "cli"):
         shutil.copytree(
             source_root / name,
             isolated_root / name,
@@ -177,11 +386,26 @@ def _copy_isolated_source_tamper_repo(tmp_path: Path) -> Path:
     for name in ("pyproject.toml",):
         shutil.copy2(source_root / name, isolated_root / name)
 
+    # Keep the disposable checkout clean under pytest bytecode/cache writes.
+    (isolated_root / ".gitignore").write_text(
+        "__pycache__/\n*.pyc\n.pytest_cache/\n",
+        encoding="utf-8",
+    )
+
     for command in (
         ("git", "init", "-q"),
         ("git", "config", "user.email", "test@example.invalid"),
         ("git", "config", "user.name", "isolated source tamper test"),
-        ("git", "add", "tradingagents", "tests", "config", "pyproject.toml"),
+        (
+            "git",
+            "add",
+            ".gitignore",
+            "tradingagents",
+            "tests",
+            "config",
+            "cli",
+            "pyproject.toml",
+        ),
         ("git", "commit", "-qm", "isolated source tamper fixture"),
     ):
         subprocess.run(command, cwd=isolated_root, check=True)
@@ -476,7 +700,12 @@ def _real_immutable_journal(tmp_path: Path, monkeypatch):
     return root, REPO_ROOT, proposal, base + timedelta(minutes=4, seconds=30), commit
 
 
-def _capped_activation_journal(tmp_path: Path, monkeypatch):
+def _capped_activation_journal(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    isolated_repo: Path | None = None,
+):
     """Build a disposable complete chain with the explicit capped opt-in on."""
 
     import tradingagents.policy.strategy_promotion as promotion_module
@@ -515,11 +744,18 @@ def _capped_activation_journal(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(promotion_module, "_git", actual_git)
     monkeypatch.setattr(sync_module, "_git", actual_git)
     isolated = (
-        Path(__file__).parents[1]
-        if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) == "1"
-        else _copy_isolated_source_tamper_repo(tmp_path)
+        isolated_repo
+        if isolated_repo is not None
+        else (
+            Path(__file__).parents[1]
+            if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) == "1"
+            else _copy_isolated_source_tamper_repo(tmp_path)
+        )
     )
     envelope = isolated / "config" / "risk_envelope.example.yaml"
+    # The capped chain requires new_sleeve_auto_promote enabled in this
+    # disposable checkout.  When the copied example already enables it the
+    # edit is a no-op and the empty commit still records the fixture HEAD.
     envelope.write_text(
         envelope.read_text(encoding="utf-8").replace(
             "new_sleeve_auto_promote: false", "new_sleeve_auto_promote: true"
@@ -528,7 +764,14 @@ def _capped_activation_journal(tmp_path: Path, monkeypatch):
     )
     for command in (
         ("git", "add", "config/risk_envelope.example.yaml"),
-        ("git", "commit", "-qm", "enable capped activation fixture"),
+        (
+            "git",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "enable capped activation fixture",
+        ),
     ):
         subprocess.run(command, cwd=isolated, check=True)
     commit = subprocess.check_output(
@@ -1284,10 +1527,12 @@ def test_real_risk_source_auto_promotion_demotion_has_exact_tuple_and_issue(
         clock=lambda: synced_at,
     )
 
+    # The committed capped configuration enables new_sleeve_auto_promote, so
+    # the auto-promotion gate passes; the sleeve is still demoted because its
+    # own evidence gates (shadow sessions, reconciliation) fail.
     assert original.issues == (
         "shadow_sessions_sufficient",
         "reconciliation_confirmed",
-        "risk_auto_promotion_disabled",
     )
     assert original.proposed_stage == "paper_only"
     assert result.promoted == ()
@@ -1360,11 +1605,12 @@ def test_real_validation_source_ci_demotion_has_exact_tuple_and_issue(
         clock=lambda: synced_at,
     )
 
+    # The committed capped configuration enables new_sleeve_auto_promote, so
+    # only the real evidence failures (CI + shadow + reconciliation) appear.
     assert demotion.issues == (
         "ci_green",
         "shadow_sessions_sufficient",
         "reconciliation_confirmed",
-        "risk_auto_promotion_disabled",
     )
     assert result.promoted == ()
     assert result.demoted == (demotion.sleeve,)
@@ -1636,6 +1882,10 @@ def test_replacement_post_write_mismatch_preserves_preimage(
     proposal, digest = _controlled_proposal()
     Proposal = type(proposal)
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    # This writer-integrity test exercises the paper-only replacement helper,
+    # not the separately covered owner-approved tiny-live transition.
+    proposal.proposed_stage = "paper_eligible"
+    monkeypatch.setattr(sync_module, "StrategyPromotionSyncPrepare", SimpleNamespace)
     monkeypatch.setattr(
         sync_module,
         "StrategyOperationalPromotionLedger",
@@ -1740,6 +1990,8 @@ def test_sync_refuses_symlink_state_path_before_any_recovery_phase_mutates(
     constructor_calls: list[str] = []
 
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
+    monkeypatch.setattr(sync_module, "StrategyPromotionSyncPrepare", SimpleNamespace)
     monkeypatch.setattr(
         sync_module,
         "StrategyOperationalPromotionLedger",
@@ -2094,6 +2346,8 @@ def test_post_guard_state_swap_recovers_exact_preimage_without_receipt(
             return SimpleNamespace(envelope=object(), created=True)
 
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
+    monkeypatch.setattr(sync_module, "StrategyPromotionSyncPrepare", SimpleNamespace)
     monkeypatch.setattr(
         sync_module,
         "StrategyOperationalPromotionLedger",
@@ -2211,6 +2465,7 @@ def test_crash_after_replace_repairs_or_retries_without_writing_state(
     Proposal = type(proposal)
     synced_at = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
     after_state = sync_module.build_strategy_promotion_state(
         proposal=proposal,
         current_state={"sleeves": {}},
@@ -2230,6 +2485,7 @@ def test_crash_after_replace_repairs_or_retries_without_writing_state(
         risk_envelope_sha256=proposal.risk_attestation.risk_envelope_sha256,
         canonical_before_sha256=sync_module._digest(preimage),
         canonical_after_sha256=sync_module._digest(after),
+        serialized_output=after.decode("utf-8"),
         state_path=str(state.resolve()),
         effective_at="2026-07-28T12:00:00+00:00",
         recorded_at="2026-07-28T12:00:00+00:00",
@@ -2361,6 +2617,7 @@ def test_crash_before_replace_resumes_only_the_durable_prepared_after_image(
     Proposal = type(proposal)
     prepared_at = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
     prepared_after = sync_module._canonical(
         sync_module.build_strategy_promotion_state(
             proposal=proposal,
@@ -2380,6 +2637,7 @@ def test_crash_before_replace_resumes_only_the_durable_prepared_after_image(
         risk_envelope_sha256=proposal.risk_attestation.risk_envelope_sha256,
         canonical_before_sha256=sync_module._digest(preimage),
         canonical_after_sha256=sync_module._digest(prepared_after),
+        serialized_output=prepared_after.decode("utf-8"),
         state_path=str(state.resolve()),
         effective_at="2026-07-28T12:00:00+00:00",
         recorded_at="2026-07-28T12:00:00+00:00",
@@ -2476,6 +2734,7 @@ def test_crash_before_replace_refuses_related_prepare_with_mismatched_preimage(
     proposal, _digest = _controlled_proposal()
     Proposal = type(proposal)
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
     prepared = StrategyPromotionSyncPrepare(
         sync_prepare_id="strategy-promotion-sync-prepare-" + "f" * 64,
         proposal_id=proposal.proposal_id,
@@ -2550,6 +2809,7 @@ def test_crash_before_replace_refuses_expired_durable_prepare_without_writing(
     proposal, _digest = _controlled_proposal()
     Proposal = type(proposal)
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
     prepared = StrategyPromotionSyncPrepare(
         sync_prepare_id="strategy-promotion-sync-prepare-" + "1" * 64,
         proposal_id=proposal.proposal_id,
@@ -2683,6 +2943,7 @@ def test_crash_before_replace_revalidates_stale_validation_attestation(
     Proposal = type(proposal)
     prepared_at = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
     prepared_after = sync_module._canonical(
         sync_module.build_strategy_promotion_state(
             proposal=proposal,
@@ -2702,6 +2963,7 @@ def test_crash_before_replace_revalidates_stale_validation_attestation(
         risk_envelope_sha256=proposal.risk_attestation.risk_envelope_sha256,
         canonical_before_sha256=sync_module._digest(preimage),
         canonical_after_sha256=sync_module._digest(prepared_after),
+        serialized_output=prepared_after.decode("utf-8"),
         state_path=str(state.resolve()),
         effective_at="2026-07-28T12:00:00+00:00",
         recorded_at="2026-07-28T12:00:00+00:00",
@@ -3088,6 +3350,7 @@ def test_exact_retry_is_byte_and_event_silent_with_real_immutable_store(
     Proposal = type(proposal)
     prepared_at = datetime(2026, 7, 28, 12, tzinfo=timezone.utc)
     monkeypatch.setattr(sync_module, "StrategyPromotionProposal", Proposal)
+    proposal.proposed_stage = "paper_eligible"
     after = sync_module._canonical(
         sync_module.build_strategy_promotion_state(
             proposal=proposal,
@@ -3113,6 +3376,7 @@ def test_exact_retry_is_byte_and_event_silent_with_real_immutable_store(
             "risk_envelope_sha256": proposal.risk_attestation.risk_envelope_sha256,
             "canonical_before_sha256": sync_module._digest(preimage),
             "canonical_after_sha256": sync_module._digest(after),
+            "serialized_output": after.decode("utf-8"),
             "state_path": str(state.resolve()),
             "promoted": [proposal.sleeve],
             "demoted": [],
@@ -3311,6 +3575,623 @@ def test_source_recompute_refusal_precedes_prepare_and_state_mutation(
     assert state.read_bytes() == preimage
 
 
+def _exact_owner_prepare_ledger_records(handle, state_path: Path) -> list[dict]:
+    """Return only ledger lines bound to this exact generic sidecar."""
+
+    from tradingagents.policy.owner_approval import read_owner_approval_prepare
+
+    prepared = read_owner_approval_prepare(
+        sync_module.owner_approval_prepare_path(state_path)
+    )
+    if prepared is None:
+        return []
+    if not handle.ledger.exists():
+        return []
+    records = []
+    for line in handle.ledger.read_text(encoding="utf-8").splitlines():
+        if not line:
+            continue
+        record = json.loads(line)
+        if (
+            record.get("approval_id") == prepared["approval_id"]
+            and record.get("action") == prepared["action"]
+            and record.get("purpose") == prepared["purpose"]
+            and record.get("transaction_binding_sha256")
+            == prepared["transaction_binding_sha256"]
+            and record.get("prepared_transaction_binding_sha256")
+            == prepared["prepared_transaction_binding_sha256"]
+        ):
+            records.append(record)
+    return records
+
+
+@pytest.mark.parametrize("boundary", ("after_immutable_prepare", "after_owner_consumption"))
+def test_direct_strategy_sync_owner_crash_boundaries_use_production_function(
+    tmp_path, monkeypatch, boundary
+) -> None:
+    """Directly prove strategy-sync prepare -> consume -> finalize recovery.
+
+    The autouse compatibility wrapper is bypassed so no test helper can mint a
+    replacement owner artifact during retry.
+    """
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_direct_strategy_sync_owner_crash_boundaries_use_production_function"
+            f"[{boundary}]",
+        )
+        return
+    from tests._owner_approval_testing import install_isolated_owner_trust
+
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "direct-strategy-owner", seed=b"direct-strategy"
+    )
+    state = tmp_path / "direct-strategy-sync.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+    owner_approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="strategy_promotion_sync",
+        issued_at=synced_at,
+        ttl_minutes=1,
+    )
+
+    def crash(actual: str) -> None:
+        if actual == boundary:
+            raise SystemExit(actual)
+
+    with pytest.raises(SystemExit, match=boundary):
+        _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            proposal=proposal,
+            state_path=state,
+            expected_current_state_sha256=sync_module._digest(preimage),
+            actor_role="strategy_learning",
+            clock=lambda: synced_at,
+            fault_hook=crash,
+            owner_approval=owner_approval,
+        )
+
+    store = sync_module.ImmutableStrategyEvidenceStore(root)
+    prepares = [
+        sync_module._envelope_object(envelope, StrategyPromotionSyncPrepare)
+        for envelope in store.envelopes(
+            kind=sync_module.STRATEGY_PROMOTION_SYNC_PREPARE_KIND
+        )
+    ]
+    prepares = [
+        item
+        for item in prepares
+        if item is not None and item.state_path == str(state.resolve())
+    ]
+    assert len(prepares) == 1
+    prepared = prepares[0]
+    assert state.read_bytes() == preimage
+    assert prepared.serialized_output
+    assert (
+        sync_module._digest(prepared.serialized_output.encode("utf-8"))
+        == prepared.canonical_after_sha256
+    )
+
+    exact_records = _exact_owner_prepare_ledger_records(handle, state)
+    ledger_before_retry = (
+        handle.ledger.read_bytes() if handle.ledger.exists() else b""
+    )
+    if boundary == "after_immutable_prepare":
+        assert exact_records == []
+        retry_at = synced_at + timedelta(seconds=30)
+    else:
+        assert len(exact_records) == 1
+        retry_at = synced_at + timedelta(minutes=2)
+
+    # The immutable prepare is inert without consumption. A current artifact
+    # can finish that exact prepared image, while a consumed sidecar can finish
+    # after artifact expiry without minting another approval.
+    result = _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(preimage),
+        actor_role="strategy_learning",
+        clock=lambda: retry_at,
+        owner_approval=owner_approval,
+    )
+    assert result.sync_prepare_id == prepared.sync_prepare_id
+    assert state.read_bytes() == prepared.serialized_output.encode("utf-8")
+    assert result.state == json.loads(prepared.serialized_output)
+    if boundary == "after_immutable_prepare":
+        assert len(handle.ledger.read_text(encoding="utf-8").splitlines()) == (
+            len(ledger_before_retry.splitlines()) + 1
+        )
+    else:
+        assert handle.ledger.read_bytes() == ledger_before_retry
+    receipts = [
+        sync_module._envelope_object(envelope, StrategyPromotionSyncReceipt)
+        for envelope in store.envelopes(
+            kind=sync_module.STRATEGY_PROMOTION_SYNC_RECEIPT_KIND
+        )
+    ]
+    receipts = [
+        item
+        for item in receipts
+        if item is not None and item.sync_prepare_id == prepared.sync_prepare_id
+    ]
+    assert len(receipts) == 1
+    assert receipts[0].effective_at == prepared.effective_at
+
+
+def test_direct_strategy_sync_tampered_consumed_sidecar_refuses_before_state_write(
+    tmp_path, monkeypatch
+) -> None:
+    """A changed generic sidecar cannot reuse a consumed strategy-sync prepare."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_direct_strategy_sync_tampered_consumed_sidecar_refuses_before_state_write",
+        )
+        return
+    from tests._owner_approval_testing import install_isolated_owner_trust
+    from tradingagents.policy.owner_approval import OwnerApprovalError
+
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "tampered-strategy-owner", seed=b"tampered-strategy"
+    )
+    state = tmp_path / "tampered-strategy-sync.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+    owner_approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="strategy_promotion_sync",
+        issued_at=synced_at,
+        ttl_minutes=1,
+    )
+
+    def crash_after_consumption(actual: str) -> None:
+        if actual == "after_owner_consumption":
+            raise SystemExit(actual)
+
+    with pytest.raises(SystemExit, match="after_owner_consumption"):
+        _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            proposal=proposal,
+            state_path=state,
+            expected_current_state_sha256=sync_module._digest(preimage),
+            actor_role="strategy_learning",
+            clock=lambda: synced_at,
+            fault_hook=crash_after_consumption,
+            owner_approval=owner_approval,
+        )
+    assert len(_exact_owner_prepare_ledger_records(handle, state)) == 1
+    sidecar = sync_module.owner_approval_prepare_path(state)
+    raw = json.loads(sidecar.read_text(encoding="utf-8"))
+    raw["transaction"]["serialized_output"] = "{}"
+    sidecar.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(OwnerApprovalError, match="prepare|transaction|expired"):
+        _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            proposal=proposal,
+            state_path=state,
+            expected_current_state_sha256=sync_module._digest(preimage),
+            actor_role="strategy_learning",
+            clock=lambda: synced_at + timedelta(minutes=2),
+            owner_approval=owner_approval,
+        )
+    assert state.read_bytes() == preimage
+
+
+@pytest.mark.parametrize("path", ("strategy_sync", "normal_live_activation"))
+def test_public_evidence_clock_cannot_revive_expired_owner_approval(
+    tmp_path, monkeypatch, path
+) -> None:
+    """Both public ``clock`` paths keep TTL authority on a private policy seam."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_public_evidence_clock_cannot_revive_expired_owner_approval"
+            f"[{path}]",
+        )
+        return
+    from tests._owner_approval_testing import install_isolated_owner_trust
+    from tradingagents.policy.owner_approval import OwnerApprovalError
+
+    root, repo_root, proposal, evidence_now, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / f"{path}-owner", seed=b"strategy-authority-clock"
+    )
+    authority = {"now": evidence_now}
+    # The former implementation has no such seam and continues to trust the
+    # public clock, making each branch below intentionally RED before the
+    # production change.
+    monkeypatch.setattr(
+        sync_module,
+        "_owner_approval_authority_utc_now",
+        lambda: authority["now"],
+        raising=False,
+    )
+    state = tmp_path / f"{path}.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+
+    if path == "strategy_sync":
+        approval = _direct_owner_approval(
+            handle,
+            proposal=proposal,
+            kind="strategy_promotion_sync",
+            issued_at=evidence_now,
+            ttl_minutes=1,
+        )
+        authority["now"] = evidence_now + timedelta(minutes=2)
+        with pytest.raises(OwnerApprovalError, match="expired"):
+            _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+                proposal_ledger_root=root,
+                repo_root=repo_root,
+                proposal=proposal,
+                state_path=state,
+                expected_current_state_sha256=sync_module._digest(preimage),
+                actor_role="strategy_learning",
+                clock=lambda: evidence_now,
+                owner_approval=approval,
+            )
+        assert state.read_bytes() == preimage
+        assert not handle.ledger.exists()
+        return
+
+    sync_approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="strategy_promotion_sync",
+        issued_at=evidence_now,
+        ttl_minutes=1,
+    )
+    synced = _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(preimage),
+        actor_role="strategy_learning",
+        clock=lambda: evidence_now,
+        owner_approval=sync_approval,
+    )
+    sync_receipt = next(
+        envelope
+        for envelope in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if envelope.object_id == synced.sync_receipt_id
+    )
+    intent = _complete_normal_live_intent(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_sha256=synced.canonical_after_sha256,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(sync_receipt.canonical_json_bytes()),
+        recorded_at=evidence_now.isoformat(),
+        expires_at=(evidence_now + timedelta(minutes=5)).isoformat(),
+    )
+    activation_approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="normal_live_activation",
+        intent=intent,
+        issued_at=evidence_now,
+        ttl_minutes=1,
+    )
+    before_activation = state.read_bytes()
+    capabilities_before = set(sync_module._NORMAL_LIVE_BROKER_POST_CAPABILITIES)
+    authority["now"] = evidence_now + timedelta(minutes=2)
+
+    with pytest.raises(OwnerApprovalError, match="expired"):
+        _PRODUCTION_ACTIVATE_NORMAL_LIVE_INTENT(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: evidence_now,
+            owner_approval=activation_approval,
+        )
+
+    assert state.read_bytes() == before_activation
+    assert not any(
+        record.get("approval_id") == activation_approval["approval_id"]
+        for record in _exact_owner_prepare_ledger_records(handle, state)
+    )
+    assert set(sync_module._NORMAL_LIVE_BROKER_POST_CAPABILITIES) == capabilities_before
+
+
+@pytest.mark.parametrize(
+    "boundary,tamper_consumed_sidecar,case_id",
+    (
+        ("after_immutable_prepare", False, "prepare_only"),
+        ("after_owner_consumption", False, "consumed_recovery"),
+        ("after_owner_consumption", True, "consumed_tamper"),
+    ),
+    ids=("prepare_only", "consumed_recovery", "consumed_tamper"),
+)
+def test_direct_activation_owner_crash_boundaries_use_production_function(
+    tmp_path, monkeypatch, boundary, tamper_consumed_sidecar, case_id
+) -> None:
+    """Direct activation recovery never receives a wrapper-minted approval."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_direct_activation_owner_crash_boundaries_use_production_function"
+            f"[{case_id}]",
+        )
+        return
+    from tests._owner_approval_testing import install_isolated_owner_trust
+
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "direct-activation-owner", seed=b"direct-activation"
+    )
+    state = tmp_path / "direct-activation.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+    sync_approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="strategy_promotion_sync",
+        issued_at=synced_at,
+        ttl_minutes=1,
+    )
+    synced = _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(preimage),
+        actor_role="strategy_learning",
+        clock=lambda: synced_at,
+        owner_approval=sync_approval,
+    )
+    sync_receipt = next(
+        envelope
+        for envelope in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if envelope.object_id == synced.sync_receipt_id
+    )
+    intent = _complete_normal_live_intent(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_sha256=synced.canonical_after_sha256,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(sync_receipt.canonical_json_bytes()),
+        recorded_at=synced_at.isoformat(),
+        expires_at=(synced_at + timedelta(minutes=5)).isoformat(),
+    )
+    before_activation = state.read_bytes()
+    activation_approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="normal_live_activation",
+        intent=intent,
+        issued_at=synced_at,
+        ttl_minutes=1,
+    )
+    capabilities_before = set(sync_module._NORMAL_LIVE_BROKER_POST_CAPABILITIES)
+
+    def crash(actual: str) -> None:
+        if actual == boundary:
+            raise SystemExit(actual)
+
+    with pytest.raises(SystemExit, match=boundary):
+        _PRODUCTION_ACTIVATE_NORMAL_LIVE_INTENT(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: synced_at,
+            fault_hook=crash,
+            owner_approval=activation_approval,
+        )
+
+    store = sync_module.ImmutableStrategyEvidenceStore(root)
+    intent_digest = sync_module._digest(intent.canonical_json_bytes())
+    prepares = [
+        envelope
+        for envelope in store.envelopes(kind=sync_module.NORMAL_LIVE_ACTIVATION_PREPARE_KIND)
+        if sync_module._thaw_json(envelope.payload).get("intent_full_sha256")
+        == intent_digest
+    ]
+    assert len(prepares) == 1
+    prepare_payload = sync_module._thaw_json(prepares[0].payload)
+    assert state.read_bytes() == before_activation
+    assert set(sync_module._NORMAL_LIVE_BROKER_POST_CAPABILITIES) == capabilities_before
+    exact_records = _exact_owner_prepare_ledger_records(handle, state)
+    ledger_before_retry = handle.ledger.read_bytes()
+    if boundary == "after_immutable_prepare":
+        assert exact_records == []
+        retry_at = synced_at + timedelta(seconds=30)
+    else:
+        assert len(exact_records) == 1
+        retry_at = synced_at + timedelta(minutes=2)
+
+    if tamper_consumed_sidecar:
+        from tradingagents.policy.owner_approval import OwnerApprovalError
+
+        sidecar = sync_module.owner_approval_prepare_path(state)
+        raw = json.loads(sidecar.read_text(encoding="utf-8"))
+        raw["transaction"]["activation_prepare"]["serialized_output"] = "{}"
+        sidecar.write_text(json.dumps(raw), encoding="utf-8")
+        with pytest.raises(OwnerApprovalError, match="prepare|transaction|expired"):
+            _PRODUCTION_ACTIVATE_NORMAL_LIVE_INTENT(
+                proposal,
+                intent,
+                proposal_ledger_root=root,
+                repo_root=repo_root,
+                state_path=state,
+                clock=lambda: retry_at,
+                owner_approval=activation_approval,
+            )
+        assert state.read_bytes() == before_activation
+        assert set(sync_module._NORMAL_LIVE_BROKER_POST_CAPABILITIES) == capabilities_before
+        return
+
+    activated = _PRODUCTION_ACTIVATE_NORMAL_LIVE_INTENT(
+        proposal,
+        intent,
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        state_path=state,
+        clock=lambda: retry_at,
+        owner_approval=activation_approval,
+    )
+    assert activated.activation_prepare_id == prepares[0].object_id
+    assert sync_module._canonical(activated.state) == prepare_payload[
+        "serialized_output"
+    ].encode("utf-8")
+    assert activated.state["normal_live_activation"]["marker"] == prepare_payload[
+        "activation_state_marker"
+    ]
+    if boundary == "after_immutable_prepare":
+        assert len(handle.ledger.read_text(encoding="utf-8").splitlines()) == (
+            len(ledger_before_retry.splitlines()) + 1
+        )
+    else:
+        assert handle.ledger.read_bytes() == ledger_before_retry
+    receipts = [
+        envelope
+        for envelope in store.envelopes(kind=sync_module.NORMAL_LIVE_ACTIVATION_RECEIPT_KIND)
+        if sync_module._thaw_json(envelope.payload).get("activation_prepare_id")
+        == prepares[0].object_id
+    ]
+    assert len(receipts) == 1
+
+
+def test_direct_activation_prepare_only_expired_artifact_is_inert_without_capability(
+    tmp_path, monkeypatch
+) -> None:
+    """An expired unconsumed activation prepare cannot alter state or mint capability."""
+
+    if os.environ.get(_CAPPED_ACTIVATION_ISOLATED_ENV) != "1":
+        _run_capped_activation_in_isolated_repo(
+            tmp_path,
+            "tests/test_strategy_promotion_sync.py::"
+            "test_direct_activation_prepare_only_expired_artifact_is_inert_without_capability",
+        )
+        return
+    from tests._owner_approval_testing import install_isolated_owner_trust
+    from tradingagents.policy.owner_approval import OwnerApprovalError
+
+    root, repo_root, proposal, synced_at, _commit = _capped_activation_journal(
+        tmp_path, monkeypatch
+    )
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "expired-activation-owner", seed=b"expired-activation"
+    )
+    state = tmp_path / "expired-activation.json"
+    preimage = b'{"sleeves":{}}'
+    state.write_bytes(preimage)
+    sync_approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="strategy_promotion_sync",
+        issued_at=synced_at,
+        ttl_minutes=1,
+    )
+    synced = _PRODUCTION_SYNC_STRATEGY_PROMOTION_STATE_FILE(
+        proposal_ledger_root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_path=state,
+        expected_current_state_sha256=sync_module._digest(preimage),
+        actor_role="strategy_learning",
+        clock=lambda: synced_at,
+        owner_approval=sync_approval,
+    )
+    sync_receipt = next(
+        envelope
+        for envelope in sync_module.ImmutableStrategyEvidenceStore(root).rebuild()
+        if envelope.object_id == synced.sync_receipt_id
+    )
+    intent = _complete_normal_live_intent(
+        root=root,
+        repo_root=repo_root,
+        proposal=proposal,
+        state_sha256=synced.canonical_after_sha256,
+        receipt_id=synced.sync_receipt_id,
+        receipt_sha256=sync_module._digest(sync_receipt.canonical_json_bytes()),
+        recorded_at=synced_at.isoformat(),
+        expires_at=(synced_at + timedelta(minutes=5)).isoformat(),
+    )
+    before_activation = state.read_bytes()
+    approval = _direct_owner_approval(
+        handle,
+        proposal=proposal,
+        kind="normal_live_activation",
+        intent=intent,
+        issued_at=synced_at,
+        ttl_minutes=1,
+    )
+    capabilities_before = set(sync_module._NORMAL_LIVE_BROKER_POST_CAPABILITIES)
+
+    def crash_after_prepare(actual: str) -> None:
+        if actual == "after_immutable_prepare":
+            raise SystemExit(actual)
+
+    with pytest.raises(SystemExit, match="after_immutable_prepare"):
+        _PRODUCTION_ACTIVATE_NORMAL_LIVE_INTENT(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: synced_at,
+            fault_hook=crash_after_prepare,
+            owner_approval=approval,
+        )
+
+    assert state.read_bytes() == before_activation
+    assert _exact_owner_prepare_ledger_records(handle, state) == []
+    # This test deliberately advances the private authority clock as well as
+    # its evidence clock. A public retry timestamp alone is no longer enough
+    # to expire (or revive) an owner artifact.
+    monkeypatch.setattr(
+        sync_module,
+        "_owner_approval_authority_utc_now",
+        lambda: synced_at + timedelta(minutes=2),
+    )
+    with pytest.raises(OwnerApprovalError, match="expired|prepared-only"):
+        _PRODUCTION_ACTIVATE_NORMAL_LIVE_INTENT(
+            proposal,
+            intent,
+            proposal_ledger_root=root,
+            repo_root=repo_root,
+            state_path=state,
+            clock=lambda: synced_at + timedelta(minutes=2),
+            owner_approval=approval,
+        )
+    assert state.read_bytes() == before_activation
+    assert set(sync_module._NORMAL_LIVE_BROKER_POST_CAPABILITIES) == capabilities_before
+
+
 def test_activation_requires_exact_current_intent_and_state_preimage(
     tmp_path, monkeypatch
 ) -> None:
@@ -3422,6 +4303,7 @@ def _sync_capped_activation_state(
     intent_recorded_at: datetime | None = None,
     intent_expires_at: datetime | None = None,
     overrides: dict[str, object] | None = None,
+    owner_approval: object = None,
 ) -> AuthorizedNormalTradeIntent:
     state.write_bytes(b'{"sleeves":{}}')
     synced = sync_module.sync_strategy_promotion_state_file(
@@ -3432,6 +4314,7 @@ def _sync_capped_activation_state(
         expected_current_state_sha256=sync_module._digest(b'{"sleeves":{}}'),
         actor_role="strategy_learning",
         clock=lambda: synced_at,
+        owner_approval=owner_approval,
     )
     receipt = next(
         item
@@ -3936,7 +4819,10 @@ def test_activation_is_one_use_and_duplicate_is_read_only_retry(
     assert state.read_bytes() == bytes_after_first
 
 
-@pytest.mark.parametrize("boundary", ("after_prepare", "after_replace"))
+@pytest.mark.parametrize(
+    "boundary",
+    ("after_immutable_prepare", "after_owner_consumption", "after_replace"),
+)
 def test_activation_crash_repair_never_widens_the_bound_intent(
     tmp_path, monkeypatch, boundary
 ) -> None:
@@ -3993,7 +4879,7 @@ def test_activation_crash_repair_never_widens_the_bound_intent(
     )
 
     assert repaired.status == (
-        "activated" if boundary == "after_prepare" else "receipt_repaired"
+        "receipt_repaired" if boundary == "after_replace" else "activated"
     )
     assert json.loads(state.read_text())["sleeves"][proposal.sleeve]["live_enabled"] is True
 

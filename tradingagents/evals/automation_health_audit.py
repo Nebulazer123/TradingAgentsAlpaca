@@ -400,20 +400,20 @@ def _schedule_contract_issues(contract: Any) -> list[str]:
             for dependency in dependencies:
                 dependency_occurrences = scheduled_occurrences[dependency]
                 dependent_occurrences = scheduled_occurrences[automation_id]
-                dependency_minutes = [minute for _day, minute in dependency_occurrences]
-                dependent_minutes = [minute for _day, minute in dependent_occurrences]
                 max_gap = EXECUTION_DEPENDENCY_MAX_GAP_MINUTES.get(
                     (dependency, automation_id)
                 )
                 if (
-                    not dependency_minutes
-                    or not dependent_minutes
-                    or min(dependency_minutes) >= min(dependent_minutes)
-                    or max_gap is not None
-                    and any(
+                    not dependency_occurrences
+                    or not dependent_occurrences
+                    or any(
                         not any(
                             dependency_day == dependent_day
-                            and 0 < dependent_minute - dependency_minute <= max_gap
+                            and dependent_minute - dependency_minute > 0
+                            and (
+                                max_gap is None
+                                or dependent_minute - dependency_minute <= max_gap
+                            )
                             for dependency_day, dependency_minute in dependency_occurrences
                         )
                         for dependent_day, dependent_minute in dependent_occurrences
@@ -871,7 +871,11 @@ def _capture_topology_issues(snapshot: Mapping[str, Any]) -> list[str]:
     expected_set = set(expected_ids) if isinstance(expected_ids, list) else set()
     discovered_set = set(discovered_ids) if isinstance(discovered_ids, list) else set()
     toml_set = set(toml_ids)
-    if expected_set != contract_ids or discovered_set != contract_ids or toml_set != contract_ids:
+    if (
+        expected_set != contract_ids
+        or not expected_set.issubset(discovered_set)
+        or toml_set != discovered_set
+    ):
         issues.append("automation_topology_incomplete_or_unexpected")
     if root is not None and root.is_absolute():
         expected_root_identity = dict(root_identity) if isinstance(root_identity, Mapping) else None
@@ -1251,6 +1255,7 @@ def evaluate_schedule_contract(
             deployment_phase == PREDEPLOYMENT_PAUSED_PHASE
             and configured_count == len(rows)
             and paused_count == len(rows)
+            and not unexpected_ids
         ),
         "deployment_proven": False,
         "issues": sorted(set(issues)),

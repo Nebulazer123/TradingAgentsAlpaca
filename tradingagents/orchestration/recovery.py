@@ -21,6 +21,11 @@ from tradingagents.policy.live_control import (
     load_live_control_state,
     parse_control_time,
 )
+from tradingagents.policy.owner_approval import (
+    OwnerApprovalError,
+    default_policy_fingerprint,
+    require_prior_consumption_for_commitment_recovery,
+)
 from tradingagents.policy.promotion_sync import promotion_state_lock
 
 UTC = dt.timezone.utc
@@ -867,6 +872,7 @@ def _promotion_transaction_issues(
     expected_commit_path = phase_path.with_name("promotion_commit.json")
     prepare_ref = promotion.get("promotion_prepare")
     commit_ref = promotion.get("promotion_commit")
+    intent = promotion.get("promotion_commit_intent")
     stage_request = promotion.get("promotion_stage_request")
     state_path = _canonical_reference(promotion.get("state_path"))
     staged_path = _canonical_reference(
@@ -1081,9 +1087,151 @@ def _promotion_transaction_issues(
             "expected_raw_stage_sha256"
         ),
         "expected_stage_sha256": staged_sha256,
+        "promoted": prepare.get("promoted"),
+        "demoted": prepare.get("demoted"),
+        "unchanged": prepare.get("unchanged"),
+        "owner_approval_request": prepare.get("owner_approval_request"),
         "can_submit_orders": False,
         "execution_authority": "none",
     }
+    owner_request = prepare.get("owner_approval_request")
+    approval_metadata = receipt.get("owner_approval")
+    approval_metadata_keys = {
+        "owner_approval_id",
+        "owner_approval_action",
+        "owner_approval_purpose",
+        "owner_approval_transaction_binding_sha256",
+        "owner_approval_request_sha256",
+        "owner_approval_policy_fingerprint_sha256",
+    }
+    owner_request_valid = False
+    owner_request_digest: str | None = None
+    if isinstance(owner_request, Mapping):
+        subject = owner_request.get("subject")
+        source_binding = owner_request.get("source_binding")
+        envelope_binding = owner_request.get("risk_envelope_binding")
+        frozen_preimage = (
+            subject.get("frozen_control_preimage_sha256")
+            if isinstance(subject, Mapping)
+            else None
+        )
+        expected_owner_request = {
+            "schema_version": "tradingagents.owner_approval_request.v1",
+            "action": "live_promotion",
+            "subject": {
+                "kind": "verified_recovery_promotion",
+                "recovery_commit_id": recovery_commit.get("commit_id"),
+                "incident_id": bindings.get("incident_id"),
+                "recovery_run_id": recovery_commit.get("recovery_run_id"),
+                "source_revision": bindings.get("source_revision"),
+                "focused_sha256": recovery_commit.get("focused_sha256"),
+                "reconciliation_sha256": recovery_commit.get(
+                    "reconciliation_sha256"
+                ),
+                "frozen_control_preimage_sha256": frozen_preimage,
+                "report_sha256": recovery_commit.get("report_sha256"),
+                "envelope_ref": str(envelope_path) if envelope_path else None,
+                "envelope_sha256": recovery_commit.get("envelope_sha256"),
+                "canonical_output_path": str(state_path),
+                "canonical_input_sha256": recovery_commit.get(
+                    "canonical_before_sha256"
+                ),
+                "staged_output_path": str(staged_path),
+                "expected_raw_stage_sha256": prepare.get(
+                    "expected_raw_stage_sha256"
+                ),
+                "expected_stage_sha256": staged_sha256,
+                "promoted": prepare.get("promoted"),
+                "demoted": prepare.get("demoted"),
+                "unchanged": prepare.get("unchanged"),
+            },
+            "source_binding": {
+                "kind": "verified_recovery_promotion",
+                "recovery_commit_id": recovery_commit.get("commit_id"),
+                "incident_id": bindings.get("incident_id"),
+                "recovery_run_id": recovery_commit.get("recovery_run_id"),
+                "source_revision": bindings.get("source_revision"),
+                "expected_stage_sha256": staged_sha256,
+                "frozen_control_preimage_sha256": frozen_preimage,
+            },
+            "risk_envelope_binding": {
+                "ref": str(envelope_path) if envelope_path else None,
+                "sha256": recovery_commit.get("envelope_sha256"),
+            },
+            "purpose": (
+                "verified_recovery_promotion:"
+                f"{recovery_commit.get('commit_id')}:"
+                f"{staged_sha256}"
+            ),
+        }
+        owner_request_digest = hashlib.sha256(
+            _canonical_json(expected_owner_request) + b"\n"
+        ).hexdigest()
+        owner_request_valid = (
+            dict(owner_request) == expected_owner_request
+            and _sha256_reference(frozen_preimage) is not None
+            and isinstance(source_binding, Mapping)
+            and isinstance(envelope_binding, Mapping)
+        )
+    approval_metadata_valid = (
+        isinstance(approval_metadata, Mapping)
+        and set(approval_metadata) == approval_metadata_keys
+        and approval_metadata.get("owner_approval_action") == "live_promotion"
+        and approval_metadata.get("owner_approval_purpose")
+        == (
+            owner_request.get("purpose")
+            if isinstance(owner_request, Mapping)
+            else None
+        )
+        and approval_metadata.get("owner_approval_request_sha256")
+        == owner_request_digest
+        and all(
+            _sha256_reference(approval_metadata.get(field)) is not None
+            for field in (
+                "owner_approval_id",
+                "owner_approval_transaction_binding_sha256",
+                "owner_approval_request_sha256",
+                "owner_approval_policy_fingerprint_sha256",
+            )
+        )
+    )
+    if approval_metadata_valid:
+        assert isinstance(approval_metadata, Mapping)
+        try:
+            if (
+                approval_metadata[
+                    "owner_approval_policy_fingerprint_sha256"
+                ]
+                != default_policy_fingerprint()
+            ):
+                approval_metadata_valid = False
+            else:
+                require_prior_consumption_for_commitment_recovery(
+                    approval_id=approval_metadata["owner_approval_id"],
+                    action=approval_metadata["owner_approval_action"],
+                    purpose=approval_metadata["owner_approval_purpose"],
+                    transaction_binding_sha256=approval_metadata[
+                        "owner_approval_transaction_binding_sha256"
+                    ],
+                )
+        except OwnerApprovalError:
+            approval_metadata_valid = False
+    expected_intent = (
+        {
+            "commit_id": recovery_commit.get("commit_id"),
+            "prepare_path": str(expected_prepare_path),
+            "prepare_sha256": prepare_ref["sha256"],
+            "staged_path": str(staged_path),
+            "staged_sha256": staged_sha256,
+            "canonical_path": str(state_path),
+            "canonical_before_sha256": recovery_commit.get(
+                "canonical_before_sha256"
+            ),
+            **dict(approval_metadata),
+        }
+        if isinstance(approval_metadata, Mapping)
+        else None
+    )
     expected_stage_request = {
         "commit_id": recovery_commit.get("commit_id"),
         "prepare_path": str(expected_prepare_path),
@@ -1104,6 +1252,7 @@ def _promotion_transaction_issues(
         "reconciliation_sha256": recovery_commit.get(
             "reconciliation_sha256"
         ),
+        "owner_approval_request_sha256": owner_request_digest,
         "arm_live": True,
         "ci_green": True,
     }
@@ -1122,15 +1271,21 @@ def _promotion_transaction_issues(
         "canonical_after_sha256": after_sha256,
         "can_submit_orders": False,
         "execution_authority": "none",
+        "owner_approval": (
+            dict(approval_metadata)
+            if isinstance(approval_metadata, Mapping)
+            else None
+        ),
     }
     if (
         _sha256_reference(prepare.get("expected_raw_stage_sha256")) is None
         or prepare != expected_prepare
+        or not owner_request_valid
     ):
         issues.append("promotion prepare receipt binding is invalid")
-    if stage_request != expected_stage_request:
+    if stage_request != expected_stage_request or intent != expected_intent:
         issues.append("promotion stage request binding is invalid")
-    if receipt != expected_receipt:
+    if receipt != expected_receipt or not approval_metadata_valid:
         issues.append("promotion commit receipt binding is invalid")
     source = (
         canonical_state.get("source")

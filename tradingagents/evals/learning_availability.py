@@ -12,12 +12,14 @@ import stat
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 from tradingagents.evals.agent_intelligence_ledger import AgentForecast
 from tradingagents.evals.hypothesis_lifecycle import HypothesisLifecycleEvent
+from tradingagents.evals.source_bound_resolution import SourceBoundWindowLookup
 
 LEARNING_AVAILABILITY_SCHEMA_VERSION = 1
 
@@ -25,8 +27,14 @@ _UTC = dt.timezone.utc
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SAFE_SOURCE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+@=-]{0,255}$")
+SOURCE_KIND_FORECAST_RESOLUTION_QUALITY = "forecast_resolution_quality"
+SOURCE_KIND_SOURCE_BOUND_FORECAST_RESOLUTION = "forecast_resolution_quality_source_bound"
 _SOURCE_KINDS = frozenset(
-    {"forecast_resolution_quality", "hypothesis_lifecycle"}
+    {
+        SOURCE_KIND_FORECAST_RESOLUTION_QUALITY,
+        SOURCE_KIND_SOURCE_BOUND_FORECAST_RESOLUTION,
+        "hypothesis_lifecycle",
+    }
 )
 _AUTHORITY_FIELDS = {
     "analysis_only": True,
@@ -90,6 +98,9 @@ _FORECAST_PAYLOAD_FIELDS = frozenset(
         "resolution_window",
     }
 )
+_SOURCE_BOUND_FORECAST_PAYLOAD_FIELDS = frozenset(
+    {*_FORECAST_PAYLOAD_FIELDS, "resolution_evidence"}
+)
 _LIFECYCLE_PAYLOAD_FIELDS = frozenset(
     {
         "event_id",
@@ -122,6 +133,40 @@ _RESOLUTION_WINDOW_FIELDS = frozenset(
         "final_bar_available",
         "horizon",
         "horizon_kind",
+    }
+)
+_LEGACY_RESOLUTION_EVIDENCE_FIELDS = frozenset({"schema_version", "ticker", "benchmark"})
+_RESOLUTION_EVIDENCE_FIELDS = frozenset(
+    {"schema_version", "ticker", "benchmark", "alpha_threshold_pct"}
+)
+_SOURCE_BOUND_LEG_FIELDS = frozenset(
+    {
+        "schema_version",
+        "window_id",
+        "window_sha256",
+        "security_id",
+        "raw_artifact_id",
+        "raw_artifact_sha256",
+        "decision_cutoff",
+        "retrieved_at",
+        "feed",
+        "adjustment_mode",
+        "adjustment_status",
+    }
+)
+_LEGACY_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v1"
+_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v2"
+_ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA = "source_bound_resolution_evidence/v3"
+_SOURCE_BOUND_LEG_EVIDENCE_SCHEMA = "source_bound_price_window_evidence/v1"
+_ECONOMIC_DECISION_FIELDS = frozenset(
+    {
+        "protocol_id",
+        "input_manifest_id",
+        "input_manifest_sha256",
+        "decision_event_id",
+        "decision_at",
+        "market_date",
+        "source_packet_id",
     }
 )
 _LIFECYCLE_CONTEXT_FIELDS = frozenset(
@@ -318,6 +363,123 @@ def _validate_forecast_payload(payload: Mapping[str, Any]) -> None:
             )
 
 
+def _validate_source_bound_resolution_evidence(value: Any) -> None:
+    if not isinstance(value, Mapping):
+        raise LearningAvailabilityError("resolution_evidence must be an object")
+    schema_version = value.get("schema_version")
+    if schema_version == _LEGACY_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        expected_fields = _LEGACY_RESOLUTION_EVIDENCE_FIELDS
+    elif schema_version == _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        expected_fields = _RESOLUTION_EVIDENCE_FIELDS
+    elif schema_version == _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        expected_fields = frozenset({*_RESOLUTION_EVIDENCE_FIELDS, "economic_decision"})
+    else:
+        raise LearningAvailabilityError("resolution_evidence schema_version is invalid")
+    _require_exact_fields(
+        value,
+        expected_fields,
+        label="resolution_evidence",
+    )
+    if schema_version in (
+        _SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+        _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA,
+    ):
+        alpha_threshold = value["alpha_threshold_pct"]
+        if type(alpha_threshold) is not str:
+            raise LearningAvailabilityError("resolution_evidence alpha_threshold_pct is invalid")
+        try:
+            parsed_threshold = Decimal(alpha_threshold)
+        except (InvalidOperation, ValueError) as exc:
+            raise LearningAvailabilityError(
+                "resolution_evidence alpha_threshold_pct is invalid"
+            ) from exc
+        if (
+            not parsed_threshold.is_finite()
+            or parsed_threshold < 0
+            or alpha_threshold != format(parsed_threshold.normalize(), "f")
+        ):
+            raise LearningAvailabilityError("resolution_evidence alpha_threshold_pct is invalid")
+    if schema_version == _ECONOMIC_SOURCE_BOUND_RESOLUTION_EVIDENCE_SCHEMA:
+        economic = value["economic_decision"]
+        if not isinstance(economic, Mapping):
+            raise LearningAvailabilityError("economic_decision must be an object")
+        _require_exact_fields(
+            economic,
+            _ECONOMIC_DECISION_FIELDS,
+            label="economic_decision",
+        )
+        for field, field_value in economic.items():
+            _required_canonical_text(field_value, field=f"economic_decision {field}")
+        if _LOWER_SHA256.fullmatch(economic["input_manifest_sha256"]) is None:
+            raise LearningAvailabilityError(
+                "economic_decision input_manifest_sha256 must be a SHA-256 digest"
+            )
+        if not economic["decision_event_id"].startswith("decision-event-"):
+            raise LearningAvailabilityError("economic_decision decision_event_id is invalid")
+        _stored_utc(economic["decision_at"], field="economic_decision decision_at")
+        try:
+            dt.date.fromisoformat(economic["market_date"])
+        except ValueError as exc:
+            raise LearningAvailabilityError(
+                "economic_decision market_date is invalid"
+            ) from exc
+    for leg_name in ("ticker", "benchmark"):
+        leg = value[leg_name]
+        if not isinstance(leg, Mapping):
+            raise LearningAvailabilityError(f"resolution_evidence {leg_name} must be an object")
+        _require_exact_fields(
+            leg,
+            _SOURCE_BOUND_LEG_FIELDS,
+            label=f"resolution_evidence {leg_name}",
+        )
+        if leg["schema_version"] != _SOURCE_BOUND_LEG_EVIDENCE_SCHEMA:
+            raise LearningAvailabilityError(
+                f"resolution_evidence {leg_name} schema_version is invalid"
+            )
+        for field in ("window_sha256", "raw_artifact_sha256"):
+            if (
+                not isinstance(leg[field], str)
+                or _LOWER_SHA256.fullmatch(leg[field]) is None
+            ):
+                raise LearningAvailabilityError(
+                    f"resolution_evidence {leg_name} {field} must be a SHA-256 digest"
+                )
+        for field in ("window_id", "security_id", "raw_artifact_id"):
+            _source_id(leg[field], field=f"resolution_evidence {leg_name} {field}")
+        retrieved_at = _stored_utc(
+            leg["retrieved_at"],
+            field=f"resolution_evidence {leg_name} retrieved_at",
+        )
+        decision_cutoff = _stored_utc(
+            leg["decision_cutoff"],
+            field=f"resolution_evidence {leg_name} decision_cutoff",
+        )
+        if retrieved_at > decision_cutoff:
+            raise LearningAvailabilityError(
+                f"resolution_evidence {leg_name} retrieval is after decision cutoff"
+            )
+        if leg["feed"] not in {"iex", "sip"}:
+            raise LearningAvailabilityError(
+                f"resolution_evidence {leg_name} feed is invalid"
+            )
+        if leg["adjustment_mode"] != "all" or leg["adjustment_status"] != "total_return_adjusted":
+            raise LearningAvailabilityError(
+                f"resolution_evidence {leg_name} adjustment contract is invalid"
+            )
+
+
+def _validate_source_bound_forecast_payload(payload: Mapping[str, Any]) -> None:
+    _require_exact_fields(
+        payload,
+        _SOURCE_BOUND_FORECAST_PAYLOAD_FIELDS,
+        label="source-bound forecast payload",
+    )
+    _validate_forecast_payload(
+        {field: payload[field] for field in _FORECAST_PAYLOAD_FIELDS}
+    )
+    _validate_source_bound_resolution_evidence(payload["resolution_evidence"])
+
+
 def _validate_lifecycle_payload(payload: Mapping[str, Any]) -> None:
     _require_exact_fields(
         payload,
@@ -366,6 +528,26 @@ class LearningObservation:
         *,
         recorded_at: dt.datetime,
     ) -> LearningObservation:
+        """Reject creation of legacy learning observations.
+
+        Existing ``forecast_resolution_quality`` objects remain readable for
+        audit and migration, but only the receipt-verifying source-bound path
+        may create a new learning admission.
+        """
+
+        del cls, forecast, recorded_at
+        raise LearningAvailabilityError(
+            "legacy forecast observations are historical read-only; use source-bound receipts"
+        )
+
+    @classmethod
+    def from_historical_forecast(
+        cls,
+        forecast: AgentForecast,
+        *,
+        recorded_at: dt.datetime,
+    ) -> LearningObservation:
+        """Reconstruct a pre-existing legacy observation for audit-only tests/tools."""
         if (
             forecast.resolved is not True
             or type(forecast.outcome) is not bool
@@ -383,7 +565,50 @@ class LearningObservation:
             for field in sorted(_FORECAST_PAYLOAD_FIELDS)
         }
         return cls._create(
-            source_kind="forecast_resolution_quality",
+            source_kind=SOURCE_KIND_FORECAST_RESOLUTION_QUALITY,
+            source_id=forecast.forecast_id,
+            effective_at=forecast.resolved_at,
+            recorded_at=recorded_at,
+            payload=payload,
+        )
+
+    @classmethod
+    def from_source_bound_forecast(
+        cls,
+        forecast: AgentForecast,
+        *,
+        recorded_at: dt.datetime,
+        verifier: SourceBoundWindowLookup,
+    ) -> LearningObservation:
+        """Record a resolved outcome only when both price legs are bound to PIT bytes."""
+
+        if (
+            forecast.resolved is not True
+            or type(forecast.outcome) is not bool
+            or not isinstance(forecast.resolved_at, str)
+            or not isinstance(forecast.label_quality, str)
+            or not forecast.label_quality.strip()
+            or not isinstance(forecast.resolution_window, Mapping)
+            or not forecast.resolution_window
+        ):
+            raise LearningAvailabilityError(
+                "forecast is not an audited resolved source-bound snapshot"
+            )
+        payload = {
+            field: getattr(forecast, field)
+            for field in sorted(_SOURCE_BOUND_FORECAST_PAYLOAD_FIELDS)
+        }
+        _validate_source_bound_forecast_payload(payload)
+        if type(verifier) is not SourceBoundWindowLookup:
+            raise LearningAvailabilityError(
+                "source-bound admission requires an exact SourceBoundWindowLookup"
+            )
+        if verifier.verify_forecast(forecast) is not True:
+            raise LearningAvailabilityError(
+                "source-bound forecast evidence did not reverify against raw receipts"
+            )
+        return cls._create(
+            source_kind=SOURCE_KIND_SOURCE_BOUND_FORECAST_RESOLUTION,
             source_id=forecast.forecast_id,
             effective_at=forecast.resolved_at,
             recorded_at=recorded_at,
@@ -518,8 +743,18 @@ def _validate_observation(observation: LearningObservation) -> None:
         )
     if not isinstance(observation.payload, Mapping):
         raise LearningAvailabilityError("payload must be an object")
-    if observation.source_kind == "forecast_resolution_quality":
+    if observation.source_kind == SOURCE_KIND_FORECAST_RESOLUTION_QUALITY:
         _validate_forecast_payload(observation.payload)
+        if observation.payload["forecast_id"] != source_id:
+            raise ObservationCollisionError(
+                "forecast source_id does not match payload forecast_id"
+            )
+        if observation.payload["resolved_at"] != observation.effective_at:
+            raise ObservationCollisionError(
+                "forecast effective_at does not match payload resolved_at"
+            )
+    elif observation.source_kind == SOURCE_KIND_SOURCE_BOUND_FORECAST_RESOLUTION:
+        _validate_source_bound_forecast_payload(observation.payload)
         if observation.payload["forecast_id"] != source_id:
             raise ObservationCollisionError(
                 "forecast source_id does not match payload forecast_id"
@@ -1205,12 +1440,26 @@ def observe_forecasts(
     *,
     availability_root: str | Path,
     recorded_at: dt.datetime,
+    source_bound_verifier: SourceBoundWindowLookup | None = None,
 ) -> tuple[ObservationAdmission, ...]:
-    observable = [
-        LearningObservation.from_forecast(forecast, recorded_at=recorded_at)
-        for forecast in forecasts
-        if _forecast_is_observable(forecast)
-    ]
+    if source_bound_verifier is None:
+        return ()
+    observable = []
+    for forecast in forecasts:
+        if not _forecast_is_observable(forecast):
+            continue
+        try:
+            observable.append(
+                LearningObservation.from_source_bound_forecast(
+                    forecast,
+                    recorded_at=recorded_at,
+                    verifier=source_bound_verifier,
+                )
+            )
+        except LearningAvailabilityError:
+            # Legacy or malformed price evidence remains in the source ledger
+            # for audit, but never becomes point-in-time learning evidence.
+            continue
     if not observable:
         return ()
     return LearningAvailabilityLedger(availability_root).record_many(observable)

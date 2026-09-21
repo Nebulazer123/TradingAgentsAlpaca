@@ -2808,6 +2808,7 @@ name = "tradingagents"
 version = "0.2.5"
 source = { editable = "." }
 dependencies = [
+    { name = "cryptography" },
     { name = "langchain-anthropic" },
     { name = "langchain-core" },
     { name = "langchain-experimental" },
@@ -2844,6 +2845,7 @@ static-analysis = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", specifier = ">=42.0" },
     { name = "langchain-anthropic", specifier = ">=0.3.15" },
     { name = "langchain-core", specifier = ">=0.3.81" },
     { name = "langchain-experimental", specifier = ">=0.3.4" },

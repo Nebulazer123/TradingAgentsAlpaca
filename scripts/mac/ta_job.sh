@@ -1,18 +1,19 @@
 #!/bin/zsh
 # TradingAgents Mac automation wrapper.
 #
-# Replaces the paused Windows Codex automations with deterministic CLI
-# sequences driven by launchd. Every job is fail-closed: live submission
-# still requires the unified go-live guard (promotion record, risk
-# envelope, unexpired dead-man control, buying power) at submit time.
+# Deterministic CLI sequences called by the canonical Codex schedules or an
+# explicitly authorized manual run. This wrapper never installs schedules.
+# The current hourly CLI hard-disables direct live submission; an action flag
+# is not an independently issued live intent or an activation receipt.
 #
 # Usage: ta_job.sh <hourly|preopen|tournament|overnight|daily-report|deliver-outbox>
 #
-# Config via environment (set in the launchd plist or shell):
+# Config via environment (set by the authorized caller):
 #   TA_REPO          repo root (default: the production tree this script infers)
-#   TA_LIVE_SUBMIT   1 to allow the supervisor to submit clean, gated actions
-#                    after a clean dry-run (historical behavior); 0 = dry-run
-#                    only (default until a human re-arms live trading).
+#   TA_LIVE_SUBMIT   1 requests the hourly CLI's gated action path and outbox
+#                    delivery; it does not enable direct live orders. 0 is
+#                    dry-run only, with no outbox delivery. Preopen is always
+#                    dry-run regardless of an inherited action flag.
 
 set -euo pipefail
 
@@ -51,9 +52,10 @@ case "$JOB" in
       --paper-tournament-log-dir results/paper_strategy_tournament
       --premarket-brief-log-dir results/premarket_briefs
     )
-    if [[ "$TA_LIVE_SUBMIT" == "1" ]]; then
-      # The CLI itself only submits when the dry-run is clean and every
-      # live gate passes; --submit-actions is permission to try, not to bypass.
+    if [[ "$JOB" == "hourly" && "$TA_LIVE_SUBMIT" == "1" ]]; then
+      # Only explicitly requested hourly action runs use this route. The CLI
+      # still rejects direct live orders; permitted paper actions retain their
+      # own guards. Preopen validation can never inherit this action mode.
       run "$PY" -m cli.main "${SUPERVISE_ARGS[@]}" --submit-actions
     else
       run "$PY" -m cli.main "${SUPERVISE_ARGS[@]}" --dry-run
@@ -63,9 +65,12 @@ case "$JOB" in
       run "$PY" -m cli.main alpaca preopen-validation --json-output
     fi
     run "$PY" scripts/automation_context_snapshot.py --write
-    # Urgent alerts queue in the outbox as they happen; drain it every tick
-    # so a CRITICAL/NOTABLE email is not stuck until the 15:40 daily drain.
-    run "$PY" scripts/mac/deliver_outbox.py
+    # Analysis-only runs must not send previously queued real messages.
+    # Explicit hourly action runs and the separate deliver-outbox job retain
+    # delivery behavior; a dry-run does not authorize an outbox drain.
+    if [[ "$JOB" == "hourly" && "$TA_LIVE_SUBMIT" == "1" ]]; then
+      run "$PY" scripts/mac/deliver_outbox.py
+    fi
     ;;
   tournament)
     run "$PY" -m cli.main alpaca paper-tournament run --all --dry-run --json-output

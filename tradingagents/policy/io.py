@@ -65,10 +65,23 @@ def atomic_append_line(
 ) -> Path:
     """Append one line by atomically rewriting the small policy log file."""
 
+    return atomic_append_text(path, line + "\n", encoding=encoding)
+
+
+def atomic_append_text(
+    path: str | Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+) -> Path:
+    """Atomically append a text block by rewriting the small file once."""
+
     output = Path(path)
     existing = output.read_text(encoding=encoding) if output.exists() else ""
     separator = "" if not existing or existing.endswith("\n") else "\n"
-    return atomic_write_text(output, f"{existing}{separator}{line}\n", encoding=encoding)
+    return atomic_write_text(
+        output, f"{existing}{separator}{text}", encoding=encoding
+    )
 
 
 def unique_packet_path(output_dir: str | Path, stem: str, suffix: str = ".json") -> Path:

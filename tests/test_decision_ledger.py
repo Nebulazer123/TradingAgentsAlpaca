@@ -121,6 +121,50 @@ def _recorded(
     return ledger, root, packet, packet_path
 
 
+def test_read_authenticated_events_does_not_create_an_absent_ledger(tmp_path):
+    root = tmp_path / "absent"
+    assert DecisionLedger(root).read_authenticated_events() == ()
+    assert not root.exists()
+
+
+def test_read_authenticated_events_preserves_bytes_and_missing_pointer(tmp_path):
+    ledger, root, packet, _ = _recorded(tmp_path)
+    (root / "latest" / f"{packet.kind}.json").unlink()
+    # Journal/packet authentication must not dereference raw evidence or repair
+    # a crash-interrupted pointer; packet replay owns those separate operations.
+    (tmp_path / "evidence/run-1.json").unlink()
+    before = {path.relative_to(root): (path.read_bytes(), path.stat().st_mtime_ns)
+              for path in root.rglob("*") if path.is_file()}
+
+    events = ledger.read_authenticated_events()
+
+    assert len(events) == 1 and events[0].run_id == packet.run_id
+    assert {path.relative_to(root): (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in root.rglob("*") if path.is_file()} == before
+
+
+@pytest.mark.parametrize("corruption", ["missing_lock", "missing_packet", "changed_packet", "torn_journal", "rolled_back_journal", "changed_pointer"])
+def test_read_authenticated_events_rejects_missing_or_corrupt_provenance(tmp_path, corruption):
+    ledger, root, _, packet_path = _recorded(tmp_path)
+    if corruption == "missing_lock":
+        (root / ".ledger.lock").unlink()
+    elif corruption == "missing_packet":
+        packet_path.unlink()
+    elif corruption == "changed_packet":
+        packet_path.write_bytes(b"{}")
+    elif corruption == "rolled_back_journal":
+        (root / "events.jsonl").write_bytes(b"")
+    elif corruption == "changed_pointer":
+        (root / "latest/research_synthesis.json").write_bytes(b"{}")
+    else:
+        journal = root / "events.jsonl"
+        journal.write_bytes(journal.read_bytes().rstrip(b"\n"))
+    before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    with pytest.raises(LedgerCorruptionError):
+        ledger.read_authenticated_events()
+    assert {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+
+
 def test_record_writes_exact_canonical_layout_and_analysis_only_shapes(tmp_path):
     root_argument = tmp_path / "nested" / ".." / "ledger"
     packet = _packet(tmp_path)

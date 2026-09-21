@@ -13,7 +13,7 @@ from collections import deque
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Any
@@ -116,6 +116,7 @@ from tradingagents.brokers.paper_tournament import (
     ALPHAINSIDER_PAPER_WATCH_ID,
     STRATEGY_IDS,
     adapt_candidate_signals_for_live_strategy,
+    authenticated_market_date_window,
     build_alphainsider_paper_watch_plan,
     build_tournament_actions,
     build_tournament_order_payloads,
@@ -140,6 +141,12 @@ from tradingagents.dataflows.alpaca_reference import (
     load_alpaca_reference_catalog,
 )
 from tradingagents.dataflows.integration_registry import build_integration_registry_report
+from tradingagents.dataflows.pit import (
+    RawPointInTimeArtifactArchive,
+    build_source_verifiable_point_in_time_cohort,
+    validate_market_date_partitions,
+    validate_market_session_calendar,
+)
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.evals.agent_intelligence_brain import (
     DEFAULT_BRAIN_PATH,
@@ -150,11 +157,14 @@ from tradingagents.evals.agent_intelligence_brain import (
 from tradingagents.evals.agent_intelligence_ledger import (
     DEFAULT_LEDGER_PATH,
     DEFAULT_RATING_CALIBRATION_PATH,
+    DEFAULT_SUMMARY_PATH,
     agent_influence_weights,
     append_forecasts,
     audit_resolved_forecasts,
+    downgrade_nonqualifying_resolution_labels,
     forecasts_from_mirofish_handoff_packet,
     forecasts_from_overnight_packet,
+    has_source_bound_resolution_evidence,
     load_ledger,
     load_ledger_with_stats,
     render_agent_influence_context,
@@ -162,6 +172,13 @@ from tradingagents.evals.agent_intelligence_ledger import (
     summarize_agent_scores,
     write_ledger,
     write_summary,
+)
+from tradingagents.evals.agent_intelligence_reconciliation import (
+    ReconciliationPathError,
+    SummaryReadError,
+    canonical_json_text,
+    reconcile_ledger_file,
+    write_reconciliation_receipt,
 )
 from tradingagents.evals.automation_health_audit import (
     build_automation_health_audit,
@@ -174,6 +191,28 @@ from tradingagents.evals.automation_memory_rollup import (
     build_automation_memory_rollup_plan,
     write_automation_memory_rollup_apply_result,
     write_automation_memory_rollup_plan,
+)
+from tradingagents.evals.economic_evaluation_admission import (
+    EconomicEvaluationAdmissionAdapter,
+    EconomicEvaluationAdmissionError,
+)
+from tradingagents.evals.economic_evaluation_partition_binding import (
+    bind_phase_eligibility,
+)
+from tradingagents.evals.economic_evaluation_protocol import (
+    validate_frozen_evaluation_protocol,
+)
+from tradingagents.evals.economic_tournament import (
+    EconomicTournamentCandidate,
+    EconomicTournamentOutcome,
+    evaluate_phase_ta_control,
+)
+from tradingagents.evals.economic_tournament_evidence import (
+    SourceBoundTournamentInput,
+    validate_source_bound_tournament_input,
+)
+from tradingagents.evals.economic_tournament_evidence_admission import (
+    verify_source_bound_tournament_input,
 )
 from tradingagents.evals.email_clarity import evaluate_email_clarity, write_email_clarity_eval
 from tradingagents.evals.execution_board import (
@@ -202,6 +241,9 @@ from tradingagents.evals.resolution_quality import (
     price_window_from_bars,
     summarize_resolution_quality,
 )
+from tradingagents.evals.source_bound_resolution import (
+    load_source_bound_window_lookup,
+)
 from tradingagents.evals.source_quality import (
     build_compact_source_quality_review,
     build_source_quality_review,
@@ -216,6 +258,10 @@ from tradingagents.graph.analyst_execution import (
     build_analyst_execution_plan,
     get_initial_analyst_node,
     sync_analyst_tracker_from_chunk,
+)
+from tradingagents.graph.checkpoint_runtime_identity import (
+    CheckpointRuntimeIdentityError,
+    build_analysis_checkpoint_identity,
 )
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.model_catalog import get_model_context_window_tokens
@@ -323,6 +369,12 @@ from tradingagents.research.provider_orchestrator import (
     DEFAULT_SOURCE_QUALITY_REVIEW_PATH,
     DEFAULT_TICKER_EVIDENCE_NEEDS,
     build_ticker_provider_research_packets,
+)
+from tradingagents.research.qualification_benchmark import (
+    ResearchQualificationBenchmarkError,
+    execute_registered_openrouter_benchmark,
+    run_registered_research_benchmark,
+    write_research_qualification_receipt,
 )
 from tradingagents.research.reddit_watchlists import build_reddit_watchlist_packet
 from tradingagents.research.release_calendar import build_release_calendar_packet
@@ -1415,6 +1467,93 @@ def research_source_quality_review(
     console.print(f"Review: {payload['json_path']}")
 
 
+@research_app.command("research-stack-benchmark")
+def research_stack_benchmark(
+    registration_path: Path = typer.Option(..., "--registration-path"),
+    lane_results_path: Path = typer.Option(..., "--lane-results-path"),
+    artifact_root: Path = typer.Option(
+        ..., "--artifact-root", exists=True, file_okay=False, readable=True
+    ),
+    output_path: Path = typer.Option(
+        Path("results/research_qualification/benchmark-receipt.json"),
+        "--output-path",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+    execute_openrouter: bool = typer.Option(
+        False,
+        "--execute-openrouter",
+        help="Explicitly execute the preregistered OpenRouter source/no-text pair after deterministic admission.",
+    ),
+    execute_reviewer: bool = typer.Option(
+        False,
+        "--execute-reviewer",
+        help="With --execute-openrouter, also run the registered distinct-model pair on ambiguous cases only.",
+    ),
+    execute_full_graph: bool = typer.Option(
+        False, "--execute-full-graph",
+        help="With --execute-openrouter, run the registered retained-only full graph pair only if simpler lanes leave attainable gain.",
+    ),
+    full_graph_registration_path: Path | None = typer.Option(
+        None, "--full-graph-registration-path", exists=True, readable=True,
+        help="Supplemental registration binding exact per-case stock/date context and source revision.",
+    ),
+    full_graph_run_root: Path | None = typer.Option(
+        None, "--full-graph-run-root",
+        help="New isolated run directory, separate from the retained artifact root; existing runs are never overwritten.",
+    ),
+):
+    """Score lane evidence, optionally executing a registered OpenRouter pair."""
+    try:
+        if execute_reviewer and not execute_openrouter:
+            raise ResearchQualificationBenchmarkError(
+                "Reviewer execution requires --execute-openrouter"
+            )
+        if execute_full_graph and not execute_openrouter:
+            raise ResearchQualificationBenchmarkError("Full-graph execution requires --execute-openrouter")
+        if execute_full_graph != (full_graph_registration_path is not None and full_graph_run_root is not None) or (
+            not execute_full_graph and (full_graph_registration_path is not None or full_graph_run_root is not None)
+        ):
+            raise ResearchQualificationBenchmarkError("Full-graph execution requires its explicit registration and new run root")
+        if execute_openrouter:
+            destination = output_path.expanduser().absolute()
+            if destination.exists() or destination.is_symlink() or destination.resolve().is_relative_to(artifact_root.resolve()):
+                raise ResearchQualificationBenchmarkError("Model execution requires a new output path outside source artifacts")
+            if full_graph_run_root is not None and destination.resolve().is_relative_to(full_graph_run_root.resolve()):
+                raise ResearchQualificationBenchmarkError("Benchmark output must be outside the full-graph run namespace")
+        registration = json.loads(registration_path.read_text(encoding="utf-8"))
+        lane_results = json.loads(lane_results_path.read_text(encoding="utf-8"))
+        if execute_openrouter:
+            if type(lane_results) is not list or len(lane_results) != 1:
+                raise ResearchQualificationBenchmarkError(
+                    "OpenRouter execution requires exactly one deterministic lane result"
+                )
+            receipt = execute_registered_openrouter_benchmark(
+                registration=registration,
+                deterministic_result=lane_results[0],
+                artifact_root=artifact_root,
+                execute_reviewer=execute_reviewer,
+                execute_full_graph=execute_full_graph,
+                full_graph_registration=(json.loads(full_graph_registration_path.read_text(encoding="utf-8")) if full_graph_registration_path is not None else None),
+                full_graph_run_root=full_graph_run_root,
+            )
+        else:
+            receipt = run_registered_research_benchmark(
+                registration=registration,
+                lane_results=lane_results,
+                artifact_root=artifact_root,
+            )
+        written = write_research_qualification_receipt(receipt, output_path)
+    except (OSError, json.JSONDecodeError, ResearchQualificationBenchmarkError) as exc:
+        raise typer.BadParameter(f"research benchmark rejected: {exc}") from exc
+    payload = {**receipt, "receipt_path": str(written)}
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    console.print(f"Research benchmark: {receipt['receipt_id']}")
+    console.print(f"Selected lane: {receipt['selected_lane']}")
+    console.print("Analysis-only; this receipt grants no execution authority.")
+
+
 @research_app.command("creator-workflow-status")
 def research_creator_workflow_status(
     overnight_packet: Path = typer.Option(
@@ -1538,6 +1677,37 @@ def research_agent_ledger_from_mirofish(
     console.print(f"Ledger: {ledger_path}")
 
 
+def _learning_pit_window_lookup(
+    *,
+    archive: Path | None,
+    raw_receipts: list[Path],
+    window_receipts: list[Path],
+    protocol: Path | None,
+    bindings: Path | None,
+    operation: str,
+):
+    if not any((archive is not None, raw_receipts, window_receipts,
+                protocol is not None, bindings is not None)):
+        return None
+    if archive is None or not raw_receipts or not window_receipts:
+        raise typer.BadParameter(
+            f"source-bound {operation} requires --pit-raw-artifact-archive plus at least "
+            "one --pit-raw-artifact-receipt and --pit-price-window-receipt"
+        )
+    try:
+        return load_source_bound_window_lookup(
+            raw_artifact_archive=archive,
+            raw_artifact_receipts=tuple(raw_receipts),
+            price_window_receipts=tuple(window_receipts),
+            economic_protocol_receipt=protocol,
+            forecast_event_bindings_receipt=bindings,
+        )
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(
+            f"source-bound PIT {operation} inputs are invalid: {exc}"
+        ) from exc
+
+
 @research_app.command("agent-ledger-resolve")
 def research_agent_ledger_resolve(
     ledger_path: Path = typer.Option(
@@ -1546,7 +1716,7 @@ def research_agent_ledger_resolve(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path.",
     ),
@@ -1560,6 +1730,33 @@ def research_agent_ledger_resolve(
         "--learning-availability-root",
         help="Immutable point-in-time learning availability ledger root.",
     ),
+    pit_raw_artifact_archive: Path | None = typer.Option(
+        None,
+        "--pit-raw-artifact-archive",
+        help="Immutable PIT raw-artifact archive root for source-bound resolution.",
+    ),
+    pit_raw_artifact_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-raw-artifact-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical raw-artifact receipt JSON. Repeat for every ticker/benchmark source.",
+    ),
+    pit_price_window_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-price-window-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical source-bound adjusted-price receipt JSON. Repeat for every window.",
+    ),
+    pit_economic_protocol: Path | None = typer.Option(
+        None, "--pit-economic-protocol", exists=True, readable=True,
+        help="Exact frozen economic protocol JSON, paired with explicit forecast-event bindings.",
+    ),
+    pit_forecast_event_bindings: Path | None = typer.Option(
+        None, "--pit-forecast-event-bindings", exists=True, readable=True,
+        help="JSON forecast-ID to decision-event-ID mapping; never inferred from legacy rows.",
+    ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     context_ticker: str = typer.Option("", "--context-ticker"),
     context_setup: str = typer.Option("", "--context-setup"),
@@ -1572,23 +1769,44 @@ def research_agent_ledger_resolve(
 
     Forecasts whose windows fail the mechanical audit (missing final bar,
     mismatched ticker/benchmark sessions, stale data) are deferred with a
-    machine-readable reason instead of being scored against bad windows.
+    machine-readable reason instead of being scored against bad windows.  The
+    default legacy yfinance route is explicitly nonqualifying; immutable PIT
+    receipts are required before a result can enter learning availability.
     """
     producer_recorded_at = _learning_producer_now()
     availability_root = _forecast_learning_availability_root(
         ledger_path,
         learning_availability_root,
     )
+    window_lookup = _learning_pit_window_lookup(
+        archive=pit_raw_artifact_archive,
+        raw_receipts=pit_raw_artifact_receipts,
+        window_receipts=pit_price_window_receipts,
+        protocol=pit_economic_protocol,
+        bindings=pit_forecast_event_bindings,
+        operation="resolution",
+    )
+    pit_inputs_supplied = window_lookup is not None
+    if pit_inputs_supplied:
+        price_window_route = "source_bound_adjusted_pit_receipts"
+    else:
+        window_lookup = _ledger_window_lookup
+        price_window_route = "legacy_yfinance_nonqualifying"
     forecasts = load_ledger(ledger_path)
     unaudited_before = sum(
         1 for forecast in forecasts if forecast.resolved and not forecast.label_quality
     )
     resolved, quality_reports = resolve_forecasts_with_quality(
         forecasts,
-        window_lookup=_ledger_window_lookup,
+        window_lookup=window_lookup,
         now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
+    if not pit_inputs_supplied:
+        resolved, quality_reports = downgrade_nonqualifying_resolution_labels(
+            resolved,
+            quality_reports,
+        )
     quality_summary = summarize_resolution_quality(
         quality_reports,
         unaudited_resolved_count=unaudited_before,
@@ -1598,8 +1816,14 @@ def research_agent_ledger_resolve(
         resolved,
         availability_root=availability_root,
         recorded_at=producer_recorded_at,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
     )
-    write_summary(resolved, path=summary_path)
+    write_summary(
+        resolved,
+        path=summary_path,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
+        ledger_path=ledger_path,
+    )
     resolution_quality_path.parent.mkdir(parents=True, exist_ok=True)
     resolution_quality_path.write_text(
         json.dumps(quality_summary, indent=2, sort_keys=True),
@@ -1609,6 +1833,7 @@ def research_agent_ledger_resolve(
     after = sum(1 for forecast in resolved if forecast.resolved)
     influence = agent_influence_weights(
         resolved,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
         ticker=context_ticker or None,
         setup=context_setup or None,
         sector=context_sector or None,
@@ -1622,6 +1847,12 @@ def research_agent_ledger_resolve(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "resolution_quality_path": str(resolution_quality_path),
+        "price_window_route": price_window_route,
+        "economic_qualification": (
+            "source_bound_ledger_resolution_only"
+            if pit_inputs_supplied
+            else "legacy_nonqualifying"
+        ),
         "learning_availability_root": str(availability_root),
         "learning_observed_count": len(availability_admissions),
         "learning_newly_recorded_count": sum(
@@ -1657,7 +1888,7 @@ def research_ledger_quality_audit(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path (refreshed with quality counts).",
     ),
@@ -1670,6 +1901,33 @@ def research_ledger_quality_audit(
         None,
         "--learning-availability-root",
         help="Immutable point-in-time learning availability ledger root.",
+    ),
+    pit_raw_artifact_archive: Path | None = typer.Option(
+        None,
+        "--pit-raw-artifact-archive",
+        help="Immutable PIT raw-artifact archive root for source-bound audit.",
+    ),
+    pit_raw_artifact_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-raw-artifact-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical raw-artifact receipt JSON. Repeat for every ticker/benchmark source.",
+    ),
+    pit_price_window_receipts: list[Path] = typer.Option(
+        [],
+        "--pit-price-window-receipt",
+        exists=True,
+        readable=True,
+        help="Canonical source-bound adjusted-price receipt JSON. Repeat for every window.",
+    ),
+    pit_economic_protocol: Path | None = typer.Option(
+        None, "--pit-economic-protocol", exists=True, readable=True,
+        help="Exact frozen economic protocol JSON, paired with explicit forecast-event bindings.",
+    ),
+    pit_forecast_event_bindings: Path | None = typer.Option(
+        None, "--pit-forecast-event-bindings", exists=True, readable=True,
+        help="JSON forecast-ID to decision-event-ID mapping; never inferred from legacy rows.",
     ),
     alpha_threshold_pct: str = typer.Option("1.5", "--alpha-threshold-pct"),
     backup: bool = typer.Option(
@@ -1692,6 +1950,20 @@ def research_ledger_quality_audit(
         ledger_path,
         learning_availability_root,
     )
+    window_lookup = _learning_pit_window_lookup(
+        archive=pit_raw_artifact_archive,
+        raw_receipts=pit_raw_artifact_receipts,
+        window_receipts=pit_price_window_receipts,
+        protocol=pit_economic_protocol,
+        bindings=pit_forecast_event_bindings,
+        operation="audit",
+    )
+    pit_inputs_supplied = window_lookup is not None
+    if pit_inputs_supplied:
+        price_window_route = "source_bound_adjusted_pit_receipts"
+    else:
+        window_lookup = _ledger_window_lookup
+        price_window_route = "legacy_yfinance_nonqualifying"
     forecasts, corrupt_line_count = load_ledger_with_stats(ledger_path)
     resolved_count = sum(1 for forecast in forecasts if forecast.resolved)
     backup_path: Path | None = None
@@ -1701,19 +1973,44 @@ def research_ledger_quality_audit(
             f"{ledger_path.stem}.backup-quality-audit-{stamp}.jsonl"
         )
         backup_path.write_text(ledger_path.read_text(encoding="utf-8"), encoding="utf-8")
-    audited, quality_reports = audit_resolved_forecasts(
-        forecasts,
-        window_lookup=_ledger_window_lookup,
+    audit_targets = (
+        forecasts
+        if pit_inputs_supplied
+        else [
+            forecast
+            for forecast in forecasts
+            if not has_source_bound_resolution_evidence(forecast)
+        ]
+    )
+    audited_targets, quality_reports = audit_resolved_forecasts(
+        audit_targets,
+        window_lookup=window_lookup,
         now=producer_recorded_at,
         alpha_threshold_pct=Decimal(alpha_threshold_pct),
     )
+    if pit_inputs_supplied:
+        audited = audited_targets
+    else:
+        audited_by_id = {forecast.forecast_id: forecast for forecast in audited_targets}
+        audited = [audited_by_id.get(forecast.forecast_id, forecast) for forecast in forecasts]
+    if not pit_inputs_supplied:
+        audited, quality_reports = downgrade_nonqualifying_resolution_labels(
+            audited,
+            quality_reports,
+        )
     write_ledger(audited, path=ledger_path)
     availability_admissions = observe_forecasts(
         audited,
         availability_root=availability_root,
         recorded_at=producer_recorded_at,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
     )
-    write_summary(audited, path=summary_path)
+    write_summary(
+        audited,
+        path=summary_path,
+        source_bound_verifier=window_lookup if pit_inputs_supplied else None,
+        ledger_path=ledger_path,
+    )
     quality_summary = summarize_resolution_quality(quality_reports)
     quality_path.parent.mkdir(parents=True, exist_ok=True)
     quality_path.write_text(
@@ -1732,6 +2029,12 @@ def research_ledger_quality_audit(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "quality_path": str(quality_path),
+        "price_window_route": price_window_route,
+        "economic_qualification": (
+            "source_bound_ledger_resolution_only"
+            if pit_inputs_supplied
+            else "legacy_nonqualifying"
+        ),
         "learning_availability_root": str(availability_root),
         "learning_observed_count": len(availability_admissions),
         "learning_newly_recorded_count": sum(
@@ -1773,7 +2076,7 @@ def research_agent_ledger_update(
         help="Append-only Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path.",
     ),
@@ -1799,10 +2102,11 @@ def research_agent_ledger_update(
     ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
-    """Append latest advisory forecasts, resolve due forecasts, and write summary.
+    """Append latest advisory forecasts and write a nonqualifying summary.
 
-    This is the automation-safe one-shot path for the Agent Intelligence Ledger.
-    It mutates only ledger/summary files and has no execution authority.
+    Source-bound price receipts are required by ``agent-ledger-resolve`` before
+    any due forecast is resolved.  This automation-safe ingestion path never
+    uses a legacy downloader to manufacture learning-quality labels.
     """
 
     producer_recorded_at = _learning_producer_now()
@@ -1841,20 +2145,8 @@ def research_agent_ledger_update(
     appended = append_forecasts(discovered_forecasts, path=ledger_path)
 
     forecasts = load_ledger(ledger_path)
-    unaudited_before = sum(
-        1 for forecast in forecasts if forecast.resolved and not forecast.label_quality
-    )
-    resolved, quality_reports = resolve_forecasts_with_quality(
-        forecasts,
-        window_lookup=_ledger_window_lookup,
-        now=producer_recorded_at,
-        alpha_threshold_pct=threshold,
-    )
-    quality_summary = summarize_resolution_quality(
-        quality_reports,
-        unaudited_resolved_count=unaudited_before,
-    )
-    write_ledger(resolved, path=ledger_path)
+    resolved = forecasts
+    quality_summary = summarize_resolution_quality((), unaudited_resolved_count=0)
     availability_admissions = observe_forecasts(
         resolved,
         availability_root=availability_root,
@@ -1888,6 +2180,8 @@ def research_agent_ledger_update(
         "ledger_path": str(ledger_path),
         "summary_path": str(summary_path),
         "learning_availability_root": str(availability_root),
+        "price_window_route": "not_resolved_by_agent_ledger_update",
+        "economic_qualification": "requires_source_bound_ledger_resolution",
         "learning_observed_count": len(availability_admissions),
         "learning_newly_recorded_count": sum(
             admission.created for admission in availability_admissions
@@ -1922,7 +2216,7 @@ def research_agent_ledger_summary(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
     ),
     context_ticker: str = typer.Option("", "--context-ticker"),
@@ -1962,6 +2256,89 @@ def research_agent_ledger_summary(
             f"resolved={stats['resolved_count']} accuracy={accuracy}"
         )
     console.print("Influence weights are advisory only and cannot bypass risk gates.")
+
+
+@research_app.command("agent-ledger-reconcile")
+def research_agent_ledger_reconcile(
+    ledger_path: Path = typer.Option(
+        DEFAULT_LEDGER_PATH,
+        "--ledger-path",
+        help="Agent Intelligence Ledger JSONL path (read-only).",
+    ),
+    summary_path: Path = typer.Option(
+        DEFAULT_SUMMARY_PATH,
+        "--summary-path",
+        help=(
+            "Agent score summary evaluated for freshness; "
+            "it is never replaced by this command."
+        ),
+    ),
+    receipt_path: Path | None = typer.Option(
+        None,
+        "--receipt-path",
+        help="Optional path for an atomic write of the reconciliation receipt only.",
+    ),
+    pit_raw_artifact_archive: Path | None = typer.Option(None, "--pit-raw-artifact-archive"),
+    pit_raw_artifact_receipts: list[Path] = typer.Option(
+        [], "--pit-raw-artifact-receipt", exists=True, readable=True,
+    ),
+    pit_price_window_receipts: list[Path] = typer.Option(
+        [], "--pit-price-window-receipt", exists=True, readable=True,
+    ),
+    pit_economic_protocol: Path | None = typer.Option(
+        None, "--pit-economic-protocol", exists=True, readable=True,
+    ),
+    pit_forecast_event_bindings: Path | None = typer.Option(
+        None, "--pit-forecast-event-bindings", exists=True, readable=True,
+    ),
+):
+    """Emit a read-only reconciliation receipt for one ledger byte snapshot.
+
+    Prints canonical JSON to stdout. Counts valid, corrupt, duplicate,
+    conflicting, resolved, and clustered rows without rewriting anything.
+    Conservative market-event clusters are labeled only as provisional
+    dependence groups, never as effective sample size. Canonical economic
+    decision identity counts remain unavailable until a verified binding is
+    present in the learning source contract.
+    """
+    window_lookup = _learning_pit_window_lookup(
+        archive=pit_raw_artifact_archive,
+        raw_receipts=pit_raw_artifact_receipts,
+        window_receipts=pit_price_window_receipts,
+        protocol=pit_economic_protocol,
+        bindings=pit_forecast_event_bindings,
+        operation="reconciliation",
+    )
+    try:
+        receipt = reconcile_ledger_file(
+            ledger_path, summary_path=summary_path, source_bound_verifier=window_lookup,
+        )
+    except SummaryReadError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except OSError as exc:
+        raise typer.BadParameter(f"could not read ledger: {exc}") from exc
+    if receipt_path is not None:
+        try:
+            if pit_raw_artifact_archive is not None and receipt_path.resolve().is_relative_to(
+                pit_raw_artifact_archive.resolve()
+            ):
+                raise ReconciliationPathError("receipt path is inside the protected PIT archive")
+            source_paths = (
+                *pit_raw_artifact_receipts,
+                *pit_price_window_receipts,
+                *(path for path in (pit_economic_protocol, pit_forecast_event_bindings)
+                  if path is not None),
+            )
+            write_reconciliation_receipt(
+                receipt,
+                receipt_path,
+                protected_paths=(ledger_path, summary_path, *source_paths),
+            )
+        except ReconciliationPathError as exc:
+            raise typer.BadParameter(f"rejected receipt path: {exc}") from exc
+        except OSError as exc:
+            raise typer.BadParameter(f"could not write receipt: {exc}") from exc
+    typer.echo(canonical_json_text(receipt))
 
 
 @research_app.command("hypothesis-factory")
@@ -2065,7 +2442,7 @@ def research_agent_intelligence_brief(
         help="Agent Intelligence Ledger JSONL path.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary (source of earned influence weights).",
     ),
@@ -2461,6 +2838,923 @@ def research_decision_quality_report(
     console.print(f"Point-in-time gaps: {packet.quality_gates['point_in_time_gap_count']}")
     console.print(f"Packet: {packet_path}")
     console.print(f"Rating calibration: {rating_calibration_path}")
+
+
+def _economic_json_object(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int = 16_000_000,
+    require_canonical: bool = False,
+) -> dict[str, object]:
+    """Load one bounded strict JSON receipt without ambiguous decoder behavior."""
+
+    max_depth = 32
+    max_nodes = 1_000_000
+    max_objects = 200_000
+    max_lists = 200_000
+    max_strings = 1_000_000
+    max_container_items = 10_000
+    max_string_chars = 4_096
+
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise typer.BadParameter(f"{label} contains a duplicate JSON key")
+            result[key] = value
+        return result
+
+    def reject_nonfinite(_value: str) -> object:
+        raise typer.BadParameter(f"{label} contains a nonfinite JSON number")
+
+    def bounded_integer(text: str) -> int:
+        if len(text.removeprefix("-")) > 128:
+            raise typer.BadParameter(f"{label} contains an over-limit JSON number")
+        return int(text)
+
+    def bounded_float(text: str) -> float:
+        parts = text.lower().split("e", 1)
+        coefficient = parts[0].replace("-", "").replace(".", "")
+        exponent = parts[1] if len(parts) == 2 else "0"
+        if (
+            len(coefficient.lstrip("0") or "0") > 128
+            or len(exponent.removeprefix("-").removeprefix("+")) > 4
+            or abs(int(exponent)) > 128
+        ):
+            raise typer.BadParameter(f"{label} contains an over-limit JSON number")
+        return float(text)
+
+    try:
+        if path.stat().st_size > max_bytes:
+            raise typer.BadParameter(f"{label} exceeds the {max_bytes}-byte limit")
+        raw_bytes = path.read_bytes()
+        if len(raw_bytes) > max_bytes:
+            raise typer.BadParameter(f"{label} exceeds the {max_bytes}-byte limit")
+        payload = json.loads(
+            raw_bytes,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_int=bounded_integer,
+            parse_float=bounded_float,
+            parse_constant=reject_nonfinite,
+        )
+    except typer.BadParameter:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise typer.BadParameter(f"{label} must be bounded strict JSON") from exc
+    if not isinstance(payload, dict):
+        raise typer.BadParameter(f"{label} must contain a JSON object")
+    objects = 0
+    lists = 0
+    strings = 0
+    nodes = 0
+    stack: list[tuple[object, int]] = [(payload, 0)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > max_nodes or depth > max_depth:
+            raise typer.BadParameter(f"{label} exceeds JSON depth/node limits")
+        if isinstance(value, dict):
+            objects += 1
+            if objects > max_objects or len(value) > max_container_items:
+                raise typer.BadParameter(f"{label} exceeds JSON object limits")
+            for key, item in value.items():
+                strings += 1
+                if strings > max_strings or len(key) > max_string_chars:
+                    raise typer.BadParameter(f"{label} exceeds JSON string limits")
+                stack.append((item, depth + 1))
+        elif isinstance(value, list):
+            lists += 1
+            if lists > max_lists or len(value) > max_container_items:
+                raise typer.BadParameter(f"{label} exceeds JSON list limits")
+            stack.extend((item, depth + 1) for item in value)
+        elif isinstance(value, str):
+            strings += 1
+            if strings > max_strings or len(value) > max_string_chars:
+                raise typer.BadParameter(f"{label} exceeds JSON string limits")
+    if require_canonical:
+        canonical = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        if raw_bytes != canonical:
+            raise typer.BadParameter(f"{label} must use canonical JSON bytes")
+    return payload
+
+
+def _economic_exact_object(
+    value: object,
+    *,
+    label: str,
+    fields: frozenset[str],
+) -> dict[str, object]:
+    """Require one explicitly versioned JSON object shape at the CLI boundary."""
+
+    if not isinstance(value, dict) or set(value) != fields:
+        raise typer.BadParameter(f"{label} fields are invalid")
+    return value
+
+
+def _economic_cohort_from_input(
+    payload: dict[str, object],
+    *,
+    archive: object,
+    market_calendar: object,
+):
+    """Open exact source references and derive one source-verifiable cohort."""
+
+    values = _economic_exact_object(
+        payload,
+        label="cohort candidate input",
+        fields=frozenset(
+            {"market_date", "as_of_cutoff", "selection_time", "candidates"}
+        ),
+    )
+    raw_candidates = values["candidates"]
+    if type(raw_candidates) is not list:
+        raise typer.BadParameter("cohort candidate input candidates must be a JSON list")
+    try:
+        return build_source_verifiable_point_in_time_cohort(
+            archive=archive,
+            market_calendar=validate_market_session_calendar(market_calendar),
+            market_date=values["market_date"],
+            as_of_cutoff=values["as_of_cutoff"],
+            selection_time=values["selection_time"],
+            candidates=tuple(raw_candidates),
+        )
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"cohort candidate input is invalid: {exc}") from exc
+
+
+def _write_economic_receipt(path: Path, payload: dict[str, object], *, label: str) -> Path:
+    """Write a local canonical receipt once, or prove the existing bytes match."""
+
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    expected = text.encode("utf-8")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        try:
+            existing = path.read_bytes()
+        except OSError as exc:
+            raise typer.BadParameter(f"{label} cannot be read") from exc
+        if existing != expected:
+            raise typer.BadParameter(f"{label} already exists with different bytes") from None
+        return path
+    except OSError as exc:
+        raise typer.BadParameter(f"{label} cannot be created") from exc
+    try:
+        offset = 0
+        while offset < len(expected):
+            written = os.write(descriptor, expected[offset:])
+            if written <= 0:
+                raise OSError("incomplete receipt write")
+            offset += written
+        os.fsync(descriptor)
+    except OSError as exc:
+        with suppress(OSError):
+            path.unlink()
+        raise typer.BadParameter(f"{label} cannot be written") from exc
+    finally:
+        os.close(descriptor)
+    try:
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError as exc:
+        raise typer.BadParameter(f"{label} directory cannot be synchronized") from exc
+    return path
+
+
+def _economic_decimal(value: object, *, label: str) -> Decimal:
+    """Parse one finite decimal required by the frozen pullback rule."""
+
+    if type(value) is not str:
+        raise typer.BadParameter(f"{label} must be a decimal string")
+    try:
+        parsed = Decimal(value)
+    except (InvalidOperation, ValueError) as exc:
+        raise typer.BadParameter(f"{label} must be a decimal string") from exc
+    if not parsed.is_finite():
+        raise typer.BadParameter(f"{label} must be finite")
+    return parsed
+
+
+def _economic_pullback_features(value: object, *, label: str) -> PullbackFeatures | None:
+    """Parse complete pullback inputs without allowing an implicit live route."""
+
+    if value is None:
+        return None
+    fields = frozenset(
+        {
+            "symbol",
+            "current_price",
+            "support_level",
+            "atr",
+            "pullback_atr",
+            "above_rising_50d",
+            "above_rising_200d",
+            "sell_volume_state",
+            "gap_state",
+            "sector_relative_strength",
+            "regime_state",
+            "earnings_blackout",
+            "fresh_negative_event",
+            "green_spike_atr",
+            "evidence_trend",
+            "reward_risk_ratio",
+            "notional_usd",
+        }
+    )
+    payload = _economic_exact_object(value, label=label, fields=fields)
+    string_fields = (
+        "symbol",
+        "sell_volume_state",
+        "gap_state",
+        "regime_state",
+        "evidence_trend",
+    )
+    if any(type(payload[field]) is not str or not payload[field] for field in string_fields):
+        raise typer.BadParameter(f"{label} string fields are invalid")
+    bool_fields = (
+        "above_rising_50d",
+        "above_rising_200d",
+        "earnings_blackout",
+        "fresh_negative_event",
+    )
+    if any(type(payload[field]) is not bool for field in bool_fields):
+        raise typer.BadParameter(f"{label} boolean fields are invalid")
+    return PullbackFeatures(
+        symbol=payload["symbol"],
+        current_price=_economic_decimal(payload["current_price"], label=f"{label}.current_price"),
+        support_level=_economic_decimal(payload["support_level"], label=f"{label}.support_level"),
+        atr=_economic_decimal(payload["atr"], label=f"{label}.atr"),
+        pullback_atr=_economic_decimal(payload["pullback_atr"], label=f"{label}.pullback_atr"),
+        above_rising_50d=payload["above_rising_50d"],
+        above_rising_200d=payload["above_rising_200d"],
+        sell_volume_state=payload["sell_volume_state"],
+        gap_state=payload["gap_state"],
+        sector_relative_strength=_economic_decimal(
+            payload["sector_relative_strength"],
+            label=f"{label}.sector_relative_strength",
+        ),
+        regime_state=payload["regime_state"],
+        earnings_blackout=payload["earnings_blackout"],
+        fresh_negative_event=payload["fresh_negative_event"],
+        green_spike_atr=_economic_decimal(
+            payload["green_spike_atr"], label=f"{label}.green_spike_atr"
+        ),
+        evidence_trend=payload["evidence_trend"],
+        reward_risk_ratio=_economic_decimal(
+            payload["reward_risk_ratio"], label=f"{label}.reward_risk_ratio"
+        ),
+        notional_usd=_economic_decimal(payload["notional_usd"], label=f"{label}.notional_usd"),
+    )
+
+
+def _economic_tournament_candidate(value: object, *, label: str) -> EconomicTournamentCandidate:
+    """Rebuild one explicit, cutoff-limited candidate for a frozen arm."""
+
+    payload = _economic_exact_object(
+        value,
+        label=label,
+        fields=frozenset(
+            {
+                "symbol",
+                "available_at",
+                "close_t_21",
+                "close_t_252",
+                "trailing_operating_income",
+                "average_total_assets",
+                "pullback_features",
+            }
+        ),
+    )
+    for field in (
+        "close_t_21",
+        "close_t_252",
+        "trailing_operating_income",
+        "average_total_assets",
+    ):
+        if payload[field] is not None and type(payload[field]) is not str:
+            raise typer.BadParameter(f"{label}.{field} must be a decimal string or null")
+    if type(payload["available_at"]) is not str:
+        raise typer.BadParameter(f"{label}.available_at must be canonical UTC")
+    _economic_effective_at(payload["available_at"])
+    try:
+        return EconomicTournamentCandidate(
+            symbol=payload["symbol"],
+            available_at=payload["available_at"],
+            close_t_21=payload["close_t_21"],
+            close_t_252=payload["close_t_252"],
+            trailing_operating_income=payload["trailing_operating_income"],
+            average_total_assets=payload["average_total_assets"],
+            pullback_features=_economic_pullback_features(
+                payload["pullback_features"],
+                label=f"{label}.pullback_features",
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"{label} is invalid: {exc}") from exc
+
+
+def _economic_tournament_inputs(
+    payload: dict[str, object],
+    *,
+    expected_event_ids: tuple[str, ...],
+) -> tuple[dict[str, tuple[EconomicTournamentCandidate, ...]], tuple[EconomicTournamentOutcome, ...]]:
+    """Require one complete, canonically ordered validation tournament input."""
+
+    values = _economic_exact_object(
+        payload,
+        label="economic tournament input",
+        fields=frozenset({"candidates_by_event", "outcomes"}),
+    )
+    raw_candidates = values["candidates_by_event"]
+    raw_outcomes = values["outcomes"]
+    if type(raw_candidates) is not list or type(raw_outcomes) is not list:
+        raise typer.BadParameter("economic tournament inputs must contain JSON lists")
+    candidate_rows: list[tuple[str, tuple[EconomicTournamentCandidate, ...]]] = []
+    for index, raw_row in enumerate(raw_candidates):
+        row = _economic_exact_object(
+            raw_row,
+            label=f"economic tournament candidates_by_event[{index}]",
+            fields=frozenset({"decision_event_id", "candidates"}),
+        )
+        if type(row["decision_event_id"]) is not str or type(row["candidates"]) is not list:
+            raise typer.BadParameter(
+                f"economic tournament candidates_by_event[{index}] is invalid"
+            )
+        candidate_rows.append(
+            (
+                row["decision_event_id"],
+                tuple(
+                    _economic_tournament_candidate(
+                        candidate,
+                        label=f"economic tournament candidates_by_event[{index}].candidates[{offset}]",
+                    )
+                    for offset, candidate in enumerate(row["candidates"])
+                ),
+            )
+        )
+    if tuple(item[0] for item in candidate_rows) != expected_event_ids:
+        raise typer.BadParameter(
+            "economic tournament candidate rows must exactly match canonical validation IDs"
+        )
+    outcome_rows: list[EconomicTournamentOutcome] = []
+    for index, raw_row in enumerate(raw_outcomes):
+        row = _economic_exact_object(
+            raw_row,
+            label=f"economic tournament outcomes[{index}]",
+            fields=frozenset({"decision_event_id", "realized_returns"}),
+        )
+        returns = row["realized_returns"]
+        if type(row["decision_event_id"]) is not str or type(returns) is not list:
+            raise typer.BadParameter(f"economic tournament outcomes[{index}] is invalid")
+        return_rows: list[tuple[str, str]] = []
+        for offset, raw_return in enumerate(returns):
+            realized = _economic_exact_object(
+                raw_return,
+                label=f"economic tournament outcomes[{index}].realized_returns[{offset}]",
+                fields=frozenset({"symbol", "return"}),
+            )
+            if type(realized["symbol"]) is not str or type(realized["return"]) is not str:
+                raise typer.BadParameter(
+                    f"economic tournament outcomes[{index}].realized_returns[{offset}] is invalid"
+                )
+            return_rows.append((realized["symbol"], realized["return"]))
+        try:
+            outcome_rows.append(
+                EconomicTournamentOutcome(
+                    decision_event_id=row["decision_event_id"],
+                    realized_returns=tuple(return_rows),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise typer.BadParameter(
+                f"economic tournament outcomes[{index}] are invalid: {exc}"
+            ) from exc
+    if tuple(item.decision_event_id for item in outcome_rows) != expected_event_ids:
+        raise typer.BadParameter(
+            "economic tournament outcome rows must exactly match canonical validation IDs"
+        )
+    return dict(candidate_rows), tuple(outcome_rows)
+
+
+def _economic_validation_report(
+    *,
+    protocol_id: str,
+    partitions: object,
+    validation_event_ids: tuple[str, ...],
+    result: object,
+    tournament_input: SourceBoundTournamentInput,
+) -> dict[str, object]:
+    """Wrap one canonical validation result in the immutable admission schema."""
+
+    result_payload = result.to_dict()
+    report = {
+        "schema_version": "economic_validation_report/v3",
+        "protocol_id": protocol_id,
+        "market_date_partitions": partitions.to_dict(),
+        "validation_event_ids": list(validation_event_ids),
+        "result": result_payload,
+        "result_id": result_payload["result_id"],
+        "result_sha256": result_payload["result_sha256"],
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
+
+
+def _economic_phase_report(
+    *,
+    protocol_id: str,
+    phase: str,
+    partitions: object,
+    event_ids: tuple[str, ...],
+    result: object,
+    tournament_input: SourceBoundTournamentInput,
+) -> dict[str, object]:
+    """Wrap one development or holdout result in its explicit v4 report."""
+
+    result_payload = result.to_dict()
+    report = {
+        "schema_version": "economic_evaluation_report/v4",
+        "protocol_id": protocol_id,
+        "phase": phase,
+        "market_date_partitions": partitions.to_dict(),
+        "event_ids": list(event_ids),
+        "result": result_payload,
+        "result_id": result_payload["result_id"],
+        "result_sha256": result_payload["result_sha256"],
+        "tournament_input": {
+            "input_id": tournament_input.input_id,
+            "input_sha256": tournament_input.input_sha256,
+        },
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    if result.availability_status == "unavailable":
+        report["availability_status"] = result.availability_status
+        report["qualification_status"] = result.qualification_status
+    return report
+
+
+def _economic_effective_at(value: str) -> datetime.datetime:
+    """Parse a canonical, second-aligned UTC receipt timestamp."""
+
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise typer.BadParameter("effective-at must be canonical UTC ISO-8601 seconds") from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() != datetime.timedelta(0)
+        or parsed.microsecond
+        or parsed.isoformat(timespec="seconds") != value
+    ):
+        raise typer.BadParameter("effective-at must be canonical UTC ISO-8601 seconds")
+    return parsed
+
+
+@research_app.command("economic-cohort-build")
+def research_economic_cohort_build(
+    candidate_input_path: Path = typer.Option(
+        ...,
+        "--candidate-input-path",
+        exists=True,
+        readable=True,
+        help="Security identities plus registered retained-source profiles; caller-authored qualification facts and paths are rejected.",
+    ),
+    pit_artifact_root: Path = typer.Option(
+        ...,
+        "--pit-artifact-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Immutable PIT raw-artifact archive reopened for every cohort candidate.",
+    ),
+    market_calendar_path: Path = typer.Option(
+        ...,
+        "--market-calendar-path",
+        exists=True,
+        readable=True,
+        help="Canonical source-bound market-session calendar receipt.",
+    ),
+    output_path: Path = typer.Option(
+        ...,
+        "--output-path",
+        help="New local canonical cohort receipt path; a differing existing receipt is rejected.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Build one analysis-only cohort by reopening retained local source bytes."""
+
+    from tradingagents.dataflows.pit.raw_artifacts import (
+        RawPointInTimeArtifactArchive as CohortArtifactArchive,
+    )
+
+    cohort = _economic_cohort_from_input(
+        _economic_json_object(
+            candidate_input_path,
+            label="candidate-input-path",
+            max_bytes=4_000_000,
+        ),
+        archive=CohortArtifactArchive(pit_artifact_root),
+        market_calendar=_economic_json_object(
+            market_calendar_path,
+            label="market-calendar-path",
+            max_bytes=2_000_000,
+            require_canonical=True,
+        ),
+    )
+    written = _write_economic_receipt(
+        output_path,
+        cohort.to_dict(),
+        label="economic cohort receipt",
+    )
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "cohort_id": cohort.cohort_id,
+        "cohort_sha256": cohort.cohort_sha256,
+        "sensitivity_universe_100_id": cohort.sensitivity_universe_100_id,
+        "sensitivity_universe_100_sha256": cohort.sensitivity_universe_100_sha256,
+        "primary_universe_75_id": cohort.primary_universe_75_id,
+        "primary_universe_75_sha256": cohort.primary_universe_75_sha256,
+        "sensitivity_universe_50_id": cohort.sensitivity_universe_50_id,
+        "sensitivity_universe_50_sha256": cohort.sensitivity_universe_50_sha256,
+        "receipt_path": str(written),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic cohort: {cohort.cohort_id}")
+    console.print(f"Canonical local receipt: {written}")
+    console.print("Analysis-only; this receipt grants no execution or promotion authority.")
+
+
+@research_app.command("economic-tournament-run")
+def research_economic_tournament_run(
+    protocol_path: Path = typer.Option(
+        ...,
+        "--protocol-path",
+        exists=True,
+        readable=True,
+        help="Canonical frozen protocol JSON receipt already admitted to the evidence store.",
+    ),
+    partitions_path: Path = typer.Option(
+        ...,
+        "--partitions-path",
+        exists=True,
+        readable=True,
+        help="Canonical PIT market-date partition receipt for this protocol.",
+    ),
+    tournament_input_path: Path = typer.Option(
+        ...,
+        "--tournament-input-path",
+        exists=True,
+        readable=True,
+        help="Complete source-bound candidate and realized-outcome evidence JSON for the selected phase.",
+    ),
+    pit_artifact_root: Path = typer.Option(
+        ...,
+        "--pit-artifact-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Immutable PIT raw-artifact archive that must verify every tournament input.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root retained for the immutable admission adapter identity.",
+    ),
+    effective_at: str = typer.Option(
+        ...,
+        "--effective-at",
+        help="Canonical UTC timestamp for the immutable phase receipt.",
+    ),
+    phase: str = typer.Option(
+        "validation",
+        "--phase",
+        help="Frozen lifecycle phase: development, validation, or holdout.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Admit one TA-Control phase result as analysis-only evidence."""
+
+    protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
+    partitions_payload = _economic_json_object(partitions_path, label="partitions-path")
+    effective = _economic_effective_at(effective_at)
+    try:
+        protocol = validate_frozen_evaluation_protocol(protocol_payload)
+        if phase not in {"development", "validation", "holdout"}:
+            raise ValueError("phase must be development, validation, or holdout")
+        eligibility = bind_phase_eligibility(
+            protocol=protocol,
+            partitions=validate_market_date_partitions(partitions_payload),
+            phase=phase,
+        )
+        adapter = EconomicEvaluationAdmissionAdapter(evidence_root, repo_root=repo_root)
+        if phase == "holdout" and not adapter.is_holdout_released(protocol.protocol_id):
+            raise EconomicEvaluationAdmissionError(
+                "holdout input is sealed until an immutable qualifying release exists"
+            )
+        tournament_payload = _economic_json_object(
+            tournament_input_path,
+            label="tournament-input-path",
+            max_bytes=32_000_000,
+            require_canonical=True,
+        )
+        tournament_input = validate_source_bound_tournament_input(
+            tournament_payload,
+            protocol=protocol,
+            eligibility=eligibility,
+        )
+        tournament_input = verify_source_bound_tournament_input(
+            archive=RawPointInTimeArtifactArchive(pit_artifact_root),
+            value=tournament_input.to_dict(),
+            protocol=protocol,
+            eligibility=eligibility,
+        )
+        result = evaluate_phase_ta_control(
+            protocol=protocol,
+            eligibility=eligibility,
+            candidates_by_event=dict(tournament_input.candidates_by_event),
+            execution_outcomes=tournament_input.outcomes,
+            tournament_input_id=tournament_input.input_id,
+            tournament_input_sha256=tournament_input.input_sha256,
+        )
+        admission = adapter.admit_evaluation_run(
+            protocol.protocol_id,
+            phase=phase,
+            effective_at=effective,
+            pit_artifact_root=pit_artifact_root,
+            tournament_input=tournament_input,
+            frozen_validation_report=(
+                _economic_validation_report(
+                    protocol_id=protocol.protocol_id,
+                    partitions=eligibility.partitions,
+                    validation_event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
+                if phase == "validation"
+                else _economic_phase_report(
+                    protocol_id=protocol.protocol_id,
+                    phase=phase,
+                    partitions=eligibility.partitions,
+                    event_ids=eligibility.event_ids,
+                    result=result,
+                    tournament_input=tournament_input,
+                )
+            ),
+        )
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic tournament admission rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": result.protocol_id,
+        "validation_result_id": result.result_id,
+        "validation_partition_id": result.validation_partition_id,
+        "tournament_input_id": tournament_input.input_id,
+        "tournament_input_sha256": tournament_input.input_sha256,
+        "evaluation_run_object_id": admission.envelope.object_id,
+        "created": admission.created,
+        "evidence_root": str(evidence_root),
+        "availability_status": result.availability_status,
+        "qualification_status": result.qualification_status,
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic validation result: {result.result_id}")
+    console.print(f"Immutable validation admission: {admission.envelope.object_id}")
+    console.print("Analysis-only; this receipt grants no execution or promotion authority.")
+
+
+@research_app.command("economic-holdout-release")
+def research_economic_holdout_release(
+    protocol_id: str = typer.Option(
+        ...,
+        "--protocol-id",
+        help="Exact protocol ID whose immutable validation report is eligible for release.",
+    ),
+    released_by: str = typer.Option(
+        ...,
+        "--released-by",
+        help="Explicit owner identifier recorded in the immutable release evidence.",
+    ),
+    released_at: str = typer.Option(
+        ...,
+        "--released-at",
+        help="Canonical UTC timestamp for the immutable holdout-release receipt.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root retained for the immutable admission adapter identity.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Release a sealed holdout only from its existing immutable validation report."""
+
+    released = _economic_effective_at(released_at)
+    try:
+        adapter = EconomicEvaluationAdmissionAdapter(evidence_root, repo_root=repo_root)
+        release = adapter.release_holdout(
+            protocol_id,
+            released_by=released_by,
+            released_at=released,
+            frozen_validation_report=adapter.frozen_validation_report(protocol_id),
+        )
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic holdout release rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": release.protocol_id,
+        "holdout_release_object_id": release.envelope.object_id,
+        "validation_run_object_id": release.validation_run_object_id,
+        "created": release.created,
+        "evidence_root": str(evidence_root),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic holdout release: {release.envelope.object_id}")
+    console.print("Analysis-only; this release grants no execution or promotion authority.")
+
+
+@research_app.command("economic-readiness-status")
+def research_economic_readiness_status(
+    protocol_id: str = typer.Option(
+        ...,
+        "--protocol-id",
+        help="Exact economic protocol ID to inspect without opening holdout rows.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root retained for the immutable admission adapter identity.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Read non-authorizing economic evidence state without accessing holdout rows."""
+
+    try:
+        readiness = EconomicEvaluationAdmissionAdapter(
+            evidence_root,
+            repo_root=repo_root,
+        ).readiness_status(protocol_id)
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic readiness status rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": readiness.protocol_id,
+        "state": readiness.state,
+        "protocol_admission_object_id": readiness.protocol_admission_object_id,
+        "development_run_object_id": readiness.development_run_object_id,
+        "validation_run_object_id": readiness.validation_run_object_id,
+        "holdout_release_object_id": readiness.holdout_release_object_id,
+        "holdout_run_object_id": readiness.holdout_run_object_id,
+        "evidence_sequence": readiness.evidence_sequence,
+        "evidence_head_event_sha256": readiness.evidence_head_event_sha256,
+        "evidence_root": str(evidence_root),
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic evidence state: {readiness.state}")
+    console.print("Read-only and analysis-only; this status grants no execution or promotion authority.")
+
+
+@research_app.command("economic-protocol-admit")
+def research_economic_protocol_admit(
+    protocol_path: Path = typer.Option(
+        ...,
+        "--protocol-path",
+        exists=True,
+        readable=True,
+        help="Canonical frozen economic protocol JSON receipt.",
+    ),
+    evidence_root: Path = typer.Option(
+        Path("results/economic_evaluation/evidence"),
+        "--evidence-root",
+        help="Immutable local economic-evidence store root.",
+    ),
+    repo_root: Path = typer.Option(
+        CANONICAL_REPOSITORY_ROOT,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help="Repository root that owns the declared source paths.",
+    ),
+    source_revision: str = typer.Option(
+        ...,
+        "--source-revision",
+        help="Exact 40-character Git revision that produced the protocol source.",
+    ),
+    source_paths: list[str] = typer.Option(
+        [],
+        "--source-path",
+        help="Repository-relative source path to bind; repeat for every source file.",
+    ),
+    effective_at: str = typer.Option(
+        ...,
+        "--effective-at",
+        help="Canonical UTC timestamp for this immutable analysis-only receipt.",
+    ),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Admit one complete frozen protocol as analysis-only local evidence.
+
+    This command has no provider, broker, scheduling, promotion, or submit
+    option. It binds only supplied protocol bytes, repository source bytes,
+    and the immutable evidence-store predecessor.
+    """
+
+    if not source_paths:
+        raise typer.BadParameter("at least one --source-path is required")
+    protocol_payload = _economic_json_object(protocol_path, label="protocol-path")
+    effective = _economic_effective_at(effective_at)
+    try:
+        protocol = validate_frozen_evaluation_protocol(protocol_payload)
+        admission = EconomicEvaluationAdmissionAdapter(
+            evidence_root,
+            repo_root=repo_root,
+        ).admit_protocol(
+            protocol,
+            source_revision=source_revision,
+            effective_at=effective,
+            source_paths=tuple(source_paths),
+        )
+    except (EconomicEvaluationAdmissionError, TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"economic protocol admission rejected: {exc}") from exc
+    payload = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "protocol_id": admission.protocol_id,
+        "input_manifest_sha256": admission.input_manifest_sha256,
+        "admission_object_id": admission.envelope.object_id,
+        "created": admission.created,
+        "evidence_root": str(evidence_root),
+        "source_revision": source_revision,
+    }
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Economic protocol: {payload['protocol_id']}")
+    console.print(f"Immutable admission: {payload['admission_object_id']}")
+    console.print("Analysis-only; this receipt grants no execution or promotion authority.")
 
 
 @research_app.command("walk-forward-replay")
@@ -3413,6 +4707,14 @@ def research_self_heal_plan(
         max=1440,
         help="Minutes before a persistent safe-plane signal is verified again.",
     ),
+    promotion_owner_approval_path: Path | None = typer.Option(
+        None,
+        "--promotion-owner-approval-path",
+        help=(
+            "Signed account_owner JSON artifact for an already prepared, "
+            "exact verified-recovery promotion. Used only with --execute-safe."
+        ),
+    ),
     json_output: bool = typer.Option(False, "--json-output"),
 ):
     """Write an audited safe-plane self-heal plan without executing fixes."""
@@ -3435,8 +4737,42 @@ def research_self_heal_plan(
     # ``owned_recovery_ready`` classification is evidence for a later
     # independently controlled recovery operation; it is not authority to
     # coordinate recovery, rearm live control, or run an executor here.
+    promotion_owner_approval = None
+    if promotion_owner_approval_path is not None:
+        if not execute_safe:
+            raise typer.BadParameter(
+                "--promotion-owner-approval-path requires --execute-safe"
+            )
+        if (
+            not promotion_owner_approval_path.is_file()
+            or promotion_owner_approval_path.is_symlink()
+        ):
+            raise typer.BadParameter(
+                "promotion owner approval must be a regular non-symlink JSON file"
+            )
+        try:
+            promotion_owner_approval = json.loads(
+                promotion_owner_approval_path.read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise typer.BadParameter(
+                "promotion owner approval artifact is unreadable JSON"
+            ) from exc
+        if not isinstance(promotion_owner_approval, dict):
+            raise typer.BadParameter(
+                "promotion owner approval artifact must be a JSON object"
+            )
     if execute_safe:
-        packet = execute_self_heal_plan(packet, repo_root=Path.cwd())
+        execute_kwargs = (
+            {"promotion_owner_approval": promotion_owner_approval}
+            if promotion_owner_approval is not None
+            else {}
+        )
+        packet = execute_self_heal_plan(
+            packet,
+            repo_root=Path.cwd(),
+            **execute_kwargs,
+        )
     json_path, markdown_path = write_self_heal_plan(packet, output_dir)
     payload = dict(packet)
     payload["json_path"] = str(json_path)
@@ -3579,7 +4915,7 @@ def research_outcome_labeling(
         help="Agent Intelligence Ledger JSONL path with resolved forecasts.",
     ),
     summary_path: Path = typer.Option(
-        Path("results/agent_intelligence/summary.json"),
+        DEFAULT_SUMMARY_PATH,
         "--summary-path",
         help="Agent score summary output path.",
     ),
@@ -4180,9 +5516,21 @@ def policy_sync_promotion(
     generated_at: str | None = typer.Option(
         None,
         "--generated-at",
-        help="Optional timezone-aware deterministic generation time.",
+        help=(
+            "Optional timezone-aware deterministic tournament-evaluation "
+            "time; never controls owner-approval authority time."
+        ),
     ),
     json_output: bool = typer.Option(False, "--json-output"),
+    owner_approval_path: Path | None = typer.Option(
+        None,
+        "--owner-approval-path",
+        help=(
+            "Signed account_owner approval artifact (JSON) bound to this "
+            "exact promotion. Required when --arm-live would promote; "
+            "verified against the canonical trust root."
+        ),
+    ),
 ):
     """Sync live promotion state from paper-tournament evidence.
 
@@ -4193,11 +5541,50 @@ def policy_sync_promotion(
     """
     from tradingagents.policy.promotion_sync import sync_promotion_state_file
 
+    owner_approval_artifact = None
+    if owner_approval_path is not None:
+        try:
+            parsed = json.loads(owner_approval_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise typer.BadParameter(
+                f"owner approval artifact unreadable at {owner_approval_path}: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise typer.BadParameter(
+                "owner approval artifact must be a JSON object"
+            )
+        owner_approval_artifact = parsed
+
+    # Bind exactly the validated regular file: read bytes once, validate,
+    # then confirm the bytes did not change during validation so the signed
+    # envelope binding cannot differ from what was checked.
+    if not envelope_path.is_file():
+        raise typer.BadParameter(
+            f"risk envelope must be an existing regular file: {envelope_path}"
+        )
+    try:
+        envelope_bytes = envelope_path.read_bytes()
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"risk envelope unreadable at {envelope_path}: {exc}"
+        ) from exc
     envelope, envelope_issues = load_risk_envelope(envelope_path)
     if envelope is None:
         raise typer.BadParameter(
             f"risk envelope unusable at {envelope_path}: {'; '.join(envelope_issues)}"
         )
+    try:
+        confirmed_bytes = envelope_path.read_bytes()
+    except OSError as exc:
+        raise typer.BadParameter(
+            f"risk envelope unreadable at {envelope_path}: {exc}"
+        ) from exc
+    if confirmed_bytes != envelope_bytes:
+        raise typer.BadParameter(
+            f"risk envelope changed while being validated: {envelope_path}"
+        )
+    owner_approval_envelope_ref = str(envelope_path.resolve())
+    owner_approval_envelope_sha256 = hashlib.sha256(confirmed_bytes).hexdigest()
     promotion_now = None
     if generated_at is not None:
         try:
@@ -4222,6 +5609,10 @@ def policy_sync_promotion(
         arm_live=arm_live,
         ci_green=ci_green,
         now=promotion_now,
+        owner_approval=owner_approval_artifact,
+        owner_approval_envelope_ref=owner_approval_envelope_ref,
+        owner_approval_envelope_sha256=owner_approval_envelope_sha256,
+        risk_envelope_ref=owner_approval_envelope_ref,
     )
     written_state_path = output_state_path or state_path
     payload = {
@@ -4245,6 +5636,71 @@ def policy_sync_promotion(
         for sleeve, sleeve_issues in result.issues_by_sleeve.items():
             for issue in sleeve_issues:
                 console.print(f"  {sleeve}: {issue}")
+
+
+@policy_app.command("readiness-status")
+def policy_readiness_status(
+    supersession_receipt_path: Path = typer.Option(
+        ..., "--supersession-receipt-path", exists=True, readable=True
+    ),
+    promotion_state_path: Path = typer.Option(
+        ..., "--promotion-state-path", exists=True, readable=True
+    ),
+    live_control_path: Path = typer.Option(
+        ..., "--live-control-path", exists=True, readable=True
+    ),
+    schedule_contract_path: Path = typer.Option(
+        ..., "--schedule-contract-path", exists=True, readable=True
+    ),
+    automation_root: Path = typer.Option(
+        ..., "--automation-root", exists=True, file_okay=False, readable=True
+    ),
+    role_contract_path: Path = typer.Option(
+        ..., "--role-contract-path", exists=True, readable=True
+    ),
+    expected_live_control_sha256: str = typer.Option(
+        ..., "--expected-live-control-sha256"
+    ),
+    expected_schedule_contract_sha256: str = typer.Option(
+        ..., "--expected-schedule-contract-sha256"
+    ),
+    expected_role_contract_sha256: str = typer.Option(
+        ..., "--expected-role-contract-sha256"
+    ),
+    generated_at: str | None = typer.Option(None, "--generated-at"),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Read current non-authorizing readiness from verified local evidence."""
+
+    from tradingagents.policy.promotion_sync import build_current_readiness_packet
+
+    try:
+        moment = (
+            datetime.datetime.now(tz=datetime.timezone.utc)
+            if generated_at is None
+            else datetime.datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+        )
+        packet = build_current_readiness_packet(
+            supersession_receipt_path=supersession_receipt_path,
+            promotion_state_path=promotion_state_path,
+            live_control_path=live_control_path,
+            schedule_contract_path=schedule_contract_path,
+            automation_root=automation_root,
+            role_contract_path=role_contract_path,
+            expected_live_control_sha256=expected_live_control_sha256,
+            expected_schedule_contract_sha256=expected_schedule_contract_sha256,
+            expected_role_contract_sha256=expected_role_contract_sha256,
+            now=moment,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise typer.BadParameter(f"readiness evidence rejected: {exc}") from exc
+    if json_output:
+        typer.echo(json.dumps(packet, indent=2, sort_keys=True))
+        return
+    console.print(f"Readiness: {packet['readiness_status']}")
+    console.print(
+        "Analysis-only; this status grants no execution or promotion authority."
+    )
 
 
 @policy_app.command("preregister-sleeve")
@@ -5188,6 +6644,21 @@ def _run_overnight_ticker_analysis(
     )
     if overrides:
         config.update(overrides)
+    if overrides.get("checkpoint_enabled", True) is not True:
+        raise CheckpointRuntimeIdentityError(
+            "overnight analysis requires evidence-safe checkpointing"
+        )
+    # Build the complete source/model/data identity before any graph or
+    # client construction.  A failure is intentionally not downgraded to
+    # an unsigned or non-checkpointed qualifying run.
+    config["checkpoint_run_identity"] = build_analysis_checkpoint_identity(
+        config=config,
+        selected_analysts=tuple(selected_analysts),
+        asset_type="stock",
+        ticker=symbol,
+        trade_date=trade_date,
+    )
+    config["checkpoint_enabled"] = True
     graph = TradingAgentsGraph(
         selected_analysts,
         config=config,
@@ -5218,6 +6689,7 @@ def _run_overnight_ticker_analysis(
         "final_trade_decision": final_decision,
         "investment_plan": final_state.get("investment_plan", ""),
         "trader_investment_plan": final_state.get("trader_investment_plan", ""),
+        "checkpoint_receipt": final_state.get("checkpoint_receipt"),
         "reports": {
             "market": final_state.get("market_report", ""),
             "sentiment": final_state.get("sentiment_report", ""),
@@ -8733,6 +10205,16 @@ def get_analysis_date():
             )
 
 
+def _save_analysis_checkpoint_receipt(final_state, save_path: Path) -> None:
+    """Persist the entrypoint's receipt without inventing a generic default."""
+    receipt = final_state.get("checkpoint_receipt")
+    if receipt is not None:
+        (save_path / "checkpoint_receipt.json").write_text(
+            json.dumps(receipt, sort_keys=True, indent=2, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+
+
 def save_report_to_disk(final_state, ticker: str, save_path: Path):
     """Save complete analysis report to disk with organized subfolders."""
     save_path.mkdir(parents=True, exist_ok=True)
@@ -8820,6 +10302,7 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
     # Write consolidated report
     header = f"# Trading Analysis Report: {ticker}\n\nGenerated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     (save_path / "complete_report.md").write_text(header + "\n\n".join(sections), encoding="utf-8")
+    _save_analysis_checkpoint_receipt(final_state, save_path)
     return save_path / "complete_report.md"
 
 
@@ -9056,11 +10539,23 @@ def run_analysis(checkpoint: bool = False):
     )
     analyst_wall_time_tracker = AnalystWallTimeTracker(analyst_execution_plan)
 
+    if checkpoint:
+        # This deliberately precedes graph/client construction.  Qualifying
+        # analysis must not silently fall back when source/model/data identity
+        # discovery cannot prove a compatible resume namespace.
+        config["checkpoint_run_identity"] = build_analysis_checkpoint_identity(
+            config=config,
+            selected_analysts=selected_analyst_keys,
+            asset_type=selections["asset_type"],
+            ticker=selections["ticker"],
+            trade_date=selections["analysis_date"],
+        )
+
     # Initialize the graph with callbacks bound to LLMs
     graph = TradingAgentsGraph(
         selected_analyst_keys,
         config=config,
-        debug=True,
+        debug=not checkpoint,
         callbacks=[stats_handler],
     )
 
@@ -9149,21 +10644,36 @@ def run_analysis(checkpoint: bool = False):
         )
         update_display(layout, spinner_text, stats_handler=stats_handler, start_time=start_time)
 
-        # Initialize state and get graph args with callbacks
-        init_agent_state = graph.propagator.create_initial_state(
-            selections["ticker"],
-            selections["analysis_date"],
-            asset_type=selections["asset_type"],
-            past_context="",
-        )
-        # Pass callbacks to graph config for tool execution tracking
-        # (LLM tracking is handled separately via LLM constructor)
-        args = graph.propagator.get_graph_args(callbacks=[stats_handler])
+        # The hardened path owns state construction/resume through
+        # ``propagate``.  The explicit opt-out retains the historical
+        # interactive stream behavior for nonqualifying/manual experimentation.
+        if checkpoint:
+            init_agent_state = None
+            args = None
+        else:
+            init_agent_state = graph.propagator.create_initial_state(
+                selections["ticker"],
+                selections["analysis_date"],
+                asset_type=selections["asset_type"],
+                past_context="",
+            )
+            # Pass callbacks to graph config for tool execution tracking
+            # (LLM tracking is handled separately via LLM constructor)
+            args = graph.propagator.get_graph_args(callbacks=[stats_handler])
 
         # Stream the analysis
         trace = []
         try:
-            graph_stream = graph.graph.stream(init_agent_state, **args)
+            if checkpoint:
+                checkpoint_final_state, _ = graph.propagate(
+                    selections["ticker"],
+                    selections["analysis_date"],
+                    asset_type=selections["asset_type"],
+                )
+                graph_stream = [checkpoint_final_state]
+            else:
+                assert args is not None
+                graph_stream = graph.graph.stream(init_agent_state, **args)
             for chunk in graph_stream:
                 # Process all messages in chunk, deduplicating by message ID
                 for message in chunk.get("messages", []):
@@ -9275,7 +10785,18 @@ def run_analysis(checkpoint: bool = False):
         final_state = {}
         for chunk in trace:
             final_state.update(chunk)
-        graph.process_signal(final_state["final_trade_decision"])
+        if not checkpoint:
+            graph.process_signal(final_state["final_trade_decision"])
+            final_state["checkpoint_receipt"] = {
+                "mode": "disabled",
+                "identity_digest": None,
+                "checkpoint_step": None,
+                "qualifying": False,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            }
+        _save_analysis_checkpoint_receipt(final_state, report_dir)
 
         # Update all agent statuses to completed
         for agent in message_buffer.agent_status:
@@ -9323,21 +10844,117 @@ def run_analysis(checkpoint: bool = False):
 @app.command()
 def analyze(
     checkpoint: bool = typer.Option(
-        False,
-        "--checkpoint",
-        help="Enable checkpoint/resume: save state after each node so a crashed run can resume.",
-    ),
-    clear_checkpoints: bool = typer.Option(
-        False,
-        "--clear-checkpoints",
-        help="Delete all saved checkpoints before running (force fresh start).",
+        True,
+        "--checkpoint/--no-checkpoint",
+        help="Use evidence-safe checkpoint/resume (default); --no-checkpoint is nonqualifying.",
     ),
 ):
-    if clear_checkpoints:
-        from tradingagents.graph.checkpointer import clear_all_checkpoints
-        n = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"])
-        console.print(f"[yellow]Cleared {n} checkpoint(s).[/yellow]")
+    """Start interactive analysis with evidence-safe checkpointing by default."""
     run_analysis(checkpoint=checkpoint)
+
+
+@app.command("checkpoint-status")
+def checkpoint_status_command(
+    ticker: str = typer.Option(..., "--ticker", help="Ticker stored in the checkpoint."),
+    trade_date: str = typer.Option(..., "--trade-date", help="Checkpoint trade date."),
+    identity_digest: str = typer.Option(
+        ...,
+        "--identity-digest",
+        help="Complete checkpoint run-identity SHA-256.",
+    ),
+):
+    """Print a bounded, analysis-only status receipt for one exact checkpoint."""
+    from tradingagents.graph.checkpointer import checkpoint_status
+
+    receipt = checkpoint_status(
+        DEFAULT_CONFIG["data_cache_dir"],
+        ticker,
+        trade_date,
+        identity_digest,
+    )
+    console.print(json.dumps(receipt.to_dict(), sort_keys=True))
+
+
+@app.command("checkpoint-clear")
+def checkpoint_clear_command(
+    ticker: str = typer.Option(..., "--ticker", help="Ticker stored in the checkpoint."),
+    trade_date: str = typer.Option(..., "--trade-date", help="Checkpoint trade date."),
+    identity_digest: str = typer.Option(
+        ...,
+        "--identity-digest",
+        help="Complete checkpoint run-identity SHA-256.",
+    ),
+):
+    """Clear only one exact checkpoint identity; no broad recovery is implied."""
+    from tradingagents.graph.checkpointer import clear_checkpoint
+
+    cleared = clear_checkpoint(
+        DEFAULT_CONFIG["data_cache_dir"],
+        ticker,
+        trade_date,
+        identity_digest,
+    )
+    console.print(
+        json.dumps(
+            {
+                "ticker": ticker.upper(),
+                "trade_date": trade_date,
+                "identity_digest": identity_digest,
+                "cleared": cleared,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("checkpoint-retention-report")
+def checkpoint_retention_report_command(
+    max_age_days: int = typer.Option(
+        7,
+        "--max-age-days",
+        min=1,
+        help="Report checkpoints older than this many days; does not delete them.",
+    ),
+):
+    """Report stale checkpoint candidates for later exact, owner-directed clearing."""
+    from tradingagents.graph.checkpointer import checkpoint_retention_report
+
+    report = checkpoint_retention_report(
+        DEFAULT_CONFIG["data_cache_dir"],
+        max_age_days=max_age_days,
+    )
+    console.print(json.dumps(report.to_dict(), sort_keys=True))
+
+
+@app.command("checkpoint-maintenance-clear-all")
+def checkpoint_maintenance_clear_all_command(
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Explicitly authorize bounded checkpoint-root maintenance deletion.",
+    ),
+):
+    """Explicit maintenance-only broad cleanup beneath the configured checkpoint root."""
+    if not confirm:
+        raise typer.BadParameter("--confirm is required for broad checkpoint maintenance")
+    from tradingagents.graph.checkpointer import clear_all_checkpoints
+
+    count = clear_all_checkpoints(DEFAULT_CONFIG["data_cache_dir"], confirm=True)
+    console.print(
+        json.dumps(
+            {
+                "cleared_databases": count,
+                "maintenance_operation": True,
+                "analysis_only": True,
+                "execution_authority": "none",
+                "can_submit_orders": False,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 @alpaca_app.command("check")
@@ -9365,6 +10982,13 @@ def alpaca_check():
         str(live_account.get("equity", "")),
     )
     console.print(table)
+
+
+# Documented Get All Orders maximum limit; a bound reconciliation reads with
+# this limit so only a response strictly below the limit proves completeness,
+# while an at-limit response fails closed because completeness could not be
+# proven beyond it.
+_BOUND_RECONCILIATION_ORDER_LIMIT = 500
 
 
 @alpaca_app.command("reconcile-observer")
@@ -9404,9 +11028,34 @@ def alpaca_reconcile_observer(
     except Exception as exc:  # noqa: BLE001 - preserve an unavailable observer as evidence.
         live = {"errors": {"client": f"live client initialization failed: {exc}"}}
     try:
-        paper = capture_read_only_broker_snapshot(_alpaca_paper_client(), captured_at=generated_at)
+        paper_client = _alpaca_paper_client()
+        paper = capture_read_only_broker_snapshot(paper_client, captured_at=generated_at)
     except Exception as exc:  # noqa: BLE001 - preserve an unavailable observer as evidence.
+        paper_client = None
         paper = {"errors": {"client": f"paper client initialization failed: {exc}"}}
+    if shadow_start is not None and paper_client is not None:
+        # A bound reconciliation must observe the complete same-market-day
+        # paper order book so adjudication can prove one-to-one identity with
+        # the day's tournament packet.  This stays a read-only GET using only
+        # documented query parameters; the wrapper fails closed when the
+        # collection reaches the limit, because completeness could not be
+        # proven beyond that ceiling.
+        try:
+            market_date = str(shadow_start.payload["market_date"])
+            day_open_utc = (
+                datetime.datetime.combine(
+                    datetime.date.fromisoformat(market_date), datetime.time.min
+                )
+                .replace(tzinfo=CENTRAL)
+                .astimezone(datetime.timezone.utc)
+            )
+            paper["all_orders"] = paper_client.list_orders(
+                status="all",
+                after=day_open_utc.isoformat(),
+                limit=_BOUND_RECONCILIATION_ORDER_LIMIT,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed read must fail the day closed.
+            paper.setdefault("errors", {})["all_orders"] = f"list_orders(all) failed: {exc}"
     packet: dict[str, object] = {
         "kind": "broker_reconciliation_observer",
         "generated_at": generated_at.isoformat(timespec="seconds"),
@@ -9644,6 +11293,95 @@ def research_shadow_day_adjudicate(
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         return
     console.print(f"Shadow-day adjudication: {admission.envelope.payload['status']}")
+    console.print(f"Decision: {admission.path}")
+
+
+@research_app.command("shadow-day-abort")
+def research_shadow_day_abort(
+    start_object_id: str = typer.Option(..., "--start-object-id", help="Authenticated pending shadow start object identity."),
+    stopped_at_stage: str = typer.Option(
+        ...,
+        "--stopped-at-stage",
+        help="Interruption stage key: day_start, one of the fixed daily-chain stage keys, or manifest_written (after the sealed manifest, before adjudication).",
+    ),
+    notes: str = typer.Option(
+        ...,
+        "--notes",
+        help="Short operator explanation recorded inside the immutable closure result.",
+    ),
+    safety_sentinel: Path | None = typer.Option(None, "--safety-sentinel", help="Present sentinel artifact, when one exists."),
+    paper_tournament: Path | None = typer.Option(None, "--paper-tournament", help="Present paper artifact, when one exists."),
+    daily_chain_manifest: Path | None = typer.Option(None, "--daily-chain-manifest", help="Present observer-chain manifest, when one exists."),
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Crash-safe closure of today's stranded pending shadow day; terminal and non-authorizing."""
+
+    from tradingagents.evals.shadow_trial import (
+        abort_shadow_day,
+        admitted_shadow_record_view,
+        load_shadow_record,
+    )
+
+    supplied: dict[str, Path] = {
+        key: value
+        for key, value in (
+            ("safety_sentinel", safety_sentinel),
+            ("paper_tournament", paper_tournament),
+            ("daily_chain_manifest", daily_chain_manifest),
+        )
+        if value is not None
+    }
+    try:
+        load_shadow_record(start_object_id, expected_kind="manual-shadow-day-start")
+        admission = abort_shadow_day(
+            start_object_id=start_object_id,
+            stopped_at_stage=stopped_at_stage,
+            notes=notes,
+            artifacts=supplied,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    payload = admitted_shadow_record_view(admission)
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    console.print(f"Shadow-day abort recorded: {payload['status']}")
+    console.print(f"Decision: {admission.path}")
+
+
+@research_app.command("shadow-day-expire-pending")
+def research_shadow_day_expire_pending(
+    json_output: bool = typer.Option(False, "--json-output"),
+):
+    """Close a pending shadow day whose Central market date has already passed."""
+
+    from tradingagents.evals.shadow_trial import (
+        admitted_shadow_record_view,
+        expire_pending_shadow_day,
+    )
+
+    try:
+        admission = expire_pending_shadow_day()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    envelope = {
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    if admission is None:
+        result = {**envelope, "expired": False, "record": None}
+        if json_output:
+            typer.echo(json.dumps(result, indent=2, sort_keys=True))
+            return
+        console.print("No expired pending shadow day.")
+        return
+    record = admitted_shadow_record_view(admission)
+    result = {**envelope, "expired": True, "record": record}
+    if json_output:
+        typer.echo(json.dumps(result, indent=2, sort_keys=True))
+        return
+    console.print(f"Expired pending shadow day closed: {record['status']}")
     console.print(f"Decision: {admission.path}")
 
 
@@ -10269,6 +12007,12 @@ def alpaca_paper_tournament_init(
     paper_account = paper_client.get_account()
     paper_positions = paper_client.list_positions()
     now = _alpaca_policy_now()
+    first_market_date, last_market_date = authenticated_market_date_window(
+        now,
+        duration_days=duration_days,
+        market_day_limit=max_submission_market_days,
+    )
+    market_calendar = paper_client.list_calendar(start=first_market_date, end=last_market_date)
     ledger = initialize_tournament(
         paper_account=paper_account,
         paper_positions=paper_positions,
@@ -10276,12 +12020,19 @@ def alpaca_paper_tournament_init(
         now=now,
         duration_days=duration_days,
         max_submission_market_days=max_submission_market_days,
+        market_calendar=market_calendar,
     )
     market_data = {}
     record_equity_snapshot(ledger, market_data=market_data, now=now)
     report = build_tournament_report(ledger, market_data=market_data, now=now)
     ledger["latest_report"] = report
-    ledger_path = write_tournament_ledger(ledger, log_dir)
+    from tradingagents.brokers.paper_tournament import tournament_submission_lock
+
+    # The durable initialization serializes with every other writer so an
+    # abort cannot land between the retired-root guard's disk read and this
+    # atomic write.  Broker/calendar reads deliberately stay outside the lock.
+    with tournament_submission_lock(log_dir):
+        ledger_path = write_tournament_ledger(ledger, log_dir)
     packet = {
         "kind": "paper_tournament_init",
         "ledger_path": str(ledger_path),
@@ -10359,8 +12110,20 @@ def alpaca_paper_tournament_alphainsider_watch(
         now=_alpaca_policy_now(),
     )
     if ledger is not None:
-        ledger["alphainsider_paper_watch_plan"] = plan
-        write_tournament_ledger(ledger, log_dir)
+        from tradingagents.brokers.paper_tournament import tournament_submission_lock
+
+        # The persisted update serializes under the per-root lock and operates
+        # on a fresh reload, so an interleaved abort is respected instead of
+        # overwritten by the stale pre-command snapshot.  Planning above kept
+        # its original early-snapshot inputs; only the durable write reloads.
+        with tournament_submission_lock(log_dir):
+            try:
+                fresh_ledger = load_tournament_ledger(log_dir)
+            except FileNotFoundError:
+                fresh_ledger = None
+            if fresh_ledger is not None:
+                fresh_ledger["alphainsider_paper_watch_plan"] = plan
+                write_tournament_ledger(fresh_ledger, log_dir)
     packet_path = write_tournament_packet(plan, log_dir, prefix="alphainsider-paper-watch")
     payload = {**plan, "packet_path": str(packet_path)}
     if json_output:
@@ -10526,7 +12289,8 @@ def alpaca_paper_tournament_run(
             selection_path = str(selection) if selection else None
             if selection_path:
                 ledger["live_strategy_selection"] = report["live_strategy_candidate"]
-        ledger["latest_report"] = report
+        if not dry_run or report.get("ledger_type") == "qualification_paper_trial":
+            ledger["latest_report"] = report
         ledger_path = write_tournament_ledger(ledger, log_dir)
     packet = {
         "kind": "paper_tournament_run",
@@ -10629,6 +12393,52 @@ def alpaca_paper_tournament_finalize(
         typer.echo(json.dumps(packet, indent=2))
         return
     console.print(f"[green]Paper tournament submission lease finalized at {ledger_path}[/green]")
+
+
+@paper_tournament_app.command("abort-submission-lease")
+def alpaca_paper_tournament_abort_submission_lease(
+    reason: str = typer.Option(..., "--reason", help="Operator reason for retiring this root."),
+    json_output: bool = typer.Option(False, "--json-output"),
+    log_dir: Path = typer.Option(
+        Path("results/paper_strategy_tournament"),
+        "--log-dir",
+        help="Directory containing the paper strategy tournament ledger.",
+    ),
+):
+    """Permanently retire a recovery-required paper root without any broker call."""
+
+    from tradingagents.brokers.paper_tournament import (
+        abort_submission_lease,
+        load_tournament_ledger,
+        tournament_submission_lock,
+        write_tournament_ledger,
+    )
+
+    with tournament_submission_lock(log_dir):
+        ledger = load_tournament_ledger(log_dir)
+        now = _alpaca_policy_now()
+        try:
+            abortion = abort_submission_lease(ledger, reason=reason, now=now)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        ledger_path = write_tournament_ledger(ledger, log_dir)
+    packet = {
+        "kind": "paper_tournament_abort",
+        "generated_at": now.isoformat(timespec="seconds"),
+        "ledger_path": str(ledger_path),
+        "submission_window_status": ledger.get("submission_window_status"),
+        "abortion": abortion,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    packet_path = write_tournament_packet(packet, log_dir, prefix="paper-tournament-abort")
+    packet["packet_path"] = str(packet_path)
+    if json_output:
+        typer.echo(json.dumps(packet, indent=2))
+        return
+    console.print(f"[red]Paper submission lease aborted at {ledger_path}[/red]")
+    console.print("This root is permanently retired; initialize a fresh root for a replacement trial.")
 
 
 @paper_tournament_app.command("report")

@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,7 @@ from typer.testing import CliRunner
 
 from cli import main as cli_main
 from cli.main import app
-from tradingagents.evals import shadow_trial
+from tradingagents.evals import runtime_identity, shadow_trial
 from tradingagents.strategy import _immutable_evidence_store as evidence_store_module
 from tradingagents.strategy._immutable_evidence_store import (
     EvidenceCandidate,
@@ -33,7 +34,12 @@ class _CalendarFake:
 
     def list_calendar(self, *, start: str, end: str) -> list[dict[str, str]]:
         self.calls.append((start, end))
-        return [{"date": start}] if start == end and start in self.dates else []
+        # Producer-real entry shape: strict HH:MM exchange open/close walls.
+        return (
+            [{"date": start, "open": "09:30", "close": "16:00"}]
+            if start == end and start in self.dates
+            else []
+        )
 
     def __getattr__(self, name: str):
         raise AssertionError(f"unexpected broker method: {name}")
@@ -57,13 +63,46 @@ def _calendar(
     *,
     observed_at: str | None = None,
     dates: list[str] | None = None,
+    open_text: str = "09:30",
+    close_text: str = "16:00",
 ) -> dict:
+    # Producer-real Alpaca calendar entries carry strict HH:MM exchange
+    # (America/New_York) open/close wall times; early closes flow through data.
     return {
         "kind": "alpaca_regular_equities_calendar",
         "market_date": date,
         "observed_at": observed_at or f"{date}T13:59:00+00:00",
-        "sessions": [{"date": item} for item in (dates if dates is not None else [date])],
+        "sessions": [
+            {"date": item, "open": open_text, "close": close_text}
+            for item in (dates if dates is not None else [date])
+        ],
     }
+
+
+# One ascending producer-real UTC timeline that is valid for both a CDT and a
+# CST market date: the paper tick lands inside the 09:30-16:00 ET regular
+# session either way, and the daily report follows the session close. The
+# minutes mirror the canonical Central automation offsets (:20 sentinel,
+# :35 supervisor, :50 board, :03 self-healer, :10 paper, :30 daily report).
+def _stage_timeline(date: str) -> dict[str, str]:
+    return {
+        "overnight_research": f"{date}T14:05:00+00:00",
+        "premarket_brief": f"{date}T14:10:00+00:00",
+        "preopen_validation": f"{date}T14:15:00+00:00",
+        "safety_sentinel": f"{date}T14:20:00+00:00",
+        "hourly_supervisor": f"{date}T14:35:00+00:00",
+        "loss_review": f"{date}T14:45:00+00:00",
+        "execution_board": f"{date}T14:50:00+00:00",
+        "self_heal_handoff": f"{date}T15:03:00+00:00",
+        "self_heal_plan": f"{date}T15:04:00+00:00",
+        "paper_tournament": f"{date}T15:10:00+00:00",
+        "broker_reconciliation": f"{date}T15:45:00+00:00",
+        "daily_report": f"{date}T21:30:00+00:00",
+    }
+
+
+# Adjudication happens after the daily-report stamp on every market date.
+_DAY_CLOCK_HOUR = 22
 
 
 def _write_schedule_fixture(
@@ -117,16 +156,115 @@ def _write_schedule_fixture(
     return contract, roles, automation_root
 
 
-def _control(path: Path, *, frozen: bool = True, malformed: bool = False) -> Path:
+def _control(
+    path: Path,
+    *,
+    frozen: bool = True,
+    malformed: bool = False,
+    dead_man_expires_at: str = "2026-12-31T00:00:00+00:00",
+) -> Path:
     _write_json(
         path,
         ({"frozen": "true"} if malformed else {
             "frozen": frozen,
             "reason": "manual safety hold",
-            "dead_man_expires_at": "2026-12-31T00:00:00+00:00",
+            "dead_man_expires_at": dead_man_expires_at,
         }),
     )
     return path
+
+
+def _canonical_json_text(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _json_digest(value: object) -> str:
+    return hashlib.sha256(_canonical_json_text(value).encode("utf-8")).hexdigest()
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _authority_file_digest(path: Path) -> str:
+    """Digest a fixture authority file; deliberately absent files stay deterministic."""
+
+    if path.exists():
+        return _file_digest(path)
+    return hashlib.sha256(f"missing:{path.as_posix()}".encode()).hexdigest()
+
+
+def _runtime_identity_fixture(
+    *,
+    control: Path,
+    contract: Path,
+    roles: Path,
+    automation_root: Path,
+) -> dict:
+    """A strict-schema flat runtime identity bound to real fixture authority files."""
+
+    schema_versions = {
+        "manual_shadow_day_start": shadow_trial.START_SCHEMA,
+        "manual_shadow_day_result": shadow_trial.DAY_SCHEMA,
+        "manual_shadow_final_report": shadow_trial.REPORT_SCHEMA,
+    }
+    overnight_route = {
+        "llm_provider": "openai",
+        "quick_think_llm": "gpt-5.4-mini",
+        "deep_think_llm": "gpt-5.4",
+    }
+    identity = {
+        "identity_schema": "runtime_identity/v1",
+        "git_commit": "f" * 40,
+        "worktree_clean": True,
+        "required_files_sha256": {
+            name: hashlib.sha256(name.encode("utf-8")).hexdigest()
+            for name in (
+                "pyproject.toml",
+                "uv.lock",
+                "requirements.txt",
+                "requirements-crawler.txt",
+            )
+        },
+        "schedule_contract_sha256": _file_digest(contract),
+        "role_contract_sha256": _file_digest(roles),
+        "live_control_sha256": _file_digest(control),
+        "automation_tomls_sha256": {
+            automation_id: _authority_file_digest(
+                automation_root / automation_id / "automation.toml"
+            )
+            for automation_id in sorted(shadow_trial.EXPECTED_AUTOMATION_IDS)
+        },
+        "provider_routes": {},
+        "provider_routes_sha256": hashlib.sha256(b"{}").hexdigest(),
+        "schema_versions": schema_versions,
+        "schema_versions_sha256": _json_digest(schema_versions),
+        "overnight_route": overnight_route,
+        "overnight_route_sha256": _json_digest(overnight_route),
+        "python_executable": "/fixture/python",
+        "package_inventory": ["fixture-package==1.0.0"],
+        "package_inventory_sha256": _json_digest(["fixture-package==1.0.0"]),
+    }
+    body = {key: value for key, value in identity.items() if key != "identity_sha256"}
+    identity["identity_sha256"] = _json_digest(body)
+    return identity
+
+
+def _recompute_identity_digests(identity: dict) -> dict:
+    """Rebuild component and whole digests so mutations stay valid captures."""
+
+    drifted = copy.deepcopy(identity)
+    drifted["provider_routes_sha256"] = _json_digest(drifted["provider_routes"])
+    drifted["schema_versions_sha256"] = _json_digest(drifted["schema_versions"])
+    route = drifted["overnight_route"]
+    drifted["overnight_route_sha256"] = None if route is None else _json_digest(route)
+    drifted["package_inventory"] = sorted(
+        {entry.strip().lower() for entry in drifted["package_inventory"]}
+    )
+    drifted["package_inventory_sha256"] = _json_digest(drifted["package_inventory"])
+    body = {key: value for key, value in drifted.items() if key != "identity_sha256"}
+    drifted["identity_sha256"] = _json_digest(body)
+    return drifted
 
 
 def _configure_environment(
@@ -137,12 +275,14 @@ def _configure_environment(
     malformed_control: bool = False,
     active_id: str | None = None,
     omit_id: str | None = None,
+    dead_man_expires_at: str = "2026-12-31T00:00:00+00:00",
 ) -> dict[str, Path]:
     manual_root = tmp_path / "results" / "manual_shadow"
     control = _control(
         tmp_path / "results" / "policy" / "live_control.json",
         frozen=frozen,
         malformed=malformed_control,
+        dead_man_expires_at=dead_man_expires_at,
     )
     contract, roles, automation_root = _write_schedule_fixture(
         tmp_path / "schedule",
@@ -154,12 +294,26 @@ def _configure_environment(
     monkeypatch.setattr(shadow_trial, "_canonical_schedule_contract_path", lambda: contract)
     monkeypatch.setattr(shadow_trial, "_canonical_role_contract_path", lambda: roles)
     monkeypatch.setattr(shadow_trial, "_canonical_automation_root", lambda: automation_root)
+    runtime_identity_holder = {
+        "value": _runtime_identity_fixture(
+            control=control,
+            contract=contract,
+            roles=roles,
+            automation_root=automation_root,
+        )
+    }
+    monkeypatch.setattr(
+        shadow_trial,
+        "_runtime_identity_capture",
+        lambda: copy.deepcopy(runtime_identity_holder["value"]),
+    )
     return {
         "manual_root": manual_root,
         "control": control,
         "contract": contract,
         "roles": roles,
         "automation_root": automation_root,
+        "runtime_identity": runtime_identity_holder,
     }
 
 
@@ -220,13 +374,14 @@ def _start(
     *,
     date: str,
     predecessor_object_id: str | None = None,
+    calendar_kwargs: dict | None = None,
 ) -> object:
     _set_clock(monkeypatch, date)
     with monkeypatch.context() as calendar_patch:
         calendar_patch.setattr(
             shadow_trial,
             "_capture_calendar_evidence",
-            lambda market_date: _calendar(market_date),
+            lambda market_date: _calendar(market_date, **(calendar_kwargs or {})),
         )
         return shadow_trial.create_shadow_day_start_manifest(
             run_id=f"run-{date}",
@@ -246,7 +401,7 @@ def _artifacts(
 ) -> dict[str, Path]:
     sentinel = root / "artifacts" / f"sentinel-{date}.json"
     paper = root / "artifacts" / f"paper-{date}.json"
-    generated_at = f"{date}T15:00:00+00:00"
+    timeline = _stage_timeline(date)
     broker_snapshot = _healthy_broker_snapshot(date=date, account_id="live-account")
     _write_json(
         sentinel,
@@ -255,7 +410,7 @@ def _artifacts(
             "run_id": run_id,
             "market_date": date,
             **({"shadow_start_object_id": start_object_id} if start_object_id else {}),
-            "generated_at": generated_at,
+            "generated_at": timeline["safety_sentinel"],
             "status": sentinel_status,
             "reasons": ["frozen_control"],
             "analysis_only": True,
@@ -294,7 +449,7 @@ def _artifacts(
             "run_id": run_id,
             "market_date": date,
             **({"shadow_start_object_id": start_object_id} if start_object_id else {}),
-            "generated_at": generated_at,
+            "generated_at": timeline["paper_tournament"],
             "status": "HOLD",
             "dry_run": True,
             "submitted_count": submitted_count,
@@ -326,7 +481,7 @@ def _complete_daily_chain(
     artifacts: dict[str, Path],
 ) -> dict[str, Path]:
     payload = _payload(start)
-    generated_at = f"{payload['market_date']}T15:00:00+00:00"
+    timeline = _stage_timeline(payload["market_date"])
     stages: dict[str, Path] = {
         "safety_sentinel": artifacts["safety_sentinel"],
         "paper_tournament": artifacts["paper_tournament"],
@@ -337,7 +492,7 @@ def _complete_daily_chain(
         path = root / "artifacts" / f"{name}-{payload['market_date']}.json"
         packet: dict[str, object] = {
             "kind": shadow_trial.DAILY_CHAIN_STAGE_KINDS[name],
-            "generated_at": generated_at,
+            "generated_at": timeline[name],
             "status": "HOLD",
             "analysis_only": True,
             "execution_authority": "none",
@@ -461,9 +616,14 @@ def _complete_daily_chain(
                     "live": _healthy_broker_snapshot(
                         date=payload["market_date"], account_id="live-account"
                     ),
-                    "paper": _healthy_broker_snapshot(
-                        date=payload["market_date"], account_id="paper-account"
-                    ),
+                    "paper": {
+                        **_healthy_broker_snapshot(
+                            date=payload["market_date"], account_id="paper-account"
+                        ),
+                        # Complete order-book evidence: an empty day must prove
+                        # it holds no tournament orders.
+                        "all_orders": [],
+                    },
                 }
             )
         _write_json(path, packet)
@@ -477,7 +637,7 @@ def _complete_daily_chain(
             "status": binding["status"],
             "sha256": binding["sha256"],
             "size_bytes": binding["size_bytes"],
-            "captured_at": generated_at,
+            "captured_at": timeline["safety_sentinel"],
             "freshness": {
                 "status": "fresh",
                 "rule": "direct_capture_current_audit",
@@ -535,7 +695,7 @@ def _day(
     date: str,
     artifacts: dict[str, Path] | None = None,
 ) -> object:
-    _set_clock(monkeypatch, date, 16)
+    _set_clock(monkeypatch, date, _DAY_CLOCK_HOUR)
     start_payload = _payload(start)
     with monkeypatch.context() as calendar_patch:
         calendar_patch.setattr(
@@ -652,17 +812,23 @@ def test_bound_reconciliation_and_public_manifest_cli_use_authenticated_start(tm
     start = _start(monkeypatch, date="2026-08-21")
 
     class Broker:
+        def __init__(self):
+            self.order_reads = []
+
         def get_account(self): return {"id": "observer", "status": "ACTIVE"}
         def list_positions(self): return []
-        def list_orders(self, *, status): return []
+        def list_orders(self, *, status, after=None, limit=None):
+            self.order_reads.append((status, after, limit))
+            return []
         def get_clock(self): return {"is_open": False, "timestamp": "2026-08-21T14:00:00+00:00"}
         def __getattr__(self, name):
             if name in {"submit_order", "cancel_order", "replace_order"}:
                 raise AssertionError(f"forbidden write {name}")
             raise AttributeError(name)
 
-    monkeypatch.setattr(cli_main, "_alpaca_live_client", Broker)
-    monkeypatch.setattr(cli_main, "_alpaca_paper_client", Broker)
+    broker = Broker()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: broker)
     monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2026-08-21", 14))
     reconcile = runner.invoke(
         app,
@@ -675,6 +841,14 @@ def test_bound_reconciliation_and_public_manifest_cli_use_authenticated_start(tm
     reconcile_payload = json.loads(reconcile.stdout)
     assert reconcile_payload["shadow_start_object_id"] == start.envelope.object_id
     assert reconcile_payload["status"] == "COMPLETE"
+    # A bound reconciliation must observe the full same-market-day paper book
+    # with the documented bounded retrieval: status=all, day-start after, limit.
+    assert broker.order_reads == [
+        ("open", None, None),
+        ("open", None, None),
+        ("all", "2026-08-21T05:00:00+00:00", 500),
+    ]
+    assert reconcile_payload["paper"]["all_orders"] == []
 
     artifacts = _artifacts(
         tmp_path,
@@ -703,6 +877,98 @@ def test_bound_reconciliation_and_public_manifest_cli_use_authenticated_start(tm
     manifest_payload = json.loads(manifest.stdout)
     assert manifest_payload["shadow_start_object_id"] == start.envelope.object_id
     assert set(manifest_payload["stages"]) == set(shadow_trial.DAILY_CHAIN_STAGES)
+
+
+def test_bound_reconciliation_records_hold_evidence_when_all_orders_read_fails(
+    tmp_path, monkeypatch
+):
+    """A failed bound all_orders read becomes HOLD errors, never silent acceptance."""
+
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    class Broker:
+        def get_account(self): return {"id": "observer", "status": "ACTIVE"}
+        def list_positions(self): return []
+        def list_orders(self, *, status, after=None, limit=None):
+            if status == "all":
+                raise RuntimeError("broker transport unavailable")
+            return []
+        def get_clock(self): return {"is_open": False, "timestamp": "2026-08-21T14:00:00+00:00"}
+        def __getattr__(self, name):
+            if name in {"submit_order", "cancel_order", "replace_order"}:
+                raise AssertionError(f"forbidden write {name}")
+            raise AttributeError(name)
+
+    broker = Broker()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2026-08-21", 14))
+    reconcile = runner.invoke(
+        app,
+        [
+            "alpaca", "reconcile-observer", "--shadow-start-object-id", start.envelope.object_id,
+            "--output-dir", str(tmp_path / "reconcile"), "--json-output",
+        ],
+    )
+    assert reconcile.exit_code == 0, reconcile.output
+    reconcile_payload = json.loads(reconcile.stdout)
+    # The failure is preserved as evidence and the packet is HOLD, not COMPLETE.
+    assert reconcile_payload["status"] == "HOLD"
+    assert reconcile_payload["paper"]["errors"]["all_orders"] == (
+        "list_orders(all) failed: broker transport unavailable"
+    )
+    assert "all_orders" not in reconcile_payload["paper"]
+    # The same evidence is non-clean-compatible downstream stage evidence.
+    assert "broker_reconciliation_stage_semantics_invalid" in (
+        shadow_trial._stage_semantic_reasons("broker_reconciliation", reconcile_payload)
+    )
+
+
+def test_bound_reconciliation_winter_market_date_uses_cst_utc_offset(
+    tmp_path, monkeypatch
+):
+    """The derived day-start bound follows the market date's UTC offset (CST 06:00Z)."""
+
+    _configure_environment(
+        monkeypatch,
+        tmp_path,
+        dead_man_expires_at="2027-12-31T00:00:00+00:00",
+    )
+    winter_start = _start(monkeypatch, date="2027-01-04")
+
+    class Broker:
+        def __init__(self):
+            self.order_reads = []
+
+        def get_account(self): return {"id": "observer", "status": "ACTIVE"}
+        def list_positions(self): return []
+        def list_orders(self, *, status, after=None, limit=None):
+            self.order_reads.append((status, after, limit))
+            return []
+        def get_clock(self): return {"is_open": False, "timestamp": "2027-01-04T14:00:00+00:00"}
+        def __getattr__(self, name):
+            if name in {"submit_order", "cancel_order", "replace_order"}:
+                raise AssertionError(f"forbidden write {name}")
+            raise AttributeError(name)
+
+    broker = Broker()
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: broker)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: _moment("2027-01-04", 14))
+    reconcile = runner.invoke(
+        app,
+        [
+            "alpaca", "reconcile-observer", "--shadow-start-object-id", winter_start.envelope.object_id,
+            "--output-dir", str(tmp_path / "reconcile"), "--json-output",
+        ],
+    )
+    assert reconcile.exit_code == 0, reconcile.output
+    reconcile_payload = json.loads(reconcile.stdout)
+    assert reconcile_payload["status"] == "COMPLETE"
+    # 2027-01-04 is Central Standard Time (UTC-6): midnight CT is 06:00Z.
+    assert broker.order_reads[-1] == ("all", "2027-01-04T06:00:00+00:00", 500)
+    assert reconcile_payload["paper"]["all_orders"] == []
 
 
 def test_red_generic_self_sealed_files_never_load_or_become_candidate(tmp_path, monkeypatch):
@@ -1377,6 +1643,680 @@ def test_red_clean_hold_and_zero_submission_are_valid_only_with_complete_bound_e
     assert payload["artifacts"]["paper_tournament"]["payload"]["submitted_count"] == 0
 
 
+def _tournament_order_fixture(
+    *,
+    client_order_id: str = "ta-paperbot-current-aggressive-2608211508-1-nvda",
+    order_id: str = "broker-order-1",
+    symbol: str = "NVDA",
+    side: str = "buy",
+    order_type: str = "limit",
+    status: str = "filled",
+    created_at: str = "2026-08-21T15:08:00+00:00",
+) -> dict:
+    return {
+        "strategy_id": "current-aggressive",
+        "reason": "shadow qualification paper tick",
+        "symbol": symbol,
+        "side": side,
+        "type": order_type,
+        "time_in_force": "day",
+        "notional": "1000.00",
+        "limit_price": "218.43",
+        "extended_hours": False,
+        "client_order_id": client_order_id,
+        "id": order_id,
+        "status": status,
+        "created_at": created_at,
+    }
+
+
+def _write_submitted_paper_artifact(root: Path, *, start, orders: list[dict]) -> Path:
+    payload = _payload(start)
+    date = payload["market_date"]
+    packet = {
+        "kind": "paper_tournament_run",
+        "run_id": payload["run_id"],
+        "market_date": date,
+        "shadow_start_object_id": start.envelope.object_id,
+        "generated_at": _stage_timeline(date)["paper_tournament"],
+        "status": "COMPLETE",
+        "dry_run": False,
+        "submitted_count": len(orders),
+        "submitted": orders,
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+    }
+    path = root / "artifacts" / f"paper-submitted-{date}.json"
+    _write_json(path, packet)
+    return path
+
+
+def _bound_reconciliation_packet(start, *, all_orders: list[dict], captured_at: str) -> dict:
+    payload = _payload(start)
+    healthy_live = _healthy_broker_snapshot(date=payload["market_date"], account_id="live-account")
+    healthy_paper = _healthy_broker_snapshot(date=payload["market_date"], account_id="paper-account")
+    healthy_live["captured_at"] = captured_at
+    healthy_paper["captured_at"] = captured_at
+    healthy_paper["all_orders"] = all_orders
+    return {
+        "kind": "broker_reconciliation_observer",
+        "run_id": payload["run_id"],
+        "market_date": payload["market_date"],
+        "shadow_start_object_id": start.envelope.object_id,
+        "generated_at": captured_at,
+        "status": "COMPLETE",
+        "analysis_only": True,
+        "execution_authority": "none",
+        "can_submit_orders": False,
+        "read_only": True,
+        "submitted_count": 0,
+        "cancelled_count": 0,
+        "live": healthy_live,
+        "paper": healthy_paper,
+    }
+
+
+def _adjudicate_day_with_paper_submission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mutate_reconciliation=None,
+    mutate_manifest=None,
+    orders: list[dict] | None = None,
+    reconciliation_all_orders: list[dict] | None = None,
+):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    payload = _payload(start)
+    date = payload["market_date"]
+    submitted_orders = [_tournament_order_fixture()] if orders is None else orders
+    observed_orders = (
+        [dict(order) for order in submitted_orders]
+        if reconciliation_all_orders is None
+        else reconciliation_all_orders
+    )
+    sentinel_path = _artifacts(
+        tmp_path,
+        run_id=payload["run_id"],
+        date=date,
+        start_object_id=start.envelope.object_id,
+    )["safety_sentinel"]
+    paper_path = _write_submitted_paper_artifact(tmp_path, start=start, orders=submitted_orders)
+    artifacts = {"safety_sentinel": sentinel_path, "paper_tournament": paper_path}
+    _complete_daily_chain(tmp_path, start=start, artifacts=artifacts)
+    reconciliation_packet = _bound_reconciliation_packet(
+        start,
+        all_orders=observed_orders,
+        captured_at="2026-08-21T15:45:00+00:00",
+    )
+    if mutate_reconciliation is not None:
+        mutate_reconciliation(reconciliation_packet)
+    recon_path = tmp_path / "artifacts" / f"broker-reconciliation-bound-{date}.json"
+    _write_json(recon_path, reconciliation_packet)
+    stage_paths = {**artifacts, "broker_reconciliation": recon_path}
+    _set_clock(monkeypatch, date, _DAY_CLOCK_HOUR)
+    manifest_path = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=stage_paths)
+    if mutate_manifest is not None:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mutate_manifest(manifest_payload)
+        _write_json(manifest_path, manifest_payload)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date=date,
+        artifacts={
+            "safety_sentinel": stage_paths["safety_sentinel"],
+            "paper_tournament": stage_paths["paper_tournament"],
+            "daily_chain_manifest": manifest_path,
+        },
+    )
+    return _payload(decision)
+
+
+def test_red_clean_day_paper_orders_must_match_post_paper_reconciliation_exactly(tmp_path, monkeypatch):
+    decision_payload = _adjudicate_day_with_paper_submission(tmp_path, monkeypatch)
+    assert decision_payload["status"] == "clean"
+    assert not any(reason.startswith("broker_reconciliation_") for reason in decision_payload["reasons"])
+
+
+# Increment 6: the approved causal order of one shadow day.  The safety
+# sentinel binds (:20) before the hourly dry-run (:35); the paper tick
+# precedes its reconciliation; and the daily report follows the session
+# close — an order that deliberately differs from the stage roster tuple.
+APPROVED_DAILY_CHAIN_ORDER = (
+    "overnight_research",
+    "premarket_brief",
+    "preopen_validation",
+    "safety_sentinel",
+    "hourly_supervisor",
+    "loss_review",
+    "execution_board",
+    "self_heal_handoff",
+    "self_heal_plan",
+    "paper_tournament",
+    "broker_reconciliation",
+    "daily_report",
+)
+# Producer-precision exception: one self-healer automation run writes both
+# packets back-to-back, so identical second-resolution stamps are a genuine
+# tie.  Every other consecutive pair crosses separate scheduled producers.
+LEGITIMATE_STAGE_TIES = {("self_heal_handoff", "self_heal_plan")}
+
+
+def _adjudicate_chain_with_stage_stamps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    date: str = "2026-08-21",
+    stamps: dict[str, str] | None = None,
+    calendar_kwargs: dict | None = None,
+    dead_man_expires_at: str = "2027-06-30T00:00:00+00:00",
+) -> dict:
+    """Adjudicate one full day whose stage files carry explicit generated_at values."""
+
+    _configure_environment(
+        monkeypatch, tmp_path, dead_man_expires_at=dead_man_expires_at
+    )
+    start = _start(monkeypatch, date=date, calendar_kwargs=calendar_kwargs)
+    payload = _payload(start)
+    market_date = payload["market_date"]
+    artifacts_map = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=payload["run_id"],
+            date=market_date,
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    stage_files = {
+        "safety_sentinel": artifacts_map["safety_sentinel"],
+        "paper_tournament": artifacts_map["paper_tournament"],
+    }
+    timeline = _stage_timeline(market_date)
+    timeline.update(stamps or {})
+    for name, stamp in timeline.items():
+        path = stage_files.get(name) or (
+            tmp_path / "artifacts" / f"{name}-{market_date}.json"
+        )
+        packet = json.loads(path.read_text(encoding="utf-8"))
+        packet["generated_at"] = stamp
+        _write_json(path, packet)
+    _set_clock(monkeypatch, market_date, _DAY_CLOCK_HOUR)
+    manifest_path = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=artifacts_map)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date=market_date,
+        artifacts={**artifacts_map, "daily_chain_manifest": manifest_path},
+    )
+    return _payload(decision)
+
+
+def test_red_valid_ascending_chain_with_in_session_paper_stays_clean(tmp_path, monkeypatch):
+    payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch)
+    assert payload["status"] == "clean"
+    for reason in payload["reasons"]:
+        assert "order" not in reason
+        assert "session" not in reason
+
+
+@pytest.mark.parametrize(
+    ("earlier_stage", "later_stage"),
+    [
+        *[
+            pytest.param(a, b, id=f"{a}-after-{b}")
+            for a, b in zip(APPROVED_DAILY_CHAIN_ORDER, APPROVED_DAILY_CHAIN_ORDER[1:], strict=False)
+        ],
+        pytest.param("overnight_research", "daily_report", id="far-swap-first-last"),
+    ],
+)
+def test_red_backward_or_swapped_stage_timestamps_are_never_clean(
+    tmp_path, monkeypatch, earlier_stage, later_stage
+):
+    timeline = _stage_timeline("2026-08-21")
+    swapped = dict(timeline)
+    swapped[earlier_stage] = timeline[later_stage]
+    swapped[later_stage] = timeline[earlier_stage]
+    payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch, stamps=swapped)
+    assert payload["status"] != "clean"
+    assert "daily_chain_stage_order_backward" in payload["reasons"]
+
+
+def test_red_paper_after_reconciliation_reversal_is_never_clean(tmp_path, monkeypatch):
+    timeline = _stage_timeline("2026-08-21")
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        stamps={
+            **timeline,
+            "paper_tournament": timeline["broker_reconciliation"],
+            "broker_reconciliation": timeline["paper_tournament"],
+        },
+    )
+    assert payload["status"] != "clean"
+    assert "daily_chain_stage_order_backward" in payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("first_stage", "second_stage"),
+    [
+        pytest.param(a, b, id=f"tie-{a}-{b}")
+        for a, b in zip(APPROVED_DAILY_CHAIN_ORDER, APPROVED_DAILY_CHAIN_ORDER[1:], strict=False)
+    ],
+)
+def test_red_equal_stage_timestamps_fail_except_documented_producer_tie(
+    tmp_path, monkeypatch, first_stage, second_stage
+):
+    timeline = _stage_timeline("2026-08-21")
+    stamps = dict(timeline)
+    stamps[second_stage] = timeline[first_stage]
+    should_stay_clean = (first_stage, second_stage) in LEGITIMATE_STAGE_TIES
+    payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch, stamps=stamps)
+    if should_stay_clean:
+        assert payload["status"] == "clean"
+        assert "daily_chain_stage_order_tie_illegitimate" not in payload["reasons"]
+    else:
+        assert payload["status"] != "clean"
+        assert "daily_chain_stage_order_tie_illegitimate" in payload["reasons"]
+        assert "daily_chain_stage_order_backward" not in payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("paper_stamp", "calendar_kwargs", "expected_clean"),
+    [
+        pytest.param("2026-08-21T13:00:00+00:00", None, False, id="before-open-et"),
+        pytest.param("2026-08-21T20:30:00+00:00", None, False, id="after-close-et"),
+        pytest.param(
+            "2026-08-21T17:30:00+00:00",
+            {"close_text": "13:00"},
+            False,
+            id="after-early-close",
+        ),
+        pytest.param(
+            "2026-08-21T16:30:00+00:00",
+            {"close_text": "13:00", "reconciliation_stamp": "2026-08-21T17:10:00+00:00"},
+            True,
+            id="inside-early-close-stays-clean",
+        ),
+    ],
+)
+def test_red_paper_tick_outside_admitted_regular_session_is_never_clean(
+    tmp_path, monkeypatch, paper_stamp, calendar_kwargs, expected_clean
+):
+    timeline = _stage_timeline("2026-08-21")
+    stamps = {**timeline, "paper_tournament": paper_stamp}
+    reconciliation_stamp = (calendar_kwargs or {}).pop("reconciliation_stamp", None)
+    if reconciliation_stamp is not None:
+        stamps["broker_reconciliation"] = reconciliation_stamp
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        stamps=stamps,
+        calendar_kwargs=calendar_kwargs,
+    )
+    if expected_clean:
+        assert payload["status"] == "clean"
+        assert "paper_tournament_stage_outside_regular_session" not in payload["reasons"]
+    else:
+        assert payload["status"] != "clean"
+        assert "paper_tournament_stage_outside_regular_session" in payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("report_stamp", "calendar_kwargs", "expected_clean"),
+    [
+        pytest.param("2026-08-21T19:00:00+00:00", None, False, id="before-session-close"),
+        pytest.param(
+            "2026-08-21T16:00:00+00:00",
+            {"close_text": "13:00"},
+            False,
+            id="before-early-close",
+        ),
+        pytest.param(
+            "2026-08-21T17:00:00+00:00",
+            {"close_text": "13:00"},
+            True,
+            id="at-early-close-or-later-stays-clean",
+        ),
+    ],
+)
+def test_red_daily_report_must_follow_the_admitted_session_close(
+    tmp_path, monkeypatch, report_stamp, calendar_kwargs, expected_clean
+):
+    timeline = _stage_timeline("2026-08-21")
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        stamps={**timeline, "daily_report": report_stamp},
+        calendar_kwargs=calendar_kwargs,
+    )
+    if expected_clean:
+        assert payload["status"] == "clean"
+        assert "daily_report_stage_before_session_close" not in payload["reasons"]
+    else:
+        assert payload["status"] != "clean"
+        assert "daily_report_stage_before_session_close" in payload["reasons"]
+
+
+def test_red_winter_session_window_is_derived_from_admitted_calendar_data(tmp_path, monkeypatch):
+    # CST/EST date: 09:30-16:00 ET is 14:30-21:00 UTC, so the default ascending
+    # chain stays clean while a stamp that only a fixed CDT assumption would
+    # admit (14:11 UTC = 08:11 CST) is rejected as before the EST open.
+    clean_payload = _adjudicate_chain_with_stage_stamps(tmp_path, monkeypatch, date="2027-01-04")
+    assert clean_payload["status"] == "clean"
+    assert "paper_tournament_stage_outside_regular_session" not in clean_payload["reasons"]
+
+    rejected_payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path / "winter-rejected",
+        monkeypatch,
+        date="2027-01-04",
+        stamps={
+            **_stage_timeline("2027-01-04"),
+            "overnight_research": "2027-01-04T14:02:00+00:00",
+            "premarket_brief": "2027-01-04T14:03:00+00:00",
+            "preopen_validation": "2027-01-04T14:04:00+00:00",
+            "safety_sentinel": "2027-01-04T14:05:00+00:00",
+            "hourly_supervisor": "2027-01-04T14:06:00+00:00",
+            "loss_review": "2027-01-04T14:07:00+00:00",
+            "execution_board": "2027-01-04T14:08:00+00:00",
+            "self_heal_handoff": "2027-01-04T14:09:00+00:00",
+            "self_heal_plan": "2027-01-04T14:10:00+00:00",
+            "paper_tournament": "2027-01-04T14:11:00+00:00",
+        },
+    )
+    assert rejected_payload["status"] != "clean"
+    assert "paper_tournament_stage_outside_regular_session" in rejected_payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        pytest.param("09:30", dt.time(9, 30), id="ascii-open"),
+        pytest.param("16:00", dt.time(16, 0), id="ascii-close"),
+        pytest.param("23:59", dt.time(23, 59), id="ascii-max"),
+        pytest.param("9:30", None, id="short-hour"),
+        pytest.param("09:60", None, id="minute-out-of-range"),
+        pytest.param("²²:³³", None, id="superscript-digits"),
+        pytest.param("١٦:٠٠", None, id="arabic-indic-digits"),
+        pytest.param("0٩:30", None, id="mixed-ascii-and-unicode-digit"),
+    ],
+)
+def test_red_exchange_wall_time_accepts_only_strict_ascii_digits(value, expected):
+    assert shadow_trial._parse_exchange_wall_time(value) == expected
+
+
+def test_red_unicode_digit_session_walls_fail_closed_without_raising(tmp_path, monkeypatch):
+    # A start can be admitted with non-ASCII digit session walls because the
+    # calendar binding validates the admitted date only.  Adjudication must
+    # then yield a fail-closed non-clean day with the existing
+    # daily_chain_session_window_unavailable reason — never a crash.
+    payload = _adjudicate_chain_with_stage_stamps(
+        tmp_path,
+        monkeypatch,
+        calendar_kwargs={"open_text": "²²:³³", "close_text": "¹⁶:⁰⁰"},
+    )
+    assert payload["status"] == "incomplete"
+    assert "daily_chain_session_window_unavailable" in payload["reasons"]
+
+
+def test_red_manifest_cannot_precede_its_bound_stage_evidence(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    payload = _payload(start)
+    market_date = payload["market_date"]
+    artifacts_map = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=payload["run_id"],
+            date=market_date,
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    # Seal the manifest before the daily-report evidence exists in time.
+    _set_clock(monkeypatch, market_date, 15)
+    manifest_path = _rebind_daily_chain_manifest(tmp_path, start=start, artifacts=artifacts_map)
+    decision = _day(
+        tmp_path,
+        monkeypatch,
+        start,
+        date=market_date,
+        artifacts={**artifacts_map, "daily_chain_manifest": manifest_path},
+    )
+    result = _payload(decision)
+    assert result["status"] != "clean"
+    assert "daily_chain_manifest_precedes_stage" in result["reasons"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_reason"),
+    [
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__(
+                "all_orders", []
+            ),
+            "broker_reconciliation_missing_tournament_order",
+            id="missing",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"].append(
+                dict(packet["paper"]["all_orders"][0])
+            ),
+            "broker_reconciliation_duplicate_tournament_order",
+            id="duplicate",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"].append(
+                _tournament_order_fixture(
+                    client_order_id="ta-paperbot-current-aggressive-2608211545-9-tsla",
+                    order_id="broker-order-9",
+                    symbol="TSLA",
+                )
+            ),
+            "broker_reconciliation_extra_tournament_order",
+            id="extra",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__(
+                "id", "broker-order-999"
+            ),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-broker-id",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__(
+                "symbol", "MSFT"
+            ),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-symbol",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__("side", "sell"),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-side",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__("type", "market"),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="mismatched-type",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__(
+                "created_at", "2026-08-21T15:19:00+00:00"
+            ),
+            "broker_reconciliation_mismatched_tournament_order",
+            id="reverse-timestamp",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"]["all_orders"][0].__setitem__("status", "new"),
+            "broker_reconciliation_nonterminal_tournament_order",
+            id="nonterminal",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__(
+                "open_orders", [dict(packet["paper"]["all_orders"][0])]
+            ),
+            "broker_reconciliation_open_tournament_order_present",
+            id="still-open-in-open-orders",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__(
+                "captured_at", "2026-08-21T15:05:00+00:00"
+            ),
+            "broker_reconciliation_captured_before_last_paper_submission",
+            id="reconciliation-captured-before-paper",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].pop("all_orders"),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="missing-all-orders-evidence",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("all_orders", ["junk"]),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="malformed-all-orders-evidence",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].pop("open_orders"),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="absent-open-orders-evidence",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("open_orders", ["junk"]),
+            "broker_reconciliation_tournament_evidence_invalid",
+            id="malformed-open-orders-entry",
+        ),
+    ],
+)
+def test_red_broken_paper_to_reconciliation_binding_is_never_clean(
+    tmp_path, monkeypatch, mutate, expected_reason
+):
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        mutate_reconciliation=mutate,
+    )
+    assert decision_payload["status"] != "clean"
+    assert expected_reason in decision_payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda packet: packet["paper"].pop("open_orders"), id="absent"),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("open_orders", ["junk"]),
+            id="nonmapping-entry",
+        ),
+    ],
+)
+def test_red_empty_day_open_orders_defects_fail_closed_in_both_layers(
+    tmp_path, monkeypatch, mutate
+):
+    """Quiet-day open_orders defects never stay clean: stage layer fails them
+    (governing status) while the hardened binding helper adds its explicit
+    invalid evidence reason as defense in depth."""
+
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        orders=[],
+        reconciliation_all_orders=[],
+        mutate_reconciliation=mutate,
+    )
+    assert decision_payload["status"] == "failed"
+    assert "broker_reconciliation_stage_semantics_invalid" in decision_payload["reasons"]
+    assert "broker_reconciliation_tournament_evidence_invalid" in decision_payload["reasons"]
+
+
+def test_red_reconciliation_tournament_entries_require_present_mapping_lists():
+    healthy = {"all_orders": [], "open_orders": []}
+    assert (
+        shadow_trial._reconciliation_tournament_entries(healthy, "all_orders", "open_orders")
+        == []
+    )
+    observed = shadow_trial._reconciliation_tournament_entries(
+        {"open_orders": [{"client_order_id": "ta-paperbot-x-1"}]}, "open_orders"
+    )
+    assert observed == [{"client_order_id": "ta-paperbot-x-1"}]
+    # Absent named list, non-list evidence, non-mapping item, bad snapshot.
+    assert shadow_trial._reconciliation_tournament_entries({"all_orders": []}, "open_orders") is None
+    assert shadow_trial._reconciliation_tournament_entries({"open_orders": "junk"}, "open_orders") is None
+    assert shadow_trial._reconciliation_tournament_entries({"open_orders": ["x"]}, "open_orders") is None
+    assert shadow_trial._reconciliation_tournament_entries("junk", "open_orders") is None
+
+
+def test_red_stray_tournament_orders_in_reconciliation_block_an_empty_day(tmp_path, monkeypatch):
+    stray = _tournament_order_fixture(
+        client_order_id="ta-paperbot-current-aggressive-2608211520-7-amzn",
+        order_id="broker-order-7",
+        symbol="AMZN",
+    )
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        orders=[],
+        reconciliation_all_orders=[stray],
+    )
+    assert decision_payload["status"] != "clean"
+    assert "broker_reconciliation_unbound_tournament_order_present" in decision_payload["reasons"]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda packet: packet["paper"].pop("all_orders"),
+            id="empty-day-missing-all-orders",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("all_orders", "junk"),
+            id="empty-day-malformed-all-orders",
+        ),
+        pytest.param(
+            lambda packet: packet["paper"].__setitem__("all_orders", ["junk"]),
+            id="empty-day-nonmapping-all-order-entry",
+        ),
+    ],
+)
+def test_red_empty_day_requires_valid_full_order_evidence_to_stay_clean(
+    tmp_path, monkeypatch, mutate
+):
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        orders=[],
+        reconciliation_all_orders=[],
+        mutate_reconciliation=mutate,
+    )
+    assert decision_payload["status"] == "incomplete"
+    assert "broker_reconciliation_tournament_evidence_invalid" in decision_payload["reasons"]
+
+
+def test_red_forged_embedded_reconciliation_cannot_launder_broken_stage_evidence(
+    tmp_path, monkeypatch
+):
+    def restore_orders_in_embedded_copy(manifest):
+        manifest["broker_reconciliation"]["paper"]["all_orders"] = [
+            _tournament_order_fixture()
+        ]
+
+    decision_payload = _adjudicate_day_with_paper_submission(
+        tmp_path,
+        monkeypatch,
+        mutate_reconciliation=lambda packet: packet["paper"].__setitem__("all_orders", []),
+        mutate_manifest=restore_orders_in_embedded_copy,
+    )
+    assert decision_payload["status"] != "clean"
+    assert "broker_reconciliation_embedded_copy_mismatch" in decision_payload["reasons"]
+
+
 def test_stage_semantics_accept_native_shapes_and_reject_provider_graph_and_broker_errors():
     overnight = {
         "generated_at": "2026-08-21T15:00:00+00:00",
@@ -1855,6 +2795,421 @@ def test_malformed_paper_tournament_with_rebound_manifest_yields_non_clean_unrea
     assert "paper_tournament_stage_hash_or_path_changed" not in payload["reasons"]
 
 
+def test_red_abort_shadow_day_closes_pending_terminal_failed_and_blocks_duplicates(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    artifacts = _artifacts(
+        tmp_path,
+        run_id=_payload(start)["run_id"],
+        date="2026-08-21",
+        start_object_id=start.envelope.object_id,
+    )
+
+    admission = shadow_trial.abort_shadow_day(
+        start_object_id=start.envelope.object_id,
+        stopped_at_stage="paper_tournament",
+        notes="process interrupted after paper persistence",
+        artifacts=artifacts,
+    )
+    payload = _payload(admission)
+    assert payload["status"] == "failed"
+    assert payload["status"] != "clean"
+    assert payload["phase"] == "repair_required"
+    assert payload["closure_kind"] == "operator_abort"
+    assert payload["stopped_at_stage"] == "paper_tournament"
+    assert payload["notes"] == "process interrupted after paper persistence"
+    assert "shadow_day_aborted_by_operator" in payload["reasons"]
+    assert "daily_chain_manifest_unreadable_or_unbound" in payload["reasons"]
+    assert payload["start_object_id"] == start.envelope.object_id
+    assert payload["run_id"] == _payload(start)["run_id"]
+    assert payload["market_date"] == "2026-08-21"
+    assert payload["role"] == "qualification"
+    assert payload["artifacts"]["safety_sentinel"]["status"] == "captured"
+    assert payload["artifacts"]["paper_tournament"]["status"] == "captured"
+    assert payload["artifacts"]["daily_chain_manifest"]["status"] == "missing"
+    assert admission.envelope.analysis_only is True
+    assert admission.envelope.execution_authority == "none"
+    assert admission.envelope.can_submit_orders is False
+
+    with pytest.raises(ValueError, match="pending|abort"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="duplicate closure attempt",
+        )
+    with pytest.raises(ValueError, match="admissible pending"):
+        shadow_trial.adjudicate_shadow_day(start_object_id=start.envelope.object_id, artifacts={})
+
+    status = shadow_trial.shadow_streak_status()
+    assert status["clean_trial_streak"] == 0
+    assert status["last_result"]["object_id"] == admission.envelope.object_id
+    assert status["last_result"]["status"] == "failed"
+    assert status["last_result"]["phase"] == "repair_required"
+    assert status["pending_start"] is None
+    assert status["can_start_next_day"] is True
+    assert status["predecessor_object_id"] == admission.envelope.object_id
+
+    _set_clock(monkeypatch, "2026-08-22")
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        repair_start = shadow_trial.create_shadow_day_start_manifest(
+            run_id="repair-after-abort",
+            market_date="2026-08-22",
+            predecessor_object_id=admission.envelope.object_id,
+        )
+    repair_payload = _payload(repair_start)
+    assert repair_payload["role"] == "repair"
+    assert repair_payload["phase"] == "repair_in_progress"
+    assert repair_payload["predecessor_object_id"] == admission.envelope.object_id
+
+
+def test_red_abort_refuses_wrong_identity_stale_date_and_nonpending_ledger(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    wrong_identity = "manual-shadow-day-start-" + "0" * 64
+    with pytest.raises(ValueError, match="pending"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=wrong_identity,
+            stopped_at_stage="day_start",
+            notes="wrong identity must be refused",
+        )
+    with pytest.raises(ValueError, match="stage"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="not-a-real-stage",
+            notes="unknown stage key must be refused",
+        )
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    assert _payload(day)["status"] == "clean"
+    with pytest.raises(ValueError, match="pending"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="already adjudicated ledger has no pending abort",
+        )
+
+
+def test_red_abort_refuses_when_market_date_is_no_longer_current(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+    _set_clock(monkeypatch, "2026-08-22", 15)
+    with pytest.raises(ValueError, match="Central"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=start.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="stale abort must be refused; expire-pending owns this state",
+        )
+    admission = shadow_trial.expire_pending_shadow_day()
+    assert admission is not None
+    assert _payload(admission)["closure_kind"] == "pending_expired"
+
+
+def test_red_expire_pending_converts_stale_start_to_immutable_incomplete(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    _set_clock(monkeypatch, "2026-08-22", 14)
+    admission = shadow_trial.expire_pending_shadow_day()
+    assert admission is not None
+    payload = _payload(admission)
+    assert payload["status"] == "incomplete"
+    assert payload["phase"] == "repair_required"
+    assert payload["closure_kind"] == "pending_expired"
+    assert payload["stopped_at_stage"] is None
+    assert payload["notes"] is None
+    assert list(payload["reasons"]) == ["pending_day_expired_without_adjudication"]
+    assert set(payload["artifacts"]) == set(shadow_trial.ARTIFACT_KEYS)
+    assert all(item["status"] == "missing" for item in payload["artifacts"].values())
+    assert payload["start_object_id"] == start.envelope.object_id
+    assert admission.envelope.analysis_only is True
+    assert admission.envelope.execution_authority == "none"
+    assert admission.envelope.can_submit_orders is False
+
+    assert shadow_trial.expire_pending_shadow_day() is None
+    with pytest.raises(ValueError, match="admissible pending"):
+        shadow_trial.adjudicate_shadow_day(start_object_id=start.envelope.object_id, artifacts={})
+
+    status = shadow_trial.shadow_streak_status()
+    assert status["clean_trial_streak"] == 0
+    assert status["last_result"]["object_id"] == admission.envelope.object_id
+    assert status["last_result"]["status"] == "incomplete"
+    assert status["can_start_next_day"] is True
+    assert status["predecessor_object_id"] == admission.envelope.object_id
+
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        repair_start = shadow_trial.create_shadow_day_start_manifest(
+            run_id="repair-after-expiry",
+            market_date="2026-08-22",
+            predecessor_object_id=admission.envelope.object_id,
+        )
+    assert _payload(repair_start)["role"] == "repair"
+    assert not (environment["manual_root"] / "objects" / "manual-shadow-final-report").exists()
+
+
+def test_red_expire_leaves_same_date_pending_untouched(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+    start = _start(monkeypatch, date="2026-08-21")
+
+    before = _ledger_surface_snapshot(results_parent)
+    assert shadow_trial.expire_pending_shadow_day() is None
+    assert before == _ledger_surface_snapshot(results_parent)
+    assert (
+        shadow_trial.load_shadow_record(
+            start.envelope.object_id,
+            expected_kind="manual-shadow-day-start",
+        ).object_id
+        == start.envelope.object_id
+    )
+
+
+def test_red_expire_empty_ledger_is_observationally_pure(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+
+    before = _ledger_surface_snapshot(results_parent)
+    assert shadow_trial.expire_pending_shadow_day() is None
+    assert before == _ledger_surface_snapshot(results_parent)
+    assert not (results_parent / ".manual-shadow-trusted-head.lock").exists()
+
+
+@pytest.mark.parametrize("stage", list(shadow_trial.SHADOW_DAY_STOP_STAGES))
+def test_red_abort_interruption_matrix_admits_one_non_clean_result_per_stage(tmp_path, monkeypatch, stage):
+    _environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    admission = shadow_trial.abort_shadow_day(
+        start_object_id=start.envelope.object_id,
+        stopped_at_stage=stage,
+        notes=f"interruption drill immediately after {stage}",
+    )
+    payload = _payload(admission)
+    assert payload["status"] == "failed"
+    assert payload["phase"] == "repair_required"
+    assert payload["stopped_at_stage"] == stage
+    assert "shadow_day_aborted_by_operator" in payload["reasons"]
+    assert all(item["status"] == "missing" for item in payload["artifacts"].values())
+    assert admission.envelope.can_submit_orders is False
+
+    journal_lines = (
+        _environment["manual_root"] / "events.jsonl"
+    ).read_bytes().splitlines()
+    assert len(journal_lines) == 2
+
+    _set_clock(monkeypatch, "2026-08-22")
+    with monkeypatch.context() as calendar_patch:
+        calendar_patch.setattr(
+            shadow_trial,
+            "_capture_calendar_evidence",
+            lambda market_date: _calendar(market_date),
+        )
+        recovery = shadow_trial.create_shadow_day_start_manifest(
+            run_id=f"recover-{stage}",
+            market_date="2026-08-22",
+            predecessor_object_id=admission.envelope.object_id,
+        )
+    assert _payload(recovery)["predecessor_object_id"] == admission.envelope.object_id
+    assert shadow_trial.shadow_streak_status()["can_start_next_day"] is False
+
+
+def test_red_closure_facades_fail_closed_on_anchor_or_journal_damage(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    results_parent = environment["manual_root"].parent
+    anchor_path = results_parent / ".manual-shadow-trusted-head.json"
+
+    qualification_start = _start(monkeypatch, date="2026-08-21")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-21")
+    stranded = _start(
+        monkeypatch,
+        date="2026-08-22",
+        predecessor_object_id=qualification.envelope.object_id,
+    )
+    _set_clock(monkeypatch, "2026-08-22", 18)
+
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    lines = (environment["manual_root"] / "events.jsonl").read_bytes().splitlines()
+
+    def head_of(line: bytes, sequence: int) -> dict[str, object]:
+        event = json.loads(line)
+        return {
+            "sequence": sequence,
+            "kind": event["kind"],
+            "object_id": event["object_id"],
+            "event_sha256": hashlib.sha256(line).hexdigest(),
+            "admission_route": event["admission_route"],
+        }
+
+    prior_head = head_of(lines[-2], len(lines) - 1)
+    last_event = json.loads(lines[-1])
+    anchor["committed_head"] = prior_head
+    anchor["pending_next"] = {
+        "prior_head": prior_head,
+        "sequence": len(lines),
+        "kind": last_event["kind"],
+        "object_id": last_event["object_id"],
+        "retry_material_sha256": last_event["retry_material_sha256"],
+        "admission_route": last_event["admission_route"],
+    }
+    anchor_path.write_text(
+        json.dumps(
+            anchor,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    damaged_before = _ledger_surface_snapshot(results_parent)
+    with pytest.raises(ValueError, match="advanced|unresolved|pending"):
+        shadow_trial.abort_shadow_day(
+            start_object_id=stranded.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="anchor damage must fail closed",
+        )
+    with pytest.raises(ValueError, match="advanced|unresolved|pending"):
+        shadow_trial.expire_pending_shadow_day()
+    assert damaged_before == _ledger_surface_snapshot(results_parent)
+
+    anchor["committed_head"] = head_of(lines[-1], len(lines) - 1)
+    anchor["pending_next"] = None
+    anchor_path.write_text(
+        json.dumps(
+            anchor,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    object_path = (
+        environment["manual_root"]
+        / "objects"
+        / "manual-shadow-day-start"
+        / f"{stranded.envelope.object_id}.json"
+    )
+    object_path.unlink()
+    journal_before = _ledger_surface_snapshot(results_parent)
+    with pytest.raises(ValueError):
+        shadow_trial.abort_shadow_day(
+            start_object_id=stranded.envelope.object_id,
+            stopped_at_stage="day_start",
+            notes="journal damage must fail closed",
+        )
+    with pytest.raises(ValueError):
+        shadow_trial.expire_pending_shadow_day()
+    assert journal_before == _ledger_surface_snapshot(results_parent)
+
+
+def test_red_cli_closure_commands_are_pinned_fail_closed_and_non_authorizing(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    calendar = _CalendarFake({"2026-08-21"})
+    monkeypatch.setattr(cli_main, "_alpaca_live_client", lambda: calendar)
+    _set_clock(monkeypatch, "2026-08-21")
+
+    abort_help = runner.invoke(app, ["research", "shadow-day-abort", "--help"])
+    assert abort_help.exit_code == 0
+    for forbidden in (
+        "--now",
+        "--ledger-id",
+        "--live-control-path",
+        "--schedule-contract-path",
+        "--automation-root",
+        "--force",
+        "--dry-run",
+        "--market-date",
+    ):
+        assert forbidden not in abort_help.output
+    assert "--stopped-at-stage" in abort_help.output
+    assert "--notes" in abort_help.output
+    expire_help = runner.invoke(app, ["research", "shadow-day-expire-pending", "--help"])
+    assert expire_help.exit_code == 0
+    assert "--now" not in expire_help.output
+
+    abort_parameters = inspect.signature(shadow_trial.abort_shadow_day).parameters
+    assert list(abort_parameters) == ["start_object_id", "stopped_at_stage", "notes", "artifacts"]
+    assert all(item.kind is inspect.Parameter.KEYWORD_ONLY for item in abort_parameters.values())
+    assert abort_parameters["notes"].default is inspect.Parameter.empty
+    assert abort_parameters["artifacts"].default is None
+    assert not inspect.signature(shadow_trial.expire_pending_shadow_day).parameters
+
+    started = runner.invoke(
+        app,
+        ["research", "shadow-day-start", "--run-id", "cli-abort-drill", "--market-date", "2026-08-21", "--json-output"],
+    )
+    assert started.exit_code == 0, started.output
+    start_id = json.loads(started.stdout)["object_id"]
+    calendar_calls_after_start = list(calendar.calls)
+
+    same_date_expire = runner.invoke(app, ["research", "shadow-day-expire-pending", "--json-output"])
+    assert same_date_expire.exit_code == 0, same_date_expire.output
+    assert json.loads(same_date_expire.stdout)["expired"] is False
+
+    bad_stage = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-abort",
+            "--start-object-id", start_id,
+            "--stopped-at-stage", "not-a-real-stage",
+            "--notes", "bad stage",
+        ],
+    )
+    assert bad_stage.exit_code != 0
+
+    aborted = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-abort",
+            "--start-object-id", start_id,
+            "--stopped-at-stage", "safety_sentinel",
+            "--notes", "cli interruption drill",
+            "--json-output",
+        ],
+    )
+    assert aborted.exit_code == 0, aborted.output
+    aborted_payload = json.loads(aborted.stdout)
+    assert aborted_payload["status"] == "failed"
+    assert aborted_payload["phase"] == "repair_required"
+    assert aborted_payload["closure_kind"] == "operator_abort"
+    assert aborted_payload["stopped_at_stage"] == "safety_sentinel"
+    assert aborted_payload["execution_authority"] == "none"
+    assert aborted_payload["can_submit_orders"] is False
+    assert calendar.calls == calendar_calls_after_start + [("2026-08-21", "2026-08-21")]
+
+    duplicate = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-abort",
+            "--start-object-id", start_id,
+            "--stopped-at-stage", "day_start",
+            "--notes", "duplicate closure attempt",
+        ],
+    )
+    assert duplicate.exit_code != 0
+
+    stale_second_start = runner.invoke(
+        app,
+        [
+            "research", "shadow-day-start",
+            "--run-id", "cli-repair-without-predecessor",
+            "--market-date", "2026-08-21",
+        ],
+    )
+    assert stale_second_start.exit_code != 0
+
+
 def test_red_full_ledger_replay_requires_repair_then_fresh_qualification_and_five_days(tmp_path, monkeypatch):
     _configure_environment(monkeypatch, tmp_path)
     qualification_start = _start(monkeypatch, date="2026-08-14")
@@ -2302,3 +3657,339 @@ def test_red_status_fails_closed_on_any_unresolved_pending_next(tmp_path, monkey
     with pytest.raises(ValueError, match="advanced|unresolved|pending"):
         shadow_trial.shadow_streak_status()
     assert advanced_before == _ledger_surface_snapshot(results_parent)
+
+
+def test_red_runtime_identity_fixture_matches_strict_schema(tmp_path):
+    contract, roles, automation_root = _write_schedule_fixture(tmp_path / "schedule")
+    control = _control(tmp_path / "results" / "policy" / "live_control.json")
+    fixture = _runtime_identity_fixture(
+        control=control,
+        contract=contract,
+        roles=roles,
+        automation_root=automation_root,
+    )
+    assert runtime_identity.validate_runtime_identity(copy.deepcopy(fixture)) == fixture
+    with pytest.raises(runtime_identity.RuntimeIdentityError):
+        runtime_identity.validate_runtime_identity(
+            {
+                "schema_version": "runtime_identity_v1",
+                **fixture,
+            }
+        )
+
+
+def test_red_start_and_day_payloads_bind_identical_runtime_identity(tmp_path, monkeypatch):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    expected_identity = environment["runtime_identity"]["value"]
+
+    start = _start(monkeypatch, date="2026-08-21")
+    start_payload = _payload(start)
+    assert shadow_trial._plain_json(start_payload["runtime_identity"]) == expected_identity
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    day_payload = _payload(day)
+    assert day_payload["status"] == "clean"
+    assert shadow_trial._plain_json(day_payload["runtime_identity"]) == expected_identity
+
+
+def test_red_start_refuses_when_identity_capture_is_dirty_or_unparseable(tmp_path, monkeypatch):
+    _configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+
+    def dirty_capture():
+        raise runtime_identity.RuntimeIdentityError("tracked tree is dirty")
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", dirty_capture)
+    with pytest.raises(ValueError, match="dirty"):
+        _start(monkeypatch, date="2026-08-21")
+
+    def malformed_capture():
+        return {"schema_version": "runtime_identity_v1"}
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", malformed_capture)
+    with pytest.raises(ValueError):
+        _start(monkeypatch, date="2026-08-21")
+
+    manual_root = tmp_path / "results" / "manual_shadow"
+    admitted_objects = (
+        list(manual_root.glob("objects/*/*.json")) if manual_root.exists() else []
+    )
+    assert admitted_objects == []
+
+
+def test_red_midday_lockfile_drift_marks_day_failed_with_runtime_identity_mismatch(
+    tmp_path, monkeypatch
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    drifted = copy.deepcopy(environment["runtime_identity"]["value"])
+    drifted["required_files_sha256"]["uv.lock"] = "9" * 64
+    environment["runtime_identity"]["value"] = _recompute_identity_digests(drifted)
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    payload = _payload(day)
+    assert payload["status"] == "failed"
+    assert "runtime_identity_mismatch" in payload["reasons"]
+    assert payload["phase"] == "repair_required"
+
+
+def test_red_cross_day_documentation_only_commit_drift_is_hard_non_clean(
+    tmp_path, monkeypatch
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    qualification_start = _start(monkeypatch, date="2026-08-20")
+    qualification = _day(tmp_path, monkeypatch, qualification_start, date="2026-08-20")
+    assert _payload(qualification)["status"] == "clean"
+
+    drifted = copy.deepcopy(environment["runtime_identity"]["value"])
+    drifted["git_commit"] = "b" * 40
+    environment["runtime_identity"]["value"] = _recompute_identity_digests(drifted)
+
+    trial_start = _start(
+        monkeypatch,
+        date="2026-08-21",
+        predecessor_object_id=qualification.envelope.object_id,
+    )
+    trial_day = _day(tmp_path, monkeypatch, trial_start, date="2026-08-21")
+    payload = _payload(trial_day)
+    assert payload["status"] == "failed"
+    assert "runtime_identity_mismatch" in payload["reasons"]
+    assert payload["phase"] == "repair_required"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda identity: identity["package_inventory"].append(
+                "hostile-drift==9.9.9"
+            ),
+            id="package_inventory",
+        ),
+        pytest.param(
+            lambda identity: identity["overnight_route"].update(
+                {"deep_think_llm": "gpt-5.5-pro"}
+            ),
+            id="overnight_model_route",
+        ),
+        pytest.param(
+            lambda identity: identity["automation_tomls_sha256"].update(
+                {"tradingagents-auto-03": "7" * 64}
+            ),
+            id="automation_toml",
+        ),
+        pytest.param(
+            lambda identity: identity.update({"live_control_sha256": "6" * 64}),
+            id="live_control_bytes",
+        ),
+        pytest.param(
+            lambda identity: identity.update({"schedule_contract_sha256": "5" * 64}),
+            id="schedule_contract",
+        ),
+    ],
+)
+def test_red_identity_surface_drift_each_fails_closed(tmp_path, monkeypatch, mutate):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    start = _start(monkeypatch, date="2026-08-21")
+
+    drifted = copy.deepcopy(environment["runtime_identity"]["value"])
+    mutate(drifted)
+    environment["runtime_identity"]["value"] = _recompute_identity_digests(drifted)
+
+    day = _day(tmp_path, monkeypatch, start, date="2026-08-21")
+    payload = _payload(day)
+    assert payload["status"] == "failed"
+    assert "runtime_identity_mismatch" in payload["reasons"]
+
+
+def test_red_closure_facades_inherit_start_identity_without_recapture(
+    tmp_path, monkeypatch
+):
+    _configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+    start = _start(monkeypatch, date="2026-08-21")
+    inherited_identity = _payload(start)["runtime_identity"]
+
+    def unavailable_capture():
+        raise runtime_identity.RuntimeIdentityError(
+            "tracked tree became dirty after start"
+        )
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", unavailable_capture)
+    aborted = shadow_trial.abort_shadow_day(
+        start_object_id=start.envelope.object_id,
+        stopped_at_stage="paper_tournament",
+        notes="crashed after the paper tick; source tree became dirty",
+    )
+    abort_payload = _payload(aborted)
+    assert abort_payload["runtime_identity"] == inherited_identity
+    assert abort_payload["status"] == "failed"
+    assert "runtime_identity_mismatch" not in abort_payload["reasons"]
+
+    _configure_environment(monkeypatch, tmp_path / "fresh-expiry-root")
+    expire_start = _start(monkeypatch, date="2026-08-24")
+    expire_inherited = _payload(expire_start)["runtime_identity"]
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", unavailable_capture)
+    _set_clock(monkeypatch, "2026-08-25", 14)
+    expired = shadow_trial.expire_pending_shadow_day()
+    assert expired is not None
+    expired_payload = _payload(expired)
+    assert expired_payload["runtime_identity"] == expire_inherited
+    assert expired_payload["status"] == "incomplete"
+    assert list(expired_payload["reasons"]) == [
+        "pending_day_expired_without_adjudication"
+    ]
+    assert "runtime_identity_mismatch" not in expired_payload["reasons"]
+
+
+def test_red_runtime_identity_adjudication_refusal_admits_nothing(
+    tmp_path, monkeypatch
+):
+    environment = _configure_environment(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_capture_calendar_evidence",
+        lambda market_date: _calendar(market_date),
+    )
+    start = _start(monkeypatch, date="2026-08-21")
+    artifacts = _complete_daily_chain(
+        tmp_path,
+        start=start,
+        artifacts=_artifacts(
+            tmp_path,
+            run_id=_payload(start)["run_id"],
+            date="2026-08-21",
+            start_object_id=start.envelope.object_id,
+        ),
+    )
+    results_parent = environment["manual_root"].parent
+    before = _ledger_surface_snapshot(results_parent)
+
+    def unavailable_capture():
+        raise runtime_identity.RuntimeIdentityError("tracked tree dirty midday")
+
+    monkeypatch.setattr(shadow_trial, "_runtime_identity_capture", unavailable_capture)
+    with pytest.raises(ValueError, match="runtime identity"):
+        shadow_trial.adjudicate_shadow_day(
+            start_object_id=start.envelope.object_id,
+            artifacts={
+                name: artifacts[name]
+                for name in ("safety_sentinel", "paper_tournament", "daily_chain_manifest")
+            },
+        )
+    assert before == _ledger_surface_snapshot(results_parent)
+
+
+def test_red_runtime_identity_production_seam_binds_exact_canonical_inputs(monkeypatch):
+    for environment_key in (
+        "TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER",
+        "TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM",
+        "TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM",
+    ):
+        monkeypatch.delenv(environment_key, raising=False)
+    captured_kwargs: dict[str, object] = {}
+
+    def recording_capture(**kwargs):
+        captured_kwargs.update(kwargs)
+        return {"identity_schema": "runtime_identity/v1"}
+
+    monkeypatch.setattr(shadow_trial, "capture_runtime_identity", recording_capture)
+    monkeypatch.setattr(
+        shadow_trial,
+        "_installed_package_inventory",
+        lambda: ["fixture-package==1.0.0"],
+    )
+    identity = shadow_trial._runtime_identity_capture()
+
+    assert identity == {"identity_schema": "runtime_identity/v1"}
+    root = shadow_trial._repo_root()
+    assert captured_kwargs["repo_root"] == root
+    assert set(captured_kwargs["required_files"]) == {
+        "pyproject.toml",
+        "uv.lock",
+        "requirements.txt",
+        "requirements-crawler.txt",
+    }
+    assert all(
+        Path(path) == root / name
+        for name, path in captured_kwargs["required_files"].items()
+    )
+    assert Path(captured_kwargs["schedule_contract"]) == (
+        shadow_trial._canonical_schedule_contract_path()
+    )
+    assert Path(captured_kwargs["role_contract"]) == (
+        shadow_trial._canonical_role_contract_path()
+    )
+    assert Path(captured_kwargs["live_control"]) == (
+        shadow_trial._canonical_live_control_path()
+    )
+    automation_root = Path(
+        shadow_trial._absolute(shadow_trial._canonical_automation_root())
+    )
+    assert Path(captured_kwargs["automation_root"]) == automation_root
+    assert set(captured_kwargs["automation_tomls"]) == set(
+        shadow_trial.EXPECTED_AUTOMATION_IDS
+    )
+    assert len(captured_kwargs["automation_tomls"]) == 10
+    assert all(
+        Path(path) == automation_root / automation_id / "automation.toml"
+        for automation_id, path in captured_kwargs["automation_tomls"].items()
+    )
+    assert captured_kwargs["schema_versions"] == {
+        "manual_shadow_day_start": shadow_trial.START_SCHEMA,
+        "manual_shadow_day_result": shadow_trial.DAY_SCHEMA,
+        "manual_shadow_final_report": shadow_trial.REPORT_SCHEMA,
+    }
+    assert captured_kwargs["provider_routes"] == {}
+    assert captured_kwargs["python_executable"] == sys.executable
+    inventory = shadow_trial._installed_package_inventory()
+    assert inventory == sorted(set(inventory))
+    assert all(entry == entry.strip().lower() for entry in inventory)
+    assert all("==" in entry for entry in inventory)
+    route = shadow_trial._allowlisted_overnight_route()
+    assert set(route) == {"llm_provider", "quick_think_llm", "deep_think_llm"}
+    from tradingagents.llm_clients.model_catalog import MODEL_OPTIONS
+
+    options = MODEL_OPTIONS[route["llm_provider"].lower()]
+    assert route["quick_think_llm"] in {name for _, name in options["quick"]}
+    assert route["deep_think_llm"] in {name for _, name in options["deep"]}
+
+
+def test_red_runtime_identity_seam_refuses_non_allowlisted_route(monkeypatch):
+    monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM", "gpt-5.6-terra")
+    with pytest.raises(runtime_identity.RuntimeIdentityError, match="allowlisted"):
+        shadow_trial._allowlisted_overnight_route()
+
+
+def test_red_runtime_identity_overnight_route_binds_configured_names_only(monkeypatch):
+    for environment_key in (
+        "TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER",
+        "TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM",
+        "TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM",
+    ):
+        monkeypatch.delenv(environment_key, raising=False)
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    configured_defaults = {
+        "llm_provider": str(DEFAULT_CONFIG["llm_provider"]),
+        "quick_think_llm": str(DEFAULT_CONFIG["quick_think_llm"]),
+        "deep_think_llm": str(DEFAULT_CONFIG["deep_think_llm"]),
+    }
+    assert shadow_trial._allowlisted_overnight_route() == configured_defaults
+
+    monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM", "gpt-5.4-nano")
+    monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM", "gpt-5.5")
+    assert shadow_trial._allowlisted_overnight_route() == {
+        "llm_provider": configured_defaults["llm_provider"],
+        "quick_think_llm": "gpt-5.4-nano",
+        "deep_think_llm": "gpt-5.5",
+    }
