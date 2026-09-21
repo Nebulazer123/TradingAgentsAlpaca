@@ -41,7 +41,7 @@ brokers into policy, and execution into brokers.
 | Context refresh | `.venv/bin/python scripts/automation_context_snapshot.py --write` |
 | n8n runner | `.venv/bin/python -m tradingagents.orchestration.n8n_runner` |
 | Mac scheduled job | `scripts/mac/ta_job.sh <job>` |
-| launchd installation | `scripts/mac/install_launchd.sh` |
+| Retired launchd installer | `scripts/mac/install_launchd.sh --help` (all installation actions fail closed; use the Codex-managed schedule) |
 | Focused tests | `.venv/bin/python -m pytest <test paths> -q` |
 | Static checks | `.venv/bin/ruff check cli tradingagents scripts tests` |
 

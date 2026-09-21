@@ -23,6 +23,16 @@
 
 ## Current continuation — verified 2026-09-07
 
+**User-priority source repair — 2026-09-14:** Before visualization, resolve the
+verified scheduling/dry-run/documentation contradictions described in
+[the conflict checkpoint](../checkpoints/2026-09-14-schedule-conflict-repair.md).
+The new wrapper regression and 125-test affected gate pass; a new exact-candidate
+full source gate is required before integration. The accepted 81b7463 receipt
+is preserved, not replayed or relabeled. The historical failed 67-path merge is
+explicit recovery evidence; its reviewed root-correct resolution already exists
+in canonical history. Preserve it unless its specific retention boundary is
+explicitly released. No operational authority or original phase requirement changes.
+
 **Latest data checkpoint — 2026-09-14, authorized read-only collection:** The
 user answered the pending SEC/additional Alpaca collection request. That bounded
 collection is complete: 298 retained responses, 297 raw archive objects, 81 SEC
@@ -875,7 +885,7 @@ Do not change automation status. Prepare, but do not execute, the future activat
 - [ ] Existing learning ledger reaches a deterministic source-bound fixed point with suspect/degraded/dependence disclosures.
 - [ ] Minimum research-stack benchmark selects the simplest registered winning lane or records a valid no-model result.
 - [ ] July `GO`, old promotion state, and expired tournament are preserved and superseded; every sleeve is paper-only/live-disabled.
-- [x] Final source candidate `81b7463` passes the single corrected complete repository gate and is re-indexed; exact scope/coverage is in the 2026-09-14 final source checkpoint. Real evidence and operational acceptance remain separate.
+- [ ] Re-freeze the source candidate after the user-priority wrapper conflict repair. The prior `81b7463` complete gate remains accepted for its inputs; the new exact-candidate gate must pass before integration. Real evidence and operational acceptance remain separate.
 - [ ] One clean qualifier and five clean trial sessions produce exactly one terminal non-authorizing readiness record.
 - [ ] `results/policy/live_control.json` still hashes to `a3fc5ddb...fb07`.
 - [ ] All ten TradingAgents automations are still `PAUSED` with the accepted hashes.
