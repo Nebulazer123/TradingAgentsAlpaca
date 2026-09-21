@@ -1,6 +1,8 @@
 import datetime
+import hashlib
 import json
 from decimal import Decimal
+from pathlib import Path
 from threading import Event, Thread
 from types import SimpleNamespace
 
@@ -21,6 +23,7 @@ from tradingagents.brokers.paper_tournament import (
     build_popular_strategy_scorecards,
     build_tournament_report,
     compact_tournament_ledger_payload,
+    fingerprint_expired_tournament_ledger,
     initialize_tournament,
     load_live_strategy_selection,
     maybe_write_live_strategy_selection,
@@ -29,6 +32,15 @@ from tradingagents.brokers.paper_tournament import (
 )
 
 runner = CliRunner()
+
+
+def _market_calendar_entry(date_text, open_text="09:30", close_text="16:00"):
+    return {"date": date_text, "open": open_text, "close": close_text}
+
+
+REGULAR_WEEK_CALENDAR = [
+    _market_calendar_entry(f"2026-06-0{day}") for day in range(1, 6)
+]
 
 
 class _FakePaperClient:
@@ -42,6 +54,7 @@ class _FakePaperClient:
         self.orders = []
         self.clock = {"is_open": True, "timestamp": "2026-06-02T18:00:00+00:00"}
         self.clock_calls = 0
+        self.calendar = [dict(entry) for entry in REGULAR_WEEK_CALENDAR]
         self.positions = [
             {
                 "symbol": "GOOGL",
@@ -80,8 +93,10 @@ class _FakePaperClient:
         return list(self.orders)
 
     def list_calendar(self, *, start, end):
-        assert start == end
-        return [{"date": start}]
+        assert start <= end
+        return [
+            dict(entry) for entry in self.calendar if start <= entry["date"] <= end
+        ]
 
     def get_clock(self):
         self.clock_calls += 1
@@ -297,6 +312,8 @@ def test_paper_tournament_run_submits_strategy_prefixed_paper_orders(monkeypatch
         paper_positions=[],
         capital_per_strategy=Decimal("10000"),
         now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+        max_submission_market_days=5,
+        market_calendar=paper_client.calendar,
     )
     write_tournament_ledger(ledger, tmp_path)
 
@@ -365,6 +382,7 @@ def _current_trial_ledger(paper_client, *, max_submission_market_days=5):
         now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
         duration_days=31,
         max_submission_market_days=max_submission_market_days,
+        market_calendar=paper_client.calendar,
     )
 
 
@@ -428,10 +446,385 @@ def test_initialize_tournament_records_bounded_submission_lease():
     ledger = _current_trial_ledger(_FakePaperClient(), max_submission_market_days=5)
 
     assert ledger["authorized_market_day_limit"] == 5
+    assert ledger["authorized_market_dates"] == REGULAR_WEEK_CALENDAR
     assert ledger["submitted_market_dates"] == []
     assert ledger["submission_window_status"] == "open"
     assert ledger["ledger_type"] == "qualification_paper_trial"
     assert ledger["submission_lease_evidence"]
+
+
+def _trial_ledger_with_calendar(paper_client, *, calendar=None, **overrides):
+    arguments = {
+        "paper_account": paper_client.get_account(),
+        "paper_positions": [],
+        "capital_per_strategy": Decimal("10000"),
+        "now": datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+        "duration_days": 31,
+        "max_submission_market_days": 5,
+        "market_calendar": paper_client.calendar if calendar is None else calendar,
+    }
+    arguments.update(overrides)
+    return initialize_tournament(**arguments)
+
+
+def test_red_initialize_tournament_admits_authenticated_market_days_with_fifth_close_expiry():
+    paper_client = _FakePaperClient()
+    ledger = _trial_ledger_with_calendar(paper_client)
+
+    assert ledger["authorized_market_dates"] == REGULAR_WEEK_CALENDAR
+    assert ledger["ends_at"] == "2026-06-05T20:00:00+00:00"
+
+    tampered = json.loads(json.dumps(ledger))
+    tampered["authorized_market_dates"][2]["close"] = "16:30"
+    assert (
+        paper_tournament._submission_lease_evidence(tampered)
+        != ledger["submission_lease_evidence"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("calendar", "duration_days", "max_days"),
+    [
+        ([], 31, 5),
+        (REGULAR_WEEK_CALENDAR, 31, 31),
+        ([dict(entry) for entry in REGULAR_WEEK_CALENDAR[:4]], 31, 5),
+        ([_market_calendar_entry("2026-06-01"), {"date": "2026-06-02"}], 31, 5),
+        ([_market_calendar_entry("2026-06-01"), _market_calendar_entry("2026-06-02", open_text="9:30")], 31, 5),
+        ([_market_calendar_entry("2026-06-01", close_text="")], 31, 5),
+        ([_market_calendar_entry("2026-06-01", open_text="16:00", close_text="09:30")], 31, 5),
+        ([_market_calendar_entry("20260601")], 31, 5),
+        ([_market_calendar_entry("2026-06-01"), _market_calendar_entry("2026-06-01")], 31, 5),
+        (["2026-06-01"], 31, 5),
+        (("not-a-sequence-of-mappings",), 31, 5),
+    ],
+    ids=[
+        "missing",
+        "capacity-exceeds-authenticated-evidence",
+        "insufficient-market-days",
+        "malformed-entry-fields",
+        "malformed-open-time",
+        "missing-close-time",
+        "open-at-or-after-close",
+        "malformed-date",
+        "duplicated-date",
+        "non-mapping-entry",
+        "non-sequence-calendar",
+    ],
+)
+def test_red_initialize_tournament_fails_closed_on_unauthenticated_calendar_evidence(
+    calendar, duration_days, max_days
+):
+    paper_client = _FakePaperClient()
+
+    with pytest.raises(ValueError, match="calendar evidence"):
+        initialize_tournament(
+            paper_account=paper_client.get_account(),
+            paper_positions=[],
+            capital_per_strategy=Decimal("10000"),
+            now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+            duration_days=duration_days,
+            max_submission_market_days=max_days,
+            market_calendar=calendar,
+        )
+
+
+def test_red_legacy_ledger_without_calendar_evidence_cannot_admit_submissions():
+    paper_client = _FakePaperClient()
+    ledger = initialize_tournament(
+        paper_account=paper_client.get_account(),
+        paper_positions=[],
+        capital_per_strategy=Decimal("10000"),
+        now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+    assert ledger["authorized_market_dates"] == []
+    now = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": now.isoformat()}
+
+    with pytest.raises(ValueError, match="no admitted market-day calendar evidence"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=now,
+        )
+    assert paper_client.clock_calls == 0
+    assert paper_client.submitted == []
+
+
+def test_red_initialize_tournament_uses_calendar_early_close_for_the_final_market_close():
+    paper_client = _FakePaperClient()
+    early_close_calendar = [
+        _market_calendar_entry(f"2026-06-0{day}") for day in range(1, 5)
+    ] + [_market_calendar_entry("2026-06-05", close_text="13:00")]
+    paper_client.calendar = [dict(entry) for entry in early_close_calendar]
+
+    ledger = _trial_ledger_with_calendar(paper_client)
+
+    assert ledger["authorized_market_dates"][4]["close"] == "13:00"
+    assert ledger["ends_at"] == "2026-06-05T17:00:00+00:00"
+
+
+def _weekday_market_calendar(start_date, count):
+    sessions = []
+    day = start_date
+    while len(sessions) < count:
+        if day.weekday() < 5:
+            sessions.append(_market_calendar_entry(day.isoformat()))
+        day += datetime.timedelta(days=1)
+    return sessions
+
+
+def test_red_default_limits_admit_full_session_count_with_ceiling_bound_ends_at():
+    sessions = _weekday_market_calendar(datetime.date(2026, 6, 1), 40)
+
+    ledger = initialize_tournament(
+        paper_account={"status": "ACTIVE", "equity": "100000"},
+        paper_positions=[],
+        capital_per_strategy=Decimal("10000"),
+        now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+        market_calendar=sessions,
+    )
+
+    assert ledger["authorized_market_day_limit"] == 31
+    assert len(ledger["authorized_market_dates"]) == 31
+    assert ledger["authorized_market_dates"][0]["date"] == "2026-06-01"
+    assert ledger["authorized_market_dates"][-1]["date"] == "2026-07-13"
+    assert ledger["lease_window_days"] == 31
+    assert ledger["ends_at"] == "2026-07-02T18:00:00+00:00"
+
+    tampered = json.loads(json.dumps(ledger))
+    tampered["ends_at"] = "2026-07-13T20:00:00+00:00"
+    assert (
+        paper_tournament._submission_lease_evidence(tampered)
+        != ledger["submission_lease_evidence"]
+    )
+    paper_client = _FakePaperClient()
+    with pytest.raises(ValueError, match="does not match ledger"):
+        paper_tournament.validate_submission_lease(
+            tampered,
+            paper_client=paper_client,
+            now=datetime.datetime(2026, 7, 13, 18, 0, tzinfo=datetime.timezone.utc),
+        )
+    assert paper_client.clock_calls == 0
+
+
+def test_red_admission_rejects_session_beyond_wall_clock_ceiling():
+    sessions = _weekday_market_calendar(datetime.date(2026, 6, 1), 40)
+    paper_client = _FakePaperClient()
+    paper_client.calendar = [dict(entry) for entry in sessions]
+    ledger = initialize_tournament(
+        paper_account=paper_client.get_account(),
+        paper_positions=[],
+        capital_per_strategy=Decimal("10000"),
+        now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+        market_calendar=sessions,
+    )
+    beyond_ceiling_day = datetime.datetime(
+        2026, 7, 13, 18, 0, tzinfo=datetime.timezone.utc
+    )
+    paper_client.clock = {"is_open": True, "timestamp": beyond_ceiling_day.isoformat()}
+
+    with pytest.raises(ValueError, match="beyond the lease wall-clock ceiling"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=beyond_ceiling_day,
+        )
+    assert paper_client.clock_calls == 0
+
+
+def test_red_forged_ends_at_with_rehashed_evidence_is_rejected():
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client)
+    forged = json.loads(json.dumps(ledger))
+    forged["ends_at"] = "2026-07-01T18:00:00+00:00"
+
+    with pytest.raises(ValueError, match="does not match ledger"):
+        paper_tournament.validate_submission_lease(
+            forged,
+            paper_client=paper_client,
+            now=datetime.datetime(2026, 6, 4, 18, 0, tzinfo=datetime.timezone.utc),
+        )
+
+    forged["submission_lease_evidence"] = paper_tournament._submission_lease_evidence(forged)
+    with pytest.raises(ValueError, match="inconsistent with the admitted market-day evidence"):
+        paper_tournament.validate_submission_lease(
+            forged,
+            paper_client=paper_client,
+            now=datetime.datetime(2026, 6, 4, 18, 0, tzinfo=datetime.timezone.utc),
+        )
+    assert paper_client.clock_calls == 0
+
+    intact_now = datetime.datetime(2026, 6, 4, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": intact_now.isoformat()}
+    assert paper_tournament.validate_submission_lease(
+        json.loads(json.dumps(ledger)),
+        paper_client=paper_client,
+        now=intact_now,
+    ) == "2026-06-04"
+
+
+def test_red_submission_admission_uses_admitted_market_dates_not_elapsed_wall_clock():
+    paper_client = _FakePaperClient()
+    ledger = _trial_ledger_with_calendar(paper_client)
+    third_market_day = datetime.datetime(2026, 6, 4, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": third_market_day.isoformat()}
+
+    assert paper_tournament.validate_submission_lease(
+        ledger,
+        paper_client=paper_client,
+        now=third_market_day,
+    ) == "2026-06-04"
+
+    holiday_calendar = [
+        _market_calendar_entry("2026-06-01"),
+        _market_calendar_entry("2026-06-02"),
+        _market_calendar_entry("2026-06-03"),
+        _market_calendar_entry("2026-06-05"),
+        _market_calendar_entry("2026-06-08"),
+    ]
+    paper_client.calendar = [dict(entry) for entry in holiday_calendar]
+    holiday_ledger = _trial_ledger_with_calendar(paper_client, calendar=holiday_calendar)
+    fifth_market_day = datetime.datetime(2026, 6, 8, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": fifth_market_day.isoformat()}
+
+    assert holiday_ledger["ends_at"] == "2026-06-08T20:00:00+00:00"
+    assert paper_tournament.validate_submission_lease(
+        holiday_ledger,
+        paper_client=paper_client,
+        now=fifth_market_day,
+    ) == "2026-06-08"
+
+
+@pytest.mark.parametrize(
+    "now_text",
+    ["2026-05-29T18:00:00+00:00", "2026-06-06T18:00:00+00:00", "2026-06-08T18:00:00+00:00"],
+    ids=["before-first-admitted-day", "weekend-inside-window", "sixth-market-day"],
+)
+def test_red_submission_fails_closed_outside_admitted_market_day_calendar(now_text):
+    paper_client = _FakePaperClient()
+    ledger = _trial_ledger_with_calendar(paper_client)
+    outside = datetime.datetime.fromisoformat(now_text)
+    paper_client.clock = {"is_open": True, "timestamp": outside.isoformat()}
+
+    with pytest.raises(ValueError, match="outside the admitted market-day calendar"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=outside,
+        )
+    assert paper_client.clock_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("live_calendar", "reason"),
+    [
+        ([], "missing"),
+        ([{"date": "2026-06-02"}], "malformed"),
+        ([_market_calendar_entry("2026-06-02", close_text="16:30")], "changed"),
+        (
+            [
+                _market_calendar_entry("2026-06-02"),
+                _market_calendar_entry("2026-06-02"),
+            ],
+            "duplicated",
+        ),
+    ],
+    ids=["missing-today-entry", "malformed-entry", "changed-session-times", "duplicated-entry"],
+)
+def test_red_submission_fails_closed_on_broker_calendar_evidence_defects(live_calendar, reason):
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client)
+    paper_client.calendar = list(live_calendar)
+
+    with pytest.raises(ValueError, match="broker calendar evidence"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc),
+        )
+    assert paper_client.clock_calls == 0
+
+
+def test_red_submission_fails_closed_when_broker_calendar_transport_is_unavailable():
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client)
+
+    def broken_calendar(*, start, end):
+        raise RuntimeError("calendar transport down")
+
+    paper_client.list_calendar = broken_calendar
+
+    with pytest.raises(ValueError, match="broker calendar check failed"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc),
+        )
+    assert paper_client.clock_calls == 0
+
+
+def test_red_early_close_session_bounds_come_from_calendar_evidence():
+    paper_client = _FakePaperClient()
+    early_close_calendar = [
+        _market_calendar_entry(f"2026-06-0{day}") for day in range(1, 5)
+    ] + [_market_calendar_entry("2026-06-05", close_text="13:00")]
+    paper_client.calendar = [dict(entry) for entry in early_close_calendar]
+    ledger = _trial_ledger_with_calendar(paper_client)
+
+    after_early_close = datetime.datetime(2026, 6, 5, 17, 59, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": after_early_close.isoformat()}
+    with pytest.raises(ValueError, match="outside the regular session"):
+        paper_tournament.validate_submission_lease(
+            ledger,
+            paper_client=paper_client,
+            now=after_early_close,
+        )
+
+    before_early_close = datetime.datetime(2026, 6, 5, 16, 59, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": before_early_close.isoformat()}
+    assert paper_tournament.validate_submission_lease(
+        ledger,
+        paper_client=paper_client,
+        now=before_early_close,
+    ) == "2026-06-05"
+
+
+def test_red_cli_init_persists_admitted_market_days_that_bind_later_submissions(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    initialized = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "init",
+            "--max-submission-market-days", "5",
+            "--json-output",
+            "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert initialized.exit_code == 0, initialized.output
+    persisted = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert persisted["authorized_market_dates"] == REGULAR_WEEK_CALENDAR
+    assert persisted["ends_at"] == "2026-06-05T20:00:00+00:00"
+    assert persisted["authorized_market_day_limit"] == 5
+
+    _configure_current_submit(monkeypatch, paper_client)
+    submitted = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert submitted.exit_code == 0, submitted.output
+    assert len(paper_client.submitted) == 1
 
 
 def test_paper_tournament_init_bounds_submission_window_options(monkeypatch, tmp_path):
@@ -740,11 +1133,11 @@ def test_submission_lease_brackets_broker_clock_with_post_response_policy_time()
         )
 
 
-def test_submission_lease_uses_post_response_policy_time_for_expiry_and_clock_order():
+def test_submission_lease_post_response_policy_time_governs_session_boundary_and_order():
     paper_client = _FakePaperClient()
-    before_expiry = datetime.datetime(2026, 6, 2, 17, 59, 59, tzinfo=datetime.timezone.utc)
-    after_expiry = datetime.datetime(2026, 6, 2, 18, 0, 1, tzinfo=datetime.timezone.utc)
-    paper_client.clock = {"is_open": True, "timestamp": before_expiry.isoformat()}
+    before_close = datetime.datetime(2026, 6, 1, 19, 59, 59, tzinfo=datetime.timezone.utc)
+    after_close = datetime.datetime(2026, 6, 1, 20, 0, 1, tzinfo=datetime.timezone.utc)
+    paper_client.clock = {"is_open": True, "timestamp": before_close.isoformat()}
     ledger = initialize_tournament(
         paper_account=paper_client.get_account(),
         paper_positions=[],
@@ -752,21 +1145,23 @@ def test_submission_lease_uses_post_response_policy_time_for_expiry_and_clock_or
         now=datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
         duration_days=1,
         max_submission_market_days=1,
+        market_calendar=paper_client.calendar[:1],
     )
+    assert ledger["ends_at"] == "2026-06-01T20:00:00+00:00"
 
-    with pytest.raises(ValueError, match="expired"):
+    with pytest.raises(ValueError, match="outside the regular session"):
         paper_tournament.validate_submission_lease(
             ledger,
             paper_client=paper_client,
-            now=before_expiry,
-            post_clock_now=lambda: after_expiry,
+            now=before_close,
+            post_clock_now=lambda: after_close,
         )
     with pytest.raises(ValueError, match="moved backwards"):
         paper_tournament.validate_submission_lease(
             _current_trial_ledger(paper_client),
             paper_client=paper_client,
-            now=before_expiry,
-            post_clock_now=lambda: before_expiry - datetime.timedelta(milliseconds=1),
+            now=before_close,
+            post_clock_now=lambda: before_close - datetime.timedelta(milliseconds=1),
         )
 
 
@@ -1359,6 +1754,577 @@ def test_paper_tournament_finalize_rejects_duplicate_or_missing_order_evidence(m
     assert json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))["submission_window_status"] == "open"
 
 
+class _RecordingPaperClient(_FakePaperClient):
+    """Fake client that records every broker read so tests can prove zero transport."""
+
+    def __init__(self):
+        super().__init__()
+        self.read_calls = []
+
+    def get_account(self):
+        self.read_calls.append("get_account")
+        return super().get_account()
+
+    def list_positions(self):
+        self.read_calls.append("list_positions")
+        return super().list_positions()
+
+    def list_orders(self, status="open", **kwargs):
+        self.read_calls.append(f"list_orders:{status}")
+        return super().list_orders(status=status)
+
+    def list_calendar(self, *, start, end):
+        self.read_calls.append("list_calendar")
+        return super().list_calendar(start=start, end=end)
+
+    def get_clock(self):
+        self.read_calls.append("get_clock")
+        return super().get_clock()
+
+
+def _loaded_ledger(output_dir):
+    return json.loads((Path(output_dir) / LEDGER_FILE).read_text(encoding="utf-8"))
+
+
+def _persist_recovery_required_root(paper_client, tmp_path) -> None:
+    """Submit one real order through the durable transaction, then seal recovery."""
+
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    payload = {
+        "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+        "symbol": "NVDA",
+        "side": "buy",
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": "218.43",
+        "notional": "1000.00",
+        "extended_hours": False,
+        "client_order_id": "ta-paperbot-current-aggressive-recovery-20260602",
+        "reason": "simulated accepted post before process loss",
+    }
+    submit_now = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    ledger = _loaded_ledger(tmp_path)
+    paper_tournament.begin_submission_transaction(
+        ledger,
+        market_date="2026-06-02",
+        payloads=[payload],
+        now=submit_now,
+    )
+    response = paper_client.submit_order(
+        {key: value for key, value in payload.items() if key not in {"strategy_id", "reason"}}
+    )
+    paper_tournament.record_submission_response(
+        ledger,
+        payload=payload,
+        response=response,
+        market_date="2026-06-02",
+        now=submit_now,
+    )
+    paper_tournament.complete_submission_transaction(
+        ledger,
+        now=submit_now + datetime.timedelta(minutes=1),
+    )
+    paper_tournament.mark_submission_recovery_required(
+        ledger,
+        reason="simulated uncertain re-post before process loss",
+        now=submit_now + datetime.timedelta(minutes=2),
+    )
+    write_tournament_ledger(ledger, tmp_path)
+
+
+def test_red_abort_submission_lease_permanently_retires_recovery_required_root(monkeypatch, tmp_path):
+    paper_client = _RecordingPaperClient()
+    _persist_recovery_required_root(paper_client, tmp_path)
+    _configure_current_submit(monkeypatch, paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 2, 18, 5, tzinfo=datetime.timezone.utc),
+    )
+
+    reads_after_submit = list(paper_client.read_calls)
+
+    aborted = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "abort-submission-lease",
+            "--reason", "operator retired the uncertain root",
+            "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert aborted.exit_code == 0, aborted.output
+    packet = json.loads(aborted.stdout)
+    assert packet["kind"] == "paper_tournament_abort"
+    assert packet["submission_window_status"] == "aborted"
+    updated = _loaded_ledger(tmp_path)
+    assert updated["submission_window_status"] == "aborted"
+    assert updated["submission_transaction"]["status"] == "aborted"
+    assert updated["submission_abortion"]["reason"] == "operator retired the uncertain root"
+    assert updated["submitted_market_dates"] == ["2026-06-02"]
+
+    retry = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert retry.exit_code != 0
+    finalized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "finalize", "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert finalized.exit_code != 0
+    repeated_abort = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "abort-submission-lease",
+            "--reason", "second attempt must refuse",
+            "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert repeated_abort.exit_code != 0
+    final_ledger = _loaded_ledger(tmp_path)
+    assert final_ledger["submission_window_status"] == "aborted"
+    # Retirement made no broker call: reads are exactly the original submission path.
+    assert paper_client.read_calls == reads_after_submit
+    assert len(paper_client.submitted) == 1
+
+
+def test_red_abort_submission_lease_refuses_open_and_finalized_roots(monkeypatch, tmp_path):
+    paper_client = _RecordingPaperClient()
+    write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: datetime.datetime(2026, 6, 2, 18, 10, tzinfo=datetime.timezone.utc))
+
+    refused_open = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "abort-submission-lease",
+            "--reason", "must refuse healthy roots",
+            "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert refused_open.exit_code != 0
+    unchanged = _loaded_ledger(tmp_path)
+    assert unchanged["submission_window_status"] == "open"
+    assert "submission_abortion" not in unchanged
+
+    _configure_current_submit(monkeypatch, paper_client)
+    submitted = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "run", "--strategy", STRATEGY_CURRENT_AGGRESSIVE,
+            "--submit-actions", "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+    assert submitted.exit_code == 0, submitted.output
+    finalized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "finalize", "--json-output", "--log-dir", str(tmp_path)],
+    )
+    assert finalized.exit_code == 0, finalized.output
+
+    refused_finalized = runner.invoke(
+        app,
+        [
+            "alpaca", "paper-tournament", "abort-submission-lease",
+            "--reason", "must refuse finalized roots",
+            "--json-output", "--log-dir", str(tmp_path),
+        ],
+    )
+
+    assert refused_finalized.exit_code != 0
+    assert _loaded_ledger(tmp_path)["submission_window_status"] == "finalized"
+
+    missing_reason = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "abort-submission-lease", "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert missing_reason.exit_code != 0
+
+
+def test_red_abort_submission_lease_unit_guards_fail_closed():
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client)
+    now = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+
+    with pytest.raises(ValueError, match="recovery"):
+        paper_tournament.abort_submission_lease(ledger, reason="healthy root", now=now)
+
+    paper_tournament.begin_submission_transaction(
+        ledger,
+        market_date="2026-06-02",
+        payloads=[
+            {
+                "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+                "symbol": "NVDA",
+                "side": "buy",
+                "type": "limit",
+                "time_in_force": "day",
+                "limit_price": "218.43",
+                "notional": "1000.00",
+                "extended_hours": False,
+                "client_order_id": "ta-paperbot-current-aggressive-unitguard-20260602",
+                "reason": "unit guard",
+            }
+        ],
+        now=now,
+    )
+    paper_tournament.mark_submission_recovery_required(
+        ledger,
+        reason="simulated uncertainty",
+        now=now + datetime.timedelta(minutes=1),
+    )
+
+    with pytest.raises(ValueError, match="monotonic"):
+        paper_tournament.abort_submission_lease(
+            ledger,
+            reason="backwards clock",
+            now=now,
+        )
+
+    with pytest.raises(ValueError, match="reason"):
+        paper_tournament.abort_submission_lease(
+            ledger,
+            reason="   ",
+            now=now + datetime.timedelta(minutes=2),
+        )
+
+    abortion = paper_tournament.abort_submission_lease(
+        ledger,
+        reason="retire root",
+        now=now + datetime.timedelta(minutes=2),
+    )
+
+    assert abortion["status"] == "aborted"
+    assert ledger["submission_window_status"] == "aborted"
+    assert ledger["submission_transaction"]["status"] == "aborted"
+    with pytest.raises(ValueError, match="recovery|aborted"):
+        paper_tournament.abort_submission_lease(ledger, reason="again", now=now + datetime.timedelta(minutes=3))
+
+
+def test_red_mark_recovery_required_cannot_revive_an_aborted_root(monkeypatch):
+    import copy
+
+    paper_client = _FakePaperClient()
+    ledger = _current_trial_ledger(paper_client)
+    now = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    paper_tournament.begin_submission_transaction(
+        ledger,
+        market_date="2026-06-02",
+        payloads=[
+            {
+                "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+                "symbol": "NVDA",
+                "side": "buy",
+                "type": "limit",
+                "time_in_force": "day",
+                "limit_price": "218.43",
+                "notional": "1000.00",
+                "extended_hours": False,
+                "client_order_id": "ta-paperbot-current-aggressive-revival-20260602",
+                "reason": "revival guard",
+            }
+        ],
+        now=now,
+    )
+    paper_tournament.mark_submission_recovery_required(
+        ledger,
+        reason="simulated uncertainty",
+        now=now + datetime.timedelta(minutes=1),
+    )
+    abortion = paper_tournament.abort_submission_lease(
+        ledger,
+        reason="retire root",
+        now=now + datetime.timedelta(minutes=2),
+    )
+    assert abortion["status"] == "aborted"
+    snapshot = copy.deepcopy(ledger)
+
+    with pytest.raises(ValueError, match="aborted"):
+        paper_tournament.mark_submission_recovery_required(
+            ledger,
+            reason="direct revival attempt",
+            now=now + datetime.timedelta(minutes=3),
+        )
+
+    assert ledger == snapshot
+    with pytest.raises(ValueError, match="aborted"):
+        paper_tournament.abort_submission_lease(
+            ledger,
+            reason="second retirement attempt",
+            now=now + datetime.timedelta(minutes=3),
+        )
+    assert ledger == snapshot
+
+
+def test_red_write_refuses_replacing_an_aborted_root_ledger(tmp_path):
+    paper_client = _FakePaperClient()
+    now = datetime.datetime(2026, 6, 2, 18, 0, tzinfo=datetime.timezone.utc)
+    ledger = _current_trial_ledger(paper_client)
+    paper_tournament.begin_submission_transaction(
+        ledger,
+        market_date="2026-06-02",
+        payloads=[
+            {
+                "strategy_id": STRATEGY_CURRENT_AGGRESSIVE,
+                "symbol": "NVDA",
+                "side": "buy",
+                "type": "limit",
+                "time_in_force": "day",
+                "limit_price": "218.43",
+                "notional": "1000.00",
+                "extended_hours": False,
+                "client_order_id": "ta-paperbot-current-aggressive-overwrite-20260602",
+                "reason": "overwrite guard",
+            }
+        ],
+        now=now,
+    )
+    paper_tournament.mark_submission_recovery_required(
+        ledger,
+        reason="simulated uncertainty",
+        now=now + datetime.timedelta(minutes=1),
+    )
+    # Writing the actual abort is allowed.
+    paper_tournament.abort_submission_lease(
+        ledger,
+        reason="retire the uncertain root",
+        now=now + datetime.timedelta(minutes=2),
+    )
+    written = write_tournament_ledger(ledger, tmp_path)
+    assert json.loads(written.read_text(encoding="utf-8"))["submission_window_status"] == "aborted"
+
+    # Later same-ledger records keep the retirement and stay writable.
+    ledger["strategies"][STRATEGY_CURRENT_AGGRESSIVE]["cash"] = "9999.99"
+    write_tournament_ledger(ledger, tmp_path)
+
+    # A fresh or record-less ledger may never replace the retired root.
+    replacement = _current_trial_ledger(_FakePaperClient())
+    with pytest.raises(ValueError, match="permanently retired"):
+        write_tournament_ledger(replacement, tmp_path)
+
+    # Keeping the record but flipping the window back open is also revival.
+    revival = json.loads(json.dumps(ledger))
+    revival["submission_window_status"] = "open"
+    with pytest.raises(ValueError, match="permanently retired"):
+        write_tournament_ledger(revival, tmp_path)
+
+    on_disk = json.loads((tmp_path / LEDGER_FILE).read_text(encoding="utf-8"))
+    assert on_disk["submission_abortion"]["reason"] == "retire the uncertain root"
+    assert on_disk["submission_window_status"] == "aborted"
+    assert on_disk["strategies"][STRATEGY_CURRENT_AGGRESSIVE]["cash"] == "9999.99"
+
+
+def test_red_cli_init_cannot_replace_an_aborted_root(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+    initialized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "init", "--max-submission-market-days", "5",
+         "--json-output", "--log-dir", str(tmp_path)],
+    )
+    assert initialized.exit_code == 0, initialized.output
+
+    _persist_recovery_required_root(paper_client, tmp_path)
+    ledger = _loaded_ledger(tmp_path)
+    paper_tournament.abort_submission_lease(
+        ledger,
+        reason="operator retired the uncertain root",
+        now=datetime.datetime(2026, 6, 2, 18, 5, tzinfo=datetime.timezone.utc),
+    )
+    write_tournament_ledger(ledger, tmp_path)
+    retired = _loaded_ledger(tmp_path)
+
+    reinitialized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "init", "--max-submission-market-days", "5",
+         "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert reinitialized.exit_code != 0
+    on_disk = _loaded_ledger(tmp_path)
+    assert on_disk == retired
+    assert on_disk["submission_window_status"] == "aborted"
+
+    # A genuinely fresh directory still initializes normally.
+    fresh_dir = tmp_path / "fresh-root"
+    fresh_init = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "init", "--max-submission-market-days", "5",
+         "--json-output", "--log-dir", str(fresh_dir)],
+    )
+    assert fresh_init.exit_code == 0, fresh_init.output
+    fresh_ledger = _loaded_ledger(fresh_dir)
+    assert fresh_ledger["submission_window_status"] == "open"
+    assert "submission_abortion" not in fresh_ledger
+
+
+def test_red_write_refuses_invalid_existing_ledger_before_any_overwrite(tmp_path):
+    replacement = _current_trial_ledger(_FakePaperClient())
+
+    corrupt_dir = tmp_path / "corrupt-root"
+    corrupt_dir.mkdir(parents=True)
+    (corrupt_dir / LEDGER_FILE).write_text("{not-json", encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable or invalid"):
+        write_tournament_ledger(replacement, corrupt_dir)
+    assert (corrupt_dir / LEDGER_FILE).read_text(encoding="utf-8") == "{not-json"
+
+    nonmapping_dir = tmp_path / "nonmapping-root"
+    nonmapping_dir.mkdir(parents=True)
+    (nonmapping_dir / LEDGER_FILE).write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="unreadable or invalid"):
+        write_tournament_ledger(replacement, nonmapping_dir)
+    assert (nonmapping_dir / LEDGER_FILE).read_text(encoding="utf-8") == "[]"
+
+
+def test_red_cli_init_cannot_replace_a_malformed_existing_ledger(monkeypatch, tmp_path):
+    paper_client = _FakePaperClient()
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+    (tmp_path / LEDGER_FILE).write_text("{not-json", encoding="utf-8")
+
+    refused = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "init", "--max-submission-market-days", "5",
+         "--json-output", "--log-dir", str(tmp_path)],
+    )
+
+    assert refused.exit_code != 0
+    assert (tmp_path / LEDGER_FILE).read_text(encoding="utf-8") == "{not-json"
+
+    fresh_dir = tmp_path / "fresh-root"
+    fresh_init = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "init", "--max-submission-market-days", "5",
+         "--json-output", "--log-dir", str(fresh_dir)],
+    )
+    assert fresh_init.exit_code == 0, fresh_init.output
+    fresh_ledger = _loaded_ledger(fresh_dir)
+    assert fresh_ledger["submission_window_status"] == "open"
+    assert "submission_abortion" not in fresh_ledger
+
+
+def _install_lock_order_probe(monkeypatch):
+    """Record acquire/guard/ledger-write/release ordering for one test."""
+
+    import contextlib
+
+    events = []
+    real_lock = paper_tournament.tournament_submission_lock
+    real_guard = paper_tournament._refuse_replacing_retired_root
+    real_atomic = paper_tournament._atomic_write_text
+
+    @contextlib.contextmanager
+    def tracking_lock(output_dir):
+        events.append("acquire")
+        try:
+            with real_lock(output_dir):
+                yield
+        finally:
+            events.append("release")
+
+    def tracking_guard(ledger_path, ledger):
+        events.append("guard")
+        real_guard(ledger_path, ledger)
+
+    def tracking_atomic(path, text):
+        events.append(f"write:{Path(path).name}")
+        real_atomic(path, text)
+
+    monkeypatch.setattr(paper_tournament, "tournament_submission_lock", tracking_lock)
+    monkeypatch.setattr(paper_tournament, "_refuse_replacing_retired_root", tracking_guard)
+    monkeypatch.setattr(paper_tournament, "_atomic_write_text", tracking_atomic)
+    return events
+
+
+def test_red_init_and_watch_hold_the_per_root_lock_across_guard_and_ledger_write(
+    monkeypatch, tmp_path
+):
+    paper_client = _FakePaperClient()
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc),
+    )
+
+    init_events = _install_lock_order_probe(monkeypatch)
+    initialized = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "init", "--max-submission-market-days", "5",
+         "--json-output", "--log-dir", str(tmp_path)],
+    )
+    assert initialized.exit_code == 0, initialized.output
+    assert ["acquire", "guard", f"write:{LEDGER_FILE}"] == init_events[:3]
+    assert init_events.index("release") > init_events.index(f"write:{LEDGER_FILE}")
+
+    init_events.clear()
+    watched = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "alphainsider-watch", "--json-output",
+         "--log-dir", str(tmp_path)],
+    )
+    assert watched.exit_code == 0, watched.output
+    assert ["acquire", "guard", f"write:{LEDGER_FILE}"] == init_events[:3]
+    assert init_events.index("release") > init_events.index(f"write:{LEDGER_FILE}")
+
+
+def test_red_alphainsider_watch_update_respects_an_aborted_root_under_lock(
+    monkeypatch, tmp_path
+):
+    """Watch persists its plan without ever dropping a root's retirement."""
+
+    paper_client = _FakePaperClient()
+    monkeypatch.setattr(cli_main, "_alpaca_paper_client", lambda: paper_client)
+    monkeypatch.setattr(
+        cli_main,
+        "_alpaca_policy_now",
+        lambda: datetime.datetime(2026, 6, 2, 18, 40, tzinfo=datetime.timezone.utc),
+    )
+    _persist_recovery_required_root(paper_client, tmp_path)
+    ledger = _loaded_ledger(tmp_path)
+    paper_tournament.abort_submission_lease(
+        ledger,
+        reason="operator retired the uncertain root",
+        now=datetime.datetime(2026, 6, 2, 18, 41, tzinfo=datetime.timezone.utc),
+    )
+    write_tournament_ledger(ledger, tmp_path)
+    retired = _loaded_ledger(tmp_path)
+    events = _install_lock_order_probe(monkeypatch)
+
+    watched = runner.invoke(
+        app,
+        ["alpaca", "paper-tournament", "alphainsider-watch", "--json-output",
+         "--log-dir", str(tmp_path)],
+    )
+
+    assert watched.exit_code == 0, watched.output
+    assert events[:3] == ["acquire", "guard", f"write:{LEDGER_FILE}"]
+    assert events.index("release") > events.index(f"write:{LEDGER_FILE}")
+    on_disk = _loaded_ledger(tmp_path)
+    # Retirement survives the update under structural JSON equality: window and record
+    # are exactly the persisted ones, only the plan section was added.
+    assert on_disk["submission_window_status"] == "aborted"
+    assert on_disk["submission_abortion"] == retired["submission_abortion"]
+    assert "alphainsider_paper_watch_plan" in on_disk
+
+
 def test_submit_finalize_interleaving_preserves_finalized_lease(monkeypatch, tmp_path):
     paper_client = _BlockingPaperClient()
     write_tournament_ledger(_current_trial_ledger(paper_client), tmp_path)
@@ -1644,6 +2610,34 @@ def test_tournament_timestamp_parsing_and_expiry_boundaries_fail_closed():
     assert _parse_timestamp("9999-12-31T23:59:59-23:59") is None
 
 
+def test_expired_tournament_fingerprint_is_read_only_and_fail_closed():
+    now = datetime.datetime(2026, 6, 5, 20, 10, tzinfo=datetime.timezone.utc)
+    ledger_bytes = json.dumps(
+        {
+            "tournament_id": "retired-paper-root",
+            "ends_at": "2026-06-05T20:10:00+00:00",
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+
+    identity = fingerprint_expired_tournament_ledger(ledger_bytes, now=now)
+
+    assert identity["tournament_id"] == "retired-paper-root"
+    assert identity["ledger_sha256"] == hashlib.sha256(ledger_bytes).hexdigest()
+    with pytest.raises(ValueError, match="not verifiably expired"):
+        fingerprint_expired_tournament_ledger(
+            json.dumps(
+                {
+                    "tournament_id": "current-root",
+                    "ends_at": "2026-06-05T20:10:01+00:00",
+                }
+            ).encode("utf-8"),
+            now=now,
+        )
+    with pytest.raises(ValueError, match="valid UTF-8 JSON"):
+        fingerprint_expired_tournament_ledger(b"not-json", now=now)
+
+
 def _write_bound_active_selection(tournament_dir, *, strategy_id="pullback-support"):
     start = datetime.datetime(2026, 6, 1, 18, 0, tzinfo=datetime.timezone.utc)
     ledger = initialize_tournament(
@@ -1688,6 +2682,33 @@ def test_nontrial_tournament_selection_behavior_remains_compatible(tmp_path):
         now=datetime.datetime(2026, 6, 5, 20, 11, tzinfo=datetime.timezone.utc),
     )
 
+    assert selection is not None
+    assert selection["strategy_id"] == report["live_strategy_candidate"]["strategy_id"]
+
+
+def test_nontrial_dry_run_preserves_the_report_bound_to_an_active_selection(monkeypatch, tmp_path):
+    report = _write_bound_active_selection(tmp_path)
+    paper_client = _FakePaperClient()
+    _configure_current_submit(monkeypatch, paper_client)
+    run_now = datetime.datetime(2026, 6, 5, 20, 11, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(cli_main, "_alpaca_policy_now", lambda: run_now)
+
+    result = runner.invoke(
+        app,
+        [
+            "alpaca",
+            "paper-tournament",
+            "run",
+            "--strategy",
+            STRATEGY_CURRENT_AGGRESSIVE,
+            "--json-output",
+            "--log-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    selection = load_live_strategy_selection(tmp_path, now=run_now)
     assert selection is not None
     assert selection["strategy_id"] == report["live_strategy_candidate"]["strategy_id"]
 

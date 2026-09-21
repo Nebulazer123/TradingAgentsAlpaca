@@ -118,7 +118,11 @@ from tradingagents.policy.order_rate_limit import (
     release_live_order_reservation,
     reserve_live_order_submission,
 )
-from tradingagents.policy.risk_envelope import load_risk_envelope
+from tradingagents.policy.risk_envelope import (
+    load_risk_envelope,
+    read_risk_envelope_bytes_locked,
+    risk_envelope_lock,
+)
 from tradingagents.policy.strategy_promotion_sync import NormalLiveActivationReceipt
 
 __all__ = [
@@ -220,6 +224,22 @@ class _NormalLiveAdmissionContext:
     order_rate_state_path: Path
     risk_metrics: NormalLiveRiskMetrics
     decision_evidence: dict[str, object]
+    # Exact canonical risk-envelope binding captured from disk at successful
+    # final-gate admission.  Carried through the durable commitment and the
+    # raw-POST capability so the sole transport consumer can refuse unless a
+    # fresh reread still hashes identically (TOCTOU defense).
+    admitted_risk_envelope_ref: str
+    admitted_risk_envelope_sha256: str
+    # Owner-approval enforcement at the final gate.  A missing artifact
+    # fails closed: the guard refuses any live order without a current,
+    # signed account_owner approval bound to this exact order.  Trust anchor,
+    # consumption ledger, and policy fingerprint resolve to canonical
+    # protected runtime paths inside the loaded checkout.
+    owner_approval: Mapping[str, object] | None = None
+    # Independently signed risk_envelope_expansion artifact retained from
+    # issuance; consumed by the final go-live guard only after every other
+    # gate passes.  Structural preflight happened at issuance (consume=False).
+    risk_envelope_expansion_approval: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +274,7 @@ _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES: dict[
         str,
         str,
         Path,
-        dict[str, str],
+        dict[str, object],
         _NormalLiveAdmissionClaim,
         LiveOrderRateReservation,
     ],
@@ -659,6 +679,33 @@ def _normal_live_intent_sha256(intent: AuthorizedNormalTradeIntent) -> str:
     return hashlib.sha256(intent.canonical_json_bytes()).hexdigest()
 
 
+def _require_risk_envelope_expansion_authorized(
+    resolved_envelope_path: Path,
+    current_envelope_sha256: str,
+    *,
+    expansion_approval: Mapping[str, object] | None,
+    now: datetime.datetime,
+    consume: bool = False,
+) -> None:
+    """Thin delegate to the policy-layer risk_envelope_expansion gate."""
+
+    from tradingagents.policy.owner_approval import (
+        OwnerApprovalError,
+        require_risk_envelope_expansion,
+    )
+
+    try:
+        require_risk_envelope_expansion(
+            resolved_envelope_path=resolved_envelope_path,
+            current_envelope_sha256=current_envelope_sha256,
+            expansion_approval=expansion_approval,
+            now=now,
+            consume=consume,
+        )
+    except OwnerApprovalError as exc:
+        raise ValueError(f"risk envelope expansion refused: {exc}") from exc
+
+
 def _issue_normal_live_submit_admission(
     intent: AuthorizedNormalTradeIntent,
     *,
@@ -669,6 +716,8 @@ def _issue_normal_live_submit_admission(
     order_rate_state_path: str | Path,
     risk_metrics: object,
     decision_evidence: Mapping,
+    owner_approval: Mapping[str, object] | None = None,
+    risk_envelope_expansion_approval: Mapping[str, object] | None = None,
 ) -> NormalLiveSubmitAdmission:
     """Issue a local capability; gates are re-evaluated under the policy lock."""
     if type(intent) is not AuthorizedNormalTradeIntent:
@@ -676,6 +725,24 @@ def _issue_normal_live_submit_admission(
     payload = _normal_live_admission_mapping(order_payload, label="normal live order")
     claimed_risk_metrics = _claim_normal_live_submit_risk_metrics(
         risk_metrics, intent=intent, order_payload=payload
+    )
+    resolved_envelope_path = _normal_live_admission_path(
+        risk_envelope_path, label="risk envelope"
+    )
+    try:
+        admitted_envelope_sha256 = hashlib.sha256(
+            resolved_envelope_path.read_bytes()
+        ).hexdigest()
+    except OSError as exc:
+        raise ValueError("risk envelope is unavailable for normal live admission") from exc
+    # P1-A: a changed/enlarged envelope becomes usable for normal-live only
+    # through an independently signed, single-use risk_envelope_expansion
+    # approval consumed at this transition point.
+    _require_risk_envelope_expansion_authorized(
+        resolved_envelope_path,
+        admitted_envelope_sha256,
+        expansion_approval=risk_envelope_expansion_approval,
+        now=_normal_live_admission_moment(),
     )
     issued_at = _normal_live_admission_moment()
     admission = NormalLiveSubmitAdmission(
@@ -689,9 +756,7 @@ def _issue_normal_live_submit_admission(
     _NORMAL_LIVE_ADMISSION_CAPABILITIES[id(admission)] = (
         admission,
         _NormalLiveAdmissionContext(
-            risk_envelope_path=_normal_live_admission_path(
-                risk_envelope_path, label="risk envelope"
-            ),
+            risk_envelope_path=resolved_envelope_path,
             promotion_state_path=_normal_live_admission_path(
                 promotion_state_path, label="promotion state"
             ),
@@ -705,6 +770,10 @@ def _issue_normal_live_submit_admission(
             decision_evidence=_normal_live_admission_mapping(
                 decision_evidence, label="decision evidence"
             ),
+            admitted_risk_envelope_ref=str(resolved_envelope_path),
+            admitted_risk_envelope_sha256=admitted_envelope_sha256,
+            owner_approval=owner_approval,
+            risk_envelope_expansion_approval=risk_envelope_expansion_approval,
         ),
     )
     return admission
@@ -813,6 +882,331 @@ def _require_normal_live_submit_admission_available(admission: object) -> None:
         raise ValueError("live submit requires an unconsumed supervisor admission artifact")
 
 
+def _exact_durable_commitment(
+    control_state_path: Path,
+    *,
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+    approval_id: str,
+    transaction_binding: str,
+) -> dict[str, object] | None:
+    """Return only a durable record matching every exact owner field.
+
+    Matches pending OR resolved records of the SAME order so an idempotent
+    lookup-only recovery can continue; nothing else qualifies.
+    """
+
+    from tradingagents.policy.live_control import load_live_control_state
+
+    state, issues = load_live_control_state(control_state_path)
+    if issues or not isinstance(state, dict):
+        return None
+    commitments = state.get("normal_live_submission_commitments") or []
+    if not isinstance(commitments, list):
+        return None
+    matches = [
+        item
+        for item in commitments
+        if isinstance(item, dict)
+        and item.get("intent_full_sha256") == intent_full_sha256
+        and item.get("order_payload_sha256") == order_payload_sha256
+        and item.get("client_order_id") == client_order_id
+        and item.get("owner_approval_id") == approval_id
+        and item.get("owner_approval_transaction_binding_sha256")
+        == transaction_binding
+    ]
+    return dict(matches[0]) if len(matches) == 1 else None
+
+
+def _exact_durable_commitment_matches(
+    control_state_path: Path,
+    *,
+    intent_full_sha256: str,
+    order_payload_sha256: str,
+    client_order_id: str,
+    approval_id: str,
+    transaction_binding: str,
+) -> bool:
+    """True only when one durable record matches every exact owner field."""
+
+    return (
+        _exact_durable_commitment(
+            control_state_path,
+            intent_full_sha256=intent_full_sha256,
+            order_payload_sha256=order_payload_sha256,
+            client_order_id=client_order_id,
+            approval_id=approval_id,
+            transaction_binding=transaction_binding,
+        )
+        is not None
+    )
+
+
+def _consume_or_confirm_owner_approval_before_commit(
+    supervisor_claim: object,
+    *,
+    payload: Mapping[str, str],
+    sleeve: str,
+    intent: AuthorizedNormalTradeIntent,
+    rate_reservation_sha256: str,
+    commitment_now: datetime.datetime,
+) -> dict[str, object]:
+    """Burn the bound owner approval exactly once, before the first commit.
+
+    The first submission of a fresh bound order consumes its fully verified
+    approval atomically before the durable commitment is created.  A later
+    retry that still carries an exact pending commitment is recognized as
+    recovery only when the canonical ledger already proves this same
+    deterministic approval (id + action + purpose); anything else fails
+    closed downstream at the final gate.
+    """
+
+    from tradingagents.policy.live_control import (
+        prepare_normal_live_submission_candidate_locked,
+    )
+    from tradingagents.policy.live_gate import _live_order_owner_subject
+    from tradingagents.policy.owner_approval import (
+        OwnerApprovalError,
+        consume_owner_approval,
+        owner_approval_has_consumption,
+        prepared_transaction_binding_sha256,
+        prepared_transaction_sha256,
+        transaction_binding_sha256,
+        verify_owner_approval_structure,
+    )
+
+    if type(supervisor_claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires an exact supervisor admission claim")
+    claim_entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(supervisor_claim))
+    if claim_entry is None or claim_entry[0] is not supervisor_claim:
+        raise ValueError("live submit requires an unconsumed supervisor admission claim")
+    context = claim_entry[1]
+    artifact = context.owner_approval
+    if artifact is None:
+        raise ValueError(
+            "owner approval required: a fresh normal-live order cannot create "
+            "its durable commitment without a current account_owner approval"
+        )
+    # TOCTOU guard at commit time: the canonical envelope must still hash to
+    # the value captured during successful final-gate admission.
+    try:
+        current_envelope_sha256 = hashlib.sha256(
+            Path(context.risk_envelope_path).read_bytes()
+        ).hexdigest()
+    except OSError as exc:
+        raise ValueError("risk envelope is unavailable before commitment") from exc
+    if (
+        current_envelope_sha256 != context.admitted_risk_envelope_sha256
+        or str(context.risk_envelope_path) != context.admitted_risk_envelope_ref
+    ):
+        raise ValueError(
+            "normal live submit final gates rejected admission: risk envelope "
+            "changed after admission"
+        )
+    action = _normal_live_action_from_payload(payload, sleeve=sleeve)
+    subject = _live_order_owner_subject(
+        action,
+        client_order_id=str(payload.get("client_order_id", "")),
+        intent_full_sha256=_normal_live_intent_sha256(intent),
+        order_payload_sha256=_normal_live_metrics_payload_sha256(payload),
+    )
+    purpose = f"live_order:{subject['decision_id']}:{subject['client_order_id']}"
+    # Crash-safe prepare: durable, non-executable record of the intended
+    # consumption BEFORE any ledger write.  An exact prepare + canonical
+    # ledger consumption authorizes recovery/finalization even after the
+    # original artifact TTL expires.
+    from tradingagents.policy.owner_approval import (
+        owner_prepare_has_exact_consumption,
+        read_owner_approval_prepare,
+        write_owner_approval_prepare,
+    )
+
+    control_dir = Path(context.control_state_path).parent
+    prepare_path = control_dir / (
+        f"{payload.get('client_order_id', 'order')}.owner-approval-prepare.json"
+    )
+    recovery_identity = {
+        "operation": "normal_live_broker_submit",
+        "subject": dict(subject),
+        "source_binding": {"guard": "unified_go_live_guard"},
+        "intent_full_sha256": _normal_live_intent_sha256(intent),
+        "order_payload_sha256": _normal_live_metrics_payload_sha256(payload),
+        "client_order_id": str(payload.get("client_order_id", "")),
+        "sleeve": sleeve,
+        "control_state_path": str(context.control_state_path),
+        "risk_envelope_ref": context.admitted_risk_envelope_ref,
+        "risk_envelope_sha256": context.admitted_risk_envelope_sha256,
+    }
+    prepared = read_owner_approval_prepare(prepare_path)
+    exact_recovery_prepare = (
+        prepared is not None
+        and prepared["transaction"].get("recovery_identity")
+        == recovery_identity
+    )
+    if prepared is not None and not exact_recovery_prepare:
+        raise ValueError(
+            "owner approval prepare does not match this normal-live transaction"
+        )
+    exact_recovery = (
+        exact_recovery_prepare
+        and owner_prepare_has_exact_consumption(prepare_path)
+    )
+    if not exact_recovery:
+        try:
+            parsed = verify_owner_approval_structure(
+                approval=artifact,
+                expected_action="live_promotion",
+                subject=subject,
+                source_binding={"guard": "unified_go_live_guard"},
+                now=_normal_live_admission_moment(),
+                purpose=purpose,
+            )
+            envelope_sha256 = hashlib.sha256(
+                Path(context.risk_envelope_path).read_bytes()
+            ).hexdigest()
+            binding = parsed["risk_envelope_binding"]
+            if (
+                binding["ref"] != str(context.risk_envelope_path)
+                or binding["sha256"] != envelope_sha256
+            ):
+                raise OwnerApprovalError(
+                    "owner approval risk envelope binding does not match this request"
+                )
+            binding = transaction_binding_sha256(
+                approval_id=parsed["approval_id"],
+                action=parsed["action"],
+                purpose=purpose,
+                subject=subject,
+                risk_envelope_ref=str(context.risk_envelope_path),
+                risk_envelope_sha256=envelope_sha256,
+            )
+            if prepared is not None:
+                prepared_transaction = prepared["transaction"]
+                candidate = prepared_transaction.get("commitment_candidate")
+                if (
+                    prepared["approval_id"] != parsed["approval_id"]
+                    or prepared["action"] != parsed["action"]
+                    or prepared["purpose"] != purpose
+                    or prepared["transaction_binding_sha256"] != binding
+                    or not isinstance(candidate, Mapping)
+                ):
+                    raise OwnerApprovalError(
+                        "owner approval prepare does not match this exact normal-live commitment"
+                    )
+            else:
+                candidate = prepare_normal_live_submission_candidate_locked(
+                    context.control_state_path,
+                    intent_full_sha256=_normal_live_intent_sha256(intent),
+                    order_payload_sha256=_normal_live_metrics_payload_sha256(payload),
+                    client_order_id=str(payload.get("client_order_id", "")),
+                    rate_reservation_sha256=rate_reservation_sha256,
+                    owner_approval_id=parsed["approval_id"],
+                    owner_approval_transaction_binding_sha256=binding,
+                    risk_envelope_ref=str(context.risk_envelope_path),
+                    risk_envelope_sha256=envelope_sha256,
+                    now=commitment_now,
+                )
+                prepared_transaction = {
+                    **recovery_identity,
+                    "recovery_identity": recovery_identity,
+                    "approval_artifact": dict(artifact),
+                    "commitment_candidate": candidate,
+                }
+            prepared_binding = prepared_transaction_binding_sha256(
+                transaction_binding_sha256=binding,
+                transaction_sha256=prepared_transaction_sha256(prepared_transaction),
+            )
+            consumed = owner_approval_has_consumption(parsed["approval_id"])
+            if consumed:
+                # Conservative transaction rule (NOT atomic): once this approval
+                # is consumed it may only continue an EXACT durable commitment
+                # of the same order (pending or already-resolved lookup-only
+                # recovery) — OR an exact crash recovery proven by this
+                # transaction's durable prepare plus the canonical ledger.
+                durable_match = _exact_durable_commitment(
+                    context.control_state_path,
+                    intent_full_sha256=_normal_live_intent_sha256(intent),
+                    order_payload_sha256=_normal_live_metrics_payload_sha256(payload),
+                    client_order_id=str(payload.get("client_order_id", "")),
+                    approval_id=parsed["approval_id"],
+                    transaction_binding=binding,
+                )
+                existing_match = durable_match is not None or (
+                    prepared is not None
+                    and exact_recovery_prepare
+                    and prepared.get("approval_id") == parsed["approval_id"]
+                    and owner_prepare_has_exact_consumption(prepare_path)
+                )
+                if not existing_match:
+                    raise OwnerApprovalError(
+                        "consumed owner approval cannot create a new normal-live "
+                        "commitment after a failed write; issue a new approval"
+                    )
+                if (
+                    durable_match is not None
+                    and durable_match.get("state") == "resolved"
+                ):
+                    # A terminal exact record is already the complete outcome
+                    # of this approval.  Its recovery sidecar was deliberately
+                    # retired, so an idempotent retry must reuse the resolved
+                    # record rather than create a second pending commitment.
+                    return {
+                        "owner_approval_id": parsed["approval_id"],
+                        "owner_approval_transaction_binding_sha256": binding,
+                        "risk_envelope_ref": context.admitted_risk_envelope_ref,
+                        "risk_envelope_sha256": context.admitted_risk_envelope_sha256,
+                        "resolved_commitment": durable_match,
+                    }
+            else:
+                # Prepare strictly precedes consumption: a crash between the
+                # two leaves the approval unconsumed but identifiable.
+                if prepared is None:
+                    written_binding = write_owner_approval_prepare(
+                        prepare_path,
+                        approval_id=parsed["approval_id"],
+                        action=parsed["action"],
+                        purpose=purpose,
+                        transaction_binding_sha256=binding,
+                        transaction=prepared_transaction,
+                        now=commitment_now,
+                    )
+                    if written_binding != prepared_binding:
+                        raise OwnerApprovalError(
+                            "owner approval prepare binding does not match this normal-live transaction"
+                        )
+                consume_owner_approval(
+                    approval_id=parsed["approval_id"],
+                    action=parsed["action"],
+                    purpose=purpose,
+                    transaction_binding_sha256=binding,
+                    prepared_transaction_binding_sha256=prepared_binding,
+                    now=commitment_now,
+                )
+        except OwnerApprovalError as exc:
+            raise ValueError(f"owner approval refused before first commitment: {exc}") from exc
+    if exact_recovery:
+        candidate = prepared["transaction"].get("commitment_candidate")
+        if not isinstance(candidate, Mapping):
+            raise ValueError("normal-live recovery candidate is invalid")
+        return {
+            "owner_approval_id": str(prepared.get("approval_id")),
+            "owner_approval_transaction_binding_sha256": str(
+                prepared.get("transaction_binding_sha256")
+            ),
+            "risk_envelope_ref": context.admitted_risk_envelope_ref,
+            "risk_envelope_sha256": context.admitted_risk_envelope_sha256,
+            "commitment_candidate": candidate,
+        }
+    return {
+        "owner_approval_id": parsed["approval_id"],
+        "owner_approval_transaction_binding_sha256": binding,
+        "risk_envelope_ref": context.admitted_risk_envelope_ref,
+        "risk_envelope_sha256": context.admitted_risk_envelope_sha256,
+        "commitment_candidate": candidate,
+    }
+
+
 def _preflight_normal_live_submit_before_broker_reads(
     admission: object,
     *,
@@ -885,6 +1279,157 @@ def _normal_live_action_from_payload(
     )
 
 
+def _normal_live_commitment_recovery_identity(
+    claim: _NormalLiveAdmissionClaim,
+    *,
+    context: _NormalLiveAdmissionContext,
+    payload: Mapping[str, str],
+    sleeve: str,
+) -> dict[str, object]:
+    """Return the immutable identity of one normal-live recovery transaction."""
+
+    from tradingagents.policy.live_gate import _live_order_owner_subject
+
+    action = _normal_live_action_from_payload(payload, sleeve=sleeve)
+    recovery_subject = _live_order_owner_subject(
+        action,
+        client_order_id=str(payload.get("client_order_id", "")),
+        intent_full_sha256=claim.intent_full_sha256,
+        order_payload_sha256=claim.order_payload_sha256,
+    )
+    return {
+        "operation": "normal_live_broker_submit",
+        "subject": recovery_subject,
+        "source_binding": {"guard": "unified_go_live_guard"},
+        "intent_full_sha256": claim.intent_full_sha256,
+        "order_payload_sha256": claim.order_payload_sha256,
+        "client_order_id": str(payload.get("client_order_id", "")),
+        "sleeve": sleeve,
+        "control_state_path": str(context.control_state_path),
+        "risk_envelope_ref": context.admitted_risk_envelope_ref,
+        "risk_envelope_sha256": context.admitted_risk_envelope_sha256,
+    }
+
+
+def _require_pending_normal_live_commitment_owner_prepare(
+    claim: object,
+    *,
+    payload: Mapping[str, str],
+    sleeve: str,
+    normal_live_commitment: Mapping[str, object],
+    require_current_control_after: bool = True,
+) -> tuple[dict[str, object], Path, dict[str, object]]:
+    """Require the exact retained owner prepare for a pending commitment.
+
+    A pending record is not independently executable.  Its retained generic
+    sidecar carries the original signed artifact plus the complete candidate
+    control image, so it must be intact before either a final gate or even a
+    lookup-only broker read can resume the transaction.  Terminal records do
+    not use this helper: their sidecar may already have been safely retired.
+    The pre-read caller requires the current control image to equal the
+    candidate after-image.  A later final gate may follow a cooperating freeze
+    that changes that image; it still verifies the retained candidate itself
+    and lets canonical live-control validation report the freeze.
+    """
+
+    from tradingagents.policy.owner_approval import (
+        owner_prepare_has_exact_consumption,
+        read_owner_approval_prepare,
+    )
+
+    if type(claim) is not _NormalLiveAdmissionClaim:
+        raise ValueError("live submit requires a trusted supervisor admission claim")
+    entry = _NORMAL_LIVE_ADMISSION_CLAIMS.get(id(claim))
+    if entry is None or entry[0] is not claim:
+        raise ValueError("live submit supervisor admission claim is unavailable")
+    if normal_live_commitment.get("state") != "pending":
+        raise ValueError("normal-live commitment is not pending")
+    context = entry[1]
+    prepare_path = Path(context.control_state_path).parent / (
+        f"{payload.get('client_order_id', 'order')}.owner-approval-prepare.json"
+    )
+    prepared = read_owner_approval_prepare(prepare_path)
+    transaction = prepared.get("transaction") if prepared is not None else None
+    artifact = (
+        transaction.get("approval_artifact")
+        if isinstance(transaction, Mapping)
+        else None
+    )
+    candidate = (
+        transaction.get("commitment_candidate")
+        if isinstance(transaction, Mapping)
+        else None
+    )
+    recovery_identity = _normal_live_commitment_recovery_identity(
+        claim, context=context, payload=payload, sleeve=sleeve
+    )
+    subject = recovery_identity["subject"]
+    if not isinstance(subject, Mapping):  # defensive: the helper owns this map
+        raise ValueError("normal-live recovery identity is invalid")
+    purpose = f"live_order:{subject['decision_id']}:{subject['client_order_id']}"
+    candidate_fields = {
+        "schema_version",
+        "control_state_path",
+        "control_preimage_sha256",
+        "control_after_sha256",
+        "control_after_json",
+        "commitment",
+    }
+    try:
+        current_control_sha256 = hashlib.sha256(
+            Path(context.control_state_path).read_bytes()
+        ).hexdigest()
+    except OSError as exc:
+        raise ValueError(
+            "pending normal-live commitment control after-image is unavailable"
+        ) from exc
+    candidate_after_json = (
+        candidate.get("control_after_json") if isinstance(candidate, Mapping) else None
+    )
+    exact = (
+        prepared is not None
+        and isinstance(transaction, Mapping)
+        and isinstance(artifact, Mapping)
+        and isinstance(candidate, Mapping)
+        and set(candidate) == candidate_fields
+        and candidate.get("schema_version") == 1
+        and candidate.get("control_state_path") == str(context.control_state_path)
+        and type(candidate.get("control_preimage_sha256")) is str
+        and re.fullmatch(r"[0-9a-f]{64}", candidate["control_preimage_sha256"])
+        is not None
+        and type(candidate.get("control_after_sha256")) is str
+        and re.fullmatch(r"[0-9a-f]{64}", candidate["control_after_sha256"])
+        is not None
+        and type(candidate_after_json) is str
+        and hashlib.sha256(candidate_after_json.encode("utf-8")).hexdigest()
+        == candidate["control_after_sha256"]
+        and (
+            not require_current_control_after
+            or candidate["control_after_sha256"] == current_control_sha256
+        )
+        and candidate.get("commitment") == dict(normal_live_commitment)
+        and prepared.get("approval_id")
+        == normal_live_commitment.get("owner_approval_id")
+        and prepared.get("action") == "live_promotion"
+        and prepared.get("purpose") == purpose
+        and prepared.get("transaction_binding_sha256")
+        == normal_live_commitment.get(
+            "owner_approval_transaction_binding_sha256"
+        )
+        and transaction.get("recovery_identity") == recovery_identity
+        and transaction.get("intent_full_sha256") == claim.intent_full_sha256
+        and transaction.get("order_payload_sha256") == claim.order_payload_sha256
+        and transaction.get("client_order_id")
+        == str(payload.get("client_order_id", ""))
+        and owner_prepare_has_exact_consumption(prepare_path)
+    )
+    if not exact:
+        raise ValueError(
+            "pending normal-live commitment requires its exact retained owner prepare"
+        )
+    return dict(artifact), prepare_path, recovery_identity
+
+
 def _revalidate_normal_live_submit_claim(
     claim: object,
     *,
@@ -904,26 +1449,59 @@ def _revalidate_normal_live_submit_claim(
     _require_normal_live_submit_claim_leases_current(
         claim, order_payload=payload
     )
+    from contextlib import nullcontext
+
+    owner_approval_for_gate = context.owner_approval
+    expired_recovery_context = nullcontext()
+    if (
+        normal_live_commitment is not None
+        and normal_live_commitment.get("state") == "pending"
+    ):
+        from tradingagents.policy.owner_approval import (
+            exact_expired_owner_approval_recovery,
+        )
+
+        (
+            owner_approval_for_gate,
+            prepare_path,
+            recovery_identity,
+        ) = _require_pending_normal_live_commitment_owner_prepare(
+            claim,
+            payload=payload,
+            sleeve=sleeve,
+            normal_live_commitment=normal_live_commitment,
+            require_current_control_after=False,
+        )
+        # A restart may carry a newly issued admission envelope, but only this
+        # retained, ledger-proven original approval can satisfy the pending
+        # commitment's exact recovery binding.  Enter this context even before
+        # TTL expiry so gate plumbing can never fall back to a caller artifact.
+        expired_recovery_context = exact_expired_owner_approval_recovery(
+            prepare_path, recovery_identity=recovery_identity
+        )
     current = _normal_live_admission_moment()
-    issues = validate_supervisor_live_submit_allowed(
-        actions=[_normal_live_action_from_payload(payload, sleeve=sleeve)],
-        risk_envelope_path=context.risk_envelope_path,
-        promotion_state_path=context.promotion_state_path,
-        control_state_path=context.control_state_path,
-        order_rate_state_path=context.order_rate_state_path,
-        current_live_exposure=live_exposure_from_positions(live_positions),
-        current_daily_loss_usd=context.risk_metrics.daily_loss_usd,
-        current_drawdown_pct=context.risk_metrics.drawdown_pct,
-        live_account=live_account,
-        live_positions=live_positions,
-        decision_evidence=context.decision_evidence,
-        now=current,
-        rate_limit_exclude_client_order_id=rate_limit_exclude_client_order_id,
-        normal_live_commitment=normal_live_commitment,
-        normal_live_intent_full_sha256=claim.intent_full_sha256,
-        normal_live_order_payload_sha256=claim.order_payload_sha256,
-        normal_live_client_order_id=str(payload.get("client_order_id", "")),
-    )
+    with expired_recovery_context:
+        issues = validate_supervisor_live_submit_allowed(
+            actions=[_normal_live_action_from_payload(payload, sleeve=sleeve)],
+            risk_envelope_path=context.risk_envelope_path,
+            promotion_state_path=context.promotion_state_path,
+            control_state_path=context.control_state_path,
+            order_rate_state_path=context.order_rate_state_path,
+            current_live_exposure=live_exposure_from_positions(live_positions),
+            current_daily_loss_usd=context.risk_metrics.daily_loss_usd,
+            current_drawdown_pct=context.risk_metrics.drawdown_pct,
+            live_account=live_account,
+            live_positions=live_positions,
+            decision_evidence=context.decision_evidence,
+            now=current,
+            rate_limit_exclude_client_order_id=rate_limit_exclude_client_order_id,
+            normal_live_commitment=normal_live_commitment,
+            normal_live_intent_full_sha256=claim.intent_full_sha256,
+            normal_live_order_payload_sha256=claim.order_payload_sha256,
+            normal_live_client_order_id=str(payload.get("client_order_id", "")),
+            owner_approval=owner_approval_for_gate,
+            risk_envelope_expansion_approval=context.risk_envelope_expansion_approval,
+        )
     if issues:
         raise ValueError(
             "normal live submit final gates rejected admission: "
@@ -1157,6 +1735,8 @@ def _issue_normal_live_submit_post_capability(
         "client_order_id",
         "control_preimage_sha256",
         "rate_reservation_sha256",
+        "risk_envelope_ref",
+        "risk_envelope_sha256",
     }
     if (
         type(client_order_id) is not str
@@ -1170,9 +1750,10 @@ def _issue_normal_live_submit_post_capability(
         or commitment.get("rate_reservation_sha256") != reservation.binding_sha256
     ):
         raise ValueError("normal live broker post capability is invalid")
-    bound_commitment = {
-        field: str(commitment[field]) for field in required_commitment
-    }
+    # Retain the complete canonical record, including its lifecycle state.
+    # The sole raw-POST consumer revalidates this exact snapshot against the
+    # control ledger and requires it to remain pending.
+    bound_commitment = dict(commitment)
     capability = object()
     _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES[id(capability)] = (
         capability,
@@ -1185,6 +1766,10 @@ def _issue_normal_live_submit_post_capability(
         reservation,
     )
     return capability
+
+
+def _after_normal_live_final_envelope_hash_check() -> None:
+    """Private deterministic race seam; production intentionally does nothing."""
 
 
 def _consume_normal_live_submit_post_capability(
@@ -1244,13 +1829,57 @@ def _consume_normal_live_submit_post_capability(
             rate_reservation_sha256=reservation.binding_sha256,
         )
         _NORMAL_LIVE_SUBMIT_POST_CAPABILITIES.pop(id(capability), None)
+    # TOCTOU defense at the sole raw-POST consumer: the canonical bound
+    # envelope is reread and hash-compared under the shared envelope-content
+    # lock immediately adjacent to send().  Future production writers must
+    # honor the same lock (there are no in-repo content writers today), so no
+    # cooperating writer can open a check-to-POST window.  A swapped,
+    # modified, missing, or malformed envelope blocks here with zero broker
+    # POST.
+    bound_envelope_ref = str(commitment.get("risk_envelope_ref") or "")
+    bound_envelope_sha256 = str(commitment.get("risk_envelope_sha256") or "")
+    if not bound_envelope_ref or len(bound_envelope_sha256) != 64:
+        raise ValueError("normal live submit final gates rejected admission")
     # Never hold the control lock around broker I/O: a later safety freeze must
-    # record promptly.  The rate lock instead covers the immediate proof and
-    # the raw POST itself, so the reserved ledger cannot be deleted, corrupted,
-    # or replaced between the final check and transport.
+    # record promptly.  The rate lock plus envelope-content lock cover the
+    # immediate proof and raw POST; neither is a live-control lock.
     if not callable(send):
         raise ValueError("live raw post requires a classified transport sender")
-    with normal_live_order_rate_reservation_lock(reservation):
+    with normal_live_order_rate_reservation_lock(reservation), risk_envelope_lock(
+        bound_envelope_ref
+    ):
+        try:
+            current_envelope_bytes = read_risk_envelope_bytes_locked(
+                bound_envelope_ref
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "normal live submit final gates rejected admission: risk "
+                "envelope is unavailable"
+            ) from exc
+        if hashlib.sha256(current_envelope_bytes).hexdigest() != bound_envelope_sha256:
+            raise ValueError(
+                "normal live submit final gates rejected admission: risk "
+                "envelope changed after commitment"
+            )
+        _after_normal_live_final_envelope_hash_check()
+        # The deterministic seam above deliberately models a write that
+        # ignored the lock.  Re-prove immediately before the raw transport
+        # call so even that hostile race cannot reach ``send``.
+        try:
+            final_envelope_bytes = read_risk_envelope_bytes_locked(
+                bound_envelope_ref
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                "normal live submit final gates rejected admission: risk "
+                "envelope is unavailable"
+            ) from exc
+        if hashlib.sha256(final_envelope_bytes).hexdigest() != bound_envelope_sha256:
+            raise ValueError(
+                "normal live submit final gates rejected admission: risk "
+                "envelope changed after commitment"
+            )
         return send()
 
 
@@ -1773,6 +2402,8 @@ def validate_supervisor_live_submit_allowed(
     normal_live_intent_full_sha256: str | None = None,
     normal_live_order_payload_sha256: str | None = None,
     normal_live_client_order_id: str | None = None,
+    owner_approval: Mapping[str, object] | Sequence[Mapping[str, object]] | None = None,
+    risk_envelope_expansion_approval: Mapping[str, object] | None = None,
 ) -> list[OrderIssue]:
     live_buying_power = None
     if isinstance(live_account, Mapping):
@@ -1798,6 +2429,8 @@ def validate_supervisor_live_submit_allowed(
         normal_live_intent_full_sha256=normal_live_intent_full_sha256,
         normal_live_order_payload_sha256=normal_live_order_payload_sha256,
         normal_live_client_order_id=normal_live_client_order_id,
+        owner_approval=owner_approval,
+        risk_envelope_expansion_approval=risk_envelope_expansion_approval,
     )
     return result.issues
 
@@ -1812,6 +2445,8 @@ def submit_authorized_normal_live_order(
     control_state_path: str | Path,
     order_rate_state_path: str | Path,
     decision_evidence: Mapping,
+    owner_approval: Mapping[str, object] | None = None,
+    risk_envelope_expansion_approval: Mapping[str, object] | None = None,
 ) -> dict:
     """Forward one already-issued intent through the locked final gate.
 
@@ -1866,6 +2501,8 @@ def submit_authorized_normal_live_order(
         order_rate_state_path=order_rate_state_path,
         risk_metrics=risk_metrics,
         decision_evidence=decision_evidence,
+        owner_approval=owner_approval,
+        risk_envelope_expansion_approval=risk_envelope_expansion_approval,
     )
     return live_client.submit_order(
         order,

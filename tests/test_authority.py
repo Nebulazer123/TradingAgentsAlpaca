@@ -36,6 +36,8 @@ def test_action_enum_contains_only_the_explicit_authority_partition():
         "strategy_change",
         "risk_change",
         "promotion_change",
+        "live_promotion",
+        "risk_envelope_expansion",
         "freeze",
         "repair",
         "verify",
@@ -55,6 +57,8 @@ def test_action_enum_has_exact_member_names_and_no_legacy_rearm_alias():
         "STRATEGY_CHANGE",
         "RISK_CHANGE",
         "PROMOTION_CHANGE",
+        "LIVE_PROMOTION",
+        "RISK_ENVELOPE_EXPANSION",
         "FREEZE",
         "REPAIR",
         "VERIFY",
@@ -72,6 +76,8 @@ def test_action_enum_has_exact_member_names_and_no_legacy_rearm_alias():
 @pytest.mark.parametrize(
     "action",
     [
+        ActionClass.LIVE_PROMOTION,
+        ActionClass.RISK_ENVELOPE_EXPANSION,
         ActionClass.CAPITAL_CHANGE,
         ActionClass.ACCOUNT_IDENTITY_CHANGE,
         ActionClass.CREDENTIAL_CHANGE,
@@ -83,3 +89,16 @@ def test_external_authority_stays_with_user(action):
     assert verdict.allowed is False
     assert verdict.human_required is True
     assert verdict.owner_role == "account_owner"
+
+
+def test_machine_risk_promotion_and_submit_reasons_scope_out_privilege():
+    """Generic machine classes must name the owner-approval boundary so a
+    broad risk/promotion classification can never read as authorizing
+    envelope expansion or live promotion."""
+
+    for action in (
+        ActionClass.RISK_CHANGE,
+        ActionClass.PROMOTION_CHANGE,
+        ActionClass.ORDER_SUBMIT,
+    ):
+        assert "account_owner approval" in authority_for(action).reason

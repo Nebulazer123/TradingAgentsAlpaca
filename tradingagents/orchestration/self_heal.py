@@ -48,6 +48,7 @@ from tradingagents.policy.live_control import (
     load_live_control_state,
     write_live_control_state,
 )
+from tradingagents.policy.owner_approval import OwnerApprovalError
 from tradingagents.policy.promotion_sync import (
     promotion_state_lock,
     sync_promotion_state_from_tournament,
@@ -141,6 +142,10 @@ _SOURCE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 class _PromotionStalePreimage(RuntimeError):
     """A concurrent canonical promotion writer won the compare-and-swap."""
+
+
+class _PromotionOwnerApprovalRequired(RuntimeError):
+    """The exact recovery promotion awaits a separate owner-issued artifact."""
 
 HIGH_REASONS = {"blocker", "issues", "schema", "graph_failure", "abnormal_pl", "unexplained_action"}
 MEDIUM_REASONS = {"model_telemetry", "crawler", "quality", "automation_health"}
@@ -1092,6 +1097,16 @@ def _recovery_now(value: dt.datetime | None) -> dt.datetime:
     return current.astimezone(UTC)
 
 
+def _owner_approval_authority_utc_now() -> dt.datetime:
+    """Return fresh policy time for owner artifacts in verified recovery.
+
+    Recovery ``generated_at`` is deterministic evidence time and cannot make
+    an expired, unconsumed promotion approval current again.
+    """
+
+    return dt.datetime.now(tz=UTC)
+
+
 def _recovery_json(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8") + b"\n"
 
@@ -1372,6 +1387,7 @@ def _valid_persisted_recovery_state(value: Mapping[str, Any]) -> bool:
         "envelope_sha256",
         "focused_sha256",
         "reconciliation_sha256",
+        "owner_approval_request_sha256",
         "arm_live",
         "ci_green",
     }
@@ -1385,6 +1401,7 @@ def _valid_persisted_recovery_state(value: Mapping[str, Any]) -> bool:
         "envelope_sha256",
         "focused_sha256",
         "reconciliation_sha256",
+        "owner_approval_request_sha256",
     }
     if stage_request is not None and (
         not isinstance(stage_request, Mapping)
@@ -1412,9 +1429,15 @@ def _valid_persisted_recovery_state(value: Mapping[str, Any]) -> bool:
             "prepare_sha256",
             "staged_path",
             "staged_sha256",
-            "canonical_path",
-            "canonical_before_sha256",
-        }
+                "canonical_path",
+                "canonical_before_sha256",
+                "owner_approval_id",
+                "owner_approval_action",
+                "owner_approval_purpose",
+                "owner_approval_transaction_binding_sha256",
+                "owner_approval_request_sha256",
+                "owner_approval_policy_fingerprint_sha256",
+            }
         or not _valid_recovery_digest(promotion_intent.get("commit_id"))
         or _canonical_absolute_path(promotion_intent.get("prepare_path")) is None
         or not _valid_recovery_digest(promotion_intent.get("prepare_sha256"))
@@ -1423,6 +1446,22 @@ def _valid_persisted_recovery_state(value: Mapping[str, Any]) -> bool:
         or _canonical_absolute_path(promotion_intent.get("canonical_path")) is None
         or not _valid_recovery_digest(
             promotion_intent.get("canonical_before_sha256")
+        )
+        or not _valid_recovery_digest(
+            promotion_intent.get("owner_approval_id")
+        )
+        or promotion_intent.get("owner_approval_action") != "live_promotion"
+        or not _nonempty_recovery_string(
+            promotion_intent.get("owner_approval_purpose")
+        )
+        or not _valid_recovery_digest(
+            promotion_intent.get("owner_approval_transaction_binding_sha256")
+        )
+        or not _valid_recovery_digest(
+            promotion_intent.get("owner_approval_request_sha256")
+        )
+        or not _valid_recovery_digest(
+            promotion_intent.get("owner_approval_policy_fingerprint_sha256")
         )
     ):
         return False
@@ -2262,6 +2301,123 @@ def _valid_promotion_phase_packet(
         return False
     commit_seed = dict(recovery_commit)
     commit_id = commit_seed.pop("commit_id")
+    owner_request = prepare.get("owner_approval_request")
+    approval_metadata = (
+        receipt.get("owner_approval")
+        if isinstance(receipt, Mapping)
+        else None
+    )
+    approval_metadata_keys = {
+        "owner_approval_id",
+        "owner_approval_action",
+        "owner_approval_purpose",
+        "owner_approval_transaction_binding_sha256",
+        "owner_approval_request_sha256",
+        "owner_approval_policy_fingerprint_sha256",
+    }
+    if (
+        not isinstance(owner_request, Mapping)
+        or not isinstance(approval_metadata, Mapping)
+        or set(approval_metadata) != approval_metadata_keys
+        or approval_metadata.get("owner_approval_action") != "live_promotion"
+        or any(
+            not _valid_recovery_digest(approval_metadata.get(field))
+            for field in (
+                "owner_approval_id",
+                "owner_approval_transaction_binding_sha256",
+                "owner_approval_request_sha256",
+                "owner_approval_policy_fingerprint_sha256",
+            )
+        )
+        or not _nonempty_recovery_string(
+            approval_metadata.get("owner_approval_purpose")
+        )
+    ):
+        return False
+    expected_owner_request = {
+        "schema_version": "tradingagents.owner_approval_request.v1",
+        "action": "live_promotion",
+        "subject": {
+            "kind": "verified_recovery_promotion",
+            "recovery_commit_id": commit_id,
+            "incident_id": bindings["incident_id"],
+            "recovery_run_id": state.get("recovery_run_id"),
+            "source_revision": bindings["source_revision"],
+            "focused_sha256": recovery_commit.get("focused_sha256"),
+            "reconciliation_sha256": recovery_commit.get(
+                "reconciliation_sha256"
+            ),
+            "frozen_control_preimage_sha256": state.get(
+                "recovery_control_freeze", {}
+            ).get("sha256"),
+            "report_sha256": recovery_commit.get("report_sha256"),
+            "envelope_ref": str(envelope_path),
+            "envelope_sha256": recovery_commit.get("envelope_sha256"),
+            "canonical_output_path": str(canonical_path),
+            "canonical_input_sha256": recovery_commit.get(
+                "canonical_before_sha256"
+            ),
+            "staged_output_path": str(staged_path),
+            "expected_raw_stage_sha256": prepare.get(
+                "expected_raw_stage_sha256"
+            ),
+            "expected_stage_sha256": packet.get("staged_state_sha256"),
+            "promoted": prepare.get("promoted"),
+            "demoted": prepare.get("demoted"),
+            "unchanged": prepare.get("unchanged"),
+        },
+        "source_binding": {
+            "kind": "verified_recovery_promotion",
+            "recovery_commit_id": commit_id,
+            "incident_id": bindings["incident_id"],
+            "recovery_run_id": state.get("recovery_run_id"),
+            "source_revision": bindings["source_revision"],
+            "expected_stage_sha256": packet.get("staged_state_sha256"),
+            "frozen_control_preimage_sha256": state.get(
+                "recovery_control_freeze", {}
+            ).get("sha256"),
+        },
+        "risk_envelope_binding": {
+            "ref": str(envelope_path),
+            "sha256": recovery_commit.get("envelope_sha256"),
+        },
+        "purpose": (
+            f"verified_recovery_promotion:{commit_id}:"
+            f"{packet.get('staged_state_sha256')}"
+        ),
+    }
+    owner_request_digest = hashlib.sha256(
+        _recovery_json(expected_owner_request)
+    ).hexdigest()
+    if (
+        dict(owner_request) != expected_owner_request
+        or approval_metadata.get("owner_approval_request_sha256")
+        != owner_request_digest
+        or approval_metadata.get("owner_approval_purpose")
+        != expected_owner_request["purpose"]
+    ):
+        return False
+    try:
+        from tradingagents.policy.owner_approval import (
+            default_policy_fingerprint,
+            require_prior_consumption_for_commitment_recovery,
+        )
+
+        if (
+            approval_metadata["owner_approval_policy_fingerprint_sha256"]
+            != default_policy_fingerprint()
+        ):
+            return False
+        require_prior_consumption_for_commitment_recovery(
+            approval_id=approval_metadata["owner_approval_id"],
+            action=approval_metadata["owner_approval_action"],
+            purpose=approval_metadata["owner_approval_purpose"],
+            transaction_binding_sha256=approval_metadata[
+                "owner_approval_transaction_binding_sha256"
+            ],
+        )
+    except OwnerApprovalError:
+        return False
     expected_intent = {
         "commit_id": commit_id,
         "prepare_path": prepare_record["path"],
@@ -2272,6 +2428,7 @@ def _valid_promotion_phase_packet(
         "canonical_before_sha256": recovery_commit.get(
             "canonical_before_sha256"
         ),
+        **dict(approval_metadata),
     }
     expected_prepare = {
         "schema_version": "tradingagents.promotion_prepare.v1",
@@ -2285,6 +2442,10 @@ def _valid_promotion_phase_packet(
             "expected_raw_stage_sha256"
         ),
         "expected_stage_sha256": packet.get("staged_state_sha256"),
+        "promoted": prepare.get("promoted"),
+        "demoted": prepare.get("demoted"),
+        "unchanged": prepare.get("unchanged"),
+        "owner_approval_request": expected_owner_request,
         "can_submit_orders": False,
         "execution_authority": "none",
     }
@@ -2308,6 +2469,7 @@ def _valid_promotion_phase_packet(
         "reconciliation_sha256": recovery_commit.get(
             "reconciliation_sha256"
         ),
+        "owner_approval_request_sha256": owner_request_digest,
         "arm_live": True,
         "ci_green": True,
     }
@@ -2326,6 +2488,7 @@ def _valid_promotion_phase_packet(
         "canonical_after_sha256": packet.get("canonical_after_sha256"),
         "can_submit_orders": False,
         "execution_authority": "none",
+        "owner_approval": dict(approval_metadata),
     }
     return (
         packet.get("schema_version") == "tradingagents.recovery_phase.v1"
@@ -3646,7 +3809,11 @@ def _record_recovery_incident(
 
 
 def build_production_recovery_request(
-    signal: Mapping[str, Any], *, repo_root: str | Path, command_runner: Any = subprocess.run
+    signal: Mapping[str, Any],
+    *,
+    repo_root: str | Path,
+    command_runner: Any = subprocess.run,
+    promotion_owner_approval: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the non-test dispatch contract for a recoverable plan signal.
 
@@ -3655,6 +3822,14 @@ def build_production_recovery_request(
     recovery state, never a manual or silently skipped outcome. Real runtime
     integrations can replace the packet producers, not this authority boundary.
     """
+    if promotion_owner_approval is not None and not isinstance(
+        promotion_owner_approval, Mapping
+    ):
+        return {
+            "ready": False,
+            "outcome": "not_recovery_work",
+            "detail": "promotion owner approval must be a parsed JSON object",
+        }
     root = Path(repo_root).resolve()
     captured_signal = _captured_signal_packet(signal, root=root)
     if captured_signal is not None and _is_execution_board_packet(
@@ -4003,6 +4178,33 @@ def build_production_recovery_request(
                 ),
             }
 
+        recovery_control_freeze = arguments.get("recovery_control_freeze")
+        if (
+            not isinstance(recovery_control_freeze, Mapping)
+            or recovery_control_freeze.get("incident_id") != bindings["incident_id"]
+            or recovery_control_freeze.get("recovery_run_id")
+            != str(arguments.get("recovery_run_id") or "")
+            or not _valid_recovery_digest(recovery_control_freeze.get("sha256"))
+        ):
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": (
+                    "sync_promotion: exact frozen-control preimage binding is "
+                    "required"
+                ),
+            }
+
+        coordinator_now = _parse_aware_recovery_time(arguments.get("generated_at"))
+        if coordinator_now is None:
+            return {
+                "outcome": "failed",
+                "failure_type": "permanent",
+                "detail": "sync_promotion: coordinator verification clock is required",
+            }
+
+        promoted_transition: dict[str, list[str]] = {"value": []}
+
         def expected_transaction(
             before_sha256: str,
             canonical_payload: Mapping[str, Any],
@@ -4022,6 +4224,11 @@ def build_production_recovery_request(
                 ci_green=True,
                 now=generated_at,
             )
+            promoted_transition["value"] = [
+                sorted(result.promoted),
+                sorted(result.demoted),
+                sorted(result.unchanged),
+            ]
             raw_state = dict(result.state)
             raw_source = raw_state.get("source")
             if not isinstance(raw_source, Mapping):
@@ -4042,6 +4249,72 @@ def build_production_recovery_request(
                 sort_keys=True,
             ).encode("utf-8")
             return recovery_commit, raw_state, raw_bytes, enriched_bytes
+
+        def owner_approval_request_from_prepare(
+            prepare: Mapping[str, Any],
+        ) -> dict[str, Any]:
+            recovery_commit = prepare["recovery_commit"]
+            subject = {
+                "kind": "verified_recovery_promotion",
+                "recovery_commit_id": recovery_commit["commit_id"],
+                "incident_id": bindings["incident_id"],
+                "recovery_run_id": str(arguments["recovery_run_id"]),
+                "source_revision": bindings["source_revision"],
+                "focused_sha256": recovery_commit["focused_sha256"],
+                "reconciliation_sha256": recovery_commit[
+                    "reconciliation_sha256"
+                ],
+                "frozen_control_preimage_sha256": recovery_control_freeze[
+                    "sha256"
+                ],
+                "report_sha256": recovery_commit["report_sha256"],
+                "envelope_ref": str(envelope.resolve()),
+                "envelope_sha256": recovery_commit["envelope_sha256"],
+                "canonical_output_path": str(canonical_state.resolve()),
+                "canonical_input_sha256": recovery_commit[
+                    "canonical_before_sha256"
+                ],
+                "staged_output_path": str(stage_path.resolve()),
+                "expected_raw_stage_sha256": prepare[
+                    "expected_raw_stage_sha256"
+                ],
+                "expected_stage_sha256": prepare["expected_stage_sha256"],
+                "promoted": list(prepare["promoted"]),
+                "demoted": list(prepare["demoted"]),
+                "unchanged": list(prepare["unchanged"]),
+            }
+            source_binding = {
+                "kind": "verified_recovery_promotion",
+                "recovery_commit_id": recovery_commit["commit_id"],
+                "incident_id": bindings["incident_id"],
+                "recovery_run_id": str(arguments["recovery_run_id"]),
+                "source_revision": bindings["source_revision"],
+                "expected_stage_sha256": prepare["expected_stage_sha256"],
+                "frozen_control_preimage_sha256": recovery_control_freeze[
+                    "sha256"
+                ],
+            }
+            purpose = (
+                "verified_recovery_promotion:"
+                f"{recovery_commit['commit_id']}:"
+                f"{prepare['expected_stage_sha256']}"
+            )
+            return {
+                "schema_version": "tradingagents.owner_approval_request.v1",
+                "action": "live_promotion",
+                "subject": subject,
+                "source_binding": source_binding,
+                "risk_envelope_binding": {
+                    "ref": str(envelope.resolve()),
+                    "sha256": recovery_commit["envelope_sha256"],
+                },
+                "purpose": purpose,
+            }
+
+        def owner_approval_request_sha256(
+            request: Mapping[str, Any],
+        ) -> str:
+            return hashlib.sha256(_recovery_json(dict(request))).hexdigest()
 
         def stage_request_from_prepare(
             prepare: Mapping[str, Any],
@@ -4070,6 +4343,11 @@ def build_production_recovery_request(
                 "reconciliation_sha256": recovery_commit[
                     "reconciliation_sha256"
                 ],
+                "owner_approval_request_sha256": (
+                    owner_approval_request_sha256(
+                        prepare["owner_approval_request"]
+                    )
+                ),
                 "arm_live": True,
                 "ci_green": True,
             }
@@ -4110,7 +4388,25 @@ def build_production_recovery_request(
                 record = _phase_record(prepare_path)
                 recovery_commit = prepare.get("recovery_commit")
                 if (
-                    prepare.get("schema_version")
+                    set(prepare)
+                    != {
+                        "schema_version",
+                        "kind",
+                        "recovery_commit",
+                        "stage_path",
+                        "generated_at",
+                        "arm_live",
+                        "ci_green",
+                        "expected_raw_stage_sha256",
+                        "expected_stage_sha256",
+                        "promoted",
+                        "demoted",
+                        "unchanged",
+                        "owner_approval_request",
+                        "can_submit_orders",
+                        "execution_authority",
+                    }
+                    or prepare.get("schema_version")
                     != "tradingagents.promotion_prepare.v1"
                     or prepare.get("kind") != "promotion_commit_prepare"
                     or prepare.get("stage_path") != str(stage_path)
@@ -4125,6 +4421,20 @@ def build_production_recovery_request(
                     or not _valid_recovery_digest(
                         prepare.get("expected_stage_sha256")
                     )
+                    or any(
+                        not isinstance(prepare.get(name), list)
+                        or not all(
+                            _nonempty_recovery_string(item)
+                            for item in prepare[name]
+                        )
+                        or prepare[name] != sorted(set(prepare[name]))
+                        for name in ("promoted", "demoted", "unchanged")
+                    )
+                    or not isinstance(
+                        prepare.get("owner_approval_request"), Mapping
+                    )
+                    or prepare.get("can_submit_orders") is not False
+                    or prepare.get("execution_authority") != "none"
                 ):
                     raise ValueError("promotion prepare packet is malformed")
                 if (
@@ -4147,6 +4457,8 @@ def build_production_recovery_request(
                     seed != expected_seed
                     or commit_id != expected_commit_id
                     or _recovery_digest(prepare_path) != record["sha256"]
+                    or prepare["owner_approval_request"]
+                    != owner_approval_request_from_prepare(prepare)
                 ):
                     raise ValueError("promotion prepare packet binding mismatch")
                 request = stage_request_from_prepare(prepare, record)
@@ -4202,9 +4514,15 @@ def build_production_recovery_request(
                 "expected_stage_sha256": hashlib.sha256(
                     enriched_bytes
                 ).hexdigest(),
+                "promoted": list(promoted_transition["value"][0]),
+                "demoted": list(promoted_transition["value"][1]),
+                "unchanged": list(promoted_transition["value"][2]),
                 "can_submit_orders": False,
                 "execution_authority": "none",
             }
+            prepare["owner_approval_request"] = (
+                owner_approval_request_from_prepare(prepare)
+            )
             prepare_sha256 = hashlib.sha256(_recovery_json(prepare)).hexdigest()
             request = stage_request_from_prepare(
                 prepare,
@@ -4323,39 +4641,166 @@ def build_production_recovery_request(
                     prepare["expected_stage_sha256"],
                 }
 
+            approval_request = dict(prepare["owner_approval_request"])
+            approval_request_digest = owner_approval_request_sha256(
+                approval_request
+            )
+            supplied_approval = arguments.get("promotion_owner_approval")
+            if supplied_approval is not None and not isinstance(
+                supplied_approval, Mapping
+            ):
+                raise _PromotionOwnerApprovalRequired(
+                    "owner approval must be supplied as a parsed JSON object"
+                )
+            supplied_approval = (
+                dict(supplied_approval)
+                if isinstance(supplied_approval, Mapping)
+                else None
+            )
+
+            from tradingagents.policy.owner_approval import (
+                consume_owner_approval,
+                default_policy_fingerprint,
+                owner_approval_has_consumption,
+                require_prior_consumption_for_commitment_recovery,
+                transaction_binding_sha256,
+                verify_owner_approval_structure,
+            )
+
+            def verify_recovery_owner_approval() -> dict[str, str]:
+                if supplied_approval is None:
+                    raise _PromotionOwnerApprovalRequired(
+                        "exact account_owner approval is required; sign the "
+                        f"request recorded in {prepare_path.resolve()}"
+                    )
+                try:
+                    parsed = verify_owner_approval_structure(
+                        approval=supplied_approval,
+                        expected_action=approval_request["action"],
+                        subject=approval_request["subject"],
+                        source_binding=approval_request["source_binding"],
+                        now=_owner_approval_authority_utc_now(),
+                        purpose=approval_request["purpose"],
+                    )
+                except OwnerApprovalError as exc:
+                    raise _PromotionOwnerApprovalRequired(
+                        f"owner approval refused: {exc}"
+                    ) from exc
+                expected_envelope = approval_request["risk_envelope_binding"]
+                if parsed.get("risk_envelope_binding") != expected_envelope:
+                    raise _PromotionOwnerApprovalRequired(
+                        "owner approval risk-envelope binding does not match "
+                        "this recovery transaction"
+                    )
+                binding = transaction_binding_sha256(
+                    approval_id=parsed["approval_id"],
+                    action=parsed["action"],
+                    purpose=approval_request["purpose"],
+                    subject=approval_request["subject"],
+                    risk_envelope_ref=expected_envelope["ref"],
+                    risk_envelope_sha256=expected_envelope["sha256"],
+                )
+                return {
+                    "owner_approval_id": parsed["approval_id"],
+                    "owner_approval_action": parsed["action"],
+                    "owner_approval_purpose": approval_request["purpose"],
+                    "owner_approval_transaction_binding_sha256": binding,
+                    "owner_approval_request_sha256": approval_request_digest,
+                    "owner_approval_policy_fingerprint_sha256": parsed[
+                        "policy_fingerprint_sha256"
+                    ],
+                }
+
+            existing_intent = arguments.get("promotion_commit_intent")
+            approval_metadata: dict[str, str] | None = None
+            if isinstance(existing_intent, Mapping):
+                candidate_metadata = {
+                    key: str(existing_intent.get(key) or "")
+                    for key in (
+                        "owner_approval_id",
+                        "owner_approval_action",
+                        "owner_approval_purpose",
+                        "owner_approval_transaction_binding_sha256",
+                        "owner_approval_request_sha256",
+                        "owner_approval_policy_fingerprint_sha256",
+                    )
+                }
+                if (
+                    candidate_metadata["owner_approval_request_sha256"]
+                    != approval_request_digest
+                    or candidate_metadata[
+                        "owner_approval_policy_fingerprint_sha256"
+                    ]
+                    != default_policy_fingerprint()
+                ):
+                    raise ValueError(
+                        "persisted recovery approval metadata is stale or mismatched"
+                    )
+                try:
+                    require_prior_consumption_for_commitment_recovery(
+                        approval_id=candidate_metadata["owner_approval_id"],
+                        action=candidate_metadata["owner_approval_action"],
+                        purpose=candidate_metadata["owner_approval_purpose"],
+                        transaction_binding_sha256=candidate_metadata[
+                            "owner_approval_transaction_binding_sha256"
+                        ],
+                    )
+                except OwnerApprovalError as exc:
+                    approval_metadata = verify_recovery_owner_approval()
+                    if approval_metadata != candidate_metadata:
+                        raise ValueError(
+                            "supplied owner approval does not match the "
+                            "persisted recovery transaction"
+                        ) from exc
+                else:
+                    approval_metadata = candidate_metadata
+            else:
+                approval_metadata = verify_recovery_owner_approval()
+
             if stage_path.exists():
                 stage_bytes = stage_path.read_bytes()
             else:
-                result = run_json(
-                    "sync_promotion",
-                    [
-                        sys.executable,
-                        "-m",
-                        "cli.main",
-                        "policy",
-                        "sync-promotion",
-                        "--report-path",
-                        str(report),
-                        "--envelope-path",
-                        str(envelope),
-                        "--state-path",
-                        str(canonical_state),
-                        "--output-state-path",
-                        str(stage_path),
-                        "--arm-live",
-                        "--ci-green",
-                        "--generated-at",
-                        deterministic_generated_at,
-                        "--json-output",
-                    ],
-                )
-                raw_packet = (
-                    result.get("packet") if isinstance(result, Mapping) else None
-                )
-                if not isinstance(raw_packet, Mapping) or not stage_path.exists():
-                    return unavailable(
-                        "sync_promotion", "canonical promotion staging failed"
+                with promotion_state_lock(canonical_state):
+                    canonical_before_bytes = canonical_state.read_bytes()
+                    canonical_before_sha256 = hashlib.sha256(
+                        canonical_before_bytes
+                    ).hexdigest()
+                    if (
+                        canonical_before_sha256
+                        != recovery_commit["canonical_before_sha256"]
+                    ):
+                        raise _PromotionStalePreimage(
+                            "promotion canonical state changed before staging"
+                        )
+                    canonical_before_payload = json.loads(
+                        canonical_before_bytes.decode("utf-8")
                     )
+                    if not isinstance(canonical_before_payload, Mapping):
+                        raise ValueError(
+                            "promotion canonical state is malformed"
+                        )
+                    (
+                        recomputed_commit,
+                        _raw_state,
+                        raw_stage_bytes,
+                        _enriched_stage_bytes,
+                    ) = expected_transaction(
+                        canonical_before_sha256,
+                        canonical_before_payload,
+                    )
+                    if recomputed_commit != recovery_commit:
+                        raise ValueError(
+                            "promotion recovery commit changed before staging"
+                        )
+                if (
+                    hashlib.sha256(raw_stage_bytes).hexdigest()
+                    != prepare["expected_raw_stage_sha256"]
+                ):
+                    raise ValueError(
+                        "recomputed raw promotion stage digest is inconsistent"
+                    )
+                atomic_write_text(stage_path, raw_stage_bytes.decode("utf-8"))
+                emit_fault("after_promotion_stage_write")
                 stage_bytes = stage_path.read_bytes()
             stage_digest = hashlib.sha256(stage_bytes).hexdigest()
             expected_raw_sha256 = prepare["expected_raw_stage_sha256"]
@@ -4456,6 +4901,7 @@ def build_production_recovery_request(
                 "canonical_before_sha256": recovery_commit[
                     "canonical_before_sha256"
                 ],
+                **approval_metadata,
             }
             with promotion_state_lock(canonical_state):
                 current_sha256 = _recovery_digest(canonical_state)
@@ -4468,6 +4914,57 @@ def build_production_recovery_request(
                 emit_fault("after_promotion_intent_fsync")
                 assert_control_frozen()
                 if current_sha256 == recovery_commit["canonical_before_sha256"]:
+                    if owner_approval_has_consumption(
+                        approval_metadata["owner_approval_id"]
+                    ):
+                        require_prior_consumption_for_commitment_recovery(
+                            approval_id=approval_metadata["owner_approval_id"],
+                            action=approval_metadata["owner_approval_action"],
+                            purpose=approval_metadata["owner_approval_purpose"],
+                            transaction_binding_sha256=approval_metadata[
+                                "owner_approval_transaction_binding_sha256"
+                            ],
+                        )
+                    else:
+                        confirmed_metadata = verify_recovery_owner_approval()
+                        if confirmed_metadata != approval_metadata:
+                            raise ValueError(
+                                "owner approval changed before canonical commit"
+                            )
+                        try:
+                            consume_owner_approval(
+                                approval_id=approval_metadata[
+                                    "owner_approval_id"
+                                ],
+                                action=approval_metadata[
+                                    "owner_approval_action"
+                                ],
+                                purpose=approval_metadata[
+                                    "owner_approval_purpose"
+                                ],
+                                transaction_binding_sha256=approval_metadata[
+                                    "owner_approval_transaction_binding_sha256"
+                                ],
+                                now=_owner_approval_authority_utc_now(),
+                            )
+                        except OwnerApprovalError:
+                            # A same-transaction concurrent/crash retry may have
+                            # won the ledger append. Only the exact durable
+                            # record permits continuation.
+                            require_prior_consumption_for_commitment_recovery(
+                                approval_id=approval_metadata[
+                                    "owner_approval_id"
+                                ],
+                                action=approval_metadata[
+                                    "owner_approval_action"
+                                ],
+                                purpose=approval_metadata[
+                                    "owner_approval_purpose"
+                                ],
+                                transaction_binding_sha256=approval_metadata[
+                                    "owner_approval_transaction_binding_sha256"
+                                ],
+                            )
                     atomic_write_text(
                         canonical_state,
                         stage_path.read_text(encoding="utf-8"),
@@ -4477,6 +4974,14 @@ def build_production_recovery_request(
                         raise ValueError("promotion canonical replace digest mismatch")
                     emit_fault("after_promotion_canonical_replace")
                 elif current_sha256 == staged_sha256:
+                    require_prior_consumption_for_commitment_recovery(
+                        approval_id=approval_metadata["owner_approval_id"],
+                        action=approval_metadata["owner_approval_action"],
+                        purpose=approval_metadata["owner_approval_purpose"],
+                        transaction_binding_sha256=approval_metadata[
+                            "owner_approval_transaction_binding_sha256"
+                        ],
+                    )
                     canonical = json.loads(
                         canonical_state.read_text(encoding="utf-8")
                     )
@@ -4506,6 +5011,7 @@ def build_production_recovery_request(
                     "canonical_after_sha256": staged_sha256,
                     "can_submit_orders": False,
                     "execution_authority": "none",
+                    "owner_approval": dict(approval_metadata),
                 }
                 receipt_record = _write_phase_packet(receipt_path, receipt)
                 emit_fault("after_promotion_commit_receipt_fsync")
@@ -4521,6 +5027,12 @@ def build_production_recovery_request(
                 }
             )
             return {"packet": packet}
+        except _PromotionOwnerApprovalRequired as error:
+            return {
+                "outcome": "failed",
+                "failure_type": "external_blocked",
+                "detail": f"sync_promotion: {_redact_recovery_detail(error)}",
+            }
         except _PromotionStalePreimage as error:
             return {
                 "outcome": "failed",
@@ -4608,6 +5120,11 @@ def build_production_recovery_request(
         "recovery_run_id": f"self-heal-run-{hashlib.sha256((signature + ':run').encode()).hexdigest()[:16]}",
         "idempotency_key": f"self-heal-delivery-{hashlib.sha256(signature.encode()).hexdigest()[:16]}",
         "adapters": {"resolve_authority": authority, "regenerate_evidence": regenerate, "sync_promotion": promotion, "reconcile": reconcile, "focused_verify": focused},
+        **(
+            {"promotion_owner_approval": dict(promotion_owner_approval)}
+            if promotion_owner_approval is not None
+            else {}
+        ),
     }
 
 
@@ -4871,8 +5388,16 @@ def coordinate_verified_recovery(
     now: dt.datetime | None = None,
     rearm: Any = rearm_after_verified_recovery,
     fault_hook: Any = None,
+    promotion_owner_approval: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Own a resumable internal recovery without acquiring broker authority.
+
+    ``promotion_owner_approval`` carries the exact account_owner approval
+    artifact required when verified recovery promotes a sleeve into
+    live-eligible.  It must bind the already-computed recovery transaction
+    (report/envelope/canonical-input digests and resulting stage digest); a
+    missing, stale, malformed, replayed, or mismatched artifact fails closed
+    and control stays frozen.
 
     Each adapter receives structured data only and returns ``{"packet": {...}}``.
     The coordinator writes immutable packets itself, binds them to the canonical
@@ -5320,6 +5845,24 @@ def coordinate_verified_recovery(
             _record_recovery_incident(root, state, now=current)
             return {"status": "retry_scheduled", "incident_id": incident_id, "phase": state.get("phase"), "next_retry_at": state["next_retry_at"]}
         prior_failure = state.get("last_failure") or {}
+        if (
+            prior_failure.get("kind") == "external_blocked"
+            and state.get("phase") == "sync_promotion"
+            and isinstance(promotion_owner_approval, Mapping)
+        ):
+            state["last_failure"] = None
+            state["next_retry_at"] = None
+            state["external_blockers"] = []
+            state["incident_stage"] = "repairing"
+            state["incident_history"].append(
+                {
+                    "event": "owner_approval_artifact_supplied",
+                    "phase": "sync_promotion",
+                    "at": current.isoformat(),
+                }
+            )
+            _write_recovery_state(state_path, state)
+            prior_failure = {}
         if prior_failure.get("kind") in {"permanent_integrity", "forbidden_effect", "external_blocked", "transient_exhausted"}:
             if state.get("phase") == "rearm" and active_task5_rearm():
                 state["last_failure"] = None
@@ -5656,10 +6199,19 @@ def coordinate_verified_recovery(
                                 "promotion_stage_request": state.get(
                                     "promotion_stage_request"
                                 ),
+                                "promotion_commit_intent": state.get(
+                                    "promotion_commit_intent"
+                                ),
+                                "recovery_control_freeze": dict(
+                                    state["recovery_control_freeze"]
+                                ),
                                 "_persist_promotion_stage_request": persist_promotion_stage_request,
                                 "_persist_promotion_commit_intent": persist_promotion_commit_intent,
                                 "_assert_recovery_control_frozen": assert_promotion_control_frozen,
                                 "_transaction_fault_hook": fault_hook,
+                                "promotion_owner_approval": (
+                                    promotion_owner_approval
+                                ),
                             }
                         )
                         if callable(fault_hook):
@@ -6717,8 +7269,13 @@ def execute_self_heal_plan(
     *,
     repo_root: str | Path = ".",
     runner: Any = subprocess.run,
+    promotion_owner_approval: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute allowlisted safe-plane verification actions from a plan packet."""
+    if promotion_owner_approval is not None and not isinstance(
+        promotion_owner_approval, Mapping
+    ):
+        raise ValueError("promotion owner approval must be a parsed JSON object")
     root = Path(repo_root)
     updated: dict[str, Any] = json.loads(json.dumps(dict(packet)))
     executed_count = 0
@@ -6734,7 +7291,11 @@ def execute_self_heal_plan(
             skipped_escalated_count += 1
             continue
         if signal.get("classification") == "recoverable_integrity" and signal.get("status") == "owned_recovery_ready":
-            request = build_production_recovery_request(signal, repo_root=root)
+            request = build_production_recovery_request(
+                signal,
+                repo_root=root,
+                promotion_owner_approval=promotion_owner_approval,
+            )
             if request.get("ready") is not True:
                 recovery = {"status": "transient_context_unavailable", "detail": request.get("detail")}
             else:

@@ -1098,3 +1098,594 @@ git commit -m "test: prove packetized agent learning loop"
 ```
 
 Expected: PASS and clean focused diff.
+
+---
+
+### Evidence-First Increment 1: Agent Ledger Reconciliation And Dependence Bounds
+
+**Status:** Approved continuation after the owner-approval authority boundary
+was integrated and reverified on canonical `master` at
+`e50ec697f8ee0379261a324563a13ecc9d0792c6`.
+
+**Files:**
+
+- Create: `tradingagents/evals/agent_intelligence_reconciliation.py`
+- Modify: `tradingagents/evals/agent_intelligence_ledger.py`
+- Modify: `cli/main.py`
+- Create or extend: `tests/test_agent_intelligence_reconciliation.py`
+- Extend only when required by the public summary contract:
+  `tests/test_agent_intelligence_ledger.py`
+
+**Purpose:** Bind every derived count to one captured ledger byte snapshot and
+make dependence visible without rewriting raw forecast history. The current
+4,944 resolved rows collapse to 2,595 packet-event clusters and 354
+conservative market-event clusters. The conservative cluster count is the
+provisional effective sample until a separately preregistered estimator exists.
+
+- [x] **Step 1: Add focused RED tests for a one-read snapshot**
+
+The reader must capture the JSONL bytes once and derive the following from
+those bytes only:
+
+```text
+schema_version = agent_intelligence_reconciliation/v1
+ledger_sha256
+ledger_byte_length
+raw_nonempty_line_count
+valid_forecast_count
+corrupt_line_count
+duplicate_forecast_id_row_count
+conflicting_forecast_id_count
+resolved_row_count
+packet_event_cluster_count
+market_event_cluster_count
+provisional_effective_sample
+summary_freshness
+receipt_sha256
+```
+
+The packet-event key is the canonical tuple of `source_packet_id`, ticker,
+benchmark, and canonical `resolution_window`. The conservative market-event
+key is ticker, the UTC creation market date, horizon, and benchmark. Missing or
+malformed cluster material is counted as unclusterable and never replaced with
+invented identity.
+
+- [x] **Step 2: Prove integrity failures remain visible and non-mutating**
+
+RED fixtures must cover malformed JSON, schema-invalid rows, exact duplicate
+IDs, conflicting duplicate IDs, missing source-packet identity, malformed
+creation time, and distinct packet events that share one market event. The
+ledger bytes and SHA-256 must be identical before and after every reconcile
+call. No reconciliation path may call `append_forecasts`, `write_ledger`,
+resolution, learning-availability, broker, runtime, schedule, or outbox code.
+
+- [x] **Step 3: Add deterministic dependence fields to derived summaries**
+
+`summarize_agent_scores()` and newly written summaries must expose the same
+dependence block so a raw resolved-row count is never presented alone as an
+effective sample. This increment does not change earned-influence math,
+promotion, mutation, paper, or live behavior; the receipt must label that
+row-weighted influence estimator as legacy/unregistered rather than imply that
+the cluster bound is already a statistical estimator.
+
+- [x] **Step 4: Add the read-only reconciliation CLI**
+
+`research agent-ledger-reconcile` prints canonical JSON to stdout by default.
+An explicit `--receipt-path` may atomically write only the derived receipt and
+must reject the ledger path itself, an alias of it, or any partial overwrite.
+It never replaces `summary.json` in this increment. Summary freshness states
+are exact: missing, malformed, `unverifiable_legacy_summary` when no ledger
+fingerprint exists, stale when the fingerprint differs, and current only when
+the fingerprint and required counts match.
+
+- [x] **Step 5: Verify the current evidence scale without mutating it**
+
+Tests use synthetic fixtures. A separate read-only check may point the pure
+reconciler at the current ignored ledger and must reproduce 6,244 valid rows,
+4,944 resolved rows, 2,595 packet-event clusters, and 354 market-event clusters
+with the current ledger SHA-256. Do not write a receipt into `results/` during
+implementation verification.
+
+- [x] **Step 6: Review and commit**
+
+```bash
+TA_LIVE_SUBMIT=0 .venv/bin/python -m pytest -q \
+  tests/test_agent_intelligence_reconciliation.py \
+  tests/test_agent_intelligence_ledger.py \
+  tests/test_resolution_quality.py \
+  tests/test_learning_context.py
+.venv/bin/ruff check \
+  tradingagents/evals/agent_intelligence_reconciliation.py \
+  tradingagents/evals/agent_intelligence_ledger.py \
+  cli/main.py \
+  tests/test_agent_intelligence_reconciliation.py \
+  tests/test_agent_intelligence_ledger.py
+```
+
+One implementation writer stops uncommitted. A fresh no-edit verifier, a fresh
+specification reviewer, and a separate quality/security reviewer must accept
+the complete diff before the scoped commit
+`feat(evals): reconcile agent ledger dependence`.
+
+**Explicit non-goals for this increment:** trial/mutation/source-span/producer
+receipt wiring, supersession, a statistical estimator, influence reweighting,
+economic backtests, data downloads, database/index migration, summary
+replacement, schedule activation, trial execution, live-control changes, or
+broker activity.
+
+**Implementation record (2026-08-24, GREEN, uncommitted for fresh review):**
+
+Worktree `~/.codex/worktrees/tradingagents-agent-ledger-reconciliation-20260824`,
+branch `codex/agent-ledger-reconciliation-20260824` at base
+`e50ec697f8ee0379261a324563a13ecc9d0792c6`. Changed paths:
+`tradingagents/evals/agent_intelligence_reconciliation.py` (new),
+`tradingagents/evals/agent_intelligence_ledger.py` (dependence block only),
+`cli/main.py` (`research agent-ledger-reconcile` only),
+`tests/test_agent_intelligence_reconciliation.py` (new);
+`tests/test_agent_intelligence_ledger.py` needed no change.
+
+RED evidence: first run of
+`TA_LIVE_SUBMIT=0 .venv/bin/python -m pytest -q tests/test_agent_intelligence_reconciliation.py`
+failed collection with
+`ModuleNotFoundError: No module named 'tradingagents.evals.agent_intelligence_reconciliation'`.
+After the pure module landed but before wiring, 13 passed / 6 failed with exact
+assertions: missing receipt fields, wrong counts on the mixed fixture,
+`KeyError: 'dependence'` from `summarize_agent_scores`, and
+`No such command 'agent-ledger-reconcile'`.
+
+GREEN: 19 reconciliation tests pass; focused set
+(`tests/test_agent_intelligence_reconciliation.py`,
+`tests/test_agent_intelligence_ledger.py`, `tests/test_resolution_quality.py`,
+`tests/test_learning_context.py`) = 146 passed; adjacent
+`tests/test_agent_intelligence_brain.py` = 7 passed.
+Ruff clean on all five plan paths; `compileall` OK with
+`PYTHONPYCACHEPREFIX` outside the repo; `uv lock --check` OK;
+`git diff --check` clean.
+
+Pinned semantics: both cluster keys cover resolved rows only; packet-event key
+canonicalizes a missing/null `resolution_window` as JSON `null` (exact stored
+value, not invented identity) while missing/empty packet/ticker/benchmark
+material is unclusterable; market-event key requires a validated UTC
+`created_at`, normalized ticker/horizon/benchmark; duplicate rows are counted
+only when every row for a forecast id is canonically identical, otherwise the
+id counts once as conflicting. Summary freshness expects a
+`ledger_fingerprint` block (sha256 + byte length + valid/resolved counts) that
+current writers do not emit yet, so live summaries read as
+`unverifiable_legacy_summary`; no writer changed in this increment.
+
+Current ignored ledger, read-only via the CLI and pure reconciler (stdout
+only, no receipt or summary written under `results/`):
+sha256 `10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+11,563,361 bytes, 6,244 valid, 4,944 resolved, 2,595 packet-event clusters,
+354 market-event clusters, provisional effective sample 354, zero corrupt,
+duplicate, conflicting, and unclusterable rows. Remaining risks: freshness
+`current` is unreachable until a future writer emits fingerprints; duplicate/
+conflict accounting for groups mixing identical and differing rows resolves to
+"conflicting" by design.
+
+**Review-fix round (2026-08-24, GREEN, still uncommitted for fresh review):**
+
+RED evidence: the extended suite first failed collection with
+`ImportError: cannot import name 'SummaryReadError'`; probes against the then-
+current code confirmed each finding: a raw U+2028 inside one legal JSON string
+made `str.splitlines()` report 5 nonempty / 1 valid / 4 corrupt instead of
+2/2/0; `resolved: 1` parsed as a valid resolved row; a naive timestamp
+clustered; a string `resolution_window` clustered as `"x"`; and the receipt
+lacked `influence_weighting_status` plus all three null-window counters.
+
+Fixed review findings: byte-level LF splitting with single trailing-CR
+tolerance and strict per-record UTF-8 (decode failure = corrupt, no lossy
+replacement; U+2028/U+2029/U+0085 never split rows); cached validator derived
+from AgentForecast type hints (JSON object required, required/allowed fields,
+strict str/bool/optional/list/dict shapes, list elements, dict keys,
+bool-rejects-int, undeclared fields rejected) with schema-invalid rows corrupt;
+packet/market keys require string key material, Mapping-or-null windows only,
+offset-aware timestamps only, and `resolved is True`; receipt and dependence
+blocks gained `packet_event_null_window_resolved_row_count`,
+`packet_event_null_window_cluster_count`, and
+`packet_event_non_null_window_cluster_count`, where raw parsing counts only an
+explicit JSON null as a null-window row and a missing field stays distinct;
+`influence_weighting_status` is now SHA-covered in every receipt and printed by
+the CLI; invalid-UTF-8/invalid-JSON summaries are malformed, a summary
+vanishing between exists/read is missing, other read errors raise
+`SummaryReadError`, and CLI wording separates read failures ("could not read
+ledger", accurate summary error text) from write failures ("could not write
+receipt"); receipt writes fsync the parent directory after `os.replace` using
+the repository's `getattr(os, "O_DIRECTORY"/"O_NOFOLLOW", 0)` style, raising
+rather than reporting a failed write as successful.
+
+P2 justification (function-local import kept): the deferred
+`AgentForecast` import inside the module is retained as a stable cycle break —
+it executes only at first reconciliation call, after both modules have fully
+initialized, so import order cannot cycle; this bounded increment does not
+duplicate the dataclass schema as a sixth module would.
+
+Verification after fixes (`TA_LIVE_SUBMIT=0`, canonical venv):
+`tests/test_agent_intelligence_reconciliation.py` = 45 passed (was 19),
+focused four-file set = 172 passed, brain suite = 7 passed; Ruff clean on all
+changed paths; `compileall` OK with `PYTHONPYCACHEPREFIX` outside the repo;
+`uv lock --check` OK; `git diff --check` clean. Canonical ignored ledger re-
+checked read-only with the explicit canonical summary path and no receipt
+output: unchanged sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`, 6,244
+valid, 4,944 resolved, 2,595 total packet-event clusters preserved, 354
+market-event clusters, provisional sample 354, and the new disclosure reads
+132 explicit-null resolved rows across 66 null-window clusters with 2,529
+non-null clusters; ledger and summary hashes unchanged. Remaining risks:
+freshness `current` still awaits a fingerprint-emitting writer; object-space
+dependence blocks cannot distinguish an absent window field from explicit
+null after construction (raw receipts can), so the two surfaces agree exactly
+only for fully serialized rows like this ledger's.
+
+**Post-fix correction round (2026-08-24, GREEN, still uncommitted):**
+
+Orchestrator findings corrected in tests and semantics only. (1) The Unicode
+line-boundary fixture now serializes with `ensure_ascii=False` and asserts the
+raw UTF-8 separator bytes U+2028/U+2029/U+0085 are present before reconciling.
+(2) The invalid-UTF-8 case now corrupts a complete otherwise-valid row by
+injecting one invalid byte into its claim, with a clean twin proving strict
+decode is the only failure reason (RED first: the replace anchor missed under
+default separators and was fixed inside the test). (3) The summary-vanishing
+race test creates summary.json first and counts one exercised read before
+mapping `FileNotFoundError` to `missing`. (4) Raw receipt semantics tightened:
+for payload mappings an omitted `resolution_window` field is missing cluster
+material and packet-event unclusterable while an explicitly present JSON null
+remains the canonical legacy null sentinel; receipt packet/market clusters are
+derived from validated raw mappings so field presence survives; object-space
+dependence blocks still count `AgentForecast.resolution_window=None` as that
+sentinel because construction loses presence, documented on the module,
+`packet_event_key`, `dependence_block`, and the receipt builder.
+
+RED evidence for the semantic change: the omitted-window key assertion and the
+updated explicit-null-versus-missing assertions failed against the prior code
+(`packet_event_key(...) is None` returned a clustered key; unclusterable count
+0 instead of 1), then went GREEN after the tightening. Verification after this
+round: reconciliation file 45 passed, focused four-file set 172 passed, brain
+suite 7 passed; Ruff clean; `compileall` OK outside repo; `uv lock --check`
+OK; `git diff --check` clean; canonical read-only check unchanged — sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid, 4,944 resolved, 2,595 packet-event clusters, 354 market-event
+clusters, provisional sample 354, 132 explicit-null rows across 66 null-window
+clusters, 2,529 non-null clusters, zero corrupt/duplicate/conflicting/
+unclusterable rows, ledger and summary hashes unchanged, no output written.
+
+**Spec-review correction round (2026-08-24, GREEN, still uncommitted):**
+
+Four findings fixed. (1) Duplicate/conflict accounting now groups validated
+raw payload mappings directly instead of reconstructed `as_dict()` output, so
+an omitted `resolution_window` and an explicit JSON null with otherwise
+identical content are conflicting rows (0 duplicates / 1 conflict), not exact
+duplicates; unclusterable and null-window accounting retained. RED: the
+regression read duplicate=1 against expected 0. (2) A summary path physically
+aliasing the ledger (direct path, symlink, or hardlink) no longer triggers a
+second read: physical equivalence is detected stat-only via
+`os.path.samefile`/realpath before any summary read, and the captured byte
+snapshot is reused for summary parsing (a JSONL ledger deterministically
+classifies as a malformed summary). Normal summary behavior unchanged;
+`SummaryReadError` fail-closed semantics preserved. RED with inode-based
+read instrumentation (`os.path.samefile`, catching name-based blind spots on
+symlink/hardlink aliases): ledger read 2 times instead of 1 for all three
+alias kinds. (3) A present summary containing JSON literal null is malformed,
+not missing: decoded payloads are distinguished from the absent-file None
+sentinel in `_decoded_summary_payload`. RED: state was `missing`. (4) CLI
+wording locked by tests: missing-ledger asserts "could not read ledger" and
+not the summary wording; a new faked summary PermissionError asserts the
+distinct "could not read summary" wording without the ledger wording (this
+pair passed immediately as a regression lock; the underlying split landed in
+the earlier round).
+
+Adjacent reassessment found no further drift: field presence is now honored
+in every raw-space surface (clustering, null counters, duplicate grouping);
+object-space dependence blocks keep their documented sentinel behavior.
+
+Post-fix verification (`TA_LIVE_SUBMIT=0`, canonical venv):
+`tests/test_agent_intelligence_reconciliation.py` = 51 passed,
+focused four-file set = 178 passed, brain suite = 7 passed; Ruff clean on all
+five changed paths; `compileall` OK with `PYTHONPYCACHEPREFIX` outside the
+repo; `uv lock --check` OK; `git diff --check` clean; canonical ignored
+ledger re-checked read-only via the CLI with the canonical summary path and
+no output write: sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid, 4,944 resolved, 2,595 packet-event clusters, 354 market-event
+clusters, provisional sample 354, 132 explicit-null rows across 66
+null-window clusters, 2,529 non-null clusters, zero corrupt/duplicate/
+conflicting/unclusterable rows, `unverifiable_legacy_summary`, ledger and
+summary hashes unchanged. Remaining risks unchanged: freshness `current`
+awaits a fingerprint-emitting writer; object-space blocks cannot recover
+field presence after construction (raw receipts can).
+
+**Strict-JSON and summary-stat correction round (2026-08-24, GREEN, still
+uncommitted):**
+
+P1 strict JSON: one shared strict decoder (`_STRICT_JSON_DECODER` with
+`object_pairs_hook` rejecting duplicate keys at any nesting level and
+`parse_constant` rejecting NaN/Infinity/-Infinity) now parses ledger records
+and summaries; non-strict ledger records count corrupt and non-strict
+summaries classify malformed. `canonical_json_text` emits standards-compliant
+JSON via `allow_nan=False` and rejects non-finite values instead of
+serializing them (packet-key window canonicalization already treats that as
+unclusterable). Raw-byte fixtures were hand-spliced, never produced by
+json.dumps: a valid forecast with `"session_count":NaN` inside its
+resolution_window; nested duplicate `entry_date` keys inside
+resolution_window plus a top-level duplicate `ticker`; a fingerprint-bearing
+summary containing NaN; and a summary with two `ledger_fingerprint` keys.
+RED evidence: 7 failed / 51 passed — the NaN row was accepted as valid, both
+duplicate-key rows were accepted as valid, canonical_json_text serialized
+non-finite values without error, the NaN summary classified `current`
+(silent acceptance despite a matching fingerprint), the duplicate-key summary
+classified from last-key-wins parsing, and the alias-stat failure did not
+raise.
+
+Adjacent confirmed read defect: the summary read path no longer probes
+existence at all. Physical alias detection is stat-only via
+`_paths_equivalent(..., strict=True)`, which re-raises every non-
+FileNotFoundError OSError so metadata/alias failures surface as
+`SummaryReadError` ("could not read summary") instead of being silently
+downgraded to a realpath guess or mislabeled "could not read ledger";
+`read_bytes` FileNotFoundError maps to missing (vanish races preserved), all
+other read OSErrors raise SummaryReadError, direct/symlink/hardlink alias
+reuse keeps the one-captured-read contract, and JSON literal null stays
+malformed. RED: faked `os.path.samefile` PermissionError did not raise and
+the CLI exited 0; GREEN raises SummaryReadError and the CLI prints the
+summary wording only. Regression tests use narrow monkeypatches of the exact
+filesystem calls, no chmod.
+
+Post-fix verification (`TA_LIVE_SUBMIT=0`, canonical venv): reconciliation
+file = 58 passed; five-suite set = 192 passed (58+23+21+83+7); Ruff clean on
+all changed Python/test paths; `compileall` OK with `PYTHONPYCACHEPREFIX`
+outside the repo; `uv lock --check` OK; `git diff --check` clean; canonical
+ignored ledger re-checked read-only via the CLI with the canonical summary
+path and no receipt write: sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid, 4,944 resolved, 2,595 packet-event clusters, 354 market-event
+clusters, provisional sample 354, 132 explicit-null rows across 66
+null-window clusters, 2,529 non-null clusters, zero corrupt/duplicate/
+conflicting/unclusterable rows, `unverifiable_legacy_summary`, ledger and
+summary hashes unchanged. Remaining risks unchanged: freshness `current`
+awaits a fingerprint-emitting writer; object-space blocks cannot recover
+field presence after construction (raw receipts can).
+
+**Existence-probe removal correction (2026-08-24, GREEN, still uncommitted):**
+
+Closed the docstring-versus-implementation mismatch: `_paths_equivalent` still
+called `Path.exists` even though the record and `reconcile_ledger_file`
+claimed the summary path never probes existence. RED: a tripwire
+monkeypatching `pathlib.Path.exists` to raise for exactly the reconciled
+ledger/summary paths failed with "unexpected existence probe on
+.../summary.json" while reconciling a normal fingerprint-matching summary.
+GREEN: the helper now calls `os.path.samefile` directly — True means inode
+alias; FileNotFoundError means no inode alias and permits the realpath
+fallback; any other samefile or realpath OSError re-raises only in strict
+read mode (wrapped by the caller as `SummaryReadError`) and stays
+non-raising for optional receipt-path protection; the realpath fallback sits
+inside the guarded error handling so strict mode cannot silently swallow a
+realpath OSError. Preserved: direct, symlink, and hardlink one-captured-read
+aliasing; vanish-as-missing; summary PermissionError wording; all strict JSON
+semantics. Verification: `tests/test_agent_intelligence_reconciliation.py`
+= 59 passed, five-suite set = 193 passed, Ruff clean on changed paths,
+`compileall` OK with external `PYTHONPYCACHEPREFIX`, `uv lock --check` OK,
+`git diff --check` clean, and the canonical read-only CLI check reproduced
+sha256 `10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid / 4,944 resolved / 2,595 packet-event clusters / 354 market-event
+clusters with 132 explicit-null rows across 66 null-window clusters and
+2,529 non-null clusters, ledger and summary hashes unchanged, no output
+written.
+
+**Blank-record classification correction (2026-08-24, GREEN, still
+uncommitted):**
+
+P1 raw-record gap: `build_reconciliation_receipt` used broad
+`record.strip()` to detect blank records, and `bytes.strip` treats vertical
+tab 0x0b and form feed 0x0c as whitespace, so such records could vanish from
+both `raw_nonempty_line_count` and `corrupt_line_count`. RED evidence
+history, stated exactly: the original RED fixture mixed one bare 0x0b record
+with a JSON record carrying a trailing 0x0c, so it isolated only the
+vertical-tab omission — the trailing-FF JSON record was already counted raw-
+nonempty/corrupt because its leading byte is not whitespace under broad
+strip. A post-fix tightening now makes both illegal bytes independent bare
+records (one b"\x0b" line, one b"\x0c" line, plus one valid forecast line,
+asserting raw_nonempty 3 / valid 1 / corrupt 2), independently locking form
+feed against any future regression of the predicate; the companion space/tab
+plus single-trailing-CR padding fixture is preserved unchanged. GREEN: the
+blank predicate remains `record.strip(b" \t")`, accepting only exact
+space/tab padding after the existing single trailing-CR strip; LF byte
+splitting, strict decoder semantics, and every accepted count are unchanged.
+P2: the module-level freshness documentation no longer references an
+existence check; it now states the summary path is never probed for
+existence and that a file vanishing before or directly during its read is
+`missing`. Verification: reconciliation file = 61 passed, five-suite set =
+195 passed (61+23+21+83+7), Ruff clean on changed paths, `compileall` OK
+with external `PYTHONPYCACHEPREFIX`, `uv lock --check` OK, `git diff --check`
+clean; canonical read-only CLI check reproduced sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 raw nonempty/valid, 4,944 resolved, 2,595 packet-event clusters, 354
+market-event clusters, provisional sample 354, 132 explicit-null rows across
+66 null-window clusters, 2,529 non-null clusters, zero corrupt/duplicate/
+conflicting/unclusterable rows, `unverifiable_legacy_summary`, ledger and
+summary hashes unchanged, no receipt written. Test-evidence tightening
+round (no production change): strengthened bare-record fixture passes
+against the unchanged predicate; reconciliation file = 61 passed, five-suite
+set = 195 passed, Ruff/compileall/uv-lock/diff-check all clean as above.
+
+**Ox quality/security round (2026-08-24, GREEN, still uncommitted):**
+
+P1 test hermeticity (custody correction, not production RED): the CLI JSON
+test invoked `agent-ledger-reconcile` without `--summary-path` and asserted
+`missing`, which only holds when the process CWD lacks the ignored
+`results/agent_intelligence/summary.json`; the orchestrator independently
+confirmed that canonical ignored summary exists and reads as
+`unverifiable_legacy_summary`, so the ambient scenario is factual without
+inventing a production failure (the sandbox denied a cd-based capture; no
+external access was requested again). Fix: every reconciliation
+`runner.invoke` case now passes an explicit tmp summary path unless it
+intentionally tests a concrete summary file; the renamed
+`test_cli_prints_canonical_json_and_hermetic_summary_state`, both
+atomic-write invokes, the write-failure wording case, and the missing-ledger
+case are hermetic. CLI production defaults unchanged.
+
+P2 fingerprint types: numeric fingerprint fields now require exactly `int`
+(`type(value) is int`) before equality — JSON `true` and float literals such
+as `1.0` never classify current for ledger_byte_length,
+valid_forecast_count, or resolved_row_count; sha stays nonempty-str;
+malformed shapes remain unverifiable legacy; typed-but-wrong stays stale.
+RED: value-equal `true`/`1.0` fingerprints classified current under Python
+equality (4 parametrized failures); an initial byte_length=true case was
+discarded because its base value 77 made it stale for the wrong reason.
+
+P2 schema evolution: `_type_checker` now validates dict values alongside
+keys (`dict[K, V]`), raises TypeError during construction for bare
+list/dict/tuple/set/frozenset, variadic/fixed tuples, legacy typing.Dict/
+typing.List, and any unrecognized annotation instead of silently accepting.
+RED: 10 loud-rejection cases plus dict-value rejection failed under the old
+accept-all fallback; one initial parametrization wrongly listed `object` as
+unsupported — it is deliberately Any-equivalent and moved to an accepted-
+hints test. AgentForecast acceptance and all counts unchanged.
+
+P2 receipt write: successful staged/final receipts assert mode 0600
+(mkstemp default, locked as regression). fdopen-failure cleanup hardened:
+the mkstemp descriptor flag pattern guarantees close when `os.fdopen` fails,
+temp residue is removed, and the original exception propagates; atomic
+replace plus parent fsync unchanged. RED: capturing the real mkstemp fd and
+faking `os.fdopen` to raise EBADF left the descriptor open (`os.fstat` did
+not raise) before the fix; post-fix fstat raises EBADF, no temp remains, and
+the test closes any deliberately leaked RED fd in its own finally.
+
+Verification: reconciliation file = 77 passed, five-suite set = 211 passed
+(77+23+21+83+7); Ruff clean on changed paths (two deliberate
+`typing.Dict/List` fixtures carry noqa UP006); compileall OK with external
+`PYTHONPYCACHEPREFIX`; `uv lock --check` OK; `git diff --check` clean;
+canonical read-only CLI check reproduced sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid / 4,944 resolved / 2,595 / 354 clusters, provisional 354,
+132/66/2529 disclosure, zero corrupt/duplicate/conflicting/unclusterable,
+`unverifiable_legacy_summary`, ledger and summary hashes unchanged, no
+receipt written.
+
+**Orchestrator hardening regression round (2026-08-24, GREEN, still
+uncommitted):**
+
+(1) Fingerprint exact types: added a direct
+`evaluate_summary_freshness` regression for `ledger_byte_length` with
+expected value 1 against recorded `True` and `1.0` (plus the exact-match
+current control). Truthful evidence status: this case passed immediately —
+the previous round's exact-int guard already covers byte_length, so it locks
+existing behavior rather than new RED. The genuinely RED checker case was
+`_type_checker(int)` accepting `bool` (`int_check(True)` returned True under
+`isinstance`); its `1.0` assertion was already GREEN and remains a regression
+lock. GREEN: `_type_checker(int)` now uses exact int semantics (rejects bool
+and floats) while AgentForecast's declared hints contain no int fields, so no
+current counts changed.
+
+(2) fdopen original-exception custody: new regression fakes `os.fdopen` to
+close the captured real descriptor first and then raise
+`OSError(EIO, "storage media revoked")`. RED: the cleanup `os.close`
+re-raised `[Errno 9] Bad file descriptor`, masking the original message.
+GREEN: only the cleanup close is wrapped in `contextlib.suppress(OSError)`,
+so the original fdopen error propagates while temp residue is still removed;
+the earlier leak test (fd stays closed on plain fdopen failure) and all
+strict-JSON/alias/freshness semantics are unchanged.
+
+Verification: reconciliation file = 79 passed, five-suite set = 213 passed
+(79+23+21+83+7); Ruff clean on changed paths; `compileall` OK with external
+`PYTHONPYCACHEPREFIX`; `uv lock --check` OK; `git diff --check` clean;
+canonical read-only CLI check reproduced sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid / 4,944 resolved / 2,595 / 354 clusters, provisional 354,
+132/66/2529 disclosure, zero corrupt/duplicate/conflicting/unclusterable,
+`unverifiable_legacy_summary`, ledger and summary hashes unchanged, no
+receipt written.
+
+**Final Ox P2 review-fix round (2026-08-24, GREEN, still uncommitted):**
+
+(1) Receipt-path alias protection fails closed: `write_reconciliation_receipt`
+now evaluates protected-path equivalence with `strict=True` and converts any
+non-FileNotFoundError metadata OSError (samefile/realpath resolution) into
+`ReconciliationPathError` ("receipt path protection could not be verified
+against ...") before any write, so an unstatable alias can never slip through
+the lenient realpath guess and clobber a protected file. Normal missing-path
+behavior is unchanged (FileNotFoundError still means not-aliased and the
+write proceeds). RED: faking `os.path.samefile` to raise PermissionError for
+the receipt target previously wrote the receipt silently (`DID NOT RAISE`);
+post-fix it rejects with no ledger change, no target file, and no temp
+residue.
+
+(2) `cli/main.py` now imports and reuses `DEFAULT_SUMMARY_PATH` from the
+ledger module instead of duplicating the
+`Path("results/agent_intelligence/summary.json")` literal in seven option
+defaults (identical value; pure de-duplication lock, no behavioral RED).
+
+(3) The manual `Path.read_bytes` patch/try-finally restore in the one-read
+test was converted to pytest `monkeypatch.setattr` auto-restoration
+(test-mechanics refactor, semantics identical).
+
+Verification: reconciliation file = 80 passed; five-suite set = 214 passed
+(80+23+21+83+7); focused hardening selectors (new fail-closed case,
+unsafe-receipt-path CLI parametrization, ledger suite) = 29 passed; Ruff
+clean on all changed Python/test paths; `compileall` OK with external
+`PYTHONPYCACHEPREFIX`; `uv lock --check` OK; `git diff --check` clean;
+canonical read-only CLI check with explicit canonical summary path and no
+receipt output reproduced sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid / 4,944 resolved / 2,595 / 354 clusters, provisional 354,
+132/66/2529 disclosure, zero corrupt/duplicate/conflicting/unclusterable,
+`unverifiable_legacy_summary`, ledger and summary hashes unchanged.
+
+**Terra alias-classification correction (2026-08-24, GREEN, still
+uncommitted):**
+
+P2: when a summary path physically aliased the ledger, the captured ledger
+bytes were re-parsed as summary JSON. A multi-record JSONL ledger failed
+strict parsing and happened to classify malformed, but a valid single-record
+ledger parsed as one complete JSON object with no fingerprint and wrongly
+classified `unverifiable_legacy_summary`. RED: new direct/symlink/hardlink
+regressions using a valid single-record ledger physically aliased as the
+summary (each instrumented to exactly one ledger read) failed all three ways
+with `unverifiable_legacy_summary` instead of `malformed`. GREEN: the alias
+branch now returns a private typed sentinel `_MalformedSummary` (slots class,
+module-level instance) instead of parsing ledger bytes as a summary;
+`evaluate_summary_freshness` classifies it malformed via the existing
+non-Mapping branch. The one-captured-read guarantee, normal non-alias summary
+parsing (including JSON literal null -> malformed), vanish-as-missing,
+SummaryReadError wording, and strict-JSON semantics are unchanged.
+Verification: reconciliation file = 83 passed; five-suite set = 217 passed
+(83+23+21+83+7); focused alias selectors = 11 passed; Ruff clean on changed
+Python/tests; `compileall` OK with external `PYTHONPYCACHEPREFIX`;
+`uv lock --check` OK; `git diff --check` clean; canonical read-only CLI check
+with explicit canonical paths and no receipt output reproduced sha256
+`10b3c228c1de2ecc91242083df90aac7a47f7cdd870f7e75eca657bd0d28c223`,
+6,244 valid / 4,944 resolved / 2,595 / 354 clusters, provisional 354,
+132/66/2529 disclosure, zero anomalies, `unverifiable_legacy_summary`,
+ledger and summary hashes unchanged.
+
+**Final acceptance (2026-08-24):** fresh no-edit verification passed 217
+tests across the five focused suites plus 41 strict hardening selectors;
+Ruff, external-cache `compileall`, `uv lock --check`, and diff checks were
+clean. The final Terra specification re-review and Ox Alpha/max
+quality-security re-review both returned `ACCEPT` with no P0/P1/P2 findings.
+Canonical ledger and summary hashes, the frozen live-control hash, and all ten
+paused TradingAgents automation states remained unchanged. Scoped commit:
+`feat(evals): reconcile agent ledger dependence`.
+
+**Post-integration correction (2026-08-24, focused fix, uncommitted):**
+
+After the scoped commit `49f4490 feat(evals): reconcile agent ledger
+dependence`, the full suite ran RED `1 failed, 4389 passed, 1 skipped,
+75 subtests`:
+`tests/test_authority_role_alignment.py::test_production_raw_http_mutation_inventory_has_no_unclassified_transport`
+reported the new 56-line `research agent-ledger-reconcile` command shifted
+the `_overnight_ticker_process_main` raw-http-put occurrences in
+`cli/main.py` from lines 5342/5354 to 5398/5410. Correction: updated only
+the two exact classification tuples in
+`tests/test_authority_role_alignment.py`
+(`("cli/main.py", 5342, "_overnight_ticker_process_main", "raw-http-put") ->
+5398`, `(..., 5354, ...) -> 5410`), preserving both classification names
+(`non-trading-local-process-result-queue`,
+`non-trading-local-process-error-queue`) and all production source behavior.
+Focused GREEN: the previously failing test passes and
+`tests/test_authority_role_alignment.py` is 53 passed; the 217-test ledger
+five-suite gate stays green; Ruff clean on the changed test path;
+external-cache compileall OK; `uv lock --check` OK; `git diff --check`
+clean. Final full-suite rerun GREEN: 4,390 passed, 1 skipped, 11 warnings,
+and 75 subtests passed in 520.90 seconds. The skip is the existing
+credential-gated DeepSeek live-API case; no runtime, broker, schedule,
+automation, or production command was invoked.

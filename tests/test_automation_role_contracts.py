@@ -7,9 +7,9 @@ record as deployment proof.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
-import shutil
 from pathlib import Path
 
 from tradingagents.evals.automation_health_audit import (
@@ -19,7 +19,6 @@ from tradingagents.evals.automation_health_audit import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_PATH = REPO_ROOT / "config" / "automation_schedule_contract.json"
-AUTOMATION_ROOT = Path.home() / ".codex" / "automations"
 FROZEN_OBSERVER_ACTIVE_IDS = frozenset(
     {
         "tradingagents-overnight-research",
@@ -40,10 +39,39 @@ FROZEN_OBSERVER_PAUSED_IDS = frozenset(
 )
 
 
-def _copy_automation_records(destination: Path) -> Path:
+def _fixture_contract_and_automation_records(destination: Path) -> tuple[Path, Path]:
+    """Materialize deterministic external records from the versioned contract."""
+
+    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
     root = destination / "automations"
-    shutil.copytree(AUTOMATION_ROOT, root)
-    return root
+    for automation_id, record in contract["automations"].items():
+        prompt = "\n".join(("fixture TradingAgents automation", *record["required_prompt_phrases"]))
+        record["prompt_sha256"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        target = record["target"]
+        lines = (
+            'version = 1',
+            f'id = {json.dumps(automation_id)}',
+            'kind = "cron"',
+            f'name = {json.dumps(record["name"])}',
+            f'prompt = {json.dumps(prompt)}',
+            'status = "PAUSED"',
+            f'rrule = {json.dumps(record["rrule"])}',
+            f'model = {json.dumps(record["model"])}',
+            f'reasoning_effort = {json.dumps(record["reasoning_effort"])}',
+            f'notification_policy = {json.dumps(record["notification_policy"])}',
+            f'cwds = {json.dumps(record["cwds"])}',
+            f'execution_environment = {json.dumps(record["execution_environment"])}',
+            "target = { "
+            f'type = {json.dumps(target["type"])}, '
+            f'project_id = {json.dumps(target["project_id"])} '
+            "}",
+        )
+        path = root / automation_id
+        path.mkdir(parents=True)
+        (path / "automation.toml").write_text("\n".join(lines), encoding="utf-8")
+    contract_path = destination / "automation_schedule_contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    return contract_path, root
 
 
 def _set_automation_status(root: Path, automation_id: str, status: str) -> None:
@@ -74,12 +102,15 @@ def _replace_automation_toml_line(
     path.write_text(updated, encoding="utf-8")
 
 
-def test_current_external_records_are_checked_against_the_versioned_contract():
-    """Current predeployment configuration is checked without proving deployment."""
+def test_fixture_records_are_checked_against_the_versioned_contract(tmp_path):
+    """The normal contract test is deterministic and does not inspect a workstation."""
+
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
 
     result = evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
-        automation_root=AUTOMATION_ROOT,
+        contract_path=contract_path,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
 
     assert result["status"] == "not_deployed"
@@ -113,7 +144,8 @@ def test_current_external_records_are_checked_against_the_versioned_contract():
 
 
 def test_contract_rejects_model_effort_notification_and_prompt_drift(tmp_path):
-    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
     record = contract["automations"]["tradingagents-overnight-research"]
     record["model"] = "wrong-model"
     record["reasoning_effort"] = "wrong-effort"
@@ -124,7 +156,7 @@ def test_contract_rejects_model_effort_notification_and_prompt_drift(tmp_path):
 
     result = evaluate_schedule_contract(
         contract_path=path,
-        automation_root=AUTOMATION_ROOT,
+        automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
 
@@ -143,9 +175,10 @@ def test_contract_rejects_model_effort_notification_and_prompt_drift(tmp_path):
 
 
 def test_missing_contract_fails_closed_without_claiming_deployment(tmp_path):
+    _contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
     result = evaluate_schedule_contract(
         contract_path=tmp_path / "missing.json",
-        automation_root=AUTOMATION_ROOT,
+        automation_root=automation_root,
     )
 
     assert result == {
@@ -162,14 +195,16 @@ def test_missing_contract_fails_closed_without_claiming_deployment(tmp_path):
 
 
 def test_contract_requires_no_submit_for_active_observers_and_dependencies(tmp_path):
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
+
     def write_contract(name, mutate):
-        contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
         mutate(contract)
         path = tmp_path / name
         path.write_text(json.dumps(contract), encoding="utf-8")
         return evaluate_schedule_contract(
             contract_path=path,
-            automation_root=AUTOMATION_ROOT,
+            automation_root=automation_root,
             role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
         )
 
@@ -258,10 +293,10 @@ def test_contract_requires_no_submit_for_active_observers_and_dependencies(tmp_p
 
 
 def test_schedule_contract_supports_predeployment_and_frozen_observer_phases(tmp_path):
-    automation_root = _copy_automation_records(tmp_path)
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
 
     predeployment = evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
+        contract_path=contract_path,
         automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
@@ -280,7 +315,7 @@ def test_schedule_contract_supports_predeployment_and_frozen_observer_phases(tmp
         _set_automation_status(automation_root, automation_id, "ACTIVE")
 
     frozen_observer = evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
+        contract_path=contract_path,
         automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
         deployment_phase="frozen_observer",
@@ -296,11 +331,13 @@ def test_schedule_contract_supports_predeployment_and_frozen_observer_phases(tmp
 
 def test_schedule_contract_rejects_each_protected_frozen_observer_activation(tmp_path):
     for automation_id in FROZEN_OBSERVER_PAUSED_IDS:
-        automation_root = _copy_automation_records(tmp_path / automation_id)
+        contract_path, automation_root = _fixture_contract_and_automation_records(
+            tmp_path / automation_id
+        )
         _set_automation_status(automation_root, automation_id, "ACTIVE")
 
         result = evaluate_schedule_contract(
-            contract_path=CONTRACT_PATH,
+            contract_path=contract_path,
             automation_root=automation_root,
             role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
             deployment_phase="frozen_observer",
@@ -317,7 +354,7 @@ def test_schedule_contract_rejects_each_protected_frozen_observer_activation(tmp
             "actual": "ACTIVE",
         }
 
-        contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
         phase = contract["deployment_policy"]["deployment_phases"]["frozen_observer"]
         phase["active_automation_ids"].remove("tradingagents-overnight-research")
         phase["active_automation_ids"].append(automation_id)
@@ -336,17 +373,17 @@ def test_schedule_contract_rejects_each_protected_frozen_observer_activation(tmp
 
 
 def test_schedule_contract_rejects_invalid_frozen_observer_phase_and_contract(tmp_path):
-    automation_root = _copy_automation_records(tmp_path)
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
 
     invalid_phase = evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
+        contract_path=contract_path,
         automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
         deployment_phase="not-a-real-phase",
     )
     assert invalid_phase["issues"] == ["deployment_phase_invalid"]
 
-    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
     del contract["deployment_policy"]["deployment_phases"]["frozen_observer"]
     path = tmp_path / "missing-phase-contract.json"
     path.write_text(json.dumps(contract), encoding="utf-8")
@@ -359,19 +396,15 @@ def test_schedule_contract_rejects_invalid_frozen_observer_phase_and_contract(tm
     assert missing_phase["issues"] == ["contract_deployment_phases"]
 
 
-def _write_mutated_contract(tmp_path: Path, name: str, mutate) -> Path:
-    contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
-    mutate(contract)
-    path = tmp_path / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(contract), encoding="utf-8")
-    return path
-
-
 def _evaluate_mutated_contract(tmp_path: Path, name: str, mutate) -> dict:
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    mutate(contract)
+    mutated_path = tmp_path / name
+    mutated_path.write_text(json.dumps(contract), encoding="utf-8")
     return evaluate_schedule_contract(
-        contract_path=_write_mutated_contract(tmp_path, name, mutate),
-        automation_root=AUTOMATION_ROOT,
+        contract_path=mutated_path,
+        automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
 
@@ -400,10 +433,10 @@ def test_expected_central_schedules_encode_current_contract_rrules_in_central_ti
 
 
 def test_current_paused_tomls_pass_with_expected_central_schedules_enforced(tmp_path):
-    automation_root = _copy_automation_records(tmp_path)
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
 
     result = evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
+        contract_path=contract_path,
         automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
@@ -418,7 +451,7 @@ def test_current_paused_tomls_pass_with_expected_central_schedules_enforced(tmp_
         _set_automation_status(automation_root, automation_id, "ACTIVE")
 
     frozen_observer = evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
+        contract_path=contract_path,
         automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
         deployment_phase="frozen_observer",
@@ -548,7 +581,7 @@ def test_arbitrary_central_schedule_drift_is_flagged_as_mismatch(tmp_path):
 
     assert minute_drift["status"] == "invalid_contract"
     assert minute_drift["issues"] == ["contract_expected_central_schedule_mismatch"]
-    assert weekday_drift["issues"] == ["contract_expected_central_schedule_mismatch"]
+    assert weekday_drift["issues"] == ["contract_dependency_order"]
     assert partial_shift["issues"] == ["contract_expected_central_schedule_mismatch"]
 
 
@@ -557,7 +590,7 @@ def _evaluate_mutated_actual_toml(
     automation_id: str,
     rrule_value: str,
 ) -> dict:
-    automation_root = _copy_automation_records(tmp_path)
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
     _replace_automation_toml_line(
         automation_root,
         automation_id,
@@ -565,7 +598,7 @@ def _evaluate_mutated_actual_toml(
         f"rrule = {json.dumps(rrule_value)}",
     )
     return evaluate_schedule_contract(
-        contract_path=CONTRACT_PATH,
+        contract_path=contract_path,
         automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
@@ -626,6 +659,46 @@ def test_actual_toml_arbitrary_rrule_drift_fails_closed_with_mismatch_issue(tmp_
         assert result["deployment_proven"] is False, name
 
 
+def test_schedule_contract_requires_a_same_day_predecessor_for_each_dependent_run(tmp_path):
+    """A Monday-only prerequisite cannot satisfy Tuesday through Friday work."""
+
+    def restrict_overnight_research_to_monday(contract):
+        contract["automations"]["tradingagents-overnight-research"]["rrule"] = (
+            "RRULE:FREQ=WEEKLY;BYHOUR=3;BYMINUTE=30;BYDAY=MO"
+        )
+        contract["expected_central_schedules"]["tradingagents-overnight-research"] = {
+            "timezone": "America/Chicago",
+            "occurrences": [{"weekday": "MO", "hour": 3, "minute": 30}],
+        }
+
+    result = _evaluate_mutated_contract(
+        tmp_path,
+        "monday-only-overnight-research.json",
+        restrict_overnight_research_to_monday,
+    )
+
+    assert result["issues"] == ["contract_dependency_order"]
+
+
+def test_unexpected_automation_fails_safe_predeployment(tmp_path):
+    contract_path, automation_root = _fixture_contract_and_automation_records(tmp_path)
+    unexpected = automation_root / "tradingagents-unexpected"
+    unexpected.mkdir()
+    (unexpected / "automation.toml").write_text(
+        'id = "tradingagents-unexpected"\nstatus = "PAUSED"\n', encoding="utf-8"
+    )
+
+    result = evaluate_schedule_contract(
+        contract_path=contract_path,
+        automation_root=automation_root,
+        role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
+    )
+
+    assert result["issues"] == ["unexpected_automation_ids"]
+    assert result["unexpected_automation_ids"] == ["tradingagents-unexpected"]
+    assert result["safe_predeployment"] is False
+
+
 def test_schedule_contract_rejects_identity_drift_in_both_deployment_phases(tmp_path):
     automation_id = "tradingagents-overnight-research"
     identity_drift = {
@@ -637,7 +710,7 @@ def test_schedule_contract_rejects_identity_drift_in_both_deployment_phases(tmp_
 
     for deployment_phase in ("predeployment_paused", "frozen_observer"):
         for field, replacement in identity_drift.items():
-            automation_root = _copy_automation_records(
+            contract_path, automation_root = _fixture_contract_and_automation_records(
                 tmp_path / deployment_phase / field
             )
             if deployment_phase == "frozen_observer":
@@ -651,7 +724,7 @@ def test_schedule_contract_rejects_identity_drift_in_both_deployment_phases(tmp_
             )
 
             result = evaluate_schedule_contract(
-                contract_path=CONTRACT_PATH,
+                contract_path=contract_path,
                 automation_root=automation_root,
                 role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
                 deployment_phase=deployment_phase,

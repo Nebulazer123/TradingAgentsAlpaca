@@ -14,7 +14,7 @@ daily_loss_halt_usd: 25.00
 max_drawdown_halt_pct: 0.05
 tiny_live_tranche_usd: 25.00
 tiny_live_max_loss_usd: 5.00
-new_sleeve_auto_promote: false
+new_sleeve_auto_promote: true
 alert_email: ops@example.com
 # --- Optional submit-path hardening (all default-inert; omit to keep unchanged) ---
 # account_hard_ceiling_usd: a hard cap on (current live exposure + new buys).

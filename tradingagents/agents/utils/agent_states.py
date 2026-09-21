@@ -50,6 +50,9 @@ class AgentState(MessagesState):
     trade_date: Annotated[str, "What date we are trading at"]
     run_id: Annotated[str, "Stable logical graph-run identity"]
     run_started_at: Annotated[str, "Checkpoint-stable real UTC run start"]
+    checkpoint_run_identity: Annotated[
+        dict[str, object], "Canonical complete identity required for checkpoint resume"
+    ]
     decision_packet_refs: Annotated[
         list[dict], "Compact decision packet references"
     ]

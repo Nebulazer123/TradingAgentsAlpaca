@@ -40,6 +40,9 @@ _LOWER_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ALLOWED_KINDS = frozenset(
     {
         "evaluation-registration",
+        "economic-evaluation-protocol",
+        "economic-holdout-release",
+        "economic-evaluation-run",
         "genome-window",
         "promotion-evidence",
         "baseline-genome",
@@ -1098,6 +1101,39 @@ class ImmutableStrategyEvidenceStore:
                     admission_route=event.admission_route,
                 )
             return envelopes, head
+
+    def verify_with_events(
+        self,
+    ) -> tuple[tuple[EvidenceEnvelope, ...], tuple[EvidenceEvent, ...]]:
+        """Verify the journal and return its immutable envelopes and events.
+
+        Consumers that bind an external admission record to a historical
+        predecessor need the individual verified event digests, not only the
+        current head.  This remains read-only and does not repair or mutate
+        store state.
+        """
+
+        self._reject_callback_reentry()
+        if self._root_is_absent():
+            return (), ()
+        with self._locked(create=False):
+            self._ensure_managed_directories(
+                create=False,
+                recover_staged_pointers=False,
+            )
+            events, envelopes = self._replay()
+            self._verify_latest(events)
+            if self._admission_route is not None:
+                orphans = self._valid_orphan_envelopes(
+                    admitted_object_ids=frozenset(
+                        event.object_id for event in events
+                    )
+                )
+                if orphans:
+                    raise EvidenceCorruptionError(
+                        "reserved manual-shadow ledger has unadmitted objects"
+                    )
+            return envelopes, events
 
     def validate_read_only(
         self,

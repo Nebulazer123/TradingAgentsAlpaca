@@ -2,10 +2,17 @@ import copy
 import datetime
 import hashlib
 import json
+import sys
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
+from tests._owner_approval_testing import (
+    DEFAULT_TEST_ISSUED_AT,
+    build_owner_approval,
+    build_risk_envelope_expansion_approval,
+)
 from tradingagents.brokers.alpaca_supervisor import (
     HourlySupervisorAction,
     validate_supervisor_live_submit_allowed,
@@ -15,8 +22,122 @@ from tradingagents.policy import live_gate as live_gate_module
 from tradingagents.policy.exit_policy import apply_exit_policy_to_position
 from tradingagents.policy.live_gate import LiveGateError, evaluate_go_live_guard
 from tradingagents.policy.order_rate_limit import record_live_order_submission
+from tradingagents.policy.owner_approval import default_policy_fingerprint
 from tradingagents.policy.promotion_sync import sync_promotion_state_file
 from tradingagents.policy.risk_envelope import load_risk_envelope
+
+
+@pytest.fixture(autouse=True)
+def _supply_genuine_owner_approvals(tmp_path, monkeypatch):
+    """Test-only compatibility layer for this legacy gate suite.
+
+    The unified go-live guard now refuses live orders without a current,
+    signed account_owner approval (enforced directly by
+    tests/test_owner_approval_boundaries.py).  This suite predates that
+    boundary, so the layer signs one genuine Ed25519 approval per live action
+    against the exact envelope bytes and rebinds this module's guard and
+    supervisor entry points.  Production policy is untouched and every
+    original assertion still runs against the fully verified path.
+    """
+
+    from tests._owner_approval_testing import install_isolated_owner_trust
+    from tradingagents.policy import owner_approval as owner_approval_module
+
+    handle = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "owner", seed=b"live-gate-anchor"
+    )
+    private_hex = handle.private_hex
+    authority_moment = {"value": DEFAULT_TEST_ISSUED_AT}
+    monkeypatch.setattr(
+        owner_approval_module,
+        "_owner_approval_authority_utc_now",
+        lambda: authority_moment["value"],
+    )
+    monkeypatch.setattr(
+        live_gate_module,
+        "_owner_approval_authority_utc_now",
+        lambda: authority_moment["value"],
+    )
+    test_module = sys.modules[__name__]
+    real_guard = test_module.evaluate_go_live_guard
+    real_supervisor = test_module.validate_supervisor_live_submit_allowed
+
+    def _signed(actions, values):
+        envelope_path = values["risk_envelope_path"]
+        issued_at = values.get("now") or DEFAULT_TEST_ISSUED_AT
+        ref = str(envelope_path)
+        try:
+            sha256 = hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+        except OSError:
+            # A deliberately absent/malformed envelope is signed against an
+            # empty body so the guard itself reports the configuration issue.
+            sha256 = hashlib.sha256(b"").hexdigest()
+        from tradingagents.policy.live_gate import _live_order_owner_subject
+
+        intent_full = values.get("normal_live_intent_full_sha256")
+        payload_sha = values.get("normal_live_order_payload_sha256")
+        client_id = values.get("normal_live_client_order_id")
+
+        def subject_for(action):
+            return _live_order_owner_subject(
+                action,
+                client_order_id=client_id,
+                intent_full_sha256=intent_full,
+                order_payload_sha256=payload_sha,
+            )
+
+        return [
+            build_owner_approval(
+                private_key_hex=private_hex,
+                action="live_promotion",
+                issued_at=issued_at,
+                ttl_minutes=30,
+                subject=subject_for(action),
+                source_binding={"guard": "unified_go_live_guard"},
+                policy_fingerprint_sha256=default_policy_fingerprint(),
+                risk_envelope_ref=ref,
+                risk_envelope_sha256=sha256,
+            )
+            for action in actions
+        ]
+
+    def guarded(actions, **values):
+        values.pop("owner_approval_anchor_path", None)
+        values.pop("owner_approval_ledger_path", None)
+        values.pop("owner_approval_policy_fingerprint", None)
+        values.setdefault("now", DEFAULT_TEST_ISSUED_AT)
+        authority_moment["value"] = values["now"]
+        values.setdefault("owner_approval", _signed(actions, values))
+        if values.get("risk_envelope_expansion_approval") is None:
+            envelope_path = Path(values["risk_envelope_path"])
+            try:
+                sha256 = hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+            except OSError:
+                sha256 = hashlib.sha256(b"").hexdigest()
+            values["risk_envelope_expansion_approval"] = (
+                build_risk_envelope_expansion_approval(
+                    private_hex,
+                    ref=str(envelope_path),
+                    sha256=sha256,
+                    issued_at=values["now"],
+                )
+            )
+        return real_guard(actions, **values)
+
+    def supervised(actions, **values):
+        values.pop("owner_approval_anchor_path", None)
+        values.pop("owner_approval_ledger_path", None)
+        values.pop("owner_approval_policy_fingerprint", None)
+        values.setdefault("now", DEFAULT_TEST_ISSUED_AT)
+        authority_moment["value"] = values["now"]
+        values.setdefault("owner_approval", _signed(actions, values))
+        return real_supervisor(actions, **values)
+
+    monkeypatch.setattr(test_module, "evaluate_go_live_guard", guarded)
+    monkeypatch.setattr(
+        test_module, "validate_supervisor_live_submit_allowed", supervised
+    )
+    yield
 
 
 def _write_envelope(
@@ -88,6 +209,96 @@ def test_live_gate_never_treats_uncapped_as_live_budget(tmp_path):
 
     assert result.allowed is False
     assert any("live_budget_mode" in issue.reason for issue in result.issues)
+
+
+def test_direct_guard_historical_evidence_clock_cannot_revive_expired_owner_approval(
+    tmp_path, monkeypatch
+):
+    """The exported guard must not let its public evidence clock grant authority.
+
+    This deliberately bypasses the module's legacy approval-supplying wrapper.
+    The order and envelope approvals are current at ``evidence_now`` but both
+    would be stale at the private policy authority moment.  Refusal must happen
+    before any durable ledger or risk-envelope-authorization mutation.
+    """
+
+    from tests._owner_approval_testing import install_isolated_owner_trust
+    from tradingagents.policy.owner_approval import (
+        canonical_risk_envelope_authorization_prepare_path,
+        owner_approval_has_consumption,
+    )
+
+    evidence_now = datetime.datetime(2026, 6, 3, 15, 0, tzinfo=datetime.timezone.utc)
+    authority_now = evidence_now + datetime.timedelta(minutes=2)
+    trust = install_isolated_owner_trust(
+        monkeypatch, tmp_path / "direct-owner", seed=b"live-gate-authority-clock"
+    )
+    monkeypatch.setattr(
+        live_gate_module,
+        "_owner_approval_authority_utc_now",
+        lambda: authority_now,
+        raising=False,
+    )
+    reached: list[str] = []
+    real_load_risk_envelope = live_gate_module.load_risk_envelope
+
+    def _record_risk_load(*args, **kwargs):
+        reached.append("risk_envelope")
+        return real_load_risk_envelope(*args, **kwargs)
+
+    monkeypatch.setattr(live_gate_module, "load_risk_envelope", _record_risk_load)
+
+    envelope_path = tmp_path / "risk_envelope.yaml"
+    promotion_path = tmp_path / "promotion.json"
+    control_path = tmp_path / "live_control.json"
+    _write_envelope(envelope_path)
+    _write_live_control(control_path, expires_at="2026-06-03T16:00:00+00:00")
+    promotion_path.write_text(
+        json.dumps({"sleeves": {"pullback-support": _promotion_record()}}),
+        encoding="utf-8",
+    )
+    promotion_before = promotion_path.read_bytes()
+    envelope_sha256 = hashlib.sha256(envelope_path.read_bytes()).hexdigest()
+    action = _tiny_live_action(decision_id="historical-owner-clock")
+    subject = live_gate_module._live_order_owner_subject(action)
+    owner_approval = build_owner_approval(
+        private_key_hex=trust.private_hex,
+        action="live_promotion",
+        issued_at=evidence_now,
+        ttl_minutes=1,
+        subject=subject,
+        source_binding={"guard": "unified_go_live_guard"},
+        policy_fingerprint_sha256=default_policy_fingerprint(),
+        risk_envelope_ref=str(envelope_path),
+        risk_envelope_sha256=envelope_sha256,
+    )
+    expansion_approval = build_risk_envelope_expansion_approval(
+        trust.private_hex,
+        ref=str(envelope_path),
+        sha256=envelope_sha256,
+        issued_at=evidence_now,
+    )
+
+    result = live_gate_module.evaluate_go_live_guard(
+        actions=[action],
+        risk_envelope_path=envelope_path,
+        promotion_state_path=promotion_path,
+        control_state_path=control_path,
+        live_buying_power=Decimal("100.00"),
+        now=evidence_now,
+        owner_approval=owner_approval,
+        risk_envelope_expansion_approval=expansion_approval,
+    )
+
+    assert result.allowed is False
+    assert any("expired" in issue.reason for issue in result.issues)
+    assert result.checks["owner_approval"] is False
+    assert not owner_approval_has_consumption(owner_approval["approval_id"])
+    assert not owner_approval_has_consumption(expansion_approval["approval_id"])
+    assert not trust.authorization.exists()
+    assert not canonical_risk_envelope_authorization_prepare_path().exists()
+    assert promotion_path.read_bytes() == promotion_before
+    assert reached == []
 
 
 #: Fresh for every gate clock used in this module (2026-06-01/03) while
@@ -206,25 +417,39 @@ def test_live_gate_rejects_forged_normal_intent_before_io(tmp_path, monkeypatch)
 def _real_autonomous_live_gate_bundle(tmp_path_factory):
     """One genuine durable activation chain shared by adversarial gate checks."""
 
-    from tests import test_strategy_staged_intent as staged_intent_tests
     from tests.test_alpaca_execution import (
         _activation_state_path,
         _real_normal_live_activation,
     )
     from tests.test_strategy_promotion_sync import _copy_isolated_source_tamper_repo
     from tradingagents.policy import strategy_promotion_sync as sync_module
+    from tradingagents.strategy import promotion_evidence as promotion_evidence_module
     from tradingagents.strategy._immutable_evidence_store import (
         ImmutableStrategyEvidenceStore,
     )
     from tradingagents.strategy.promotion_evidence import StrategyPromotionEvidence
 
+    # Snapshot the process-global loaded-calculation provenance so the
+    # disposable chain below cannot leak its own bindings into later tests.
+    saved_sources = promotion_evidence_module._LOADED_CALCULATION_SOURCES
+    calculation_names = tuple(
+        name for name, _rel in promotion_evidence_module._CALCULATION_MODULE_PATHS
+    )
+    saved_modules = {name: sys.modules.get(name) for name in calculation_names}
+
     patcher = pytest.MonkeyPatch()
     tmp_path = tmp_path_factory.mktemp("live-gate-authority")
     try:
         fixture_repo = _copy_isolated_source_tamper_repo(tmp_path / "fixture-source")
-        patcher.setattr(staged_intent_tests, "REPO_ROOT", fixture_repo)
+        # Test-only provenance bypass scoped to this disposable chain: the
+        # isolated checkout intentionally differs from the canonical imports.
+        patcher.setattr(
+            promotion_evidence_module,
+            "_require_loaded_source_binding",
+            lambda *_args, **_kwargs: None,
+        )
         root, repo_root, intent, receipt, activated_at = _real_normal_live_activation(
-            tmp_path, patcher
+            tmp_path, patcher, isolated_repo=fixture_repo
         )
         patcher.setattr(
             sync_module,
@@ -242,6 +467,7 @@ def _real_autonomous_live_gate_bundle(tmp_path_factory):
                 if envelope.object_id == source["promotion_evidence_id"]
             )
         )
+
         yield {
             "root": root,
             "repo_root": repo_root,
@@ -254,6 +480,12 @@ def _real_autonomous_live_gate_bundle(tmp_path_factory):
         }
     finally:
         patcher.undo()
+        promotion_evidence_module._LOADED_CALCULATION_SOURCES = saved_sources
+        for name, module in saved_modules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def _real_autonomous_gate_call(tmp_path, bundle, **overrides):
@@ -449,6 +681,7 @@ def test_owned_alpaca_boundary_rejects_drifted_activation_before_any_broker_requ
         _normal_live_admission,
     )
     from tradingagents.brokers import alpaca as alpaca_module
+    from tradingagents.policy import owner_approval as owner_approval_module
 
     bundle = _real_autonomous_live_gate_bundle
     intent = bundle["intent"]
@@ -457,6 +690,11 @@ def test_owned_alpaca_boundary_rejects_drifted_activation_before_any_broker_requ
     monkeypatch.setattr(
         alpaca_module,
         "_normal_live_utc_now",
+        lambda: activated_at,
+    )
+    monkeypatch.setattr(
+        owner_approval_module,
+        "_owner_approval_authority_utc_now",
         lambda: activated_at,
     )
     admission = _normal_live_admission(
@@ -705,7 +943,7 @@ def test_verified_commitment_never_bypasses_frozen_live_control(
     )
     monkeypatch.setattr(
         live_gate_module,
-        "verify_pending_normal_live_submission_commitment",
+        "verify_normal_live_submission_commitment_for_recovery",
         lambda *args, **kwargs: None,
     )
 

@@ -56,6 +56,7 @@ FORECAST_FIELDS = {
     "quality_flags",
     "resolution_window",
 }
+SOURCE_BOUND_FORECAST_FIELDS = {"resolution_evidence", *FORECAST_FIELDS}
 LIFECYCLE_FIELDS = {
     "event_id",
     "event_type",
@@ -91,6 +92,30 @@ def _window() -> dict[str, object]:
     }
 
 
+def _resolution_evidence() -> dict[str, object]:
+    def leg(*, marker: str) -> dict[str, str]:
+        return {
+            "schema_version": "source_bound_price_window_evidence/v1",
+            "window_id": f"spw-{marker}",
+            "window_sha256": marker * 64,
+            "security_id": f"security-{marker}",
+            "raw_artifact_id": f"pit-{marker}",
+            "raw_artifact_sha256": marker * 64,
+            "decision_cutoff": "2026-07-18T15:00:00+00:00",
+            "retrieved_at": "2026-07-18T14:00:00+00:00",
+            "feed": "iex",
+            "adjustment_mode": "all",
+            "adjustment_status": "total_return_adjusted",
+        }
+
+    return {
+        "schema_version": "source_bound_resolution_evidence/v2",
+        "ticker": leg(marker="a"),
+        "benchmark": leg(marker="b"),
+        "alpha_threshold_pct": "1.5",
+    }
+
+
 def _forecast(**changes: object) -> AgentForecast:
     values: dict[str, object] = {
         "forecast_id": "af-safe-001",
@@ -123,6 +148,7 @@ def _forecast(**changes: object) -> AgentForecast:
         "label_quality": "high",
         "quality_flags": [],
         "resolution_window": _window(),
+        "resolution_evidence": _resolution_evidence(),
     }
     values.update(changes)
     return AgentForecast(**values)
@@ -151,11 +177,16 @@ def _event(**changes: object) -> HypothesisLifecycleEvent:
 
 def _record_forecast(root: str, index: int) -> None:
     forecast = _forecast(forecast_id=f"af-concurrent-{index:03d}")
-    observe_forecasts([forecast], availability_root=root, recorded_at=RECORDED)
+    LearningAvailabilityLedger(root).record(
+        LearningObservation.from_historical_forecast(
+            forecast,
+            recorded_at=RECORDED,
+        )
+    )
 
 
 def test_exact_schema_authority_allowlist_and_forbidden_text_absence():
-    observation = LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
+    observation = LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED)
 
     assert observation.schema_version == LEARNING_AVAILABILITY_SCHEMA_VERSION == 1
     assert observation.observation_id.startswith("lo-")
@@ -171,6 +202,31 @@ def test_exact_schema_authority_allowlist_and_forbidden_text_absence():
     assert b"forbidden raw claim" not in encoded
     assert b"forbidden raw recommendation" not in encoded
     assert b"forbidden raw note" not in encoded
+
+
+def test_source_bound_observation_requires_issued_receipt_lookup():
+    with pytest.raises(LearningAvailabilityError, match="exact SourceBoundWindowLookup"):
+        LearningObservation.from_source_bound_forecast(
+            _forecast(),
+            recorded_at=RECORDED,
+            verifier=None,
+        )
+
+
+def test_legacy_forecast_constructor_rejects_new_admission():
+    with pytest.raises(LearningAvailabilityError, match="historical read-only"):
+        LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
+
+
+def test_observe_forecasts_rejects_legacy_price_windows(tmp_path: Path):
+    admissions = observe_forecasts(
+        [_forecast(resolution_evidence=None)],
+        availability_root=tmp_path,
+        recorded_at=RECORDED,
+    )
+
+    assert admissions == ()
+    assert not any(tmp_path.iterdir())
 
 
 def test_lifecycle_payload_is_exact_and_omits_claim_and_note():
@@ -191,12 +247,12 @@ def test_lifecycle_payload_is_exact_and_omits_claim_and_note():
 )
 def test_recorded_at_requires_utc_timezone(recorded_at: dt.datetime):
     with pytest.raises(LearningAvailabilityError, match="recorded_at"):
-        LearningObservation.from_forecast(_forecast(), recorded_at=recorded_at)
+        LearningObservation.from_historical_forecast(_forecast(), recorded_at=recorded_at)
 
 
 def test_effective_time_cannot_be_future_relative_to_recorded():
     with pytest.raises(LearningAvailabilityError, match="effective_at"):
-        LearningObservation.from_forecast(
+        LearningObservation.from_historical_forecast(
             _forecast(resolved_at="2026-07-18T15:06:00+00:00"),
             recorded_at=RECORDED,
         )
@@ -204,7 +260,7 @@ def test_effective_time_cannot_be_future_relative_to_recorded():
 
 def test_nonfinite_payload_values_are_rejected():
     with pytest.raises(LearningAvailabilityError, match="finite canonical JSON"):
-        LearningObservation.from_forecast(
+        LearningObservation.from_historical_forecast(
             _forecast(actual_return=float("nan")),
             recorded_at=RECORDED,
         )
@@ -226,8 +282,8 @@ def test_unresolved_or_unaudited_forecasts_are_neutral(tmp_path: Path):
 
 
 def test_stable_id_excludes_recorded_at_and_later_retry_keeps_first_time(tmp_path: Path):
-    first = LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
-    later = LearningObservation.from_forecast(
+    first = LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED)
+    later = LearningObservation.from_historical_forecast(
         _forecast(),
         recorded_at=RECORDED + dt.timedelta(minutes=10),
     )
@@ -247,19 +303,19 @@ def test_stable_id_excludes_recorded_at_and_later_retry_keeps_first_time(tmp_pat
 
 def test_earlier_retry_is_rejected_as_backdating(tmp_path: Path):
     ledger = LearningAvailabilityLedger(tmp_path)
-    later = LearningObservation.from_forecast(
+    later = LearningObservation.from_historical_forecast(
         _forecast(),
         recorded_at=RECORDED + dt.timedelta(minutes=10),
     )
     ledger.record(later)
-    earlier = LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
+    earlier = LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED)
     with pytest.raises(ObservationCollisionError, match="backdat"):
         ledger.record(earlier)
 
 
 def test_same_id_material_change_is_collision(tmp_path: Path):
     ledger = LearningAvailabilityLedger(tmp_path)
-    original = LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
+    original = LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED)
     ledger.record(original)
     changed = replace(original, source_id="af-other")
     with pytest.raises(ObservationCollisionError):
@@ -268,7 +324,7 @@ def test_same_id_material_change_is_collision(tmp_path: Path):
 
 def test_object_and_journal_are_canonical_and_strictly_verified(tmp_path: Path):
     ledger = LearningAvailabilityLedger(tmp_path)
-    observation = LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
+    observation = LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED)
     admission = ledger.record(observation)
     assert admission.path.read_bytes() == observation.canonical_json_bytes()
     line = (tmp_path / "events.jsonl").read_bytes()
@@ -313,7 +369,7 @@ def test_root_and_managed_paths_reject_symlinks(tmp_path: Path):
     observations = real / "observations"
     observations.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(AvailabilityCorruptionError, match="observations"):
-        ledger.record(LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED))
+        ledger.record(LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED))
 
 
 def test_crash_after_object_fsync_recovers_orphan_with_original_time(tmp_path: Path):
@@ -321,7 +377,7 @@ def test_crash_after_object_fsync_recovers_orphan_with_original_time(tmp_path: P
         def _after_object_fsync(self, path: Path) -> None:
             raise RuntimeError("crash after object fsync")
 
-    observation = LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
+    observation = LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED)
     with pytest.raises(RuntimeError, match="object fsync"):
         CrashAfterObject(tmp_path).record(observation)
     assert list((tmp_path / "observations").glob("*.json"))
@@ -342,7 +398,7 @@ def test_crash_after_event_fsync_is_event_silent_on_retry(tmp_path: Path):
         def _after_event_fsync(self, event: object) -> None:
             raise RuntimeError("crash after event fsync")
 
-    observation = LearningObservation.from_forecast(_forecast(), recorded_at=RECORDED)
+    observation = LearningObservation.from_historical_forecast(_forecast(), recorded_at=RECORDED)
     with pytest.raises(RuntimeError, match="event fsync"):
         CrashAfterEvent(tmp_path).record(observation)
     admission = LearningAvailabilityLedger(tmp_path).record(observation)
@@ -351,7 +407,7 @@ def test_crash_after_event_fsync_is_event_silent_on_retry(tmp_path: Path):
 
 
 def test_record_many_is_sorted_and_retry_converges(tmp_path: Path):
-    first = LearningObservation.from_forecast(
+    first = LearningObservation.from_historical_forecast(
         _forecast(forecast_id="af-z"), recorded_at=RECORDED
     )
     second = LearningObservation.from_lifecycle_event(_event(event_id="hle-a"), recorded_at=RECORDED)

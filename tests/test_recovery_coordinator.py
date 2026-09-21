@@ -24,6 +24,23 @@ from tradingagents.orchestration.recovery import (
 from tradingagents.policy.live_control import load_live_control_state, write_live_control_state
 
 NOW = dt.datetime(2026, 7, 18, 12, 0, tzinfo=dt.timezone.utc)
+_RECOVERY_OWNER_HANDLE = None
+
+
+@pytest.fixture(autouse=True)
+def _isolated_recovery_owner_trust(monkeypatch, tmp_path):
+    """Keep recovery approval consumption hermetic and deterministic."""
+
+    from tests._owner_approval_testing import install_isolated_owner_trust
+
+    global _RECOVERY_OWNER_HANDLE
+    _RECOVERY_OWNER_HANDLE = install_isolated_owner_trust(
+        monkeypatch,
+        tmp_path / "owner-approval",
+        seed=b"recovery-coordinator-owner-seed",
+    )
+    yield
+    _RECOVERY_OWNER_HANDLE = None
 
 
 def _control_sha256(path: Path) -> str:
@@ -584,6 +601,130 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
     canonical_path.write_bytes(canonical_bytes)
     canonical_after_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
 
+    control_path = tmp_path / "control.json"
+    write_live_control_state(
+        control_path,
+        frozen=True,
+        reason="incident",
+        dead_man_expires_at=now + dt.timedelta(days=1),
+        now=now,
+    )
+    frozen_preimage_sha256 = hashlib.sha256(
+        control_path.read_bytes()
+    ).hexdigest()
+    promoted: list[str] = []
+    demoted: list[str] = []
+    unchanged: list[str] = []
+    approval_subject = {
+        "kind": "verified_recovery_promotion",
+        "recovery_commit_id": recovery_commit["commit_id"],
+        "incident_id": bindings["incident_id"],
+        "recovery_run_id": recovery_commit["recovery_run_id"],
+        "source_revision": bindings["source_revision"],
+        "focused_sha256": recovery_commit["focused_sha256"],
+        "reconciliation_sha256": recovery_commit["reconciliation_sha256"],
+        "frozen_control_preimage_sha256": frozen_preimage_sha256,
+        "report_sha256": recovery_commit["report_sha256"],
+        "envelope_ref": str(envelope_path.resolve()),
+        "envelope_sha256": recovery_commit["envelope_sha256"],
+        "canonical_output_path": str(canonical_path.resolve()),
+        "canonical_input_sha256": canonical_before_sha256,
+        "staged_output_path": str(staged_path.resolve()),
+        "expected_raw_stage_sha256": raw_stage_sha256,
+        "expected_stage_sha256": canonical_after_sha256,
+        "promoted": promoted,
+        "demoted": demoted,
+        "unchanged": unchanged,
+    }
+    approval_source_binding = {
+        "kind": "verified_recovery_promotion",
+        "recovery_commit_id": recovery_commit["commit_id"],
+        "incident_id": bindings["incident_id"],
+        "recovery_run_id": recovery_commit["recovery_run_id"],
+        "source_revision": bindings["source_revision"],
+        "expected_stage_sha256": canonical_after_sha256,
+        "frozen_control_preimage_sha256": frozen_preimage_sha256,
+    }
+    approval_purpose = (
+        "verified_recovery_promotion:"
+        f"{recovery_commit['commit_id']}:{canonical_after_sha256}"
+    )
+    owner_request = {
+        "schema_version": "tradingagents.owner_approval_request.v1",
+        "action": "live_promotion",
+        "subject": approval_subject,
+        "source_binding": approval_source_binding,
+        "risk_envelope_binding": {
+            "ref": str(envelope_path.resolve()),
+            "sha256": recovery_commit["envelope_sha256"],
+        },
+        "purpose": approval_purpose,
+    }
+    owner_request_sha256 = hashlib.sha256(
+        (
+            json.dumps(
+                owner_request,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    ).hexdigest()
+    from tests._owner_approval_testing import build_owner_approval
+    from tradingagents.policy.owner_approval import (
+        consume_owner_approval,
+        transaction_binding_sha256,
+        verify_owner_approval_structure,
+    )
+
+    assert _RECOVERY_OWNER_HANDLE is not None
+    approval = build_owner_approval(
+        private_key_hex=_RECOVERY_OWNER_HANDLE.private_hex,
+        action="live_promotion",
+        issued_at=now,
+        ttl_minutes=90,
+        subject=approval_subject,
+        source_binding=approval_source_binding,
+        risk_envelope_ref=str(envelope_path.resolve()),
+        risk_envelope_sha256=recovery_commit["envelope_sha256"],
+    )
+    parsed_approval = verify_owner_approval_structure(
+        approval=approval,
+        expected_action="live_promotion",
+        subject=approval_subject,
+        source_binding=approval_source_binding,
+        now=now,
+        purpose=approval_purpose,
+    )
+    approval_transaction_binding = transaction_binding_sha256(
+        approval_id=parsed_approval["approval_id"],
+        action=parsed_approval["action"],
+        purpose=approval_purpose,
+        subject=approval_subject,
+        risk_envelope_ref=str(envelope_path.resolve()),
+        risk_envelope_sha256=recovery_commit["envelope_sha256"],
+    )
+    consume_owner_approval(
+        approval_id=parsed_approval["approval_id"],
+        action=parsed_approval["action"],
+        purpose=approval_purpose,
+        transaction_binding_sha256=approval_transaction_binding,
+        now=now,
+    )
+    approval_metadata = {
+        "owner_approval_id": parsed_approval["approval_id"],
+        "owner_approval_action": parsed_approval["action"],
+        "owner_approval_purpose": approval_purpose,
+        "owner_approval_transaction_binding_sha256": (
+            approval_transaction_binding
+        ),
+        "owner_approval_request_sha256": owner_request_sha256,
+        "owner_approval_policy_fingerprint_sha256": parsed_approval[
+            "policy_fingerprint_sha256"
+        ],
+    }
+
     prepare_path = tmp_path / "promotion_prepare.json"
     prepare = {
         "schema_version": "tradingagents.promotion_prepare.v1",
@@ -595,6 +736,10 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
         "ci_green": True,
         "expected_raw_stage_sha256": raw_stage_sha256,
         "expected_stage_sha256": canonical_after_sha256,
+        "promoted": promoted,
+        "demoted": demoted,
+        "unchanged": unchanged,
+        "owner_approval_request": owner_request,
         "can_submit_orders": False,
         "execution_authority": "none",
     }
@@ -614,8 +759,19 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
         "canonical_after_sha256": canonical_after_sha256,
         "can_submit_orders": False,
         "execution_authority": "none",
+        "owner_approval": approval_metadata,
     }
     commit_path.write_text(json.dumps(commit), encoding="utf-8")
+    promotion_commit_intent = {
+        "commit_id": recovery_commit["commit_id"],
+        "prepare_path": str(prepare_path.resolve()),
+        "prepare_sha256": prepare_sha256,
+        "staged_path": str(staged_path.resolve()),
+        "staged_sha256": canonical_after_sha256,
+        "canonical_path": str(canonical_path.resolve()),
+        "canonical_before_sha256": canonical_before_sha256,
+        **approval_metadata,
+    }
     packets["promotion"] = {
         "promotion_evidence_fresh": True,
         "issues": [],
@@ -629,6 +785,7 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
             "path": str(commit_path.resolve()),
             "sha256": hashlib.sha256(commit_path.read_bytes()).hexdigest(),
         },
+        "promotion_commit_intent": promotion_commit_intent,
         "promotion_stage_request": {
             "commit_id": recovery_commit["commit_id"],
             "prepare_path": str(prepare_path.resolve()),
@@ -645,6 +802,7 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
             "reconciliation_sha256": recovery_commit[
                 "reconciliation_sha256"
             ],
+            "owner_approval_request_sha256": owner_request_sha256,
             "arm_live": True,
             "ci_green": True,
         },
@@ -671,13 +829,6 @@ def _write_cli_recovery_bundle(tmp_path, *, now):
     }
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    control_path = tmp_path / "control.json"
-    write_live_control_state(
-        control_path,
-        frozen=True,
-        reason="incident",
-        dead_man_expires_at=now + dt.timedelta(days=1),
-    )
     return {
         "paths": paths,
         "manifest_path": manifest_path,

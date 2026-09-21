@@ -31,6 +31,8 @@ from tradingagents.schemas.trading import TradeIntent
 
 PAPER_BASE_URL = "https://paper-api.alpaca.markets"
 LIVE_BASE_URL = "https://api.alpaca.markets"
+# Documented Get All Orders maximum page size (limit query parameter).
+_ALPACA_ORDERS_MAX_LIMIT = 500
 
 
 class AlpacaConfigError(RuntimeError):
@@ -975,11 +977,41 @@ class AlpacaRestClient:
             raise AlpacaExecutionError("Alpaca account response is invalid")
         return result
 
-    def list_orders(self, status: str = "open") -> list[dict]:
+    def list_orders(
+        self, status: str = "open", *, after: str | None = None, limit: int | None = None
+    ) -> list[dict]:
+        """Read one documented Get All Orders collection for the given filters.
+
+        The documented contract offers ``status``, ``after``, and ``limit``
+        (default 50, maximum 500) with no cursor parameter.  When a caller
+        passes an explicit ``limit`` the read is a completeness proof: a
+        result strictly below the limit is provably the whole collection,
+        while a result that reaches the limit is ambiguous and fails closed.
+        Callers that omit ``limit`` keep the historical single-read behavior.
+        """
+
         self.assert_expected_mode(paper=self.settings.paper)
-        result = self._read_json("/v2/orders", params={"status": status})
+        if type(status) is not str or not status:
+            raise ValueError("Alpaca orders status filter must be a non-empty string")
+        params: dict[str, object] = {"status": status}
+        if after is not None:
+            if type(after) is not str or not after.strip():
+                raise ValueError("Alpaca orders after filter must be a non-empty timestamp string")
+            params["after"] = after
+        if limit is not None:
+            if type(limit) is not int or not 1 <= limit <= _ALPACA_ORDERS_MAX_LIMIT:
+                raise ValueError(
+                    f"Alpaca orders limit must be an integer from 1 through {_ALPACA_ORDERS_MAX_LIMIT}"
+                )
+            params["limit"] = limit
+        result = self._read_json("/v2/orders", params=params)
         if type(result) is not list:
             raise AlpacaExecutionError("Alpaca orders response is invalid")
+        if limit is not None and len(result) >= limit:
+            raise AlpacaExecutionError(
+                "Alpaca orders response reached the retrieval ceiling; "
+                "order completeness cannot be proven"
+            )
         return result
 
     def list_positions(self) -> list[dict]:

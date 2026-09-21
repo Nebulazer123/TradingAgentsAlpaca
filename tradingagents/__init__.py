@@ -22,12 +22,10 @@ with suppress(ImportError):
 with suppress(ImportError):
     import langchain_core  # noqa: F401
 
-# langgraph-checkpoint 4.0.3 calls Reviver() at module load without an
-# explicit allowed_objects, which triggers a noisy pending-deprecation
-# warning from langchain-core 1.3.3 on every interpreter start. The fix
-# is already merged upstream (langchain-ai/langgraph#7743, 2026-05-08)
-# and will arrive in the next langgraph-checkpoint release. Remove this
-# block (and the langchain_core preload above) when we bump past it.
+# Some checkpoint dependency combinations construct Reviver() at import
+# without explicit allowed_objects. Keep this narrowly scoped compatibility
+# filter until removing it has been verified against the locked dependencies;
+# a version bump alone is not evidence that the warning path is gone.
 warnings.filterwarnings(
     "ignore",
     message=r"The default value of `allowed_objects`.*",
