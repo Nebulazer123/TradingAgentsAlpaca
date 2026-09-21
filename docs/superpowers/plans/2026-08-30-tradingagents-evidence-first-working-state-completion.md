@@ -23,6 +23,16 @@
 
 ## Current continuation — verified 2026-09-07
 
+**User-priority source repair — 2026-09-14:** Before visualization, resolve the
+verified scheduling/dry-run/documentation contradictions described in
+[the conflict checkpoint](../checkpoints/2026-09-14-schedule-conflict-repair.md).
+The new wrapper regression and 125-test affected gate pass; a new exact-candidate
+full source gate is required before integration. The accepted 81b7463 receipt
+is preserved, not replayed or relabeled. The historical failed 67-path merge is
+explicit recovery evidence; its reviewed root-correct resolution already exists
+in canonical history. Preserve it unless its specific retention boundary is
+explicitly released. No operational authority or original phase requirement changes.
+
 **Latest data checkpoint — 2026-09-14, authorized read-only collection:** The
 user answered the pending SEC/additional Alpaca collection request. That bounded
 collection is complete: 298 retained responses, 297 raw archive objects, 81 SEC
@@ -672,6 +682,68 @@ Do not purchase data, install a managed graph/vector database, add agents, fine-
 
 ---
 
+### Task 7.1 continuation: real source inputs, not fixture-only qualification
+
+The 2026-09-14 offline inventory binds 81 retained SEC HTML filings to 205,989
+original-byte spans. This is preparation, not the 1,400-case qualification corpus.
+See canonical SDD `benchmark-real-source-compatibility-20260914.md` and
+`results/research_benchmark_preparation/20260914-sec-span-inventory/verification.json`.
+The original case counts, media, source/no-text comparisons, severity thresholds,
+privacy and no-authority requirements remain unchanged.
+
+**Immediate source slice:** correct scalar JSON and shared-page retrieval
+semantics in `tradingagents/research/qualification_benchmark.py`, with focused
+coverage in `tests/test_research_qualification_source_inputs.py` and the existing
+`tests/test_research_qualification_benchmark.py` integration tests. Reuse the
+existing isolated benchmark worktree; do not change the running 76199c1 repair
+candidate or launch another broad verifier while that gate is active.
+
+**Interfaces remain unchanged:** `_extract(case, raw) -> str` consumes an exact
+retained source span and registered selector, never the answer key.
+`_bm25_answers(cases, sources) -> dict[str, str | None]` searches the complete
+retained source corpus and returns a per-question answer only for the matching
+retrieved source unit.
+
+- [x] Prove finite JSON decimals currently fail despite the source loader
+  returning `Decimal`. Cover positive/negative fractions, exponent notation,
+  negative zero, and retained source resource limits. Normalize using the
+  existing PIT decimal routine, without a float conversion or accepting booleans,
+  containers, null or nonfinite values.
+- [x] Prove two distinct registered questions on one original page currently
+  compete as duplicate indexed documents and one loses merely by case-ID order.
+  Index each `(artifact_sha256, byte_start, byte_end)` once; extract using the
+  current question's selector only after the returned unit matches its source.
+  Reject inconsistent bytes for one unit and keep genuinely distinct spans and
+  source artifacts distinct. Do not require artificial unique search tokens or
+  pad the corpus with duplicate pages.
+- [x] Run the two focused reproductions RED, the new source-input module GREEN,
+  then the affected benchmark/full-graph modules once on the corrected slice.
+  Reuse all unchanged prior broad evidence without claiming it covers new source.
+  Record solo review, exact candidate/source hashes and focused receipts; retain
+  the isolated branch pending the subsequent real-media work and phase gate.
+
+Source-slice evidence: seven RED failures became 16 GREEN passes; expanded
+source-input, registered benchmark and actual full-graph modules passed 72 tests
+in 42.26 seconds. Two actual retained SEC company-facts decimal selections reject
+on old source and match on corrected source; both questions retrieve correctly
+from their one shared original response. See
+`docs/superpowers/checkpoints/2026-09-14-benchmark-real-inputs.md`.
+This isolated source is not covered by the concurrent 76199c1 wrapper gate and
+has not been integrated or declared final-source/benchmark qualification.
+
+**Remaining real-media acceptance is still open:** the v4 direct extractor is
+JSON-only and rejects all 81 original HTML filings. A faithful raw-media or
+authenticated derivative route must bind original hashes, byte/page identity,
+transformation/version and source-visible content for every compared lane;
+preserve historical registrations; and handle genuine HTML tables/inline XBRL,
+PDF/image, repository documents and tool output. Expected answers stay separate
+from source preparation. XBRL context, unit, sign, scale, continuation and format
+must be derived from original bytes, not guessed from the ticker or inserted
+gold labels. Raw CSS page-break cues do not establish 500 distinct pages.
+Do not call the immediate numeric/retrieval fixes complete multimedia support.
+Real questions, checked labels, full registered media coverage and actual
+deterministic/FTS qualification remain required before any model execution.
+
 ## Phase 8 — Supersede stale readiness and promotion state
 
 ### Task 8.1: Add bounded legacy supersession
@@ -813,7 +885,7 @@ Do not change automation status. Prepare, but do not execute, the future activat
 - [ ] Existing learning ledger reaches a deterministic source-bound fixed point with suspect/degraded/dependence disclosures.
 - [ ] Minimum research-stack benchmark selects the simplest registered winning lane or records a valid no-model result.
 - [ ] July `GO`, old promotion state, and expired tournament are preserved and superseded; every sleeve is paper-only/live-disabled.
-- [x] Final source candidate `81b7463` passes the single corrected complete repository gate and is re-indexed; exact scope/coverage is in the 2026-09-14 final source checkpoint. Real evidence and operational acceptance remain separate.
+- [ ] Re-freeze the source candidate after the user-priority wrapper conflict repair. The prior `81b7463` complete gate remains accepted for its inputs; the new exact-candidate gate must pass before integration. Real evidence and operational acceptance remain separate.
 - [ ] One clean qualifier and five clean trial sessions produce exactly one terminal non-authorizing readiness record.
 - [ ] `results/policy/live_control.json` still hashes to `a3fc5ddb...fb07`.
 - [ ] All ten TradingAgents automations are still `PAUSED` with the accepted hashes.

@@ -158,8 +158,6 @@ def _canonical_decimal(
         decimal_value = value if type(value) is Decimal else Decimal(value)
         if not decimal_value.is_finite():
             raise PointInTimeDataError(f"{label} must be finite")
-        if decimal_value.is_zero():
-            return "0"
         sign, digits, exponent = decimal_value.as_tuple()
     except PointInTimeDataError:
         raise
@@ -174,6 +172,8 @@ def _canonical_decimal(
         or abs(adjusted_exponent) > max_exponent
     ):
         raise PointInTimeDataError(f"{label} exceeds decimal resource limits")
+    if decimal_value.is_zero():
+        return "0"
     if exponent >= 0:
         predicted_length = digit_count + exponent
     else:
