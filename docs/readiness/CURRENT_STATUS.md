@@ -85,18 +85,21 @@ three jobs that stay paused, saved role model assignments and explicit
 planning estimates. The harness prompt/model refresh is recorded in
 [the modernization report](../harness/2026-10-01-modernization.md); it grants no activation authority. The existing launch prerequisites remain in force.
 
-The owner also authorized one public AAPL comparison using GPT-6 Luna and
-GPT-6.1 Sol through Codex and the OpenAI API, capped at USD 1. Both subscription
-agents completed low-confidence forecasts from the same source cut. The paid
-comparison did not run because the OpenAI API key is unconfigured. API spending
-is USD 0. The original October 1 issue window has now closed, so that
-prepared run must not start. A future comparison needs its own genuine issue
-time and future targets; the saved subscription forecasts retain their original
-timestamps. No forecast is an order or proof that the system is profitable.
+The owner now wants the existing ChatGPT subscription rather than a future
+paid API route. Codex reports `Logged in using ChatGPT`; its jobs and agents can
+use that signed-in access and its allowance. An OpenAI API key is not a
+requirement for this route. TradingAgents' internal Python model runner still
+needs a Codex connector before it can use the subscription directly. Keep that
+implementation requirement distinct from missing data and operational acceptance.
 
-Paying has not demonstrated better forecast quality. The API supplies a direct
-application route with separate usage billing. Supported Codex CLI/SDK routes
-can use the subscription, but TradingAgents has no adapter for them yet. The
+The earlier public AAPL subscription forecasts remain saved with their original
+timestamps. The paid comparison made zero calls and spent USD 0; its original
+issue window closed and the paid route is no longer requested. Preserve its
+receipts without seeking a future API key or restarting the paid pilot.
+No forecast is an order or proof that the system is profitable.
+
+Paying has not demonstrated better forecast quality. Supported Codex CLI/SDK
+routes can use the subscription, but TradingAgents has no adapter for them yet. The
 prepared API graph passed an offline twelve-role simulation with fabricated
 responses; that establishes integration behavior, not paid-model performance.
 

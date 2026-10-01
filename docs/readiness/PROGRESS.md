@@ -77,18 +77,24 @@ AAPL samples would establish access/field coverage only, not the complete
 identity interval or an admitted universe. Preserve the closed archive search
 and completed SEC/Alpaca collection.
 
-The October 1 exploratory comparison uses the same retained public AAPL source
-packet for two Codex agents and the actual TradingAgents role graph. The owner
-authorized the existing OpenAI API key with the earlier total USD 1 cap. The key
-is absent from the project environment, process environment and Codex API-key
-field, so the paid route has made zero calls. The completed subscription forecasts
-and comparison contract are retained in
+The October 1 exploratory comparison supplied the same retained public AAPL
+source packet to two Codex agents and prepared an actual TradingAgents role
+graph. Both subscription forecasts completed. The paid route made zero calls
+and spent USD 0. The completed forecasts and historical comparison contract remain in
 `results/readiness_continuation/20261001-aapl-route-comparison/`. This one-case
 pilot is separate from registered research acceptance and the economic campaign.
 The original issue window closed at October 1, 13:30 UTC. Its repaired private
 preflight rejects a late request or result; seven offline checks pass. Preserve
-the original forecasts and prepare a future prospective comparison only when
-the approved access is available. No API spending occurred.
+the original forecasts and receipts.
+
+The owner's latest decision replaces the future paid-API plan with the existing
+ChatGPT subscription. A read-only `codex login status` confirms signed-in ChatGPT
+access. Existing Codex jobs/agents can use it; an API key is no longer a requested
+input. The application factory still lacks a Codex inference adapter, so direct
+subscription execution inside the Python role graph remains implementation work,
+not a verified runtime capability. Preserve normal subscription allowances and
+the data, model-evidence, holdout and operational acceptance requirements. Do
+not seek a future paid API key or infer a new paid/provider execution budget.
 
 The app's read-only automation view returned a rendered-card notice without
 a machine-readable next run. The exact return is retained in
