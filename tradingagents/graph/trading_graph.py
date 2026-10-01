@@ -516,7 +516,12 @@ class TradingAgentsGraph:
 
         max_output_tokens = self.config.get("llm_max_output_tokens")
         if max_output_tokens is not None:
-            if provider == "google":
+            if provider == "codex":
+                # CLI has no provider token cap. Bound accepted characters instead.
+                if type(max_output_tokens) is not int or max_output_tokens <= 0:
+                    raise ValueError("llm_max_output_tokens must be a positive integer")
+                kwargs["max_output_chars"] = max_output_tokens * 4
+            elif provider == "google":
                 kwargs["max_output_tokens"] = max_output_tokens
             else:
                 kwargs["max_tokens"] = max_output_tokens
@@ -526,7 +531,7 @@ class TradingAgentsGraph:
             if thinking_level:
                 kwargs["thinking_level"] = thinking_level
 
-        elif provider == "openai":
+        elif provider in {"openai", "codex"}:
             reasoning_effort = self.config.get("openai_reasoning_effort")
             if reasoning_effort:
                 kwargs["reasoning_effort"] = reasoning_effort

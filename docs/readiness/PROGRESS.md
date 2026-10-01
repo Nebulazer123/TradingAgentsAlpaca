@@ -5,6 +5,14 @@ repository guidance. Read the completion contract for the stable finish line.
 
 ## Current missing work — 2026-10-01
 
+The owner's preferred subscription route now has an implemented Codex CLI
+connector. Luna 6 and Sol 6.1 both passed real structured-response connection
+checks, and Luna completed an application ToolNode round-trip using synthetic
+data. The default provider and overnight selection now use this route.
+[Runner setup and limits](SUBSCRIPTION_RUNNER.md) records the implementation.
+The new source requires its own final repository check; the older `85fe50d`
+acceptance remains preserved for that candidate.
+
 Harness prompt/model refresh is recorded separately in
 [the modernization report](../harness/2026-10-01-modernization.md); it does not
 complete the readiness acceptance rows below.

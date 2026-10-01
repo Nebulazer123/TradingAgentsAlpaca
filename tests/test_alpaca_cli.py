@@ -3732,6 +3732,7 @@ def test_plan_overnight_passes_overnight_graph_config_to_guarded(monkeypatch, tm
 
 
 def test_overnight_graph_config_uses_mac_helper_metadata_when_windows_is_down(monkeypatch):
+    monkeypatch.setitem(cli_main.DEFAULT_CONFIG, "llm_provider", "openai")
     for env_name in (
         "TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER",
         "TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM",
@@ -3898,6 +3899,7 @@ def test_plan_overnight_runs_explicit_openai_graph_without_backend(monkeypatch, 
 
 
 def test_plan_overnight_disables_full_graph_when_only_mac_helper_is_healthy(monkeypatch, tmp_path):
+    monkeypatch.setitem(cli_main.DEFAULT_CONFIG, "llm_provider", "openai")
     paper_client = _FakeCliClient(paper=True)
     live_client = _FakeCliClient(paper=False)
     for env_name in (

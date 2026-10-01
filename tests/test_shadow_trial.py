@@ -3986,10 +3986,11 @@ def test_red_runtime_identity_overnight_route_binds_configured_names_only(monkey
     }
     assert shadow_trial._allowlisted_overnight_route() == configured_defaults
 
+    monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_LLM_PROVIDER", "openai")
     monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_QUICK_THINK_LLM", "gpt-5.4-nano")
     monkeypatch.setenv("TRADINGAGENTS_OVERNIGHT_DEEP_THINK_LLM", "gpt-5.5")
     assert shadow_trial._allowlisted_overnight_route() == {
-        "llm_provider": configured_defaults["llm_provider"],
+        "llm_provider": "openai",
         "quick_think_llm": "gpt-5.4-nano",
         "deep_think_llm": "gpt-5.5",
     }

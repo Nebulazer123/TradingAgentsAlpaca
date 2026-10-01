@@ -56,6 +56,22 @@ def test_runtime_adapter_builds_a_complete_identity_from_resolved_inputs(
     assert identity.identity_sha256
 
 
+def test_subscription_identity_resolves_local_route_and_actual_bounds(monkeypatch):
+    monkeypatch.setattr("tradingagents.llm_clients.codex_client.codex_runner_version", lambda: "codex-cli 0.159.2")
+    monkeypatch.setattr(runtime_identity, "_clean_source_revision", lambda _root: "a" * 40)
+    config = _config()
+    config.update(llm_provider="codex", backend_url=None, quick_think_llm="gpt-6-luna", deep_think_llm="gpt-6.1-sol", llm_max_output_tokens=1000, llm_max_retries=2)
+    identity = runtime_identity.build_analysis_checkpoint_identity(
+        config=config, selected_analysts=("market",), asset_type="stock",
+    )
+    assert identity.backend_route_identity == "codex://local/exec"
+    settings = runtime_identity.checkpoint_provider_reasoning_settings(config)
+    assert settings["max_output_chars"] == 4000
+    assert settings["max_retries"] == 0
+    assert settings["runner_version"] == "codex-cli 0.159.2"
+    assert "max_output_tokens" not in settings
+
+
 def test_runtime_adapter_fails_closed_when_source_is_not_clean(monkeypatch):
     root = Path(__file__).resolve().parents[1]
     monkeypatch.setattr(

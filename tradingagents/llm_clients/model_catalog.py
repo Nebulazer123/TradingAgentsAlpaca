@@ -92,6 +92,13 @@ _MINIMAX_MODELS: dict[str, list[ModelOption]] = {
 
 
 MODEL_OPTIONS: ProviderModeOptions = {
+    "codex": {
+        "quick": [("GPT-6 Luna - ChatGPT subscription", "gpt-6-luna")],
+        "deep": [
+            ("GPT-6.1 Sol - ChatGPT subscription", "gpt-6.1-sol"),
+            ("GPT-6 Astra - ChatGPT subscription", "gpt-6-astra"),
+        ],
+    },
     "openai": {
         "quick": [
             ("GPT-6 Luna - Focused, high-volume tasks", "gpt-6-luna"),
@@ -200,6 +207,12 @@ MODEL_OPTIONS: ProviderModeOptions = {
 
 
 MODEL_METADATA: dict[str, dict[str, ModelMetadata]] = {
+    "codex": {
+        # Codex catalog context, distinct from API model capacity.
+        "gpt-6.1-sol": ModelMetadata("codex", "gpt-6.1-sol", 272_000),
+        "gpt-6-luna": ModelMetadata("codex", "gpt-6-luna", 272_000),
+        "gpt-6-astra": ModelMetadata("codex", "gpt-6-astra", 272_000),
+    },
     "openai": {
         "gpt-6.1-sol": ModelMetadata("openai", "gpt-6.1-sol", 1_050_000),
         "gpt-6-luna": ModelMetadata("openai", "gpt-6-luna", 1_050_000),

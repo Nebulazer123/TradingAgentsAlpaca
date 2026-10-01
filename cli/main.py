@@ -7122,6 +7122,12 @@ def _build_overnight_graph_config_overrides(
         "deep_think_llm": deep_think_llm or env_values["deep_think_llm"],
         "backend_url": backend_url or env_values["backend_url"],
     }
+    if (
+        not values["llm_provider"]
+        and not values["backend_url"]
+        and DEFAULT_CONFIG.get("llm_provider") == "codex"
+    ):
+        values["llm_provider"] = "codex"
     explicit_non_ollama_provider = _is_explicit_non_ollama_overnight_provider(
         values.get("llm_provider")
     )
@@ -7147,7 +7153,9 @@ def _build_overnight_graph_config_overrides(
         )
     filtered_values = {key: value for key, value in values.items() if value}
     if explicit_non_ollama_provider and not values.get("backend_url"):
-        filtered_values["backend_url"] = None
+        filtered_values["backend_url"] = (
+            "codex://local/exec" if values["llm_provider"] == "codex" else None
+        )
     overrides.update(filtered_values)
     token_value = max_completion_tokens
     if token_value is None:
@@ -10129,7 +10137,7 @@ def get_user_selections():
             )
         )
         thinking_level = ask_gemini_thinking_config()
-    elif provider_lower == "openai":
+    elif provider_lower in {"openai", "codex"}:
         console.print(
             create_question_box(
                 "Step 8: Reasoning Effort",

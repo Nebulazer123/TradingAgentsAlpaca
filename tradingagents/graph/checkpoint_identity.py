@@ -54,6 +54,8 @@ _SAFE_REASONING_SETTING_FIELDS = frozenset(
         "include_thoughts",
         "max_completion_tokens",
         "max_output_tokens",
+        "max_output_chars",
+        "runner_version",
         "max_tokens",
         "min_p",
         "mode",
@@ -219,6 +221,8 @@ def normalize_backend_route_identity(value: object) -> str:
         raise CheckpointRunIdentityError("backend_route_identity must be a canonical route")
     if not value:
         return ""
+    if value == "codex://local/exec":
+        return value
     parsed = urlsplit(value)
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
         raise CheckpointRunIdentityError("backend_route_identity must be an HTTP(S) route")
@@ -361,6 +365,8 @@ def build_checkpoint_run_identity(
         raise CheckpointRunIdentityError("source_tree_dirty must be exactly false")
     if type(clean_source_revision) is not str or _GIT_REVISION.fullmatch(clean_source_revision) is None:
         raise CheckpointRunIdentityError("clean_source_revision must be a clean lowercase Git revision")
+    if (requested_provider == "codex") != (backend_route_identity == "codex://local/exec"):
+        raise CheckpointRunIdentityError("Codex provider must use the exact local subscription runner route")
     material: dict[str, object] = {
         "identity_schema_version": identity_schema_version,
         "clean_source_revision": clean_source_revision,

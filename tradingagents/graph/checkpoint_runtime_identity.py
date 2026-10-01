@@ -199,7 +199,18 @@ def checkpoint_provider_reasoning_settings(
         "timeout_seconds": config.get("llm_timeout_seconds"),
     }
     normalized = provider.lower()
-    if normalized == "google":
+    if normalized == "codex":
+        from tradingagents.llm_clients.codex_client import codex_runner_version
+
+        settings["runner_version"] = codex_runner_version()
+        output_tokens = settings.pop("max_output_tokens", None)
+        if output_tokens is not None:
+            if type(output_tokens) is not int or output_tokens <= 0:
+                raise CheckpointRuntimeIdentityError("Codex output setting must be a positive integer")
+            settings["max_output_chars"] = output_tokens * 4
+        settings["max_retries"] = 0
+        settings["reasoning_effort"] = config.get("openai_reasoning_effort") or "low"
+    elif normalized == "google":
         settings["thinking"] = config.get("google_thinking_level")
     elif normalized == "openai":
         settings["reasoning_effort"] = config.get("openai_reasoning_effort")
@@ -325,6 +336,8 @@ def build_analysis_checkpoint_identity(
     """Resolve one complete identity for a qualifying analysis-only entrypoint."""
     root = Path(project_root or Path(__file__).resolve().parents[2]).resolve(strict=True)
     backend_url = config.get("backend_url")
+    if config.get("llm_provider") == "codex" and backend_url is None:
+        backend_url = "codex://local/exec"
     if type(backend_url) is not str or not backend_url.strip():
         raise CheckpointRuntimeIdentityError(
             "backend_url must be explicitly resolved for checkpointed analysis"

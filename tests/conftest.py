@@ -108,6 +108,25 @@ def _block_external_network(monkeypatch, request):
 
 
 @pytest.fixture(autouse=True)
+def _block_live_codex_in_tests(monkeypatch, request):
+    """A child CLI does not inherit Python's socket guard; block real inference."""
+    if request.node.get_closest_marker("integration") or request.node.get_closest_marker("allow_network"):
+        return
+    import subprocess
+
+    original = subprocess.Popen
+
+    def guarded_popen(args, *positional, **kwargs):
+        if isinstance(args, (list, tuple)) and args:
+            executable = str(args[0]).replace("\\", "/").rsplit("/", 1)[-1]
+            if executable == "codex" and "exec" in args:
+                raise RuntimeError("Live Codex inference is blocked in tests; mock the transport")
+        return original(args, *positional, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", guarded_popen)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_connector_health(monkeypatch, tmp_path):
     """Keep connector fault-injection telemetry out of real automation context."""
     from tradingagents.dataflows import _official_common as official_common

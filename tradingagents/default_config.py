@@ -109,7 +109,7 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # Pending entries are never pruned. None disables rotation entirely.
     "memory_log_max_entries": None,
     # LLM settings
-    "llm_provider": "openai",
+    "llm_provider": "codex",
     "deep_think_llm": "gpt-6.1-sol",
     "quick_think_llm": "gpt-6-luna",
     "llm_timeout_seconds": 120.0,

@@ -12,6 +12,7 @@ prompts for it automatically instead of failing on first API call.
 from __future__ import annotations
 
 PROVIDER_API_KEY_ENV: dict[str, str | None] = {
+    "codex":      None,  # Signed-in ChatGPT subscription via Codex CLI.
     "openai":     "OPENAI_API_KEY",
     "anthropic":  "ANTHROPIC_API_KEY",
     "google":     "GOOGLE_API_KEY",

@@ -88,9 +88,12 @@ planning estimates. The harness prompt/model refresh is recorded in
 The owner now wants the existing ChatGPT subscription rather than a future
 paid API route. Codex reports `Logged in using ChatGPT`; its jobs and agents can
 use that signed-in access and its allowance. An OpenAI API key is not a
-requirement for this route. TradingAgents' internal Python model runner still
-needs a Codex connector before it can use the subscription directly. Keep that
-implementation requirement distinct from missing data and operational acceptance.
+requirement for this route. TradingAgents now has a working Codex connector and
+uses it by default with Luna 6 and Sol 6.1. Real subscription checks passed for
+both models, including structured output and an application tool round-trip.
+[Using the subscription runner](SUBSCRIPTION_RUNNER.md) explains the setup and
+allowance limits. This new source receives its own checks; the older passing
+repository gate covers its recorded candidate.
 
 The earlier public AAPL subscription forecasts remain saved with their original
 timestamps. The paid comparison made zero calls and spent USD 0; its original
@@ -99,7 +102,7 @@ receipts without seeking a future API key or restarting the paid pilot.
 No forecast is an order or proof that the system is profitable.
 
 Paying has not demonstrated better forecast quality. Supported Codex CLI/SDK
-routes can use the subscription, but TradingAgents has no adapter for them yet. The
+routes can use the subscription, and the local CLI adapter is now implemented. The
 prepared API graph passed an offline twelve-role simulation with fabricated
 responses; that establishes integration behavior, not paid-model performance.
 

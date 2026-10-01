@@ -67,6 +67,18 @@ def test_identity_is_canonical_complete_and_secret_safe():
     assert b"secret" not in identity.canonical_json_bytes()
 
 
+def test_subscription_route_is_reserved_for_codex():
+    identity = build_checkpoint_run_identity(**_args(
+        requested_provider="codex", backend_route_identity="codex://local/exec",
+        requested_quick_model="gpt-6-luna", requested_deep_model="gpt-6.1-sol",
+        provider_reasoning_settings={"max_output_chars": 16384, "max_retries": 0},
+    ))
+    assert validate_checkpoint_run_identity(identity.to_dict()) == identity
+    for provider, route in [("openai", "codex://local/exec"), ("codex", "https://api.openai.com/v1"), ("codex", "codex://remote/exec")]:
+        with pytest.raises(CheckpointRunIdentityError):
+            build_checkpoint_run_identity(**_args(requested_provider=provider, backend_route_identity=route))
+
+
 def test_identity_binds_two_separate_required_predecessor_digests():
     fields = _args()
     fields.pop("evidence_ledger_predecessor_identity", None)
