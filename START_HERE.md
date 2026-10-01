@@ -8,6 +8,14 @@ This is the single canonical Git repository and runnable application root. The
 old nested application, Windows transfer, separate public clone, and development
 worktrees were consolidated or preserved as recoverable archives on 2026-08-10.
 
+## Understand the current state
+
+Start with [Where TradingAgents stands](docs/readiness/CURRENT_STATUS.md) for a
+plain-English account of what works, what remains, and the next action. The
+[day/night/weekend walkthrough](docs/orchestration/day-night-weekend-walkthrough.md)
+explains the intended operation alongside today's paused behavior. Exact
+acceptance rules and historical evidence remain in their linked owners.
+
 ## Start with the task
 
 ```zsh

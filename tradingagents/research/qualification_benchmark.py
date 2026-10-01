@@ -18,6 +18,7 @@ from tradingagents.dataflows.pit.official_observations import (
     _select_json,
 )
 from tradingagents.research.memory import contains_sensitive_text
+from tradingagents.research.qualification_media import MediaInputError, media_source, validate_media_input
 
 AUTHORITY = {"analysis_only": True, "execution_authority": "none", "can_submit_orders": False}
 LANE_ORDER = ("deterministic_sec_xbrl", "metadata_fts5_bm25", "openrouter_source_bound", "tradingagents_full_graph", "different_model_reviewer")
@@ -79,7 +80,7 @@ LANE_SPEC_FIELDS = {"provider", "model", "revision", "route", "prompt_sha256", "
 
 def _registration(value: object) -> dict[str, object]:
     row = _map(value, {"schema_version", "registration_id", "registration_sha256", "cases", "comparison_policy", "lane_specs", *AUTHORITY}, "registration")
-    if row["schema_version"] != "research_qualification_registration/v4":
+    if row["schema_version"] not in {"research_qualification_registration/v4", "research_qualification_registration/v5"}:
         raise ResearchQualificationBenchmarkError("registration schema is invalid")
     if any(row[key] != expected for key, expected in AUTHORITY.items()):
         raise ResearchQualificationBenchmarkError("registration authority is invalid")
@@ -113,6 +114,7 @@ def _registration(value: object) -> dict[str, object]:
             raise ResearchQualificationBenchmarkError(
                 "paired lane identity must match before removing retained text"
             )
+    media_version = row["schema_version"] == "research_qualification_registration/v5"
     raw_cases = row["cases"]
     if type(raw_cases) is not list:
         raise ResearchQualificationBenchmarkError("registration cases must be a list")
@@ -122,7 +124,7 @@ def _registration(value: object) -> dict[str, object]:
     content_query_units: set[tuple[object, ...]] = set()
     filing_page_units: set[tuple[object, ...]] = set()
     for index, raw in enumerate(raw_cases):
-        case = _map(raw, CASE_FIELDS, f"case {index}")
+        case = _map(raw, CASE_FIELDS | ({"media_input"} if media_version else set()), f"case {index}")
         case_id, variant_id = _text(case["case_id"], "case_id"), _text(case["variant_id"], "variant_id")
         kind, medium = _text(case["case_kind"], "case_kind"), _text(case["medium"], "medium")
         path = Path(_text(case["artifact_path"], "artifact_path"))
@@ -138,6 +140,16 @@ def _registration(value: object) -> dict[str, object]:
             raise ResearchQualificationBenchmarkError("artifact path is not contained")
         if type(case["byte_start"]) is not int or type(case["byte_end"]) is not int or case["byte_start"] < 0 or case["byte_end"] <= case["byte_start"]:
             raise ResearchQualificationBenchmarkError("byte span is invalid")
+        if media_version:
+            try:
+                media = validate_media_input(case["media_input"])
+            except MediaInputError as exc:
+                raise ResearchQualificationBenchmarkError(str(exc)) from exc
+            permitted_media = {"html": {"text", "table"}, "json": {"text", "tool_output"}, "pdf": {"pdf_image"}, "image": {"pdf_image"}, "repository_document": {"repository_document"}, "tool_output": {"tool_output"}}
+            if medium not in permitted_media[media["format"]] or case["byte_start"] != 0:
+                raise ResearchQualificationBenchmarkError("media classification or original span is invalid")
+            if kind == "filing_document_page" and media["format"] not in {"pdf", "image"}:
+                raise ResearchQualificationBenchmarkError("document-page cases require intrinsic page boundaries; HTML spans are not pages")
         query_text = _text(case["adapter_query"], "adapter_query")
         try:
             query = _map(json.loads(query_text), {"json_path", "fts_query"}, "adapter query")
@@ -153,7 +165,7 @@ def _registration(value: object) -> dict[str, object]:
         variants.append(variant_id)
         counts[kind] += 1
         cases.append(case)
-        source_unit = (case["artifact_sha256"], case["byte_start"], case["byte_end"])
+        source_unit = (case["artifact_sha256"], case["byte_start"], case["byte_end"], *((_digest(case["media_input"]),) if media_version else ()))
         unit = (*source_unit, _digest(query))
         if unit in content_query_units:
             raise ResearchQualificationBenchmarkError("duplicate case content/query unit")
@@ -178,9 +190,9 @@ def _registration(value: object) -> dict[str, object]:
     return row
 
 
-def build_research_qualification_registration(cases: Sequence[Mapping[str, object]], *, minimum_accuracy_gain: str, lane_cost_budgets_usd: Mapping[str, str], lane_specs: Mapping[str, Mapping[str, object]]) -> dict[str, object]:
+def build_research_qualification_registration(cases: Sequence[Mapping[str, object]], *, minimum_accuracy_gain: str, lane_cost_budgets_usd: Mapping[str, str], lane_specs: Mapping[str, Mapping[str, object]], schema_version: str = "research_qualification_registration/v4") -> dict[str, object]:
     payload = {
-        "schema_version": "research_qualification_registration/v4",
+        "schema_version": schema_version,
         "registration_id": None,
         "registration_sha256": None,
         "cases": [dict(case) for case in cases],
@@ -233,6 +245,13 @@ def _source(root: Path, case: Mapping[str, object]) -> bytes:
     start, end = int(case["byte_start"]), int(case["byte_end"])
     if end > len(raw):
         raise ResearchQualificationBenchmarkError("retained byte span exceeds artifact")
+    if "media_input" in case:
+        if start != 0 or end != len(raw):
+            raise ResearchQualificationBenchmarkError("media extraction requires the complete original artifact")
+        try:
+            return media_source(raw, case["media_input"])
+        except (MediaInputError, UnicodeError) as exc:
+            raise ResearchQualificationBenchmarkError(f"retained media extraction failed: {exc}") from exc
     return raw[start:end]
 
 
@@ -261,7 +280,7 @@ def _bm25_answers(cases: Mapping[str, Mapping[str, object]], sources: Mapping[st
         retained_units: dict[str, bytes] = {}
         for case_id in sorted(cases):
             case = cases[case_id]
-            unit_id = _digest((case["artifact_sha256"], case["byte_start"], case["byte_end"]))
+            unit_id = _digest((case["artifact_sha256"], case["byte_start"], case["byte_end"], *((case["media_input"],) if "media_input" in case else ())))
             unit_by_case[case_id] = unit_id
             source = sources[case_id]
             if unit_id in retained_units:
@@ -356,6 +375,8 @@ def _adapter_input(case: Mapping[str, object], lane_id: str, source: bytes) -> t
         "input_mode": "no_text" if not effective_source else "source_bound",
         "pair_id": pair_id,
     }
+    if "media_input" in case:
+        safe["media_input"] = case["media_input"]
     safe["input_sha256"] = _digest({"case": safe, "source_sha256": hashlib.sha256(effective_source).hexdigest()})
     return safe, effective_source
 
@@ -492,7 +513,7 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
                 "security_pass": secure,
                 "input_sha256": safe_case["input_sha256"],
                 "pair_id": safe_case["pair_id"],
-                "source_span": {"artifact_id": case["artifact_id"], "byte_start": case["byte_start"], "byte_end": case["byte_end"]},
+                "source_span": {"artifact_id": case["artifact_id"], "byte_start": case["byte_start"], "byte_end": case["byte_end"], **({"media_input": case["media_input"], "original_sha256": case["artifact_sha256"]} if "media_input" in case else {})},
             }
         )
     return {**lane, "case_outputs": scored, **_cohort_quality(cases, scored), "cost_usd": format(cost, "f")}
@@ -586,7 +607,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
             selected = lane_id
             retained.append(lane_id)
     receipt = {
-        "schema_version": "research_qualification_benchmark/v4",
+        "schema_version": "research_qualification_benchmark/v5" if frozen["schema_version"].endswith("/v5") else "research_qualification_benchmark/v4",
         "receipt_id": None,
         "receipt_sha256": None,
         "registration_id": frozen["registration_id"],
