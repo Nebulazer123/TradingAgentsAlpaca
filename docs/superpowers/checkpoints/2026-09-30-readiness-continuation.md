@@ -225,3 +225,55 @@ outbox delivery remain off, and concurrency remains 1. Legitimate dated stock
 identity/universe, legacy outcome links, actual prospective economic phases,
 separate holdout release, current TSM/BOARD evidence and six clean market sessions
 remain exact unfinished gates. Neither handoff is retired.
+
+## October 1 terminal gate and broader adapter preparation
+
+The detached `72e5585` source gate ended at
+`2026-10-01T07:49:05.796964+00:00`, with **5,088 passed, one failed, one skipped,
+75 passed subtests and eleven warnings** in 6,412.10 seconds. All six static
+checks passed and source identity remained unchanged. Its sole failure was
+`test_unexpected_automation_fails_safe_predeployment`: the obsolete assertion
+expected post-capture unexpected-ID reporting, while exact-topology admission
+correctly rejects the snapshot earlier. The complete failed gate, XML and logs
+are preserved; no running or passing claim remains.
+
+Root corrected only that test, retaining the runtime rejection. It now verifies
+the capture manifest preserves all ten expected IDs and the extra identity,
+reports `automation_topology_invalid`, and rejects the same snapshot in both
+declared deployment phases with no evaluated automation rows, predeployment
+acceptance or deployment proof. The full affected role-contract, health-audit
+and sentinel modules passed **81 tests in 19.44 seconds**. Scoped Ruff, diff
+hygiene and separate root readback passed. Receipt:
+`results/readiness_continuation/20261001-terminal-gate-repair/`.
+
+During the source freeze, root separately prepared 300 temporal questions from
+forty retained original filings and 400 actual read-only configuration-auditor
+cases. Two additional ServiceNow narrative labels distinguish presentation
+reclassification from restatement. Original SEC publication metadata and actual
+capture times are bound, with no historical possession claimed. A separate
+TOML review found twenty malformed whitespace fixtures; the repaired helper
+reran those twenty and reused 380 exactly unchanged execution receipts. Neutral
+IDs keep variation names outside source-visible material. Evidence:
+`results/readiness_continuation/20261001-semantic-corpus-preparation/` and
+`results/readiness_continuation/20261001-workflow-corpus-preparation/`.
+
+The prepared typed-query adapter matches all 700 temporal/configuration labels.
+Its first malformed-input review found seven issues; the failed adapter/check
+remain retained. The hardened prototype passes 34 malformed-input and fourteen
+precision/cutoff/custody checks. It verifies genuine fact/context/unit namespaces,
+exact transformed decimals, full periods and reporting-precision boundaries.
+Both filing and publication-metadata observation times must meet a prospective
+cutoff. Unchanged media extractions and workflow execution were reused after
+source/input and exact workflow-dispatch readback. No model, network, production
+configuration or protected-owner action occurred. Evidence and integration
+notes: `results/readiness_continuation/20261001-semantic-adapter-prototype/`.
+
+This is a prototype, not an accepted research registration. Integrate the
+multiple-original custody reader and typed-query contract with v4/v5 replay
+preserved, bind identical material across lanes, register the complete corpus
+and run deterministic/retrieval qualification before any eligible model run.
+The interpreter alone cannot authenticate a caller's asserted source bundle;
+the trusted reader must reconstruct and verify originals first. Finish that
+source integration before freezing and running the final complete source gate.
+The two failed integrated receipts and the older broken-pipe verifier remain
+preserved. Readiness is still `NOT_ESTABLISHED`; every schedule remains paused.

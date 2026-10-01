@@ -14,7 +14,9 @@ from pathlib import Path
 
 from tradingagents.evals.automation_health_audit import (
     _contract_local_occurrences,
+    capture_schedule_contract_snapshot,
     evaluate_schedule_contract,
+    schedule_contract_snapshot_manifest,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -688,15 +690,24 @@ def test_unexpected_automation_fails_safe_predeployment(tmp_path):
         'id = "tradingagents-unexpected"\nstatus = "PAUSED"\n', encoding="utf-8"
     )
 
-    result = evaluate_schedule_contract(
+    snapshot = capture_schedule_contract_snapshot(
         contract_path=contract_path,
         automation_root=automation_root,
         role_contract_path=REPO_ROOT / "config" / "automation_roles.json",
     )
-
-    assert result["issues"] == ["unexpected_automation_ids"]
-    assert result["unexpected_automation_ids"] == ["tradingagents-unexpected"]
-    assert result["safe_predeployment"] is False
+    manifest = schedule_contract_snapshot_manifest(snapshot)
+    assert manifest["capture_issues"] == ["automation_topology_invalid"]
+    assert {row["automation_id"] for row in manifest["automation_tomls"]} == {
+        *json.loads(contract_path.read_text())["automations"],
+        "tradingagents-unexpected",
+    }
+    for phase in ("predeployment_paused", "frozen_observer"):
+        result = evaluate_schedule_contract(captured_snapshot=snapshot, deployment_phase=phase)
+        assert result["issues"] == ["captured_snapshot_invalid"]
+        assert result["contract_status"] == "fail"
+        assert result["automations"] == []
+        assert result["safe_predeployment"] is False
+        assert result["deployment_proven"] is False
 
 
 def test_schedule_contract_rejects_identity_drift_in_both_deployment_phases(tmp_path):
