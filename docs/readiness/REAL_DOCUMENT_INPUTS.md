@@ -5,7 +5,7 @@ PDF pages, PNG/JPEG images, UTF-8 repository documents and saved tool responses.
 It does not consult an answer key to extract a document. Existing v4 registrations
 still replay through their original JSON-byte-span path.
 
-New media registrations use `research_qualification_registration/v5` and a
+Single-original media registrations use `research_qualification_registration/v5` and a
 `research_media_input/v1` descriptor, or v2 for a locked HTML element selection.
 Each case binds the complete original
 artifact hash, actual extraction-engine versions and the resulting extraction
@@ -19,10 +19,43 @@ sees this same selected material; a missing or changed selection rejects replay.
 Whole-document v1 inputs remain supported. Selection avoids sending an entire
 large filing for a question about one passage.
 
-Every source lane receives the same extracted `research_media_source/v1` bytes.
+Every source lane receives the same extracted `research_media_source/v1` or v2 bytes.
 The paired no-text lane receives no document bytes. Answer labels remain in the
 scoring registration and are excluded from adapter inputs. Source descriptors,
 original hashes, page numbers and extraction transformations remain in receipts.
+
+## Questions using several originals
+
+The v6 registration adds `research_source_bundle_input/v1` and typed
+`research_semantic_query/v1` questions. It preserves both v4 JSON-span and v5
+single-original replay. The reader verifies every complete original, including
+secondary filings, their actual collection receipts, SEC submission metadata
+and that metadata's collection receipt. A bad secondary component stops the
+comparison. Reader and interpreter source identities, all original spans and
+the resulting extraction are bound before execution.
+
+Financial questions select the complete reporting period, issuer, concept and
+unit; apply the retained sign and scale; compare exact values within their stated
+reporting precision; or test whether publication, filing collection and metadata
+collection all preceded a prospective cutoff. A past publication date cannot
+pretend that a later collection existed earlier. Conflicting matching facts
+remain unavailable instead of silently selecting the first. Numeric fact text,
+namespaces, attributes and continuations are checked against the retained markup.
+Financial selectors currently require explicitly undimensioned facts.
+
+Workflow questions check the named role and the complete ten-role configuration
+against its declared phase. They read counterfactual TOMLs, never deploy them.
+The fixture binds the original schedule and role contracts, audit source and
+test source; its only contract transformation derives the fixture prompt hashes
+from the original required phrases. Local custody paths and preparation questions
+are excluded from compared material. The result always records that configuration
+checking proves no deployment and grants no order-submission authority.
+
+Ordinary page, repository and tool-output questions keep source-derived scalar
+selection. Genuine PDF/image page identity depends on the original and intrinsic
+page number; extra descriptor variants cannot count the same page twice. No gold
+answer enters the reader or its operators. All compared lanes receive identical
+canonical source bundles, and no-text twins receive no material.
 
 ## Material and locations
 
@@ -122,3 +155,47 @@ Registration and reviewed labels:
 `results/readiness_continuation/20260930-real-corpus-candidates/`.
 Completed local execution and benchmark receipts:
 `results/readiness_continuation/20260930-real-corpus-candidates/local-qualification-v1/`.
+
+## Integrated broader local result — October 1, 09:18 UTC
+
+The v6 registration retains the same 500 native pages and 200 injection labels,
+then replaces the narrow temporal/workflow readings with 100 complete-period
+questions, 100 actual-collection cutoff questions, 100 cross-filing precision
+comparisons and 400 configuration fixtures. Each workflow question checks a named
+role and the complete configuration. The 700 typed labels were independently
+checked against originals or the actual configuration auditor before integration;
+all 1,400 answers were checked again against authenticated material. The final
+affected source group passed 159 tests, including 51 new regression cases.
+
+All 1,400 cases are conservatively scored at high severity. The deterministic
+lane answered every case correctly: 100% source, critical-field and high-severity
+accuracy, with zero authority changes, disclosure or source bypass. FTS retrieval
+answered 293 cases correctly, 20.9%, and did not qualify; its no-text twin answered
+none correctly. All lanes passed the security checks. Local model calls, network
+calls and spending were zero. The deterministic lane is selected within this
+registered question contract. Neither missing model results nor this selection
+establishes a general no-model verdict.
+
+The input originals, actual collection/publication times, page and span locations,
+extraction transformations and reader/interpreter source identities remain bound.
+V4 and v5 replay remain supported. The actual run exposed excessive SQLite body
+copying while ranking; the repair preserves the BM25 order and reads only the
+winning retained source. Root's separate review also hardened direct malformed
+fact text, namespace, attribute and continuation inputs. Interrupted, changed-engine
+and invalid-telemetry attempts remain preserved; none is accepted as a pass.
+The final telemetry correction rounds elapsed milliseconds upward to the required
+integer without changing the registration, material or executed answers.
+
+Scope remains bounded: two issuers supply the native PDF pages. The cross-filing
+pool contained consistent or compatible-precision values, not a demonstrated
+unresolved numeric contradiction. Two separately reviewed ServiceNow narrative
+cases remain outside these typed operators. General restatement narratives,
+publisher chart reasoning, forecasts, economics and model qualification retain
+their actual requirements. Configuration fixtures do not prove deployment or
+runtime sessions.
+
+Accepted registration, results and execution review:
+`results/readiness_continuation/20261001-v6-source-bundle-integration/accepted-local-qualification/`.
+Registration: `e550ac25eca071ed043630ec390efa36831aebbdcf795c9d51a20a113dbbccf2`.
+Benchmark receipt: `0bbff1099ae23758f5b6ccfff9e63156577fc2fcdad64bc009b8cb5df8302772`.
+The earlier literal-field v5 result remains retained under its original scope.

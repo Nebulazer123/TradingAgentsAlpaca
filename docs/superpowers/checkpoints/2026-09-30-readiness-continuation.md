@@ -277,3 +277,52 @@ the trusted reader must reconstruct and verify originals first. Finish that
 source integration before freezing and running the final complete source gate.
 The two failed integrated receipts and the older broken-pipe verifier remain
 preserved. Readiness is still `NOT_ESTABLISHED`; every schedule remains paused.
+
+## October 1 integrated v6 source and local qualification
+
+The prepared adapter is now integrated with a trusted multiple-original reader
+and typed-query contract. This entry supersedes the preparation status above.
+V4 and v5 replay remain supported. Every filing original, capture receipt, SEC
+publication record/receipt and workflow supporting original is authenticated
+before interpretation. Actual capture times are retained; a past publication
+date does not establish earlier possession. Private answers stay outside
+extraction, and compared lanes receive identical source bytes.
+
+Separate root review hardened fact text, attributes, namespaces and continuation
+chains against their retained markup. Direct malformed-input checks cover the
+finding. The real corpus also exposed excessive body copying during SQLite
+ranking; the repair selects by the same BM25/unit order and uses the winning
+bound bytes. The final affected benchmark/media/graph/source-input group passed
+**159 tests in 32.47 seconds**, including 51 new regressions. Scoped Ruff,
+compile checks and source/doc diff readback passed. No agent performed source
+implementation or verification.
+
+The checked v6 registration includes 500 actual native PDF pages, 300 temporal
+questions, 400 configuration fixtures and 200 controlled injection cases across
+the required five media. Temporal questions cover full periods, actual collection
+cutoffs and cross-filing precision. Workflow answers cover both a named role and
+the complete configuration; they grant neither deployment nor order authority.
+All 1,400 cases are conservatively high severity. The deterministic lane answers
+all correctly, reaching 100% source/critical/high accuracy and zero authority
+changes, disclosure or source bypass. Retrieval answers 293 correctly, 20.9%,
+and does not qualify; its no-text twin answers none correctly. All three lanes
+pass security checks. Model/network calls and spending are zero.
+
+Accepted result completed at `2026-10-01T09:18:25.244777+00:00`. Evidence:
+`results/readiness_continuation/20261001-v6-source-bundle-integration/`.
+Registration/results/readback are in `accepted-local-qualification/`.
+Registration: `e550ac25eca071ed043630ec390efa36831aebbdcf795c9d51a20a113dbbccf2`.
+Receipt: `0bbff1099ae23758f5b6ccfff9e63156577fc2fcdad64bc009b8cb5df8302772`.
+Changed-engine, interrupted and invalid-telemetry attempts remain preserved. The
+final telemetry correction rounds milliseconds upward without changing the
+registration, source material or executed answers.
+
+The native pages still come from two issuers; cross-filing values in this pool
+are consistent or compatible in precision. General restatement narratives,
+publisher charts, forecasts, economics and model qualification retain their
+actual limits. The two reviewed ServiceNow narrative cases are outside the typed
+operators. Neither missing models nor selecting this bounded deterministic lane
+establishes a no-model verdict. Configuration fixtures do not prove runtime
+sessions. Freeze the completed source for one full repository gate; every
+economic, cohort, legacy-ledger, fresh portfolio and six-session requirement
+remains in the current missing-work table. All ten real schedules stay paused.

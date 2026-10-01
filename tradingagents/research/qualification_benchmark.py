@@ -19,6 +19,9 @@ from tradingagents.dataflows.pit.official_observations import (
 )
 from tradingagents.research.memory import contains_sensitive_text
 from tradingagents.research.qualification_media import MediaInputError, media_source, validate_media_input
+from tradingagents.research.qualification_semantics import SemanticInputError, validate_semantic_query
+from tradingagents.research.qualification_semantics import evaluate as evaluate_semantic_query
+from tradingagents.research.qualification_source_bundle import ARTIFACT_FIELDS, SourceBundleError, source_artifacts, source_bundle_source, validate_source_bundle_input
 
 AUTHORITY = {"analysis_only": True, "execution_authority": "none", "can_submit_orders": False}
 LANE_ORDER = ("deterministic_sec_xbrl", "metadata_fts5_bm25", "openrouter_source_bound", "tradingagents_full_graph", "different_model_reviewer")
@@ -80,7 +83,7 @@ LANE_SPEC_FIELDS = {"provider", "model", "revision", "route", "prompt_sha256", "
 
 def _registration(value: object) -> dict[str, object]:
     row = _map(value, {"schema_version", "registration_id", "registration_sha256", "cases", "comparison_policy", "lane_specs", *AUTHORITY}, "registration")
-    if row["schema_version"] not in {"research_qualification_registration/v4", "research_qualification_registration/v5"}:
+    if row["schema_version"] not in {"research_qualification_registration/v4", "research_qualification_registration/v5", "research_qualification_registration/v6"}:
         raise ResearchQualificationBenchmarkError("registration schema is invalid")
     if any(row[key] != expected for key, expected in AUTHORITY.items()):
         raise ResearchQualificationBenchmarkError("registration authority is invalid")
@@ -115,6 +118,7 @@ def _registration(value: object) -> dict[str, object]:
                 "paired lane identity must match before removing retained text"
             )
     media_version = row["schema_version"] == "research_qualification_registration/v5"
+    bundle_version = row["schema_version"] == "research_qualification_registration/v6"
     raw_cases = row["cases"]
     if type(raw_cases) is not list:
         raise ResearchQualificationBenchmarkError("registration cases must be a list")
@@ -124,7 +128,7 @@ def _registration(value: object) -> dict[str, object]:
     content_query_units: set[tuple[object, ...]] = set()
     filing_page_units: set[tuple[object, ...]] = set()
     for index, raw in enumerate(raw_cases):
-        case = _map(raw, CASE_FIELDS | ({"media_input"} if media_version else set()), f"case {index}")
+        case = _map(raw, CASE_FIELDS | ({"media_input"} if media_version else {"source_bundle"} if bundle_version else set()), f"case {index}")
         case_id, variant_id = _text(case["case_id"], "case_id"), _text(case["variant_id"], "variant_id")
         kind, medium = _text(case["case_kind"], "case_kind"), _text(case["medium"], "medium")
         path = Path(_text(case["artifact_path"], "artifact_path"))
@@ -150,12 +154,40 @@ def _registration(value: object) -> dict[str, object]:
                 raise ResearchQualificationBenchmarkError("media classification or original span is invalid")
             if kind == "filing_document_page" and media["format"] not in {"pdf", "image"}:
                 raise ResearchQualificationBenchmarkError("document-page cases require intrinsic page boundaries; HTML spans are not pages")
+        if bundle_version:
+            try:
+                bundle = validate_source_bundle_input(case["source_bundle"])
+            except (SourceBundleError, MediaInputError) as exc:
+                raise ResearchQualificationBenchmarkError(str(exc)) from exc
+            first = bundle["sources"][0]
+            if first["original"] != {field: case[field] for field in ARTIFACT_FIELDS}:
+                raise ResearchQualificationBenchmarkError("primary artifact differs from the complete source bundle")
+            permitted = {"html": {"text", "table"}, "json": {"text", "tool_output"}, "pdf": {"pdf_image"}, "image": {"pdf_image"}, "repository_document": {"repository_document"}, "tool_output": {"tool_output"}}
+            if first["kind"] == "workflow_fixture":
+                if medium != "repository_document":
+                    raise ResearchQualificationBenchmarkError("workflow source classification is invalid")
+            elif medium not in permitted[first["media_input"]["format"]]:
+                raise ResearchQualificationBenchmarkError("source-bundle media classification is invalid")
+            for source in bundle["sources"]:
+                for component in source_artifacts(source):
+                    binding = (component["artifact_path"], component["artifact_sha256"])
+                    if artifact_bindings.setdefault(component["artifact_id"], binding) != binding:
+                        raise ResearchQualificationBenchmarkError("component identity is bound to inconsistent source bytes")
+            if kind == "filing_document_page" and (len(bundle["sources"]) != 1 or first["kind"] != "media" or first["media_input"]["format"] not in {"pdf", "image"}):
+                raise ResearchQualificationBenchmarkError("document-page cases require one intrinsic PDF/image page")
         query_text = _text(case["adapter_query"], "adapter_query")
         try:
-            query = _map(json.loads(query_text), {"json_path", "fts_query"}, "adapter query")
-        except (json.JSONDecodeError, TypeError) as exc:
+            query = _map(_query(case) if bundle_version else json.loads(query_text), {"semantic_query", "fts_query"} if bundle_version else {"json_path", "fts_query"}, "adapter query")
+            if bundle_version:
+                semantic = validate_semantic_query(query["semantic_query"])
+                by_source = {source["source_id"]: source for source in bundle["sources"]}
+                selected_ids = semantic.get("source_ids", [semantic.get("source_id")])
+                required_kind = {"scalar_path": "media", "workflow_configuration_conformance": "workflow_fixture"}.get(semantic["operator"], "financial_filing")
+                if any(i not in by_source or by_source[i]["kind"] != required_kind for i in selected_ids):
+                    raise ResearchQualificationBenchmarkError("query source identity/kind is invalid")
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise ResearchQualificationBenchmarkError("adapter query is invalid") from exc
-        if type(query["json_path"]) is not list or not query["json_path"] or any(type(part) not in {str, int} for part in query["json_path"]):
+        if not bundle_version and (type(query["json_path"]) is not list or not query["json_path"] or any(type(part) not in {str, int} for part in query["json_path"])):
             raise ResearchQualificationBenchmarkError("adapter query JSON path is invalid")
         _text(query["fts_query"], "FTS query")
         answer = _text(case["expected_answer"], "expected_answer")
@@ -165,13 +197,13 @@ def _registration(value: object) -> dict[str, object]:
         variants.append(variant_id)
         counts[kind] += 1
         cases.append(case)
-        source_unit = (case["artifact_sha256"], case["byte_start"], case["byte_end"], *((_digest(case["media_input"]),) if media_version else ()))
+        source_unit = (case["artifact_sha256"], case["byte_start"], case["byte_end"], *((_digest(case["media_input"]),) if media_version else (_digest(case["source_bundle"]),) if bundle_version else ()))
         unit = (*source_unit, _digest(query))
         if unit in content_query_units:
             raise ResearchQualificationBenchmarkError("duplicate case content/query unit")
         content_query_units.add(unit)
         if kind == "filing_document_page":
-            filing_page_units.add(source_unit)
+            filing_page_units.add((first["original"]["artifact_sha256"], first["media_input"]["format"], first["media_input"]["page_number"]) if bundle_version else source_unit)
         if kind == "injection_case":
             injection_media.add(medium)
     if ids != sorted(ids) or len(ids) != len(set(ids)) or len(variants) != len(set(variants)):
@@ -230,7 +262,12 @@ RESULT_FIELDS = {
 OUTPUT_FIELDS = {"case_id", "answer", "source_artifact_id", "byte_start", "byte_end", "input_sha256", "pair_id"}
 
 
-def _source(root: Path, case: Mapping[str, object]) -> bytes:
+def _source(root: Path, case: Mapping[str, object], *, artifact_cache=None) -> bytes:
+    if "source_bundle" in case:
+        try:
+            return source_bundle_source(root, case["source_bundle"], artifact_cache=artifact_cache)
+        except (SourceBundleError, UnicodeError) as exc:
+            raise ResearchQualificationBenchmarkError(f"retained source-bundle extraction failed: {exc}") from exc
     target = root / str(case["artifact_path"])
     try:
         resolved = target.resolve(strict=True)
@@ -256,10 +293,18 @@ def _source(root: Path, case: Mapping[str, object]) -> bytes:
 
 
 def _query(case: Mapping[str, object]) -> dict[str, object]:
+    if "source_bundle" in case:
+        return dict(_json_mapping(str(case["adapter_query"]).encode(), label="semantic adapter query"))
     return dict(json.loads(str(case["adapter_query"])))
 
 
 def _extract(case: Mapping[str, object], raw: bytes) -> str:
+    if "source_bundle" in case:
+        try:
+            result = evaluate_semantic_query(_query(case)["semantic_query"], dict(_json_mapping(raw, label="semantic source bundle")))
+            return result if type(result) is str else _bytes(result).decode()
+        except (json.JSONDecodeError, SemanticInputError, TypeError, ValueError, UnicodeError) as exc:
+            raise ResearchQualificationBenchmarkError(f"semantic source query failed: {exc}") from exc
     try:
         value = _json_mapping(raw, label="benchmark SEC/XBRL")
         value = _select_json(value, tuple(_query(case)["json_path"]), label="benchmark SEC/XBRL answer")
@@ -280,7 +325,7 @@ def _bm25_answers(cases: Mapping[str, Mapping[str, object]], sources: Mapping[st
         retained_units: dict[str, bytes] = {}
         for case_id in sorted(cases):
             case = cases[case_id]
-            unit_id = _digest((case["artifact_sha256"], case["byte_start"], case["byte_end"], *((case["media_input"],) if "media_input" in case else ())))
+            unit_id = _digest((case["artifact_sha256"], case["byte_start"], case["byte_end"], *((case["media_input"],) if "media_input" in case else (case["source_bundle"],) if "source_bundle" in case else ())))
             unit_by_case[case_id] = unit_id
             source = sources[case_id]
             if unit_id in retained_units:
@@ -292,10 +337,10 @@ def _bm25_answers(cases: Mapping[str, Mapping[str, object]], sources: Mapping[st
         answers: dict[str, str | None] = {}
         for case_id in sorted(cases):
             found = db.execute(
-                "SELECT unit_id, body FROM documents WHERE documents MATCH ? ORDER BY bm25(documents), unit_id LIMIT 1",
+                "SELECT unit_id FROM documents WHERE documents MATCH ? ORDER BY bm25(documents), unit_id LIMIT 1",
                 (_query(cases[case_id])["fts_query"],),
             ).fetchone()
-            answers[case_id] = None if found is None or found[0] != unit_by_case[case_id] else _extract(cases[case_id], str(found[1]).encode())
+            answers[case_id] = None if found is None or found[0] != unit_by_case[case_id] else _extract(cases[case_id], retained_units[found[0]])
         return answers
     except (UnicodeError, sqlite3.Error) as exc:
         raise ResearchQualificationBenchmarkError("FTS5/BM25 execution failed") from exc
@@ -377,6 +422,8 @@ def _adapter_input(case: Mapping[str, object], lane_id: str, source: bytes) -> t
     }
     if "media_input" in case:
         safe["media_input"] = case["media_input"]
+    if "source_bundle" in case:
+        safe["source_bundle"] = case["source_bundle"]
     safe["input_sha256"] = _digest({"case": safe, "source_sha256": hashlib.sha256(effective_source).hexdigest()})
     return safe, effective_source
 
@@ -513,7 +560,8 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
                 "security_pass": secure,
                 "input_sha256": safe_case["input_sha256"],
                 "pair_id": safe_case["pair_id"],
-                "source_span": {"artifact_id": case["artifact_id"], "byte_start": case["byte_start"], "byte_end": case["byte_end"], **({"media_input": case["media_input"], "original_sha256": case["artifact_sha256"]} if "media_input" in case else {})},
+                "source_span": {"artifact_id": case["artifact_id"], "byte_start": case["byte_start"], "byte_end": case["byte_end"],
+                                **({"media_input": case["media_input"], "original_sha256": case["artifact_sha256"]} if "media_input" in case else {"source_bundle": case["source_bundle"]} if "source_bundle" in case else {})},
             }
         )
     return {**lane, "case_outputs": scored, **_cohort_quality(cases, scored), "cost_usd": format(cost, "f")}
@@ -535,7 +583,8 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
     if not root.is_dir() or type(lane_results) is not list:
         raise ResearchQualificationBenchmarkError("benchmark inputs are invalid")
     cases = {case["case_id"]: case for case in frozen["cases"]}
-    sources = {cid: _source(root, case) for cid, case in cases.items()}
+    artifact_cache = {}
+    sources = {cid: _source(root, case, artifact_cache=artifact_cache) for cid, case in cases.items()}
     raw_by_id = {str(row.get("lane_id")): row for row in lane_results if isinstance(row, Mapping)}
     if len(raw_by_id) != len(lane_results):
         raise ResearchQualificationBenchmarkError("lane results are duplicated")
@@ -607,7 +656,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
             selected = lane_id
             retained.append(lane_id)
     receipt = {
-        "schema_version": "research_qualification_benchmark/v5" if frozen["schema_version"].endswith("/v5") else "research_qualification_benchmark/v4",
+        "schema_version": frozen["schema_version"].replace("research_qualification_registration/", "research_qualification_benchmark/"),
         "receipt_id": None,
         "receipt_sha256": None,
         "registration_id": frozen["registration_id"],

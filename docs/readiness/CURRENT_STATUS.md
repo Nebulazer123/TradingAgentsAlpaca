@@ -22,10 +22,13 @@ read that history to understand today's status.
 - The final-check runner saves logs and exit receipts even with its output pipe
   closed. Five regression checks passed. The failed older verifier is preserved.
 - The required 500 document pages, 300 temporal questions, 400 workflow cases
-  and 200 hostile-input cases are registered and their labels checked. Local
-  deterministic field reading passed with 100% critical/high accuracy;
-  retrieval did not qualify. These tests read literal fields and constraints,
-  rather than proving investment reasoning or workflow execution.
+  and 200 hostile-input cases are registered and their labels checked. The new
+  reader checks full reporting periods, collection cutoffs, exact comparisons
+  between filings, and each named automation role and complete configuration.
+  Local deterministic reading passed with 100% critical/high accuracy;
+  retrieval reached 20.9% and did not qualify. This remains document and fixture
+  evidence; investment reasoning, runtime operation and model comparisons retain
+  their separate requirements.
 - Historical GO, promotion and expired tournament claims are preserved and
   superseded through the accepted writer. The current readiness report says
   `NOT_ESTABLISHED`; fresh portfolio loss review and BOARD evidence remain open.
@@ -33,12 +36,14 @@ read that history to understand today's status.
   After repairs, its successor finished with 5,088 passes, one stale test
   assertion and one skipped live-API test. That assertion now checks strict
   capture rejection in both deployment phases; all 81 affected checks pass.
-  Both failed receipts remain preserved. The completed source still needs its
-  final gate after the remaining benchmark adapter is integrated.
-- A broader offline adapter now produces the checked answers for 300 temporal
-  questions and 400 workflow configuration cases. It also passes 48 malformed
-  input, exact-number and timing checks. It remains a prepared prototype;
-  repository integration, full registration and qualification are unfinished.
+  Both failed receipts remain preserved. The completed candidate awaits its
+  full repository gate.
+- The broader adapter and original-file reader are integrated, preserving older
+  benchmark replay. All 159 affected checks passed, including 51 new regression
+  cases. Separate review added retained-markup checks and removed excessive
+  document copying during retrieval. Failed and intermediate receipts remain
+  preserved. [Supported inputs and qualification scope](REAL_DOCUMENT_INPUTS.md)
+  explain what the completed local run establishes.
 - The prediction ledger is backed up byte for byte. Its read-only audit found
   6,244 valid records, including 4,944 marked resolved and 1,300 pending. Those
   labels do not establish verified economic outcomes; its missing result links
@@ -52,10 +57,10 @@ read that history to understand today's status.
 | --- | --- | --- |
 | A dated, trustworthy list of stocks and their identities | The study must prove which stocks were eligible when it began, including name changes and corporate events. | Trace saved source records; establish the missing official records before selecting the top 100, 75 and 50. The existing 43-symbol collection is too small. |
 | A link from each old prediction to the result being scored | Otherwise a result could be attributed to the wrong prediction or stock. | Trace original prediction records and saved price/event evidence. Leave unprovable rows unresolved. |
-| Proof of broader document reasoning | Literal field-reading accuracy does not prove reasoning about changed reports, charts or investments. | Integrate the checked temporal/workflow adapter, register the complete corpus and qualify comparable lanes. Preserve prior local evidence and its limits; missing model evidence does not establish a no-model verdict. |
+| Proof of broader document reasoning | Checked reporting periods, collection times and configuration fixtures do not prove general reasoning about changed reports, publisher charts or investments. | Preserve the completed 1,400-case local result and its limits. Admit any further questions and model comparisons through their actual evidence and authorization prerequisites; missing model evidence does not establish a no-model verdict. |
 | A study that begins before its results are known | Choosing inputs after seeing the outcome would bias the result. | Admit the future-facing study, then collect actual development and validation results. Release the reserved final test only through its separate owner approval. |
 | Fresh portfolio loss review and BOARD evidence | Old positions and stale reviews cannot establish today's state. | Preserve the completed readiness supersession; obtain the required fresh source evidence within its authorized scope. |
-| A passing check of the completed source | Neither the older 5,005-test pass nor either failed integrated gate accepts the current source. | Finish the benchmark adapter, freeze the completed candidate, then run its complete gate with durable results. |
+| A passing check of the completed source | Neither the older 5,005-test pass nor either failed integrated gate accepts the current source. | Freeze the completed adapter candidate and run its complete gate with durable results. |
 | Six clean market sessions | The system must operate reliably over real elapsed sessions. | Complete one qualifier, then five additional clean sessions in the existing order. A failed session requires repair and a new qualifier. |
 
 I will investigate the saved files and sources. You do not need to supply the
