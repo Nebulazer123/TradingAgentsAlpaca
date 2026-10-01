@@ -94,16 +94,19 @@ _MINIMAX_MODELS: dict[str, list[ModelOption]] = {
 MODEL_OPTIONS: ProviderModeOptions = {
     "openai": {
         "quick": [
+            ("GPT-6 Luna - Focused, high-volume tasks", "gpt-6-luna"),
             ("GPT-5.4 Mini - Fast, strong coding and tool use", "gpt-5.4-mini"),
             ("GPT-5.4 Nano - Cheapest, high-volume tasks", "gpt-5.4-nano"),
-            ("GPT-5.5 - Latest frontier, 1M context", "gpt-5.5"),
+            ("GPT-5.5 - Earlier frontier, 1M context", "gpt-5.5"),
             ("GPT-4.1 - Smartest non-reasoning model", "gpt-4.1"),
         ],
         "deep": [
-            ("GPT-5.5 - Latest frontier, 1M context", "gpt-5.5"),
+            ("GPT-6.1 Sol - Complex work at lower cost", "gpt-6.1-sol"),
+            ("GPT-6 Astra - Most demanding reasoning and coding", "gpt-6-astra"),
+            ("GPT-5.5 - Earlier frontier, 1M context", "gpt-5.5"),
             ("GPT-5.4 - Previous-gen frontier, 1M context, cost-effective", "gpt-5.4"),
             ("GPT-5.2 - Strong reasoning, cost-effective", "gpt-5.2"),
-            ("GPT-5.5 Pro - Most capable, expensive ($30/$180 per 1M tokens)", "gpt-5.5-pro"),
+            ("GPT-5.5 Pro - Earlier premium model", "gpt-5.5-pro"),
         ],
     },
     "anthropic": {
@@ -198,6 +201,9 @@ MODEL_OPTIONS: ProviderModeOptions = {
 
 MODEL_METADATA: dict[str, dict[str, ModelMetadata]] = {
     "openai": {
+        "gpt-6.1-sol": ModelMetadata("openai", "gpt-6.1-sol", 1_050_000),
+        "gpt-6-luna": ModelMetadata("openai", "gpt-6-luna", 1_050_000),
+        "gpt-6-astra": ModelMetadata("openai", "gpt-6-astra", 1_050_000),
         "gpt-5.5": ModelMetadata("openai", "gpt-5.5", 1_000_000),
         "gpt-5.5-pro": ModelMetadata("openai", "gpt-5.5-pro", 1_000_000),
         "gpt-5.4": ModelMetadata("openai", "gpt-5.4", 1_000_000),

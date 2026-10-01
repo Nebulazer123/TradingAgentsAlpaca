@@ -21,8 +21,8 @@ def _reload_with_env(monkeypatch, **overrides):
 def test_no_env_uses_built_in_defaults(monkeypatch):
     dc = _reload_with_env(monkeypatch)
     assert dc.DEFAULT_CONFIG["llm_provider"] == "openai"
-    assert dc.DEFAULT_CONFIG["deep_think_llm"] == "gpt-5.4"
-    assert dc.DEFAULT_CONFIG["quick_think_llm"] == "gpt-5.4-mini"
+    assert dc.DEFAULT_CONFIG["deep_think_llm"] == "gpt-6.1-sol"
+    assert dc.DEFAULT_CONFIG["quick_think_llm"] == "gpt-6-luna"
     assert dc.DEFAULT_CONFIG["backend_url"] is None
     assert dc.DEFAULT_CONFIG["llm_timeout_seconds"] == 120.0
     assert dc.DEFAULT_CONFIG["llm_max_retries"] == 2

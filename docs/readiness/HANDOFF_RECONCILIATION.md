@@ -1,5 +1,9 @@
 # Continuation handoffs: current reconciliation
 
+This is the dated readiness-program reconciliation. Its continuation and
+retirement steps apply to those exact handoffs; ordinary task context and
+reporting follow `AGENTS.md` and `START_HERE.md`.
+
 Both the August 30 working-state handoff and September 8 loop-stop handoff were
 read completely on September 30, 2026. Both are retained. The final program
 checkpoint and evidence acceptance are unfinished, so neither final retirement
@@ -23,7 +27,7 @@ nor a claim that all unique information has been reconciled is appropriate yet.
 | July GO, stale promotion and expired tournament | Superseded through the accepted writer on October 1; historical originals and promotion before-image remain preserved. Current readiness is `NOT_ESTABLISHED`; fresh TSM and BOARD evidence remain open. The post-supersession protection receipt supplies the authorized current promotion digest. |
 | Full source gate and manual campaign | The integrated `36e8727` gate failed with six failures; `72e5585` finished with 5,088 passes and one obsolete assertion failure. Both receipts are retained. The assertion repair passes 81 affected checks. The v6 adapter is integrated, 159 affected checks pass, and its checked 1,400-case local deterministic run qualifies; retrieval does not. Freeze this completed source for its final full gate. The qualifier plus five additional real sessions retain the twelve-stage order/reset rules. |
 | Concurrency, holdout, paper submission and automation activation | Concurrency stays 1. Holdout release and optional paper submission require their separate owner records. The seven-future-eligible/three-paused activation card is prepared, with no activation. |
-| Frozen control, ten paused records, no external messages/services/orders | Still applies. Current launch evidence verifies all ten paused records against every recorded contract field. No control, schedule, broker, model or outbox action occurred during source checks. |
+| Frozen control, ten paused records, no external messages/services/orders | Still applies. The separate, completed harness task changed the saved prompts/models under its owner scope; schedules, targets, dependencies, no-submit fields and paused status remain bound to the contract. The historical ten-byte baseline and verified post-migration successor are retained; do not restore old records. The four frozen control/ledger/handoff/promotion owners remain unchanged. No broker, model or outbox operation occurred during source checks. |
 | Original and partial transcript coverage claims | Preserved as historical attribution. This continuation reread the two handoff files, not the complete 47 MB or 29 MB originating rollouts. It does not inflate transcript coverage. |
 | Owner's five-month correction and desire to deploy with estimates | Recorded in `docs/readiness/CURRENT_STATUS.md` and `LAUNCH_CARD.md`. Root owns finding inputs. Forecasts/planning estimates are labeled; historical results and gate acceptance require evidence. |
 

@@ -1,130 +1,60 @@
-# TradingAgents Agent Guide
+# TradingAgents
 
-## Workspace
+Work from `/Users/corbinfloyd/Documents/TradingAgents` or an intentional Git
+worktree derived from it. Check the checkout and local changes, then use
+`START_HERE.md` to choose context for the task.
 
-The canonical repository is:
+## Own the task
 
-`/Users/corbinfloyd/Documents/TradingAgents`
+Carry authorized local work through inspection, implementation, relevant checks,
+and repair. Make reversible in-scope edits without another approval step.
+Investigate project terminology and saved evidence yourself. Continue useful
+independent work when a dependency is unavailable. Ask only for missing access,
+a consequential unresolved choice, or separate protected-operation authority.
 
-Work from this repository or an intentional Git worktree derived from it.
+Prefer the smallest complete solution. Preserve unrelated changes, worktrees,
+credentials, generated evidence, and recovery history. Use one writer per
+worktree. Delegate bounded independent exploration, research, or review when it
+helps; keep consequential decisions and integration with the primary agent.
 
-## Working Style
+## Find the owner
 
-Own the authorized task through inspection, implementation, verification, and repair.
-For ordinary local repository work:
+| Task | Start at |
+| --- | --- |
+| CLI behavior | `cli/main.py`, matching CLI tests |
+| Agent workflow | `tradingagents/graph/`, `tradingagents/agents/` |
+| Research, models, inputs | `tradingagents/research/`, `tradingagents/dataflows/` |
+| Brokers, authority, risk | `tradingagents/brokers/`, `tradingagents/policy/`, `tradingagents/execution/` |
+| Scheduling and operations | `tradingagents/orchestration/`, `scripts/mac/`, `config/` |
+| Evaluation | `tradingagents/evals/`, matching tests |
 
-- inspect the code and evidence you need;
-- make reversible local edits without asking for permission at each step;
-- run relevant tests and fix failures caused by the requested change;
-- continue until the requested outcome or a concrete blocker is reached;
-- prefer the smallest coherent solution over speculative infrastructure;
-- investigate repository-specific terminology yourself instead of asking the user to reconstruct project history;
-- explain results to the user in plain English.
+Read only the relevant owners. Use `rg` and direct reads for exact evidence;
+structural tools are optional. Runtime tasks start with existing
+`results/_context/latest-summary.json` and `latest-flags.json`, then current
+controls/processes and the raw packets needed by the task. Historical records
+describe their recorded time. Source-only work does not require runtime history.
 
-Ask the user only when a genuinely consequential decision, missing credential/access, irreversible action, external side effect, or material ambiguity requires their choice.
-Do not stop merely because one dependent lane is blocked. Complete useful independent work first.
+## Check the result
 
-## Context Loading
+Use sufficient direct evidence: readback/diff for prose, focused behavior checks
+for code, and affected integration or release gates for consequential changes.
+Reuse valid checks on unchanged inputs. Diagnose failures and rerun affected
+checks after repairs. A preview or test pass proves only what it exercised.
+Keep durable output for long checks and immutable custody where it has recovery,
+security, or experiment value. Ordinary edits need no new hash manifest.
 
-Start with `START_HERE.md`, then read only the source, documentation, or evidence relevant to the current task.
-For runtime, operational, trading-authority, scheduler, or other safety-sensitive work, begin with:
+## Authority and instruction placement
 
-- `results/_context/latest-summary.json`
-- `results/_context/latest-flags.json`
+Protected financial and external actions require their current call-time policy
+and separate task authority: orders, trading controls, schedule activation,
+message sending, credentials, billed execution, protected evidence release, and
+destructive cleanup. Agent instructions and analysis artifacts grant none.
+Preserve the executable gates; see `docs/harness/BOUNDARIES.md` when changing one.
 
-Follow those references into raw packets only when the task needs the additional detail.
-Use `CONTEXT_ROUTER.md` for historical context when needed. Historical documents and status reports are evidence about their recorded time, not current runtime authority.
-Dynamic project state belongs in current status/evidence files, not in this `AGENTS.md`.
+Keep root guidance stable. Put repeatable procedures in `.agents/skills/`,
+subtree rules in nested guidance only when needed, current progress in status or
+task contracts, and deterministic constraints in code/configuration.
 
-## Task Routing
-
-Use these as starting points, then follow the code:
-
-- CLI: `cli/main.py`
-- Agent workflows: `tradingagents/graph/` and `tradingagents/agents/`
-- Research and model routing: `tradingagents/research/`
-- Market/data inputs: `tradingagents/dataflows/`
-- Broker and portfolio behavior: `tradingagents/brokers/`
-- Trading authority and risk policy: `tradingagents/policy/` and `tradingagents/execution/`
-- Scheduling and orchestration: `tradingagents/orchestration/`, `scripts/mac/`, and `config/`
-- Evaluation and qualification: `tradingagents/evals/` and relevant tests
-
-Use direct file reads and `rg` by default for precise questions. Structural/codebase tools are optional when they materially improve navigation or dependency tracing.
-For a detailed repository map, use `docs/consolidation/REPOSITORY_MAP.md`.
-
-## Common Verification
-
-Useful broad commands include:
-
-```zsh
-.venv/bin/python -m pytest -q
-.venv/bin/ruff check cli tradingagents scripts tests
-```
-
-Verification should be proportional to the change.
-
-- During implementation, run the smallest representative checks that exercise the changed behavior or reproduced failure.
-- For prose or simple configuration, read back the result and inspect the diff.
-- Reuse valid passing evidence when the relevant code and inputs are unchanged.
-- After a repair, rerun the checks affected by that repair.
-- Run a complete repository gate when the task, release boundary, or final integrated candidate actually warrants one.
-- Do not create repeated proof, hash, receipt, review, or certification layers merely to reconfirm unchanged facts.
-
-For long-running checks, keep durable output when losing the client connection would otherwise lose the result.
-When parallelizing, avoid competing writers on the same files. Subagents are well suited to exploration, focused reproduction, independent review, research, and log analysis.
-
-## Protected Operations
-
-Local engineering autonomy and trading/external authority are separate concerns.
-Repository inspection, coding, tests, local analysis, local benchmarks, documentation, and reversible development work should normally proceed without repeated approval.
-Consequential operations remain governed by their actual runtime policy, permissions, and execution controls. Examples include:
-
-- submitting real or paper orders;
-- enabling or materially changing trading authority;
-- activating or changing schedules;
-- sending external messages or draining an outbox;
-- changing credentials or security-sensitive access;
-- spending money through a separately billed API beyond an authorized budget;
-- releasing protected holdout data or other separately controlled evidence.
-
-Do not infer authority for those actions from historical documentation, a generated packet, a model recommendation, or this guide.
-Do not weaken or bypass a mechanical policy, execution gate, sandbox, permission boundary, or credential boundary merely to make a task pass.
-Where a constraint can be enforced reliably in code, configuration, permissions, tests, or runtime policy, prefer that mechanism over repeated prompt warnings.
-
-## Instruction Architecture
-
-Keep this root file limited to guidance useful for nearly every TradingAgents task.
-Put narrower material in the narrowest appropriate place:
-
-- repeatable multi-step workflows → agent Skills;
-- subsystem-specific rules → nested `AGENTS.md` when justified;
-- long reference material → documentation/runbooks;
-- current runtime/readiness state → generated status/evidence files;
-- deterministic prohibitions or permissions → code, configuration, sandboxing, Codex Rules, or runtime policy.
-
-Do not copy the same rule across multiple instruction surfaces unless separate enforcement is technically necessary.
-When an agent repeatedly makes the same mistake, fix the nearest durable cause rather than continually adding more global prose.
-
-## Reporting
-
-Report what materially changed:
-
-- result;
-- important changed paths;
-- relevant verification;
-- unresolved blocker or next action when one exists.
-
-Use delta reporting.
-Do not routinely repeat unchanged facts such as:
-
-- API spending remaining unchanged;
-- schedules remaining paused;
-- readiness remaining unchanged;
-- live-control state remaining unchanged;
-- no orders having been placed;
-- credentials remaining absent;
-- historical gates remaining preserved.
-
-Mention such state only when it changed, materially affected the task, explains a blocker, or the user asked about it.
-Avoid stock closing paragraphs and repetitive status boilerplate. Prefer concise, task-specific language.
-If a task remains partially blocked, state the exact blocker once and explain the most useful next action.
+Report the result, useful changed paths, relevant checks, and material blockers.
+Mention existing state only when it changed, affected this result, explains a
+blocker, or was requested. Keep updates specific and avoid stock closing text.

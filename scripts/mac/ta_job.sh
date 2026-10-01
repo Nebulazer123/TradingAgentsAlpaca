@@ -10,9 +10,9 @@
 #
 # Config via environment (set by the authorized caller):
 #   TA_REPO          repo root (default: the production tree this script infers)
-#   TA_LIVE_SUBMIT   1 requests the hourly CLI's gated action path and outbox
-#                    delivery; it does not enable direct live orders. 0 is
-#                    dry-run only, with no outbox delivery. Preopen is always
+#   TA_LIVE_SUBMIT   1 requests the hourly CLI's gated action path; it does not
+#                    enable direct live orders or email sending. 0 is
+#                    dry-run only. Preopen is always
 #                    dry-run regardless of an inherited action flag.
 
 set -euo pipefail
@@ -65,9 +65,8 @@ case "$JOB" in
       run "$PY" -m cli.main alpaca preopen-validation --json-output
     fi
     run "$PY" scripts/automation_context_snapshot.py --write
-    # Analysis-only runs must not send previously queued real messages.
-    # Explicit hourly action runs and the separate deliver-outbox job retain
-    # delivery behavior; a dry-run does not authorize an outbox drain.
+    # This invocation previews the queue. Transport requires a separate,
+    # explicitly scoped delivery request.
     if [[ "$JOB" == "hourly" && "$TA_LIVE_SUBMIT" == "1" ]]; then
       run "$PY" scripts/mac/deliver_outbox.py
     fi

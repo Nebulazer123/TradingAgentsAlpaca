@@ -41,6 +41,14 @@ FROZEN_OBSERVER_PAUSED_IDS = frozenset(
 )
 
 
+def test_source_prompt_bytes_bind_the_scheduled_contract():
+    contract = json.loads(CONTRACT_PATH.read_text())
+    for automation_id, record in contract["automations"].items():
+        source = (REPO_ROOT / "config/automation_prompts" / f"{automation_id}.md").read_bytes()
+        assert hashlib.sha256(source).hexdigest() == record["prompt_sha256"]
+        assert all(phrase in source.decode() for phrase in record["required_prompt_phrases"])
+
+
 def _fixture_contract_and_automation_records(destination: Path) -> tuple[Path, Path]:
     """Materialize deterministic external records from the versioned contract."""
 

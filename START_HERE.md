@@ -1,56 +1,26 @@
-# Start Here
+# Start with the task
 
-Open TradingAgents in Codex at this exact folder:
+The canonical application and Git root is
+`/Users/corbinfloyd/Documents/TradingAgents`. Intentional linked worktrees have
+their own checkout state. Begin with `git status --short --branch` and `AGENTS.md`.
+The canonical Python environment is `.venv/`; use it from linked worktrees too.
 
-`/Users/corbinfloyd/Documents/TradingAgents`
+| Need | Read |
+| --- | --- |
+| Implement or explain source | Relevant subsystem and tests; [repository map](docs/consolidation/REPOSITORY_MAP.md) if useful |
+| Diagnose runtime or authority | Existing compact summary/flags in `results/_context/`, then the specific current controls and packets |
+| Continue readiness work | [Current progress](docs/readiness/CURRENT_STATUS.md) and [completion contract](docs/readiness/COMPLETION_CONTRACT.md) |
+| Qualify research or economic evidence | `.agents/skills/ta-research-evaluation/SKILL.md` |
+| Investigate operations | `.agents/skills/ta-runtime-diagnosis/SKILL.md` |
+| Freeze a release candidate or recover history | `.agents/skills/ta-source-release/SKILL.md` |
+| Find an older decision | [History router](CONTEXT_ROUTER.md) |
 
-This is the single canonical Git repository and runnable application root. The
-old nested application, Windows transfer, separate public clone, and development
-worktrees were consolidated or preserved as recoverable archives on 2026-08-10.
+Application code lives in `cli/` and `tradingagents/`, tests in `tests/`, durable
+docs in `docs/`, generated evidence in `results/`, and recovery material in
+`archive/`. Local credentials stay in the ignored `.env`.
 
-## Understand the current state
-
-Start with [Where TradingAgents stands](docs/readiness/CURRENT_STATUS.md) for a
-plain-English account of what works, what remains, and the next action. The
-[day/night/weekend walkthrough](docs/orchestration/day-night-weekend-walkthrough.md)
-explains the intended operation alongside today's paused behavior. Exact
-acceptance rules and historical evidence remain in their linked owners.
-
-## Start with the task
-
-```zsh
-cd /Users/corbinfloyd/Documents/TradingAgents
-git status --short --branch
-```
-
-Read `AGENTS.md` for working guidance. Use
-`docs/consolidation/REPOSITORY_MAP.md` when a source map helps. For runtime,
-operational, or safety-sensitive work, read the existing compact summary and
-flags under `results/_context/`, then only the raw packets they identify.
-Refresh compact context only under the conditions in `AGENTS.md`; startup does
-not require a write or a CLI invocation. Use `CONTEXT_ROUTER.md` selectively for
-historical operational context, not as a current status report.
-
-## What is current
-
-- Application code: `cli/` and `tradingagents/`
-- Tests: `tests/`
-- Mac automation: `scripts/mac/`
-- Local runtime state and evidence: `results/`
-- Durable documentation: `docs/`
-- Historical and recovery material: `archive/`
-- Python environment: `.venv/`
-- Local credentials: `.env`
-
-The launchd n8n runner uses this root and serves its health endpoint at
-`http://127.0.0.1:8765/health`.
-
-## Current evidence order
-
-1. Active process and broker state
-2. `results/policy/live_control.json`
-3. `results/_context/latest-summary.json` and `latest-flags.json`
-4. The newest raw packets linked by compact context
-5. Historical docs and archived packets
-
-This order keeps a new chat centered on what the system is actually running.
+Refresh compact context with
+`.venv/bin/python scripts/automation_context_snapshot.py --write` when its
+inputs changed or the index is missing/stale for a runtime task. Startup and
+source edits alone need no refresh. An index timestamp does not refresh the
+underlying evidence.

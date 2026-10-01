@@ -13,7 +13,10 @@ read that history to understand today's status.
   stay in dry-run, and dry-run jobs cannot send previously queued mail.
 - The obsolete conflicted checkout is removed. Its branch and complete recovery
   backup remain available. Every other checkout is preserved.
-- The operating instructions are simpler and retain the existing safety rules.
+- The completed harness update simplifies operating instructions, preserves
+  financial controls, and assigns Luna 6 and Sol 6.1 to the saved job roles.
+  Its 612 affected tests and six static checks passed. It is combined with the
+  benchmark source for the final repository check.
 - Document readers now handle real web pages, tables, financial-report facts,
   PDFs, images, repository documents and saved tool responses. The affected
   checks passed 157 tests. All 81 saved SEC documents were read with their
@@ -36,8 +39,8 @@ read that history to understand today's status.
   After repairs, its successor finished with 5,088 passes, one stale test
   assertion and one skipped live-API test. That assertion now checks strict
   capture rejection in both deployment phases; all 81 affected checks pass.
-  Both failed receipts remain preserved. The completed candidate awaits its
-  full repository gate.
+  Both failed receipts remain preserved. The combined benchmark and harness
+  candidate awaits its full repository gate.
 - The broader adapter and original-file reader are integrated, preserving older
   benchmark replay. All 159 affected checks passed, including 51 new regression
   cases. Separate review added retained-markup checks and removed excessive
@@ -60,7 +63,7 @@ read that history to understand today's status.
 | Proof of broader document reasoning | Checked reporting periods, collection times and configuration fixtures do not prove general reasoning about changed reports, publisher charts or investments. | Preserve the completed 1,400-case local result and its limits. Admit any further questions and model comparisons through their actual evidence and authorization prerequisites; missing model evidence does not establish a no-model verdict. |
 | A study that begins before its results are known | Choosing inputs after seeing the outcome would bias the result. | Admit the future-facing study, then collect actual development and validation results. Release the reserved final test only through its separate owner approval. |
 | Fresh portfolio loss review and BOARD evidence | Old positions and stale reviews cannot establish today's state. | Preserve the completed readiness supersession; obtain the required fresh source evidence within its authorized scope. |
-| A passing check of the completed source | Neither the older 5,005-test pass nor either failed integrated gate accepts the current source. | Freeze the completed adapter candidate and run its complete gate with durable results. |
+| A passing check of the completed source | Neither the older 5,005-test pass nor either failed integrated gate accepts the current source. | Freeze the combined benchmark and harness candidate and run its complete gate with durable results. |
 | Six clean market sessions | The system must operate reliably over real elapsed sessions. | Complete one qualifier, then five additional clean sessions in the existing order. A failed session requires repair and a new qualifier. |
 
 I will investigate the saved files and sources. You do not need to supply the
@@ -71,9 +74,9 @@ cost if any, and why it is needed.
 The immediate deployment target is the existing frozen observer phase. It can
 produce labeled forecasts and reports while new results accumulate. The
 [launch preparation](LAUNCH_CARD.md) lists the seven intended observer jobs,
-three jobs that stay paused, proposed current model assignments and explicit
-planning estimates. These updates are prepared for review and have not been
-applied. The existing launch prerequisites remain in force.
+three jobs that stay paused, saved role model assignments and explicit
+planning estimates. The harness prompt/model refresh is recorded in
+[the modernization report](../harness/2026-10-01-modernization.md); it grants no activation authority. The existing launch prerequisites remain in force.
 
 The owner also authorized one public AAPL comparison using GPT-6 Luna and
 GPT-6.1 Sol through Codex and the OpenAI API, capped at USD 1. Both subscription
@@ -93,3 +96,5 @@ The [continuation record](../superpowers/checkpoints/2026-09-30-readiness-contin
 records what changed and the supporting checks. Readiness remains unestablished
 until all required gates are satisfied; a reliable negative study result is
 acceptable, missing evidence is not completion.
+
+Detailed dated work and evidence references: [PROGRESS.md](PROGRESS.md).

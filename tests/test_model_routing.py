@@ -2,6 +2,8 @@ import json
 from dataclasses import replace
 from decimal import Decimal
 
+import pytest
+
 from tradingagents.evals.agent_intelligence_ledger import forecasts_from_overnight_packet
 from tradingagents.policy.packets import write_research_packet
 from tradingagents.research.model_routing import (
@@ -24,6 +26,47 @@ from tradingagents.research.model_telemetry import (
     write_model_telemetry_report,
 )
 from tradingagents.schemas.research import ModelRunTelemetryPacket
+
+
+@pytest.mark.parametrize("cap", ["", "0", "-1", "NaN", "sNaN", "Infinity", "bad-budget"])
+@pytest.mark.parametrize("select", [select_research_model_route, select_intelligent_model_route])
+def test_paid_routes_reject_absent_and_invalid_dollar_caps(cap, select):
+    route = select(
+        env={"GOOGLE_API_KEY": "present", "TRADINGAGENTS_MODEL_ALLOW_PAID": "true",
+             "TRADINGAGENTS_MODEL_MAX_COST_USD_PER_RUN": cap},
+        estimated_cost_usd=Decimal("0.10"),
+    )
+    assert route.status == "blocked" and route.paid is False
+    assert "finite positive" in route.reason
+
+
+@pytest.mark.parametrize("cost", [None, Decimal("0"), Decimal("-1"), Decimal("NaN"), Decimal("sNaN"), Decimal("Infinity"), "0.10"])
+def test_paid_routes_reject_unknown_or_invalid_estimate(cost):
+    route = select_intelligent_model_route(
+        env={"GOOGLE_API_KEY": "present"},
+        policy=ModelRoutingPolicy(allow_paid=True, max_cost_usd_per_run=Decimal("1")),
+        estimated_cost_usd=cost,
+    )
+    assert route.status == "blocked" and route.paid is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("max_cost_usd_per_run", None), ("max_cost_usd_per_run", Decimal("NaN")),
+    ("max_model_calls_per_run", 0), ("max_input_tokens_per_run", -1),
+    ("monthly_soft_budget_usd", Decimal("Infinity")),
+    ("allow_paid", "false"), ("allow_openai_paid", "false"),
+])
+def test_direct_policies_cannot_bypass_budget_validation(field, value):
+    policy = replace(ModelRoutingPolicy(allow_paid=True, max_cost_usd_per_run=Decimal("1")), **{field: value})
+    assert evaluate_model_budget_caps(policy=policy, estimated_cost_usd=Decimal("0.10"))
+
+
+def test_current_judgment_models_and_explicit_override():
+    policy = model_routing_policy_from_env({})
+    assert policy.openai_model == policy.codex_intelligent_model == "gpt-6.1-sol"
+    assert policy.allow_paid is False and policy.allow_openai_paid is False
+    overridden = model_routing_policy_from_env({"TRADINGAGENTS_CODEX_INTELLIGENT_MODEL": "gpt-6-astra"})
+    assert overridden.codex_intelligent_model == "gpt-6-astra"
 
 
 def test_model_routing_prefers_free_local_route_even_when_paid_key_exists():

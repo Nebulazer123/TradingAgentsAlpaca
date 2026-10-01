@@ -2,7 +2,9 @@
 
 The renderers in this repo only compose messages; historically the Windows
 Codex automation was the transport. On the Mac, notifications queue in
-``results/outbox`` and this script delivers them when SMTP settings exist.
+``results/outbox``. Sending requires ``--send --message-id ID`` for each
+explicitly authorized message. Otherwise this script only reports the backlog,
+even with SMTP credentials configured. Trading flags do not authorize email.
 
 Configuration (all required to actually send; otherwise messages stay
 queued and this script exits 0 after reporting the backlog):
@@ -18,6 +20,7 @@ Credentials load from the repo .env (the package bootstraps python-dotenv).
 
 from __future__ import annotations
 
+import argparse
 import os
 import smtplib
 import sys
@@ -34,12 +37,24 @@ from tradingagents.notifications.outbox import (  # noqa: E402
 )
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--send", action="store_true", help="Send explicitly authorized message IDs")
+    parser.add_argument("--message-id", action="append", default=[], help="Authorized queued ID; repeat for several")
+    args = parser.parse_args(argv)
+    if args.send != bool(args.message_id):
+        parser.error("delivery requires both --send and at least one --message-id")
     outbox_dir = REPO_ROOT / "results" / "outbox"
     pending = list_undelivered(outbox_dir)
-    if not pending:
-        print("outbox empty; nothing to deliver")
+    if not args.send:
+        print(f"outbox preview: {len(pending)} message(s) queued")
         return 0
+    requested = set(args.message_id)
+    if requested - {item["id"] for item in pending}:
+        parser.error("one or more requested message IDs are not queued; nothing sent")
+    pending = [item for item in pending if item["id"] in requested]
+    if len(pending) != len(requested):
+        parser.error("requested message IDs are ambiguous; nothing sent")
 
     host = os.environ.get("SMTP_HOST", "").strip()
     port = os.environ.get("SMTP_PORT", "").strip()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,10 +10,7 @@ from tradingagents.orchestration.token_context import (
     classify_pre_tool_use_warning,
     classify_raw_context_need,
     load_compact_context,
-    write_hook_event,
 )
-
-SNAPSHOT_EVENTS = {"SessionStart", "SubagentStart", "PostCompact", "Stop"}
 
 
 def _read_payload() -> dict[str, Any]:
@@ -44,45 +40,19 @@ def _detect_event(payload: dict[str, Any]) -> str:
     )
 
 
-def _run_snapshot(repo_root: Path) -> str:
-    try:
-        completed = subprocess.run(
-            [sys.executable, "scripts/automation_context_snapshot.py", "--write"],
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            timeout=25,
-            check=False,
-        )
-    except Exception as exc:  # pragma: no cover - hook defensive boundary
-        return f"snapshot_error={exc}"
-    if completed.returncode:
-        return f"snapshot_exit={completed.returncode}"
-    return "snapshot=refreshed"
-
-
 def main() -> int:
     payload = _read_payload()
     event = _detect_event(payload)
+    # Lifecycle events describe a conversation, not a runtime input change.
+    # Source work needs no snapshot, status recap, or hook receipt.
+    if event != "PreToolUse":
+        return 0
     repo_root = Path.cwd()
-    snapshot_status = _run_snapshot(repo_root) if event in SNAPSHOT_EVENTS else "snapshot=skipped"
     compact = load_compact_context(repo_root)
     decision = classify_raw_context_need(compact.flags)
-    pre_tool_warning = classify_pre_tool_use_warning(payload, decision=decision) if event == "PreToolUse" else None
-    out_path = write_hook_event(
-        repo_root,
-        event=str(event),
-        payload=payload,
-        decision=decision,
-        pre_tool_warning=pre_tool_warning,
-    )
-    print(f"TradingAgents hook: {event}")
-    print(snapshot_status)
-    print(f"raw_context_required={decision.required}; reasons={','.join(decision.reasons) or 'none'}")
-    if pre_tool_warning and pre_tool_warning.should_warn:
-        print(f"pre_tool_warning=warning_only; reasons={','.join(pre_tool_warning.reasons)}")
-        print(pre_tool_warning.guidance or "Use compact context before raw packets.")
-    print(f"event_packet={out_path}")
+    warning = classify_pre_tool_use_warning(payload, decision=decision)
+    if warning.should_warn:
+        print(warning.guidance or "Use relevant compact context before broad raw-packet reads.")
     return 0
 
 

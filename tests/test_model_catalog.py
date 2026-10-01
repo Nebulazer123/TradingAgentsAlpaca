@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from tradingagents.llm_clients.model_catalog import (
     get_model_context_window_tokens,
     get_model_metadata,
@@ -39,8 +41,15 @@ def test_model_routes_include_context_window_when_catalog_knows_model():
             "TRADINGAGENTS_MODEL_ALLOW_PAID": "true",
             "TRADINGAGENTS_MODEL_MAX_COST_USD_PER_RUN": "1.00",
             "TRADINGAGENTS_GEMINI_RESEARCH_MODEL": "gemini-2.5-flash-lite",
-        }
+        },
+        estimated_cost_usd=Decimal("0.10"),
     )
 
     assert route.context_window_tokens == 1_048_576
     assert route.model_dump()["context_window_tokens"] == 1_048_576
+
+
+def test_current_openai_catalog_covers_workload_choices():
+    for mode, model in (("quick", "gpt-6-luna"), ("deep", "gpt-6.1-sol"), ("deep", "gpt-6-astra")):
+        assert model in [value for _, value in get_model_options("openai", mode)]
+        assert get_model_context_window_tokens("openai", model) == 1_050_000

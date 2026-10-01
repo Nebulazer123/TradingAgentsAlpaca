@@ -47,12 +47,13 @@ def test_analysis_wrapper_never_submits_or_drains_queued_notifications(tmp_path,
     assert not (tmp_path / f'results/mac_automation/locks/{job}.lock').exists()
 
 
-def test_explicit_hourly_action_mode_keeps_the_guarded_action_route_and_delivery(tmp_path):
+def test_explicit_hourly_action_mode_keeps_guarded_actions_and_only_previews_outbox(tmp_path):
     commands = _run_wrapper(tmp_path, 'hourly', '1')
 
     supervisor = [command for command in commands if 'supervise-hourly' in command]
     assert len(supervisor) == 1 and '--submit-actions' in supervisor[0]
     assert sum('deliver_outbox.py' in command for command in commands) == 1
+    assert not any('--send' in command for command in commands)
 
 
 def test_explicit_outbox_job_remains_available(tmp_path):

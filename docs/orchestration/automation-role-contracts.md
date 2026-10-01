@@ -7,10 +7,10 @@ tier, prompt fingerprint, artifact expectations, ordering, and predeployment
 no-submit posture.  These are deliberately separate: an authority change and
 a scheduler configuration change have different review and activation gates.
 
-## Current state
+## Deployment phases
 
 The contract has two status phases.  `predeployment_paused` requires all ten
-external records to be `PAUSED`; that is the current safe predeployment state,
+external records to be `PAUSED`; that is a safe predeployment state,
 but it is **not** evidence that the schedule is deployed or healthy.
 `frozen_observer` permits only overnight research, preopen validation,
 self-healer, safety sentinel, execution BOARD, paper tournament, and daily
@@ -61,23 +61,23 @@ weekday market-session reliability controller, not a fictitious 24/7 service.
 
 | Automation ID | Intended CT schedule | Model / effort | Dependency |
 | --- | --- | --- | --- |
-| `tradingagents-overnight-research` | Weekdays 03:30 | Terra / high | — |
-| `tradingagents-automation-wake-controller` | Weekdays 06:45 | Luna / medium | — |
-| `tradingagents-autonomous-self-healer` | Weekdays 07:03, 09:03, 11:03, 13:03, 15:03 | Terra / high | — |
-| `tradingagents-preopen-validation` | Weekdays 08:10 | Terra / high | Overnight research |
-| `tradingagents-autonomous-safety-sentinel` | Weekdays 08:20, then hourly through 14:20 | Luna / medium | Preopen + self-healer |
-| `tradingagents-market-supervisor` | Weekdays 08:35, then hourly through 14:35 | Terra / high | Sentinel |
-| `tradingagents-autonomous-execution-board` | Weekdays 08:50, then hourly through 14:50 | Terra / high | Sentinel + supervisor |
-| `tradingagents-paper-tournament` | Weekdays 09:10 | Terra / high | Overnight research |
-| `tradingagents-daily-report` | Weekdays 15:30 | Luna / medium | BOARD |
-| `tradingagents-automation-sleep-controller` | Weekdays 16:45 | Luna / medium | Daily report |
+| `tradingagents-overnight-research` | Weekdays 03:30 | GPT-6.1 Sol / high | — |
+| `tradingagents-automation-wake-controller` | Weekdays 06:45 | GPT-6 Luna / medium | — |
+| `tradingagents-autonomous-self-healer` | Weekdays 07:03, 09:03, 11:03, 13:03, 15:03 | GPT-6.1 Sol / high | — |
+| `tradingagents-preopen-validation` | Weekdays 08:10 | GPT-6 Luna / medium | Overnight research |
+| `tradingagents-autonomous-safety-sentinel` | Weekdays 08:20, then hourly through 14:20 | GPT-6 Luna / medium | Preopen + self-healer |
+| `tradingagents-market-supervisor` | Weekdays 08:35, then hourly through 14:35 | GPT-6.1 Sol / high | Sentinel |
+| `tradingagents-autonomous-execution-board` | Weekdays 08:50, then hourly through 14:50 | GPT-6.1 Sol / high | Sentinel + supervisor |
+| `tradingagents-paper-tournament` | Weekdays 09:10 | GPT-6 Luna / medium | Overnight research |
+| `tradingagents-daily-report` | Weekdays 15:30 | GPT-6 Luna / medium | BOARD |
+| `tradingagents-automation-sleep-controller` | Weekdays 16:45 | GPT-6 Luna / medium | Daily report |
 
 Matching external schedule fields are still not deployment proof for this
 matrix. Historical one-hour drift, the self-healer's `24/7` wording and the
 scheduled-paper dry-run defect have been corrected in the preserved current
 records/source; use the read-only evaluator below to report any fresh drift,
-rather than treating that old diagnosis as current. All ten records remain
-`PAUSED`; separate API-confirmed, no-submit shadow validation is still required.
+rather than treating that old diagnosis as current. Current record state belongs in the scheduler and runtime evidence; separate
+API-confirmed, no-submit shadow validation is still required for deployment.
 
 ## One scheduling owner; explicit side effects
 
@@ -94,12 +94,11 @@ The job wrapper remains available for approved manual or Codex-scheduled use:
 - `preopen` always uses the supervisor's `--dry-run`, even if its caller has
   `TA_LIVE_SUBMIT=1`, and never drains the outbox.
 - `hourly` with `TA_LIVE_SUBMIT=0` is dry-run and never drains queued messages.
-- Explicit `hourly` action mode retains its guarded CLI action request and
-  notification delivery. The current hourly CLI still hard-disables direct live
+- Explicit `hourly` action mode retains its guarded CLI action request and an outbox preview. The current hourly CLI still hard-disables direct live
   orders; setting an environment flag or unfreezing alone does not change that.
 - `tournament` remains explicitly dry-run. The existing `daily-report` and
-  `deliver-outbox` jobs retain their separately authorized reporting/delivery
-  behavior. Analysis-only does not automatically mean a command has no local
+  `deliver-outbox` jobs queue and preview messages. Transport uses a separate
+  `--send --message-id` request for selected IDs. Analysis-only does not automatically mean a command has no local
   packet-writing or external read effects.
 
 ## Read-only verification
