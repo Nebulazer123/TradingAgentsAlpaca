@@ -83,8 +83,8 @@ accuracy. No HTML pages were counted.
 Saved evidence lives under `results/readiness_continuation/` in
 `20260930-media-review/` and `20260930-retained-html-review/`. The initial failed
 namespace serialization check is preserved in `20260930-media-affected/`.
-The required checked 500/300/400/200 corpus and qualification are still separate
-work; source tests and inventories cannot satisfy those gates.
+Source tests and inventories remain distinct from the registered case results
+below.
 
 The corpus preparation now retains HPE's 180-page and JPMorganChase's 364-page
 publisher-original PDFs, with actual download times and custody receipts.
@@ -92,4 +92,33 @@ Five hundred distinct native pages have been extracted and bound. The original
 187 successful preparations were reused after the font repair; the failed sweep
 receipt remains preserved. Prepared pages live under
 `results/readiness_continuation/20260930-pdf-page-repaired/`. Questions, labels and
-qualification remain pending; this preparation is not a 500-case pass.
+qualification were then completed separately as described below; extraction
+preparation itself is not a 500-case pass.
+
+## Checked local corpus result — October 1
+
+The v5 registration contains 500 native PDF pages, 300 temporal source questions,
+400 repository workflow constraints and 200 controlled hostile-input derivatives.
+Every original location and gold label was checked in a separate root self-review.
+Answers remain outside extraction. Of 1,400 cases, 901 are critical, 280 high
+severity and 219 normal. No arbitrary HTML span counts as a PDF page.
+
+The deterministic source-derived JSON-field lane reached 100% source, critical
+and high-severity accuracy, with zero authority change, disclosure or source
+bypass. It is selected for this literal-field-reading contract. FTS retrieval
+reached about 52.7% overall, 52.4% critical and 23.2% high-severity accuracy and
+did not qualify. Both ran locally with zero model and network calls.
+
+The scope is explicit: the 500 pages come from two issuers; temporal cases check
+200 scaled/signed facts, 50 contexts and 50 units rather than adjudicate
+restatements; workflow cases read constraints rather than execute workflows.
+Rendered raster cases test OCR, not every embedded publisher chart. These results
+do not establish general investment reasoning, forecast quality, economics or a
+no-model verdict. Registered model comparisons remain ineligible under their
+existing identity/route and zero-budget records; the separately authorized AAPL
+pilot does not change those records.
+
+Registration and reviewed labels:
+`results/readiness_continuation/20260930-real-corpus-candidates/`.
+Completed local execution and benchmark receipts:
+`results/readiness_continuation/20260930-real-corpus-candidates/local-qualification-v1/`.

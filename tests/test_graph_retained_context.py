@@ -1,5 +1,6 @@
 """Retained-only analyst inputs in the real role and packet topology."""
 
+import datetime as dt
 import hashlib
 import json
 
@@ -38,7 +39,11 @@ def _forbidden(*_args, **_kwargs):
 def test_retained_inputs_run_actual_full_role_topology_without_live_analysts(
     tmp_path, monkeypatch, context, concurrency,
 ):
+    from tradingagents.graph import packet_nodes as packet_nodes_module
     from tradingagents.graph import setup as setup_module
+
+    run_started_at = dt.datetime(2026, 9, 13, 20, tzinfo=dt.timezone.utc)
+    monkeypatch.setattr(packet_nodes_module, "_utc_now", lambda: run_started_at)
 
     for name in (
         "create_market_analyst", "create_prefetched_market_analyst",
@@ -62,7 +67,7 @@ def test_retained_inputs_run_actual_full_role_topology_without_live_analysts(
         run_signature_factory=lambda _asset: hashlib.sha256(context.encode()).hexdigest(),
     ).create_initial_state(
         "AAPL", "2026-09-11",
-        run_started_at="2026-09-13T20:00:00+00:00", learning_context="",
+        run_started_at=run_started_at.isoformat(), learning_context="",
     )
     updates = list(graph.stream(initial, {"recursion_limit": 100}, stream_mode="updates"))
     visited = {name for update in updates for name in update}

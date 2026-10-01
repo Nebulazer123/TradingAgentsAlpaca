@@ -657,6 +657,10 @@ def test_captured_schedule_snapshot_rejects_hidden_unexpected_automation(tmp_pat
     result = evaluate_schedule_contract(captured_snapshot=snapshot)
 
     assert result["issues"] == ["captured_snapshot_invalid"]
+    assert result["contract_status"] == "fail"
+    assert automation_health_audit.schedule_contract_snapshot_manifest(snapshot)["capture_issues"] == [
+        "automation_topology_invalid"
+    ]
 
 
 def test_captured_schedule_snapshot_rejects_unexpected_regular_file_automation_entry(tmp_path):

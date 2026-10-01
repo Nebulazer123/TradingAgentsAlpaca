@@ -1,6 +1,6 @@
 # Readiness continuation — 2026-09-30
 
-Root is the sole implementer and verifier, with a separate self-review pass.
+Root is the sole source implementer and verifier, with a separate self-review pass.
 Readiness remains unestablished. Live control remains frozen, ten automations
 remain paused, paper submission is off, and concurrency remains 1.
 
@@ -156,3 +156,72 @@ in `docs/readiness/HANDOFF_RECONCILIATION.md`. Their original bytes and coverage
 limits remain preserved. Final no-unique-information and retirement checks wait
 for full program acceptance; no handoff was deleted. Readback receipt:
 `results/readiness_continuation/20260930-handoff-reconciliation/receipt.json`.
+
+## October 1 execution and current disposition
+
+This section supersedes the earlier pending-work observations above. The full
+500/300/400/200 corpus is now registered, with all 1,400 original/gold locations
+checked by a separate root self-review. The deterministic JSON-field lane met
+100% critical/high accuracy and the security requirements; FTS retrieval did not
+qualify. This accepts literal field reading within the recorded scope, not
+semantic restatement adjudication, actual workflow execution, embedded-chart
+reasoning, forecast performance or a no-model verdict. All labels, failed
+preparations and local execution receipts remain retained in
+`results/readiness_continuation/20260930-real-corpus-candidates/`.
+
+The accepted readiness writer superseded historical GO/promotion/tournament
+claims while preserving the July GO, expired tournament and promotion before-image.
+Both sleeves are now paper-only with live execution false; live control was
+unchanged. Current readiness is `NOT_ESTABLISHED`. The accepted successor
+protection receipt records the authorized new promotion hash; the original
+baseline is historical and must not be repinned. Fresh TSM loss-review and BOARD
+evidence remain unavailable. Receipts:
+`results/readiness_continuation/20261001-readiness-supersession/`.
+
+The detached full source gate at `36e8727ba927ed717dd6108a01dfbce174e2879f`
+finished after 7,623.91 seconds with **5,083 passed, six failed, one skipped and
+75 passed subtests**. All six static checks passed. Four failures came from the
+retained-graph test's historical run start against today's production admission
+clock. The test now fixes its clock to its declared run start; production expiry
+checks are retained. Two failures exposed valid unexpected automation directories
+being accepted as complete capture topology. The evaluator now requires the
+discovered IDs to equal the expected IDs, retaining the distinction for unrelated
+automation namespaces and rejecting unsafe/symlinked captures.
+
+The stable affected run passed **130 tests in 3.92 seconds**, covering schedule
+audit, sentinel, retained graph and packet handoffs. Root separately reviewed the
+exact inventory comparison and clock scope; full-source Ruff and diff checks
+passed. A first focused rerun contained an assertion placed in the wrong test,
+was corrected while running and is not accepted as proof. Its error and the
+original six-failure gate remain recorded. A new complete gate is required
+because the integrated candidate changed; the obsolete wrapper was not restarted.
+Affected evidence: `results/readiness_continuation/20261001-gate-repairs/`.
+Original integrated failure:
+`results/readiness_continuation/20260930-final-source-gate-36e8727/`.
+The corrected frozen candidate's detached receipt belongs in
+`results/readiness_continuation/20261001-final-integrated-source-gate/`;
+its launch is not a passing source or operational claim.
+
+The owner separately authorized two public-only forecasting agents and a matched
+OpenAI API pilot capped at USD 1, using GPT-6 Luna and GPT-6.1 Sol. Root remains
+the sole source implementer and verifier. Both subscription agents completed
+forecasts from the same public AAPL packet and source cut; their ranges were
+recomputed independently and frozen before the first target session opened.
+They differ mainly in whether to extrapolate a weak estimated positive drift.
+Their nominal intervals are not empirically calibrated and outcomes are future.
+
+The OpenAI key is absent from the checked project/process/Codex key locations.
+The API route has made **zero calls and spent USD 0**. Its prepared actual graph
+route uses isolated stores, twelve bounded roles, no tools/retries/fallbacks,
+exact official OpenAI origin and a conservative twelve-call ceiling of USD
+0.4864 under the owner's USD 1 cap. Offline checks prove the client payload and
+representative scope/cost restrictions; they do not prove model execution.
+The one-case API-versus-subscription comparison remains incomplete and cannot
+establish that paying improves forecasts. Evidence and prepared helper:
+`results/readiness_continuation/20261001-aapl-route-comparison/`.
+
+All ten automations remain paused, live control remains frozen, paper orders and
+outbox delivery remain off, and concurrency remains 1. Legitimate dated stock
+identity/universe, legacy outcome links, actual prospective economic phases,
+separate holdout release, current TSM/BOARD evidence and six clean market sessions
+remain exact unfinished gates. Neither handoff is retired.

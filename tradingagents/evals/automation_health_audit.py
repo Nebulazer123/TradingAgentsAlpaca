@@ -873,7 +873,7 @@ def _capture_topology_issues(snapshot: Mapping[str, Any]) -> list[str]:
     toml_set = set(toml_ids)
     if (
         expected_set != contract_ids
-        or not expected_set.issubset(discovered_set)
+        or expected_set != discovered_set
         or toml_set != discovered_set
     ):
         issues.append("automation_topology_incomplete_or_unexpected")

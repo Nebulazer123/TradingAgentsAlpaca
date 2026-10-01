@@ -1,6 +1,6 @@
 # TradingAgents Evidence-First Working-State Completion Implementation Plan
 
-> **Execution mode:** Use `superpowers:executing-plans` to continue this approved plan. The user's latest instruction is to finish the existing bounded workers and use no more subagents. Root continues solo after those assignments; do not dispatch or reactivate workers. Earlier delegation details remain historical and are superseded by this instruction.
+> **Execution mode:** Continue this approved plan with root as the sole source implementer and verifier. On October 1 the owner separately authorized public AAPL forecasting assessments by GPT-6 Luna and GPT-6.1 Sol agents and a bounded OpenAI API comparison. That exception covers forecasting only; it does not delegate source work or verification. Earlier delegation instructions remain historical.
 
 **Goal:** Bring TradingAgents to a manually verified, evidence-first research and paper-trading working state, then stop with live control frozen and all ten TradingAgents automations paused. A reproducible null or negative economic result counts as a working system; profitability remains `NOT_ESTABLISHED` unless later evidence supports it.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - The user authorized continuous execution of the full program on 2026-09-07, superseding the earlier Phase 3 stop. Complete each phase's technical acceptance before its dependents; do not pause for routine continuation approval.
-- Root is the sole implementer and verifier. Use a separate self-review pass and no subagents. Preserve one writer per worktree and reuse unchanged verification evidence.
+- Root is the sole source implementer and verifier, with a separate self-review pass. Only the expressly authorized public forecasting agents are excepted. Preserve one writer per worktree and reuse unchanged verification evidence.
 - Live control remains frozen; all ten TradingAgents automations remain `PAUSED` at the accepted hashes. Source work and tests make no broker, provider, vendor, or application-model calls.
 - Holdout release and optional paper-only submission each require separate owner authorization. Historical GO, promotion, checkpoint, result, and readiness records confer no execution authority.
 - Preserve every existing feature change and evidence file. Keep the temporary handoff until the final program stop and complete reconciliation; the Phase 3 stop does not retire it.
@@ -21,7 +21,7 @@
 
 ---
 
-## Current missing work — 2026-09-30
+## Current missing work — 2026-10-01
 
 The Phase 4, LangGraph checkpoint, learning-reporting, and initial benchmark and
 readiness source are integrated. The earlier source gate passed 5,005 tests and
@@ -29,9 +29,13 @@ readiness source are integrated. The earlier source gate passed 5,005 tests and
 `76199c1` wrapper candidate verifier stopped with pytest `-9` and a broken pipe;
 its receipt remains failed and preserved. It is not running or accepted. Reuse
 unchanged 125-test wrapper and 72-test benchmark evidence. Those repairs are now
-integrated; the final completed-source gate remains required. The September 30
-continuation adds media-reader proof, recovery retirement, a plain-English
-status page and a prepared launch/model card. The owner has no additional input
+integrated. The durable integrated gate at `36e8727` finished with 5,083 passes,
+six failures and one live-API skip. The failures required an exact automation
+inventory check and a frozen test clock; 130 affected checks now pass. That
+failed gate remains preserved; the repaired frozen candidate requires its full
+gate. The continuation adds media-reader proof, checked local corpus results,
+recovery retirement, historical readiness supersession, a plain-English status
+page and a prepared launch/model card. The owner has no additional input
 files to supply: root owns source discovery and tracing the saved evidence.
 Planning estimates and new forecasts must be labeled; they cannot replace
 historical source evidence or accepted outcome records.
@@ -41,13 +45,13 @@ historical source evidence or accepted outcome records.
 | Guidance and repository | Completed: newer guidance preserved and exact schedule/dry-run and decimal/shared-page repairs integrated. Final source gate remains below. | Root alone implements, verifies, and separately self-reviews. |
 | Historical conflict | Completed: exact obsolete worktree retired with verified 863-file recovery, preserved branch/archive/merge receipts, and no active owner. | All other worktrees retained. An unrelated economic-suite pass was not required. |
 | Media inputs | Implemented v5 real-media contract preserving v4 replay; 157 affected checks passed, all 81 retained SEC HTML originals extracted with matching structural counts. Complete the integrated source gate. | Bind originals, page/span locations and transformations; keep labels outside extraction and show identical source material across compared lanes. Explicit unsupported transformations stay unavailable. Arbitrary HTML spans are not pages. |
-| Research | Register and check 500 document pages, 300 temporal questions, 400 workflow cases and 200 injection cases; run deterministic and retrieval qualification before eligible model comparisons. Five hundred distinct pages are extracted from the retained publisher-original PDFs; questions, labels and qualification remain pending. | 99.5% critical-field and 100% high-severity accuracy; zero authority changes, disclosure or source bypass. Missing model evidence does not establish a no-model verdict. |
+| Research | The 500/300/400/200 cohort is registered and every source/label location reviewed. Deterministic literal-field reading reached 100% critical/high accuracy with no security failure; retrieval did not qualify. Semantic restatement/workflow reasoning, embedded chart interpretation and registered model comparisons remain unproved. | Preserve 99.5% critical-field and 100% high-severity accuracy, zero authority changes, disclosure or source bypass. The local field-reading contract does not establish forecast quality, profitability or a no-model verdict. |
 | Cohort | Establish legitimate effective-dated `security_master/v1` and ranked eligible top-100/75/50 evidence. | The configured local hostname is not established provenance; the 43-symbol capture is insufficient. |
 | Economics | Admit the prospective protocol; complete development, validation, separately released holdout and final status from actual source-bound outcomes. | Preserve actual capture times. Real elapsed market time and a separate holdout owner record are required; a reproducible negative result is acceptable, missing evidence is not completion. |
 | Learning | Byte-exact backup and read-only audit completed: 6,244 valid rows, 4,944 labeled resolved, 1,300 pending, no verified economic bindings. Supply legitimate mappings and accepted prices/corporate actions, then complete source-bound resolution and fixed-point reconciliation. | Accepted PIT inputs and mappings; no replacement ledger or invented historical crosswalk. Current labels do not establish outcomes. |
-| Readiness | Preserve and supersede historical GO/promotion/tournament records through the accepted writer; produce non-authorizing readiness, TSM loss review and BOARD evidence. | Follow existing evidence prerequisites; keep live control byte-identical. |
+| Readiness | Historical GO/promotion/tournament supersession and current `NOT_ESTABLISHED` readiness are complete through the accepted writer. Fresh TSM loss review and BOARD evidence remain open. | Use the accepted post-supersession protection receipt; preserve historical originals/before-images and byte-identical live control. Fresh portfolio evidence retains its actual access boundary. |
 | Concurrency | Compare 1 and 2 on the same registered cohort. | Registered cohort and permitted model execution; retain 1 meanwhile. |
-| Final source | Freeze and verify the completed integrated candidate once. | Relevant affected checks and separate self-review first; durable results survive a disconnected pipe. |
+| Final source | Freeze the corrected candidate and complete its repository gate. The prior integrated run failed and is not accepted. | 130 affected checks passed; complete separate self-review. Durable results survive a disconnected pipe; no restart of the obsolete verifier. |
 | Operations | One clean qualifier plus five additional clean market sessions, exactly twelve stages each. | Accepted source/readiness, reconciled external/model authority and real elapsed sessions; retain reset rules. |
 | Explanation and handoff | Walkthrough and seven-future-eligible/three-paused card prepared, with all ten current contract records verified and proposed model refreshes unapplied. Reconcile both handoffs and obtain actual API next-run proof when available. | Distinguish current paused behavior from designed operation; no activation. Final retirement waits for complete reconciliation. |
 
@@ -55,6 +59,15 @@ The bounded SEC/Alpaca collection is complete within its approved scope. Do not
 repeat it or request its approval again. Additional external access and model
 execution must match their actual authorized scope. All ten automations stay
 paused; live control stays frozen; paper submission defaults to off.
+
+The October 1 exploratory comparison uses the same retained public AAPL source
+packet for two Codex agents and the actual TradingAgents role graph. The owner
+authorized the existing OpenAI API key with the earlier total USD 1 cap. The key
+is absent from the project environment, process environment and Codex API-key
+field, so the paid route has made zero calls. The completed subscription forecasts
+and comparison contract are retained in
+`results/readiness_continuation/20261001-aapl-route-comparison/`. This one-case
+pilot is separate from registered research acceptance and the economic campaign.
 
 Retained checkpoint references: [Phase 4](../checkpoints/2026-09-13-phase4-source-acceptance.md),
 [LangGraph](../checkpoints/2026-09-13-phase5-checkpoint-repairs.md),
