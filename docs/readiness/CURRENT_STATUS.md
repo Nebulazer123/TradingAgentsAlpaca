@@ -34,7 +34,9 @@ read that history to understand today's status.
   their separate requirements.
 - Historical GO, promotion and expired tournament claims are preserved and
   superseded through the accepted writer. The current readiness report says
-  `NOT_ESTABLISHED`; fresh portfolio loss review and BOARD evidence remain open.
+  `NOT_ESTABLISHED`. Its October 1 successor at 12:45:58 UTC binds the approved
+  Luna/Sol prompt migration and all ten current paused records; the earlier
+  packet is retained. Fresh portfolio loss review and BOARD evidence remain open.
 - The first integrated source check finished with 5,083 passes and six failures.
   After repairs, its successor finished with 5,088 passes, one stale test
   assertion and one skipped live-API test. That assertion now checks strict
@@ -62,7 +64,7 @@ read that history to understand today's status.
 
 | Plain-English requirement | Why it matters | Next work |
 | --- | --- | --- |
-| A dated, trustworthy list of stocks and their identities | The study must prove which stocks were eligible when it began, including name changes and corporate events. | Trace saved source records; establish the missing official records before selecting the top 100, 75 and 50. The existing 43-symbol collection is too small. |
+| A dated, trustworthy list of stocks and their identities | The study must prove which stocks were eligible when it began, including name changes and corporate events. | A free-provider access check is prepared and awaits separate account approval. Establish actual dated records before selecting the top 100, 75 and 50; the existing 43-symbol collection is too small. |
 | A link from each old prediction to the result being scored | Otherwise a result could be attributed to the wrong prediction or stock. | Trace original prediction records and saved price/event evidence. Leave unprovable rows unresolved. |
 | Proof of broader document reasoning | Checked reporting periods, collection times and configuration fixtures do not prove general reasoning about changed reports, publisher charts or investments. | Preserve the completed 1,400-case local result and its limits. Admit any further questions and model comparisons through their actual evidence and authorization prerequisites; missing model evidence does not establish a no-model verdict. |
 | A study that begins before its results are known | Choosing inputs after seeing the outcome would bias the result. | Admit the future-facing study, then collect actual development and validation results. Release the reserved final test only through its separate owner approval. |

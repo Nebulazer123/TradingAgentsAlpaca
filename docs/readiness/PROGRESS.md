@@ -47,7 +47,7 @@ historical source evidence or accepted outcome records.
 | Cohort | Establish legitimate effective-dated `security_master/v1` and ranked eligible top-100/75/50 evidence. | The configured local hostname is not established provenance; the 43-symbol capture is insufficient. |
 | Economics | Admit the prospective protocol; complete development, validation, separately released holdout and final status from actual source-bound outcomes. | Preserve actual capture times. Real elapsed market time and a separate holdout owner record are required; a reproducible negative result is acceptable, missing evidence is not completion. |
 | Learning | Byte-exact backup and read-only audit completed: 6,244 valid rows, 4,944 labeled resolved, 1,300 pending, no verified economic bindings. Supply legitimate mappings and accepted prices/corporate actions, then complete source-bound resolution and fixed-point reconciliation. | Accepted PIT inputs and mappings; no replacement ledger or invented historical crosswalk. Current labels do not establish outcomes. |
-| Readiness | Historical GO/promotion/tournament supersession and current `NOT_ESTABLISHED` readiness are complete through the accepted writer. Fresh TSM loss review and BOARD evidence remain open. | Use the accepted post-supersession protection receipt; preserve historical originals/before-images and byte-identical live control. Fresh portfolio evidence retains its actual access boundary. |
+| Readiness | Historical GO/promotion/tournament supersession is complete through the accepted writer. The read-only October 1 packet at 12:45:58 UTC binds the current prompt/model migration and retains `NOT_ESTABLISHED`. Fresh TSM loss review and BOARD evidence remain open. | Use the accepted post-migration protection baseline and current packet; preserve the earlier packet, historical originals/before-images and byte-identical live control. Fresh portfolio evidence retains its actual access boundary. |
 | Concurrency | Compare 1 and 2 on the same registered cohort. | Registered cohort and permitted model execution; retain 1 meanwhile. |
 | Final source | Completed at candidate `85fe50d`: 5,183 tests and 78 subtests passed, one live API test skipped, all six static checks passed. Both checkouts were clean at the tested candidate, and protected-state verification passed. The `36e8727` and `72e5585` failed receipts remain preserved. | Root separately reviewed the combined candidate and reused unchanged affected evidence. Durable results survive a disconnected pipe. Later changes receive checks appropriate to their scope; this source pass grants no deployment or economic acceptance. |
 | Operations | One clean qualifier plus five additional clean market sessions, exactly twelve stages each. | Accepted source/readiness, reconciled external/model authority and real elapsed sessions; retain reset rules. |
@@ -62,6 +62,20 @@ ten-byte protection baseline remains historical. The reconciled successor at
 `results/readiness_continuation/20261001-combined-source-integration/post-migration-protection.json`
 verifies all ten current records, unchanged schedule/target/dependency/no-submit
 fields and all four frozen owner digests; it grants no activation authority.
+The read-only `policy readiness-status` successor is retained in
+`results/readiness_continuation/20261001-post-gate-readiness/current-readiness.json`.
+It validates the same historical supersession and current promotion state,
+binds the schedule contract from tested source `85fe50d` and matches all ten
+accepted post-migration automation fingerprints. The 05:08 packet remains
+historical; do not use its earlier schedule fingerprints as the current baseline.
+
+The free Massive historical-reference probe is prepared in
+`results/readiness_continuation/20261001-massive-reference-preflight/REVIEW.md`.
+Its eight synthetic offline checks and zero-request preview passed. New provider
+account/access permission is pending; no signup or data request occurred. Two
+AAPL samples would establish access/field coverage only, not the complete
+identity interval or an admitted universe. Preserve the closed archive search
+and completed SEC/Alpaca collection.
 
 The October 1 exploratory comparison uses the same retained public AAPL source
 packet for two Codex agents and the actual TradingAgents role graph. The owner
