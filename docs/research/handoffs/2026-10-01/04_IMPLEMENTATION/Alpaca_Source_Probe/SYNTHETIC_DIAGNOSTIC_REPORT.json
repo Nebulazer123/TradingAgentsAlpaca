@@ -1,0 +1,307 @@
+{
+  "example_kind": "SYNTHETIC FIXTURE \u2014 NOT MARKET DATA",
+  "report": {
+    "schema_version": "alpaca_source_probe/v1",
+    "plan_sha256": "6ae8055fd7d1ebc47fae1b241a906572525a51dd28afa17be76f4525277d358a",
+    "transport_mode": "injected_fixture",
+    "queries": {
+      "assets_active": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 546
+      },
+      "assets_inactive": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 139
+      },
+      "calendar": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 3181
+      },
+      "asset_AAPL": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 135
+      },
+      "bars_AAPL": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 2620
+      },
+      "asset_GOOG": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 135
+      },
+      "bars_GOOG": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 2620
+      },
+      "asset_GOOGL": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 136
+      },
+      "bars_GOOGL": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 2621
+      },
+      "asset_META": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 135
+      },
+      "bars_META": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 2620
+      },
+      "actions": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 47
+      },
+      "action_replay": {
+        "status": "response_complete",
+        "page_count": 1,
+        "body_bytes": 127
+      }
+    },
+    "sample_symbols": [
+      "AAPL",
+      "GOOG",
+      "GOOGL",
+      "META"
+    ],
+    "inventory": {
+      "active": {
+        "records": 4,
+        "potential_common_stock_candidates_not_type_verified": 4,
+        "cross_snapshot_conflicting_ids": [],
+        "historical_membership": "UNKNOWN",
+        "common_stock_classification": "UNKNOWN"
+      },
+      "inactive": {
+        "records": 1,
+        "potential_common_stock_candidates_not_type_verified": 0,
+        "cross_snapshot_conflicting_ids": [],
+        "historical_membership": "UNKNOWN",
+        "common_stock_classification": "UNKNOWN"
+      },
+      "ambiguous_active_symbols": {}
+    },
+    "sample_assets": {
+      "AAPL": {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "symbol": "AAPL",
+        "class": "us_equity",
+        "exchange": "NASDAQ",
+        "status": "active",
+        "tradable": true,
+        "security_type": "UNKNOWN",
+        "historical_effective_from": null,
+        "same_as_discovery_snapshot": true
+      },
+      "GOOG": {
+        "id": "00000000-0000-0000-0000-000000000002",
+        "symbol": "GOOG",
+        "class": "us_equity",
+        "exchange": "NASDAQ",
+        "status": "active",
+        "tradable": true,
+        "security_type": "UNKNOWN",
+        "historical_effective_from": null,
+        "same_as_discovery_snapshot": true
+      },
+      "GOOGL": {
+        "id": "00000000-0000-0000-0000-000000000003",
+        "symbol": "GOOGL",
+        "class": "us_equity",
+        "exchange": "NASDAQ",
+        "status": "active",
+        "tradable": true,
+        "security_type": "UNKNOWN",
+        "historical_effective_from": null,
+        "same_as_discovery_snapshot": true
+      },
+      "META": {
+        "id": "00000000-0000-0000-0000-000000000004",
+        "symbol": "META",
+        "class": "us_equity",
+        "exchange": "NASDAQ",
+        "status": "active",
+        "tradable": true,
+        "security_type": "UNKNOWN",
+        "historical_effective_from": null,
+        "same_as_discovery_snapshot": true
+      }
+    },
+    "sample_bars": {
+      "AAPL": {
+        "row_count": 60,
+        "missing_sessions": [],
+        "unexpected_sessions": [],
+        "matches_60_session_grid": true,
+        "feed": "sip",
+        "adjustment": "raw",
+        "session_basis": "alpaca_provider_daily_not_certified_regular_only",
+        "prior_complete_close": "10",
+        "median_daily_dollar_volume": "305",
+        "price_floor_pass": true,
+        "identity_continuity": "NOT_ESTABLISHED",
+        "security_type": "UNKNOWN"
+      },
+      "GOOG": {
+        "row_count": 60,
+        "missing_sessions": [],
+        "unexpected_sessions": [],
+        "matches_60_session_grid": true,
+        "feed": "sip",
+        "adjustment": "raw",
+        "session_basis": "alpaca_provider_daily_not_certified_regular_only",
+        "prior_complete_close": "10",
+        "median_daily_dollar_volume": "305",
+        "price_floor_pass": true,
+        "identity_continuity": "NOT_ESTABLISHED",
+        "security_type": "UNKNOWN"
+      },
+      "GOOGL": {
+        "row_count": 60,
+        "missing_sessions": [],
+        "unexpected_sessions": [],
+        "matches_60_session_grid": true,
+        "feed": "sip",
+        "adjustment": "raw",
+        "session_basis": "alpaca_provider_daily_not_certified_regular_only",
+        "prior_complete_close": "10",
+        "median_daily_dollar_volume": "305",
+        "price_floor_pass": true,
+        "identity_continuity": "NOT_ESTABLISHED",
+        "security_type": "UNKNOWN"
+      },
+      "META": {
+        "row_count": 60,
+        "missing_sessions": [],
+        "unexpected_sessions": [],
+        "matches_60_session_grid": true,
+        "feed": "sip",
+        "adjustment": "raw",
+        "session_basis": "alpaca_provider_daily_not_certified_regular_only",
+        "prior_complete_close": "10",
+        "median_daily_dollar_volume": "305",
+        "price_floor_pass": true,
+        "identity_continuity": "NOT_ESTABLISHED",
+        "security_type": "UNKNOWN"
+      }
+    },
+    "corporate_actions": {
+      "returned_records": 0,
+      "types": {},
+      "query_date_basis": "process_date",
+      "data_quality": "all",
+      "event_absence_proven": false,
+      "historical_coverage": "UNKNOWN"
+    },
+    "action_replay": {
+      "unique_events": 1,
+      "duplicate_deliveries": 0,
+      "event_types": {
+        "name_change_corporateaction_event": 1
+      },
+      "event_ids": [
+        "01J9RPMV5TKB8WX3M4F1KZ7QH2"
+      ],
+      "revision_history_completeness": "UNKNOWN",
+      "mutations_applied": false
+    },
+    "market_population_completeness": "NOT_ESTABLISHED",
+    "security_master_qualified": false,
+    "cohort_qualified": false,
+    "historical_custody_qualified": false,
+    "original_source_capture_times_preserved": true,
+    "qualification_blockers": [
+      "sample_is_not_ranked_market_universe",
+      "dated_identity_and_type_history_unproven",
+      "corporate_action_coverage_unproven",
+      "provider_retention_and_use_rights_unverified"
+    ],
+    "analysis_only": true,
+    "execution_authority": "none",
+    "can_submit_orders": false,
+    "calendar": {
+      "session_count": 60,
+      "sessions": [
+        "2026-01-02",
+        "2026-01-05",
+        "2026-01-06",
+        "2026-01-07",
+        "2026-01-08",
+        "2026-01-09",
+        "2026-01-12",
+        "2026-01-13",
+        "2026-01-14",
+        "2026-01-15",
+        "2026-01-16",
+        "2026-01-19",
+        "2026-01-20",
+        "2026-01-21",
+        "2026-01-22",
+        "2026-01-23",
+        "2026-01-26",
+        "2026-01-27",
+        "2026-01-28",
+        "2026-01-29",
+        "2026-01-30",
+        "2026-02-02",
+        "2026-02-03",
+        "2026-02-04",
+        "2026-02-05",
+        "2026-02-06",
+        "2026-02-09",
+        "2026-02-10",
+        "2026-02-11",
+        "2026-02-12",
+        "2026-02-13",
+        "2026-02-16",
+        "2026-02-17",
+        "2026-02-18",
+        "2026-02-19",
+        "2026-02-20",
+        "2026-02-23",
+        "2026-02-24",
+        "2026-02-25",
+        "2026-02-26",
+        "2026-02-27",
+        "2026-03-02",
+        "2026-03-03",
+        "2026-03-04",
+        "2026-03-05",
+        "2026-03-06",
+        "2026-03-09",
+        "2026-03-10",
+        "2026-03-11",
+        "2026-03-12",
+        "2026-03-13",
+        "2026-03-16",
+        "2026-03-17",
+        "2026-03-18",
+        "2026-03-19",
+        "2026-03-20",
+        "2026-03-23",
+        "2026-03-24",
+        "2026-03-25",
+        "2026-03-26"
+      ],
+      "exactly_60": true
+    },
+    "all_planned_responses_valid": true,
+    "all_sample_grids_complete": true,
+    "snapshot_identity_conflicts": false,
+    "diagnostic_checks_passed": true,
+    "diagnostic_status": "responses_checked_not_qualified"
+  }
+}

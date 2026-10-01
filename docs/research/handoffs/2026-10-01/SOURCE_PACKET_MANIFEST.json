@@ -1,0 +1,169 @@
+{
+  "schema_version": "tradingagents_chat_handoff_manifest/v1",
+  "created_for": "TradingAgents development handoff",
+  "date": "2026-10-01",
+  "authoritative_probe_test_count": 85,
+  "notes": [
+    "User-visible conversation content is indexed in CHAT_TRANSCRIPT.md; long assistant responses are preserved in dedicated markdown files.",
+    "The attached Pasted text.txt is preserved byte-for-byte.",
+    "The previously delivered probe ZIP, patch, source, docs and receipts are preserved.",
+    "Tool internals, hidden chain of thought, system prompts and credentials are not included."
+  ],
+  "files": [
+    {
+      "path": "00_START_HERE/AGENT_CONTINUATION_PROMPT.md",
+      "bytes": 2508,
+      "sha256": "0d2ba1a67c9b72a101e326f8ff92769c204527f05429ac584f39568c6ea8fbd7"
+    },
+    {
+      "path": "00_START_HERE/CURRENT_STATE.md",
+      "bytes": 6166,
+      "sha256": "309436a022fce279926b4f07cf4eef4031791e0f464dba73dc4ebf60ed9be658"
+    },
+    {
+      "path": "00_START_HERE/SOURCE_AND_EVIDENCE_NOTES.md",
+      "bytes": 4278,
+      "sha256": "f19c157fb8050c03cc2525d63c9b62ebc6c6fc6bc185177148fa6b90240adcb0"
+    },
+    {
+      "path": "00_START_HERE/START_HERE_AGENT.md",
+      "bytes": 10936,
+      "sha256": "329fd5f241dd813cf3aa90e8e32c6a88e97b28d4d3ec385e0f1b9b0f42cefd98"
+    },
+    {
+      "path": "01_CHAT_AND_REQUESTS/CHAT_TRANSCRIPT.md",
+      "bytes": 11030,
+      "sha256": "775a81ee178216e205d8618bbbe59904c2c4885785d9377f3370fc44ed4e22ac"
+    },
+    {
+      "path": "01_CHAT_AND_REQUESTS/DEEP_RESEARCH_PROMPT.md",
+      "bytes": 28774,
+      "sha256": "c4fa9914b6cb15e00184b5d541a21da079d923ee999adcdc652bc76e6e618e14"
+    },
+    {
+      "path": "02_RESEARCH/01_INITIAL_SECURITY_MASTER_RESEARCH.md",
+      "bytes": 32264,
+      "sha256": "a75fc55414ea3a0a006c534b505a02c839d1fd6c558e9921333dd85e1bb8a8f6"
+    },
+    {
+      "path": "02_RESEARCH/02_TLDR_FREE_FIRST_CORRECTION.md",
+      "bytes": 4276,
+      "sha256": "4fae3139d8e905ebf9ad8890a86fdca3fcbe6a67f032e9320a1ccc32a4918be8"
+    },
+    {
+      "path": "02_RESEARCH/FREE_FIRST_SECURITY_MASTER_RESEARCH.md",
+      "bytes": 48509,
+      "sha256": "9b481c70559195d09909d531b29f217f8653c51e228b229f0e2e93c591c8d195"
+    },
+    {
+      "path": "03_REPO_FINDINGS/DEEP_REPO_REVIEW.md",
+      "bytes": 23756,
+      "sha256": "cb47b2c9be32f1fd3c0dc5df4614fdc945f7a26942ba764d21632e797f2281a9"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/BUILD_RECEIPT.json",
+      "bytes": 2144,
+      "sha256": "f50ffc449775d24b7d2036e0cd1ad4cb4981c6136d09b1e190a91c8cc98c2782"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/EXAMPLE_PLAN.json",
+      "bytes": 244,
+      "sha256": "91bed4d18124c0ef9d4cf7ae8793c2f8f73299b8491a11f2de0ba06ff351dc9d"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/EXAMPLE_REQUESTS.json",
+      "bytes": 2737,
+      "sha256": "7c18db1890f9680eb0738b47983a8809731e6bafa95dcf7033507b46e6e9ed9a"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/INTEGRATION_NOTE.md",
+      "bytes": 2351,
+      "sha256": "58e0d4ca5af3372388700c2071ced500b87f5dfe62156bd040092c8fd8d85ecb"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/ORIGINAL_BUILD_RESPONSE.md",
+      "bytes": 3633,
+      "sha256": "9afcdd519a3f75b953f65e3a2a0b5be6d52c3a878ee493e484ae3ae250f47bf0"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/README.md",
+      "bytes": 3216,
+      "sha256": "da5d7f000ad2dd33504bf05d6ef2ce06a9d74d51a16b6302ac86fa5d2a63eaa7"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/SYNTHETIC_DIAGNOSTIC_REPORT.json",
+      "bytes": 8645,
+      "sha256": "d2a2d1e6c74d6a836e40db554841a027f63cb6afa614570e718fad426be49acc"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/TEST_RESULTS.txt",
+      "bytes": 179,
+      "sha256": "49a3157dfffb569a175911dacc078d3f820a08d824f7d5cfc39296bde914c6c6"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/source/docs/data/ALPACA_SOURCE_PROBE.md",
+      "bytes": 12328,
+      "sha256": "f08f43a3234fb1ba72c048f16430929b2691c347cdf8215a16ca91cd1ffbdfff"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/source/scripts/alpaca_source_probe.py",
+      "bytes": 718,
+      "sha256": "0471fa895dd4b77c2bfd974af4af1ef7d4e34d97378f202ccaabef130dcafef2"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/source/tests/test_alpaca_source_probe.py",
+      "bytes": 29244,
+      "sha256": "ec0c74f8d87399e71bd19e46d3cff4ffde1dfaa4f508e3d2f00281ff52e4036f"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/source/tradingagents/dataflows/alpaca_source_probe.py",
+      "bytes": 44589,
+      "sha256": "515388142b56531d704bcdfc76d6c4b6631a20f3a82453377c7221389e08aa61"
+    },
+    {
+      "path": "04_IMPLEMENTATION/Alpaca_Source_Probe/tradingagents-alpaca-source-probe.patch",
+      "bytes": 89727,
+      "sha256": "f94b38445b1bff56ea959b08624b22f4b4530a85f11db618fe520b44dbdf2807"
+    },
+    {
+      "path": "05_RAW_FILES/Pasted text.txt",
+      "bytes": 28774,
+      "sha256": "c4fa9914b6cb15e00184b5d541a21da079d923ee999adcdc652bc76e6e618e14"
+    },
+    {
+      "path": "05_RAW_FILES/TradingAgents_Alpaca_Source_Probe.zip",
+      "bytes": 58306,
+      "sha256": "bb8503cd59812bb6697a0ce84e2b8cf4df0d65cba2d35787e078114a9f94d02a"
+    },
+    {
+      "path": "06_INTERNAL_LOGS/probe-tests-final-candidate.txt",
+      "bytes": 179,
+      "sha256": "087a64164437a3ba035d27f4aca415a0b6f17782370332f9ed5cff5bf843008d"
+    },
+    {
+      "path": "06_INTERNAL_LOGS/probe-tests-first.txt",
+      "bytes": 6055,
+      "sha256": "491289ad2eb34542d9158ffa53f441ab52fdd10024ebe24be9be3fa288e14723"
+    },
+    {
+      "path": "06_INTERNAL_LOGS/probe-tests-second.txt",
+      "bytes": 99,
+      "sha256": "3eab119ca8e1fb48f8fcde01d5960c150c5de392a6e9e77c06f6e678c3a8ee59"
+    },
+    {
+      "path": "06_INTERNAL_LOGS/probe-tests-third.txt",
+      "bytes": 179,
+      "sha256": "66ebbb86f8b2a54a3e29020508f0539517152ef622524e9e7d16998828f6904b"
+    },
+    {
+      "path": "DELIVERY_MESSAGE.md",
+      "bytes": 570,
+      "sha256": "048e5ea69e015fdc4042e82b8d23544362d10c64e381dbd5b016fba1e27efffc"
+    },
+    {
+      "path": "FILE_INDEX.md",
+      "bytes": 3121,
+      "sha256": "b8a23d0a68553bad86dcebb71dbd85c64c2114bd0f46a4e32b0c3410f890573a"
+    }
+  ]
+}

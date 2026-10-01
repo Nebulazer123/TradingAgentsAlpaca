@@ -64,9 +64,24 @@ read that history to understand today's status.
 
 ## What is still needed
 
+The new priority is the October 1 free-first security-master research packet,
+preserved with selected source files and its original manifest under
+[the packet record](../research/handoffs/2026-10-01/PACKET_INGESTION.md).
+Its donor probe is a diagnostic only: the package reports offline tests and a
+synthetic diagnostic, no real provider request, no security-master producer,
+and no admitted cohort.
+Follow the
+[full continuation plan](../superpowers/plans/2026-10-01-tradingagents-research-and-readiness-continuation.md)
+from current source owners; the packet's repository review cites older source
+and must be reconciled before any patch is applied. The plan freezes population
+and eligibility policy before complete discovery, separates a representative
+access check from full capture, and adds independent source checks for corporate
+action terms, terminal proceeds, subscription benchmark migration, and learning
+quality.
+
 | Plain-English requirement | Why it matters | Next work |
 | --- | --- | --- |
-| A dated, trustworthy list of stocks and their identities | The study must prove which stocks were eligible when it began, including name changes and corporate events. | A free-provider access check is prepared and awaits separate account approval. Establish actual dated records before selecting the top 100, 75 and 50; the existing 43-symbol collection is too small. |
+| A dated, trustworthy list of stocks and their identities | The study must prove which stocks are eligible at the prospective cutoff, including name changes and corporate events. | Audit the October 1 Alpaca/SEC proposal against current point-in-time owners and qualify the probe offline first. The older Massive preflight remains a separate pending route, not a prerequisite. Capture only within exact current provider/data-use authority; establish complete source-backed records before selecting the top 100, 75 and 50. The existing 43-symbol capture is too small. |
 | A link from each old prediction to the result being scored | Otherwise a result could be attributed to the wrong prediction or stock. | Trace original prediction records and saved price/event evidence. Leave unprovable rows unresolved. |
 | Proof of broader document reasoning | Checked reporting periods, collection times and configuration fixtures do not prove general reasoning about changed reports, publisher charts or investments. | Preserve the completed 1,400-case local result and its limits. Admit any further questions and model comparisons through their actual evidence and authorization prerequisites; missing model evidence does not establish a no-model verdict. |
 | A study that begins before its results are known | Choosing inputs after seeing the outcome would bias the result. | Admit the future-facing study, then collect actual development and validation results. Release the reserved final test only through its separate owner approval. |
@@ -95,6 +110,11 @@ both models, including structured output and an application tool round-trip.
 allowance limits. This new source receives its own checks; the older passing
 repository gate covers its recorded candidate.
 
+The research qualification runners are a separate unfinished integration: the
+benchmark registration still requires OpenRouter and the full-graph runner
+hard-codes it. The continuation plan adds a new versioned subscription
+registration while preserving historical OpenRouter results and replay.
+
 The earlier public AAPL subscription forecasts remain saved with their original
 timestamps. The paid comparison made zero calls and spent USD 0; its original
 issue window closed and the paid route is no longer requested. Preserve its
@@ -105,6 +125,12 @@ Paying has not demonstrated better forecast quality. Supported Codex CLI/SDK
 routes can use the subscription, and the local CLI adapter is now implemented. The
 prepared API graph passed an offline twelve-role simulation with fabricated
 responses; that establishes integration behavior, not paid-model performance.
+
+The source review also found a local serialization defect in normal-trade intent
+validation: fixed string fields are checked by Python object identity, which can
+reject equal values parsed from a real JSON document. The plan calls for strict
+type/value validation and an offline JSON reload regression. This repair does
+not grant order or submission authority.
 
 The exact acceptance rules remain in the
 [existing implementation plan](../superpowers/plans/2026-08-30-tradingagents-evidence-first-working-state-completion.md).

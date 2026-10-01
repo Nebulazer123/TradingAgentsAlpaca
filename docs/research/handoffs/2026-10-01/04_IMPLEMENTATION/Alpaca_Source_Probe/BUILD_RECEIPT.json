@@ -1,0 +1,45 @@
+{
+  "artifact": "TradingAgents Alpaca source probe \u2014 first additive implementation",
+  "reference_repository": "Nebulazer123/TradingAgentsAlpaca",
+  "inspected_reference_commit": "b3484fe22270b9282adef2228a35477558730b4a",
+  "implementation_environment": "isolated partial-source workspace; full clone unavailable (GitHub DNS resolution failure)",
+  "python_runtime": "3.13.5",
+  "tests": {
+    "command": "python -m pytest -q tests/test_alpaca_source_probe.py",
+    "passed": 85,
+    "failed": 0,
+    "scope": "new-module offline tests and mocked HTTPS transport, not complete repository suite"
+  },
+  "checks": {
+    "python_3_10_grammar": "passed (grammar check only; not a 3.10 runtime test)",
+    "python_compile": "passed",
+    "patch_apply_and_byte_equality": "passed in fresh isolated directory; not an integration test against full repository",
+    "four_symbol_synthetic_demo": "passed; injected fixture transport only"
+  },
+  "ruff": "not run: unavailable in this environment; no dependencies installed",
+  "real_data_provider_requests_executed": 0,
+  "broker_account_requests_executed": 0,
+  "remote_repository_mutated": false,
+  "local_mac_checkout_mutated": false,
+  "scope": "diagnostic intake and replay only; authoritative security master, complete market ranking and admitted cohorts remain unbuilt",
+  "files": {
+    "tradingagents/dataflows/alpaca_source_probe.py": {
+      "sha256": "515388142b56531d704bcdfc76d6c4b6631a20f3a82453377c7221389e08aa61",
+      "bytes": 44589
+    },
+    "scripts/alpaca_source_probe.py": {
+      "sha256": "0471fa895dd4b77c2bfd974af4af1ef7d4e34d97378f202ccaabef130dcafef2",
+      "bytes": 718
+    },
+    "tests/test_alpaca_source_probe.py": {
+      "sha256": "ec0c74f8d87399e71bd19e46d3cff4ffde1dfaa4f508e3d2f00281ff52e4036f",
+      "bytes": 29244
+    },
+    "docs/data/ALPACA_SOURCE_PROBE.md": {
+      "sha256": "f08f43a3234fb1ba72c048f16430929b2691c347cdf8215a16ca91cd1ffbdfff",
+      "bytes": 12328
+    }
+  },
+  "patch_sha256": "f94b38445b1bff56ea959b08624b22f4b4530a85f11db618fe520b44dbdf2807",
+  "test_log_sha256": "49a3157dfffb569a175911dacc078d3f820a08d824f7d5cfc39296bde914c6c6"
+}

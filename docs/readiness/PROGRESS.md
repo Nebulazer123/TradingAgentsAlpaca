@@ -13,9 +13,27 @@ data. The default provider and overnight selection now use this route.
 The new source requires its own final repository check; the older `85fe50d`
 acceptance remains preserved for that candidate.
 
+The registered qualification runners have not yet migrated to the subscription
+route: benchmark registration and the full-graph runner still require or hard-code
+OpenRouter. The continuation plan adds a versioned Codex-subscription registration
+while preserving historical OpenRouter results and replay. No model call is part
+of the plan-writing task.
+
 Harness prompt/model refresh is recorded separately in
 [the modernization report](../harness/2026-10-01-modernization.md); it does not
 complete the readiness acceptance rows below.
+
+The owner's October 1 free-first security-master handoff is preserved under
+[the packet record](../research/handoffs/2026-10-01/PACKET_INGESTION.md), and
+the full continuation plan is
+[here](../superpowers/plans/2026-10-01-tradingagents-research-and-readiness-continuation.md).
+The plan prioritizes comparing the bundled diagnostic probe with current PIT
+owners, specifying security-master v2, and freezing the declared population and
+eligibility contract before complete discovery capture. A bounded access
+diagnostic is kept separate from full source collection. The packet also flags
+independent corporate-action/proceeds coverage and a JSON-reload check for
+authorization records. Its offline test receipt and synthetic diagnostic report
+do not establish account access, identity coverage, economic terms, or a cohort.
 
 The Phase 4, LangGraph checkpoint, learning-reporting, and initial benchmark and
 readiness source are integrated. The earlier source gate passed 5,005 tests and
@@ -51,19 +69,21 @@ historical source evidence or accepted outcome records.
 | Guidance and repository | Completed: newer guidance preserved and exact schedule/dry-run and decimal/shared-page repairs integrated. The combined source gate passed. | Root alone implements, verifies, and separately self-reviews. |
 | Historical conflict | Completed: exact obsolete worktree retired with verified 863-file recovery, preserved branch/archive/merge receipts, and no active owner. | All other worktrees retained. An unrelated economic-suite pass was not required. |
 | Media inputs | Implemented v5/v6 real-media and multiple-original source contracts, preserving v4/v5 replay. All 159 affected checks passed, including 51 new regressions; all 81 retained SEC HTML originals retain their structural counts. The combined source gate passed. | Bind originals, page/span locations and transformations; keep labels outside extraction and show identical source material across compared lanes. Explicit unsupported transformations stay unavailable. Arbitrary HTML spans are not pages. |
-| Research | The checked v6 500/300/400/200 registration and local qualification are complete: deterministic critical/high/source accuracy is 100%; retrieval is 293/1,400 (20.9%) and does not qualify; no-text accuracy is zero. Typed questions cover full periods, actual collection cutoffs, exact cross-filing precision and named-role/complete-configuration conformance. Preserve the earlier v5 result. General restatement narratives, publisher chart reasoning, forecast quality and model evidence retain their actual limits and prerequisites. | Preserve 99.5% critical-field and 100% high-severity accuracy, zero authority changes, disclosure or source bypass. All v6 cases are conservatively high severity. A bounded local result does not establish profitability or a no-model verdict. |
-| Cohort | Establish legitimate effective-dated `security_master/v1` and ranked eligible top-100/75/50 evidence. | The configured local hostname is not established provenance; the 43-symbol capture is insufficient. |
-| Economics | Admit the prospective protocol; complete development, validation, separately released holdout and final status from actual source-bound outcomes. | Preserve actual capture times. Real elapsed market time and a separate holdout owner record are required; a reproducible negative result is acceptable, missing evidence is not completion. |
-| Learning | Byte-exact backup and read-only audit completed: 6,244 valid rows, 4,944 labeled resolved, 1,300 pending, no verified economic bindings. Supply legitimate mappings and accepted prices/corporate actions, then complete source-bound resolution and fixed-point reconciliation. | Accepted PIT inputs and mappings; no replacement ledger or invented historical crosswalk. Current labels do not establish outcomes. |
+| Research | The checked v6 500/300/400/200 registration and local qualification are complete: deterministic critical/high/source accuracy is 100%; retrieval is 293/1,400 (20.9%) and does not qualify; no-text accuracy is zero. Typed questions cover full periods, actual collection cutoffs, exact cross-filing precision and named-role/complete-configuration conformance. Preserve the earlier v5 result. General restatement narratives, publisher chart reasoning, forecast quality and model evidence retain their actual limits and prerequisites. | Preserve 99.5% critical-field and 100% high-severity accuracy, zero authority changes, disclosure or source bypass. All v6 cases are conservatively high severity. Migrate only new benchmark registrations to the Codex subscription route with truthful route/usage telemetry; preserve OpenRouter replays. Do not infer profitability or a no-model verdict. |
+| Cohort and new security-master research | Prioritize the free-first Alpaca/SEC path in the October 1 handoff. Audit the donor probe against current owners; preserve security_master/v1 replay and add a versioned evidence path only after source design. Freeze declared population/source/eligibility policy before complete capture; account for every declared candidate before ranking top-100/75/50. | The donor probe is not an admitted cohort; its tests are offline and its diagnostic is synthetic. Separate representative access checks from full capture. The configured local hostname is not upstream provenance and the 43-symbol capture is insufficient. Any real capture requires exact current provider/data-use authority. |
+| Economics and action coverage | Admit the prospective protocol; independently reopen source action and terminal-proceeds originals, then complete development, validation, separately released holdout and final status from source-bound outcomes. | Corporate-action-set self-labels and price twins do not establish event terms or consideration. Cash-only acquisitions, successor legs, and distributions need explicit handling; unsupported terms stay unavailable. Real elapsed market time and a separate holdout owner record are required. |
+| Learning | Byte-exact backup and read-only audit completed: 6,244 valid rows, 4,944 labeled resolved, 1,300 pending, no verified economic bindings. Audit all rows, exclude suspect bindings from quality/availability results, refresh the accepted quality and availability reports, then reconcile supported rows to a fixed point. | Accepted PIT inputs and mappings; preserve the backup and ledger provenance. Current labels do not establish outcomes. Disclose degraded quality and dependent readiness when evidence is incomplete. |
+| Authorization JSON | Current normal-trade intent validation uses identity checks for fixed string values, so a freshly JSON-parsed valid intent may be rejected. | Add exact-type/value validation and true offline JSON round-trip regressions. Preserve all authorization and order-binding gates; no order operation. |
 | Readiness | Historical GO/promotion/tournament supersession is complete through the accepted writer. The read-only October 1 packet at 12:45:58 UTC binds the current prompt/model migration and retains `NOT_ESTABLISHED`. Fresh TSM loss review and BOARD evidence remain open. | Use the accepted post-migration protection baseline and current packet; preserve the earlier packet, historical originals/before-images and byte-identical live control. Fresh portfolio evidence retains its actual access boundary. |
-| Concurrency | Compare 1 and 2 on the same registered cohort. | Registered cohort and permitted model execution; retain 1 meanwhile. |
+| Concurrency | Compare analyst concurrency 1 and 2 on the same registered cohort only when both runs have an exact authorized route. Capture quality, cost, latency, errors and completeness; retain configured concurrency at 1. | Registered cohort, exact model identity/input, and permitted subscription allowance; no setting change. |
 | Final source | Completed at candidate `85fe50d`: 5,183 tests and 78 subtests passed, one live API test skipped, all six static checks passed. Both checkouts were clean at the tested candidate, and protected-state verification passed. The `36e8727` and `72e5585` failed receipts remain preserved. | Root separately reviewed the combined candidate and reused unchanged affected evidence. Durable results survive a disconnected pipe. Later changes receive checks appropriate to their scope; this source pass grants no deployment or economic acceptance. |
 | Operations | One clean qualifier plus five additional clean market sessions, exactly twelve stages each. | Accepted source/readiness, reconciled external/model authority and real elapsed sessions; retain reset rules. |
-| Explanation and handoff | Walkthrough and seven-future-eligible/three-paused card prepared. The October 1 harness refresh applied the saved model/prompt updates and rebound the exact contract text; the earlier launch preparation remains historical. Reconcile both handoffs and obtain actual API next-run proof when available. | Distinguish current paused behavior from designed operation; no activation. Final retirement waits for complete reconciliation. |
+| Explanation and handoff | Walkthrough and seven-future-eligible/three-paused card prepared. The October 1 harness refresh applied the saved model/prompt updates and rebound the exact contract text; the earlier launch preparation remains historical. Reconcile both handoffs and capture actual Central/UTC scheduler proof. | Require machine-readable next-run evidence and no-submit shadow-equivalence before any future activation. This task prepares evidence only; all ten remain paused. Final handoff reconciliation does not archive or retire source records. |
 
-The bounded SEC/Alpaca collection is complete within its approved scope. Do not
-repeat it or request its approval again. Additional external access and model
-execution must match their actual authorized scope. All ten automations stay
+The earlier bounded SEC/Alpaca collection is complete within its approved scope;
+preserve it and do not repeat that specific collection. It does not establish
+the newly declared complete population or event coverage. Any new capture or
+model execution must match its exact current authorization. All ten automations stay
 paused; live control stays frozen; paper submission defaults to off. The completed
 harness owner migrated prompt/model records to Luna 6 and Sol 6.1. The earlier
 ten-byte protection baseline remains historical. The reconciled successor at
@@ -96,13 +116,15 @@ preflight rejects a late request or result; seven offline checks pass. Preserve
 the original forecasts and receipts.
 
 The owner's latest decision replaces the future paid-API plan with the existing
-ChatGPT subscription. A read-only `codex login status` confirms signed-in ChatGPT
-access. Existing Codex jobs/agents can use it; an API key is no longer a requested
-input. The application factory still lacks a Codex inference adapter, so direct
-subscription execution inside the Python role graph remains implementation work,
-not a verified runtime capability. Preserve normal subscription allowances and
-the data, model-evidence, holdout and operational acceptance requirements. Do
-not seek a future paid API key or infer a new paid/provider execution budget.
+ChatGPT subscription. The Codex CLI connector is integrated and is the default
+provider; saved structured-response and ToolNode checks establish connection and
+application integration, not model quality. The remaining source migration is in
+the research qualification path: benchmark registration remains OpenRouter-only
+and the full-graph runner hard-codes that provider. Add a new versioned
+subscription registration and preserve historical OpenRouter replay. Keep normal
+subscription allowances and data, model-evidence, holdout and operational
+acceptance requirements. Do not seek a future paid API key or infer a new paid
+execution budget.
 
 The app's read-only automation view returned a rendered-card notice without
 a machine-readable next run. The exact return is retained in

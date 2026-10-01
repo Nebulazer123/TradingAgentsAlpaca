@@ -1,0 +1,86 @@
+[
+  {
+    "query_id": "assets_active",
+    "kind": "assets",
+    "method": "GET",
+    "url": "https://paper-api.alpaca.markets/v2/assets?status=active&asset_class=us_equity",
+    "symbol": null
+  },
+  {
+    "query_id": "assets_inactive",
+    "kind": "assets",
+    "method": "GET",
+    "url": "https://paper-api.alpaca.markets/v2/assets?status=inactive&asset_class=us_equity",
+    "symbol": null
+  },
+  {
+    "query_id": "calendar",
+    "kind": "calendar",
+    "method": "GET",
+    "url": "https://paper-api.alpaca.markets/v2/calendar?start=2026-06-17&end=2026-09-11&date_type=TRADING",
+    "symbol": null
+  },
+  {
+    "query_id": "asset_AAPL",
+    "kind": "asset",
+    "method": "GET",
+    "url": "https://paper-api.alpaca.markets/v2/assets/AAPL",
+    "symbol": "AAPL"
+  },
+  {
+    "query_id": "bars_AAPL",
+    "kind": "bars",
+    "method": "GET",
+    "url": "https://data.alpaca.markets/v2/stocks/AAPL/bars?timeframe=1Day&feed=sip&adjustment=raw&start=2026-06-17T04%3A00%3A00Z&end=2026-09-12T03%3A59%3A59Z&asof=2026-10-01&limit=1000&sort=asc",
+    "symbol": "AAPL"
+  },
+  {
+    "query_id": "asset_GOOG",
+    "kind": "asset",
+    "method": "GET",
+    "url": "https://paper-api.alpaca.markets/v2/assets/GOOG",
+    "symbol": "GOOG"
+  },
+  {
+    "query_id": "bars_GOOG",
+    "kind": "bars",
+    "method": "GET",
+    "url": "https://data.alpaca.markets/v2/stocks/GOOG/bars?timeframe=1Day&feed=sip&adjustment=raw&start=2026-06-17T04%3A00%3A00Z&end=2026-09-12T03%3A59%3A59Z&asof=2026-10-01&limit=1000&sort=asc",
+    "symbol": "GOOG"
+  },
+  {
+    "query_id": "asset_GOOGL",
+    "kind": "asset",
+    "method": "GET",
+    "url": "https://paper-api.alpaca.markets/v2/assets/GOOGL",
+    "symbol": "GOOGL"
+  },
+  {
+    "query_id": "bars_GOOGL",
+    "kind": "bars",
+    "method": "GET",
+    "url": "https://data.alpaca.markets/v2/stocks/GOOGL/bars?timeframe=1Day&feed=sip&adjustment=raw&start=2026-06-17T04%3A00%3A00Z&end=2026-09-12T03%3A59%3A59Z&asof=2026-10-01&limit=1000&sort=asc",
+    "symbol": "GOOGL"
+  },
+  {
+    "query_id": "asset_META",
+    "kind": "asset",
+    "method": "GET",
+    "url": "https://paper-api.alpaca.markets/v2/assets/META",
+    "symbol": "META"
+  },
+  {
+    "query_id": "bars_META",
+    "kind": "bars",
+    "method": "GET",
+    "url": "https://data.alpaca.markets/v2/stocks/META/bars?timeframe=1Day&feed=sip&adjustment=raw&start=2026-06-17T04%3A00%3A00Z&end=2026-09-12T03%3A59%3A59Z&asof=2026-10-01&limit=1000&sort=asc",
+    "symbol": "META"
+  },
+  {
+    "query_id": "actions",
+    "kind": "actions",
+    "method": "GET",
+    "url": "https://data.alpaca.markets/v1/corporate-actions?symbols=AAPL%2CGOOG%2CGOOGL%2CMETA&start=2026-06-17&end=2026-09-11&region=us&data_quality=all&limit=1000&sort=asc",
+    "symbol": null
+  }
+]
