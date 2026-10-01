@@ -51,9 +51,10 @@ market sessions, in the existing twelve-stage order with reset rules. Even with
 no failure, that spans more than one calendar week. Economic acceptance uses the
 actual prospectively registered outcome windows.
 
+The combined source passed its [full gate](../superpowers/checkpoints/2026-10-01-combined-source-acceptance.md).
 Finish the remaining research qualification, legitimate cohort and prospective
-study, prediction reconciliation, current readiness evidence, final source gate
-and six-session campaign. Then use the existing no-submit shadow-equivalence
+study, prediction reconciliation, current readiness evidence and six-session
+campaign. Then use the existing no-submit shadow-equivalence
 and artifact-health checks. API-returned next runs in Central and UTC remain a
 separate deployment requirement; calculated times do not replace that proof.
 

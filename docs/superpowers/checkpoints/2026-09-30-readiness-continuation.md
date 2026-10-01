@@ -326,3 +326,13 @@ establishes a no-model verdict. Configuration fixtures do not prove runtime
 sessions. Freeze the completed source for one full repository gate; every
 economic, cohort, legacy-ledger, fresh portfolio and six-session requirement
 remains in the current missing-work table. All ten real schedules stay paused.
+
+## October 1 combined source acceptance
+
+The completed benchmark and harness candidate `85fe50d` subsequently passed its
+full source gate: 5,183 tests and 78 subtests, one live API skip, and all six
+static checks. See [the exact acceptance checkpoint](2026-10-01-combined-source-acceptance.md)
+for the candidate, terminal receipt and post-test protection verification.
+Earlier failed and intermediate receipts remain preserved. Source acceptance
+does not complete the economic, cohort, ledger, fresh portfolio or six-session
+requirements above.

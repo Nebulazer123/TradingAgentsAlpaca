@@ -25,8 +25,12 @@ pass. Both failed receipts remain retained. The v6 semantic/input adapter is
 implemented and merged with the completed harness update. All 159 affected
 checks pass, including 51 new reader/interpreter regressions. The checked
 1,400-case local deterministic qualification passes at 100% critical/high
-accuracy; retrieval reaches 20.9% and does not qualify. Freeze the combined
-candidate for its one complete repository gate.
+accuracy; retrieval reaches 20.9% and does not qualify. The combined candidate
+`85fe50d251e3d64fe25768b54c0ff3ecf3c3c01f` passed its complete repository gate
+at `2026-10-01T11:55:39.937144+00:00`: 5,183 tests and 78 subtests passed,
+one live API test was skipped, and all six static checks passed. The source
+stayed unchanged. [Source acceptance](../superpowers/checkpoints/2026-10-01-combined-source-acceptance.md)
+records the exact evidence; operational and economic qualification remain open.
 The continuation adds media-reader proof, checked local corpus results,
 recovery retirement, historical readiness supersession, a plain-English status
 page and a prepared launch/model card. The owner has no additional input
@@ -36,16 +40,16 @@ historical source evidence or accepted outcome records.
 
 | Area | Remaining work and acceptance | Prerequisite or boundary |
 | --- | --- | --- |
-| Guidance and repository | Completed: newer guidance preserved and exact schedule/dry-run and decimal/shared-page repairs integrated. Final source gate remains below. | Root alone implements, verifies, and separately self-reviews. |
+| Guidance and repository | Completed: newer guidance preserved and exact schedule/dry-run and decimal/shared-page repairs integrated. The combined source gate passed. | Root alone implements, verifies, and separately self-reviews. |
 | Historical conflict | Completed: exact obsolete worktree retired with verified 863-file recovery, preserved branch/archive/merge receipts, and no active owner. | All other worktrees retained. An unrelated economic-suite pass was not required. |
-| Media inputs | Implemented v5/v6 real-media and multiple-original source contracts, preserving v4/v5 replay. All 159 affected checks passed, including 51 new regressions; all 81 retained SEC HTML originals retain their structural counts. Complete the integrated source gate. | Bind originals, page/span locations and transformations; keep labels outside extraction and show identical source material across compared lanes. Explicit unsupported transformations stay unavailable. Arbitrary HTML spans are not pages. |
+| Media inputs | Implemented v5/v6 real-media and multiple-original source contracts, preserving v4/v5 replay. All 159 affected checks passed, including 51 new regressions; all 81 retained SEC HTML originals retain their structural counts. The combined source gate passed. | Bind originals, page/span locations and transformations; keep labels outside extraction and show identical source material across compared lanes. Explicit unsupported transformations stay unavailable. Arbitrary HTML spans are not pages. |
 | Research | The checked v6 500/300/400/200 registration and local qualification are complete: deterministic critical/high/source accuracy is 100%; retrieval is 293/1,400 (20.9%) and does not qualify; no-text accuracy is zero. Typed questions cover full periods, actual collection cutoffs, exact cross-filing precision and named-role/complete-configuration conformance. Preserve the earlier v5 result. General restatement narratives, publisher chart reasoning, forecast quality and model evidence retain their actual limits and prerequisites. | Preserve 99.5% critical-field and 100% high-severity accuracy, zero authority changes, disclosure or source bypass. All v6 cases are conservatively high severity. A bounded local result does not establish profitability or a no-model verdict. |
 | Cohort | Establish legitimate effective-dated `security_master/v1` and ranked eligible top-100/75/50 evidence. | The configured local hostname is not established provenance; the 43-symbol capture is insufficient. |
 | Economics | Admit the prospective protocol; complete development, validation, separately released holdout and final status from actual source-bound outcomes. | Preserve actual capture times. Real elapsed market time and a separate holdout owner record are required; a reproducible negative result is acceptable, missing evidence is not completion. |
 | Learning | Byte-exact backup and read-only audit completed: 6,244 valid rows, 4,944 labeled resolved, 1,300 pending, no verified economic bindings. Supply legitimate mappings and accepted prices/corporate actions, then complete source-bound resolution and fixed-point reconciliation. | Accepted PIT inputs and mappings; no replacement ledger or invented historical crosswalk. Current labels do not establish outcomes. |
 | Readiness | Historical GO/promotion/tournament supersession and current `NOT_ESTABLISHED` readiness are complete through the accepted writer. Fresh TSM loss review and BOARD evidence remain open. | Use the accepted post-supersession protection receipt; preserve historical originals/before-images and byte-identical live control. Fresh portfolio evidence retains its actual access boundary. |
 | Concurrency | Compare 1 and 2 on the same registered cohort. | Registered cohort and permitted model execution; retain 1 meanwhile. |
-| Final source | Benchmark integration and scoped local qualification are complete; the completed harness update is preserved and merged. Freeze this combined candidate and run one complete repository gate. The `36e8727` and `72e5585` failed receipts remain preserved. | Reuse unchanged 81-test repair, 159-test adapter and 612-test harness evidence. Root separately reviews the combined candidate. Durable results survive a disconnected pipe; no restart of obsolete candidates. |
+| Final source | Completed at candidate `85fe50d`: 5,183 tests and 78 subtests passed, one live API test skipped, all six static checks passed. Both checkouts were clean at the tested candidate, and protected-state verification passed. The `36e8727` and `72e5585` failed receipts remain preserved. | Root separately reviewed the combined candidate and reused unchanged affected evidence. Durable results survive a disconnected pipe. Later changes receive checks appropriate to their scope; this source pass grants no deployment or economic acceptance. |
 | Operations | One clean qualifier plus five additional clean market sessions, exactly twelve stages each. | Accepted source/readiness, reconciled external/model authority and real elapsed sessions; retain reset rules. |
 | Explanation and handoff | Walkthrough and seven-future-eligible/three-paused card prepared. The October 1 harness refresh applied the saved model/prompt updates and rebound the exact contract text; the earlier launch preparation remains historical. Reconcile both handoffs and obtain actual API next-run proof when available. | Distinguish current paused behavior from designed operation; no activation. Final retirement waits for complete reconciliation. |
 
@@ -83,6 +87,8 @@ Retained checkpoint references: [Phase 4](../superpowers/checkpoints/2026-09-13-
 [readiness source](../superpowers/checkpoints/2026-09-13-phase8-readiness-source-integration.md),
 [5,005-test gate](../superpowers/checkpoints/2026-09-14-final-source-gate.md), and
 [completed collection](../superpowers/checkpoints/2026-09-14-prospective-source-collection.md).
+The current combined source is accepted in the
+[October 1 checkpoint](../superpowers/checkpoints/2026-10-01-combined-source-acceptance.md).
 Historical search was closed in
 `.superpowers/sdd/2026-08-30-tradingagents-evidence-first-working-state-completion/expanded-archive-search-20260913.md`;
 continue the prospective route without backdating custody. The temporary handoff
