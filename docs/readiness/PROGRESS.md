@@ -85,6 +85,25 @@ field, so the paid route has made zero calls. The completed subscription forecas
 and comparison contract are retained in
 `results/readiness_continuation/20261001-aapl-route-comparison/`. This one-case
 pilot is separate from registered research acceptance and the economic campaign.
+The original issue window closed at October 1, 13:30 UTC. Its repaired private
+preflight rejects a late request or result; seven offline checks pass. Preserve
+the original forecasts and prepare a future prospective comparison only when
+the approved access is available. No API spending occurred.
+
+The app's read-only automation view returned a rendered-card notice without
+a machine-readable next run. The exact return is retained in
+`results/readiness_continuation/20261001-native-automation-view/observation.json`.
+This does not close the launch card's Central/UTC scheduler-proof requirement;
+no schedule changed.
+
+A focused legacy-ledger readback confirms that all 6,244 original predictions
+date from June 2 through August 13 and none stores `resolution_evidence`.
+`SourceBoundWindowLookup.economic_decision_evidence` requires an exact original
+symbol, benchmark, packet, creation date, horizon and resolution window against
+the frozen protocol. A newly issued prospective forecast cannot serve as the
+old forecast's mapping. Preserve the backup and unverified labels; the missing
+original bindings and accepted outcome receipts remain requirements. This
+readback did not reopen the closed historical-archive search or mutate the ledger.
 
 The accepted v6 registration and local results are retained under
 `results/readiness_continuation/20261001-v6-source-bundle-integration/accepted-local-qualification/`.

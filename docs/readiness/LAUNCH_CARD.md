@@ -57,6 +57,10 @@ study, prediction reconciliation, current readiness evidence and six-session
 campaign. Then use the existing no-submit shadow-equivalence
 and artifact-health checks. API-returned next runs in Central and UTC remain a
 separate deployment requirement; calculated times do not replace that proof.
+The October 1 read-only native view returned only a rendered-card notice,
+without a machine-readable next run. Its exact return is preserved under
+`results/readiness_continuation/20261001-native-automation-view/`; no status or
+schedule was changed. Next-run proof remains open.
 
 Historical launch preparation remains under
 `results/readiness_continuation/20260930-launch-preparation/`. Its old proposed

@@ -56,7 +56,9 @@ read that history to understand today's status.
 - The prediction ledger is backed up byte for byte. Its read-only audit found
   6,244 valid records, including 4,944 marked resolved and 1,300 pending. Those
   labels do not establish verified economic outcomes; its missing result links
-  remain an exact open requirement.
+  remain an exact open requirement. These predictions were issued from June 2
+  through August 13. New forecasts cannot supply their missing original links;
+  the resolver requires the original date, stock, packet and scoring window.
 - The [day, night and weekend explanation](../orchestration/day-night-weekend-walkthrough.md)
   distinguishes today's paused state from the intended operation.
 
@@ -86,8 +88,11 @@ planning estimates. The harness prompt/model refresh is recorded in
 The owner also authorized one public AAPL comparison using GPT-6 Luna and
 GPT-6.1 Sol through Codex and the OpenAI API, capped at USD 1. Both subscription
 agents completed low-confidence forecasts from the same source cut. The paid
-comparison is waiting for the existing OpenAI API key to be configured; API
-spending is USD 0. No forecast is an order or proof that the system is profitable.
+comparison did not run because the OpenAI API key is unconfigured. API spending
+is USD 0. The original October 1 issue window has now closed, so that
+prepared run must not start. A future comparison needs its own genuine issue
+time and future targets; the saved subscription forecasts retain their original
+timestamps. No forecast is an order or proof that the system is profitable.
 
 Paying has not demonstrated better forecast quality. The API supplies a direct
 application route with separate usage billing. Supported Codex CLI/SDK routes
