@@ -12,14 +12,14 @@ deployment phases, dependencies and no-submit fields retain their existing scope
 
 | Job | Intended observer phase | Saved Codex model / effort |
 | --- | --- | --- |
-| Overnight research | Eligible after gates; one capped ticker initially | GPT-6.1 Sol / high |
-| Preopen checks | Eligible after gates; dry-run | GPT-6 Luna / medium |
-| Safety sentinel | Eligible after gates; verification | GPT-6 Luna / medium |
-| Self-healer | Eligible after gates; bounded recovery | GPT-6.1 Sol / high |
-| Execution BOARD | Eligible after gates; analysis only | GPT-6.1 Sol / high |
-| Paper tournament | Eligible after gates; dry-run | GPT-6 Luna / medium |
-| Daily report | Eligible after gates; local queue | GPT-6 Luna / medium |
-| Market supervisor | Ineligible in observer phase | GPT-6.1 Sol / high |
+| Overnight research | Eligible after gates; one capped ticker initially | GPT-6.1 Sol / max |
+| Preopen checks | Eligible after gates; dry-run | GPT-6 Luna / high |
+| Safety sentinel | Eligible after gates; verification | GPT-6 Luna / max |
+| Self-healer | Eligible after gates; bounded recovery | GPT-6.1 Sol / max |
+| Execution BOARD | Eligible after gates; analysis only | GPT-6.1 Sol / max |
+| Paper tournament | Eligible after gates; dry-run | GPT-6 Luna / max |
+| Daily report | Eligible after gates; local queue | GPT-6 Luna / high |
+| Market supervisor | Ineligible in observer phase | GPT-6.1 Sol / max |
 | Wake controller | Ineligible in observer phase | GPT-6 Luna / medium |
 | Sleep controller | Ineligible in observer phase | GPT-6 Luna / medium |
 

@@ -57,9 +57,11 @@ was added to imply they were solved.
 
 ## Models
 
-Saved Codex jobs use GPT-6 Luna/medium for bounded inspection, tournament and
-reporting, and GPT-6.1 Sol/high for BOARD, recovery, supervisor and research
-synthesis. Versioned graph defaults are Sol for deep roles and Luna for quick
+At the owner’s follow-up request, saved Codex jobs use GPT-6 Luna/medium for
+wake/sleep controllers, Luna/high for preopen checks and daily reporting, and
+Luna/max for the safety sentinel and tournament. GPT-6.1 Sol/max handles BOARD,
+recovery, supervisor and research synthesis. Higher effort reflects complexity
+and consequence; it is not a measured quality-improvement claim. Versioned graph defaults are Sol for deep roles and Luna for quick
 roles; advisory judgment defaults to Sol. Explicit provider/model overrides
 remain available. Astra is in the API catalog for difficult measured escalation,
 with no extra job. Active primary-session settings were not switched.

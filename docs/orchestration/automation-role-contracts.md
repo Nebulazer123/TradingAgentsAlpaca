@@ -53,7 +53,7 @@ Each exact automation ID has:
 
 The prompt digest catches unreviewed prompt changes.  The semantic clauses
 catch known safety requirements that a digest alone cannot describe.  In
-particular, the sentinel is intentionally Luna/medium for deterministic
+particular, the sentinel is intentionally Luna/max for deterministic
 verification and must escalate uncertain diagnosis; the self-healer is a
 weekday market-session reliability controller, not a fictitious 24/7 service.
 
@@ -61,15 +61,15 @@ weekday market-session reliability controller, not a fictitious 24/7 service.
 
 | Automation ID | Intended CT schedule | Model / effort | Dependency |
 | --- | --- | --- | --- |
-| `tradingagents-overnight-research` | Weekdays 03:30 | GPT-6.1 Sol / high | — |
+| `tradingagents-overnight-research` | Weekdays 03:30 | GPT-6.1 Sol / max | — |
 | `tradingagents-automation-wake-controller` | Weekdays 06:45 | GPT-6 Luna / medium | — |
-| `tradingagents-autonomous-self-healer` | Weekdays 07:03, 09:03, 11:03, 13:03, 15:03 | GPT-6.1 Sol / high | — |
-| `tradingagents-preopen-validation` | Weekdays 08:10 | GPT-6 Luna / medium | Overnight research |
-| `tradingagents-autonomous-safety-sentinel` | Weekdays 08:20, then hourly through 14:20 | GPT-6 Luna / medium | Preopen + self-healer |
-| `tradingagents-market-supervisor` | Weekdays 08:35, then hourly through 14:35 | GPT-6.1 Sol / high | Sentinel |
-| `tradingagents-autonomous-execution-board` | Weekdays 08:50, then hourly through 14:50 | GPT-6.1 Sol / high | Sentinel + supervisor |
-| `tradingagents-paper-tournament` | Weekdays 09:10 | GPT-6 Luna / medium | Overnight research |
-| `tradingagents-daily-report` | Weekdays 15:30 | GPT-6 Luna / medium | BOARD |
+| `tradingagents-autonomous-self-healer` | Weekdays 07:03, 09:03, 11:03, 13:03, 15:03 | GPT-6.1 Sol / max | — |
+| `tradingagents-preopen-validation` | Weekdays 08:10 | GPT-6 Luna / high | Overnight research |
+| `tradingagents-autonomous-safety-sentinel` | Weekdays 08:20, then hourly through 14:20 | GPT-6 Luna / max | Preopen + self-healer |
+| `tradingagents-market-supervisor` | Weekdays 08:35, then hourly through 14:35 | GPT-6.1 Sol / max | Sentinel |
+| `tradingagents-autonomous-execution-board` | Weekdays 08:50, then hourly through 14:50 | GPT-6.1 Sol / max | Sentinel + supervisor |
+| `tradingagents-paper-tournament` | Weekdays 09:10 | GPT-6 Luna / max | Overnight research |
+| `tradingagents-daily-report` | Weekdays 15:30 | GPT-6 Luna / high | BOARD |
 | `tradingagents-automation-sleep-controller` | Weekdays 16:45 | GPT-6 Luna / medium | Daily report |
 
 Matching external schedule fields are still not deployment proof for this
