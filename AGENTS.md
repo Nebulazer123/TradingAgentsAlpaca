@@ -1,181 +1,130 @@
 # TradingAgents Agent Guide
 
-## Canonical Workspace
+## Workspace
 
-The canonical repository and working directory is:
+The canonical repository is:
 
 `/Users/corbinfloyd/Documents/TradingAgents`
 
-Start every TradingAgents Codex chat from this directory. The Python application,
-Git history, local environment, runtime evidence, documentation, and recovery
-archives all live beneath this root.
+Work from this repository or an intentional Git worktree derived from it.
 
-## Session Start
+## Working Style
 
-1. Run `pwd` and `git status --short --branch`.
-2. Read `START_HERE.md` for workspace identity, then the source or guidance relevant to the task.
-3. For runtime, operational, or safety-sensitive work, read
-   `results/_context/latest-summary.json` and `results/_context/latest-flags.json`.
-   Open only the raw packet named by compact context when a flag calls for detail.
-4. When the authorized task needs a context refresh, use
-   `.venv/bin/python scripts/automation_context_snapshot.py --write` only if those
-   files are missing or stale, or the task changes the runtime/generated-packet
-   inputs they summarize; then reread them. A read-only audit does not require a write.
-5. Consult only the relevant section of `CONTEXT_ROUTER.md` for historical
-   operational context. Its dated status is not current authority.
+Own the authorized task through inspection, implementation, verification, and repair.
+For ordinary local repository work:
 
-`results/_context/` is the fast index to runtime state. Timestamped files under
-`results/` support it. Source-only work retains the safety-fingerprint practice
-below without loading unrelated operational history.
+- inspect the code and evidence you need;
+- make reversible local edits without asking for permission at each step;
+- run relevant tests and fix failures caused by the requested change;
+- continue until the requested outcome or a concrete blocker is reached;
+- prefer the smallest coherent solution over speculative infrastructure;
+- investigate repository-specific terminology yourself instead of asking the user to reconstruct project history;
+- explain results to the user in plain English.
 
-## Repository Map
+Ask the user only when a genuinely consequential decision, missing credential/access, irreversible action, external side effect, or material ambiguity requires their choice.
+Do not stop merely because one dependent lane is blocked. Complete useful independent work first.
 
-| Area | Purpose |
-| --- | --- |
-| `cli/main.py` | Typer command surface for Alpaca, research, evaluation, and operations |
-| `tradingagents/agents/` | Analyst, researcher, trader, and risk-role implementations |
-| `tradingagents/graph/` | LangGraph workflow construction and propagation |
-| `tradingagents/brokers/` | Alpaca integration, supervisor decisions, and paper tournament |
-| `tradingagents/policy/` | Live control, approval records, risk posture, gates, and policy packets |
-| `tradingagents/execution/` | Execution locks, clocks, reconciliation, and submit coordination |
-| `tradingagents/research/` | Provider orchestration, evidence packets, crawlers, and research workflows |
-| `tradingagents/orchestration/` | n8n runner, job policy, context control, and automation plumbing |
-| `tradingagents/dataflows/` | Market, fundamentals, news, social, and vendor data routes |
-| `tradingagents/evals/` | Decision quality, telemetry, calibration, and evaluation datasets |
-| `tests/` | Unit and integration coverage organized by subsystem |
-| `scripts/mac/` | Mac launchd jobs, runner wrappers, and outbox delivery |
-| `config/` | Versioned examples, allowlists, schedules, and local runtime configuration |
-| `results/` | Generated runtime packets, compact context, logs, locks, and evidence |
-| `docs/` | Architecture, policy, orchestration, plans, and project history |
-| `archive/` | Recovery manifests, inactive checkout archives, and Windows transfer history |
+## Context Loading
 
-The detailed map and consolidation record live in
-`docs/consolidation/REPOSITORY_MAP.md` and
-`docs/consolidation/CONSOLIDATION_REPORT.md`.
+Start with `START_HERE.md`, then read only the source, documentation, or evidence relevant to the current task.
+For runtime, operational, trading-authority, scheduler, or other safety-sensitive work, begin with:
+
+- `results/_context/latest-summary.json`
+- `results/_context/latest-flags.json`
+
+Follow those references into raw packets only when the task needs the additional detail.
+Use `CONTEXT_ROUTER.md` for historical context when needed. Historical documents and status reports are evidence about their recorded time, not current runtime authority.
+Dynamic project state belongs in current status/evidence files, not in this `AGENTS.md`.
 
 ## Task Routing
 
-- CLI behavior starts at `cli/main.py`, then follows the called subsystem and
-  its matching `tests/test_*_cli.py` coverage.
-- Trading decisions start at `tradingagents/brokers/alpaca_supervisor.py` and
-  continue through `tradingagents/policy/` and `tradingagents/execution/`.
-- Research behavior starts at `tradingagents/research/provider_orchestrator.py`,
-  `tradingagents/research/automation_orchestrator.py`, and the relevant dataflow.
-- Agent workflow changes start at `tradingagents/graph/trading_graph.py` and the
-  matching role implementation under `tradingagents/agents/`.
-- n8n jobs start at `tradingagents/orchestration/n8n_runner.py` and
-  `config/n8n_tradingagents_allowlist.json`.
-- Runtime investigations start with compact context, then the named raw packet,
-  broker history, active process state, and current configuration.
+Use these as starting points, then follow the code:
 
-Use direct reads and `rg` for prose, configuration, logs, JSON packets, exact
-strings, and small source questions. Structural tooling such as codebase-memory
-is optional when it helps trace relationships; verify its indexed root and
-coverage, then confirm behavior in source. Reuse a known index rather than
-repeatedly listing the catalog. Consult architecture for service boundaries,
-schema guidance for data changes, and release guidance for release work.
+- CLI: `cli/main.py`
+- Agent workflows: `tradingagents/graph/` and `tradingagents/agents/`
+- Research and model routing: `tradingagents/research/`
+- Market/data inputs: `tradingagents/dataflows/`
+- Broker and portfolio behavior: `tradingagents/brokers/`
+- Trading authority and risk policy: `tradingagents/policy/` and `tradingagents/execution/`
+- Scheduling and orchestration: `tradingagents/orchestration/`, `scripts/mac/`, and `config/`
+- Evaluation and qualification: `tradingagents/evals/` and relevant tests
 
-## Mac Commands
+Use direct file reads and `rg` by default for precise questions. Structural/codebase tools are optional when they materially improve navigation or dependency tracing.
+For a detailed repository map, use `docs/consolidation/REPOSITORY_MAP.md`.
+
+## Common Verification
+
+Useful broad commands include:
 
 ```zsh
-cd /Users/corbinfloyd/Documents/TradingAgents
-.venv/bin/python -m cli.main --help
-.venv/bin/python -m cli.main alpaca --help
-.venv/bin/python scripts/automation_context_snapshot.py --write
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check cli tradingagents scripts tests
 ```
 
-The complete pytest and Ruff commands are broad checkpoint gates, not per-edit
-defaults. Use the smallest affected test group while a behavior slice is changing.
+Verification should be proportional to the change.
 
-The local n8n runner listens on `127.0.0.1:8765`. Its launchd configuration and
-wrapper point to this repository root. The ten Codex schedules are the canonical
-timetable, defined by
-`config/automation_schedule_contract.json`. All remain paused during readiness
-work. `scripts/mac/ta_job.sh` supplies the bounded job commands; the legacy
-`scripts/mac/install_launchd.sh` is retired and cannot install a second timetable.
+- During implementation, run the smallest representative checks that exercise the changed behavior or reproduced failure.
+- For prose or simple configuration, read back the result and inspect the diff.
+- Reuse valid passing evidence when the relevant code and inputs are unchanged.
+- After a repair, rerun the checks affected by that repair.
+- Run a complete repository gate when the task, release boundary, or final integrated candidate actually warrants one.
+- Do not create repeated proof, hash, receipt, review, or certification layers merely to reconfirm unchanged facts.
 
-## Configuration and Evidence
+For long-running checks, keep durable output when losing the client connection would otherwise lose the result.
+When parallelizing, avoid competing writers on the same files. Subagents are well suited to exploration, focused reproduction, independent review, research, and log analysis.
 
-Keep research memory in local redacted packets. Zep remains disabled by the
-settled project decision; re-enable it only if the user explicitly changes that
-decision. This does not require a new memory service for ordinary work.
+## Protected Operations
 
-Local credentials live in `.env` with mode `0600`. Local risk configuration may
-live in ignored configuration files. Versioned example files describe expected
-shape. Current operational state comes from the live files on disk, active
-process state, broker order history, and newest result packets.
+Local engineering autonomy and trading/external authority are separate concerns.
+Repository inspection, coding, tests, local analysis, local benchmarks, documentation, and reversible development work should normally proceed without repeated approval.
+Consequential operations remain governed by their actual runtime policy, permissions, and execution controls. Examples include:
 
-`results/policy/live_control.json` records the current live-control posture.
-Submission authority is established by the complete current policy and execution
-path at call time. Analysis packets, historical statuses, and documentation
-provide context for that evaluation.
+- submitting real or paper orders;
+- enabling or materially changing trading authority;
+- activating or changing schedules;
+- sending external messages or draining an outbox;
+- changing credentials or security-sensitive access;
+- spending money through a separately billed API beyond an authorized budget;
+- releasing protected holdout data or other separately controlled evidence.
 
-For source-only work that cannot invoke a runtime, automation, or broker action,
-capture one compact safety fingerprint for the candidate revision and reuse it
-while the relevant control files, automation state, processes, and diff are
-unchanged. Recheck after a relevant change, immediately before any protected
-operation, and at the checkpoint. Reuse never substitutes for the complete
-call-time submission-authority path.
+Do not infer authority for those actions from historical documentation, a generated packet, a model recommendation, or this guide.
+Do not weaken or bypass a mechanical policy, execution gate, sandbox, permission boundary, or credential boundary merely to make a task pass.
+Where a constraint can be enforced reliably in code, configuration, permissions, tests, or runtime policy, prefer that mechanism over repeated prompt warnings.
 
-## Change and Verification Practice
+## Instruction Architecture
 
-Continue authorized local implementation through inspection, relevant checks,
-and repairs until its acceptance criteria are met. Pause only dependent work
-for missing evidence, access, a consequential unresolved decision, or separate
-protected-operation authority; complete useful independent work.
+Keep this root file limited to guidance useful for nearly every TradingAgents task.
+Put narrower material in the narrowest appropriate place:
 
-Use representative tests for changed behavior and demonstrated failures. For
-prose and simple configuration, read back the result and review the diff. Reuse
-passing evidence on unchanged inputs. Run affected checks after relevant source
-changes and one complete repository gate on the final integrated candidate;
-diagnose failures and rerun the checks needed by the repair. Root is the sole
-implementer and verifier for the current readiness program and performs a
-separate self-review pass.
+- repeatable multi-step workflows → agent Skills;
+- subsystem-specific rules → nested `AGENTS.md` when justified;
+- long reference material → documentation/runbooks;
+- current runtime/readiness state → generated status/evidence files;
+- deterministic prohibitions or permissions → code, configuration, sandboxing, Codex Rules, or runtime policy.
 
-Keep durable test output and exit receipts independent of the client output
-pipe. Preserve failed receipts. Use hashes for immutable source custody,
-checkpoint identity, recovery integrity, and required protected-operation checks;
-avoid adding hash manifests for ordinary prose, successful logs, or repeated
-unchanged-state observations. Report concise outcomes and failures. Refresh
-compact context when summarized runtime/generated-packet inputs change; a new
-index timestamp does not make stale runtime evidence current. Refresh a useful
-structural index after substantial source changes when subsequent work needs it.
+Do not copy the same rule across multiple instruction surfaces unless separate enforcement is technically necessary.
+When an agent repeatedly makes the same mistake, fix the nearest durable cause rather than continually adding more global prose.
 
-## Optional Ox Alpha Help
+## Reporting
 
-Use Ox only when the user explicitly requests it. Read
-`/Users/corbinfloyd/.codex/references/opencode-ox.md` for the current route,
-compatibility preflight, and safety boundaries. Keep one writer per worktree and
-one owner of affected tests for a revision; inspect the resulting diff and
-focused evidence.
+Report what materially changed:
 
-Keep source, tests, and durable documentation in Git. Keep generated results,
-credentials, environments, caches, and recovery archives in their established
-ignored locations. Record important verification commands and outcomes in the
-relevant report or plan.
+- result;
+- important changed paths;
+- relevant verification;
+- unresolved blocker or next action when one exists.
 
-## History and Recovery
+Use delta reporting.
+Do not routinely repeat unchanged facts such as:
 
-The canonical `master` branch contains the consolidated active implementation.
-Former development lines remain available as Git branches. Complete recovery
-archives for retired checkouts and the imported public clone live under
-`archive/inactive-checkouts/`. Windows transfer material lives under
-`archive/windows-transfer-2026-07-11/`.
+- API spending remaining unchanged;
+- schedules remaining paused;
+- readiness remaining unchanged;
+- live-control state remaining unchanged;
+- no orders having been placed;
+- credentials remaining absent;
+- historical gates remaining preserved.
 
-## Completion Handoff
-
-Report the result, changed paths, verification evidence, current runtime posture,
-and the next useful starting file. Use exact absolute paths for workspace handoff
-and relative paths for files inside this repository.
-
-## Current readiness work
-
-Follow the current missing-work table in
-`docs/superpowers/plans/2026-08-30-tradingagents-evidence-first-working-state-completion.md`.
-Keep its research, economic, learning, and six-session acceptance requirements.
-Live control stays frozen, all ten automations stay paused, concurrency stays at
-1, and paper submission defaults to off. Holdout release, optional submission,
-model execution, and additional external operations retain their own established
-authority scope. The completed SEC/Alpaca collection needs no renewed approval.
+Mention such state only when it changed, materially affected the task, explains a blocker, or the user asked about it.
+Avoid stock closing paragraphs and repetitive status boilerplate. Prefer concise, task-specific language.
+If a task remains partially blocked, state the exact blocker once and explain the most useful next action.
