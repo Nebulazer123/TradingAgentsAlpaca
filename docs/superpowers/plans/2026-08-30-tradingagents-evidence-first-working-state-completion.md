@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - The user authorized continuous execution of the full program on 2026-09-07, superseding the earlier Phase 3 stop. Complete each phase's technical acceptance before its dependents; do not pause for routine continuation approval.
-- Finish only the already-running Sol assignments, then use no more subagents or follow-on assignments. Root becomes sole implementation/verification owner; use a distinct self-review pass without describing it as independent review. The existing verifier finishes the current Phase 3 gate. Preserve one writer per worktree and one owner of test execution per revision; no duplicate broad tests.
+- Root is the sole implementer and verifier. Use a separate self-review pass and no subagents. Preserve one writer per worktree and reuse unchanged verification evidence.
 - Live control remains frozen; all ten TradingAgents automations remain `PAUSED` at the accepted hashes. Source work and tests make no broker, provider, vendor, or application-model calls.
 - Holdout release and optional paper-only submission each require separate owner authorization. Historical GO, promotion, checkpoint, result, and readiness records confer no execution authority.
 - Preserve every existing feature change and evidence file. Keep the temporary handoff until the final program stop and complete reconciliation; the Phase 3 stop does not retire it.
@@ -21,135 +21,51 @@
 
 ---
 
-## Current continuation — verified 2026-09-07
+## Current missing work — 2026-09-30
 
-**Latest data checkpoint — 2026-09-14, authorized read-only collection:** The
-user answered the pending SEC/additional Alpaca collection request. That bounded
-collection is complete: 298 retained responses, 297 raw archive objects, 81 SEC
-filings, complete raw/adjusted 60-session grids for 42 ledger tickers plus SPY,
-and 43 current-cutoff exploratory adjusted-price windows. Offline byte/custody
-and preservation checks pass; no source gate was replayed. See
-[the source collection checkpoint](../checkpoints/2026-09-14-prospective-source-collection.md)
-for exact receipts and explicit QQQ/XOM gaps. These inputs do not establish
-historical custody, effective-dated security identity, an eligible ranked
-100/75/50 cohort, old forecast mappings or real benchmark/economic readiness.
-No actual ledger/promotion, model, trading, holdout or automation transition
-occurred. Preserve the original ordered plan and all operational boundaries.
+The Phase 4, LangGraph checkpoint, learning-reporting, and initial benchmark and
+readiness source are integrated. The earlier source gate passed 5,005 tests and
+75 subtests with one live-API skip on its recorded candidate. The later
+`76199c1` wrapper candidate verifier stopped with pytest `-9` and a broken pipe;
+its receipt remains failed and preserved. It is not running or accepted. Reuse
+unchanged 125-test wrapper and 72-test benchmark evidence; those isolated repairs
+still require integration and the final completed-source gate.
 
-**Latest source checkpoint — 2026-09-14, final source gate accepted:** Clean
-canonical `81b7463cbfe612bdbb9c7c0f25b0a3e05a1349da` passed the single corrected
-complete gate: **5,005 tests and 75 subtests passed, one live-API test skipped**,
-11 disclosed warnings, plus all required statics. Session 24109 is terminal
-exit 0; its runner and pytest PIDs are absent. Source and protected owners were
-unchanged. The refreshed canonical index was checked for all 75 changed
-source/test paths: 73 match and two fixture paths remain intentionally excluded
-with direct source/test evidence. See
-[the final source checkpoint](../checkpoints/2026-09-14-final-source-gate.md)
-for exact receipt/hash identities, scope and remaining acceptance requirements.
-Do not continue polling or replay this accepted run for documentation changes.
-Real Task 6.2, research/economic qualification, actual legacy supersession and
-the future operational campaign remain open; no new external, model, holdout,
-paper-submit or automation authority is implied. The separately authorized
-SEC/Alpaca collection is recorded above. Preserve the full goal,
-frozen live control, ten PAUSED automations, captured data and both handoffs.
-
-**Earlier source checkpoint — 2026-09-14, adjusted-price REST repair:** The first
-full Phase 10 candidate `5771809` was deliberately stopped only after two new
-regressions demonstrated a route/body mismatch in the adjusted-price parser.
-Its final receipt records pytest exit -15 with unchanged source and protected
-owners, not a passing full gate. The isolated repair accepts the actual
-single-symbol REST list, binds its response symbol and rejects incomplete or
-continuation-only pages; exact source/custody/economic guards remain. Eight
-synthetic literals were corrected without changing their data or assertions.
-The 13 new contract tests and seven-module 155-test affected gate pass. See
-[the repair checkpoint](../checkpoints/2026-09-14-adjusted-price-rest-contract.md).
-The corrected full source gate subsequently passed as recorded above.
-The retained broad multi-symbol capture is still not an accepted adjusted-window
-input, and no actual learning, economic or operational qualification is claimed.
-
-**Latest source checkpoint — 2026-09-13, Phase 8 runner:** Reviewed `0b38a8e`
-is combined with canonical `3901c2c`. Two additional boundary defects are repaired:
-completion/rollback evidence is checked before promotion replacement, and current
-readiness rejects captured-contract mismatch or observed mid-read file changes.
-The seven-module affected gate passed 560 tests; existing canonical definitions
-and frozen owners are preserved. See
-[the Phase 8 source checkpoint](../checkpoints/2026-09-13-phase8-readiness-source-integration.md).
-The real historical artifacts pass offline schema/hash checks, but **no actual
-supersession or readiness transition occurred**; the stale promotion state is
-still unchanged. Complete the remaining evidence prerequisites and accepted-source
-freeze/gate without inventing cohort/model results or expanding external authority.
-All numbered phases and operational boundaries below remain in force.
-
-**Latest source checkpoint — 2026-09-13, Phase 7 runner:** The retained-only
-full-role benchmark is implemented on clean source `f59a40c`, with 341 passing
-affected tests and an unmocked clean-Git proof of both actual twelve-role graph
-variants using synthetic HTTP responses. See
-[the Phase 7 source checkpoint](../checkpoints/2026-09-13-phase7-benchmark-source-preparation.md).
-The real 500/300/400/200 corpus, model qualification and Phase 7 acceptance remain
-open. The authorized Alpaca paper capture is preserved, but cannot establish
-historical source availability. Do not replay that collection or earlier gates.
-After local source integration, continue Phase 8's isolated readiness-source
-review/integration; actual state transitions still require their evidence and
-authority prerequisites. Keep Task 6.2, concurrency qualification, later economic
-and operational gates open, and preserve the full program and frozen controls.
-
-**Latest source checkpoint — 2026-09-13, Task 6.1:** Reviewed learning source
-`c11a9c4` is combined with canonical `bc579d4`; 205 affected tests, scoped statics,
-exact CLI merge preservation, and frozen-owner checks pass. See
-[the Phase 6.1 source checkpoint](../checkpoints/2026-09-13-phase6-learning-source-integration.md).
-Real Task 6.2 remains pending accepted PIT receipts and a legitimate forecast/event
-mapping; the newly retained Alpaca account data does not establish historical
-qualification. Continue independent Phase 7 source work without running the real
-ledger workflow or inferring new external/model authority. The full program and
-all operational acceptance requirements remain unfinished.
-
-**Latest source checkpoint — 2026-09-13, Tasks 5.1–5.4:** The preserved LangGraph
-amendment and repairs passed 333 focused tests at `b40683e`. Integration with
-canonical `7c5b9a7` preserved both CLI definition sets and passed the corrected
-285-test affected gate plus scoped statics. Exact-source safety inventory
-locations were updated without relaxing classifications. See
-[the Phase 5 source checkpoint](../checkpoints/2026-09-13-phase5-checkpoint-repairs.md).
-Next is Phase 6 source integration and evidence reconciliation. Task 5.5 remains
-conditional on a registered cohort and model-call authority; concurrency stays 1.
-Phases 6–12, real qualification, and the operational campaign remain unfinished.
-All protected controls, schedules, holdout and paper-submit boundaries remain.
-
-**Earlier Phase 4 source checkpoint — 2026-09-13:** Phase 4 lifecycle is accepted
-and integrated at `4fa91d3` after the one 17-module gate (393 passed plus all
-static checks). Canonical then fast-forwarded through isolated Alpaca
-bar-shape correction `8fc3296`, with its separate five-module PIT checkpoint
-(124 passed) and scoped static proof. The exact revision boundaries and
-preservation evidence are in
-[the Phase 4 checkpoint](../checkpoints/2026-09-13-phase4-source-acceptance.md).
-Do not replay these accepted checks. Next: Phase 5 in the existing LangGraph
-worktree, whose sixteen original dirty paths remain intact. Phases 6–12 and
-all actual qualification/operational gates below remain unfinished. The
-older table and start instruction below are retained historical context.
-
-**Start with the [Phase 3 acceptance checkpoint](2026-09-07-tradingagents-phase-3-acceptance-and-stop.md), then continue through the remaining program.** That checkpoint supersedes the old starting-state instructions below and in the temporary handoff. The user's latest 2026-09-07 instruction removes the interim stop, not the technical gates or protected-operation boundaries. Accepted work must not be replayed.
-
-| Surface | Current evidence | Disposition |
+| Area | Remaining work and acceptance | Prerequisite or boundary |
 | --- | --- | --- |
-| Canonical | `master` at `93854eb6d1f04bac5e8c36896b5a7252789b6cde`; the original completion plan was its only untracked file before this documentation update | Planning changes remain uncommitted until the Phase 4 integration boundary |
-| Economic | `codex/economic-tournament-evidence-20260825` at `5f3aad295f87c24be3415875cf15f20d5bc24f04`, clean, fifteen commits ahead | Preserve history and the original eight economic paths already committed into it; source frozen during Phase 3 verification |
-| Phase 1 | Accepted through `29e46d4b44b8be3aa63eccb7729c1657178cb408` | Tasks 1.1–1.3 below are retained requirements, not new work |
-| Phase 2 | Accepted through `53a286acc9ba07da5b30022352e113dba1a02fd8` | Preserve complete feature/outcome custody and its accepted receipts |
-| Phase 3 | Initial `43bf815` and later `8b528fd` required correction; `5f3aad` has focused F1/F2/F3/CLI proof and independent static closure | One affected/static gate is running; technical acceptance remains pending, then continue to Phase 4 |
-| Learning source | Isolated `oai/tradingagents-learning-reconciliation-20260907` from Phase 2, clean `c11a9c49cf4f270120aadc41b6d1945d58128b05` | Producer baseline independently reviewed; root completed loader/CLI reachability, current ledger-bound summary and input preservation with self-review plus 149-test affected proof and 122-test final writer proof. No real ledger reconciliation or early phase acceptance |
-| Benchmark source | Isolated `oai/tradingagents-research-benchmark-20260907` from Phase 2, clean `d467fd93b756ae801a963011cdb03dd5d72c62a1` | Root fixed paired-model identity with twelve tests passing; real-client metadata contract B9, FTS-before-provider path and full-graph/reviewer wiring remain open. No real model call or early phase acceptance |
-| Readiness source | Isolated `oai/tradingagents-readiness-supersession-20260907` from Phase 2, clean `0b38a8ece291c3f0f54940bcdd8336043d116f59`; R1/R2 independently clear | Owner stopped; 52 promotion tests passed. Ordered integration, actual state transition and full Phase 8 acceptance remain pending |
-| LangGraph | Still at `93854eb`, eleven modified and five untracked paths | Do not touch until economic Phases 1–4 are accepted and integrated |
-| Control and automations | Frozen digest and ten paused hashes match the accepted runbook on 2026-09-07 | Reuse the compact fingerprint while its inputs remain unchanged; check again at the phase checkpoint |
-| Learning and promotion owners | Ledger and promotion bytes retain hashes `10b3c228...c223` and `8b0e5d99...e196` | No learning reconciliation or promotion supersession has been performed |
-| Temporary handoff | Still hashes to `d7440a09d358d37b4da531be9fe8c2ccd3c59b160438869a2e1f078aab4bd057` | Retain; its historical starting point and active-goal claim are not current authority |
+| Guidance and repository | Preserve newer guidance edits; integrate schedule/dry-run repairs and decimal/shared-page fixes. | Root alone implements, verifies, and separately self-reviews. |
+| Historical conflict | Retire only the exact obsolete `tradingagents-autonomous-firm-integration` worktree. | Verify the existing 863-file recovery archive, unchanged target and merge/index state, preserved branch and receipts, and no active owner; an unrelated economic-suite pass is not required. Keep all other worktrees. |
+| Media inputs | Add a versioned real HTML/table/inline-XBRL/PDF/image/repository/tool-output contract preserving v4 replay. | Bind originals, page/span locations and transformations; keep labels outside extraction and show identical source material across compared lanes. Arbitrary HTML spans are not pages. |
+| Research | Register and check 500 document pages, 300 temporal questions, 400 workflow cases and 200 injection cases; run deterministic and retrieval qualification before eligible model comparisons. | 99.5% critical-field and 100% high-severity accuracy; zero authority changes, disclosure or source bypass. Missing model evidence does not establish a no-model verdict. |
+| Cohort | Establish legitimate effective-dated `security_master/v1` and ranked eligible top-100/75/50 evidence. | The configured local hostname is not established provenance; the 43-symbol capture is insufficient. |
+| Economics | Admit the prospective protocol; complete development, validation, separately released holdout and final status from actual source-bound outcomes. | Preserve actual capture times. Real elapsed market time and a separate holdout owner record are required; a reproducible negative result is acceptable, missing evidence is not completion. |
+| Learning | Supply legitimate forecast/event mappings and accepted prices/corporate actions; back up and reconcile the existing ledger to a fixed point. | Accepted PIT inputs and mappings; no replacement ledger or invented historical crosswalk. |
+| Readiness | Preserve and supersede historical GO/promotion/tournament records through the accepted writer; produce non-authorizing readiness, TSM loss review and BOARD evidence. | Follow existing evidence prerequisites; keep live control byte-identical. |
+| Concurrency | Compare 1 and 2 on the same registered cohort. | Registered cohort and permitted model execution; retain 1 meanwhile. |
+| Final source | Freeze and verify the completed integrated candidate once. | Relevant affected checks and separate self-review first; durable results survive a disconnected pipe. |
+| Operations | One clean qualifier plus five additional clean market sessions, exactly twelve stages each. | Accepted source/readiness, reconciled external/model authority and real elapsed sessions; retain reset rules. |
+| Explanation and handoff | Finish the day/night/weekend walkthrough after conflict cleanup, reconcile both handoffs, and prepare the seven-eligible/three-paused activation card. | Distinguish current paused behavior from designed operation; no activation. Final retirement waits for complete reconciliation. |
 
-Historically, the source task's last instruction was “stop at next chekoint”; its final response promised Phase 3 proof/review and stop. Its latest turn remains failed/inactive, not independently accepted. The 2026-08-31 reconciliation preserved that boundary and the Sol-only instruction. On 2026-09-07 the user first requested implementation and then explicitly accepted moving onward through the full program without routine stops. That latest instruction supersedes the interim stop. It does not convert unresolved source defects, missing verification, historical packets, or readiness claims into technical acceptance or execution authority.
+The bounded SEC/Alpaca collection is complete within its approved scope. Do not
+repeat it or request its approval again. Additional external access and model
+execution must match their actual authorized scope. All ten automations stay
+paused; live control stays frozen; paper submission defaults to off.
 
-The economic worktree has **no `.venv` directory**. Use the canonical interpreter and Ruff executables while the current directory and `PYTHONPATH` point to the feature worktree. The checkpoint plan contains exact commands and an import-origin check. In later worktree phases, interpret `.venv/bin/python` and `.venv/bin/ruff` below as the absolute canonical tool paths; do not copy credentials or create another environment just to make the old shorthand work.
+Retained checkpoint references: [Phase 4](../checkpoints/2026-09-13-phase4-source-acceptance.md),
+[LangGraph](../checkpoints/2026-09-13-phase5-checkpoint-repairs.md),
+[learning source](../checkpoints/2026-09-13-phase6-learning-source-integration.md),
+[benchmark source](../checkpoints/2026-09-13-phase7-benchmark-source-preparation.md),
+[readiness source](../checkpoints/2026-09-13-phase8-readiness-source-integration.md),
+[5,005-test gate](../checkpoints/2026-09-14-final-source-gate.md), and
+[completed collection](../checkpoints/2026-09-14-prospective-source-collection.md).
+Historical search was closed in
+`.superpowers/sdd/2026-08-30-tradingagents-evidence-first-working-state-completion/expanded-archive-search-20260913.md`;
+continue the prospective route without backdating custody. The temporary handoff
+and all historical receipts remain retained.
 
-The compact context files still summarize the 2026-08-24 snapshot. This documentation pass uses the current owner files directly and does not treat a regenerated index timestamp as fresh economic or operational evidence.
-
-The bounded retained-custody audit is recorded in `.superpowers/sdd/2026-08-30-tradingagents-evidence-first-working-state-completion/task-9.1-retained-custody-inventory.md`. Audited canonical/default caches do not contain admissible PIT archive/raw/window receipts. Legacy caches remain exploratory, not historical admission or source-bound learning evidence; unaudited areas are explicitly identified. This does not block independent source completion or authorize a data/model/broker fetch.
+Worktrees use the canonical interpreter and Ruff executables at
+`/Users/corbinfloyd/Documents/TradingAgents/.venv/bin/`; do not copy credentials
+or create an environment solely to satisfy shorthand paths below.
 
 ## Execution amendment — natural proportional mode (2026-08-30)
 
@@ -213,23 +129,13 @@ the repository's normal defaults and the smallest complete design.
 
 ## Default proportional implementation model
 
-- Give one Sol subagent a complete coherent outcome and exact ownership.
-  The user's 2026-09-07 request for more parallel implementation authorizes
-  isolated Phase 6.1 learning-reporting, Phase 7.1 benchmark-source and Phase 8.1
-  legacy-supersession source owners
-  alongside the economic owner. These source slices start from accepted Phase 2
-  (`53a286a`) in separate worktrees; they do not run evidence campaigns, accept
-  dependent phases early, or change the ordered integration gates.
-- Keep one writer per worktree. Move to the next writer only at a clean reviewed
-  boundary.
-- While behavior changes, run the smallest focused test group that proves the
-  slice. Run the affected gate once after phase acceptance and the complete
-  repository gate once on the final source candidate.
-- Use one independent phase review by default. Add a second specialist review
-  only for a genuinely distinct high-risk boundary, not as ceremony.
-- A failed check that changes source requires the relevant focused rerun. Do not
-  replay unchanged green suites without a concrete reason.
-- Ox Alpha is optional and not planned. If explicitly substituted for one Codex implementation or one distinct checkpoint review, use the existing bounded high-variant workflow only once on that diff.
+Root executes the settled authorized work and separately self-reviews each
+material slice. Add representative regressions for changed behavior and actual
+failures. Reuse passing evidence for unchanged inputs; run affected checks after
+relevant changes and one complete gate on the final integrated candidate.
+Preserve failed verifier receipts. Do not restart an obsolete candidate to
+satisfy its historical helper. Continue independent work when a dependency is
+unavailable, and report the exact incomplete gate without claiming acceptance.
 
 ---
 

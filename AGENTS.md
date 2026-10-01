@@ -68,11 +68,12 @@ The detailed map and consolidation record live in
 - Runtime investigations start with compact context, then the named raw packet,
   broker history, active process state, and current configuration.
 
-For code relationships, use the indexed canonical project in codebase-memory,
-then confirm exact behavior in source and focused tests. For prose, configuration,
-logs, JSON packets, and exact strings, use direct reads and `rg`.
-When the indexed project name is already known, use exact `index_status` and
-reuse it; do not repeatedly list the global project catalog.
+Use direct reads and `rg` for prose, configuration, logs, JSON packets, exact
+strings, and small source questions. Structural tooling such as codebase-memory
+is optional when it helps trace relationships; verify its indexed root and
+coverage, then confirm behavior in source. Reuse a known index rather than
+repeatedly listing the catalog. Consult architecture for service boundaries,
+schema guidance for data changes, and release guidance for release work.
 
 ## Mac Commands
 
@@ -89,8 +90,11 @@ The complete pytest and Ruff commands are broad checkpoint gates, not per-edit
 defaults. Use the smallest affected test group while a behavior slice is changing.
 
 The local n8n runner listens on `127.0.0.1:8765`. Its launchd configuration and
-wrapper point to this repository root. Mac scheduled jobs use
-`scripts/mac/ta_job.sh`; installation lives in `scripts/mac/install_launchd.sh`.
+wrapper point to this repository root. The ten Codex schedules are the canonical
+timetable, defined by
+`config/automation_schedule_contract.json`. All remain paused during readiness
+work. `scripts/mac/ta_job.sh` supplies the bounded job commands; the legacy
+`scripts/mac/install_launchd.sh` is retired and cannot install a second timetable.
 
 ## Configuration and Evidence
 
@@ -117,22 +121,27 @@ call-time submission-authority path.
 
 ## Change and Verification Practice
 
-Match each coherent behavior slice with focused tests for the affected subsystem.
-On an unchanged candidate revision, one verifier owns test execution; independent
-specification, quality, security, and safety reviewers inspect their assigned
-lanes and run only focused reproductions they need. Shared policy, execution,
-broker, packet-schema, and automation changes receive the broader affected gate
-at a phase checkpoint and the complete repository gate once per candidate
-revision, feature freeze, or release boundary. If a failure leads to a changed
-diff, rerun the affected check and one final broad gate on the corrected revision;
-do not duplicate the same broad run merely because another reviewer starts.
+Continue authorized local implementation through inspection, relevant checks,
+and repairs until its acceptance criteria are met. Pause only dependent work
+for missing evidence, access, a consequential unresolved decision, or separate
+protected-operation authority; complete useful independent work.
 
-Prefer bounded proof output: inspect diff stats and changed paths before full
-hunks, report concise test summaries and failures instead of replaying complete
-successful logs, and use narrow process/model checks instead of full machine or
-catalog dumps. Refresh compact context after changes that alter generated packets.
-Re-index the canonical repository after substantial source changes so
-architecture queries reflect the checkout.
+Use representative tests for changed behavior and demonstrated failures. For
+prose and simple configuration, read back the result and review the diff. Reuse
+passing evidence on unchanged inputs. Run affected checks after relevant source
+changes and one complete repository gate on the final integrated candidate;
+diagnose failures and rerun the checks needed by the repair. Root is the sole
+implementer and verifier for the current readiness program and performs a
+separate self-review pass.
+
+Keep durable test output and exit receipts independent of the client output
+pipe. Preserve failed receipts. Use hashes for immutable source custody,
+checkpoint identity, recovery integrity, and required protected-operation checks;
+avoid adding hash manifests for ordinary prose, successful logs, or repeated
+unchanged-state observations. Report concise outcomes and failures. Refresh
+compact context when summarized runtime/generated-packet inputs change; a new
+index timestamp does not make stale runtime evidence current. Refresh a useful
+structural index after substantial source changes when subsequent work needs it.
 
 ## Optional Ox Alpha Help
 
@@ -160,3 +169,13 @@ archives for retired checkouts and the imported public clone live under
 Report the result, changed paths, verification evidence, current runtime posture,
 and the next useful starting file. Use exact absolute paths for workspace handoff
 and relative paths for files inside this repository.
+
+## Current readiness work
+
+Follow the current missing-work table in
+`docs/superpowers/plans/2026-08-30-tradingagents-evidence-first-working-state-completion.md`.
+Keep its research, economic, learning, and six-session acceptance requirements.
+Live control stays frozen, all ten automations stay paused, concurrency stays at
+1, and paper submission defaults to off. Holdout release, optional submission,
+model execution, and additional external operations retain their own established
+authority scope. The completed SEC/Alpaca collection needs no renewed approval.
