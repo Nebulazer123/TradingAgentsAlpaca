@@ -2,6 +2,17 @@ import pytest
 
 from tradingagents.llm_clients import azure_client as azure_mod
 from tradingagents.llm_clients import google_client as google_mod
+from tradingagents.llm_clients import openai_client as openai_mod
+
+
+@pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-astra"])
+def test_current_openai_models_use_responses_with_tools_and_supported_reasoning(monkeypatch, model):
+    captured = {}
+    monkeypatch.setattr(openai_mod, "NormalizedChatOpenAI", lambda **kwargs: captured.update(kwargs))
+    openai_mod.OpenAIClient(model, reasoning_effort="medium", api_key="test-key").get_llm()
+    assert captured["model"] == model
+    assert captured["use_responses_api"] is True
+    assert captured["reasoning_effort"] == "medium"
 
 
 def test_google_gemini_25_minimal_uses_small_positive_thinking_budget(monkeypatch):

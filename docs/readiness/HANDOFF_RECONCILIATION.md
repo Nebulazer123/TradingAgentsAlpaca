@@ -1,5 +1,9 @@
 # Continuation handoffs: current reconciliation
 
+This is the dated readiness-program reconciliation. Its continuation and
+retirement steps apply to those exact handoffs; ordinary task context and
+reporting follow `AGENTS.md` and `START_HERE.md`.
+
 Both the August 30 working-state handoff and September 8 loop-stop handoff were
 read completely on September 30, 2026. Both are retained. The final program
 checkpoint and evidence acceptance are unfinished, so neither final retirement

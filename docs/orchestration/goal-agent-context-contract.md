@@ -1,57 +1,37 @@
-# Goal And Subagent Context Contract
+# Goals and task context
 
-This repo uses Codex goals, hooks, subagents, automations, and n8n as control
-surfaces around the Python TradingAgents system. None of those surfaces may
-submit orders, approve orders, promote sleeves, cancel orders, waive live gates,
-or read secrets.
+A native Codex Goal is a thread-scoped completion contract. Create it only when
+requested. Its objective, current progress, historical evidence, and permanent
+repository rules have separate owners. A goal confers no financial or external
+authority. Hooks must not create, complete, block, or rewrite goals.
 
-## Goal States
+## State
 
-Use these repo-local state names when summarizing goal context in hook packets,
-handoffs, and process reviews:
+Optional context labels remain available to existing hook consumers:
 
-| State | Meaning |
+| Label | Meaning |
 | --- | --- |
-| `goal_absent` | No explicit durable Codex goal is active. Use normal compact orientation. |
-| `goal_active` | A durable goal exists and work should continue against it. |
-| `goal_waiting_for_user` | Progress needs a user decision, credential, hook trust action, or external state change. |
-| `goal_blocked` | The same blocker has repeated long enough that work cannot continue meaningfully without user/external action. |
-| `goal_complete` | The objective is achieved, tests/evals ran, and no required work remains. |
+| `goal_absent` | No explicit Goal; carry out the current task. |
+| `goal_active` | Continue toward the defined outcome using direct evidence. |
+| `goal_waiting_for_user` | A dependent step needs a choice, access, or external change; continue independent work. |
+| `goal_blocked` | Native tool requirements for repeated blocking have been met. |
+| `goal_complete` | Objective checked; no required work remains. |
 
-## Goal Context Rules
+## Context and continuation
 
-When a goal exists:
+Source goals read relevant source and tests. Runtime/readiness goals use existing
+compact summary/flags and the particular packets or controls the task needs.
+Refresh the snapshot when those inputs change or the index is missing/stale;
+ordinary goal lifecycle events do not require a write. Hook warnings help choose
+context and never enforce broker, scheduler, or spending authority.
 
-1. Run `python scripts/automation_context_snapshot.py --write`.
-2. Read `results/_context/latest-summary.json`, `latest-flags.json`, and
-   `recent-deltas.md` before opening raw packets.
-3. Open raw packets only when compact flags name a reason or exact path.
-4. Keep native Codex goal updates human-visible. Hooks may write compact event
-   packets, but hidden hooks must not create, complete, block, or rewrite goals.
-5. Dispatch subagents only with a narrow task boundary and explicit files or
-   result folders to inspect.
+Keep a compact progress record for substantial work: objective, decisions,
+completed changes, useful evidence, exact blocker, and next step. Record deltas
+instead of a fresh global status recap after every turn. Readiness continuation
+uses `docs/readiness/COMPLETION_CONTRACT.md` and its current status page.
 
-## Subagent Output Contract
-
-Every subagent result should return only:
-
-- task result
-- exact files inspected
-- exact files changed
-- tests or commands run
-- compact blocker list
-- raw packets opened and why
-- recommended next inspection point
-
-Subagents should not paste full raw packets, full stdout logs, secrets, full
-Deep Research reports, or entire automation memories into the main thread.
-
-## Hook And Wrapper Proof Boundary
-
-The hooked runner and n8n runner may refresh compact context and write compact
-event packets. They do not bypass `alpaca check`, dry-run, unified live-submit
-guard, risk envelope, stale-data checks, or promotion gates.
-
-Low-risk wrapper proof should start with `context_snapshot` or daily/paper
-observer jobs before any live-adjacent supervisor rollout. Hook trust remains a
-manual Codex UI/CLI action whenever hook files change.
+Give a subagent one bounded question and clear ownership. Its result should
+contain the finding, useful changed paths, relevant checks, and blockers.
+Request exact inspected files or raw-packet details when needed to assess a
+claim; no fixed checklist applies to every result. Keep private evidence and
+large logs in their local owners, linking the material needed for integration.

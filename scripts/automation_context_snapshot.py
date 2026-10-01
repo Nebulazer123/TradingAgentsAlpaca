@@ -3339,73 +3339,18 @@ def rrule_minutes(rrule: str | None) -> int | None:
 
 
 def automation_recommendation(automation_id: str, model: str | None, effort: str | None, rrule: str | None) -> dict[str, Any]:
-    keep_quality_note = "Do not reduce evidence quality; reduce repeated prompt/input context first."
-    if automation_id == "hourly-market-supervisor":
-        return {
-            "pricing_bet": "Keep medium reasoning for normal hourly ticks; require high only when summary flags actions/issues/submissions.",
-            "model_level": model,
-            "reasoning_effort": effort,
-            "frequency": "Hourly is defensible while live supervision is active; consider market-hours-only plus explicit pre/post windows after observing no value from overnight weekend ticks.",
-            "combine_with": "Can share the same compact supervisor prompt as market-window jobs; do not combine with paper tournament execution.",
-            "quality_guard": keep_quality_note,
-        }
-    if automation_id == "paper-strategy-tournament-runner":
-        return {
-            "pricing_bet": "Paper-only quiet ticks can use compact prompt and medium effort; escalate only on submitted paper orders, blockers, or candidate changes.",
-            "model_level": model,
-            "reasoning_effort": effort,
-            "frequency": "Hourly at minute 5 is likely more frequent than needed for strategic sleeve ranking; propose market-hours hourly or every 2 hours unless candidate promotion depends on every tick.",
-            "combine_with": "Can be summarized by context index; keep execution separate from live supervisor.",
-            "quality_guard": full_detail_guard(),
-        }
-    if automation_id == "tradingagents-overnight-planning":
-        return {
-            "pricing_bet": "Keep high reasoning because this is the expensive planning synthesis; save tokens by compacting prompt and using summaries, not by weakening analysis.",
-            "model_level": model,
-            "reasoning_effort": effort,
-            "frequency": "Daily 3 AM run is reasonable; avoid extra reruns unless packet missing/stale/failed.",
-            "combine_with": "Can produce premarket brief in same automation as now.",
-            "quality_guard": keep_quality_note,
-        }
-    if "market-supervisor" in automation_id:
-        return {
-            "pricing_bet": "Use same shared supervisor prompt with time-window focus injected; keep high before/after open, medium near/after close unless flags require escalation.",
-            "model_level": model,
-            "reasoning_effort": effort,
-            "frequency": "Keep four market-window runs; they are event checkpoints, not redundant hourly ticks.",
-            "combine_with": "Combine prompt template with hourly supervisor, not schedules.",
-            "quality_guard": keep_quality_note,
-        }
-    if automation_id == "tradingagents-daily-market-report":
-        return {
-            "pricing_bet": "Daily report can stay medium but should read generated context summary before full packets.",
-            "model_level": model,
-            "reasoning_effort": effort,
-            "frequency": "Once per trading day is sufficient.",
-            "combine_with": "Do not combine with after-close supervisor; report should wait for final packets.",
-            "quality_guard": keep_quality_note,
-        }
-    if automation_id in {"tradingagents-automation-sleep-controller", "tradingagents-automation-wake-controller"}:
-        return {
-            "pricing_bet": "Low reasoning is appropriate because these controllers only inspect calendars/configs and update automation status.",
-            "model_level": model,
-            "reasoning_effort": effort,
-            "frequency": "Twice-daily controller pattern is high leverage: it reduces token-heavy off-hours runs without weakening trading analysis.",
-            "combine_with": "Do not combine the controllers; separate wake/sleep timing keeps status transitions auditable.",
-            "quality_guard": "Keep controllers read-only with respect to repo/trading commands; status updates only.",
-        }
     return {
-        "pricing_bet": "Use compact prompt and escalate only on flags.",
+        "pricing_bet": "Choose models by role and observed quality/cost; this index does not run or change models.",
         "model_level": model,
         "reasoning_effort": effort,
-        "frequency": "No change proposed.",
-        "combine_with": "No safe consolidation identified.",
-        "quality_guard": keep_quality_note,
+        "frequency": "Follow config/automation_schedule_contract.json; no change inferred from this index.",
+        "combine_with": "Preserve role separation and the canonical scheduler.",
+        "quality_guard": full_detail_guard(),
     }
 
 
 def full_detail_guard() -> str:
-    return "Keep full raw packets and drill down on candidate changes, blockers, submissions, or schema mismatch."
+    return "Use task-relevant raw evidence for material actions, failures, or changed decisions."
 
 
 def discover_automation_ids() -> list[str]:
@@ -3618,10 +3563,11 @@ def collect_snapshot(*, refresh: bool = True) -> dict[str, Any]:
     return {
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "repo": str(ROOT),
-        "router": "CONTEXT_ROUTER.md",
+        "router": "START_HERE.md",
+        "historical_router": "CONTEXT_ROUTER.md",
         "read_path": [
             "AGENTS.md",
-            "CONTEXT_ROUTER.md",
+            "START_HERE.md (choose context for the task)",
             "results/_context/latest-summary.json",
             "results/_context/latest-flags.json",
             "Open raw packets only for listed flags or task-specific drilldown.",
@@ -3830,56 +3776,13 @@ def build_recent_deltas() -> str:
 
 
 def proposed_prompt_patterns() -> str:
-    exe = r'C:\Users\Corbin\Documents\Coding projects\TradingAgents-main\.venv\Scripts\tradingagents.exe'
-    return f"""# Automation Prompt Compaction Approval Plan
+    return """# Automation prompt sources
 
-Generated: {dt.datetime.now(dt.timezone.utc).isoformat()}
-
-This is an approval plan, not an applied automation change. It preserves report
-quality by keeping full raw packets and using generated summaries as the first
-read path.
-
-## Shared Compact Header
-
-Use this repo's compact read path before opening large packets:
-`AGENTS.md -> CONTEXT_ROUTER.md -> results/_context/latest-summary.json -> results/_context/latest-flags.json`.
-Open full raw packets only when flags show blockers, issues, submitted actions,
-stale data, graph failures, candidate changes, schema mismatch, or unexplained
-P/L/action changes. Raw packets remain authoritative.
-
-Use the repo executable directly:
-`& "{exe}" ...`
-
-## Proposed Automation Changes
-
-| Automation | Current | Proposed |
-| --- | --- | --- |
-| hourly-market-supervisor | Hourly all days, model gpt-5.5, medium effort, long prompt | Keep schedule for now, replace repeated context with shared header, escalate reasoning only when flags/actions/issues appear. |
-| paper-strategy-tournament-runner | Hourly all days, gpt-5.5 medium | Consider every 2 hours or market-hours-only after approval; keep separate from live supervisor; compact prompt now is safe. |
-| tradingagents-overnight-planning | Daily 3 AM, gpt-5.5 high | Keep high reasoning and daily frequency; compact prompt only. |
-| market-supervisor-15-min-before-open | Weekdays 8:15, gpt-5.5 high | Keep high; compact with shared header plus pre-open focus. |
-| market-supervisor-30-min-after-open | Weekdays 9:00, gpt-5.5 high | Keep high; compact with shared header plus open-window focus. |
-| market-supervisor-30-min-before-close | Weekdays 14:30, gpt-5.5 medium | Keep medium; compact with shared header plus close-prep focus. |
-| market-supervisor-15-min-after-close | Weekdays 15:15, gpt-5.5 medium | Keep medium; compact with shared header plus after-close focus. |
-| tradingagents-daily-market-report | Weekdays 15:30, gpt-5.5 medium | Keep once daily; read summaries first and drill down for report detail only as needed. |
-| tradingagents-automation-sleep-controller | Daily 16:45, gpt-5.5 low | Keep low; high leverage because it pauses token-heavy automations after market work. |
-| tradingagents-automation-wake-controller | Daily 06:45, gpt-5.5 low | Keep low; high leverage because it wakes market-day automations only when useful. |
-| tradingagents-night-shift-supervisor | Overnight patrol, low effort | Keep low and controller-only; it checks status drift and compact flags without running trading commands. |
-| fetch-tradingagents-deep-research-report | One-off Browser/report heartbeat | Treat as follow-up, not a TradingAgents scheduler; do not pause/resume unless explicitly requested. |
-
-## Safe Consolidation
-
-- Combine prompt templates for hourly and four market-window supervisors.
-- Keep execution schedules separate because each window has different market risk.
-- Keep paper tournament separate from live supervisor because it is paper-only.
-- Keep daily report separate because it must wait for after-close packets.
-
-## Changes Requiring Approval
-
-- Any schedule/frequency reduction.
-- Any model downgrade.
-- Any active `C:\\cm\\automations\\...\\automation.toml` prompt rewrite.
-- Any packet schema compaction.
+Maintained source prompts live in `config/automation_prompts/`; their exact
+scheduled text is bound by `config/automation_schedule_contract.json`.
+Load only the running role's procedure in `docs/orchestration/automation-runbook.md`.
+Report material changes, actions and blockers with relevant evidence. This index
+neither changes schedules/models nor grants financial or external authority.
 """
 
 
@@ -3963,13 +3866,13 @@ def main() -> int:
     parser.add_argument("--write", action="store_true", help="write compact context artifacts under results/_context")
     args = parser.parse_args()
 
-    snapshot = collect_snapshot()
     if args.write:
         written = write_context_files()
         print("Wrote context artifacts:")
         for path in written:
             print(f"- {rel(path)}")
         return 0
+    snapshot = collect_snapshot(refresh=False)
     if args.json:
         print(json.dumps(snapshot, indent=2, sort_keys=True))
     else:

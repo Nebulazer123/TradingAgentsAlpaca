@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from tradingagents.llm_clients.model_catalog import get_model_context_window_tokens
 
@@ -78,8 +78,8 @@ class ModelRoutingPolicy:
     windows_local_model: str = "gpt-oss:20b"
     mac_local_model: str = "deepseek-r1:14b"
     gemini_model: str = "gemini-2.5-flash"
-    openai_model: str = "gpt-5.4-mini"
-    codex_intelligent_model: str = "chatgpt-codex"
+    openai_model: str = "gpt-6.1-sol"
+    codex_intelligent_model: str = "gpt-6.1-sol"
 
     @property
     def local_model(self) -> str:
@@ -103,7 +103,10 @@ def _decimal_env(env: Mapping[str, str], name: str, default: Decimal) -> Decimal
     raw = str(env.get(name, "")).strip()
     if not raw:
         return default
-    return Decimal(raw)
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return Decimal("NaN")  # Retain invalid configuration for fail-closed evaluation.
 
 
 def _int_env(env: Mapping[str, str], name: str, default: int) -> int:
@@ -167,9 +170,9 @@ def model_routing_policy_from_env(env: Mapping[str, str]) -> ModelRoutingPolicy:
         ),
         mac_local_model=str(env.get("TRADINGAGENTS_MAC_RESEARCH_MODEL") or "deepseek-r1:14b"),
         gemini_model=str(env.get("TRADINGAGENTS_GEMINI_RESEARCH_MODEL") or "gemini-2.5-flash"),
-        openai_model=str(env.get("TRADINGAGENTS_OPENAI_RESEARCH_MODEL") or "gpt-5.4-mini"),
+        openai_model=str(env.get("TRADINGAGENTS_OPENAI_RESEARCH_MODEL") or "gpt-6.1-sol"),
         codex_intelligent_model=str(
-            env.get("TRADINGAGENTS_CODEX_INTELLIGENT_MODEL") or "chatgpt-codex"
+            env.get("TRADINGAGENTS_CODEX_INTELLIGENT_MODEL") or "gpt-6.1-sol"
         ),
     )
 
@@ -185,15 +188,31 @@ def evaluate_model_budget_caps(
 ) -> list[str]:
     """Return paid-model cap issues. Empty means the paid route is allowed."""
     issues: list[str] = []
-    if model_calls < 0:
-        issues.append("model_calls cannot be negative")
-    if policy.max_model_calls_per_run > 0 and model_calls > policy.max_model_calls_per_run:
+    if type(policy.allow_paid) is not bool or type(policy.allow_openai_paid) is not bool:
+        issues.append("paid opt-in switches must be booleans")
+    cap = policy.max_cost_usd_per_run
+    if not isinstance(cap, Decimal) or not cap.is_finite() or cap <= 0:
+        issues.append("paid routing requires a finite positive per-run dollar cap")
+    for name in ("max_model_calls_per_run", "max_input_tokens_per_run", "max_output_tokens_per_run"):
+        value = getattr(policy, name)
+        if type(value) is not int or value <= 0:
+            issues.append(f"{name} must be a positive integer")
+    monthly = policy.monthly_soft_budget_usd
+    if not isinstance(monthly, Decimal) or not monthly.is_finite() or monthly < 0:
+        issues.append("monthly soft budget must be finite and nonnegative")
+    if not isinstance(monthly_spend_so_far_usd, Decimal) or not monthly_spend_so_far_usd.is_finite() or monthly_spend_so_far_usd < 0:
+        issues.append("monthly spend must be finite and nonnegative")
+    for name, value in (("model_calls", model_calls), ("input_tokens", input_tokens), ("output_tokens", output_tokens)):
+        if (name == "model_calls" or value is not None) and (type(value) is not int or value < 0):
+            issues.append(f"{name} must be a nonnegative integer")
+    if issues:
+        return issues
+    if model_calls > policy.max_model_calls_per_run:
         issues.append(
             f"model calls {model_calls} exceed per-run cap {policy.max_model_calls_per_run}"
         )
     if (
         input_tokens is not None
-        and policy.max_input_tokens_per_run > 0
         and input_tokens > policy.max_input_tokens_per_run
     ):
         issues.append(
@@ -201,7 +220,6 @@ def evaluate_model_budget_caps(
         )
     if (
         output_tokens is not None
-        and policy.max_output_tokens_per_run > 0
         and output_tokens > policy.max_output_tokens_per_run
     ):
         issues.append(
@@ -210,12 +228,10 @@ def evaluate_model_budget_caps(
     if estimated_cost_usd is None:
         issues.append("estimated model cost is unavailable")
     else:
-        if estimated_cost_usd < Decimal("0"):
-            issues.append("estimated model cost cannot be negative")
-        if (
-            policy.max_cost_usd_per_run > Decimal("0")
-            and estimated_cost_usd > policy.max_cost_usd_per_run
-        ):
+        if not isinstance(estimated_cost_usd, Decimal) or not estimated_cost_usd.is_finite() or estimated_cost_usd <= 0:
+            issues.append("estimated paid-model cost must be finite and positive")
+            return issues
+        if estimated_cost_usd > policy.max_cost_usd_per_run:
             issues.append(
                 f"estimated cost {estimated_cost_usd} exceeds per-run cap {policy.max_cost_usd_per_run}"
             )
@@ -243,7 +259,7 @@ def _budget_blocked_route(
         route=route,
         status="blocked",
         reason=reason,
-        estimated_cost_usd=estimated_cost_usd or Decimal("0"),
+        estimated_cost_usd=(estimated_cost_usd if isinstance(estimated_cost_usd, Decimal) and estimated_cost_usd.is_finite() and estimated_cost_usd >= 0 else Decimal("0")),
         role=role,
         paid=False,
         can_use_connectors=False,

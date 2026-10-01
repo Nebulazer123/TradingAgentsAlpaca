@@ -534,19 +534,29 @@ def test_installed_execution_board_prompt_owns_decision_but_not_execution():
     automation = tomllib.loads(path.read_text(encoding="utf-8"))
     prompt = automation["prompt"]
 
-    assert "own HOLD-versus-SELL trade decisions" in prompt
-    assert "do not own execution or order submission" in prompt
-    assert "missing, stale, malformed, contradictory" in prompt
-    assert "record autonomous HOLD" in prompt
-    assert "separate execution intent" in prompt
-    assert "Never change strategy, risk, or promotion settings" in prompt
-    assert "Never freeze, refresh, re-arm, or unfreeze live control" in prompt
-    assert "freeze live trading" not in prompt
+    source = Path("config/automation_prompts/tradingagents-autonomous-execution-board.md").read_text()
+    assert prompt == source
+    assert "can_submit_orders=false" in prompt and "analysis-only" in prompt
+    runbook = Path("docs/orchestration/automation-runbook.md").read_text()
+    board_scope = runbook.split("## Execution BOARD", 1)[1].split("## Safety sentinel", 1)[0]
+    assert "execution_authority=none" in board_scope
+    assert "does not include orders, policy edits, or control writes" in board_scope
     assert automation["notification_policy"] == "failed_runs_only"
     # The installed paused record must match the versioned Central-time contract.
     assert automation["rrule"] == (
         "RRULE:FREQ=WEEKLY;BYHOUR=8,9,10,11,12,13,14;BYMINUTE=50;BYDAY=MO,TU,WE,TH,FR"
     )
+
+
+def test_runtime_read_path_selects_task_context_and_retains_machine_authority(tmp_path, monkeypatch):
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    _write_valid_autonomous_contract(config_dir)
+    summary = _compact_context(tmp_path, monkeypatch)
+    assert "CONTEXT_ROUTER.md" not in summary["read_path"]
+    assert any("START_HERE.md" in entry for entry in summary["read_path"])
+    assert summary["execution_authority"] == "paper"
+    assert "flags" in summary and "latest_packets" in summary
 
 
 def test_incident_summary_projects_only_structural_blocker_presence(

@@ -257,23 +257,25 @@ def test_hook_script_env_event_takes_precedence(monkeypatch):
     assert module._detect_event({"hook_event_name": "SessionStart"}) == "Stop"
 
 
-def test_goal_agent_context_contract_documents_states_and_output_rules():
-    doc_path = Path("docs/orchestration/goal-agent-context-contract.md")
-    text = doc_path.read_text(encoding="utf-8")
+def test_lifecycle_hook_is_silent_and_does_not_load_runtime(monkeypatch, capsys):
+    module = _load_token_context_hook_module()
+    monkeypatch.delenv("CODEX_HOOK_EVENT", raising=False)
+    def unexpected(*args, **kwargs):
+        raise AssertionError("lifecycle events must not read or rewrite runtime context")
+    monkeypatch.setattr(module, "load_compact_context", unexpected)
+    for event in ("SessionStart", "SubagentStart", "PostCompact", "Stop"):
+        monkeypatch.setattr(module, "_read_payload", lambda event=event: {"event": event})
+        assert module.main() == 0
+    assert capsys.readouterr().out == ""
 
-    for state in (
-        "goal_absent",
-        "goal_active",
-        "goal_waiting_for_user",
-        "goal_blocked",
-        "goal_complete",
-    ):
-        assert state in text
-    for phrase in (
-        "exact files inspected",
-        "exact files changed",
-        "tests or commands run",
-        "raw packets opened and why",
-        "must not create, complete, block, or rewrite goals",
-    ):
-        assert phrase in text
+
+def test_source_tool_hook_emits_no_runtime_status(monkeypatch, tmp_path, capsys):
+    module = _load_token_context_hook_module()
+    monkeypatch.delenv("CODEX_HOOK_EVENT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(module, "_read_payload", lambda: {
+        "event": "PreToolUse", "tool_input": {"cmd": "cat tradingagents/default_config.py"},
+    })
+    assert module.main() == 0
+    assert capsys.readouterr().out == ""
+    assert list(tmp_path.iterdir()) == []

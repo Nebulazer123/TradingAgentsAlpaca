@@ -66,9 +66,9 @@ cost if any, and why it is needed.
 The immediate deployment target is the existing frozen observer phase. It can
 produce labeled forecasts and reports while new results accumulate. The
 [launch preparation](LAUNCH_CARD.md) lists the seven intended observer jobs,
-three jobs that stay paused, proposed current model assignments and explicit
-planning estimates. These updates are prepared for review and have not been
-applied. The existing launch prerequisites remain in force.
+three jobs that stay paused, saved role model assignments and explicit
+planning estimates. The harness prompt/model refresh is recorded in
+[the modernization report](../harness/2026-10-01-modernization.md); it grants no activation authority. The existing launch prerequisites remain in force.
 
 The owner also authorized one public AAPL comparison using GPT-6 Luna and
 GPT-6.1 Sol through Codex and the OpenAI API, capped at USD 1. Both subscription
@@ -88,3 +88,5 @@ The [continuation record](../superpowers/checkpoints/2026-09-30-readiness-contin
 records what changed and the supporting checks. Readiness remains unestablished
 until all required gates are satisfied; a reliable negative study result is
 acceptable, missing evidence is not completion.
+
+Detailed dated work and evidence references: [PROGRESS.md](PROGRESS.md).

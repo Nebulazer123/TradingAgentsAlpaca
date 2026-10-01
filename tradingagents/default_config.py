@@ -110,8 +110,8 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "memory_log_max_entries": None,
     # LLM settings
     "llm_provider": "openai",
-    "deep_think_llm": "gpt-5.4",
-    "quick_think_llm": "gpt-5.4-mini",
+    "deep_think_llm": "gpt-6.1-sol",
+    "quick_think_llm": "gpt-6-luna",
     "llm_timeout_seconds": 120.0,
     "llm_max_retries": 2,
     "llm_max_output_tokens": 4096,
