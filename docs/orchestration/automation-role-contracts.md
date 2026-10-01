@@ -72,11 +72,35 @@ weekday market-session reliability controller, not a fictitious 24/7 service.
 | `tradingagents-daily-report` | Weekdays 15:30 | Luna / medium | BOARD |
 | `tradingagents-automation-sleep-controller` | Weekdays 16:45 | Luna / medium | Daily report |
 
-The currently observed external RRULEs are not yet the deployment proof for
-this matrix.  The existing one-hour schedule drift, the self-healer's `24/7`
-claim, and the scheduled-paper dry-run issue are intentionally reported rather
-than silently normalized.  Any external correction remains `PAUSED` until a
-separate API-confirmed, no-submit shadow validation completes.
+Matching external schedule fields are still not deployment proof for this
+matrix. Historical one-hour drift, the self-healer's `24/7` wording and the
+scheduled-paper dry-run defect have been corrected in the preserved current
+records/source; use the read-only evaluator below to report any fresh drift,
+rather than treating that old diagnosis as current. All ten records remain
+`PAUSED`; separate API-confirmed, no-submit shadow validation is still required.
+
+## One scheduling owner; explicit side effects
+
+The old six-job launchd installer is retired. Its Eastern-time assumptions and
+different cadence must not create a competing scheduler on this Central-time
+Mac. `scripts/mac/install_launchd.sh --help` explains the current contract; all
+other invocations fail closed without installing, removing or changing anything.
+This retirement does not remove the independently installed localhost n8n runner,
+which serves allowlisted jobs but is not itself the ten-job schedule. Existing
+services and automation TOMLs are not mutated by this source correction.
+
+The job wrapper remains available for approved manual or Codex-scheduled use:
+
+- `preopen` always uses the supervisor's `--dry-run`, even if its caller has
+  `TA_LIVE_SUBMIT=1`, and never drains the outbox.
+- `hourly` with `TA_LIVE_SUBMIT=0` is dry-run and never drains queued messages.
+- Explicit `hourly` action mode retains its guarded CLI action request and
+  notification delivery. The current hourly CLI still hard-disables direct live
+  orders; setting an environment flag or unfreezing alone does not change that.
+- `tournament` remains explicitly dry-run. The existing `daily-report` and
+  `deliver-outbox` jobs retain their separately authorized reporting/delivery
+  behavior. Analysis-only does not automatically mean a command has no local
+  packet-writing or external read effects.
 
 ## Read-only verification
 

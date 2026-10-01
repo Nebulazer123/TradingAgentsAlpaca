@@ -149,6 +149,31 @@ def test_runner_executes_distinct_sec_extraction_and_cohort_fts5_routes(tmp_path
         run_registered_research_benchmark(registration=registration, lane_results=[forged], artifact_root=root)
 
 
+def test_registered_runner_allows_distinct_questions_on_one_retained_page(tmp_path):
+    root, cases, _registration = _fixture(tmp_path)
+    shared = cases[800]  # Workflow question; all 500 distinct filing pages stay intact.
+    shared["byte_start"], shared["byte_end"] = cases[0]["byte_start"], cases[0]["byte_end"]
+    shared["adapter_query"] = json.dumps({"json_path": ["search_token"], "fts_query": "unique0000"})
+    shared["expected_answer"] = "unique0000"
+    shared["expected_answer_sha256"] = hashlib.sha256(b"unique0000").hexdigest()
+    registration = build_research_qualification_registration(
+        cases, minimum_accuracy_gain="0.001", lane_cost_budgets_usd={lane: "10" for lane in LANE_ORDER}, lane_specs=_specs(),
+    )
+    lanes = [_lane(name, cases, root) for name in ("deterministic_sec_xbrl", "metadata_fts5_bm25", "metadata_fts5_bm25_no_text")]
+    for lane in lanes:
+        lane["case_outputs"][800] = _output(shared, "unique0000", lane["lane_id"], root)
+    twin = lanes[-1]
+    receipt = run_registered_research_benchmark(
+        registration=registration, lane_results=lanes, artifact_root=root,
+        lane_adapters={twin["lane_id"]: _adapter(twin["case_outputs"])},
+    )
+    metadata = next(row for row in receipt["lane_results"] if row["lane_id"] == "metadata_fts5_bm25")
+    assert metadata["qualified"] is True
+    assert len(metadata["case_outputs"]) == 1400
+    assert metadata["case_outputs"][800]["correct"] is True
+    assert receipt["selected_lane"] == "deterministic_sec_xbrl"
+
+
 def test_failed_deterministic_prerequisite_calls_no_adapters_regardless_order(tmp_path):
     root, cases, registration = _fixture(tmp_path, wrong_expected=8)
     deterministic = _lane("deterministic_sec_xbrl", cases, root)

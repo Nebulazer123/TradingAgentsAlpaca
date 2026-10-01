@@ -12,7 +12,11 @@ from collections.abc import Callable, Mapping, Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from tradingagents.dataflows.pit.official_observations import _json_mapping, _select_json
+from tradingagents.dataflows.pit.official_observations import (
+    _json_mapping,
+    _normalize_source_value,
+    _select_json,
+)
 from tradingagents.research.memory import contains_sensitive_text
 
 AUTHORITY = {"analysis_only": True, "execution_authority": "none", "can_submit_orders": False}
@@ -240,6 +244,8 @@ def _extract(case: Mapping[str, object], raw: bytes) -> str:
     try:
         value = _json_mapping(raw, label="benchmark SEC/XBRL")
         value = _select_json(value, tuple(_query(case)["json_path"]), label="benchmark SEC/XBRL answer")
+        if type(value) is Decimal:
+            value = _normalize_source_value(value)
     except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError, UnicodeError) as exc:
         raise ResearchQualificationBenchmarkError("SEC/XBRL extraction failed") from exc
     if type(value) not in {str, int, float}:
@@ -250,17 +256,27 @@ def _extract(case: Mapping[str, object], raw: bytes) -> str:
 def _bm25_answers(cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes]) -> dict[str, str | None]:
     db = sqlite3.connect(":memory:")
     try:
-        db.execute("CREATE VIRTUAL TABLE documents USING fts5(case_id UNINDEXED, artifact_id UNINDEXED, medium UNINDEXED, body)")
+        db.execute("CREATE VIRTUAL TABLE documents USING fts5(unit_id UNINDEXED, artifact_id UNINDEXED, medium UNINDEXED, body)")
+        unit_by_case: dict[str, str] = {}
+        retained_units: dict[str, bytes] = {}
         for case_id in sorted(cases):
             case = cases[case_id]
-            db.execute("INSERT INTO documents VALUES (?, ?, ?, ?)", (case_id, case["artifact_id"], case["medium"], sources[case_id].decode()))
+            unit_id = _digest((case["artifact_sha256"], case["byte_start"], case["byte_end"]))
+            unit_by_case[case_id] = unit_id
+            source = sources[case_id]
+            if unit_id in retained_units:
+                if retained_units[unit_id] != source:
+                    raise ResearchQualificationBenchmarkError("one retained source unit has inconsistent bytes")
+                continue
+            retained_units[unit_id] = source
+            db.execute("INSERT INTO documents VALUES (?, ?, ?, ?)", (unit_id, case["artifact_id"], case["medium"], source.decode()))
         answers: dict[str, str | None] = {}
         for case_id in sorted(cases):
             found = db.execute(
-                "SELECT case_id, body FROM documents WHERE documents MATCH ? ORDER BY bm25(documents), case_id LIMIT 1",
+                "SELECT unit_id, body FROM documents WHERE documents MATCH ? ORDER BY bm25(documents), unit_id LIMIT 1",
                 (_query(cases[case_id])["fts_query"],),
             ).fetchone()
-            answers[case_id] = None if found is None or found[0] != case_id else _extract(cases[case_id], str(found[1]).encode())
+            answers[case_id] = None if found is None or found[0] != unit_by_case[case_id] else _extract(cases[case_id], str(found[1]).encode())
         return answers
     except (UnicodeError, sqlite3.Error) as exc:
         raise ResearchQualificationBenchmarkError("FTS5/BM25 execution failed") from exc
