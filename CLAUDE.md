@@ -1,12 +1,6 @@
 # TradingAgents instructions for Claude
 
-Read [AGENTS.md](AGENTS.md) for current workspace, task routing, authority,
-verification, and evidence rules. Use [START_HERE.md](START_HERE.md) for workspace
-identity. Open only the source and reference sections the current task needs.
-
-The former July operating audit is preserved in
-[the historical reference](docs/history/2026-09-14-preserved-claude-operating-audit.md).
-It is not current runtime state or permission to submit orders, re-arm live
-control, change schedules, send messages, spend, or load models. Current user
-authorization and the complete call-time policy and execution path govern
-protected operations.
+Use `AGENTS.md` as the shared repository guidance and `START_HERE.md` as the workspace entry point.
+Read only the source and supporting documentation relevant to the current task. Do not duplicate repository policy here; narrower or repeatable workflows belong in the appropriate skill, runbook, or subsystem guidance.
+Historical reports, audits, handoffs, and generated status files describe their recorded state. Use current source, runtime evidence, and applicable policy when current behavior or authority matters.
+Follow the repository's delta-reporting rule: report material changes and blockers rather than repeating unchanged global status.
