@@ -63,6 +63,31 @@ issuer/ticker metadata rows, original SHA-256
 It supplies issuer metadata only; it does not close any class or dated identity
 gap. No source originals or keys are published.
 
+## Current free crosswalk profiles
+
+Three later free requests captured five OpenFIGI mappings and two whole Nasdaq
+listing files at **10:57:35–36 UTC**. The current type/profile reopener retains
+all **5,633 Nasdaq-listed + 7,661 other-listed = 13,294 rows**. Ten other-listed
+rows use exchange codes F/M outside the current published definition table.
+The first whole-original replay rejected those codes; its failure remains
+retained. The repaired reader preserves the rows and explicit unmapped venue
+gaps. The publisher's footer wall clock remains without an assigned time zone.
+
+The observed OpenFIGI label pairs normalize AAPL/GOOG/GOOGL to common stock and
+TSM to ADR. SPY's broad ETP/Mutual Fund pair remains unknown. GOOG and GOOGL have
+distinct returned share-class FIGIs. The five normalized type assertions reopen
+both the original outgoing request and complete response. Their dates remain
+null and their internal subjects have no reviewed crosswalk. No source facts
+were silently copied into the frozen Alpaca v3 population accounting.
+
+[Source-profile rules](../../data/SECURITY_SOURCE_PROFILES.md) describe the new
+explicit normalization parser and unchanged direct-parser replay. Originals,
+profiles and assertions are private under `free-crosswalk-original-replay-v2/`.
+Population-wide classifications/prices, dated listing/alias/class relationships
+and effective-event coverage remain open. A future cohort using these extra
+families requires a prospectively frozen policy; the existing v3 policy is not
+backdated or expanded.
+
 ## Additive source capabilities
 
 - `security_master/v2` reopens original JSON fields, keeps issuer, security,
@@ -113,7 +138,7 @@ invalid telemetry, changed runners and sensitive inputs reject qualification.
 Source bundles remain equal across lanes and gold remains outside model input.
 The original zero budgets are retained. No model or 1,400-case rerun occurred.
 The full-graph supplemental registration is written after source freeze under
-`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2/`,
+`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2-final/`,
 binding the final clean revision and unchanged dependency lock. It grants no
 model execution authority.
 
@@ -147,9 +172,14 @@ the later parser migration; 235 integrated benchmark/source/media/client checks;
 population checks; and the additional original-leg tournament admission checks.
 These groups overlap and must not be added into a unique suite count. Mocked
 model responses and synthetic calendars establish source behavior only.
+The first continuation candidate `ced5545` passed six static checks, then its
+full suite was deliberately interrupted at the source-profile integration
+boundary. Its durable exit 130 and withdrawal reason remain retained; it is not
+an accepted candidate. The additional 124 profile/master/archive/population
+checks passed after the original-backed normalization repair.
 Failed attempts remain retained. At this pre-freeze checkpoint the final complete
 integrated source gate has not yet run. The subsequent candidate-bound receipt
-under `results/readiness_continuation/20261002-continuation-implementation/source-gate-final/`
+under `results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v2/`
 owns final source acceptance; only its recorded completed successful exits
 establish a passing gate.
 

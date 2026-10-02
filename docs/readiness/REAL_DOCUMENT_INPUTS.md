@@ -221,7 +221,7 @@ verdict. Gold remains outside model input and compared source bytes remain equal
 The affected integrated benchmark/media/client/checkpoint group passed 235 checks
 with mocked model/subprocess responses. No real model or corpus rerun occurred.
 The supplemental graph receipt under the private
-`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2/`
+`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2-final/`
 binds the final clean source revision. It does not execute a graph.
 See [the October 2 evidence checkpoint](../superpowers/checkpoints/2026-10-02-continuation-source-and-data.md)
 for registration hashes and remaining economic/operational gates.

@@ -11,7 +11,8 @@ from `d1cd3ee40002660ca4cb116ca69240e7aa376ae5`, with a distinct self-review.
 [The source-owner comparison](../research/handoffs/2026-10-01/ALPACA_SOURCE_OWNER_COMPARISON.md)
 is complete. The additive Alpaca probe, original-backed security-master v2,
 frozen population contract, exhaustive discovery accounting, original action
-valuation/outcome path and strict intent JSON reload repair are integrated.
+valuation/outcome path, actual OpenFIGI/Nasdaq source profiles and strict intent
+JSON reload repair are integrated.
 The owner authorized actual bounded source reads. The separate discovery capture
 contains 33,555 records: 20,356 source-supported exclusions and 13,199 unresolved
 potential candidates. No cohort is admitted. New benchmark registrations use the
@@ -19,9 +20,10 @@ versioned Codex subscription route; no model run occurred.
 
 [The October 2 evidence checkpoint](../superpowers/checkpoints/2026-10-02-continuation-source-and-data.md)
 records actual capture times, policy/source hashes, original-row accounting,
+the additional five current type observations and 13,294 Nasdaq source rows,
 focused checks, the full 6,244-row learning audit and remaining prerequisites.
 Final source acceptance is recorded against the frozen commit in the private
-`results/readiness_continuation/20261002-continuation-implementation/source-gate-final/receipt.json`.
+`results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v2/receipt.json`.
 Only its completed successful exits establish candidate acceptance. The original
 packet, source/ledger originals and failed check receipts remain preserved.
 
@@ -48,7 +50,7 @@ serving identity and subscription cost. Historical OpenRouter and v4/v5/v6 repla
 remain supported. The frozen migration retains the exact 1,400-case v6 material
 and zero budgets. It is source-path evidence, not a new model-quality result.
 The graph supplement binds the frozen clean candidate in the private
-`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2/`
+`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2-final/`
 receipt. Registration does not execute a model.
 
 Harness prompt/model refresh is recorded separately in
@@ -65,7 +67,10 @@ capture, for the October 5 13:00 UTC prospective cutoff. Discovery completion
 does not supply common-share class, dated identity, whole-population pricing or
 effective-event coverage. The source-original action path retains unavailable
 returns while those gaps remain. The donor's original offline/synthetic evidence
-keeps its original scope.
+keeps its original scope. The additional current metadata profiles leave dated
+relationships unknown and do not change the frozen v3 accounting. The first
+continuation candidate `ced5545` was withdrawn before its full suite completed;
+its exit 130, static passes and reason remain preserved.
 
 The Phase 4, LangGraph checkpoint, learning-reporting, and initial benchmark and
 readiness source are integrated. The earlier source gate passed 5,005 tests and

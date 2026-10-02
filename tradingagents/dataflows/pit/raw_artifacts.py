@@ -44,6 +44,7 @@ _CONTENT_TYPES = frozenset(
         "application/xhtml+xml",
         "application/xml",
         "text/html",
+        "text/plain",
         "text/xml",
     }
 )

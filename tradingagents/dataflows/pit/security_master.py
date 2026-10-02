@@ -25,6 +25,7 @@ from tradingagents.dataflows.pit.records import PointInTimeDataError
 
 SCHEMA = "security_master/v2"
 PARSER_VERSION = "security_master_json_fields/v1"
+_PROFILE_PARSER_VERSION = "security_master_openfigi_label_pair/v1"
 _AUTHORITY = {"analysis_only": True, "execution_authority": "none", "can_submit_orders": False}
 _KINDS = {
     "issuer": {"name", "cik"},
@@ -236,6 +237,7 @@ class _Replay:
         self.sources: dict[str, tuple[dict, object]] = {}
         self.verified: dict[str, SecurityMasterAssertionV2] = {}
         self.visiting: set[str] = set()
+        self.profiles: dict[tuple[str, str], dict] = {}
 
     def source(self, identifier: str) -> tuple[dict, object]:
         if identifier not in self.sources:
@@ -246,17 +248,47 @@ class _Replay:
         return self.sources[identifier]
 
     def derive(self, *, subject_kind: str, subject_id: str, field: str, raw_artifact_id: str, source_field_paths: dict,
-               derivation_mode: str, correction_parents: Sequence[str]) -> SecurityMasterAssertionV2:
+               derivation_mode: str, correction_parents: Sequence[str], source_profile_binding: dict | None = None) -> SecurityMasterAssertionV2:
         _subject(subject_kind, subject_id)
         paths = _paths(source_field_paths)
-        if type(derivation_mode) is not str or derivation_mode not in {"direct", "historical_reconstruction"}:
+        if type(derivation_mode) is not str or derivation_mode not in {"direct", "historical_reconstruction", "source_profile_normalization"}:
             raise PointInTimeDataError("unsupported security-master derivation mode")
+        if (source_profile_binding is not None) != (derivation_mode == "source_profile_normalization"):
+            raise PointInTimeDataError("profile normalization requires its explicit original binding")
         if type(correction_parents) not in {list, tuple} or len(correction_parents) > 128 or any(type(item) is not str or _ASSERTION_ID.fullmatch(item) is None for item in correction_parents):
             raise PointInTimeDataError("invalid security-master correction parents")
         if list(correction_parents) != sorted(set(correction_parents)):
             raise PointInTimeDataError("security-master correction parents must be unique and sorted")
         artifact, payload = self.source(raw_artifact_id)
         facts = {name: None if path is None else _plain(_select(payload, path)) for name, path in paths.items()}
+        if source_profile_binding is not None:
+            binding = source_profile_binding
+            expected = {"profile_family", "request_artifact_id", "response_artifact_id", "profile_id", "profile_sha256", "mapping_job_index", "mapping_record_index"}
+            if (type(binding) is not dict or set(binding) != expected or subject_kind != "security" or field != "security_type"
+                    or binding["profile_family"] != "openfigi_current_us_ticker/v1" or binding["response_artifact_id"] != raw_artifact_id
+                    or type(binding["mapping_job_index"]) is not int or type(binding["mapping_record_index"]) is not int
+                    or binding["mapping_job_index"] < 0 or binding["mapping_record_index"] < 0
+                    or paths["value"] != [binding["mapping_job_index"], "data", binding["mapping_record_index"], "securityType"]
+                    or any(paths[name] is not None for name in _PATH_FIELDS - {"value"})):
+                raise PointInTimeDataError("security-master source profile scope differs")
+            from tradingagents.dataflows.pit.security_source_profiles import build_openfigi_mapping_source_profile
+
+            pair = binding["request_artifact_id"], raw_artifact_id
+            if type(pair[0]) is not str:
+                raise PointInTimeDataError("security-master original mapping request is invalid")
+            if pair not in self.profiles:
+                self.profiles[pair] = build_openfigi_mapping_source_profile(archive=self.archive, request_artifact_id=pair[0], response_artifact_id=pair[1])
+            profile = self.profiles[pair]
+            if profile["profile_id"] != binding["profile_id"] or profile["profile_sha256"] != binding["profile_sha256"]:
+                raise PointInTimeDataError("security-master source profile identity differs")
+            try:
+                job = profile["results"][binding["mapping_job_index"]]
+                mapped = job["records"][binding["mapping_record_index"]]
+            except IndexError as exc:
+                raise PointInTimeDataError("security-master mapping slot is unavailable") from exc
+            if job["result_status"] != "observed_unique_current_mapping":
+                raise PointInTimeDataError("security-master current mapping is ambiguous")
+            facts["value"] = mapped["normalized_security_type"]
         facts["value"] = _value(subject_kind, field, facts["value"])
         for name in ("effective_from", "effective_to", "coverage_through"):
             if facts[name] is not None:
@@ -281,6 +313,8 @@ class _Replay:
                   "retrieved_at": artifact["retrieved_at"], "archive_recorded_at": artifact["archive_recorded_at"], "raw_artifact": artifact,
                   "source_field_paths": paths, "parser_version": PARSER_VERSION, "derivation_mode": derivation_mode,
                   "correction_parents": list(correction_parents), "derivation_parent_hashes": parents, **_AUTHORITY}
+        if source_profile_binding is not None:
+            record.update(parser_version=_PROFILE_PARSER_VERSION, source_profile_binding=dict(source_profile_binding))
         record["assertion_id"] = "security-master-assertion-" + hashlib.sha256(_canonical(record)).hexdigest()
         return _assertion(record)
 
@@ -297,7 +331,8 @@ class _Replay:
                 raise PointInTimeDataError("security-master requires an exact original artifact receipt")
             rebuilt = self.derive(subject_kind=payload["subject_kind"], subject_id=payload["subject_id"], field=payload["field"],
                                   raw_artifact_id=artifact["raw_artifact_id"], source_field_paths=payload["source_field_paths"],
-                                  derivation_mode=payload["derivation_mode"], correction_parents=payload["correction_parents"])
+                                  derivation_mode=payload["derivation_mode"], correction_parents=payload["correction_parents"],
+                                  source_profile_binding=payload.get("source_profile_binding"))
             if rebuilt.canonical_json_bytes() != _canonical(payload):
                 raise PointInTimeDataError("security-master assertion differs from its reopened original derivation")
             self.verified[identifier] = rebuilt
@@ -312,7 +347,9 @@ def _registry(records: Sequence[object]) -> dict[str, dict]:
     result = {}
     for value in records:
         payload = value.to_dict() if type(value) is SecurityMasterAssertionV2 else value
-        if type(payload) is not dict or set(payload) != _FIELDS or payload["schema_version"] != SCHEMA or payload["parser_version"] != PARSER_VERSION:
+        if (type(payload) is not dict or payload.get("schema_version") != SCHEMA
+                or type(payload.get("parser_version")) is not str or payload.get("parser_version") not in {PARSER_VERSION, _PROFILE_PARSER_VERSION}
+                or set(payload) != (_FIELDS | {"source_profile_binding"} if payload.get("parser_version") == _PROFILE_PARSER_VERSION else _FIELDS)):
             raise PointInTimeDataError("security-master assertion fields or version differ")
         if any(type(payload[name]) is not type(expected) or payload[name] != expected for name, expected in _AUTHORITY.items()):
             raise PointInTimeDataError("security-master assertion authority is fixed")
@@ -325,10 +362,12 @@ def _registry(records: Sequence[object]) -> dict[str, dict]:
 
 def build_security_master_assertion(*, archive: RawPointInTimeArtifactArchive, subject_kind: str, subject_id: str, field: str,
                                     raw_artifact_id: str, source_field_paths: dict, derivation_mode: str = "direct",
-                                    correction_parents: Sequence[str] = (), prior_assertions: Sequence[object] = ()) -> SecurityMasterAssertionV2:
+                                    correction_parents: Sequence[str] = (), prior_assertions: Sequence[object] = (),
+                                    source_profile_binding: dict | None = None) -> SecurityMasterAssertionV2:
     replay = _Replay(archive, _registry(prior_assertions))
     return replay.derive(subject_kind=subject_kind, subject_id=subject_id, field=field, raw_artifact_id=raw_artifact_id,
-                         source_field_paths=source_field_paths, derivation_mode=derivation_mode, correction_parents=correction_parents)
+                         source_field_paths=source_field_paths, derivation_mode=derivation_mode, correction_parents=correction_parents,
+                         source_profile_binding=source_profile_binding)
 
 
 def verify_security_master_assertions(records: Sequence[object], *, archive: RawPointInTimeArtifactArchive) -> tuple[SecurityMasterAssertionV2, ...]:
@@ -347,7 +386,7 @@ def build_security_master_assertions(requests: Sequence[dict], *, archive: RawPo
     records = []
     expected = {"subject_kind", "subject_id", "field", "raw_artifact_id", "source_field_paths", "derivation_mode", "correction_parents"}
     for request in requests:
-        if type(request) is not dict or set(request) != expected:
+        if type(request) is not dict or set(request) not in (expected, expected | {"source_profile_binding"}):
             raise PointInTimeDataError("security-master batch request fields differ")
         record = replay.derive(**request)
         if record.assertion_id in replay.registry:

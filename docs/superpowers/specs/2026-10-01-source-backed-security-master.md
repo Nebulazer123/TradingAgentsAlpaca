@@ -132,3 +132,17 @@ sources, missing/late events, delisting without proceeds, altered originals and
 append-only corrections. Serialize and reopen each assertion; any changed fact,
 path, clock, parent or hash must fail verification. These checks prove software
 behavior and no historical/population coverage.
+
+## Genuine current metadata profiles — October 2
+
+`security_source_profiles.py` now reopens actual OpenFIGI request/response slots
+and Nasdaq whole-file layouts. The explicit OpenFIGI label-pair parser can
+produce original-backed normalized type assertions while the earlier direct
+JSON parser remains byte-compatible. Unknown or broad types, ambiguous matches,
+undocumented exchange codes and missing date/zone fields remain visible.
+
+The diagnostic captured five mappings and 13,294 independent directory rows.
+It does not establish a provider-to-share-class relationship or dated interval.
+The frozen Alpaca v3 campaign and all of its dispositions are unchanged. A
+future campaign using these additional families needs prospective policy freeze
+and qualified coverage; source agreement alone does not admit a cohort.

@@ -55,7 +55,7 @@ The earlier combined source passed its [full gate](../superpowers/checkpoints/20
 The October 2 continuation adds reviewed source capture, complete directory
 accounting, original action/outcome checks, v7 subscription registration and the
 JSON reload repair. Its final candidate-bound gate receipt is under the private
-`results/readiness_continuation/20261002-continuation-implementation/source-gate-final/`.
+`results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v2/`.
 Only recorded completed successful exits establish source acceptance. The fresh readback
 still says `NOT_ESTABLISHED`: 13,199 candidates lack required identity/pricing
 evidence and no study cohort is admitted.
