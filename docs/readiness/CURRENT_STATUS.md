@@ -91,7 +91,7 @@ Follow the
 [full continuation plan](../superpowers/plans/2026-10-01-tradingagents-research-and-readiness-continuation.md)
 from current source owners. The source comparison is complete, and the v3 policy
 was frozen before complete discovery for the October 5 prospective cutoff.
-The final candidate's private `results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v2/receipt.json`
+The final candidate's private `results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v3/receipt.json`
 records its source acceptance. Only completed successful exits cover the new
 changes; the older accepted source gate covers its recorded candidate.
 

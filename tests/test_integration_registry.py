@@ -183,3 +183,27 @@ def test_example_registry_matches_default_integration_names():
     example_names = {item["name"] for item in load_integration_registry(example_path)}
 
     assert example_names == default_names
+
+
+def test_subscription_and_probe_registry_require_runtime_checks_without_authority():
+    report = build_integration_registry_report(env={"ALPACA_PAPER_API_KEY": "private-paper-key", "ALPACA_PAPER_SECRET_KEY": "private-paper-secret"})
+    by_name = {item["name"]: item for item in report["integrations"]}
+    for name in ("codex", "alpaca_source_probe"):
+        item = by_name[name]
+        assert item["status"] == "requires_runtime_check"
+        assert item["runtime_check_required"] is True
+        assert item["write_authority"] == item["trading_authority"] == "none"
+    assert by_name["codex"]["env"] == {}
+    assert by_name["codex"]["cost_tier"] == "chatgpt_subscription_allocation_unknown"
+    assert by_name["alpaca_source_probe"]["read_authority"] == "explicit_opt_in_fixed_endpoint_gets"
+    assert report["execution_authority"] == "none" and report["can_submit_orders"] is False
+    serialized = json.dumps(report)
+    assert "private-paper-key" not in serialized and "private-paper-secret" not in serialized
+
+
+def test_example_registry_matches_probe_and_subscription_boundaries():
+    default = _default_registry_by_name()
+    example_path = Path(__file__).resolve().parents[1] / "config/research_integrations.example.json"
+    example = {item["name"]: item for item in load_integration_registry(example_path)}
+    for name in ("codex", "alpaca_source_probe"):
+        assert example[name] == default[name]

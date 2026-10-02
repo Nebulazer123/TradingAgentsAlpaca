@@ -561,10 +561,10 @@ def _production_http_mutation_occurrences(
 _HTTP_MUTATION_CLASSIFICATIONS: dict[tuple[str, int, str, str], str] = {
     # These are deliberately exact source locations, rather than a module or
     # receiver allow-list.  A new raw write must get reviewed classification.
-    ("cli/main.py", 6716, "_overnight_ticker_process_main", "raw-http-put"): (
+    ("cli/main.py", 6729, "_overnight_ticker_process_main", "raw-http-put"): (
         "non-trading-local-process-result-queue"
     ),
-    ("cli/main.py", 6728, "_overnight_ticker_process_main", "raw-http-put"): (
+    ("cli/main.py", 6741, "_overnight_ticker_process_main", "raw-http-put"): (
         "non-trading-local-process-error-queue"
     ),
     ("tradingagents/brokers/alpaca.py", 72, "_AlpacaTransport.get_json", "raw-http-request"): (
@@ -575,6 +575,9 @@ _HTTP_MUTATION_CLASSIFICATIONS: dict[tuple[str, int, str, str], str] = {
     ),
     ("tradingagents/dataflows/_official_common.py", 368, "_request_json", "raw-http-post"): (
         "non-trading-external-official-research-post"
+    ),
+    ("tradingagents/dataflows/alpaca_source_probe.py", 307, "AlpacaReadTransport.get", "raw-http-request"): (
+        "explicit-opt-in-fixed-endpoint-alpaca-diagnostic-get-only"
     ),
     ("tradingagents/graph/checkpointer.py", 60, "_MessageMetadataSqliteSaver.put", "raw-http-put"): (
         "non-trading-local-sqlite-checkpoint-metadata-write"
@@ -783,6 +786,33 @@ def test_production_raw_http_mutation_inventory_has_no_unclassified_transport():
         _HTTP_MUTATION_CLASSIFICATIONS,
     )
     assert _HTTP_MUTATION_CLASSIFICATIONS
+
+
+def _assert_source_probe_transport_is_literal_get(source: str) -> None:
+    """The reviewed read classification cannot hide a changed verb or body."""
+    tree = ast.parse(source)
+    transport = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "AlpacaReadTransport")
+    get = next(node for node in transport.body if isinstance(node, ast.FunctionDef) and node.name == "get")
+    calls = [node for node in ast.walk(get) if isinstance(node, ast.Call) and _call_name(node.func) == "connection.request"]
+    assert len(calls) == 1
+    call = calls[0]
+    assert len(call.args) == 2 and isinstance(call.args[0], ast.Constant)
+    assert type(call.args[0].value) is str and call.args[0].value == "GET"
+    assert [keyword.arg for keyword in call.keywords] == ["headers"]
+
+
+def test_source_probe_read_classification_requires_literal_get_without_body():
+    source = (ROOT / "tradingagents/dataflows/alpaca_source_probe.py").read_text(encoding="utf-8")
+    _assert_source_probe_transport_is_literal_get(source)
+    for replacement in ('connection.request("POST",', 'connection.request(method,', 'connection.request(None,'):
+        changed = source.replace('connection.request("GET",', replacement, 1)
+        assert changed != source
+        with pytest.raises(AssertionError):
+            _assert_source_probe_transport_is_literal_get(changed)
+    changed = source.replace('headers=headers)', 'headers=headers, body=b"mutation")', 1)
+    assert changed != source
+    with pytest.raises(AssertionError):
+        _assert_source_probe_transport_is_literal_get(changed)
 
 
 def test_live_write_inventory_rejects_an_unclassified_new_production_path(tmp_path):

@@ -122,6 +122,8 @@ def test_policy_refuses_nonprospective_or_invalid_dates(tmp_path, cutoff, start,
 def test_policy_requires_private_parent_and_rejects_symlink_or_duplicate_json(tmp_path):
     open_parent = tmp_path / "public"
     open_parent.mkdir(mode=0o755)
+    # The source gate inherits umask 077; establish actual public permissions.
+    open_parent.chmod(0o755)
     with pytest.raises(PopulationContractError):
         contract(open_parent)
     policy = contract(tmp_path)

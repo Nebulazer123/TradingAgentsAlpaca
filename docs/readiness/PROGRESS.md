@@ -23,7 +23,7 @@ records actual capture times, policy/source hashes, original-row accounting,
 the additional five current type observations and 13,294 Nasdaq source rows,
 focused checks, the full 6,244-row learning audit and remaining prerequisites.
 Final source acceptance is recorded against the frozen commit in the private
-`results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v2/receipt.json`.
+`results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v3/receipt.json`.
 Only its completed successful exits establish candidate acceptance. The original
 packet, source/ledger originals and failed check receipts remain preserved.
 
@@ -50,7 +50,7 @@ serving identity and subscription cost. Historical OpenRouter and v4/v5/v6 repla
 remain supported. The frozen migration retains the exact 1,400-case v6 material
 and zero budgets. It is source-path evidence, not a new model-quality result.
 The graph supplement binds the frozen clean candidate in the private
-`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2-final/`
+`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2-repaired-source/`
 receipt. Registration does not execute a model.
 
 Harness prompt/model refresh is recorded separately in

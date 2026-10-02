@@ -131,14 +131,20 @@ with case SHA-256
 Registration SHA-256:
 `ef2e9adfc06f7502d41c805aaef0c1e9a3878d9652a5c1e87c27ceb664dbf790`.
 
-It records installed CLI 0.159.3, explicit requested models/effort and runner
-limits. The CLI does not return serving-model/revision identity or subscription
+The original registration records observed CLI 0.159.3. An external runner
+update to 0.160.0 correctly failed the old version preflight. The immutable
+`codex-registration-v7-current-runner/` successor changes only the six Codex
+lane runner versions, retaining all 1,400 cases, gold and zero budgets. Its
+registration SHA-256 is
+`4e47fe6455f04c7bed1b715034a41b80cc9c6ba702bff64683b7ba8861d46a11`.
+Explicit requested models/effort and runner limits remain fixed. The CLI does
+not return serving-model/revision identity or subscription
 allocation cost; those values stay unknown. Missing or repeated execution IDs,
 invalid telemetry, changed runners and sensitive inputs reject qualification.
 Source bundles remain equal across lanes and gold remains outside model input.
 The original zero budgets are retained. No model or 1,400-case rerun occurred.
 The full-graph supplemental registration is written after source freeze under
-`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2-final/`,
+`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2-repaired-source/`,
 binding the final clean revision and unchanged dependency lock. It grants no
 model execution authority.
 
@@ -177,9 +183,21 @@ full suite was deliberately interrupted at the source-profile integration
 boundary. Its durable exit 130 and withdrawal reason remain retained; it is not
 an accepted candidate. The additional 124 profile/master/archive/population
 checks passed after the original-backed normalization repair.
-Failed attempts remain retained. At this pre-freeze checkpoint the final complete
-integrated source gate has not yet run. The subsequent candidate-bound receipt
-under `results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v2/`
+The second candidate `f46125a` completed its full gate at **13:10:13 UTC**,
+with **4 failed, 5,527 passed and 1 skipped** (plus 81 subtests passed). Its
+failed receipt remains under `source-gate-final-v2/`; it is not accepted or
+published. The failures exposed shifted exact transport-inventory locations,
+the missing probe/Codex registry entries, and a public-directory fixture whose
+requested permissions were narrowed by the gate's inherited umask 077.
+The repair preserves exact transport classification, checks the probe's literal
+GET/no-body invariant, marks both registry entries as requiring runtime checks
+without write/trading authority, and explicitly sets the fixture's intended
+public permissions. All 195 affected checks passed under umask 077.
+
+Failed attempts remain retained. At this replacement pre-freeze checkpoint the
+repaired candidate's full integrated source gate has not yet run. The subsequent
+candidate-bound receipt
+under `results/readiness_continuation/20261002-continuation-implementation/source-gate-final-v3/`
 owns final source acceptance; only its recorded completed successful exits
 establish a passing gate.
 
