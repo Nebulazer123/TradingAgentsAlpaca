@@ -1484,14 +1484,18 @@ def research_stack_benchmark(
         "--execute-openrouter",
         help="Explicitly execute the preregistered OpenRouter source/no-text pair after deterministic admission.",
     ),
+    execute_codex: bool = typer.Option(
+        False, "--execute-codex",
+        help="Explicitly execute the preregistered v7 Codex subscription source/no-text pair after deterministic admission.",
+    ),
     execute_reviewer: bool = typer.Option(
         False,
         "--execute-reviewer",
-        help="With --execute-openrouter, also run the registered distinct-model pair on ambiguous cases only.",
+        help="With a registered model executor, also run its distinct-model pair on ambiguous cases only.",
     ),
     execute_full_graph: bool = typer.Option(
         False, "--execute-full-graph",
-        help="With --execute-openrouter, run the registered retained-only full graph pair only if simpler lanes leave attainable gain.",
+        help="With a registered model executor, run its retained-only full graph pair only if simpler lanes leave attainable gain.",
     ),
     full_graph_registration_path: Path | None = typer.Option(
         None, "--full-graph-registration-path", exists=True, readable=True,
@@ -1502,19 +1506,22 @@ def research_stack_benchmark(
         help="New isolated run directory, separate from the retained artifact root; existing runs are never overwritten.",
     ),
 ):
-    """Score lane evidence, optionally executing a registered OpenRouter pair."""
+    """Score lane evidence, optionally executing one explicit registered route."""
     try:
-        if execute_reviewer and not execute_openrouter:
+        if execute_openrouter and execute_codex:
+            raise ResearchQualificationBenchmarkError("Select exactly one registered model execution route")
+        execute_models = execute_openrouter or execute_codex
+        if execute_reviewer and not execute_models:
             raise ResearchQualificationBenchmarkError(
-                "Reviewer execution requires --execute-openrouter"
+                "Reviewer execution requires --execute-openrouter or --execute-codex"
             )
-        if execute_full_graph and not execute_openrouter:
-            raise ResearchQualificationBenchmarkError("Full-graph execution requires --execute-openrouter")
+        if execute_full_graph and not execute_models:
+            raise ResearchQualificationBenchmarkError("Full-graph execution requires --execute-openrouter or --execute-codex")
         if execute_full_graph != (full_graph_registration_path is not None and full_graph_run_root is not None) or (
             not execute_full_graph and (full_graph_registration_path is not None or full_graph_run_root is not None)
         ):
             raise ResearchQualificationBenchmarkError("Full-graph execution requires its explicit registration and new run root")
-        if execute_openrouter:
+        if execute_models:
             destination = output_path.expanduser().absolute()
             if destination.exists() or destination.is_symlink() or destination.resolve().is_relative_to(artifact_root.resolve()):
                 raise ResearchQualificationBenchmarkError("Model execution requires a new output path outside source artifacts")
@@ -1522,12 +1529,18 @@ def research_stack_benchmark(
                 raise ResearchQualificationBenchmarkError("Benchmark output must be outside the full-graph run namespace")
         registration = json.loads(registration_path.read_text(encoding="utf-8"))
         lane_results = json.loads(lane_results_path.read_text(encoding="utf-8"))
-        if execute_openrouter:
+        if execute_models:
             if type(lane_results) is not list or len(lane_results) != 1:
                 raise ResearchQualificationBenchmarkError(
-                    "OpenRouter execution requires exactly one deterministic lane result"
+                    "Model execution requires exactly one deterministic lane result"
                 )
-            receipt = execute_registered_openrouter_benchmark(
+            if execute_codex:
+                from tradingagents.research.qualification_codex import execute_registered_codex_benchmark
+
+                executor = execute_registered_codex_benchmark
+            else:
+                executor = execute_registered_openrouter_benchmark
+            receipt = executor(
                 registration=registration,
                 deterministic_result=lane_results[0],
                 artifact_root=artifact_root,

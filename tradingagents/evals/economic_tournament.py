@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, localcontext
 
 from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
+from tradingagents.dataflows.pit.execution_outcomes_v2 import SourceBoundExecutionOutcomeV2
 from tradingagents.evals.economic_evaluation_partition_binding import (
     EconomicPhaseEligibility,
     ValidationPhaseEligibility,
@@ -368,7 +369,7 @@ def evaluate_phase_ta_control(
     protocol: FrozenEvaluationProtocol,
     eligibility: EconomicPhaseEligibility,
     candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
-    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...],
+    execution_outcomes: tuple[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2, ...],
     tournament_input_id: str,
     tournament_input_sha256: str,
 ) -> EconomicValidationResult:
@@ -388,7 +389,7 @@ def evaluate_phase_ta_control(
     if type(candidates_by_event) is not dict or set(candidates_by_event) != set(expected_ids):
         raise EconomicTournamentError("candidate inputs must exactly cover phase events")
     if type(execution_outcomes) is not tuple or any(
-        type(item) is not SourceBoundExecutionOutcome for item in execution_outcomes
+        type(item) not in {SourceBoundExecutionOutcome, SourceBoundExecutionOutcomeV2} for item in execution_outcomes
     ):
         raise EconomicTournamentError(
             "v3 evaluation requires exact source-bound execution outcomes"
@@ -403,7 +404,7 @@ def evaluate_phase_ta_control(
         for market_date in sorted(grouped_by_date)
     )
     required_symbols = tuple(sorted((*frozen.primary_universe, "SPY")))
-    outcomes_by_date: dict[str, list[SourceBoundExecutionOutcome]] = {}
+    outcomes_by_date: dict[str, list[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2]] = {}
     for outcome in execution_outcomes:
         outcomes_by_date.setdefault(outcome.decision_market_date, []).append(outcome)
     if set(outcomes_by_date) != set(grouped):
@@ -586,7 +587,7 @@ def evaluate_validation_ta_control(
     protocol: FrozenEvaluationProtocol,
     eligibility: ValidationPhaseEligibility,
     candidates_by_event: dict[str, tuple[EconomicTournamentCandidate, ...]],
-    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...],
+    execution_outcomes: tuple[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2, ...],
     tournament_input_id: str,
     tournament_input_sha256: str,
 ) -> EconomicValidationResult:

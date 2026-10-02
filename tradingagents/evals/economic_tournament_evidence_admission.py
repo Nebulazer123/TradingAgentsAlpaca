@@ -22,6 +22,8 @@ from tradingagents.dataflows.pit import (
     validate_source_bound_execution_outcome,
     verify_source_bound_adjusted_price_window,
 )
+from tradingagents.dataflows.pit.action_originals import verify_execution_action_originals
+from tradingagents.dataflows.pit.execution_outcomes_v2 import verify_original_leg_execution_outcome
 from tradingagents.evals.economic_evaluation_partition_binding import (
     EconomicPhaseEligibility,
     ValidationPhaseEligibility,
@@ -339,42 +341,37 @@ def verify_source_bound_tournament_input(
                     "canonical tournament outcome is invalid"
                 )
             try:
-                window = validate_source_bound_adjusted_price_window(
-                    _plain_json(outcome.get("price_window"))
-                )
-                artifact = archive.read_artifact(window.raw_artifact_id)
-                verified = verify_source_bound_adjusted_price_window(
-                    archive=archive,
-                    raw_artifact=artifact,
-                    value=window.to_dict(),
-                )
                 raw_execution = _plain_json(outcome.get("execution_outcome"))
                 symbol = raw_execution.get("symbol")
                 security = identities[symbol]
-                execution = validate_source_bound_execution_outcome(
-                    raw_execution,
-                    security=security,
-                    market_calendar=calendar,
-                    adjusted_price_window=verified,
-                )
-                official_open = resolve_market_session_open(
-                    archive=archive,
-                    market_calendar=calendar,
-                    session_date=execution.entry_session_date,
-                )
+                _verify_execution_evidence(archive=archive, value=outcome, security=security, calendar=calendar)
             except (OSError, TypeError, ValueError) as exc:
                 raise EconomicTournamentInputEvidenceError(
                     "tournament outcome raw artifact cannot be verified"
                 ) from exc
-            if verified.canonical_json_bytes() != window.canonical_json_bytes():
-                raise EconomicTournamentInputEvidenceError(
-                    "tournament outcome price window bytes are not exact"
-                )
-            if execution.entry_session_open_at != official_open:
-                raise EconomicTournamentInputEvidenceError(
-                    "tournament execution open does not replay from raw calendar bytes"
-                )
     return receipt
+
+
+def _verify_execution_evidence(*, archive, value: Mapping, security, calendar):
+    """The same original reopener used by complete tournament admission."""
+    raw_execution = _plain_json(value.get("execution_outcome"))
+    if type(raw_execution) is not dict:
+        raise EconomicTournamentInputEvidenceError("tournament execution outcome is invalid")
+    if raw_execution.get("schema_version") == "source_bound_execution_outcome/v2":
+        if value.get("price_window") is not None:
+            raise EconomicTournamentInputEvidenceError("original-leg outcome cannot mix adjusted prices")
+        return verify_original_leg_execution_outcome(archive=archive, value=raw_execution, security=security, market_calendar=calendar)
+    window = validate_source_bound_adjusted_price_window(_plain_json(value.get("price_window")))
+    artifact = archive.read_artifact(window.raw_artifact_id)
+    verified = verify_source_bound_adjusted_price_window(archive=archive, raw_artifact=artifact, value=window.to_dict())
+    execution = validate_source_bound_execution_outcome(raw_execution, security=security, market_calendar=calendar, adjusted_price_window=verified)
+    verify_execution_action_originals(archive=archive, execution=execution)
+    official_open = resolve_market_session_open(archive=archive, market_calendar=calendar, session_date=execution.entry_session_date)
+    if verified.canonical_json_bytes() != window.canonical_json_bytes():
+        raise EconomicTournamentInputEvidenceError("tournament outcome price window bytes are not exact")
+    if execution.entry_session_open_at != official_open:
+        raise EconomicTournamentInputEvidenceError("tournament execution open does not replay from raw calendar bytes")
+    return execution
 
 
 def _canonical_existing_directory(value: str | Path) -> Path:

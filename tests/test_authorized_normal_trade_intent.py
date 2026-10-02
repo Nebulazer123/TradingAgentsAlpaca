@@ -182,6 +182,56 @@ def test_normal_live_intent_binds_one_exact_payload_and_id() -> None:
     assert AuthorizedNormalTradeIntent.from_dict(intent.to_dict()).canonical_json_bytes() == intent.canonical_json_bytes()
 
 
+def test_normal_live_intent_survives_real_canonical_json_reload() -> None:
+    intent = _make_intent()
+    payload = json.loads(intent.canonical_json_bytes())
+    reloaded = AuthorizedNormalTradeIntent.from_dict(payload)
+    assert reloaded == intent
+    assert reloaded.canonical_json_bytes() == intent.canonical_json_bytes()
+    reloaded.verify_order_payload(_bound_order(reloaded), at=_at("2026-07-28T12:00:01Z"))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("live_submit_authorized", 1), ("paper_submit_authorized", 0),
+    ("live_submit_authorized", 1.0), ("paper_submit_authorized", 0.0),
+    ("live_submit_authorized", "true"), ("paper_submit_authorized", None),
+    ("owner_role", ["portfolio_executive"]), ("authorization_scope", None),
+    ("owner_role", "execution_operator"), ("authorization_scope", "single_alpaca_paper_order"),
+])
+def test_fixed_authority_fields_reject_wrong_types_and_values_after_reload(field, value) -> None:
+    payload = json.loads(_make_intent().canonical_json_bytes())
+    payload[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        AuthorizedNormalTradeIntent.from_dict(payload)
+
+
+@pytest.mark.parametrize("field", ["owner_role", "authorization_scope", "live_submit_authorized", "paper_submit_authorized"])
+def test_fixed_authority_fields_cannot_be_missing_after_reload(field) -> None:
+    payload = json.loads(_make_intent().canonical_json_bytes())
+    del payload[field]
+    with pytest.raises(ValueError):
+        AuthorizedNormalTradeIntent.from_dict(payload)
+
+
+def test_json_reload_rejects_extra_fields_and_altered_authorization_digest() -> None:
+    payload = json.loads(_make_intent().canonical_json_bytes())
+    with pytest.raises(ValueError):
+        AuthorizedNormalTradeIntent.from_dict({**payload, "schema_version": 1})
+    with pytest.raises(ValueError):
+        AuthorizedNormalTradeIntent.from_dict({**payload, "authorization_id": "authorized-normal-trade-intent-" + _sha("0")})
+
+
+def test_fixed_authority_rejects_equal_string_subclasses() -> None:
+    class StringSubclass(str):
+        pass
+
+    for field in ("owner_role", "authorization_scope"):
+        payload = _make_intent().to_dict()
+        payload[field] = StringSubclass(payload[field])
+        with pytest.raises(ValueError):
+            AuthorizedNormalTradeIntent.from_dict(payload)
+
+
 @pytest.mark.parametrize("mutator", [_wrong_owner, _wrong_digest, _wrong_notional, _wrong_client_id])
 def test_normal_live_intent_rejects_forged_or_changed_binding(mutator) -> None:
     with pytest.raises(ValueError):

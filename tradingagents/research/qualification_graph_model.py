@@ -68,10 +68,19 @@ class GraphModelTelemetry(BaseCallbackHandler):
         metadata, usage = getattr(message, "response_metadata", None), getattr(message, "usage_metadata", None)
         if not isinstance(metadata, Mapping) or not isinstance(usage, Mapping):
             raise ResearchQualificationBenchmarkError("full-graph response telemetry is unavailable")
-        actual = tuple(metadata.get(key) for key in ("provider", "model_name", "system_fingerprint", "route"))
-        expected = tuple(self.spec[key] for key in ("provider", "model", "revision", "route"))
-        if actual != expected or metadata.get("fallback_used") is not False:
-            raise ResearchQualificationBenchmarkError("full-graph observed route differs from registration")
+        codex = self.spec["provider"] == "codex"
+        extra = {}
+        if codex:
+            from tradingagents.research.qualification_codex import codex_result_identity, validate_codex_response
+
+            observed = validate_codex_response(metadata, usage, self.spec)
+            actual = tuple(observed[key] for key in ("actual_provider", "actual_model", "actual_revision", "route"))
+            extra = codex_result_identity(self.spec)
+        else:
+            actual = tuple(metadata.get(key) for key in ("provider", "model_name", "system_fingerprint", "route"))
+            expected = tuple(self.spec[key] for key in ("provider", "model", "revision", "route"))
+            if actual != expected or metadata.get("fallback_used") is not False:
+                raise ResearchQualificationBenchmarkError("full-graph observed route differs from registration")
         counts = [usage.get(key) for key in ("input_tokens", "output_tokens")]
         if any(type(value) is not int or value < 0 for value in counts):
             raise ResearchQualificationBenchmarkError("full-graph observed usage is invalid")
@@ -89,7 +98,7 @@ class GraphModelTelemetry(BaseCallbackHandler):
         response_path = f"model-response-{len(self.calls) + 1:04d}.json"
         write_research_qualification_receipt(payload, self.response_root / response_path)
         response_sha256 = hashlib.sha256(_bytes(payload) + b"\n").hexdigest()
-        cost = sum(Decimal(count) * Decimal(self.spec[key]) for count, key in zip(
+        cost = None if codex else sum(Decimal(count) * Decimal(self.spec[key]) for count, key in zip(
             counts, ("input_price_per_million_usd", "output_price_per_million_usd"), strict=True,
         )) / Decimal(1_000_000)
         pending = dict(self.pending)
@@ -100,8 +109,9 @@ class GraphModelTelemetry(BaseCallbackHandler):
             "actual_provider": actual[0], "actual_model": actual[1],
             "actual_revision": actual[2], "route": actual[3], "fallback_used": False,
             "input_tokens": counts[0], "output_tokens": counts[1],
-            "cost_usd": "0" if cost.is_zero() else format(cost.normalize(), "f"),
+            "cost_usd": None if codex else "0" if cost.is_zero() else format(cost.normalize(), "f"),
             "latency_ms": max(0, (time.monotonic_ns() - started) // 1_000_000),
+            **extra,
         })
         self.pending = None
         self.last_response = captured

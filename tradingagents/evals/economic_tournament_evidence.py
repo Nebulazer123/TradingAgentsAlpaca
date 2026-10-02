@@ -25,6 +25,10 @@ from tradingagents.dataflows.pit.execution_outcomes import (
     SourceBoundExecutionOutcome,
     validate_source_bound_execution_outcome,
 )
+from tradingagents.dataflows.pit.execution_outcomes_v2 import (
+    SourceBoundExecutionOutcomeV2,
+    validate_original_leg_execution_outcome,
+)
 from tradingagents.dataflows.pit.market_calendar import (
     validate_market_session_calendar,
 )
@@ -479,8 +483,20 @@ def _outcome(
     event_market_date: str,
     expected_decision_event_id: str,
     label: str,
-) -> tuple[SourceBoundExecutionOutcome, dict[str, object]]:
+) -> tuple[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2, dict[str, object]]:
     payload = _exact_mapping(value, _OUTCOME_FIELDS, label=label)
+    raw_outcome = _thaw_json(payload["execution_outcome"])
+    if type(raw_outcome) is dict and raw_outcome.get("schema_version") == "source_bound_execution_outcome/v2":
+        if payload["price_window"] is not None:
+            raise EconomicTournamentInputEvidenceError(f"{label} original-leg outcome cannot mix adjusted prices")
+        try:
+            calendar = validate_market_session_calendar(market_calendar)
+            outcome = validate_original_leg_execution_outcome(raw_outcome, security=security, market_calendar=calendar)
+        except (TypeError, ValueError) as exc:
+            raise EconomicTournamentInputEvidenceError(f"{label} original-leg outcome is invalid") from exc
+        if outcome.decision_event_id != expected_decision_event_id or outcome.decision_market_date != event_market_date:
+            raise EconomicTournamentInputEvidenceError(f"{label} original-leg outcome event does not match")
+        return outcome, {"execution_outcome": outcome.to_dict(), "price_window": None}
     window = _exact_mapping(
         payload["price_window"],
         _PRICE_WINDOW_FIELDS,
@@ -740,7 +756,7 @@ class SourceBoundTournamentOutcomes:
     validation_event_ids: tuple[str, ...]
     market_dates: tuple[str, ...]
     date_evidence: tuple[Mapping[str, object], ...]
-    outcomes: tuple[SourceBoundExecutionOutcome, ...]
+    outcomes: tuple[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2, ...]
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("SourceBoundTournamentOutcomes instances require its builder")
@@ -773,7 +789,7 @@ class SourceBoundTournamentInput:
     features: SourceBoundTournamentFeatures
     outcome_receipt: SourceBoundTournamentOutcomes
     candidates_by_event: Mapping[str, tuple[EconomicTournamentCandidate, ...]]
-    outcomes: tuple[SourceBoundExecutionOutcome, ...]
+    outcomes: tuple[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2, ...]
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         raise TypeError("SourceBoundTournamentInput instances require its builder")
@@ -940,7 +956,7 @@ def _build_outcomes(
             "outcomes must be grouped once per validation market date"
     )
     canonical_dates: list[Mapping[str, object]] = []
-    evaluator_outcomes: list[SourceBoundExecutionOutcome] = []
+    evaluator_outcomes: list[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2] = []
     for index, ((market_date, events), raw_date, feature_date) in enumerate(
         zip(grouped, raw_dates, features.date_evidence, strict=True)
     ):
@@ -977,7 +993,7 @@ def _build_outcomes(
             _thaw_json(feature_benchmark["security"])
         )
         identities[benchmark_security.symbol] = benchmark_security
-        date_outcomes: list[SourceBoundExecutionOutcome] = []
+        date_outcomes: list[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2] = []
         normalized: list[dict[str, object]] = []
         events_by_symbol = {event.symbol: event for event in events}
         first_event_id = events[0].decision_event_id

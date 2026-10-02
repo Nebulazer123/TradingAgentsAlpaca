@@ -9,6 +9,16 @@ read that history to understand today's status.
 
 ## Work completed in this continuation
 
+- The reviewed Alpaca diagnostic and original-backed security-master evidence
+  path are integrated. Authorized captures now account for every row in the
+  declared directory: 33,555 records, with 20,356 source-supported exclusions
+  and 13,199 unresolved potential candidates. No study cohort is admitted.
+- New benchmark registrations now use the Codex subscription route, preserving
+  the exact 1,400-case material and all historical OpenRouter replay. The checks
+  use mocked responses; no new model-quality result is claimed. Original action
+  and consideration checks retain unavailable returns when coverage is missing.
+  [October 2 evidence and remaining gates](../superpowers/checkpoints/2026-10-02-continuation-source-and-data.md)
+  record the captures, registration, focused checks and preserved failures.
 - The old scheduling conflicts are fixed in the current source. Morning checks
   stay in dry-run, and dry-run jobs cannot send previously queued mail.
 - The obsolete conflicted checkout is removed. Its branch and complete recovery
@@ -34,9 +44,9 @@ read that history to understand today's status.
   their separate requirements.
 - Historical GO, promotion and expired tournament claims are preserved and
   superseded through the accepted writer. The current readiness report says
-  `NOT_ESTABLISHED`. Its October 1 successor at 12:45:58 UTC binds the approved
-  Luna/Sol prompt migration and all ten current paused records; the earlier
-  packet is retained. Fresh portfolio loss review and BOARD evidence remain open.
+  `NOT_ESTABLISHED`. The fresh October 2 readback at 10:02:30 UTC binds current
+  contracts and all ten paused records; earlier packets remain retained.
+  Fresh portfolio loss review and BOARD evidence remain open.
 - The first integrated source check finished with 5,083 passes and six failures.
   After repairs, its successor finished with 5,088 passes, one stale test
   assertion and one skipped live-API test. That assertion now checks strict
@@ -56,7 +66,11 @@ read that history to understand today's status.
 - The prediction ledger is backed up byte for byte. Its read-only audit found
   6,244 valid records, including 4,944 marked resolved and 1,300 pending. Those
   labels do not establish verified economic outcomes; its missing result links
-  remain an exact open requirement. These predictions were issued from June 2
+  remain an exact open requirement. The full October 2 row/quality audit found
+  zero verified economic bindings, so all 6,244 remain economically unresolved.
+  Its repeatable read-only result is not an accepted economic fixed point, and
+  the existing summary was not refreshed with invented results.
+  These predictions were issued from June 2
   through August 13. New forecasts cannot supply their missing original links;
   the resolver requires the original date, stock, packet and scoring window.
 - The [day, night and weekend explanation](../orchestration/day-night-weekend-walkthrough.md)
@@ -67,25 +81,25 @@ read that history to understand today's status.
 The new priority is the October 1 free-first security-master research packet,
 preserved with selected source files and its original manifest under
 [the packet record](../research/handoffs/2026-10-01/PACKET_INGESTION.md).
-Its donor probe is a diagnostic only: the package reports offline tests and a
-synthetic diagnostic, no real provider request, no security-master producer,
-and no admitted cohort.
+Its original donor probe was a synthetic diagnostic. The reviewed integration
+now has separate authorized real source captures, original-backed assertions
+and complete directory accounting. Discovery completion still does not establish
+class, dated identity, pricing, economic outcomes or an admitted cohort.
 Follow the
 [full continuation plan](../superpowers/plans/2026-10-01-tradingagents-research-and-readiness-continuation.md)
-from current source owners; the packet's repository review cites older source
-and must be reconciled before any patch is applied. The plan freezes population
-and eligibility policy before complete discovery, separates a representative
-access check from full capture, and adds independent source checks for corporate
-action terms, terminal proceeds, subscription benchmark migration, and learning
-quality.
+from current source owners. The source comparison is complete, and the v3 policy
+was frozen before complete discovery for the October 5 prospective cutoff.
+The final candidate's private `results/readiness_continuation/20261002-continuation-implementation/source-gate-final/receipt.json`
+records its source acceptance. Only completed successful exits cover the new
+changes; the older accepted source gate covers its recorded candidate.
 
 | Plain-English requirement | Why it matters | Next work |
 | --- | --- | --- |
-| A dated, trustworthy list of stocks and their identities | The study must prove which stocks are eligible at the prospective cutoff, including name changes and corporate events. | Audit the October 1 Alpaca/SEC proposal against current point-in-time owners and qualify the probe offline first. The older Massive preflight remains a separate pending route, not a prerequisite. Capture only within exact current provider/data-use authority; establish complete source-backed records before selecting the top 100, 75 and 50. The existing 43-symbol capture is too small. |
+| A dated, trustworthy list of stocks and their identities | The study must prove which stocks are eligible at the prospective cutoff, including name changes and corporate events. | Resolve the 13,199 potentially eligible directory records using positive share-class evidence, reviewed identity links, dated listing/alias intervals and exact 60-session prices. Preserve all 33,555 accounted rows. Current Alpaca names and SEC ticker metadata cannot close those gaps; no top-100/75/50 cohort is admitted. |
 | A link from each old prediction to the result being scored | Otherwise a result could be attributed to the wrong prediction or stock. | Trace original prediction records and saved price/event evidence. Leave unprovable rows unresolved. |
 | Proof of broader document reasoning | Checked reporting periods, collection times and configuration fixtures do not prove general reasoning about changed reports, publisher charts or investments. | Preserve the completed 1,400-case local result and its limits. Admit any further questions and model comparisons through their actual evidence and authorization prerequisites; missing model evidence does not establish a no-model verdict. |
 | A study that begins before its results are known | Choosing inputs after seeing the outcome would bias the result. | Admit the future-facing study, then collect actual development and validation results. Release the reserved final test only through its separate owner approval. |
-| Fresh portfolio loss review and BOARD evidence | Old positions and stale reviews cannot establish today's state. | Preserve the completed readiness supersession; obtain the required fresh source evidence within its authorized scope. |
+| Fresh portfolio loss review and BOARD evidence | Old positions and stale reviews cannot establish today's state. | Current paper account/position originals were captured at 10:40:58 UTC, including TSM. Complete the source-bound decision/loss-reason and qualifying TSM/BOARD reviews; the fresh fact readback alone does not qualify. |
 | Six clean market sessions | The system must operate reliably over real elapsed sessions. | Complete one qualifier, then five additional clean sessions in the existing order. A failed session requires repair and a new qualifier. |
 
 I will investigate the saved files and sources. You do not need to supply the
@@ -110,10 +124,13 @@ both models, including structured output and an application tool round-trip.
 allowance limits. This new source receives its own checks; the older passing
 repository gate covers its recorded candidate.
 
-The research qualification runners are a separate unfinished integration: the
-benchmark registration still requires OpenRouter and the full-graph runner
-hard-codes it. The continuation plan adds a new versioned subscription
-registration while preserving historical OpenRouter results and replay.
+The research qualification runners now support a new explicit v7 subscription
+registration and v2 full-graph route while preserving historical OpenRouter
+results and replay. The exact existing corpus was migrated without rerunning it
+or changing its zero model budgets. Serving identity and subscription cost stay
+unknown when the CLI does not report them. The supplemental graph registration and complete source gate bind the final
+clean revision in their private receipts; neither executes a model or closes
+the remaining economic and market-session gates.
 
 The earlier public AAPL subscription forecasts remain saved with their original
 timestamps. The paid comparison made zero calls and spent USD 0; its original
@@ -126,11 +143,10 @@ routes can use the subscription, and the local CLI adapter is now implemented. T
 prepared API graph passed an offline twelve-role simulation with fabricated
 responses; that establishes integration behavior, not paid-model performance.
 
-The source review also found a local serialization defect in normal-trade intent
-validation: fixed string fields are checked by Python object identity, which can
-reject equal values parsed from a real JSON document. The plan calls for strict
-type/value validation and an offline JSON reload regression. This repair does
-not grant order or submission authority.
+The normal-trade intent serialization defect is repaired. Strict type/value
+checks accept an equal value parsed from real JSON and reject malformed, partial
+or wrong-typed authorization fields. All 35 affected checks passed. The repair
+grants no order or submission authority.
 
 The exact acceptance rules remain in the
 [existing implementation plan](../superpowers/plans/2026-08-30-tradingagents-evidence-first-working-state-completion.md).

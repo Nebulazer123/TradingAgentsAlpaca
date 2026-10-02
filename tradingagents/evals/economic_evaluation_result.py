@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 
 from tradingagents.dataflows.pit.execution_outcomes import SourceBoundExecutionOutcome
+from tradingagents.dataflows.pit.execution_outcomes_v2 import SourceBoundExecutionOutcomeV2
 from tradingagents.evals.economic_evaluation_partition_binding import (
     EconomicPhaseEligibility,
     ValidationPhaseEligibility,
@@ -277,7 +278,7 @@ def _canonical_unavailable_outcomes(value: object) -> tuple[Mapping[str, str], .
         }
     )
     if type(value) is tuple and all(
-        type(item) is SourceBoundExecutionOutcome for item in value
+        type(item) in {SourceBoundExecutionOutcome, SourceBoundExecutionOutcomeV2} for item in value
     ):
         rows = [
             {
@@ -328,7 +329,7 @@ def _canonical_execution_outcome_refs(
     value: object,
 ) -> tuple[Mapping[str, str], ...]:
     if type(value) is tuple and all(
-        type(item) is SourceBoundExecutionOutcome for item in value
+        type(item) in {SourceBoundExecutionOutcome, SourceBoundExecutionOutcomeV2} for item in value
     ):
         rows = [
             {
@@ -788,7 +789,7 @@ def build_validation_evaluation_result(
     registered_statistics: EconomicTournamentStatistics | None = None,
     tournament_input_id: str | None = None,
     tournament_input_sha256: str | None = None,
-    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...] | None = None,
+    execution_outcomes: tuple[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2, ...] | None = None,
     unavailable: bool = False,
 ) -> EconomicValidationResult:
     """Build a complete result for the canonical, purged validation phase."""
@@ -893,7 +894,7 @@ def build_phase_evaluation_result(
     registered_statistics: EconomicTournamentStatistics | None = None,
     tournament_input_id: str | None = None,
     tournament_input_sha256: str | None = None,
-    execution_outcomes: tuple[SourceBoundExecutionOutcome, ...] | None = None,
+    execution_outcomes: tuple[SourceBoundExecutionOutcome | SourceBoundExecutionOutcomeV2, ...] | None = None,
     unavailable: bool = False,
 ) -> EconomicValidationResult:
     """Build a v4 result bound to one named frozen lifecycle phase."""

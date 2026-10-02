@@ -5,9 +5,12 @@
 All ten TradingAgents automations are paused. Their saved times describe the
 intended cadence; they do not establish scheduled execution. Live control is
 frozen, paper submission defaults to off, concurrency remains 1, and overall
-readiness is unestablished. The September source collections are retained
-observations with their actual capture times. They are not a current broker,
-price, learning, or economic qualification refresh.
+readiness is unestablished. The October 2 authorized directory capture accounts
+for all 33,555 source records but leaves 13,199 potential candidates unresolved.
+Identity, price and effective-event coverage remain independent; no cohort is
+admitted. The fresh readiness readback still says `NOT_ESTABLISHED`. The retained
+September collections and original ledger are not a current broker, portfolio
+loss-review or economic qualification refresh.
 
 The following explains the designed operation. A future owner-approved observer
 phase could make seven analysis roles eligible for activation after the evidence
@@ -28,8 +31,10 @@ research packet cannot issue approval or bypass an execution gate.
 
 The one-ticker manual qualifier is deliberately capped. A genuine registered
 benchmark separately measures whether models improve source accuracy or resolved
-forecast quality enough to justify their cost. The current collection's 43
-symbols do not establish the eligible ranked top-100/75/50 study universe.
+forecast quality enough to justify their cost. New benchmark registrations can
+use the Codex subscription route; no new model comparison has run. The complete
+directory and the earlier 43-symbol sample do not establish the required
+source-qualified ranked top-100/75/50 study universe.
 Forecasts require legitimate decision/event mappings and source-bound future
 outcomes before they can enter learning or economic conclusions.
 
@@ -80,8 +85,10 @@ readiness; supersession must use the accepted writer after its prerequisites.
 
 Forecast resolution is an evidence operation. Legitimate mappings identify the
 original forecast and decision event; accepted prices and corporate actions
-establish the outcome. The existing ledger is backed up and reconciled to a
-fixed point. Missing, stale or ambiguous rows remain pending with reasons;
+establish the outcome. The existing ledger is backed up and its read-only audit
+is reproducible. All 6,244 rows still lack verified economic bindings; an economic
+fixed point has not been accepted. Missing, stale or ambiguous rows remain
+unresolved with reasons;
 stored outcomes are not rewritten. Reports distinguish raw forecast rows from
 unique events, market dates and quality-qualified observations.
 

@@ -149,6 +149,31 @@ def test_partial_failed_or_native_tool_events_reject(monkeypatch, raw):
         CodexChatModel().invoke("Public fixture")
 
 
+@pytest.mark.parametrize("injected", [
+    {"type": "unknown.protocol.event"},
+    {"type": []},
+    {"type": "item.updated", "item": {"type": "command_execution"}},
+    {"type": "item.updated", "item": {"type": []}},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": '{"content":"second","tool_calls":[]}'}},
+    {"type": "item.completed", "item": {"type": "agent_message", "text": None}},
+])
+def test_event_drift_and_repeated_final_messages_cannot_hide_in_a_valid_reply(monkeypatch, injected):
+    lines = events({"content": "fixture answer", "tool_calls": []}).splitlines()
+    lines.insert(2, json.dumps(injected))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="\n".join(lines), stderr=""))
+    with pytest.raises(CodexRunnerError):
+        CodexChatModel().invoke("Public fixture")
+
+
+def test_after_completion_and_repeated_turn_start_are_rejected(monkeypatch):
+    lines = events({"content": "fixture answer", "tool_calls": []}).splitlines()
+    for stream in [lines + [json.dumps({"type": "item.started", "item": {"type": "reasoning"}})],
+                   [lines[0], json.dumps({"type": "turn.started"}), json.dumps({"type": "turn.started"}), *lines[1:]]]:
+        monkeypatch.setattr(subprocess, "run", lambda *a, value=stream, **k: SimpleNamespace(returncode=0, stdout="\n".join(value), stderr=""))
+        with pytest.raises(CodexRunnerError):
+            CodexChatModel().invoke("Public fixture")
+
+
 def test_disabled_native_host_startup_notice(monkeypatch):
     notice = json.dumps({"type": "item.completed", "item": {"type": "error", "message": _DISABLED_HOST_NOTICE}})
     raw = notice + "\n" + events({"content": "4", "tool_calls": []})
@@ -227,3 +252,24 @@ def test_overnight_default_uses_subscription_without_ollama_probe(monkeypatch):
     assert config["llm_provider"] == "codex"
     assert config["backend_url"] == CODEX_ROUTE
     assert "overnight_graph_disabled_reason" not in config
+
+
+def test_runner_preserves_returned_outcome_and_reports_unknown_serving_identity(monkeypatch):
+    rows = [{"type": "thread.started", "thread_id": "observed-thread"},
+            {"type": "item.completed", "item": {"id": "observed-item", "type": "agent_message", "text": json.dumps({"content": "4", "tool_calls": []})}},
+            {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 4}}]
+    raw = "\n".join(json.dumps(row) for row in rows)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout=raw, stderr=""))
+    result = CodexChatModel().invoke("2+2")
+    meta = result.response_metadata
+    assert meta["id"] == "codex:observed-thread:observed-item"
+    assert meta["returned_model_name"] is None and meta["returned_provider_identity"] is None
+    assert meta["subscription_cost_usd"] is None
+    assert meta["model_identity_source"] == "requested_cli_argument_only"
+    assert meta["runner_outcome"] == {"thread_id": "observed-thread", "item_id": "observed-item"}
+
+
+def test_missing_runner_outcome_is_not_synthesized(transport):
+    result = CodexChatModel().invoke("Public fixture")
+    assert result.response_metadata["id"] is None
+    assert result.response_metadata["runner_outcome"]["item_id"] is None

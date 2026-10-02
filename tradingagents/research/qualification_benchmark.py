@@ -81,24 +81,41 @@ POLICY_FIELDS = {"minimum_accuracy_gain", "lane_cost_budgets_usd"}
 LANE_SPEC_FIELDS = {"provider", "model", "revision", "route", "prompt_sha256", "input_price_per_million_usd", "output_price_per_million_usd"}
 
 
+def _lane_order(specs: Mapping[str, object]) -> tuple[str, ...]:
+    if "codex_subscription_source_bound" in specs:
+        from tradingagents.research.qualification_codex import CODEX_LANE_ORDER
+
+        return CODEX_LANE_ORDER
+    return LANE_ORDER
+
+
 def _registration(value: object) -> dict[str, object]:
     row = _map(value, {"schema_version", "registration_id", "registration_sha256", "cases", "comparison_policy", "lane_specs", *AUTHORITY}, "registration")
-    if row["schema_version"] not in {"research_qualification_registration/v4", "research_qualification_registration/v5", "research_qualification_registration/v6"}:
+    if row["schema_version"] not in {"research_qualification_registration/v4", "research_qualification_registration/v5", "research_qualification_registration/v6", "research_qualification_registration/v7"}:
         raise ResearchQualificationBenchmarkError("registration schema is invalid")
-    if any(row[key] != expected for key, expected in AUTHORITY.items()):
+    if any(type(row[key]) is not type(expected) or row[key] != expected for key, expected in AUTHORITY.items()):
         raise ResearchQualificationBenchmarkError("registration authority is invalid")
     policy = _map(row["comparison_policy"], POLICY_FIELDS, "comparison policy")
     gain = _decimal(policy["minimum_accuracy_gain"], "minimum_accuracy_gain")
     budgets = policy["lane_cost_budgets_usd"]
-    if gain <= 0 or gain > 1 or not isinstance(budgets, Mapping) or set(budgets) != set(LANE_ORDER):
+    subscription = row["schema_version"] == "research_qualification_registration/v7"
+    from tradingagents.research.qualification_codex import CODEX_LANE_ORDER, validate_codex_lane_spec
+
+    order = CODEX_LANE_ORDER if subscription else LANE_ORDER
+    text_lanes, model_lanes = order[1:], set(order[2:])
+    if gain <= 0 or gain > 1 or not isinstance(budgets, Mapping) or set(budgets) != set(order):
         raise ResearchQualificationBenchmarkError("comparison policy is invalid")
-    policy = {"minimum_accuracy_gain": format(gain, "f"), "lane_cost_budgets_usd": {lane: format(_decimal(budgets[lane], f"{lane} budget"), "f") for lane in LANE_ORDER}}
+    policy = {"minimum_accuracy_gain": format(gain, "f"), "lane_cost_budgets_usd": {lane: format(_decimal(budgets[lane], f"{lane} budget"), "f") for lane in order}}
     raw_specs = row["lane_specs"]
-    expected_lanes = {*LANE_ORDER, *(f"{lane}_no_text" for lane in TEXT_LANES)}
+    expected_lanes = {*order, *(f"{lane}_no_text" for lane in text_lanes)}
     if not isinstance(raw_specs, Mapping) or set(raw_specs) != expected_lanes:
         raise ResearchQualificationBenchmarkError("registered lane identities are incomplete")
     lane_specs = {}
     for lane_id in sorted(expected_lanes):
+        base = lane_id.removesuffix("_no_text")
+        if subscription and base in model_lanes:
+            lane_specs[lane_id] = validate_codex_lane_spec(raw_specs[lane_id])
+            continue
         spec = _map(raw_specs[lane_id], LANE_SPEC_FIELDS, f"{lane_id} lane spec")
         for key in ("provider", "model", "revision", "route"):
             _text(spec[key], f"{lane_id} {key}")
@@ -106,19 +123,20 @@ def _registration(value: object) -> dict[str, object]:
             raise ResearchQualificationBenchmarkError("registered prompt digest is invalid")
         for key in ("input_price_per_million_usd", "output_price_per_million_usd"):
             spec[key] = format(_decimal(spec[key], f"{lane_id} {key}"), "f")
-        base = lane_id.removesuffix("_no_text")
         if (base in MODEL_LANES) != (spec["provider"] == "openrouter"):
             raise ResearchQualificationBenchmarkError("registered provider does not match lane")
         lane_specs[lane_id] = spec
-    for lane_id in TEXT_LANES:
+        if subscription and spec["provider"] != "none":
+            raise ResearchQualificationBenchmarkError("local lanes cannot use provider")
+    for lane_id in text_lanes:
         twin = lane_specs[f"{lane_id}_no_text"]
         if any(lane_specs[lane_id][key] != twin[key]
-               for key in ("provider", "model", "revision", "route")):
+               for key in (tuple(lane_specs[lane_id]) if subscription and lane_specs[lane_id]["provider"] == "codex" else ("provider", "model", "revision", "route"))):
             raise ResearchQualificationBenchmarkError(
                 "paired lane identity must match before removing retained text"
             )
     media_version = row["schema_version"] == "research_qualification_registration/v5"
-    bundle_version = row["schema_version"] == "research_qualification_registration/v6"
+    bundle_version = row["schema_version"] in {"research_qualification_registration/v6", "research_qualification_registration/v7"}
     raw_cases = row["cases"]
     if type(raw_cases) is not list:
         raise ResearchQualificationBenchmarkError("registration cases must be a list")
@@ -476,15 +494,25 @@ def _cohort_quality(cases: Mapping[str, Mapping[str, object]], rows: Sequence[Ma
 
 
 def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapping[str, bytes], adapters: Mapping[str, LaneAdapter], lane_specs: Mapping[str, Mapping[str, object]], local_answers: Mapping[str, str | None] | None = None) -> dict[str, object]:
-    lane = _map(raw, RESULT_FIELDS, "lane result")
+    order = _lane_order(lane_specs)
+    subscription = order != LANE_ORDER
+    candidate_id = raw.get("lane_id") if isinstance(raw, Mapping) else None
+    codex_lane = type(candidate_id) is str and candidate_id in lane_specs and lane_specs[candidate_id]["provider"] == "codex"
+    from tradingagents.research.qualification_codex import CODEX_RESULT_FIELDS, validate_codex_result
+
+    lane = _map(raw, RESULT_FIELDS | (CODEX_RESULT_FIELDS if codex_lane else set()), "lane result")
     lane_id = _text(lane["lane_id"], "lane_id")
     base = lane_id.removesuffix("_no_text")
-    if base not in LANE_ORDER or any(lane[k] != v for k, v in AUTHORITY.items()):
+    if base not in order or lane_id not in lane_specs or any(type(lane[k]) is not type(v) or lane[k] != v for k, v in AUTHORITY.items()):
         raise ResearchQualificationBenchmarkError("lane identity or authority is invalid")
     spec = lane_specs[lane_id]
     observed_identity = (lane["actual_provider"], lane["actual_model"], lane["actual_revision"], lane["route"], lane["prompt_sha256"])
     registered_identity = (spec["provider"], spec["model"], spec["revision"], spec["route"], spec["prompt_sha256"])
-    if observed_identity != registered_identity:
+    if codex_lane:
+        validate_codex_result(lane, spec)
+        if lane["prompt_sha256"] != spec["prompt_sha256"]:
+            raise ResearchQualificationBenchmarkError("lane identity differs from registration")
+    elif observed_identity != registered_identity:
         raise ResearchQualificationBenchmarkError("lane identity differs from registration")
     if lane["fallback_used"] is not False:
         raise ResearchQualificationBenchmarkError("fallback cannot qualify")
@@ -499,14 +527,15 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
         "privacy_mode",
         "checkpoint_id",
     ):
-        _text(lane[key], key)
+        if not (codex_lane and key in {"requested_revision", "actual_model", "actual_revision"}):
+            _text(lane[key], key)
     requested = tuple(lane[k] for k in ("requested_provider", "requested_model", "requested_revision"))
     actual = tuple(lane[k] for k in ("actual_provider", "actual_model", "actual_revision"))
-    if requested != actual:
+    if not codex_lane and requested != actual:
         raise ResearchQualificationBenchmarkError("requested and actual identities differ")
-    if base in MODEL_LANES and lane["actual_provider"] != "openrouter":
+    if base in set(order[2:]) and not codex_lane and lane["actual_provider"] != "openrouter":
         raise ResearchQualificationBenchmarkError("model lanes require OpenRouter")
-    if base not in MODEL_LANES and lane["actual_provider"] != "none":
+    if base not in set(order[2:]) and lane["actual_provider"] != "none":
         raise ResearchQualificationBenchmarkError("local lanes cannot use provider")
     if type(lane["prompt_sha256"]) is not str or _SHA.fullmatch(lane["prompt_sha256"]) is None:
         raise ResearchQualificationBenchmarkError("prompt digest is invalid")
@@ -515,11 +544,13 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
     for key in ("input_tokens", "output_tokens", "latency_ms"):
         if type(lane[key]) is not int or lane[key] < 0:
             raise ResearchQualificationBenchmarkError("telemetry is invalid")
-    cost = _decimal(lane["cost_usd"], "cost_usd")
-    derived_cost = (Decimal(lane["input_tokens"]) * Decimal(spec["input_price_per_million_usd"]) + Decimal(lane["output_tokens"]) * Decimal(spec["output_price_per_million_usd"])) / Decimal(1_000_000)
-    if cost != derived_cost:
-        raise ResearchQualificationBenchmarkError("lane cost does not match registered pricing and usage")
-    expected = set(cases) if base != "different_model_reviewer" else {cid for cid, case in cases.items() if case["ambiguous"]}
+    cost = None if codex_lane else _decimal(lane["cost_usd"], "cost_usd")
+    if not codex_lane:
+        derived_cost = (Decimal(lane["input_tokens"]) * Decimal(spec["input_price_per_million_usd"]) + Decimal(lane["output_tokens"]) * Decimal(spec["output_price_per_million_usd"])) / Decimal(1_000_000)
+        if cost != derived_cost:
+            raise ResearchQualificationBenchmarkError("lane cost does not match registered pricing and usage")
+    reviewer_lane = order[-1] if subscription else "different_model_reviewer"
+    expected = set(cases) if base != reviewer_lane else {cid for cid, case in cases.items() if case["ambiguous"]}
     if not expected:
         raise ResearchQualificationBenchmarkError("reviewer requires registered ambiguous cases")
     outputs = lane["case_outputs"]
@@ -530,7 +561,7 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
         raise ResearchQualificationBenchmarkError("lane case coverage is invalid")
     adapter = adapters.get(lane_id)
     if (
-        base in MODEL_LANES
+        base in set(order[2:])
         or (lane_id.endswith("_no_text") and base != "metadata_fts5_bm25")
     ) and adapter is None:
         raise ResearchQualificationBenchmarkError(f"{lane_id} source adapter is unavailable")
@@ -564,7 +595,7 @@ def _score(raw: object, cases: Mapping[str, Mapping[str, object]], sources: Mapp
                                 **({"media_input": case["media_input"], "original_sha256": case["artifact_sha256"]} if "media_input" in case else {"source_bundle": case["source_bundle"]} if "source_bundle" in case else {})},
             }
         )
-    return {**lane, "case_outputs": scored, **_cohort_quality(cases, scored), "cost_usd": format(cost, "f")}
+    return {**lane, "case_outputs": scored, **_cohort_quality(cases, scored), "cost_usd": format(cost, "f") if cost is not None else None}
 
 
 def _reviewed_cohort(
@@ -579,6 +610,7 @@ def _reviewed_cohort(
 
 def run_registered_research_benchmark(*, registration: object, lane_results: object, artifact_root: str | Path, lane_adapters: Mapping[str, LaneAdapter] | None = None) -> dict[str, object]:
     frozen = _registration(registration)
+    order = _lane_order(frozen["lane_specs"])
     root = Path(artifact_root).expanduser().resolve(strict=True)
     if not root.is_dir() or type(lane_results) is not list:
         raise ResearchQualificationBenchmarkError("benchmark inputs are invalid")
@@ -588,7 +620,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
     raw_by_id = {str(row.get("lane_id")): row for row in lane_results if isinstance(row, Mapping)}
     if len(raw_by_id) != len(lane_results):
         raise ResearchQualificationBenchmarkError("lane results are duplicated")
-    deterministic_raw = raw_by_id.get(LANE_ORDER[0])
+    deterministic_raw = raw_by_id.get(order[0])
     if deterministic_raw is None:
         raise ResearchQualificationBenchmarkError("deterministic prerequisites must qualify first")
     deterministic = _score(
@@ -606,7 +638,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
     scored = [deterministic]
     for row in lane_results:
         lane_id = str(row.get("lane_id")) if isinstance(row, Mapping) else ""
-        if lane_id == LANE_ORDER[0]:
+        if lane_id == order[0]:
             continue
         local_answers = None
         if lane_id == "metadata_fts5_bm25":
@@ -618,7 +650,7 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
     for lane in scored:
         lane["cohort_cost_usd"] = lane["cost_usd"]
         lane["cohort_cost_lane_ids"] = [lane["lane_id"]]
-    for lane in TEXT_LANES:
+    for lane in order[1:]:
         if lane in by_id and f"{lane}_no_text" not in by_id:
             raise ResearchQualificationBenchmarkError(f"{lane} requires its no-text twin")
         if lane in by_id:
@@ -626,28 +658,28 @@ def run_registered_research_benchmark(*, registration: object, lane_results: obj
             no_text_rows = {row["case_id"]: row for row in by_id[f"{lane}_no_text"]["case_outputs"]}
             if any(source_rows[case_id]["pair_id"] != no_text_rows[case_id]["pair_id"] or source_rows[case_id]["input_sha256"] == no_text_rows[case_id]["input_sha256"] for case_id in source_rows):
                 raise ResearchQualificationBenchmarkError("paired source and no-text inputs are not distinct and bound")
-    reviewer, reviewed = by_id.get("different_model_reviewer"), by_id.get("openrouter_source_bound")
-    if reviewer and (reviewed is None or reviewer["actual_model"] == reviewed["actual_model"]):
+    reviewer, reviewed = by_id.get(order[-1]), by_id.get(order[2])
+    model_key = "requested_model" if order != LANE_ORDER else "actual_model"
+    if reviewer and (reviewed is None or reviewer[model_key] == reviewed[model_key]):
         raise ResearchQualificationBenchmarkError("reviewer must use a distinct model")
     if reviewer is not None:
-        for review_lane in (reviewer, by_id.get("different_model_reviewer_no_text")):
+        for review_lane in (reviewer, by_id.get(order[-1] + "_no_text")):
             if review_lane is None:
                 continue
             combined = _reviewed_cohort(cases, reviewed, review_lane)
             review_lane.update(combined)
             # Both reviewer variants replace only ambiguous cases in the same
             # source-model cohort; their comparison must pay for that cohort.
-            review_lane["cohort_cost_usd"] = format(
-                Decimal(reviewed["cost_usd"]) + Decimal(review_lane["cost_usd"]), "f"
-            )
+            review_lane["cohort_cost_usd"] = (format(Decimal(reviewed["cost_usd"]) + Decimal(review_lane["cost_usd"]), "f")
+                                               if reviewed["cost_usd"] is not None and review_lane["cost_usd"] is not None else None)
             review_lane["cohort_cost_lane_ids"] = [reviewed["lane_id"], review_lane["lane_id"]]
     policy = frozen["comparison_policy"]
     gain = Decimal(policy["minimum_accuracy_gain"])
     budgets = policy["lane_cost_budgets_usd"]
-    selected, retained = LANE_ORDER[0], [LANE_ORDER[0]]
-    for lane_id in LANE_ORDER[1:]:
+    selected, retained = order[0], [order[0]]
+    for lane_id in order[1:]:
         lane, twin = by_id.get(lane_id), by_id.get(f"{lane_id}_no_text")
-        if lane is None or twin is None or lane["qualified"] is not True or Decimal(lane["cohort_cost_usd"]) > Decimal(budgets[lane_id]):
+        if lane is None or twin is None or lane["qualified"] is not True or lane["cohort_cost_usd"] is None or Decimal(lane["cohort_cost_usd"]) > Decimal(budgets[lane_id]):
             continue
         accuracy = Decimal(lane["source_accuracy"])
         twin_accuracy = Decimal(twin["source_accuracy"])
@@ -690,6 +722,8 @@ def execute_registered_openrouter_benchmark(
 ) -> dict[str, object]:
     """Execute registered model pairs after local admission, graph only explicitly."""
     frozen = _registration(registration)
+    if frozen["schema_version"] == "research_qualification_registration/v7":
+        raise ResearchQualificationBenchmarkError("OpenRouter execution cannot use a Codex v7 registration")
     if execute_full_graph != (full_graph_registration is not None and full_graph_run_root is not None) or (
         not execute_full_graph and (full_graph_registration is not None or full_graph_run_root is not None)
     ):

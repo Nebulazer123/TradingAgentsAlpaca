@@ -19,6 +19,7 @@ from tradingagents.research.qualification_benchmark import (
     ResearchQualificationBenchmarkError,
     _adapter_input,
     _digest,
+    _lane_order,
     _map,
     _openrouter_prompt,
     _registration,
@@ -57,11 +58,16 @@ _REGISTRATION_FIELDS = {
 }
 
 
+def _graph_lanes(research: Mapping) -> tuple[str, str]:
+    base = _lane_order(research["lane_specs"])[3]
+    return base, base + "_no_text"
+
+
 def validate_full_graph_registration(raw: object, research_registration: object) -> dict:
     research = _registration(research_registration)
     row = _map(raw, _REGISTRATION_FIELDS, "full-graph registration")
     if (
-        row["schema_version"] != "research_full_graph_registration/v1"
+        row["schema_version"] != ("research_full_graph_registration/v2" if research["schema_version"].endswith("/v7") else "research_full_graph_registration/v1")
         or row["research_registration_sha256"] != research["registration_sha256"]
         or any(type(row[key]) is not type(value) or row[key] != value for key, value in AUTHORITY.items())
         or type(row["clean_source_revision"]) is not str
@@ -70,10 +76,11 @@ def validate_full_graph_registration(raw: object, research_registration: object)
         or re.fullmatch(r"[0-9a-f]{64}", row["uv_lock_sha256"]) is None
     ):
         raise ResearchQualificationBenchmarkError("full-graph registration identity is invalid")
-    for lane in ("tradingagents_full_graph", "tradingagents_full_graph_no_text"):
+    graph_lane, graph_twin = _graph_lanes(research)
+    for lane in (graph_lane, graph_twin):
         if research["lane_specs"][lane]["prompt_sha256"] != FULL_GRAPH_PROMPT_SHA256:
             raise ResearchQualificationBenchmarkError("full-graph prompt contract is not registered")
-    if research["lane_specs"]["tradingagents_full_graph"] != research["lane_specs"]["tradingagents_full_graph_no_text"]:
+    if research["lane_specs"][graph_lane] != research["lane_specs"][graph_twin]:
         raise ResearchQualificationBenchmarkError("full-graph twin settings and pricing must match")
     contexts = row["case_contexts"]
     if type(contexts) is not list:
@@ -111,7 +118,7 @@ def build_full_graph_registration(
 ) -> dict:
     research = _registration(research_registration)
     row = {
-        "schema_version": "research_full_graph_registration/v1",
+        "schema_version": "research_full_graph_registration/v2" if research["schema_version"].endswith("/v7") else "research_full_graph_registration/v1",
         "graph_registration_id": None, "graph_registration_sha256": None,
         "research_registration_sha256": research["registration_sha256"],
         "clean_source_revision": clean_source_revision, "uv_lock_sha256": uv_lock_sha256,
@@ -123,15 +130,22 @@ def build_full_graph_registration(
 
 
 def graph_case_directory(run_root: Path, case_id: str, lane_id: str) -> Path:
-    if lane_id not in {"tradingagents_full_graph", "tradingagents_full_graph_no_text"}:
+    if lane_id not in {"tradingagents_full_graph", "tradingagents_full_graph_no_text", "codex_subscription_full_graph", "codex_subscription_full_graph_no_text"}:
         raise ResearchQualificationBenchmarkError("full-graph lane is invalid")
     return run_root / _digest({"case_id": case_id, "lane_id": lane_id})
 
 
 def graph_case_config(case_root: Path, spec: Mapping[str, object]) -> dict:
+    if spec["provider"] == "codex":
+        from tradingagents.research.qualification_codex import validate_codex_lane_spec
+
+        validate_codex_lane_spec(spec)
+    elif spec["provider"] != "openrouter":
+        raise ResearchQualificationBenchmarkError("full-graph provider is not a registered route")
     return {
-        "llm_provider": "openrouter", "quick_think_llm": spec["model"], "deep_think_llm": spec["model"],
-        "backend_url": "https://openrouter.ai/api/v1", "output_language": "English",
+        "llm_provider": spec["provider"], "quick_think_llm": spec["model"], "deep_think_llm": spec["model"],
+        "backend_url": spec["route"] if spec["provider"] == "codex" else "https://openrouter.ai/api/v1", "output_language": "English",
+        **({"openai_reasoning_effort": spec["reasoning_effort"], "llm_timeout_seconds": spec["timeout_seconds"], "llm_max_retries": 0} if spec["provider"] == "codex" else {}),
         "max_debate_rounds": 1, "max_risk_discuss_rounds": 1,
         "max_analyst_tool_rounds": 0, "max_recur_limit": 100, "analyst_concurrency_limit": 1,
         "tool_free_analysts": list(GRAPH_ANALYSTS), "data_vendors": {}, "tool_vendors": {},
@@ -153,6 +167,8 @@ def build_full_graph_source_identity(graph_registration: Mapping[str, object], s
         raise ResearchQualificationBenchmarkError(f"full-graph source preflight failed: {exc}") from exc
     if identity.clean_source_revision != graph_registration["clean_source_revision"] or identity.uv_lock_sha256 != graph_registration["uv_lock_sha256"]:
         raise ResearchQualificationBenchmarkError("full-graph source revision or lock differs from registration")
+    if spec["provider"] == "codex" and identity.provider_reasoning_settings["runner_version"] != spec["runner_version"]:
+        raise ResearchQualificationBenchmarkError("installed Codex runner differs from graph registration")
     return identity
 
 
@@ -184,6 +200,7 @@ def bind_full_graph_case_identity(
             "graph_context": dict(graph_context), "safe_case": safe,
             "retained_context_sha256": hashlib.sha256(context.encode()).hexdigest(),
             "contract_sha256": FULL_GRAPH_PROMPT_SHA256,
+            **({"registered_codex_spec_sha256": _digest(spec)} if spec["provider"] == "codex" else {}),
         }),
         agent_prompt_surface_sha256=_digest({
             "base": material["agent_prompt_surface_sha256"],
@@ -191,7 +208,8 @@ def bind_full_graph_case_identity(
             "contract_sha256": FULL_GRAPH_PROMPT_SHA256,
         }),
         learning_context_policy_identity=_digest({"contract": "benchmark-no-learning-v1", "context": ""}),
-        provider_reasoning_settings={"temperature": 0, "max_retries": 0},
+        provider_reasoning_settings={"temperature": 0, "max_retries": 0,
+                                     **({key: spec[key] for key in ("runner_version", "reasoning_effort", "max_output_chars", "timeout_seconds")} if spec["provider"] == "codex" else {})},
         **capture_checkpoint_predecessors(graph_case_config(case_root, spec)),
     )
     return build_checkpoint_run_identity(**material), safe, context
@@ -217,9 +235,13 @@ def execute_full_graph_case(
 
     if not case_root.is_absolute() or case_root.exists() or case_root.is_symlink():
         raise ResearchQualificationBenchmarkError("full-graph case destination must be new and absolute")
+    expected_lane = "codex_subscription_full_graph" if spec["provider"] == "codex" else "tradingagents_full_graph"
+    expected_schema = "research_full_graph_registration/v2" if spec["provider"] == "codex" else "research_full_graph_registration/v1"
+    if lane_id.removesuffix("_no_text") != expected_lane or graph_registration["schema_version"] != expected_schema or spec["prompt_sha256"] != FULL_GRAPH_PROMPT_SHA256:
+        raise ResearchQualificationBenchmarkError("full-graph lane/provider/prompt differs from registration")
     _require_registered_language()
     expected_context = next((row for row in graph_registration["case_contexts"] if row["case_id"] == case["case_id"]), None)
-    if graph_context != expected_context or source_identity.requested_quick_model != spec["model"] or source_identity.requested_deep_model != spec["model"]:
+    if graph_context != expected_context or source_identity.requested_quick_model != spec["model"] or source_identity.requested_deep_model != spec["model"] or source_identity.requested_provider != spec["provider"]:
         raise ResearchQualificationBenchmarkError("full-graph case context or model differs from its binding")
     identity, safe, retained_context = bind_full_graph_case_identity(
         source_identity=source_identity, graph_registration=graph_registration,
@@ -236,7 +258,12 @@ def execute_full_graph_case(
 
         llm_factory = create_llm_client
     telemetry = GraphModelTelemetry(spec, GRAPH_MODEL_ROLES, case_root)
-    client = llm_factory(provider="openrouter", model=spec["model"], temperature=0, max_retries=0)
+    if spec["provider"] == "codex":
+        from tradingagents.research.qualification_codex import codex_factory_kwargs
+
+        client = llm_factory(**codex_factory_kwargs(spec))
+    else:
+        client = llm_factory(provider="openrouter", model=spec["model"], temperature=0, max_retries=0)
     model = StrictGraphModel(client.get_llm(), telemetry, str(safe["adapter_query"]))
     evidence_root = Path(config["results_dir"])
     ledger_root = evidence_root / "control_plane/decisions"
@@ -281,7 +308,7 @@ def execute_full_graph_case(
         "input_sha256": safe["input_sha256"], "pair_id": safe["pair_id"],
     }
     receipt = {
-        "schema_version": "research_full_graph_case/v1", "case_id": case["case_id"], "lane_id": lane_id,
+        "schema_version": "research_full_graph_case/v2" if spec["provider"] == "codex" else "research_full_graph_case/v1", "case_id": case["case_id"], "lane_id": lane_id,
         "graph_registration_sha256": graph_registration["graph_registration_sha256"],
         "case_directory": case_root.name, "graph_context": dict(graph_context),
         "run_id": run_id, "run_started_at": initial["run_started_at"],
@@ -319,10 +346,11 @@ def prepare_full_graph_execution(
         raise ResearchQualificationBenchmarkError("full-graph run root must be new, nonsymlinked and separate from source artifacts")
     cases = {case["case_id"]: case for case in research["cases"]}
     sources = {case_id: _source(artifacts, case) for case_id, case in cases.items()}
-    for lane in ("tradingagents_full_graph", "tradingagents_full_graph_no_text"):
+    graph_lane, graph_twin = _graph_lanes(research)
+    for lane in (graph_lane, graph_twin):
         for case_id, case in cases.items():
             _openrouter_prompt(*_adapter_input(case, lane, sources[case_id]), FULL_GRAPH_INSTRUCTION)
-    identity = build_full_graph_source_identity(graph, research["lane_specs"]["tradingagents_full_graph"], destination)
+    identity = build_full_graph_source_identity(graph, research["lane_specs"][graph_lane], destination)
     return {
         "research": research, "graph": graph, "run_root": destination,
         "cases": cases, "sources": sources, "source_identity": identity,
@@ -343,13 +371,14 @@ def execute_prepared_full_graph(prepared: Mapping[str, object], *, llm_factory=N
     research, graph = prepared["research"], prepared["graph"]
     root, cases, sources = prepared["run_root"], prepared["cases"], prepared["sources"]
     source_identity = prepared["source_identity"]
-    spec = research["lane_specs"]["tradingagents_full_graph"]
+    graph_lane, graph_twin = _graph_lanes(research)
+    spec = research["lane_specs"][graph_lane]
     if build_full_graph_source_identity(graph, spec, root) != source_identity:
         raise ResearchQualificationBenchmarkError("full-graph source changed after preflight")
     root.mkdir(mode=0o700, parents=False, exist_ok=False)
     contexts = {context["case_id"]: context for context in graph["case_contexts"]}
     lanes, captured, case_receipts, seen_outcomes = [], {}, [], set()
-    for lane_id in ("tradingagents_full_graph", "tradingagents_full_graph_no_text"):
+    for lane_id in (graph_lane, graph_twin):
         outputs, call_rows, latency_ms = [], [], 0
         spec = research["lane_specs"][lane_id]
         for case_id, case in cases.items():
@@ -366,7 +395,8 @@ def execute_prepared_full_graph(prepared: Mapping[str, object], *, llm_factory=N
             call_rows.extend(receipt["model_calls"])
             latency_ms += receipt["latency_ms"]
             case_receipts.append(receipt)
-        cost = sum((Decimal(call["cost_usd"]) for call in call_rows), Decimal(0))
+        codex = spec["provider"] == "codex"
+        cost = None if codex else sum((Decimal(call["cost_usd"]) for call in call_rows), Decimal(0))
         captured[lane_id] = outputs
         lanes.append({
             "lane_id": lane_id, "requested_provider": spec["provider"], "requested_model": spec["model"],
@@ -375,16 +405,20 @@ def execute_prepared_full_graph(prepared: Mapping[str, object], *, llm_factory=N
             "route": call_rows[0]["route"], "prompt_sha256": spec["prompt_sha256"], "fallback_used": False,
             "input_tokens": sum(call["input_tokens"] for call in call_rows),
             "output_tokens": sum(call["output_tokens"] for call in call_rows), "latency_ms": latency_ms,
-            "cost_usd": "0" if cost.is_zero() else format(cost.normalize(), "f"),
+            "cost_usd": None if codex else "0" if cost.is_zero() else format(cost.normalize(), "f"),
             "privacy_mode": "registered_retained_source",
             "outcome_ids": [call["outcome_id"] for call in call_rows],
             "checkpoint_id": f"registered-full-graph-{_digest([row['checkpoint_id'] for row in case_receipts if row['lane_id'] == lane_id])}",
             "case_outputs": outputs, **AUTHORITY,
         })
+        if codex:
+            from tradingagents.research.qualification_codex import codex_result_identity
+
+            lanes[-1].update(codex_result_identity(spec))
     if build_full_graph_source_identity(graph, spec, root) != source_identity:
         raise ResearchQualificationBenchmarkError("full-graph source changed during execution")
     execution = {
-        "schema_version": "research_full_graph_execution/v1", "status": "completed",
+        "schema_version": "research_full_graph_execution/v2" if spec["provider"] == "codex" else "research_full_graph_execution/v1", "status": "completed",
         "graph_registration": graph, "run_root": str(root), "case_runs": case_receipts, **AUTHORITY,
     }
     write_research_qualification_receipt(execution, root / "execution-receipt.json")

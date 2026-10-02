@@ -178,7 +178,7 @@ class AuthorizedNormalTradeIntent:
         if actual != _INPUT_FIELDS:
             raise ValueError(f"authorized normal trade intent fields do not match; missing={sorted(_INPUT_FIELDS - actual)}, extra={sorted(actual - _INPUT_FIELDS)}")
         for name, expected in _FIXED.items():
-            if payload[name] is not expected:
+            if type(payload[name]) is not type(expected) or payload[name] != expected:
                 raise ValueError(f"{name} does not match fixed authorization")
         intent = cls(**{
             name: payload[name]

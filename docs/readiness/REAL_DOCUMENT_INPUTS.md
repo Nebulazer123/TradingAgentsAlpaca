@@ -199,3 +199,29 @@ Accepted registration, results and execution review:
 Registration: `e550ac25eca071ed043630ec390efa36831aebbdcf795c9d51a20a113dbbccf2`.
 Benchmark receipt: `0bbff1099ae23758f5b6ccfff9e63156577fc2fcdad64bc009b8cb5df8302772`.
 The earlier literal-field v5 result remains retained under its original scope.
+
+## Subscription registration migration — October 2
+
+`research_qualification_registration/v7` adds explicit Codex subscription source,
+full-graph and reviewer lanes. The new immutable registration preserves all
+1,400 v6 case/gold bytes and the original zero execution budgets. It does not
+rerun or reinterpret the accepted local results. Historical v4/v5/v6 and
+OpenRouter registrations retain their original routes and replay.
+
+The runner binds requested model/effort, installed CLI version, input/output/time
+limits and execution outcome IDs. Serving-model/revision identity and subscription
+allocation cost stay unknown because the CLI does not return them. Unknown cost
+cannot win a cost-bounded selection. Sensitive inputs, missing/repeated IDs,
+invalid telemetry or runner drift reject qualification. Models run only through
+explicit executor selection and the registered gates; deterministic/retrieval
+baselines run first. A perfect deterministic baseline leaves no attainable model
+accuracy gain for this exact corpus, without establishing a general no-model
+verdict. Gold remains outside model input and compared source bytes remain equal.
+
+The affected integrated benchmark/media/client/checkpoint group passed 235 checks
+with mocked model/subprocess responses. No real model or corpus rerun occurred.
+The supplemental graph receipt under the private
+`results/readiness_continuation/20261002-continuation-implementation/codex-full-graph-registration-v2/`
+binds the final clean source revision. It does not execute a graph.
+See [the October 2 evidence checkpoint](../superpowers/checkpoints/2026-10-02-continuation-source-and-data.md)
+for registration hashes and remaining economic/operational gates.

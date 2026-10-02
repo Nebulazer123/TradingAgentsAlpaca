@@ -51,7 +51,14 @@ market sessions, in the existing twelve-stage order with reset rules. Even with
 no failure, that spans more than one calendar week. Economic acceptance uses the
 actual prospectively registered outcome windows.
 
-The combined source passed its [full gate](../superpowers/checkpoints/2026-10-01-combined-source-acceptance.md).
+The earlier combined source passed its [full gate](../superpowers/checkpoints/2026-10-01-combined-source-acceptance.md).
+The October 2 continuation adds reviewed source capture, complete directory
+accounting, original action/outcome checks, v7 subscription registration and the
+JSON reload repair. Its final candidate-bound gate receipt is under the private
+`results/readiness_continuation/20261002-continuation-implementation/source-gate-final/`.
+Only recorded completed successful exits establish source acceptance. The fresh readback
+still says `NOT_ESTABLISHED`: 13,199 candidates lack required identity/pricing
+evidence and no study cohort is admitted.
 Finish the remaining research qualification, legitimate cohort and prospective
 study, prediction reconciliation, current readiness evidence and six-session
 campaign. Then use the existing no-submit shadow-equivalence
